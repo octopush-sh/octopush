@@ -400,9 +400,26 @@ export interface McpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** A remote server's choices; the backend builds the `mcp-remote` bridge
+   *  in command/args/env from them (`mcp::remote::apply_bridge`). */
+  remote?: McpRemoteConfig;
   /** Any other key of the entry (`cwd`, `type`, `disabled`…), kept as it
    *  was (the backend's `extra`). */
   [extra: string]: unknown;
+}
+
+/** How a remote MCP server is reached (`mcp::remote::RemoteConfig`). */
+export interface McpRemoteConfig {
+  url: string;
+  /** Browser (OAuth), a bearer token, or the user's own headers. */
+  auth: "oauth" | "token" | "headers";
+  /** The custom headers' names (`auth: "headers"`). */
+  header_names?: string[];
+  transport: "auto" | "http-only" | "sse-only";
+  /** A pre-registered OAuth client (`auth: "oauth"`). */
+  client_id?: string;
+  /** More mcp-remote arguments, appended as given. */
+  extra_args?: string[];
 }
 
 /** Why Settings' Test or Reconnect failed (`mcp::classify_failure`), the

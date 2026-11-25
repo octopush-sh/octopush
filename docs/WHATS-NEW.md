@@ -165,6 +165,7 @@ Current anchors:
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
 | `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
 | `settings-mcp-edit` | Settings › Integrations › MCP Servers: the first server's Edit icon button (only with a server configured and no form open on it) | `settings/McpServersSection.tsx` |
+| `settings-mcp-add` · `settings-mcp-type` | Settings › Integrations › MCP Servers: "Add MCP server" (disabled while a form is open) · the open form's Local command / Remote URL choice (only while the add or edit form is open) | `settings/McpServersSection.tsx` · `settings/McpServerForm.tsx` |
 | `settings-readiness-card` · `settings-readiness-again` · `settings-readiness-checked` | Settings › General: the Readiness card · its "Check again" ("Run the check" before the first run) · the "Checked 2m ago" meta (once a check answered) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-disk` | Settings › General, Readiness card: the Disk space row | `settings/ReadinessCard.tsx` |
 | `settings-readiness-codex` | Settings › General, Readiness card: the Codex CLI row (only when a saved crew or Routine has a Codex CLI stage) | `settings/ReadinessCard.tsx` |

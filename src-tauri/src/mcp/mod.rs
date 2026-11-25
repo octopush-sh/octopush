@@ -33,6 +33,7 @@ use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
 mod failure;
+pub mod remote;
 pub use failure::{classify_failure, classify_failure_with, McpFailure};
 // Per-conversation server scope and the registry's status read (Companion).
 pub mod scope;
@@ -44,6 +45,11 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// A remote server's choices in Settings, from which Octopush builds
+    /// the bridge in `command`/`args`/`env` (`remote::apply_bridge`). An
+    /// entry without it is a local command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<remote::RemoteConfig>,
     /// Every other key of the entry (`cwd`, `type`, `disabled`, another
     /// client's own fields), kept as it was so a save never drops it.
     #[serde(flatten)]
@@ -113,6 +119,9 @@ pub fn save_user_config(servers: &HashMap<String, McpServerConfig>) -> Result<()
 }
 
 /// Load configured servers for a worktree (project overrides user on name clash).
+/// A remote entry's bridge is rebuilt from its `remote` choices
+/// (`remote::with_bridges`), as Settings' Test and Reconnect do, so a
+/// hand-edited `remote` block runs the same in Talk.
 pub fn load_server_configs(worktree: &Path) -> HashMap<String, McpServerConfig> {
     let mut merged: HashMap<String, McpServerConfig> = HashMap::new();
     if let Some(home) = dirs::home_dir() {
@@ -120,10 +129,30 @@ pub fn load_server_configs(worktree: &Path) -> HashMap<String, McpServerConfig> 
             merged.extend(parse_mcp_config(&c));
         }
     }
-    if let Ok(c) = std::fs::read_to_string(worktree.join(".claude/mcp.json")) {
-        merged.extend(parse_mcp_config(&c));
-    }
-    merged
+    merged.extend(project_config(worktree));
+    remote::with_bridges(merged)
+}
+
+/// The servers a worktree's own `.claude/mcp.json` defines, as written.
+pub fn project_config(worktree: &Path) -> HashMap<String, McpServerConfig> {
+    std::fs::read_to_string(worktree.join(".claude/mcp.json")).map(|c| parse_mcp_config(&c)).unwrap_or_default()
+}
+
+/// The renames a save really made (`renamed`: new name → old), as old →
+/// new pairs sorted by the old name: the old name was saved before and is
+/// gone now, and the new one is saved now.
+pub fn real_renames(
+    old: &HashMap<String, McpServerConfig>,
+    new: &HashMap<String, McpServerConfig>,
+    renamed: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = renamed
+        .iter()
+        .filter(|(to, from)| to != from && old.contains_key(*from) && !new.contains_key(*from) && new.contains_key(*to))
+        .map(|(to, from)| (from.clone(), to.clone()))
+        .collect();
+    pairs.sort();
+    pairs
 }
 
 /// The servers whose entry differs between two configs: changed, removed or
@@ -178,14 +207,19 @@ fn spawn_plan(cfg: &McpServerConfig, search_path: &str) -> Result<SpawnPlan, Str
                 .join(":")
         }
     };
-    let program = if cfg.command.contains('/') {
-        std::path::PathBuf::from(&cfg.command)
+    // A remote entry's bridge saved an absolute `npx`; one that has since
+    // moved (a Node upgrade under nvm) is looked up again on the PATH.
+    let command = match cfg.remote {
+        Some(_) if cfg.command.contains('/') && !Path::new(&cfg.command).exists() => "npx",
+        _ => cfg.command.as_str(),
+    };
+    let program = if command.contains('/') {
+        std::path::PathBuf::from(command)
     } else {
-        resolve_executable(&cfg.command, &child_path).ok_or_else(|| {
+        resolve_executable(command, &child_path).ok_or_else(|| {
             let whose = if own.is_some() { "the server's own PATH" } else { "the PATH Octopush searched" };
             format!(
-                "Octopush couldn't find `{0}` on {whose} ({child_path}). Use its full path (run `which {0}` in Terminal).",
-                cfg.command
+                "Octopush couldn't find `{command}` on {whose} ({child_path}). Use its full path (run `which {command}` in Terminal)."
             )
         })?
     };
@@ -237,12 +271,26 @@ static QUOTED_SECRET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::n
 });
 /// A header line under a secret-ish name: `X-API-Key: …`,
 /// `Authorization: Basic …` (after mcp-remote's `[pid]` prefix, if any).
+/// Group 1 is the name, so an error class (`InvalidTokenError: …`) keeps
+/// its message.
 static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"(?i)^\s*(?:\[\d+\]\s*)*[A-Za-z0-9_\-]*(?:authorization|api[_\-]?key|apikey|token|secret|passw(?:or)?d|cookie)[A-Za-z0-9_\-]*\s*:\s*(\S.*)$",
+        r"(?i)^\s*(?:\[\d+\]\s*)*([A-Za-z0-9_\-]*(?:authorization|api[_\-]?key|apikey|token|secret|passw(?:or)?d|cookie)[A-Za-z0-9_\-]*)\s*:\s*(\S.*)$",
     )
     .unwrap()
 });
+/// An env name that reads as a credential.
+static SECRET_ENV_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|BEARER|CREDENTIAL|PRIVATE").unwrap()
+});
+
+/// A value that looks like base64 rather than a word: a digit or `+/=`, or
+/// a capital after its first character beside a lower-case letter.
+fn looks_base64(v: &str) -> bool {
+    v.chars().count() >= 8
+        && (v.chars().any(|c| c.is_ascii_digit() || matches!(c, '+' | '/' | '='))
+            || (v.chars().skip(1).any(|c| c.is_ascii_uppercase()) && v.chars().any(|c| c.is_ascii_lowercase())))
+}
 
 /// `line` with capture `group` of every match of `re` replaced by
 /// `secret_scan::REDACTED`.
@@ -271,26 +319,93 @@ pub(crate) fn redact_output_line(line: &str, known: &[crate::secret_scan::KnownS
     use crate::secret_scan::REDACTED;
     let line = crate::secret_scan::redact_line(line, known);
     let line = AUTH_CODE.replace_all(&line, format!("code={REDACTED}")).into_owned();
-    let line = redact_group(&line, &BASIC_AUTH, 1);
+    let line = redact_matching(&line, &BASIC_AUTH, |c| c.get(1).filter(|m| looks_base64(m.as_str())));
     let line = BARE_JWT.replace_all(&line, REDACTED).into_owned();
     let line = redact_group(&line, &QUOTED_SECRET, 1);
-    redact_group(&line, &SECRET_HEADER, 1)
+    redact_matching(&line, &SECRET_HEADER, |c| {
+        let name = c.get(1)?.as_str().to_ascii_lowercase();
+        if name.ends_with("error") || name.ends_with("exception") {
+            return None;
+        }
+        c.get(2)
+    })
 }
 
-/// The server's own env values, to redact wherever they echo: every value
-/// of at least 8 characters except PATH, a path or a plain number.
+/// `line` with the span `pick` chooses in each match of `re` (if any)
+/// replaced by `secret_scan::REDACTED`.
+fn redact_matching<'h>(
+    line: &'h str,
+    re: &regex::Regex,
+    pick: impl Fn(&regex::Captures<'h>) -> Option<regex::Match<'h>>,
+) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for c in re.captures_iter(line) {
+        if let Some(m) = pick(&c) {
+            out.push_str(&line[last..m.start()]);
+            out.push_str(crate::secret_scan::REDACTED);
+            last = m.end();
+        }
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
+/// Whether env var `key`'s value could be a credential:
+/// - a remote bridge's header or client-secret value, always;
+/// - under a name that reads as one (`SECRET_ENV_NAME`), unless a path or
+///   a plain number;
+/// - a URL with a path or a query (a webhook URL carries its secret there);
+/// - long, mixing letters and digits, and not a host or path.
+///
+/// A bare host, a plain word (`production`), a path or a number stays
+/// readable, so a DNS failure can still name its host. Never PATH.
+fn could_be_credential(key: &str, value: &str) -> bool {
+    let v = value.trim();
+    // Shorter values would redact every occurrence of a common string.
+    if key == "PATH" || v.chars().count() < 4 {
+        return false;
+    }
+    if key.starts_with(remote::HEADER_ENV_PREFIX) || key == remote::CLIENT_SECRET_ENV {
+        return true;
+    }
+    let path_or_number = v.starts_with(['/', '~', '.']) || v.chars().all(|c| c.is_ascii_digit());
+    if path_or_number {
+        return false;
+    }
+    if SECRET_ENV_NAME.is_match(key) {
+        return true;
+    }
+    if let Some((_, rest)) = v.split_once("://") {
+        let path = rest.split_once('/').map_or("", |(_, p)| p);
+        return !path.is_empty() || rest.contains('?');
+    }
+    v.chars().count() >= 20
+        && v.chars().any(|c| c.is_ascii_digit())
+        && v.chars().any(|c| c.is_ascii_alphabetic())
+        && !v.contains(['.', '/', ':', ' '])
+}
+
+/// The server's own env values that could be credentials
+/// (`could_be_credential`), to redact wherever they echo. A `Bearer …` or
+/// `Basic …` value is also known without its scheme, since a server may
+/// echo the bare token.
 pub(crate) fn known_secrets(cfg: &McpServerConfig) -> Vec<crate::secret_scan::KnownSecret> {
-    cfg.env
-        .iter()
-        .filter(|(k, v)| {
-            let v = v.trim();
-            k.as_str() != "PATH"
-                && v.chars().count() >= 8
-                && !v.starts_with(['/', '~', '.'])
-                && !v.chars().all(|c| c.is_ascii_digit())
-        })
-        .map(|(k, v)| crate::secret_scan::KnownSecret::new(format!("env {k}"), v.trim()))
-        .collect()
+    let mut known = Vec::new();
+    for (k, v) in cfg.env.iter().filter(|(k, v)| could_be_credential(k, v)) {
+        let v = v.trim();
+        known.push(crate::secret_scan::KnownSecret::new(format!("env {k}"), v));
+        let lower = v.to_ascii_lowercase();
+        for scheme in ["bearer ", "basic "] {
+            if lower.starts_with(scheme) {
+                let bare = v[scheme.len()..].trim();
+                if bare.chars().count() >= 4 {
+                    known.push(crate::secret_scan::KnownSecret::new(format!("env {k}"), bare));
+                }
+            }
+        }
+    }
+    known
 }
 
 /// `text` redacted line by line ([`redact_output_line`]).
@@ -1523,6 +1638,20 @@ done
 
     #[cfg(unix)]
     #[test]
+    fn a_remote_bridges_npx_that_moved_is_found_again_on_the_path() {
+        let login = tempfile::tempdir().unwrap();
+        let npx = fake_bin(login.path(), "npx");
+        let mut cfg = command("/nowhere/old-node/bin/npx", &[]);
+        cfg.remote = Some(remote::RemoteConfig { url: "https://mcp.example.com/mcp".into(), ..Default::default() });
+        let plan = spawn_plan(&cfg, &login.path().to_string_lossy()).unwrap();
+        assert_eq!(plan.program, npx);
+        // One that still exists is used as saved.
+        cfg.command = npx.to_string_lossy().into_owned();
+        assert_eq!(spawn_plan(&cfg, "/usr/bin").unwrap().program, npx);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_servers_own_path_wins() {
         let own = tempfile::tempdir().unwrap();
         let uvx = fake_bin(own.path(), "uvx");
@@ -1575,6 +1704,44 @@ done
                  Use its full path (run `which octopush-no-such-server-xyz` in Terminal)."
             )
         );
+    }
+
+    #[test]
+    fn talk_runs_a_remote_entrys_bridge_as_its_choices_describe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stale = McpServerConfig { command: "npx".into(), args: vec!["-y".into(), "stale-bridge".into()], ..Default::default() };
+        stale.remote = Some(remote::RemoteConfig {
+            url: "https://mcp.example.com/mcp".into(),
+            auth: "oauth".into(),
+            transport: "sse-only".into(),
+            ..Default::default()
+        });
+        let claude = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("mcp.json"), json!({ "mcpServers": { "example-remote": stale } }).to_string()).unwrap();
+        let cfgs = load_server_configs(dir.path());
+        assert_eq!(
+            cfgs["example-remote"].args,
+            vec!["-y", "mcp-remote@^0.16", "https://mcp.example.com/mcp", "--transport", "sse-only"],
+            "rebuilt from `remote`, not the args written"
+        );
+        assert_eq!(project_config(dir.path())["example-remote"].args, vec!["-y", "stale-bridge"], "the file as written");
+    }
+
+    #[test]
+    fn only_real_renames_count() {
+        let cfg = |c: &str| McpServerConfig { command: c.into(), ..Default::default() };
+        let old = HashMap::from([("docs".to_string(), cfg("a")), ("kept".to_string(), cfg("b"))]);
+        let new = HashMap::from([("docs-server".to_string(), cfg("a")), ("kept".to_string(), cfg("b"))]);
+        let renamed = HashMap::from([
+            ("docs-server".to_string(), "docs".to_string()),
+            // Not renames: the old name is still there, it never existed, or the new one isn't saved.
+            ("kept".to_string(), "kept".to_string()),
+            ("ghost".to_string(), "never-saved".to_string()),
+            ("missing".to_string(), "docs".to_string()),
+        ]);
+        assert_eq!(real_renames(&old, &new, &renamed), vec![("docs".to_string(), "docs-server".to_string())]);
+        assert!(real_renames(&old, &new, &HashMap::new()).is_empty());
     }
 
     #[test]
@@ -1856,14 +2023,54 @@ done
         let known = known_secrets(&cfg);
         let text = redact_text("key k-1234567890 at debug level on /opt/homebrew/bin port 123456789", &known);
         assert_eq!(text, "key [redacted] at debug level on /opt/homebrew/bin port 123456789");
+        // A plain name's short or host-like value stays; a long random one goes.
+        let cfg = McpServerConfig {
+            command: "uvx".into(),
+            env: HashMap::from([
+                ("STAGE".to_string(), "production".to_string()),
+                ("HOST".to_string(), "internal-mcp.corp.example.com".to_string()),
+                ("SESSION".to_string(), "a8f3k29dk3m4n5b6v7c8x9".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let text = redact_text("production at internal-mcp.corp.example.com with a8f3k29dk3m4n5b6v7c8x9", &known_secrets(&cfg));
+        assert_eq!(text, "production at internal-mcp.corp.example.com with [redacted]");
+    }
+
+    #[test]
+    fn a_bridges_header_values_and_a_webhook_url_are_always_known() {
+        let cfg = McpServerConfig {
+            command: "npx".into(),
+            env: HashMap::from([
+                ("OCTOPUSH_MCP_H_AUTHORIZATION".to_string(), "Bearer tok-abc".to_string()),
+                ("OCTOPUSH_MCP_H_COOKIE".to_string(), "sid=x9".to_string()),
+                ("OCTOPUSH_MCP_H_X_SESSION".to_string(), "short".to_string()),
+                ("OCTOPUSH_MCP_CLIENT_SECRET".to_string(), "shh1".to_string()),
+                ("NOTIFY".to_string(), "https://hooks.example.com/services/T0/B0/abc".to_string()),
+                ("CALLBACK".to_string(), "https://hooks.example.com?sig=abc".to_string()),
+                ("UPSTREAM".to_string(), "https://mcp.example.com".to_string()),
+                ("REGION".to_string(), "eu-west-1".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let known = known_secrets(&cfg);
+        let text = redact_text(
+            "token tok-abc · cookie sid=x9 · session short · secret shh1 · https://hooks.example.com/services/T0/B0/abc · \
+             https://hooks.example.com?sig=abc · upstream https://mcp.example.com in eu-west-1",
+            &known,
+        );
+        for secret in ["tok-abc", "sid=x9", "short", "shh1", "services/T0", "sig=abc"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(text.contains("upstream https://mcp.example.com in eu-west-1"), "{text}");
     }
 
     #[cfg(unix)]
     #[test]
     fn a_failure_never_shows_the_servers_own_env() {
-        const ECHO_ENV: &str = "#!/usr/bin/env bash\necho start >> \"$SPAWN_LOG\"\nread -r line\necho \"using $SAMPLE_VALUE\"\nexit 1\n";
+        const ECHO_ENV: &str = "#!/usr/bin/env bash\necho start >> \"$SPAWN_LOG\"\nread -r line\necho \"using $SAMPLE_TOKEN\"\nexit 1\n";
         let (dir, _log) = fixture_dir(ECHO_ENV);
-        let cfg = fixture_config(dir.path(), &[("SAMPLE_VALUE", "sample-value-123")]);
+        let cfg = fixture_config(dir.path(), &[("SAMPLE_TOKEN", "sample-value-123")]);
         let err = McpRegistry::test_connect("fix", &cfg).unwrap_err();
         assert!(err.contains("using [redacted]") && !err.contains("sample-value-123"), "{err}");
         write_servers(dir.path(), &HashMap::from([("fix".to_string(), cfg)]));
