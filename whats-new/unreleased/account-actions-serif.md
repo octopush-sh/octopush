@@ -4,4 +4,4 @@ kind: improvement
 area: app
 highlight: false
 ---
-In Settings › Account, **Manage your account ↗** and **Sign out of Octopush** are now set in the same serif voice and button shape as every other pane's actions, instead of looking like code chips.
+In Settings › Account, **Manage your account ↗**, **Sign out of Octopush** and the sign-in's **Cancel** now use the same serif voice and button shape as the other panes' actions, instead of looking like code chips.
