@@ -973,17 +973,29 @@ pub async fn run_subagent_core(
 
 /// The workspace's MCP tools, discovered once per fan-out (off-thread,
 /// bounded — a hung server must not stall the crew); each sub-agent then
-/// sees the subset its definition grants.
-pub async fn discover_mcp_tools(mcp: Arc<crate::mcp::McpRegistry>, workspace_path: &str) -> Vec<crate::mcp::McpToolInfo> {
+/// sees the subset its definition grants. Servers switched off in the
+/// parent conversation (`off`, from [`thread_mcp_off`]) are left out, so a
+/// sub-agent never gets what its conversation turned off.
+pub async fn discover_mcp_tools(
+    mcp: Arc<crate::mcp::McpRegistry>,
+    workspace_path: &str,
+    off: std::collections::HashSet<String>,
+) -> Vec<crate::mcp::McpToolInfo> {
     let wp = std::path::PathBuf::from(workspace_path);
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        tokio::task::spawn_blocking(move || mcp.list_tools(&wp)),
+        tokio::task::spawn_blocking(move || mcp.list_tools_except(&wp, &off)),
     )
     .await
     .ok()
     .and_then(|r| r.ok())
     .unwrap_or_default()
+}
+
+/// The MCP servers a conversation switched off (the Companion's "can use"
+/// chips). A read error counts as none off: the default is every server.
+pub fn thread_mcp_off(db: &Mutex<Db>, thread_id: &str) -> std::collections::HashSet<String> {
+    db.lock().thread_mcp_disabled(thread_id).unwrap_or_default().into_iter().collect()
 }
 
 /// The configured model ids and the user's tier map, for definition/call
@@ -1016,7 +1028,9 @@ pub async fn run_subagents(
     // bounded — a hung server must not stall the crew); each sub-agent then
     // sees the subset its definition grants.
     let mcp_tools: Arc<Vec<crate::mcp::McpToolInfo>> = Arc::new(match specs.first() {
-        Some(first) => discover_mcp_tools(Arc::clone(&mcp), &first.workspace_path).await,
+        Some(first) => {
+            discover_mcp_tools(Arc::clone(&mcp), &first.workspace_path, thread_mcp_off(&db, &first.thread_id)).await
+        }
         None => Vec::new(),
     });
     let turnstiles = mcp_turnstiles(&mcp_tools);

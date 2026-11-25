@@ -32,6 +32,9 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
+// Per-conversation server scope and the registry's status read (Companion).
+pub mod scope;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub command: String,

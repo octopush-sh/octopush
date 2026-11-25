@@ -600,6 +600,7 @@ import type {
   Attachment,
   McpToolInfo,
   McpServerConfig,
+  McpServerStatus,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -1086,6 +1087,23 @@ export const ipc = {
     invoke<McpToolInfo[]>("list_mcp_tools", { workspacePath }),
   listMcpServers: (workspacePath: string) =>
     invoke<string[]>("list_mcp_servers", { workspacePath }),
+  /** Every server configured for the worktree with Talk's live status for
+   *  it. Spawns nothing. */
+  listMcpServerStatus: (workspacePath: string) =>
+    invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The MCP servers switched off in one Talk conversation (none by default). */
+  getThreadMcpDisabled: (threadId: string) => invoke<string[]>("get_thread_mcp_disabled", { threadId }),
+  setThreadMcpDisabled: (threadId: string, servers: string[]) =>
+    invoke<void>("set_thread_mcp_disabled", { threadId, servers }),
+  /** Settings saved the MCP config, Reconnect restarted a server, or a Talk
+   *  turn's discovery started (or failed to start) servers. */
+  onMcpChanged: async (handler: () => void) => {
+    const offs = await Promise.all([
+      listen("mcp://config-changed", () => handler()),
+      listen("mcp://status-changed", () => handler()),
+    ]);
+    return () => offs.forEach((off) => off());
+  },
   getMcpConfig: () => invoke<Record<string, McpServerConfig>>("get_mcp_config"),
   saveMcpConfig: (servers: Record<string, McpServerConfig>) =>
     invoke<void>("save_mcp_config", { servers }),

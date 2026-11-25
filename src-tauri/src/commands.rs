@@ -2248,6 +2248,34 @@ pub async fn list_mcp_servers(workspace_path: String) -> AppResult<Vec<String>> 
     Ok(names)
 }
 
+/// Every MCP server configured for a worktree with what Talk's registry knows
+/// about it (connected · N tools, not started yet, failed and why), for the
+/// Companion's "can use" chips. Spawns nothing.
+#[tauri::command]
+pub async fn list_mcp_server_status(
+    state: State<'_, AppState>,
+    workspace_path: String,
+) -> AppResult<Vec<crate::mcp::scope::McpServerStatus>> {
+    Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
+}
+
+/// The MCP servers switched off in one Talk conversation (none by default).
+#[tauri::command]
+pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<String>> {
+    state.db.lock().thread_mcp_disabled(&thread_id)
+}
+
+/// Replace the MCP servers switched off in one Talk conversation. The next
+/// turn (and its sub-agents) leaves their tools out.
+#[tauri::command]
+pub async fn set_thread_mcp_disabled(
+    state: State<'_, AppState>,
+    thread_id: String,
+    servers: Vec<String>,
+) -> AppResult<()> {
+    state.db.lock().set_thread_mcp_disabled(&thread_id, &servers)
+}
+
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
 #[tauri::command]
 pub async fn get_mcp_config(
@@ -2261,6 +2289,7 @@ pub async fn get_mcp_config(
 /// fails).
 #[tauri::command]
 pub async fn save_mcp_config(
+    app: AppHandle,
     state: State<'_, AppState>,
     servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
 ) -> AppResult<()> {
@@ -2271,6 +2300,7 @@ pub async fn save_mcp_config(
     tokio::task::spawn_blocking(move || registry.apply_config_change(&old, &servers))
         .await
         .map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+    let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ()); // Companion "can use" reloads
     Ok(())
 }
 
@@ -2289,6 +2319,7 @@ pub async fn test_mcp_server(
 /// run the same smoke test as Test. Talk's next call spawns it afresh.
 #[tauri::command]
 pub async fn reconnect_mcp_server(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     config: crate::mcp::McpServerConfig,
@@ -2298,6 +2329,7 @@ pub async fn reconnect_mcp_server(
     tokio::task::spawn_blocking(move || registry.reset_server(&server))
         .await
         .map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+    let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ()); // Companion "can use" reloads
     smoke_test_mcp_server(name, config).await
 }
 

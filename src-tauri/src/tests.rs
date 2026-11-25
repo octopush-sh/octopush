@@ -29157,3 +29157,130 @@ mod talk_context_guard_tests {
             .any(|f| f.file == "deploy.sh" && f.line == Some(new_start - 1) && f.rule == "github-token"));
     }
 }
+
+#[cfg(test)]
+mod talk_mcp_scope_tests {
+    use crate::db::Db;
+    use crate::mcp::scope::McpServerState;
+    use crate::mcp::{McpRegistry, McpServerConfig};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn thread_db() -> (NamedTempFile, Db, String) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.insert_project("p-mcp", "P", "/tmp/p-mcp").unwrap();
+        db.insert_workspace("w-mcp", "p-mcp", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-mcp", "Docs work").unwrap();
+        (tmp, db, t.id)
+    }
+
+    #[test]
+    fn a_conversation_from_before_the_column_has_every_server_on() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            // The v11 thread table, with a row, before `mcp_disabled`.
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL, last_opened TEXT NOT NULL);
+                CREATE TABLE workspaces (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL,
+                    task TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL, worktree_path TEXT,
+                    setup_script TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL, last_active TEXT NOT NULL);
+                CREATE TABLE chat_threads (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT 'New conversation', created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0);
+                INSERT INTO projects VALUES ('p1', 'Old', '/tmp/octo-mcp-old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO workspaces (id, project_id, name, branch, created_at, last_active)
+                    VALUES ('w1', 'p1', 'main', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO chat_threads (id, workspace_id, title, created_at, updated_at)
+                    VALUES ('t-old', 'w1', 'Old talk', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        assert!(db.thread_mcp_disabled("t-old").unwrap().is_empty(), "an old row has nothing off");
+        assert_eq!(db.list_chat_threads("w1").unwrap()[0].title, "Old talk");
+        db.set_thread_mcp_disabled("t-old", &["docs-server".into()]).unwrap();
+        drop(db);
+        // Reopening runs the migration again: idempotent, and the value stays.
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(db.thread_mcp_disabled("t-old").unwrap(), vec!["docs-server".to_string()]);
+        assert!(db.thread_mcp_disabled("no-such-thread").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_off_list_is_trimmed_sorted_and_cleared_to_null() {
+        let (_tmp, db, t) = thread_db();
+        let names = ["  example-remote ", "docs-server", "", "docs-server"].map(String::from);
+        db.set_thread_mcp_disabled(&t, &names).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs-server".to_string(), "example-remote".to_string()]);
+        db.set_thread_mcp_disabled(&t, &[]).unwrap();
+        let raw: Option<String> = db
+            .conn_ref()
+            .query_row("SELECT mcp_disabled FROM chat_threads WHERE id = ?1", [&t], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None, "all on is stored as NULL, like a row from before the column");
+        // An unreadable value reads as all on rather than failing the turn.
+        db.conn_ref().execute("UPDATE chat_threads SET mcp_disabled = 'not json' WHERE id = ?1", [&t]).unwrap();
+        assert!(db.thread_mcp_disabled(&t).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_fork_keeps_the_conversations_mcp_scope() {
+        let (_tmp, db, t) = thread_db();
+        let u = db.insert_chat_message("w-mcp", &t, "user", "one", None, None, None, None).unwrap();
+        db.set_thread_mcp_disabled(&t, &["docs-server".into()]).unwrap();
+        let (fork, _, _) = db.fork_chat_thread(&t, u).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&fork.id).unwrap(), vec!["docs-server".to_string()]);
+        // And they are separate from then on.
+        db.set_thread_mcp_disabled(&fork.id, &[]).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs-server".to_string()]);
+    }
+
+    /// A worktree whose project config names two servers that can't start.
+    fn two_servers() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = |n: &str| McpServerConfig {
+            command: format!("/nonexistent/octopush-test/{n}"),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let servers = HashMap::from([("docs-server", cfg("docs-server")), ("example-remote", cfg("example-remote"))]);
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/mcp.json"), serde_json::json!({ "mcpServers": servers }).to_string())
+            .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_turn_and_its_sub_agents_discover_only_the_servers_on_in_their_conversation() {
+        use crate::chat_agents::{discover_mcp_tools, thread_mcp_off};
+        let (_tmp, db, t) = thread_db();
+        let other = db.create_chat_thread("w-mcp", "Other").unwrap().id;
+        db.set_thread_mcp_disabled(&t, &["docs-server".into()]).unwrap();
+        let db = parking_lot::Mutex::new(db);
+        let wt = two_servers();
+        let wp = wt.path().to_string_lossy().into_owned();
+        let reg = Arc::new(McpRegistry::new());
+
+        let off = thread_mcp_off(&db, &t);
+        assert_eq!(off.iter().cloned().collect::<Vec<_>>(), vec!["docs-server".to_string()]);
+        assert!(discover_mcp_tools(Arc::clone(&reg), &wp, off).await.is_empty());
+        let status = reg.status(wt.path());
+        assert_eq!(status[0].name, "docs-server");
+        assert_eq!(status[0].state, McpServerState::Idle, "an off server is never started for the conversation");
+        assert_eq!(status[1].state, McpServerState::Failed);
+        let reason = status[1].reason.as_deref().unwrap();
+        assert!(reason.contains("example-remote") && !reason.contains('\n'), "the first line only: {reason}");
+
+        // Another conversation in the same workspace has both on, so it tries both.
+        assert!(thread_mcp_off(&db, &other).is_empty());
+        discover_mcp_tools(Arc::clone(&reg), &wp, thread_mcp_off(&db, &other)).await;
+        assert!(reg.status(wt.path()).iter().all(|s| s.state == McpServerState::Failed));
+    }
+}
