@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import codexCatalog from "./codexEffortLevels.json";
+import type { PipelineStage, PipelineWithStages, Routine } from "./ipc";
 
 const cliVersionMock = vi.hoisted(() => vi.fn());
 vi.mock("./ipc", () => ({ ipc: { claudeCliVersion: cliVersionMock } }));
@@ -17,7 +18,9 @@ const {
   crewClaudeModels,
   crewUsesClaudeCode,
   crewUsesCodex,
+  claudeRecommendedNote,
   effortApplies,
+  libraryUsesClaudeCode,
   loadClaudeCliVersion,
   modelFloorLabel,
   resetClaudeCliVersionCache,
@@ -45,6 +48,55 @@ describe("crewClaudeModels", () => {
       "claude-opus-5-5",
     ]);
     expect(crewClaudeModels(stages.slice(2, 3), {})).toEqual([]);
+  });
+});
+
+describe("claudeRecommendedNote", () => {
+  const worktree = { version: "2.1.330", reason: "fixes a", audience: "run" as const };
+  const settings = { version: "2.1.330", reason: "fixes b", audience: "any" as const };
+  const mcp = { version: "2.1.331", reason: "fixes c", audience: "any" as const };
+  const all = [worktree, settings, mcp];
+
+  it("lists every missing fix in a Run session, not only the newest", () => {
+    expect(claudeRecommendedNote(all, { inRun: true, inCrews: false })).toBe(
+      "Recommended: Claude Code 2.1.331. 2.1.330 fixes a. 2.1.330 fixes b. 2.1.331 fixes c.",
+    );
+  });
+
+  it("keeps a run-only fix out of a note shown for crews", () => {
+    expect(claudeRecommendedNote(all, { inRun: false, inCrews: true })).toBe(
+      "Recommended: Claude Code 2.1.331. 2.1.330 fixes b. 2.1.331 fixes c.",
+    );
+    expect(claudeRecommendedNote([mcp], { inRun: false, inCrews: true })).toBe("Recommended: Claude Code 2.1.331 fixes c.");
+    expect(claudeRecommendedNote([worktree], { inRun: false, inCrews: true })).toBeNull();
+  });
+
+  it("says nothing with no audience or no missing fix", () => {
+    expect(claudeRecommendedNote(all, { inRun: false, inCrews: false })).toBeNull();
+    expect(claudeRecommendedNote([], { inRun: true, inCrews: true })).toBeNull();
+    expect(claudeRecommendedNote(undefined, { inRun: true, inCrews: true })).toBeNull();
+  });
+});
+
+describe("libraryUsesClaudeCode", () => {
+  const stage = (position: number, substrate: "api" | "cli", agentModel: string, escalateModel: string | null = null) =>
+    ({ position, substrate, agentModel, escalateModel }) as unknown as PipelineStage;
+  const crew = (id: string, stages: PipelineStage[]) =>
+    ({ pipeline: { id, name: id, description: "", isBuiltin: false, createdAt: "t" }, stages }) as PipelineWithStages;
+  const routine = (pipelineId: string, stageOverrides: string | null) => ({ pipelineId, stageOverrides }) as Routine;
+
+  it("is true for a crew with a Claude Code CLI stage or escalation", () => {
+    expect(libraryUsesClaudeCode([crew("a", [stage(0, "cli", "sonnet")])], [])).toBe(true);
+    expect(libraryUsesClaudeCode([crew("a", [stage(0, "cli", "gpt-5-codex", "claude-opus-5-5")])], [])).toBe(true);
+    expect(libraryUsesClaudeCode([crew("a", [stage(0, "api", "sonnet"), stage(1, "cli", "gpt-5-codex")])], [])).toBe(false);
+    expect(libraryUsesClaudeCode([], [])).toBe(false);
+  });
+
+  it("reads a Routine's model overrides", () => {
+    const codex = crew("c", [stage(0, "cli", "gpt-5-codex")]);
+    expect(libraryUsesClaudeCode([codex], [routine("c", JSON.stringify([[0, "claude-sonnet-5-5"]]))])).toBe(true);
+    expect(libraryUsesClaudeCode([codex], [routine("c", null)])).toBe(false);
+    expect(libraryUsesClaudeCode([codex], [routine("missing", JSON.stringify([[0, "sonnet"]]))])).toBe(false);
   });
 });
 

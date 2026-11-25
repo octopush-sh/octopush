@@ -11,6 +11,7 @@ import { useRoutinesStore } from "../../stores/routinesStore";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import { useModelRetirements } from "../../hooks/useModelRetirements";
 import { libraryModels, readinessRetirementCheck } from "../../lib/modelRetirement";
+import { claudeRecommendedNote, libraryUsesClaudeCode } from "../../lib/claudeCli";
 import { tourId } from "../../lib/tour/ids";
 import { SectionLabel, formatRelative } from "./shared";
 
@@ -70,12 +71,14 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
   const modelsRow = readinessRetirementCheck(pipelines, routines, retirements, new Date());
   const rows = checks && checks.length > 0 && modelsRow ? [...checks, modelsRow] : checks;
 
-  // The Claude Code row's recommended note (#1002) matters to interactive
-  // sessions, which share worktrees: it shows only while a Run-mode session
-  // runs Claude Code.
+  // The Claude Code row's recommended note (#1002, #1065): a `run` fix
+  // (interactive sessions share worktrees) shows only while a Run-mode
+  // session runs Claude Code; an `any` fix also while a crew or Routine has
+  // a Claude Code CLI stage.
   const claudeInRun = useTerminalsStore((s) =>
     Object.values(s.terminalsByWs).some((ts) => ts.some((t) => t.running && t.agentCli === "claude")),
   );
+  const claudeInCrews = libraryUsesClaudeCode(pipelines, routines);
 
   const neverChecked = !checks && !loading && !error;
 
@@ -134,7 +137,9 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
                 key={c.id ?? i}
                 check={c}
                 index={i}
-                note={c.id === "claude" && claudeInRun ? c.note : null}
+                note={
+                  c.id === "claude" ? claudeRecommendedNote(c.recommended, { inRun: claudeInRun, inCrews: claudeInCrews }) : null
+                }
                 onShowCaches={c.id === "disk" ? onShowCaches : undefined}
               />
             ))}

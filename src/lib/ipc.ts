@@ -1865,9 +1865,20 @@ export interface ReadinessCheck {
   /** A copyable command that fixes it, when there is one. */
   command: string | null;
   timedOut: boolean;
-  /** A recommendation that is no verdict (the Claude Code row's
-   *  `agent_adapter::claude_recommended_notice`); the card decides when it shows. */
-  note?: string | null;
+  /** Recommendations that are no verdict: the Claude Code row's missing
+   *  `agent_adapter::CLAUDE_RECOMMENDED_FIXES` rows, oldest first; the card
+   *  decides by audience which show. */
+  recommended?: RecommendedFix[];
+}
+
+/** A Claude Code fix worth updating for (mirrors Rust `agent_adapter::RecommendedFix`).
+ *  `run`: shown while a Run-mode session runs Claude Code; `any`: that, or
+ *  while a saved crew or Routine has a Claude Code CLI stage. */
+export interface RecommendedFix {
+  version: string;
+  /** "fixes …", one line. */
+  reason: string;
+  audience: "run" | "any";
 }
 
 /** A DIRECT-mode role definition (mirrors Rust `RoleDef`). */
