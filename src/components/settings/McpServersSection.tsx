@@ -90,7 +90,8 @@ export function McpServersSection() {
   }, []);
 
   /** Save the entries; `secrets` (server → env name → typed value) go to the
-   *  Keychain, `renamed` (new name → old) moves a renamed server's items. */
+   *  Keychain, `renamed` (new name → old) moves a renamed server's items and its
+   *  conversations' off-list entries. */
   async function persist(
     next: Record<string, McpServerConfig>,
     secrets: Record<string, Record<string, string>> = {},

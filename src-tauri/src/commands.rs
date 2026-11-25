@@ -2281,7 +2281,8 @@ pub async fn get_mcp_config(
 /// (`mcp::save_user_servers`). `secrets` holds the values Settings' secret
 /// fields were given (server → env name → value; never written to
 /// `mcp.json`; an empty value keeps the saved one), `renamed` maps a new
-/// server name to the old one so its Keychain items move with it. Returns
+/// server name to the old one so its Keychain items move with it, and
+/// conversations that had the old name switched off get the new one. Returns
 /// the entries as saved, without any secret value.
 #[tauri::command]
 pub async fn save_mcp_config(
@@ -2292,6 +2293,7 @@ pub async fn save_mcp_config(
     renamed: Option<std::collections::HashMap<String, String>>,
 ) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
     let registry = Arc::clone(&state.chat.mcp);
+    let db = Arc::clone(&state.db);
     // `npx` lookup, Keychain and file I/O, kill + reap: off the runtime thread.
     let saved = tokio::task::spawn_blocking(
         move || -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
@@ -2300,6 +2302,7 @@ pub async fn save_mcp_config(
             let (old, saved, touched) =
                 crate::mcp::save_user_servers(servers, secrets.unwrap_or_default(), &renamed, &*store)
                     .map_err(crate::error::AppError::Other)?;
+            db.lock().rename_thread_mcp_servers(&crate::mcp::real_renames(&old, &saved, &renamed))?;
             registry.apply_config_change(&old, &saved);
             // A new secret value leaves the entry as it reads: restart it too.
             for name in touched {

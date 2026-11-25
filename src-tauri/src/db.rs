@@ -3966,6 +3966,48 @@ impl Db {
         self.thread_mcp_disabled(thread_id)
     }
 
+    /// After MCP servers were renamed in Settings (`renames`: old → new):
+    /// every conversation that had an old name switched off has the new one
+    /// off instead, so a renamed server doesn't come back on there. All rows
+    /// in one transaction; an unreadable value is left as it is. Returns how
+    /// many conversations changed.
+    pub fn rename_thread_mcp_servers(&self, renames: &[(String, String)]) -> AppResult<usize> {
+        if renames.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, mcp_disabled FROM chat_threads WHERE mcp_disabled IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut changed = 0;
+        for (id, raw) in rows {
+            let Ok(names) = serde_json::from_str::<Vec<String>>(&raw) else { continue };
+            let mut hit = false;
+            // Each name maps once, so two servers that swap names swap here too.
+            let renamed: std::collections::BTreeSet<String> = names
+                .into_iter()
+                .map(|n| match renames.iter().find(|(old, _)| *old == n) {
+                    Some((_, new)) => {
+                        hit = true;
+                        new.clone()
+                    }
+                    None => n,
+                })
+                .collect();
+            if hit {
+                tx.execute(
+                    "UPDATE chat_threads SET mcp_disabled = ?2 WHERE id = ?1",
+                    params![id, serde_json::to_string(&renamed)?],
+                )?;
+                changed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn rename_chat_thread(&self, thread_id: &str, title: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE chat_threads SET title = ?1 WHERE id = ?2",

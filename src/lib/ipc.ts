@@ -1115,7 +1115,8 @@ export const ipc = {
   /** Save the user-level servers; returns them as saved (remote bridges
    *  rebuilt, no secret value). `secrets` (server → env name → typed value)
    *  go to the login Keychain, never to mcp.json; `renamed` (new name → old)
-   *  moves a renamed server's Keychain items. */
+   *  moves a renamed server's Keychain items and carries the rename over to
+   *  the conversations that had the old name switched off. */
   saveMcpConfig: (
     servers: Record<string, McpServerConfig>,
     secrets: Record<string, Record<string, string>> = {},
