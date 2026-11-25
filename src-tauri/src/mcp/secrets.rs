@@ -28,9 +28,29 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), String>;
 }
 
-/// The Keychain account of server `server`'s env var `name`.
+/// The Keychain account of server `server`'s env var `name`. A valid env
+/// name has no `/` (`valid_env_name`), so the account splits at its last
+/// `/` one way only: `a/b` + `C` and `a` + `b/C` can't meet.
 pub fn account(server: &str, name: &str) -> String {
     format!("{server}/{name}")
+}
+
+/// An env var name a secret may be kept under: `[A-Za-z_][A-Za-z0-9_]*`.
+pub fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Every name a save would keep in the Keychain is a valid env name.
+pub fn check_names(servers: &HashMap<String, McpServerConfig>) -> Result<(), String> {
+    let mut names: Vec<(&String, &String)> =
+        servers.iter().flat_map(|(server, cfg)| cfg.secret_env.iter().map(move |n| (server, n))).collect();
+    names.sort();
+    match names.into_iter().find(|(_, n)| !valid_env_name(n)) {
+        Some((server, n)) => Err(format!("{n} (in {server}) isn't a valid environment variable name.")),
+        None => Ok(()),
+    }
 }
 
 /// An env name that reads as a credential: it moves to the Keychain on save
@@ -106,21 +126,37 @@ pub fn resolve(server: &str, cfg: &McpServerConfig, store: &dyn SecretStore) -> 
             Ok(Some(value)) => out.push((name.clone(), value)),
             Ok(None) => {
                 return Err(format!(
-                    "The token for {server} isn't in the Keychain; edit the server to enter it.\n{name} has no saved value."
+                    "The value for {name} isn't in the Keychain; edit {server} to enter it."
                 ))
             }
-            Err(e) => return Err(format!("Octopush couldn't read the token for {server}: {e}")),
+            Err(e) => return Err(format!("Octopush couldn't read the value for {name} ({server}): {e}")),
         }
     }
     Ok(out)
 }
 
 /// `text` with every resolved secret value replaced, so a server that echoes
-/// its credentials can't show them in a failure.
+/// its credentials can't show them in a failure. A `Bearer …` / `Basic …`
+/// value is also replaced without its scheme (a server may echo just the
+/// token), the longest form first; values under 4 characters are left.
 pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
+    let mut forms: Vec<&str> = Vec::new();
+    for (_, value) in secrets {
+        let value = value.trim();
+        forms.push(value);
+        let lower = value.to_ascii_lowercase();
+        for scheme in ["bearer ", "basic "] {
+            if lower.starts_with(scheme) {
+                forms.push(value[scheme.len()..].trim());
+            }
+        }
+    }
+    forms.retain(|f| f.chars().count() >= 4);
+    forms.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    forms.dedup();
     let mut out = text.to_string();
-    for (_, value) in secrets.iter().filter(|(_, v)| v.len() >= 4) {
-        out = out.replace(value.as_str(), crate::secret_scan::REDACTED);
+    for form in forms {
+        out = out.replace(form, crate::secret_scan::REDACTED);
     }
     out
 }
@@ -176,6 +212,7 @@ pub fn plan_secrets(
             .iter()
             .filter(|(k, v)| {
                 looks_secret(k)
+                    && valid_env_name(k)
                     && !cfg.secret_env.contains(k)
                     && !plain.contains(k)
                     && !k.starts_with(remote::HEADER_ENV_PREFIX)
@@ -191,7 +228,15 @@ pub fn plan_secrets(
         cfg.secret_env.dedup();
         let mut wrote = false;
         for key in cfg.secret_env.clone() {
-            let value = cfg.env.insert(key.clone(), String::new()).unwrap_or_default();
+            let mut value = cfg.env.insert(key.clone(), String::new()).unwrap_or_default();
+            // Listed with no value, but the saved entry still has it in plain
+            // text (a migration whose Keychain write failed, a stale form):
+            // that value is the one to keep, never "".
+            if value.is_empty() {
+                if let Some(p) = prev.filter(|p| !p.secret_env.contains(&key)) {
+                    value = p.env.get(&key).cloned().unwrap_or_default();
+                }
+            }
             let to = account(name, &key);
             if !value.is_empty() {
                 plan.writes.push((to.clone(), value));
@@ -220,19 +265,57 @@ pub fn plan_secrets(
     plan
 }
 
-/// Before `mcp.json` is written: copy a renamed server's values and store
-/// the new ones. A failure stops the save, so the file never names a value
-/// that wasn't stored.
-pub fn apply_before_save(store: &dyn SecretStore, plan: &SecretPlan) -> Result<(), String> {
-    for (from, to) in &plan.copies {
-        if let Some(value) = store.get(from)? {
-            store.set(to, &value)?;
+/// What a save overwrote in the Keychain, to put back if it can't finish:
+/// each account written, with the value it held before (`None`: none).
+#[derive(Debug, Default)]
+pub struct Undo(Vec<(String, Option<String>)>);
+
+impl Undo {
+    /// Put every written account back as it was. Best effort: a failure is
+    /// logged.
+    pub fn revert(self, store: &dyn SecretStore) {
+        for (item, before) in self.0.into_iter().rev() {
+            let result = match before {
+                Some(value) => store.set(&item, &value),
+                None => store.delete(&item),
+            };
+            if let Err(e) = result {
+                tracing::warn!(item = %item, error = %e, "couldn't put an MCP secret back in the Keychain");
+            }
         }
     }
-    for (item, value) in &plan.writes {
-        store.set(item, value)?;
+}
+
+/// Before `mcp.json` is written: copy a renamed server's values and store
+/// the new ones. Every copy's source is read before anything is written, so
+/// two servers swapping names each keep their own value. A failure puts
+/// back what was written and stops the save, so the file never names a
+/// value that wasn't stored. Returns how to undo it, for a file write that
+/// fails next.
+pub fn apply_before_save(store: &dyn SecretStore, plan: &SecretPlan) -> Result<Undo, String> {
+    let mut sets: Vec<(String, String)> = Vec::new();
+    for (from, to) in &plan.copies {
+        if let Some(value) = store.get(from)? {
+            sets.push((to.clone(), value));
+        }
     }
-    Ok(())
+    sets.extend(plan.writes.iter().cloned());
+    let mut undo = Undo::default();
+    for (item, value) in sets {
+        let before = match store.get(&item) {
+            Ok(before) => before,
+            Err(e) => {
+                undo.revert(store);
+                return Err(e);
+            }
+        };
+        if let Err(e) = store.set(&item, &value) {
+            undo.revert(store);
+            return Err(e);
+        }
+        undo.0.push((item, before));
+    }
+    Ok(undo)
 }
 
 /// After `mcp.json` is written: delete the items nothing names any more. A
@@ -272,6 +355,8 @@ pub struct MemoryStore {
     pub items: Mutex<HashMap<String, String>>,
     /// Every account read, in order.
     pub reads: Mutex<Vec<String>>,
+    /// A `set` of this account fails (a Keychain that denies the write).
+    pub deny: Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -290,6 +375,9 @@ impl SecretStore for MemoryStore {
         Ok(self.items.lock().get(account).cloned())
     }
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
+        if self.deny.lock().as_deref() == Some(account) {
+            return Err("the Keychain denied the write".into());
+        }
         self.items.lock().insert(account.to_string(), value.to_string());
         Ok(())
     }
@@ -347,8 +435,7 @@ mod tests {
         assert_eq!(resolve("example", &cfg, &store).unwrap(), vec![("GITHUB_TOKEN".to_string(), "ghp_value".to_string())]);
 
         let err = resolve("other", &cfg, &store).unwrap_err();
-        assert!(err.starts_with("The token for other isn't in the Keychain; edit the server to enter it."), "{err}");
-        assert!(err.contains("GITHUB_TOKEN"), "{err}");
+        assert_eq!(err, "The value for GITHUB_TOKEN isn't in the Keychain; edit other to enter it.");
 
         // No secrets: the store isn't touched at all.
         let store = MemoryStore::default();
@@ -477,5 +564,79 @@ mod tests {
     fn scrub_replaces_resolved_values() {
         let secrets = vec![("T".to_string(), "tok-123".to_string()), ("S".to_string(), "ab".to_string())];
         assert_eq!(scrub("auth failed for tok-123 (ab)", &secrets), "auth failed for [redacted] (ab)");
+    }
+
+    #[test]
+    fn scrub_also_replaces_a_bare_token() {
+        let secrets = vec![
+            ("OCTOPUSH_MCP_H_AUTHORIZATION".to_string(), "Bearer tok-abcdef".to_string()),
+            ("BASIC".to_string(), "Basic dXNlcjpwYXNz".to_string()),
+        ];
+        let text = scrub("sent Bearer tok-abcdef; invalid token tok-abcdef; basic dXNlcjpwYXNz", &secrets);
+        assert_eq!(text, "sent [redacted]; invalid token [redacted]; basic [redacted]");
+    }
+
+    #[test]
+    fn two_servers_swapping_names_keep_their_own_values() {
+        let old = map(vec![("a", local(&[("API_KEY", "")], &["API_KEY"])), ("b", local(&[("API_KEY", "")], &["API_KEY"]))]);
+        let store = MemoryStore::with(&[("a/API_KEY", "value-of-a"), ("b/API_KEY", "value-of-b")]);
+        // Entry a is renamed b and b is renamed a, in one save.
+        let swapped = map(vec![("a", old["b"].clone()), ("b", old["a"].clone())]);
+        save(&store, &old, swapped, &[("a", "b"), ("b", "a")]);
+        let items = store.items.lock();
+        assert_eq!(items["a/API_KEY"], "value-of-b");
+        assert_eq!(items["b/API_KEY"], "value-of-a");
+    }
+
+    #[test]
+    fn a_name_listed_without_a_value_keeps_the_plain_value_it_had() {
+        // The file still has the value in plain text (a migration whose
+        // Keychain write failed); the entry now lists it as kept there.
+        let old = map(vec![("example", local(&[("API_KEY", "k-plain")], &[]))]);
+        let stale = map(vec![("example", local(&[("API_KEY", "")], &["API_KEY"]))]);
+        let store = MemoryStore::default();
+        let (servers, plan) = save(&store, &old, stale, &[]);
+        assert_eq!(store.items.lock().get("example/API_KEY").map(String::as_str), Some("k-plain"));
+        assert_eq!(servers["example"].env["API_KEY"], "");
+        assert_eq!(plan.touched, vec!["example"]);
+    }
+
+    #[test]
+    fn a_remote_servers_plain_headers_stay_in_the_file() {
+        let mut cfg = McpServerConfig {
+            env: HashMap::from([("OCTOPUSH_MCP_H_X_AUTH_MODE".to_string(), "basic".to_string())]),
+            remote: Some(remote::RemoteConfig {
+                url: "https://mcp.example.com/mcp".into(),
+                auth: "headers".into(),
+                header_names: vec!["X-Auth-Mode".into()],
+                transport: "auto".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        remote::apply_bridge(&mut cfg, "npx");
+        let store = MemoryStore::default();
+        // The name reads as a secret (AUTH), but a header's secrecy is the form's choice.
+        assert!(looks_secret("OCTOPUSH_MCP_H_X_AUTH_MODE"));
+        let (servers, _) = save(&store, &HashMap::new(), map(vec![("example-remote", cfg)]), &[]);
+        assert!(servers["example-remote"].secret_env.is_empty());
+        assert_eq!(servers["example-remote"].env["OCTOPUSH_MCP_H_X_AUTH_MODE"], "basic");
+        assert!(store.items.lock().is_empty());
+    }
+
+    #[test]
+    fn only_valid_env_names_reach_the_keychain() {
+        assert!(valid_env_name("API_KEY") && valid_env_name("_x1"));
+        for bad in ["", "1KEY", "b/C", "X-API-KEY", "A B"] {
+            assert!(!valid_env_name(bad), "{bad}");
+        }
+        // A name that would make `a` + `b/C` read as `a/b` + `C` is refused.
+        let servers = map(vec![("a", local(&[("b/C", "")], &["b/C"]))]);
+        assert!(check_names(&servers).unwrap_err().contains("b/C"));
+        assert!(check_names(&map(vec![("a/b", local(&[("C", "")], &["C"]))])).is_ok());
+        // And the migration leaves an invalid name where it is.
+        let store = MemoryStore::default();
+        let (servers, _) = save(&store, &HashMap::new(), map(vec![("x", local(&[("X-API-KEY", "v")], &[]))]), &[]);
+        assert!(servers["x"].secret_env.is_empty() && store.items.lock().is_empty());
     }
 }

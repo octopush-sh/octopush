@@ -256,6 +256,43 @@ describe("McpServersSection", () => {
       );
     });
 
+    it("turning Keep in Keychain off on a saved value asks for the value first", async () => {
+      const saved = { command: "uvx", args: [], env: { API_KEY: "" }, secret_env: ["API_KEY"] };
+      getMcpConfig.mockResolvedValue({ example: saved });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit example" }));
+      fireEvent.click(screen.getByRole("switch", { name: "Keep variable 1 in Keychain" }));
+      expect(screen.getByText("type the value to store it in plain text")).toBeInTheDocument();
+      expect(screen.getByText("Save changes").closest("button")).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Variable 1 value"), { target: { value: "k-plain" } });
+      expect(screen.queryByText("type the value to store it in plain text")).toBeNull();
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        { example: { ...saved, env: { API_KEY: "k-plain" }, secret_env: [], plain_env: ["API_KEY"] } },
+        { example: {} },
+        {},
+      );
+    });
+
+    it("a failed save shows what is really saved, not the half-done list", async () => {
+      const legacy = { command: "uvx", args: [], env: { API_KEY: "k-plain" } };
+      getMcpConfig.mockResolvedValue({ example: legacy });
+      saveMcpConfig.mockRejectedValue("couldn't save it to the Keychain: denied");
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit example" }));
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      await settle();
+      expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "error", title: "Save failed" }));
+      expect(getMcpConfig).toHaveBeenCalledTimes(2);
+      // Reopened, the value is still the plain one the file holds, not "•••• saved".
+      fireEvent.click(screen.getByRole("button", { name: "Edit example" }));
+      expect(screen.getByLabelText("Variable 1 value")).toHaveValue("k-plain");
+    });
+
     it("Keep in Keychain follows a new variable's name until it's set, and a plain one stays in the file", async () => {
       getMcpConfig.mockResolvedValue({ fs });
       render(<McpServersSection />);
@@ -668,6 +705,31 @@ describe("McpServersSection", () => {
       const form = screen.getByRole("group", { name: "Edit example-remote" });
       expect(within(form).getByLabelText("Token")).toHaveValue("tok-123");
       expect(within(form).queryByText("Clear sign-in")).toBeNull();
+    });
+
+    it("a saved client secret can be forgotten, keeping the client id", async () => {
+      const withSecret = {
+        ...saved,
+        env: { OCTOPUSH_MCP_CLIENT_SECRET: "" },
+        secret_env: ["OCTOPUSH_MCP_CLIENT_SECRET"],
+        remote: { ...saved.remote, client_id: "client-abc" },
+      };
+      getMcpConfig.mockResolvedValue({ "example-remote": withSecret });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit example-remote" }));
+      expect(screen.getByLabelText("OAuth client secret")).toHaveAttribute("placeholder", "•••• saved");
+      const forget = screen.getByRole("button", { name: "Forget the saved client secret" });
+      expect(forget).toHaveAttribute("title", expect.stringMatching(/client ID stays/));
+      fireEvent.click(forget);
+      expect(screen.getByLabelText("OAuth client secret")).toHaveAttribute("placeholder", "Only if one was issued");
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      const [servers, secrets] = saveMcpConfig.mock.calls[0];
+      expect(servers["example-remote"].remote.client_id).toBe("client-abc");
+      expect(servers["example-remote"].secret_env).toEqual([]);
+      expect(servers["example-remote"].env).toEqual({});
+      expect(secrets).toEqual({ "example-remote": {} });
     });
 
     it("a saved token reads as saved and needn't be typed again", async () => {

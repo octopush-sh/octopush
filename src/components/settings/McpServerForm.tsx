@@ -244,16 +244,29 @@ function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
                 </div>
                 <div>
                   <div className={labelClass}>OAuth client secret</div>
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    className={inputClass}
-                    value={draft.clientSecret}
-                    onChange={(e) => set({ clientSecret: e.target.value })}
-                    placeholder={draft.clientSecretSaved ? SAVED_PLACEHOLDER : "Only if one was issued"}
-                    aria-label="OAuth client secret"
-                    disabled={!draft.clientId.trim()}
-                  />
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      className={inputClass}
+                      value={draft.clientSecret}
+                      onChange={(e) => set({ clientSecret: e.target.value })}
+                      placeholder={draft.clientSecretSaved ? SAVED_PLACEHOLDER : "Only if one was issued"}
+                      aria-label="OAuth client secret"
+                      disabled={!draft.clientId.trim()}
+                    />
+                    {draft.clientSecretSaved && (
+                      <button
+                        type="button"
+                        onClick={() => set({ clientSecretSaved: false, clientSecret: "" })}
+                        aria-label="Forget the saved client secret"
+                        title="Forget the saved client secret (the client ID stays)"
+                        className={`octo-fade-in ${iconButtonClass}`}
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             )}

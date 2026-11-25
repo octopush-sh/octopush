@@ -259,6 +259,8 @@ function allowedUrl(url: string, extraArgs: string): boolean {
 /** Why a draft can't be saved, as shown beside Save, or null. Empty
  *  required fields only disable Save (`draftComplete`). */
 export function draftProblem(draft: Draft): string | null {
+  const rows = draft.type === "local" ? named(draft.env) : draft.auth === "headers" ? named(draft.headers) : [];
+  if (rows.some(losesSavedValue)) return "type the value to store it in plain text";
   if (draft.type === "local") {
     const names = named(draft.env).map((r) => r.name.trim());
     if (names.some((n) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(n))) return "env names use letters, digits and _";
@@ -282,7 +284,15 @@ export function draftProblem(draft: Draft): string | null {
 
 /** A secret row has a value: typed, or saved under its name. */
 function secretFilled(row: SecretRow, kind: "env" | "header"): boolean {
-  return !row.secret || !!row.value || rowSaved(row, kind);
+  if (row.secret) return !!row.value || rowSaved(row, kind);
+  // Turned off on a saved value: the value isn't known here, and saving ""
+  // would delete it from the Keychain. It has to be typed again.
+  return !(row.savedAs !== null && !row.value);
+}
+
+/** A row whose saved Keychain value would be lost by this draft. */
+function losesSavedValue(row: SecretRow): boolean {
+  return !row.secret && row.savedAs !== null && !row.value;
 }
 
 /** Every field the draft's type needs is filled in. */

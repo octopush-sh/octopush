@@ -224,6 +224,44 @@ describe("draftFrom", () => {
   });
 });
 
+describe("a saved value turned out of the Keychain", () => {
+  const saved = (name: string): SecretRow => ({ name, value: "", secret: false, savedAs: name, touched: true });
+
+  it("must be typed again before it can be saved in plain text", () => {
+    const draft: Draft = { ...emptyDraft(), name: "x", command: "uvx", env: [saved("API_KEY")] };
+    expect(draftProblem(draft)).toBe("type the value to store it in plain text");
+    expect(draftComplete(draft)).toBe(false);
+    const typed: Draft = { ...draft, env: [{ ...saved("API_KEY"), value: "k-plain" }] };
+    expect(draftProblem(typed)).toBeNull();
+    expect(draftComplete(typed)).toBe(true);
+    const { config, secrets } = configFromDraft(typed);
+    expect(config.env).toEqual({ API_KEY: "k-plain" });
+    expect(config.plain_env).toEqual(["API_KEY"]);
+    expect(secrets).toEqual({});
+  });
+
+  it("the same for a custom header", () => {
+    const header = { ...saved("X-Api-Key"), savedAs: headerEnv("X-Api-Key") };
+    const draft = remote({ auth: "headers", headers: [header] });
+    expect(draftProblem(draft)).toBe("type the value to store it in plain text");
+    expect(draftComplete(draft)).toBe(false);
+  });
+
+  it("a saved value kept in the Keychain needs nothing typed", () => {
+    const draft: Draft = { ...emptyDraft(), name: "x", command: "uvx", env: [{ ...saved("API_KEY"), secret: true }] };
+    expect(draftProblem(draft)).toBeNull();
+    expect(draftComplete(draft)).toBe(true);
+  });
+
+  it("forgetting a saved client secret keeps the client id", () => {
+    const { config, secrets } = configFromDraft(remote({ clientId: "client-abc", clientSecretSaved: false }));
+    expect(config.remote?.client_id).toBe("client-abc");
+    expect(config.secret_env).toEqual([]);
+    expect(config.env).toEqual({});
+    expect(secrets).toEqual({});
+  });
+});
+
 describe("draftProblem and draftComplete", () => {
   it("wants an https URL, or http on localhost or 127.0.0.1, as mcp-remote 0.16 does", () => {
     expect(draftProblem(remote({ url: "http://[::1]:8808/mcp" }))).toMatch(/https/);

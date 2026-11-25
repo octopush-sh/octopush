@@ -102,29 +102,35 @@ fn user_config_path() -> Option<std::path::PathBuf> {
 /// Settings UI manages (project-level `.claude/mcp.json` is repo-committed and
 /// edited in the repo, not here).
 pub fn load_user_config() -> HashMap<String, McpServerConfig> {
-    user_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|c| parse_mcp_config(&c))
-        .unwrap_or_default()
+    user_config_path().map(|p| load_config_at(&p)).unwrap_or_default()
+}
+
+/// The servers of the config file at `path` (empty when it's missing).
+fn load_config_at(path: &Path) -> HashMap<String, McpServerConfig> {
+    std::fs::read_to_string(path).map(|c| parse_mcp_config(&c)).unwrap_or_default()
 }
 
 /// Persist the user-level server map to `~/.claude/mcp.json` (pretty JSON under
 /// the `mcpServers` key, matching the Claude-Code shape).
 pub fn save_user_config(servers: &HashMap<String, McpServerConfig>) -> Result<(), String> {
-    let path = user_config_path().ok_or("no home directory")?;
+    save_config_at(&user_config_path().ok_or("no home directory")?, servers)
+}
+
+/// [`save_user_config`] to the file at `path`.
+fn save_config_at(path: &Path, servers: &HashMap<String, McpServerConfig>) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     // Preserve any sibling top-level keys the user keeps in mcp.json — only the
     // `mcpServers` object is ours to rewrite. (Comments aren't preserved; JSON.)
-    let mut root = std::fs::read_to_string(&path)
+    let mut root = std::fs::read_to_string(path)
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}));
     root["mcpServers"] = serde_json::to_value(servers).map_err(|e| e.to_string())?;
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| e.to_string())
+    std::fs::write(path, pretty).map_err(|e| e.to_string())
 }
 
 /// Load configured servers for a worktree (project overrides user on name clash).
@@ -167,6 +173,22 @@ pub fn project_config(worktree: &Path) -> HashMap<String, McpServerConfig> {
 /// servers whose secret values changed.
 #[allow(clippy::type_complexity)]
 pub fn save_user_servers(
+    servers: HashMap<String, McpServerConfig>,
+    new_values: HashMap<String, HashMap<String, String>>,
+    renamed: &HashMap<String, String>,
+    store: &dyn secrets::SecretStore,
+) -> Result<(HashMap<String, McpServerConfig>, HashMap<String, McpServerConfig>, Vec<String>), String> {
+    save_servers_at(&user_config_path().ok_or("no home directory")?, servers, new_values, renamed, store)
+}
+
+/// [`save_user_servers`] with the config file at `path`. The Keychain is
+/// written first: a write it refuses puts back what was written and stops
+/// the save before the file is touched; a file write that fails then puts
+/// the Keychain back too. Only after the file is written are unused items
+/// deleted.
+#[allow(clippy::type_complexity)]
+fn save_servers_at(
+    path: &Path,
     mut servers: HashMap<String, McpServerConfig>,
     new_values: HashMap<String, HashMap<String, String>>,
     renamed: &HashMap<String, String>,
@@ -174,10 +196,14 @@ pub fn save_user_servers(
 ) -> Result<(HashMap<String, McpServerConfig>, HashMap<String, McpServerConfig>, Vec<String>), String> {
     secrets::merge_new_values(&mut servers, new_values);
     let mut servers = remote::with_bridges(servers);
-    let old = load_user_config();
+    let old = load_config_at(path);
     let plan = secrets::plan_secrets(&old, &mut servers, renamed);
-    secrets::apply_before_save(store, &plan)?;
-    save_user_config(&servers)?;
+    secrets::check_names(&servers)?;
+    let undo = secrets::apply_before_save(store, &plan)?;
+    if let Err(e) = save_config_at(path, &servers) {
+        undo.revert(store);
+        return Err(e);
+    }
     secrets::apply_after_save(store, &plan);
     Ok((old, servers, plan.touched))
 }
@@ -989,6 +1015,32 @@ impl McpRegistry {
         changed
     }
 
+    /// [`Self::apply_config_change`], then also reset every server in
+    /// `touched` (its secret values changed, so its entry reads the same
+    /// but its process holds the old ones). Returns the names reset.
+    pub fn apply_save(
+        &self,
+        old: &HashMap<String, McpServerConfig>,
+        new: &HashMap<String, McpServerConfig>,
+        touched: &[String],
+    ) -> Vec<String> {
+        let mut reset = self.apply_config_change(old, new);
+        let more: Vec<String> = touched.iter().filter(|n| !reset.contains(n)).cloned().collect();
+        for name in more {
+            self.reset_server(&name);
+            reset.push(name);
+        }
+        reset.sort();
+        reset
+    }
+
+    /// A call's connection failure as the model may read it: the server's
+    /// own env values and its Keychain values redacted.
+    fn redact_call_failure(&self, server: &str, cfg: &McpServerConfig, reason: &str) -> String {
+        let values = secrets::resolve(server, cfg, &*self.secrets).unwrap_or_default();
+        redact_text(&secrets::scrub(reason, &values), &known_secrets(cfg))
+    }
+
     /// Spawn a server, run the MCP initialize handshake, and fetch its tools.
     /// The process is registered as `pending` for the length of the
     /// handshake so an abort can reach it.
@@ -1252,6 +1304,7 @@ impl McpRegistry {
                 // instead of reusing a corpse. This call isn't retried — it
                 // may already have reached the server.
                 self.evict_if_current(&server, &conn);
+                let reason = self.redact_call_failure(&server, cfg, &reason);
                 return Err(McpCallError::Connection { server, reason });
             }
         };
@@ -1807,9 +1860,9 @@ done
         // A secret that isn't saved fails before anything starts.
         std::fs::remove_file(&dump).unwrap();
         let err = McpRegistry::test_connect_with("other", &cfg, &store).unwrap_err();
-        assert!(err.starts_with("The token for other isn't in the Keychain; edit the server to enter it."), "{err}");
+        assert_eq!(err, "The value for MY_TOKEN isn't in the Keychain; edit other to enter it.");
         assert!(!dump.exists());
-        assert_eq!(classify_failure(&err).summary, "The token for other isn't in the Keychain.");
+        assert_eq!(classify_failure(&err).summary, "The value for MY_TOKEN isn't in the Keychain.");
 
         // The same entry in a repo's `.claude/mcp.json` gets nothing from
         // the Keychain: Talk starts it with the file's empty value.
@@ -1819,6 +1872,63 @@ done
         assert!(reg.call(dir.path(), "mcp__example__x", &json!({})).is_err());
         assert_eq!(std::fs::read_to_string(&dump).unwrap(), "");
         assert!(store.reads.lock().is_empty(), "the Keychain wasn't even read");
+    }
+
+    #[test]
+    fn the_file_is_never_written_before_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let before = r#"{"mcpServers":{"a-first":{"command":"uvx","env":{"API_KEY":""},"secret_env":["API_KEY"]}}}"#;
+        std::fs::write(&path, before).unwrap();
+        let store = secrets::MemoryStore::with(&[("a-first/API_KEY", "old-a")]);
+        *store.deny.lock() = Some("b-second/API_KEY".into());
+        let cfg = |v: &str| McpServerConfig {
+            command: "uvx".into(),
+            env: HashMap::from([("API_KEY".to_string(), v.to_string())]),
+            secret_env: vec!["API_KEY".into()],
+            ..Default::default()
+        };
+        let servers = HashMap::from([("a-first".to_string(), cfg("new-a")), ("b-second".to_string(), cfg("new-b"))]);
+        let err = save_servers_at(&path, servers.clone(), HashMap::new(), &HashMap::new(), &store).unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "the file is untouched");
+        assert_eq!(store.items.lock()["a-first/API_KEY"], "old-a", "the write that went through is put back");
+        assert!(!store.items.lock().contains_key("b-second/API_KEY"));
+
+        // The Keychain takes them, the file write fails: the Keychain is put back too.
+        *store.deny.lock() = None;
+        let blocked = dir.path().join("not-a-dir");
+        std::fs::write(&blocked, "a file").unwrap();
+        assert!(save_servers_at(&blocked.join("mcp.json"), servers.clone(), HashMap::new(), &HashMap::new(), &store).is_err());
+        assert_eq!(store.items.lock()["a-first/API_KEY"], "old-a");
+        assert!(!store.items.lock().contains_key("b-second/API_KEY"));
+
+        // And when both work, the file holds no value.
+        let (_, saved, touched) = save_servers_at(&path, servers, HashMap::new(), &HashMap::new(), &store).unwrap();
+        assert_eq!(touched, vec!["a-first", "b-second"]);
+        assert_eq!(saved["a-first"].env["API_KEY"], "");
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(!file.contains("new-a") && !file.contains("new-b"), "{file}");
+        assert_eq!(store.items.lock()["b-second/API_KEY"], "new-b");
+        // An invalid name stops the save before anything is written.
+        let bad = HashMap::from([("x".to_string(), McpServerConfig { secret_env: vec!["b/C".into()], ..cfg("v") })]);
+        assert!(save_servers_at(&path, bad, HashMap::new(), &HashMap::new(), &store).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_whose_secret_changed_restarts_the_server_whose_entry_reads_the_same() {
+        let (dir, _log, servers) = echo_worktree("pong");
+        let reg = McpRegistry::new();
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
+        let child = Arc::clone(&reg.conns.lock()["fix"].child);
+        // Same entry, nothing touched: it keeps running.
+        assert!(reg.apply_save(&servers, &servers, &[]).is_empty());
+        assert!(reg.conns.lock().contains_key("fix") && !reaped(&child));
+        // Same entry, but its Keychain value changed: restarted.
+        assert_eq!(reg.apply_save(&servers, &servers, &["fix".to_string()]), vec!["fix"]);
+        assert!(reg.conns.lock().is_empty() && reaped(&child));
     }
 
     #[test]

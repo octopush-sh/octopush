@@ -68,7 +68,7 @@ static CHILD_MISSING: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// A Keychain secret the entry names isn't saved (`secrets::resolve`).
 static NO_SECRET: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^The token for (.+?) isn't in the Keychain").unwrap());
+    LazyLock::new(|| Regex::new(r"^The value for (\S+) isn't in the Keychain").unwrap());
 /// A browser sign-in that wasn't finished in time.
 static AUTH_TIMEOUT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:authenticat|authoriz|sign[- ]?in)\w*\s+timed out\b").unwrap());
@@ -168,7 +168,7 @@ fn summarize(lines: &[String], text: &str) -> (String, Option<String>) {
         );
     }
     if let Some(c) = NO_SECRET.captures(first) {
-        return (format!("The token for {} isn't in the Keychain.", &c[1]), hint("Edit the server to enter it."));
+        return (format!("The value for {} isn't in the Keychain.", &c[1]), hint("Edit the server to enter it."));
     }
     if let Some(c) = OUR_TIMEOUT.captures(first) {
         return (
@@ -371,12 +371,10 @@ mod tests {
 
     #[test]
     fn a_secret_missing_from_the_keychain() {
-        let f = classify_failure(
-            "The token for example-remote isn't in the Keychain; edit the server to enter it.\nOCTOPUSH_MCP_H_AUTHORIZATION has no saved value.",
-        );
-        assert_eq!(f.summary, "The token for example-remote isn't in the Keychain.");
+        let f = classify_failure("The value for DB_PASSWORD isn't in the Keychain; edit example to enter it.");
+        assert_eq!(f.summary, "The value for DB_PASSWORD isn't in the Keychain.");
         assert_eq!(f.hint.as_deref(), Some("Edit the server to enter it."));
-        assert!(f.detail.contains("OCTOPUSH_MCP_H_AUTHORIZATION"));
+        assert!(f.detail.contains("edit example to enter it"));
     }
 
     #[test]

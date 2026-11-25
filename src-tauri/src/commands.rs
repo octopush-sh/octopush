@@ -2310,11 +2310,8 @@ pub async fn save_mcp_config(
             if let Err(e) = db.lock().rename_thread_mcp_servers(&renames, keeps_old) {
                 tracing::warn!(error = %e, "couldn't carry an MCP server rename over to conversations' off lists");
             }
-            registry.apply_config_change(&old, &saved);
             // A new secret value leaves the entry as it reads: restart it too.
-            for name in touched {
-                registry.reset_server(&name);
-            }
+            registry.apply_save(&old, &saved, &touched);
             Ok(saved)
         },
     )
@@ -2388,6 +2385,9 @@ async fn smoke_test_mcp_server(
         if config.remote.is_some() {
             crate::mcp::remote::apply_bridge(&mut config, &crate::mcp::remote::resolve_npx());
         }
+        // Which Keychain items it may read is the saved entry's say, never
+        // the caller's.
+        config.secret_env = crate::mcp::load_user_config().get(&name).map(|c| c.secret_env.clone()).unwrap_or_default();
         crate::mcp::McpRegistry::test_connect(&name, &config)
     });
     let failed =

@@ -101,6 +101,7 @@ export function McpServersSection() {
     // Only the latest save's answer is shown: an earlier one arriving late
     // describes entries that were replaced since.
     const seq = ++saveSeq.current;
+    const before = servers;
     setServers(next);
     try {
       // The entries as saved: a remote entry's bridge is built by the
@@ -109,6 +110,15 @@ export function McpServersSection() {
       if (saved && seq === saveSeq.current) setServers(saved);
     } catch (e) {
       pushToast({ level: "error", title: "Save failed", body: String(e) });
+      // Show what is really saved: the optimistic list may hold "" for a
+      // value the Keychain refused, and a later save would write it.
+      let stored: Record<string, McpServerConfig> = before;
+      try {
+        stored = (await ipc.getMcpConfig()) ?? before;
+      } catch {
+        // Keep the list from before this save.
+      }
+      if (seq === saveSeq.current) setServers(stored);
     }
   }
 
