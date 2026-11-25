@@ -33,15 +33,21 @@ use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
 mod failure;
+pub mod remote;
 pub use failure::{classify_failure, McpFailure};
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// A remote server's choices in Settings, from which Octopush builds
+    /// the bridge in `command`/`args`/`env` (`remote::apply_bridge`). An
+    /// entry without it is a local command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<remote::RemoteConfig>,
 }
 
 /// A tool exposed by an MCP server, surfaced to the agentic loop.
@@ -172,14 +178,19 @@ fn spawn_plan(cfg: &McpServerConfig, search_path: &str) -> Result<SpawnPlan, Str
                 .join(":")
         }
     };
-    let program = if cfg.command.contains('/') {
-        std::path::PathBuf::from(&cfg.command)
+    // A remote entry's bridge saved an absolute `npx`; one that has since
+    // moved (a Node upgrade under nvm) is looked up again on the PATH.
+    let command = match cfg.remote {
+        Some(_) if cfg.command.contains('/') && !Path::new(&cfg.command).exists() => "npx",
+        _ => cfg.command.as_str(),
+    };
+    let program = if command.contains('/') {
+        std::path::PathBuf::from(command)
     } else {
-        resolve_executable(&cfg.command, &child_path).ok_or_else(|| {
+        resolve_executable(command, &child_path).ok_or_else(|| {
             let whose = if own.is_some() { "the server's own PATH" } else { "the PATH Octopush searched" };
             format!(
-                "Octopush couldn't find `{0}` on {whose} ({child_path}). Use its full path (run `which {0}` in Terminal).",
-                cfg.command
+                "Octopush couldn't find `{command}` on {whose} ({child_path}). Use its full path (run `which {command}` in Terminal)."
             )
         })?
     };
@@ -1002,7 +1013,7 @@ done
         let cfg = McpServerConfig {
             command: "bash".into(),
             args: vec![script.to_string_lossy().to_string()],
-            env: HashMap::new(),
+            ..Default::default()
         };
         // Real spawn + initialize handshake + tools/list over stdio JSON-RPC.
         let tools = McpRegistry::test_connect("fix", &cfg).expect("fixture should connect");
@@ -1101,6 +1112,7 @@ sleep 30
             command: "bash".into(),
             args: vec![dir.join("hang.sh").to_string_lossy().into_owned()],
             env,
+            ..Default::default()
         }
     }
 
@@ -1284,7 +1296,7 @@ done
         // A server that failed to start is skipped until it is reset.
         let broken = HashMap::from([(
             "gone".to_string(),
-            McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), args: vec![], env: HashMap::new() },
+            McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), ..Default::default() },
         )]);
         write_servers(dir.path(), &broken);
         assert!(reg.list_tools(dir.path()).is_empty());
@@ -1307,7 +1319,7 @@ done
         assert_eq!(log_lines(&log, "start"), 2);
 
         // A failure is remembered for the config that failed, not the name.
-        let bad = McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), args: vec![], env: HashMap::new() };
+        let bad = McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), ..Default::default() };
         write_servers(dir.path(), &HashMap::from([("fix".to_string(), bad)]));
         assert!(matches!(reg.call(dir.path(), "mcp__fix__echo", &json!({})), Err(McpCallError::Connection { .. })));
         write_servers(dir.path(), &HashMap::from([("fix".to_string(), fixture_config(dir.path(), &[("ECHO_TEXT", "back")]))]));
@@ -1330,6 +1342,7 @@ done
             command: command.into(),
             args: vec!["-y".into(), "mcp-remote".into(), "https://mcp.example/sse".into()],
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..Default::default()
         }
     }
 
@@ -1387,6 +1400,20 @@ done
 
     #[cfg(unix)]
     #[test]
+    fn a_remote_bridges_npx_that_moved_is_found_again_on_the_path() {
+        let login = tempfile::tempdir().unwrap();
+        let npx = fake_bin(login.path(), "npx");
+        let mut cfg = command("/nowhere/old-node/bin/npx", &[]);
+        cfg.remote = Some(remote::RemoteConfig { url: "https://mcp.example.com/mcp".into(), ..Default::default() });
+        let plan = spawn_plan(&cfg, &login.path().to_string_lossy()).unwrap();
+        assert_eq!(plan.program, npx);
+        // One that still exists is used as saved.
+        cfg.command = npx.to_string_lossy().into_owned();
+        assert_eq!(spawn_plan(&cfg, "/usr/bin").unwrap().program, npx);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_servers_own_path_wins() {
         let own = tempfile::tempdir().unwrap();
         let uvx = fake_bin(own.path(), "uvx");
@@ -1415,6 +1442,7 @@ done
                 ("ENV_DUMP".to_string(), env_dump.to_string_lossy().into_owned()),
                 ("PATH_DUMP".to_string(), path_dump.to_string_lossy().into_owned()),
             ]),
+            ..Default::default()
         };
         // The script exits without a handshake: only its environment matters.
         assert!(McpRegistry::test_connect("dump", &cfg).is_err());
@@ -1442,7 +1470,7 @@ done
 
     #[test]
     fn changed_servers_lists_changed_removed_and_added_entries() {
-        let cfg = |c: &str| McpServerConfig { command: c.into(), args: vec![], env: HashMap::new() };
+        let cfg = |c: &str| McpServerConfig { command: c.into(), ..Default::default() };
         let old = HashMap::from([("a".to_string(), cfg("x")), ("b".to_string(), cfg("y")), ("c".to_string(), cfg("z"))]);
         let new = HashMap::from([("a".to_string(), cfg("x")), ("b".to_string(), cfg("y2")), ("d".to_string(), cfg("w"))]);
         assert_eq!(changed_servers(&old, &new), vec!["b", "c", "d"]);

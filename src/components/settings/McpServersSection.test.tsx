@@ -5,17 +5,20 @@ const getMcpConfig = vi.fn();
 const saveMcpConfig = vi.fn();
 const testMcpServer = vi.fn();
 const reconnectMcpServer = vi.fn();
+const clearMcpSignIn = vi.fn();
 const copyToClipboard = vi.fn();
+const pushToast = vi.fn();
 vi.mock("../../lib/ipc", () => ({
   ipc: {
     getMcpConfig: () => getMcpConfig(),
     saveMcpConfig: (...a: unknown[]) => saveMcpConfig(...a),
     testMcpServer: (...a: unknown[]) => testMcpServer(...a),
     reconnectMcpServer: (...a: unknown[]) => reconnectMcpServer(...a),
+    clearMcpSignIn: (...a: unknown[]) => clearMcpSignIn(...a),
   },
 }));
 vi.mock("../../lib/clipboard", () => ({ copyToClipboard: (...a: unknown[]) => copyToClipboard(...a) }));
-vi.mock("../Toasts", () => ({ pushToast: vi.fn() }));
+vi.mock("../Toasts", () => ({ pushToast: (...a: unknown[]) => pushToast(...a) }));
 
 const { McpServersSection, parseEnv, draftFrom, mcpFailureFrom } = await import("./McpServersSection");
 
@@ -33,7 +36,7 @@ describe("draftFrom", () => {
   it("is the inverse of the form's parsing", () => {
     const cfg = { command: "npx", args: ["-y", "example-server"], env: { A: "1", B: "two=three" } };
     const d = draftFrom("example", cfg);
-    expect(d).toEqual({ name: "example", command: "npx", argsText: "-y\nexample-server", envText: "A=1\nB=two=three" });
+    expect(d).toMatchObject({ name: "example", type: "local", command: "npx", argsText: "-y\nexample-server", envText: "A=1\nB=two=three" });
     expect(parseEnv(d.envText)).toEqual(cfg.env);
   });
 });
@@ -62,6 +65,8 @@ describe("McpServersSection", () => {
     testMcpServer.mockReset();
     reconnectMcpServer.mockReset();
     copyToClipboard.mockReset().mockResolvedValue(true);
+    clearMcpSignIn.mockReset();
+    pushToast.mockReset();
   });
 
   it("lists configured servers and a Test action", async () => {
@@ -286,6 +291,150 @@ describe("McpServersSection", () => {
     expect(saveMcpConfig).toHaveBeenCalledWith({
       fs: { command: "bash", args: [], env: {} },
       example: { command: "uvx", args: [], env: {} },
+    });
+  });
+
+  describe("remote servers", () => {
+    const URL = "https://mcp.example.com/mcp";
+    const saved = {
+      command: "/opt/homebrew/bin/npx",
+      args: ["-y", "mcp-remote", URL],
+      env: {},
+      remote: { url: URL, auth: "oauth" as const, transport: "auto" as const },
+    };
+
+    it("a row shows the URL, not the bridge's command line", async () => {
+      getMcpConfig.mockResolvedValue({ "example-remote": saved });
+      render(<McpServersSection />);
+      await settle();
+      expect(screen.getByText(URL)).toHaveAttribute("title", URL);
+      expect(screen.getByLabelText("Remote server").closest("[title]")).toHaveAttribute("title", "Remote server");
+      expect(screen.queryByText(/-y mcp-remote/)).toBeNull();
+    });
+
+    it("adds a server by URL, and shows what the backend saved", async () => {
+      getMcpConfig.mockResolvedValue({});
+      saveMcpConfig.mockImplementation(async (servers: Record<string, unknown>) => ({
+        ...servers,
+        "example-remote": saved,
+      }));
+      const { container } = render(<McpServersSection />);
+      await settle();
+      const add = screen.getByText("Add MCP server").closest("button")!;
+      expect(container.querySelector('[data-tour="settings-mcp-add"]')).toBe(add);
+      fireEvent.click(add);
+      const form = screen.getByRole("group", { name: "Add an MCP server" });
+      expect(container.querySelector('[data-tour="settings-mcp-type"]')).not.toBeNull();
+      fireEvent.click(within(form).getByRole("radio", { name: "Remote URL" }));
+      fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "example-remote" } });
+      const url = await within(form).findByLabelText("URL");
+      fireEvent.change(url, { target: { value: "http://mcp.example.com/mcp" } });
+      expect(within(form).getByText(/https:\/\/ URL/)).toBeInTheDocument();
+      expect(within(form).getByText("Add server").closest("button")).toBeDisabled();
+      fireEvent.change(url, { target: { value: URL } });
+      // Browser (OAuth) is the default sign-in.
+      expect(within(form).getByRole("radio", { name: "Browser (OAuth)" })).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(within(form).getByText("Add server"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenCalledWith({
+        "example-remote": { command: "npx", args: [], env: {}, remote: { url: URL, auth: "oauth", transport: "auto" } },
+      });
+      expect(screen.getByText(URL)).toBeInTheDocument();
+    });
+
+    it("a token sign-in is masked and goes in the header's env var", async () => {
+      getMcpConfig.mockResolvedValue({});
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByText("Add MCP server"));
+      const form = screen.getByRole("group", { name: "Add an MCP server" });
+      fireEvent.click(within(form).getByRole("radio", { name: "Remote URL" }));
+      fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "example-remote" } });
+      fireEvent.change(await within(form).findByLabelText("URL"), { target: { value: URL } });
+      fireEvent.click(within(form).getByRole("radio", { name: "Token" }));
+      const token = await within(form).findByLabelText("Token");
+      expect(token).toHaveAttribute("type", "password");
+      expect(within(form).getByText("Add server").closest("button")).toBeDisabled();
+      fireEvent.change(token, { target: { value: "tok-123" } });
+      fireEvent.click(within(form).getByText("Add server"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenCalledWith({
+        "example-remote": {
+          command: "npx",
+          args: [],
+          env: { OCTOPUSH_MCP_H_AUTHORIZATION: "tok-123" },
+          remote: { url: URL, auth: "token", transport: "auto" },
+        },
+      });
+    });
+
+    it("custom headers and the advanced choices", async () => {
+      getMcpConfig.mockResolvedValue({});
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByText("Add MCP server"));
+      const form = screen.getByRole("group", { name: "Add an MCP server" });
+      fireEvent.click(within(form).getByRole("radio", { name: "Remote URL" }));
+      fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "example-remote" } });
+      fireEvent.change(await within(form).findByLabelText("URL"), { target: { value: URL } });
+      fireEvent.click(within(form).getByRole("radio", { name: "Custom headers" }));
+      fireEvent.change(await within(form).findByLabelText("Header 1 name"), { target: { value: "X-Api-Key" } });
+      fireEvent.change(within(form).getByLabelText("Header 1 value"), { target: { value: "k" } });
+      fireEvent.click(within(form).getByText("Add a header"));
+      fireEvent.change(within(form).getByLabelText("Header 2 name"), { target: { value: "x_api_key" } });
+      expect(within(form).getByText("each header once")).toBeInTheDocument();
+      fireEvent.click(within(form).getByRole("button", { name: "Remove header 2" }));
+      expect(within(form).getByRole("button", { name: "Remove header 1" })).toHaveAttribute("title", "Remove header");
+      const advanced = within(form).getByRole("button", { name: "Advanced" });
+      expect(advanced).toHaveAttribute("aria-expanded", "false");
+      fireEvent.click(advanced);
+      fireEvent.click(within(form).getByRole("radio", { name: "SSE only" }));
+      fireEvent.click(within(form).getByText("Add server"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenCalledWith({
+        "example-remote": {
+          command: "npx",
+          args: [],
+          env: { OCTOPUSH_MCP_H_X_API_KEY: "k" },
+          remote: { url: URL, auth: "headers", transport: "sse-only", header_names: ["X-Api-Key"] },
+        },
+      });
+    });
+
+    it("Edit reopens a remote server's choices, and offers Clear sign-in for a browser sign-in", async () => {
+      const withClient = { ...saved, remote: { ...saved.remote, client_id: "client-abc", transport: "http-only" as const } };
+      getMcpConfig.mockResolvedValue({ "example-remote": withClient });
+      clearMcpSignIn.mockResolvedValue(2);
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit example-remote" }));
+      const form = screen.getByRole("group", { name: "Edit example-remote" });
+      expect(within(form).getByRole("radio", { name: "Remote URL" })).toHaveAttribute("aria-checked", "true");
+      expect(within(form).getByLabelText("URL")).toHaveValue(URL);
+      // Advanced opens on its own when it holds something.
+      expect(within(form).getByRole("button", { name: "Advanced" })).toHaveAttribute("aria-expanded", "true");
+      expect(within(form).getByLabelText("OAuth client ID")).toHaveValue("client-abc");
+      expect(within(form).getByRole("radio", { name: "HTTP only" })).toHaveAttribute("aria-checked", "true");
+
+      const clear = within(form).getByText("Clear sign-in");
+      expect(clear).toHaveAttribute("title", expect.stringMatching(/browser sign-in/));
+      fireEvent.click(clear);
+      await settle();
+      expect(clearMcpSignIn).toHaveBeenCalledWith("example-remote", withClient);
+      expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "success", title: "Sign-in cleared" }));
+      expect(saveMcpConfig).not.toHaveBeenCalled();
+    });
+
+    it("no Clear sign-in for a token server or while adding", async () => {
+      getMcpConfig.mockResolvedValue({
+        "example-remote": { ...saved, env: { OCTOPUSH_MCP_H_AUTHORIZATION: "Bearer tok-123" }, remote: { ...saved.remote, auth: "token" as const } },
+      });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit example-remote" }));
+      const form = screen.getByRole("group", { name: "Edit example-remote" });
+      expect(within(form).getByLabelText("Token")).toHaveValue("tok-123");
+      expect(within(form).queryByText("Clear sign-in")).toBeNull();
     });
   });
 });

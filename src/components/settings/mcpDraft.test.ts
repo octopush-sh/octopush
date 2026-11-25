@@ -1,0 +1,133 @@
+import { describe, it, expect } from "vitest";
+import {
+  configFromDraft,
+  draftComplete,
+  draftFrom,
+  draftProblem,
+  emptyDraft,
+  headerEnv,
+  CLIENT_SECRET_ENV,
+  type Draft,
+} from "./mcpDraft";
+import type { McpServerConfig } from "../../lib/types";
+
+const URL = "https://mcp.example.com/mcp";
+
+function remote(patch: Partial<Draft>): Draft {
+  return { ...emptyDraft(), name: "example-remote", type: "remote", url: URL, ...patch };
+}
+
+describe("headerEnv", () => {
+  it("matches mcp::remote::header_env", () => {
+    expect(headerEnv("Authorization")).toBe("OCTOPUSH_MCP_H_AUTHORIZATION");
+    expect(headerEnv(" X-Api-Key ")).toBe("OCTOPUSH_MCP_H_X_API_KEY");
+  });
+});
+
+describe("configFromDraft", () => {
+  it("a Browser (OAuth) server is its URL; the backend builds the bridge", () => {
+    expect(configFromDraft(remote({}))).toEqual({
+      command: "npx",
+      args: [],
+      env: {},
+      remote: { url: URL, auth: "oauth", transport: "auto" },
+    });
+  });
+
+  it("a token goes in the Authorization header's env var", () => {
+    const cfg = configFromDraft(remote({ auth: "token", token: " tok-123 " }));
+    expect(cfg.env).toEqual({ OCTOPUSH_MCP_H_AUTHORIZATION: "tok-123" });
+    expect(cfg.remote).toEqual({ url: URL, auth: "token", transport: "auto" });
+  });
+
+  it("custom headers keep their names and values; blank rows are dropped", () => {
+    const cfg = configFromDraft(
+      remote({ auth: "headers", headers: [{ name: " X-Api-Key ", value: "k" }, { name: "", value: "stray" }, { name: "X-Tenant", value: "sample" }] }),
+    );
+    expect(cfg.remote?.header_names).toEqual(["X-Api-Key", "X-Tenant"]);
+    expect(cfg.env).toEqual({ OCTOPUSH_MCP_H_X_API_KEY: "k", OCTOPUSH_MCP_H_X_TENANT: "sample" });
+  });
+
+  it("the OAuth client and transport only where they apply", () => {
+    const cfg = configFromDraft(remote({ clientId: " client-abc ", clientSecret: "shh", transport: "sse-only" }));
+    expect(cfg.remote).toEqual({ url: URL, auth: "oauth", transport: "sse-only", client_id: "client-abc" });
+    expect(cfg.env).toEqual({ [CLIENT_SECRET_ENV]: "shh" });
+    const token = configFromDraft(remote({ auth: "token", token: "t", clientId: "client-abc", clientSecret: "shh" }));
+    expect(token.remote?.client_id).toBeUndefined();
+    expect(token.env[CLIENT_SECRET_ENV]).toBeUndefined();
+  });
+
+  it("keeps a remote entry's own env, drops a local entry's when it turns remote", () => {
+    const base: McpServerConfig = {
+      command: "/opt/homebrew/bin/npx",
+      args: ["-y", "mcp-remote", URL],
+      env: { NODE_EXTRA_CA_CERTS: "/ca.pem", OCTOPUSH_MCP_H_OLD: "gone" },
+      remote: { url: URL, auth: "oauth", transport: "auto" },
+    };
+    expect(configFromDraft(remote({}), base).env).toEqual({ NODE_EXTRA_CA_CERTS: "/ca.pem" });
+    const local: McpServerConfig = { command: "uvx", args: [], env: { API_KEY: "x" } };
+    expect(configFromDraft(remote({}), local).env).toEqual({});
+  });
+
+  it("a remote entry turned local loses its remote choices", () => {
+    const base: McpServerConfig = { command: "npx", args: [], env: {}, remote: { url: URL, auth: "oauth", transport: "auto" } };
+    const cfg = configFromDraft({ ...emptyDraft(), name: "x", command: "uvx", argsText: "example-server" }, base);
+    expect(cfg).toEqual({ command: "uvx", args: ["example-server"], env: {} });
+  });
+});
+
+describe("draftFrom round-trips what configFromDraft saved", () => {
+  it.each<[string, Partial<Draft>]>([
+    ["oauth", { clientId: "client-abc", clientSecret: "shh", transport: "http-only" }],
+    ["token", { auth: "token", token: "tok-123" }],
+    ["headers", { auth: "headers", headers: [{ name: "X-Api-Key", value: "k" }, { name: "X-Tenant", value: "sample" }] }],
+  ])("%s", (_, patch) => {
+    const draft = remote(patch);
+    const back = draftFrom("example-remote", configFromDraft(draft));
+    expect(back).toEqual(draft);
+  });
+
+  it("a saved token reads back without its Bearer prefix", () => {
+    const cfg: McpServerConfig = {
+      command: "npx",
+      args: [],
+      env: { OCTOPUSH_MCP_H_AUTHORIZATION: "Bearer tok-123" },
+      remote: { url: URL, auth: "token", transport: "auto" },
+    };
+    expect(draftFrom("x", cfg).token).toBe("tok-123");
+  });
+
+  it("an entry without remote reads as a local command, even an old hand-written bridge", () => {
+    const d = draftFrom("legacy", { command: "npx", args: ["-y", "mcp-remote", URL], env: {} });
+    expect(d.type).toBe("local");
+    expect(d.argsText).toBe(`-y\nmcp-remote\n${URL}`);
+  });
+});
+
+describe("draftProblem and draftComplete", () => {
+  it("wants an https URL, or http on localhost", () => {
+    expect(draftProblem(remote({ url: "http://mcp.example.com/mcp" }))).toMatch(/https/);
+    expect(draftProblem(remote({ url: "mcp.example.com" }))).toMatch(/https/);
+    expect(draftProblem(remote({ url: "http://localhost:8808/mcp" }))).toBeNull();
+    expect(draftProblem(remote({ url: "http://127.0.0.1:3000" }))).toBeNull();
+    expect(draftProblem(remote({}))).toBeNull();
+  });
+
+  it("checks header names and duplicates", () => {
+    expect(draftProblem(remote({ auth: "headers", headers: [{ name: "Bad Name", value: "v" }] }))).toMatch(/header names/);
+    expect(
+      draftProblem(remote({ auth: "headers", headers: [{ name: "X-Key", value: "a" }, { name: "x_key", value: "b" }] })),
+    ).toBe("each header once");
+  });
+
+  it("needs what the chosen kind needs", () => {
+    expect(draftComplete({ ...emptyDraft(), name: "x", command: "uvx" })).toBe(true);
+    expect(draftComplete({ ...emptyDraft(), name: "x" })).toBe(false);
+    expect(draftComplete(remote({}))).toBe(true);
+    expect(draftComplete(remote({ url: " " }))).toBe(false);
+    expect(draftComplete(remote({ auth: "token" }))).toBe(false);
+    expect(draftComplete(remote({ auth: "token", token: "t" }))).toBe(true);
+    expect(draftComplete(remote({ auth: "headers" }))).toBe(false);
+    expect(draftComplete(remote({ name: "" }))).toBe(false);
+  });
+});

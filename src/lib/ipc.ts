@@ -1087,13 +1087,18 @@ export const ipc = {
   listMcpServers: (workspacePath: string) =>
     invoke<string[]>("list_mcp_servers", { workspacePath }),
   getMcpConfig: () => invoke<Record<string, McpServerConfig>>("get_mcp_config"),
+  /** Save the user-level servers; returns them as saved (remote bridges rebuilt). */
   saveMcpConfig: (servers: Record<string, McpServerConfig>) =>
-    invoke<void>("save_mcp_config", { servers }),
+    invoke<Record<string, McpServerConfig>>("save_mcp_config", { servers }),
   testMcpServer: (name: string, config: McpServerConfig) =>
     invoke<McpToolInfo[]>("test_mcp_server", { name, config }),
   /** Stop Talk's cached connection to the server, then run the same smoke test as Test. */
   reconnectMcpServer: (name: string, config: McpServerConfig) =>
     invoke<McpToolInfo[]>("reconnect_mcp_server", { name, config }),
+  /** Delete mcp-remote's saved browser sign-in for a remote server and stop
+   *  Talk's connection to it; returns how many files went. */
+  clearMcpSignIn: (name: string, config: McpServerConfig) =>
+    invoke<number>("clear_mcp_sign_in", { name, config }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),
