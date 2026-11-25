@@ -9,7 +9,8 @@
 use crate::chat_agents::{
     agent_tool_definitions, director_doctrine, director_model_for_auto, is_agent_tool, parse_agent_call,
     run_subagents, unmapped_subagent_tiers, AgentOutcome, AUTO_MODEL,
-    SubagentSpec, SubagentPlan, plan_subagent, run_one_subagent, discover_mcp_tools, model_catalog, mcp_turnstiles,
+    SubagentSpec, SubagentPlan, plan_subagent, run_one_subagent, discover_thread_mcp_tools, model_catalog, mcp_turnstiles,
+    mcp_off_refusal, thread_mcp_off,
 };
 use crate::chat_history::{
     build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
@@ -2277,7 +2278,8 @@ impl ChatEngine {
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         });
 
-        let mcp_tools = discover_mcp_tools(Arc::clone(&self.mcp), &spec.workspace_path).await;
+        let mcp_tools = discover_thread_mcp_tools(Arc::clone(&self.mcp), &self.db, &spec.workspace_path, &run.thread_id).await;
+        let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
         let turnstiles = mcp_turnstiles(&mcp_tools);
         let (known_models, tiers) = model_catalog();
         let outcome = run_one_subagent(
@@ -2864,19 +2866,22 @@ impl ChatEngine {
         // `mcp__server__tool`). Unreachable servers are skipped inside
         // list_tools. A skill's allowed-tools filter above doesn't touch these
         // (MCP tools are opt-in via the server config, not the skill).
-        // Run the (blocking) MCP discovery off the async runtime thread, bounded
-        // by a timeout so a hung server can't freeze the turn.
+        // Discovery runs off the async runtime thread, bounded by a timeout so
+        // a hung server can't freeze the turn (`discover_mcp_tools`). Servers
+        // the user switched off in this conversation (Companion "can use")
+        // are left out and never started for it; the same path as
+        // sub-agents'. What it offers is fixed for the turn.
         {
-            let mcp = Arc::clone(&self.mcp);
-            let wp = workspace_path.clone();
-            let discovered = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                tokio::task::spawn_blocking(move || mcp.list_tools(&wp)),
+            let discovered = discover_thread_mcp_tools(
+                Arc::clone(&self.mcp),
+                &self.db,
+                &request.workspace_path,
+                &request.thread_id,
             )
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
+            .await;
+            // Discovery may have started servers or seen one fail: the
+            // Companion's chips re-read their status.
+            let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
             for t in discovered {
                 tools.push(LlmTool {
                     name: t.namespaced,
@@ -3338,6 +3343,15 @@ impl ChatEngine {
                     pair
                 } else if u.name == RECALL_TOOL_NAME {
                     self.recall_tool_output(&request.thread_id, &u.input)
+                } else if let Some(refusal) = crate::mcp::is_mcp_tool(&u.name)
+                    .then(|| mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)))
+                    .flatten()
+                {
+                    // The list as it is now, not at the turn's start: a server
+                    // turned off mid-turn stops here, one turned back on runs.
+                    // (A call to a server not offered this turn can still be
+                    // copied from an earlier turn's history.)
+                    (refusal, false)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
                     // Bounded, and a timeout STOPS the server so the call can
                     // never complete later in the background.

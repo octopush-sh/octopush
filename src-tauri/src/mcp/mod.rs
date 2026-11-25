@@ -34,6 +34,8 @@ use std::sync::Arc;
 
 mod failure;
 pub use failure::{classify_failure, McpFailure};
+// Per-conversation server scope and the registry's status read (Companion).
+pub mod scope;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {

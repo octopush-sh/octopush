@@ -600,6 +600,7 @@ import type {
   Attachment,
   McpToolInfo,
   McpServerConfig,
+  McpServerStatus,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -1084,8 +1085,32 @@ export const ipc = {
   // ─── MCP ─────────────────────────────────────────────────────────
   listMcpTools: (workspacePath: string) =>
     invoke<McpToolInfo[]>("list_mcp_tools", { workspacePath }),
-  listMcpServers: (workspacePath: string) =>
-    invoke<string[]>("list_mcp_servers", { workspacePath }),
+  /** Every server configured for the worktree (user ∪ project config) with
+   *  Talk's live status for it. Spawns nothing. */
+  listMcpServerStatus: (workspacePath: string) =>
+    invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The MCP servers switched off in one Talk conversation (none by default). */
+  getThreadMcpDisabled: (threadId: string) => invoke<string[]>("get_thread_mcp_disabled", { threadId }),
+  /** Turn one server off (or back on) in a conversation; resolves to its new
+   *  off list. The backend reads and writes the list under one lock. */
+  setThreadMcpServer: (threadId: string, server: string, off: boolean) =>
+    invoke<string[]>("set_thread_mcp_server", { threadId, server, off }),
+  /** Settings saved the MCP config, Reconnect restarted a server, or Talk's
+   *  discovery started (or failed to start) servers. If either subscription
+   *  fails, the other is dropped and the promise rejects. */
+  onMcpChanged: async (handler: () => void) => {
+    const subs = await Promise.allSettled([
+      listen("mcp://config-changed", () => handler()),
+      listen("mcp://status-changed", () => handler()),
+    ]);
+    const offs = subs.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+    const failed = subs.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) {
+      offs.forEach((off) => off());
+      throw failed.reason;
+    }
+    return () => offs.forEach((off) => off());
+  },
   getMcpConfig: () => invoke<Record<string, McpServerConfig>>("get_mcp_config"),
   saveMcpConfig: (servers: Record<string, McpServerConfig>) =>
     invoke<void>("save_mcp_config", { servers }),

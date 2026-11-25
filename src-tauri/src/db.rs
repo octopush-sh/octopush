@@ -706,6 +706,11 @@ impl Db {
             &self.conn,
             "ALTER TABLE chat_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         )?;
+        // MCP servers switched off for one conversation (the Companion's "can
+        // use" chips): a JSON array of server names. NULL — every row from
+        // before the column — means none is off, so every configured server
+        // stays available, as it always was.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mcp_disabled TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
@@ -3921,6 +3926,46 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// The MCP servers switched off in a conversation, sorted. Empty for a
+    /// thread that never switched one off (NULL), an unreadable value, or a
+    /// thread that no longer exists: the default is every server.
+    pub fn thread_mcp_disabled(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT mcp_disabled FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok()).unwrap_or_default())
+    }
+
+    /// Replace a conversation's switched-off MCP servers. Names are trimmed,
+    /// de-duplicated and sorted; an empty list stores NULL (all on).
+    pub fn set_thread_mcp_disabled(&self, thread_id: &str, servers: &[String]) -> AppResult<()> {
+        let names: std::collections::BTreeSet<&str> =
+            servers.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let value = (!names.is_empty()).then(|| serde_json::to_string(&names).ok()).flatten();
+        self.conn.execute(
+            "UPDATE chat_threads SET mcp_disabled = ?2 WHERE id = ?1",
+            params![thread_id, value],
+        )?;
+        Ok(())
+    }
+
+    /// Turn one MCP server off (or back on) in a conversation, leaving the
+    /// others as stored, and return the new list. Read and written under the
+    /// one connection the caller holds locked, so two toggles never lose
+    /// each other's change.
+    pub fn set_thread_mcp_server_off(&self, thread_id: &str, server: &str, off: bool) -> AppResult<Vec<String>> {
+        let server = server.trim();
+        let mut names = self.thread_mcp_disabled(thread_id)?;
+        names.retain(|n| n != server);
+        if off && !server.is_empty() {
+            names.push(server.to_string());
+        }
+        self.set_thread_mcp_disabled(thread_id, &names)?;
+        self.thread_mcp_disabled(thread_id)
+    }
+
     pub fn rename_chat_thread(&self, thread_id: &str, title: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE chat_threads SET title = ?1 WHERE id = ?2",
@@ -4051,6 +4096,11 @@ impl Db {
         // One transaction: a failure part-way leaves no half-copied fork.
         let tx = self.conn.unchecked_transaction()?;
         let thread = self.create_chat_thread(&workspace_id, &format!("{title} · fork"))?;
+        // A fork is the same conversation from here: it keeps its MCP scope.
+        tx.execute(
+            "UPDATE chat_threads SET mcp_disabled = (SELECT mcp_disabled FROM chat_threads WHERE id = ?2) WHERE id = ?1",
+            params![thread.id, thread_id],
+        )?;
         let mut pairs = Vec::with_capacity(ids.len());
         for old in ids {
             tx.execute(

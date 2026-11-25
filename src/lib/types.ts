@@ -384,6 +384,17 @@ export interface McpToolInfo {
   description: string;
 }
 
+/** What Talk's MCP registry knows about one configured server
+ *  (`list_mcp_server_status`): running with N tools, not started yet (it
+ *  starts on first use), or failed with the first line of why. `tools` is
+ *  null while a call holds the connection. */
+export interface McpServerStatus {
+  name: string;
+  state: "connected" | "idle" | "failed";
+  tools: number | null;
+  reason: string | null;
+}
+
 /** A configured MCP server (stdio): the command to spawn + its args/env. */
 export interface McpServerConfig {
   command: string;
