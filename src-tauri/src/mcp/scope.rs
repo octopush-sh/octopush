@@ -146,7 +146,7 @@ done
         let cfg = McpServerConfig {
             command: "bash".into(),
             args: vec![script.to_string_lossy().into_owned()],
-            env: HashMap::new(),
+            ..Default::default()
         };
         write_servers(wt.path(), &[("docs-server", cfg)]);
         let reg = McpRegistry::new();

@@ -2327,16 +2327,20 @@ async fn smoke_test_mcp_server(
     name: String,
     config: crate::mcp::McpServerConfig,
 ) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    // The server's own env values are redacted wherever its output echoes them.
+    let known = crate::mcp::known_secrets(&config);
     let fut = tokio::task::spawn_blocking(move || crate::mcp::McpRegistry::test_connect(&name, &config));
+    let failed =
+        |reason: &str| crate::error::AppError::McpFailure(crate::mcp::classify_failure_with(reason, &known));
     // 120s: OAuth bridge tools (e.g. mcp-remote) may need to open a browser
     // and wait for the user to authenticate. 15s was too short for that flow.
     match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
         Ok(join) => join
             .map_err(|e| crate::error::AppError::Other(e.to_string()))?
-            .map_err(crate::error::AppError::Other),
-        Err(_) => Err(crate::error::AppError::Other(
+            .map_err(|reason| failed(&reason)),
+        Err(_) => Err(failed(
             "Connection timed out after 120s. If this server requires OAuth, complete \
-             the authentication in the browser that opened, then test again.".into(),
+             the authentication in the browser that opened, then test again.",
         )),
     }
 }

@@ -400,6 +400,20 @@ export interface McpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Any other key of the entry (`cwd`, `type`, `disabled`…), kept as it
+   *  was (the backend's `extra`). */
+  [extra: string]: unknown;
+}
+
+/** Why Settings' Test or Reconnect failed (`mcp::classify_failure`), the
+ *  payload of an `AppError` with `kind: "McpFailure"`. */
+export interface McpFailure {
+  /** One short line: what went wrong. */
+  summary: string;
+  /** What to do about it, when Octopush knows. */
+  hint: string | null;
+  /** The whole reason and server output, redacted. */
+  detail: string;
 }
 
 export interface ChatMessage {

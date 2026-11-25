@@ -132,6 +132,12 @@ pub enum AppError {
         fingerprint: String,
     },
 
+    /// An MCP server failed Settings' Test or Reconnect, classified
+    /// (`mcp::classify_failure`). The frontend detects `kind == "McpFailure"`
+    /// to show the summary and hint, with the redacted output behind Details.
+    #[error("{0}")]
+    McpFailure(crate::mcp::McpFailure),
+
     /// Returned when a backend budget gate blocks a spend (Phase 3 enforcement).
     /// The frontend detects `kind == "BudgetExceeded"` to surface the budget UI /
     /// override affordance. `scope` is a human string like "workspace daily".
@@ -216,6 +222,15 @@ impl Serialize for AppError {
                 map.serialize_entry("fingerprint", fingerprint)?;
                 map.end()
             }
+            AppError::McpFailure(f) => {
+                let mut map = ser.serialize_map(Some(5))?;
+                map.serialize_entry("kind", "McpFailure")?;
+                map.serialize_entry("message", &f.summary)?;
+                map.serialize_entry("summary", &f.summary)?;
+                map.serialize_entry("hint", &f.hint)?;
+                map.serialize_entry("detail", &f.detail)?;
+                map.end()
+            }
             other => ser.serialize_str(&other.to_string()),
         }
     }
@@ -260,6 +275,18 @@ mod tests {
         assert_eq!(val["feature"], "direct.unlimited");
         assert_eq!(val["used"], 25);
         assert_eq!(val["limit"], 25);
+    }
+
+    #[test]
+    fn mcp_failure_serializes_as_structured_object() {
+        let err = AppError::McpFailure(crate::mcp::classify_failure("MCP server closed the connection"));
+        let val: serde_json::Value = serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
+        assert_eq!(val["kind"], "McpFailure");
+        assert_eq!(val["summary"], "The server exited before it answered.");
+        assert_eq!(val["message"], val["summary"]);
+        assert_eq!(val["hint"], "Run its command in Terminal to see why.");
+        assert_eq!(val["detail"], "MCP server closed the connection");
+        assert_eq!(err.to_string(), "The server exited before it answered.");
     }
 
     #[test]
