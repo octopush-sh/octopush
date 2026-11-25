@@ -400,6 +400,9 @@ export interface McpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Any other key of the entry (`cwd`, `type`, `disabled`…), kept as it
+   *  was (the backend's `extra`). */
+  [extra: string]: unknown;
 }
 
 /** Why Settings' Test or Reconnect failed (`mcp::classify_failure`), the

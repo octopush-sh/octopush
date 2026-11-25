@@ -29247,8 +29247,7 @@ mod talk_mcp_scope_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = |n: &str| McpServerConfig {
             command: format!("/nonexistent/octopush-test/{n}"),
-            args: vec![],
-            env: HashMap::new(),
+            ..Default::default()
         };
         let servers = HashMap::from([("docs-server", cfg("docs-server")), ("example-remote", cfg("example-remote"))]);
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();

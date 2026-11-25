@@ -33,17 +33,21 @@ use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
 mod failure;
-pub use failure::{classify_failure, McpFailure};
+pub use failure::{classify_failure, classify_failure_with, McpFailure};
 // Per-conversation server scope and the registry's status read (Companion).
 pub mod scope;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Every other key of the entry (`cwd`, `type`, `disabled`, another
+    /// client's own fields), kept as it was so a save never drops it.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// A tool exposed by an MCP server, surfaced to the agentic loop.
@@ -216,19 +220,89 @@ const SERVER_OUTPUT_CAP: usize = 1024;
 static AUTH_CODE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bcode=([^\s&]+)").unwrap());
 
-/// One line of a server's output with token-like values redacted
-/// (`secret_scan::redact_line`: provider key prefixes, `TOKEN=…`,
-/// `Bearer …`; plus `code=…`), for the model or for Settings' details.
-pub(crate) fn redact_output_line(line: &str) -> String {
-    let line = crate::secret_scan::redact_line(line, &[]);
-    AUTH_CODE.replace_all(&line, format!("code={}", crate::secret_scan::REDACTED)).into_owned()
+/// `Basic <base64>` credentials (an Authorization header's value).
+static BASIC_AUTH: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bbasic\s+([A-Za-z0-9+/=._~-]{6,})").unwrap());
+/// A bare JWT (`eyJ….eyJ….sig`): an id, access or refresh token.
+static BARE_JWT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*").unwrap()
+});
+/// A quoted value under a secret-ish key, however short:
+/// `"client_secret": "…"`, `'password':'…'`, `"refresh_token":"…"`.
+static QUOTED_SECRET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)["']?[A-Za-z0-9_.\-]*(?:secret|passw(?:or)?d|token|api[_\-]?key|apikey|authorization|credential|private[_\-]?key|cookie)[A-Za-z0-9_.\-]*["']?\s*[:=]\s*["']([^"']+)["']"#,
+    )
+    .unwrap()
+});
+/// A header line under a secret-ish name: `X-API-Key: …`,
+/// `Authorization: Basic …` (after mcp-remote's `[pid]` prefix, if any).
+static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)^\s*(?:\[\d+\]\s*)*[A-Za-z0-9_\-]*(?:authorization|api[_\-]?key|apikey|token|secret|passw(?:or)?d|cookie)[A-Za-z0-9_\-]*\s*:\s*(\S.*)$",
+    )
+    .unwrap()
+});
+
+/// `line` with capture `group` of every match of `re` replaced by
+/// `secret_scan::REDACTED`.
+fn redact_group(line: &str, re: &regex::Regex, group: usize) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for c in re.captures_iter(line) {
+        if let Some(m) = c.get(group) {
+            out.push_str(&line[last..m.start()]);
+            out.push_str(crate::secret_scan::REDACTED);
+            last = m.end();
+        }
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
+/// One line of a server's output with token-like values redacted, for the
+/// model or for Settings' details: `known` values (the server's own env,
+/// `known_secrets`), what `secret_scan::redact_line` catches (provider key
+/// prefixes, `TOKEN=…`, `Bearer …`, URL passwords), OAuth `code=…`, `Basic
+/// …`, bare JWTs, quoted values under secret-ish keys and header lines with
+/// secret-ish names. A best effort for text shown on screen: a secret in a
+/// shape none of these covers can still get through.
+pub(crate) fn redact_output_line(line: &str, known: &[crate::secret_scan::KnownSecret]) -> String {
+    use crate::secret_scan::REDACTED;
+    let line = crate::secret_scan::redact_line(line, known);
+    let line = AUTH_CODE.replace_all(&line, format!("code={REDACTED}")).into_owned();
+    let line = redact_group(&line, &BASIC_AUTH, 1);
+    let line = BARE_JWT.replace_all(&line, REDACTED).into_owned();
+    let line = redact_group(&line, &QUOTED_SECRET, 1);
+    redact_group(&line, &SECRET_HEADER, 1)
+}
+
+/// The server's own env values, to redact wherever they echo: every value
+/// of at least 8 characters except PATH, a path or a plain number.
+pub(crate) fn known_secrets(cfg: &McpServerConfig) -> Vec<crate::secret_scan::KnownSecret> {
+    cfg.env
+        .iter()
+        .filter(|(k, v)| {
+            let v = v.trim();
+            k.as_str() != "PATH"
+                && v.chars().count() >= 8
+                && !v.starts_with(['/', '~', '.'])
+                && !v.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|(k, v)| crate::secret_scan::KnownSecret::new(format!("env {k}"), v.trim()))
+        .collect()
+}
+
+/// `text` redacted line by line ([`redact_output_line`]).
+pub(crate) fn redact_text(text: &str, known: &[crate::secret_scan::KnownSecret]) -> String {
+    text.lines().map(|l| redact_output_line(l, known)).collect::<Vec<_>>().join("\n")
 }
 
 /// A server's stdout/stderr as the model may read it: redacted line by line
 /// (`redact_output_line`), then cut to its last [`SERVER_OUTPUT_CAP`] bytes
 /// from a line start, where the error usually is.
 fn server_output(detail: &str) -> String {
-    let redacted: Vec<String> = detail.lines().map(redact_output_line).collect();
+    let redacted: Vec<String> = detail.lines().map(|l| redact_output_line(l, &[])).collect();
     let text = redacted.join("\n");
     if text.len() <= SERVER_OUTPUT_CAP {
         return text;
@@ -342,7 +416,7 @@ struct Connection {
     tools: Vec<McpToolInfo>,
     /// Stderr drained by a background thread; included in "closed the connection"
     /// errors so bridge tools (e.g. mcp-remote) can surface auth/network failures.
-    stderr_log: Arc<Mutex<String>>,
+    stderr_log: Arc<Mutex<StderrLog>>,
 }
 
 impl Connection {
@@ -364,7 +438,7 @@ impl Connection {
                 .read_line(&mut buf)
                 .map_err(|e| RpcError::Transport(format!("couldn't read from the server: {e}")))?;
             if n == 0 {
-                let stderr = self.stderr_log.lock();
+                let stderr = self.stderr_log.lock().text();
                 let stderr = stderr.trim();
                 let stdout = stdout_lines.join("\n");
                 let stdout = stdout.trim();
@@ -472,16 +546,73 @@ struct Failure {
     reason: String,
 }
 
-/// Drain `stderr` into `log`, capped at 4 KiB. Runs on a dedicated thread per
-/// server so the child process is never blocked writing diagnostics.
-fn drain_stderr(stderr: ChildStderr, log: Arc<Mutex<String>>) {
+/// The most of a server's stderr kept from its start, and from its end, in
+/// bytes: the head says what it was doing, the tail how it failed (a late
+/// "Fatal error" after a long log).
+const STDERR_HEAD: usize = 2048;
+const STDERR_TAIL: usize = 2048;
+
+/// A server's stderr, bounded: its first [`STDERR_HEAD`] bytes of lines and
+/// its last [`STDERR_TAIL`] bytes of lines, with a count of what fell between.
+#[derive(Default)]
+struct StderrLog {
+    head: String,
+    tail: std::collections::VecDeque<String>,
+    tail_bytes: usize,
+    cut: usize,
+}
+
+impl StderrLog {
+    fn push(&mut self, line: &str) {
+        if self.tail.is_empty() && self.head.len() + line.len() < STDERR_HEAD {
+            self.head.push_str(line);
+            self.head.push('\n');
+            return;
+        }
+        // A single line longer than the tail keeps its end (and its newline fits).
+        let line = if line.len() >= STDERR_TAIL {
+            let mut start = line.len() - (STDERR_TAIL - 1);
+            while !line.is_char_boundary(start) {
+                start += 1;
+            }
+            &line[start..]
+        } else {
+            line
+        };
+        self.tail_bytes += line.len() + 1;
+        self.tail.push_back(line.to_string());
+        while self.tail_bytes > STDERR_TAIL {
+            match self.tail.pop_front() {
+                Some(old) => {
+                    self.tail_bytes -= old.len() + 1;
+                    self.cut += 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut out = self.head.clone();
+        if self.cut > 0 {
+            let s = if self.cut == 1 { "" } else { "s" };
+            out.push_str(&format!("… ({} line{s} cut)\n", self.cut));
+        }
+        for line in &self.tail {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Drain `stderr` into `log` (bounded, `StderrLog`). Runs on a dedicated
+/// thread per server so the child process is never blocked writing
+/// diagnostics.
+fn drain_stderr(stderr: ChildStderr, log: Arc<Mutex<StderrLog>>) {
     let reader = BufReader::new(stderr);
     for line in reader.lines().map_while(Result::ok) {
-        let mut buf = log.lock();
-        if buf.len() < 4096 {
-            buf.push_str(&line);
-            buf.push('\n');
-        }
+        log.lock().push(&line);
     }
 }
 
@@ -697,7 +828,8 @@ impl McpRegistry {
     fn connect(&self, name: &str, cfg: &McpServerConfig) -> Result<Connection, String> {
         let child = Self::spawn(cfg)?;
         self.pending.lock().insert(name.to_string(), Arc::clone(&child));
-        let result = Self::handshake(name, child);
+        // A server that echoes its own env can't show it in the failure.
+        let result = Self::handshake(name, child).map_err(|e| redact_text(&e, &known_secrets(cfg)));
         self.pending.lock().remove(name);
         result
     }
@@ -743,7 +875,7 @@ impl McpRegistry {
         // writing diagnostics. The buffer is capped at 4 KiB; we include it in
         // "closed the connection" errors so bridge tools (e.g. mcp-remote) can
         // surface auth and network failures instead of silently exiting.
-        let stderr_log: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let stderr_log: Arc<Mutex<StderrLog>> = Arc::new(Mutex::new(StderrLog::default()));
         if let Some(stderr) = stderr {
             let log = Arc::clone(&stderr_log);
             std::thread::spawn(move || drain_stderr(stderr, log));
@@ -805,7 +937,7 @@ impl McpRegistry {
     /// touch the cache or the failed-set, so testing a broken config doesn't
     /// poison a real session.
     pub fn test_connect(name: &str, cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>, String> {
-        let conn = Self::handshake(name, Self::spawn(cfg)?)?;
+        let conn = Self::handshake(name, Self::spawn(cfg)?).map_err(|e| redact_text(&e, &known_secrets(cfg)))?;
         Ok(conn.tools.clone())
     }
 
@@ -1004,7 +1136,7 @@ done
         let cfg = McpServerConfig {
             command: "bash".into(),
             args: vec![script.to_string_lossy().to_string()],
-            env: HashMap::new(),
+            ..Default::default()
         };
         // Real spawn + initialize handshake + tools/list over stdio JSON-RPC.
         let tools = McpRegistry::test_connect("fix", &cfg).expect("fixture should connect");
@@ -1103,6 +1235,7 @@ sleep 30
             command: "bash".into(),
             args: vec![dir.join("hang.sh").to_string_lossy().into_owned()],
             env,
+            ..Default::default()
         }
     }
 
@@ -1286,7 +1419,7 @@ done
         // A server that failed to start is skipped until it is reset.
         let broken = HashMap::from([(
             "gone".to_string(),
-            McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), args: vec![], env: HashMap::new() },
+            McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), ..Default::default() },
         )]);
         write_servers(dir.path(), &broken);
         assert!(reg.list_tools(dir.path()).is_empty());
@@ -1309,7 +1442,7 @@ done
         assert_eq!(log_lines(&log, "start"), 2);
 
         // A failure is remembered for the config that failed, not the name.
-        let bad = McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), args: vec![], env: HashMap::new() };
+        let bad = McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), ..Default::default() };
         write_servers(dir.path(), &HashMap::from([("fix".to_string(), bad)]));
         assert!(matches!(reg.call(dir.path(), "mcp__fix__echo", &json!({})), Err(McpCallError::Connection { .. })));
         write_servers(dir.path(), &HashMap::from([("fix".to_string(), fixture_config(dir.path(), &[("ECHO_TEXT", "back")]))]));
@@ -1332,6 +1465,7 @@ done
             command: command.into(),
             args: vec!["-y".into(), "mcp-remote".into(), "https://mcp.example/sse".into()],
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..Default::default()
         }
     }
 
@@ -1417,6 +1551,7 @@ done
                 ("ENV_DUMP".to_string(), env_dump.to_string_lossy().into_owned()),
                 ("PATH_DUMP".to_string(), path_dump.to_string_lossy().into_owned()),
             ]),
+            ..Default::default()
         };
         // The script exits without a handshake: only its environment matters.
         assert!(McpRegistry::test_connect("dump", &cfg).is_err());
@@ -1444,7 +1579,7 @@ done
 
     #[test]
     fn changed_servers_lists_changed_removed_and_added_entries() {
-        let cfg = |c: &str| McpServerConfig { command: c.into(), args: vec![], env: HashMap::new() };
+        let cfg = |c: &str| McpServerConfig { command: c.into(), ..Default::default() };
         let old = HashMap::from([("a".to_string(), cfg("x")), ("b".to_string(), cfg("y")), ("c".to_string(), cfg("z"))]);
         let new = HashMap::from([("a".to_string(), cfg("x")), ("b".to_string(), cfg("y2")), ("d".to_string(), cfg("w"))]);
         assert_eq!(changed_servers(&old, &new), vec!["b", "c", "d"]);
@@ -1633,7 +1768,7 @@ done
         for secret in ["s3cr3tc0de", "abcdefgh12345678", "tok-value-123", gh.as_str()] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
-        assert!(text.contains("cb?code=[redacted]&state=1") && text.contains("Bearer [redacted]"), "{text}");
+        assert!(text.contains("cb?code=[redacted]&state=1") && text.contains("Authorization: [redacted]"), "{text}");
 
         let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
         let text = connection_failure_text("jira", &format!("closed\n{}", lines.join("\n")));
@@ -1659,6 +1794,81 @@ done
             "{again}"
         );
         assert!(!again.contains("Server output") && !again.contains("auth failed"), "{again}");
+    }
+
+    #[test]
+    fn keys_octopush_doesnt_know_round_trip() {
+        let file = r#"{"mcpServers":{"example":{"command":"uvx","args":["example-server"],"env":{"LOG":"debug"},"cwd":"/repo","type":"stdio","disabled":true,"timeout":{"ms":5000}}}}"#;
+        let servers = parse_mcp_config(file);
+        let cfg = &servers["example"];
+        assert_eq!(cfg.command, "uvx");
+        assert_eq!(cfg.extra.get("cwd"), Some(&json!("/repo")));
+        assert_eq!(cfg.extra.get("disabled"), Some(&json!(true)));
+        // Written the way `save_user_config` writes it, then read again.
+        let written = json!({ "mcpServers": servers }).to_string();
+        let back: Value = serde_json::from_str(&written).unwrap();
+        let original: Value = serde_json::from_str(file).unwrap();
+        assert_eq!(back, original, "every key survives a save");
+        assert_eq!(parse_mcp_config(&written), servers);
+        // An entry with none still writes only its own keys.
+        let plain = McpServerConfig { command: "uvx".into(), ..Default::default() };
+        assert_eq!(serde_json::to_value(&plain).unwrap(), json!({ "command": "uvx", "args": [], "env": {} }));
+    }
+
+    #[test]
+    fn stderr_keeps_its_head_and_its_tail() {
+        let mut log = StderrLog::default();
+        log.push("starting example-server");
+        for i in 0..2000 {
+            log.push(&format!("debug line {i}"));
+        }
+        log.push("Fatal error: the last thing it said");
+        let text = log.text();
+        assert!(text.starts_with("starting example-server\n"), "{text}");
+        assert!(text.trim_end().ends_with("Fatal error: the last thing it said"), "{text}");
+        assert!(text.contains(" lines cut)\n"), "{text}");
+        assert!(text.len() <= STDERR_HEAD + STDERR_TAIL + 64, "{} bytes", text.len());
+        // A short log is kept whole, with no marker.
+        let mut short = StderrLog::default();
+        short.push("one");
+        short.push("two");
+        assert_eq!(short.text(), "one\ntwo\n");
+        // One huge line keeps its end.
+        let mut huge = StderrLog::default();
+        huge.push(&"x".repeat(STDERR_HEAD));
+        huge.push(&format!("{}END", "y".repeat(3 * STDERR_TAIL)));
+        assert!(huge.text().trim_end().ends_with("END") && huge.text().len() <= STDERR_HEAD + STDERR_TAIL + 64);
+    }
+
+    #[test]
+    fn known_secrets_are_the_servers_env_values_that_could_be_credentials() {
+        let cfg = McpServerConfig {
+            command: "uvx".into(),
+            env: HashMap::from([
+                ("API_KEY".to_string(), "k-1234567890".to_string()),
+                ("LOG".to_string(), "debug".to_string()),
+                ("PATH".to_string(), "/opt/homebrew/bin:/usr/bin".to_string()),
+                ("CA".to_string(), "/etc/ssl/ca-bundle.pem".to_string()),
+                ("PORT".to_string(), "123456789".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let known = known_secrets(&cfg);
+        let text = redact_text("key k-1234567890 at debug level on /opt/homebrew/bin port 123456789", &known);
+        assert_eq!(text, "key [redacted] at debug level on /opt/homebrew/bin port 123456789");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_never_shows_the_servers_own_env() {
+        const ECHO_ENV: &str = "#!/usr/bin/env bash\necho start >> \"$SPAWN_LOG\"\nread -r line\necho \"using $SAMPLE_VALUE\"\nexit 1\n";
+        let (dir, _log) = fixture_dir(ECHO_ENV);
+        let cfg = fixture_config(dir.path(), &[("SAMPLE_VALUE", "sample-value-123")]);
+        let err = McpRegistry::test_connect("fix", &cfg).unwrap_err();
+        assert!(err.contains("using [redacted]") && !err.contains("sample-value-123"), "{err}");
+        write_servers(dir.path(), &HashMap::from([("fix".to_string(), cfg)]));
+        let err = McpRegistry::new().call(dir.path(), "mcp__fix__x", &json!({})).unwrap_err().to_string();
+        assert!(!err.contains("sample-value-123"), "{err}");
     }
 
     #[test]
