@@ -31,7 +31,6 @@ interface ContextProps {
   toolCalls: number;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
-  mcpServers?: string[];
   onReviewClick?: () => void;
   onSettingsClick?: () => void;
   onOpenLogbook?: () => void;
@@ -220,7 +219,12 @@ export function Companion({
                 and everything about the one on screen (context, cost, the
                 mission line, capabilities, budgets). */}
             <CompanionHistory {...historyProps} />
-            <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} onOpenLogbook={onOpenLogbook} />
+            <CompanionContext
+              {...contextProps}
+              workspaceId={workspaceId ?? undefined}
+              worktreePath={workspace?.worktreePath ?? undefined}
+              onOpenLogbook={onOpenLogbook}
+            />
             {onMakeProject && (
               <div className="border-t border-octo-hairline px-3 py-3">
                 <button
