@@ -32,6 +32,7 @@ const cliVersionMock = vi.hoisted(() => vi.fn());
 const floorNoteMock = vi.hoisted(() => vi.fn());
 const knownBadMock = vi.hoisted(() => vi.fn());
 const codexTrustMock = vi.hoisted(() => vi.fn());
+const repoHooksMock = vi.hoisted(() => vi.fn());
 const repoCrewsMock = vi.hoisted(() => vi.fn());
 const readRepoCrewMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -39,7 +40,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
   return {
     ...actual,
     ipc: {
-      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock, claudeKnownBadNote: knownBadMock, codexTrustNote: codexTrustMock,
+      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock, claudeKnownBadNote: knownBadMock, codexTrustNote: codexTrustMock, repoHooksNotice: repoHooksMock,
       listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock,
     },
   };
@@ -79,6 +80,8 @@ beforeEach(() => {
   knownBadMock.mockResolvedValue(null);
   codexTrustMock.mockReset();
   codexTrustMock.mockResolvedValue(null);
+  repoHooksMock.mockReset();
+  repoHooksMock.mockResolvedValue(null);
 });
 
 describe("PipelineSetup crews from the repo", () => {
@@ -661,6 +664,41 @@ describe("PipelineSetup Claude Code version preflight", () => {
     await act(async () => {});
     expect(codexTrustMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId("launcher-codex-trust")).not.toBeInTheDocument();
+  });
+
+  it("shows what the repo's own hooks and MCP servers run for a Claude Code crew, and says the sandbox holds them", async () => {
+    repoHooksMock.mockResolvedValue({
+      hooks: [
+        { event: "PreToolUse", matcher: "Bash", kind: "command", runs: "./scripts/guard.sh" },
+        { event: "statusLine", matcher: null, kind: "status_line", runs: "~/.claude/status.sh" },
+      ],
+      servers: [{ name: "db", runs: "npx -y db-mcp" }],
+      hash: "ab".repeat(32),
+    });
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-repo-hooks");
+    expect(repoHooksMock).toHaveBeenCalledWith("/tmp/w1");
+    expect(note).toHaveAttribute("data-tour", "direct-launcher-repo-hooks");
+    expect(note).toHaveTextContent("This repo's own Claude Code config runs 1 hook, a status line and 1 MCP server.");
+    expect(note).toHaveTextContent("PreToolUse Bash · ./scripts/guard.sh");
+    expect(note).toHaveTextContent("MCP db · npx -y db-mcp");
+    expect(note).not.toHaveTextContent("inside the sandbox");
+    expect(note.querySelector(".text-octo-warning")).toBeNull();
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "sandbox" } as any } }));
+    expect(screen.getByTestId("launcher-repo-hooks")).toHaveTextContent("and it runs inside the sandbox.");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("does not read the repo's hooks for a crew without a Claude Code stage", async () => {
+    repoHooksMock.mockResolvedValue({ hooks: [], servers: [{ name: "db", runs: "npx db" }], hash: "h" });
+    storeState.pipelines = [cliPipe("gpt-5-codex")];
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await act(async () => {});
+    expect(repoHooksMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-repo-hooks")).not.toBeInTheDocument();
   });
 
   it("tells a project marked untrusted in Codex to change its trust_level, not to run --trust", async () => {

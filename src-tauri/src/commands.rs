@@ -8174,6 +8174,16 @@ pub struct CodexTrustNote {
     pub how: String,
 }
 
+/// Direct launcher: the hooks, status line and MCP servers this worktree's
+/// committed `.claude/settings.json` and `.mcp.json` run in a Claude Code
+/// stage. Read-only; `None` when they run nothing or are missing or malformed.
+#[tauri::command]
+pub async fn repo_hooks_notice(workspace_path: String) -> AppResult<Option<crate::repo_hooks::RepoHooks>> {
+    tokio::task::spawn_blocking(move || crate::repo_hooks::read(std::path::Path::new(&workspace_path)))
+        .await
+        .map_err(|e| AppError::Other(format!("repo hooks task failed: {e}")))
+}
+
 /// Direct launcher, Readiness and Routines: the models among `models` with a
 /// published retirement date (`token_engine::MODEL_RETIREMENTS`), each once.
 /// The caller decides from the date whether to say anything.

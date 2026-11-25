@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type CodexTrustNote, type PipelineWithStages, type RepoCrew, type RunEstimate } from "../lib/ipc";
+import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type CodexTrustNote, type PipelineWithStages, type RepoCrew, type RepoHooksNotice, type RunEstimate } from "../lib/ipc";
+import { repoHooksItems, repoHooksLine } from "../lib/repoHooks";
 import { dragHasFiles, openDroppedCrew } from "../lib/crew";
 import { useCrewImportStore } from "../stores/crewImportStore";
 import {
@@ -274,6 +275,19 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
       .catch(() => {});
     return () => { alive = false; };
   }, [usesCodex, workspacePath]);
+  // What the repo's own committed Claude Code config (hooks, status line,
+  // .mcp.json servers) runs in a Claude Code stage. Read-only, calm.
+  const [repoHooks, setRepoHooks] = useState<RepoHooksNotice | null>(null);
+  useEffect(() => {
+    setRepoHooks(null);
+    if (!usesClaudeCode || !workspacePath) return;
+    let alive = true;
+    ipc.repoHooksNotice(workspacePath)
+      .then((n) => { if (alive) setRepoHooks(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [usesClaudeCode, workspacePath]);
+  const sandboxed = execIsolation === "sandbox" || gitIsolation === "readonly";
   // An Action stage on Codex outside a sandboxed mission can't commit.
   const codexCommitLine = selected ? codexCommitNote(selected.stages, overrides, roles, execIsolation) : null;
   // A read-only Codex stage in a sandboxed (or readonly) mission is refused
@@ -635,6 +649,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 </p>
               </div>
             </div>
+            {repoHooks && (
+              <div data-tour="direct-launcher-repo-hooks" data-testid="launcher-repo-hooks" className="octo-rise-in mt-3">
+                <p className="m-0 text-[11px] leading-[1.55] text-octo-sage">{repoHooksLine(repoHooks, sandboxed)}</p>
+                <ul className="m-0 mt-0.5 list-none p-0">
+                  {repoHooksItems(repoHooks).map((item, i) => (
+                    <li key={i} title={item} className="truncate font-mono text-[10px] text-octo-mute">{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {cliNote && cli?.version && (
               <div
                 data-tour="direct-launcher-cli-version"

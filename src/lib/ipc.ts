@@ -1843,6 +1843,9 @@ export const ipc = {
   /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
   codexTrustNote: (workspacePath: string) =>
     invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
+  /** The hooks and MCP servers the repo's own Claude Code config runs, or null. Read-only. */
+  repoHooksNotice: (workspacePath: string) =>
+    invoke<RepoHooksNotice | null>("repo_hooks_notice", { workspacePath }),
   /** The models among `models` with a published retirement date
    *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
   modelRetirements: (models: string[]) =>
@@ -1958,6 +1961,16 @@ export interface CodexTrustNote {
   line: string;
   /** How the user can trust it themselves; differs between the two states. */
   how: string;
+}
+
+/** What a worktree's committed `.claude/settings.json` (hooks, status line)
+ *  and `.mcp.json` (servers) run in a Claude Code stage
+ *  (`commands::repo_hooks_notice`). */
+export interface RepoHooksNotice {
+  hooks: { event: string; matcher: string | null; kind: "command" | "http" | "mcp_tool" | "status_line"; runs: string }[];
+  servers: { name: string; runs: string }[];
+  /** SHA-256 over the canonical JSON of every entry. */
+  hash: string;
 }
 
 /** A crew model the installed Claude Code is too old for (mirrors Rust
