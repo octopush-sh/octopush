@@ -32,6 +32,7 @@ pub mod providers;
 pub mod pty_client;
 pub mod pty_daemon;
 mod pty_manager;
+pub mod repo_hooks;
 mod session;
 pub mod session_recap;
 pub mod secret_scan;
@@ -463,6 +464,7 @@ pub fn run() {
             commands::claude_model_floor_note,
             commands::claude_known_bad_note,
             commands::codex_trust_note,
+            commands::repo_hooks_notice,
             commands::model_retirements,
             commands::readiness_check,
             // Role commands
