@@ -355,6 +355,31 @@ describe("McpServersSection", () => {
       );
     });
 
+    it("shows the entries the backend saved, and only the latest save's", async () => {
+      getMcpConfig.mockResolvedValue({ fs });
+      const answers: Array<(saved: Record<string, unknown>) => void> = [];
+      saveMcpConfig.mockImplementation(() => new Promise((r) => { answers.push(r); }));
+      render(<McpServersSection />);
+      await settle();
+      // Save 1: Args changed.
+      fireEvent.click(screen.getByRole("button", { name: "Edit fs" }));
+      fireEvent.change(screen.getByLabelText("Args"), { target: { value: "one.sh" } });
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      // Save 2, before save 1 answers.
+      fireEvent.click(screen.getByRole("button", { name: "Edit fs" }));
+      fireEvent.change(screen.getByLabelText("Args"), { target: { value: "two.sh" } });
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      expect(answers).toHaveLength(2);
+      // The backend answers save 2 first, with its own resolved command, then save 1 late.
+      await act(async () => { answers[1]({ fs: { command: "/opt/homebrew/bin/bash", args: ["two.sh"], env: {} } }); });
+      expect(screen.getByText("/opt/homebrew/bin/bash two.sh")).toBeInTheDocument();
+      await act(async () => { answers[0]({ fs: { command: "/opt/homebrew/bin/bash", args: ["one.sh"], env: {} } }); });
+      expect(screen.getByText("/opt/homebrew/bin/bash two.sh")).toBeInTheDocument();
+      expect(screen.queryByText(/one\.sh/)).toBeNull();
+    });
+
     it("a duplicate check that a prototype key can't fool", async () => {
       getMcpConfig.mockResolvedValue({ fs });
       render(<McpServersSection />);
@@ -485,6 +510,8 @@ describe("McpServersSection", () => {
       fireEvent.change(await within(form).findByLabelText("URL"), { target: { value: URL } });
       fireEvent.click(within(form).getByRole("radio", { name: "Custom headers" }));
       fireEvent.change(await within(form).findByLabelText("Header 1 name"), { target: { value: "X-Api-Key" } });
+      // A secret-looking header's value is masked; another's isn't.
+      expect(within(form).getByLabelText("Header 1 value")).toHaveAttribute("type", "password");
       fireEvent.change(within(form).getByLabelText("Header 1 value"), { target: { value: "k" } });
       fireEvent.click(within(form).getByText("Add a header"));
       fireEvent.change(within(form).getByLabelText("Header 2 name"), { target: { value: "x_api_key" } });

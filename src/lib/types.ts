@@ -418,6 +418,8 @@ export interface McpRemoteConfig {
   transport: "auto" | "http-only" | "sse-only";
   /** A pre-registered OAuth client (`auth: "oauth"`). */
   client_id?: string;
+  /** More mcp-remote arguments, appended as given. */
+  extra_args?: string[];
 }
 
 /** Why Settings' Test or Reconnect failed (`mcp::classify_failure`), the

@@ -28,16 +28,24 @@ export interface Draft {
   clientId: string;
   clientSecret: string;
   transport: RemoteTransport;
+  /** More mcp-remote arguments, one per line (`--enable-proxy`…). */
+  extraArgsText: string;
 }
 
 // Mirrors of `mcp::remote`'s names (its tests pin the same examples).
 export const HEADER_ENV_PREFIX = "OCTOPUSH_MCP_H_";
 export const CLIENT_SECRET_ENV = "OCTOPUSH_MCP_CLIENT_SECRET";
 export const TOKEN_HEADER = "Authorization";
+const SECRET_NAME = /TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|BEARER|CREDENTIAL|PRIVATE|COOKIE|SESSION/i;
 
 /** The env var carrying header `name`'s value (`mcp::remote::header_env`). */
 export function headerEnv(name: string): string {
   return HEADER_ENV_PREFIX + name.trim().replace(/[^A-Za-z0-9]/g, "_").toUpperCase();
+}
+
+/** A header or env name that reads as a credential: its value is masked. */
+export function looksSecret(name: string): boolean {
+  return SECRET_NAME.test(name);
 }
 
 /** An env var the bridge owns (a header's value or the client secret). */
@@ -71,6 +79,7 @@ export function emptyDraft(): Draft {
     clientId: "",
     clientSecret: "",
     transport: "auto",
+    extraArgsText: "",
   };
 }
 
@@ -101,6 +110,7 @@ export function draftFrom(name: string, cfg: McpServerConfig): Draft {
     clientId: remote.client_id ?? "",
     clientSecret: env[CLIENT_SECRET_ENV] ?? "",
     transport: remote.transport,
+    extraArgsText: (remote.extra_args ?? []).join("\n"),
   };
 }
 
@@ -139,12 +149,18 @@ export function configFromDraft(draft: Draft, base?: McpServerConfig): McpServer
     remote.client_id = clientId;
     if (draft.clientSecret) env[CLIENT_SECRET_ENV] = draft.clientSecret;
   }
+  const extraArgs = draft.extraArgsText.split("\n").map((a) => a.trim()).filter(Boolean);
+  if (extraArgs.length) remote.extra_args = extraArgs;
   return { ...rest, command: "npx", args: [], env, remote };
 }
 
-/** A URL mcp-remote connects to without `--allow-http`. */
-function allowedUrl(url: string): boolean {
-  return /^https:\/\/\S+$/i.test(url) || /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/\S*)?$/i.test(url);
+/** A URL mcp-remote 0.16 connects to: https, or plain http on `localhost`
+ *  or `127.0.0.1` only (not `[::1]`), unless `--allow-http` is among the
+ *  extra arguments. */
+function allowedUrl(url: string, extraArgs: string): boolean {
+  if (/^https:\/\/\S+$/i.test(url)) return true;
+  if (!/^http:\/\/\S+$/i.test(url)) return false;
+  return /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/\S*)?$/i.test(url) || /^\s*--allow-http\s*$/m.test(extraArgs);
 }
 
 /** Why a draft can't be saved, as shown beside Save, or null. Empty
@@ -152,7 +168,11 @@ function allowedUrl(url: string): boolean {
 export function draftProblem(draft: Draft): string | null {
   if (draft.type === "local") return null;
   const url = draft.url.trim();
-  if (url && !allowedUrl(url)) return "use an https:// URL (http only for localhost)";
+  if (url && !allowedUrl(url, draft.extraArgsText)) return "use an https:// URL (http only for localhost or 127.0.0.1)";
+  // mcp-remote puts the secret into the client info's JSON before parsing it.
+  if (draft.auth === "oauth" && draft.clientId.trim() && /["\\]/.test(draft.clientSecret)) {
+    return "the client secret can't contain \" or \\";
+  }
   if (draft.auth === "headers") {
     const headers = namedHeaders(draft);
     if (headers.some((h) => !/^[A-Za-z0-9_-]+$/.test(h.name))) return "header names use letters, digits, - and _";

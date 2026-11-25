@@ -2295,8 +2295,14 @@ pub async fn save_mcp_config(
             let servers = crate::mcp::remote::with_bridges(servers);
             let old = crate::mcp::load_user_config();
             crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)?;
+            // The file is written: from here on nothing fails the save.
             let renames = crate::mcp::real_renames(&old, &servers, &renamed.unwrap_or_default());
-            db.lock().rename_thread_mcp_servers(&renames)?;
+            let keeps_old = |worktree: &str, name: &str| {
+                crate::mcp::project_config(std::path::Path::new(worktree)).contains_key(name)
+            };
+            if let Err(e) = db.lock().rename_thread_mcp_servers(&renames, keeps_old) {
+                tracing::warn!(error = %e, "couldn't carry an MCP server rename over to conversations' off lists");
+            }
             registry.apply_config_change(&old, &servers);
             Ok(servers)
         },
@@ -2323,18 +2329,21 @@ pub async fn test_mcp_server(
 /// Returns how many files went.
 #[tauri::command]
 pub async fn clear_mcp_sign_in(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     config: crate::mcp::McpServerConfig,
 ) -> AppResult<usize> {
     let registry = Arc::clone(&state.chat.mcp);
-    tokio::task::spawn_blocking(move || -> AppResult<usize> {
+    let removed = tokio::task::spawn_blocking(move || -> AppResult<usize> {
         let removed = crate::mcp::remote::clear_sign_in(&config).map_err(crate::error::AppError::Other)?;
         registry.reset_server(&name);
         Ok(removed)
     })
     .await
-    .map_err(|e| crate::error::AppError::Other(e.to_string()))?
+    .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
+    let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ()); // Companion "can use" reloads
+    Ok(removed)
 }
 
 /// Settings' Reconnect: stop Talk's cached connection to the server (a call

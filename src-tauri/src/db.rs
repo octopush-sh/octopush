@@ -3968,27 +3968,39 @@ impl Db {
 
     /// After MCP servers were renamed in Settings (`renames`: old → new):
     /// every conversation that had an old name switched off has the new one
-    /// off instead, so a renamed server doesn't come back on there. All rows
-    /// in one transaction; an unreadable value is left as it is. Returns how
-    /// many conversations changed.
-    pub fn rename_thread_mcp_servers(&self, renames: &[(String, String)]) -> AppResult<usize> {
+    /// off instead, so a renamed server doesn't come back on there. Not
+    /// where `keeps_old(workspace path, old name)` says the conversation's
+    /// project still defines the old name itself (its `.claude/mcp.json`):
+    /// the entry there still means that server. All rows in one
+    /// transaction; an unreadable value is left as it is. Returns how many
+    /// conversations changed.
+    pub fn rename_thread_mcp_servers(
+        &self,
+        renames: &[(String, String)],
+        keeps_old: impl Fn(&str, &str) -> bool,
+    ) -> AppResult<usize> {
         if renames.is_empty() {
             return Ok(0);
         }
         let tx = self.conn.unchecked_transaction()?;
-        let rows: Vec<(String, String)> = {
-            let mut stmt = tx.prepare("SELECT id, mcp_disabled FROM chat_threads WHERE mcp_disabled IS NOT NULL")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let rows: Vec<(String, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT t.id, t.mcp_disabled, COALESCE(NULLIF(w.worktree_path, ''), p.path) FROM chat_threads t \
+                 LEFT JOIN workspaces w ON w.id = t.workspace_id LEFT JOIN projects p ON p.id = w.project_id \
+                 WHERE t.mcp_disabled IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut changed = 0;
-        for (id, raw) in rows {
+        for (id, raw, path) in rows {
             let Ok(names) = serde_json::from_str::<Vec<String>>(&raw) else { continue };
             let mut hit = false;
             // Each name maps once, so two servers that swap names swap here too.
             let renamed: std::collections::BTreeSet<String> = names
                 .into_iter()
                 .map(|n| match renames.iter().find(|(old, _)| *old == n) {
+                    Some(_) if path.as_deref().is_some_and(|p| keeps_old(p, &n)) => n,
                     Some((_, new)) => {
                         hit = true;
                         new.clone()
