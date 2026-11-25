@@ -75,8 +75,10 @@ export function PrivacyPane() {
         </li>
         <li>
           <span className={LEAD_IN_CLASS}>API keys:</span> stored in{" "}
-          <code className={PATH_CHIP_CLASS}>~/.octopush/settings.json</code>. Your
-          account session lives in the macOS Keychain.
+          <code className={PATH_CHIP_CLASS}>~/.octopush/settings.json</code>. MCP servers:{" "}
+          <code className={PATH_CHIP_CLASS}>~/.claude/mcp.json</code>, with their tokens and the values
+          you mark Keep in Keychain in the macOS Keychain. Your account session lives in the macOS
+          Keychain too.
         </li>
         <li>
           <span className={LEAD_IN_CLASS}>Outbound traffic, only to:</span>

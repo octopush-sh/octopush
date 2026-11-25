@@ -86,7 +86,7 @@ describe("PrivacyPane", () => {
  *  the owner to approve at merge). */
 const APPROVED_INVENTORY = [
   "Stored on this Mac: projects, workspaces, chats, tool executions, Direct runs, token usage — in ~/Library/Application Support/octopush/octopush.db. Runs and custom pipelines leave it only if you turn on sync.",
-  "API keys: stored in ~/.octopush/settings.json. Your account session lives in the macOS Keychain.",
+  "API keys: stored in ~/.octopush/settings.json. MCP servers: ~/.claude/mcp.json, with their tokens and the values you mark Keep in Keychain in the macOS Keychain. Your account session lives in the macOS Keychain too.",
   "Outbound traffic, only to:" +
     "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models." +
     "Clerk for sign-in and Dodo Payments for checkout, when you use your account." +
