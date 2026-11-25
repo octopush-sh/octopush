@@ -2276,35 +2276,43 @@ pub async fn get_mcp_config(
 /// Replace the user-level MCP server config, then stop Talk's cached
 /// connection to every server whose entry changed or was removed, so the next
 /// call spawns it from the saved config (a call in flight on the old process
-/// fails). A remote entry's bridge is rebuilt from its choices first
-/// (`mcp::remote::with_bridges`). `renamed` maps a new server name to the
-/// old one it replaces: conversations that had the old name switched off
-/// get the new one instead. Returns the config as saved.
+/// fails), and tell the Companion. A remote entry's bridge is rebuilt from
+/// its choices first, and secret values move to the login Keychain
+/// (`mcp::save_user_servers`). `secrets` holds the values Settings' secret
+/// fields were given (server → env name → value; never written to
+/// `mcp.json`; an empty value keeps the saved one), `renamed` maps a new
+/// server name to the old one so its Keychain items move with it, and
+/// conversations that had the old name switched off get the new one. Returns
+/// the entries as saved, without any secret value.
 #[tauri::command]
 pub async fn save_mcp_config(
     app: AppHandle,
     state: State<'_, AppState>,
     servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
+    secrets: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
     renamed: Option<std::collections::HashMap<String, String>>,
 ) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
     let registry = Arc::clone(&state.chat.mcp);
     let db = Arc::clone(&state.db);
-    // `npx` lookup, file I/O, kill + reap: off the runtime thread.
+    // `npx` lookup, Keychain and file I/O, kill + reap: off the runtime thread.
     let saved = tokio::task::spawn_blocking(
         move || -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
-            let servers = crate::mcp::remote::with_bridges(servers);
-            let old = crate::mcp::load_user_config();
-            crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)?;
+            let store = crate::mcp::secrets::keychain();
+            let renamed = renamed.unwrap_or_default();
+            let (old, saved, touched) =
+                crate::mcp::save_user_servers(servers, secrets.unwrap_or_default(), &renamed, &*store)
+                    .map_err(crate::error::AppError::Other)?;
             // The file is written: from here on nothing fails the save.
-            let renames = crate::mcp::real_renames(&old, &servers, &renamed.unwrap_or_default());
+            let renames = crate::mcp::real_renames(&old, &saved, &renamed);
             let keeps_old = |worktree: &str, name: &str| {
                 crate::mcp::project_config(std::path::Path::new(worktree)).contains_key(name)
             };
             if let Err(e) = db.lock().rename_thread_mcp_servers(&renames, keeps_old) {
                 tracing::warn!(error = %e, "couldn't carry an MCP server rename over to conversations' off lists");
             }
-            registry.apply_config_change(&old, &servers);
-            Ok(servers)
+            // A new secret value leaves the entry as it reads: restart it too.
+            registry.apply_save(&old, &saved, &touched);
+            Ok(saved)
         },
     )
     .await
@@ -2377,6 +2385,9 @@ async fn smoke_test_mcp_server(
         if config.remote.is_some() {
             crate::mcp::remote::apply_bridge(&mut config, &crate::mcp::remote::resolve_npx());
         }
+        // Which Keychain items it may read is the saved entry's say, never
+        // the caller's.
+        config.secret_env = crate::mcp::load_user_config().get(&name).map(|c| c.secret_env.clone()).unwrap_or_default();
         crate::mcp::McpRegistry::test_connect(&name, &config)
     });
     let failed =

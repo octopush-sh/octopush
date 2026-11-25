@@ -1,18 +1,20 @@
 // The MCP server add/edit form: a local command, or a remote URL that the
 // backend reaches through the mcp-remote bridge it builds from these choices.
 import { useState } from "react";
-import { ChevronRight, Plus, X } from "lucide-react";
+import { ChevronRight, KeyRound, Plus, X } from "lucide-react";
 import { SegmentedControl } from "../controls/SegmentedControl";
 import { Reveal } from "../primitives/Reveal";
 import { FadeSwap } from "../primitives/FadeSwap";
 import {
   draftComplete,
   draftProblem,
-  looksSecret,
+  newRow,
+  renameRow,
+  rowSaved,
   type Draft,
-  type HeaderRow,
   type RemoteAuth,
   type RemoteTransport,
+  type SecretRow,
   type ServerType,
 } from "./mcpDraft";
 
@@ -40,6 +42,9 @@ const TRANSPORTS: { value: RemoteTransport; label: string; title: string }[] = [
   { value: "http-only", label: "HTTP only", title: "Streamable HTTP only" },
   { value: "sse-only", label: "SSE only", title: "Server-sent events only" },
 ];
+
+/** What a saved Keychain value shows instead of itself. */
+export const SAVED_PLACEHOLDER = "•••• saved";
 
 /** The add/edit form. `original` is the edited server's saved name (null
  *  when adding); `taken` says whether a name belongs to another server.
@@ -143,16 +148,15 @@ function LocalFields({ draft, set }: { draft: Draft; set: Patch }) {
           aria-label="Args"
         />
       </div>
-      <div>
-        <div className={labelClass}>Env (KEY=value, one per line)</div>
-        <textarea
-          className={`${inputClass} h-16 resize-none`}
-          value={draft.envText}
-          onChange={(e) => set({ envText: e.target.value })}
-          placeholder="GITHUB_TOKEN=ghp_…"
-          aria-label="Env"
-        />
-      </div>
+      <SecretRows
+        kind="env"
+        label="Env"
+        rows={draft.env}
+        onChange={(env) => set({ env })}
+        namePlaceholder="GITHUB_TOKEN"
+        addLabel="Add a variable"
+        what="Variable"
+      />
     </>
   );
 }
@@ -194,13 +198,25 @@ function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
               className={inputClass}
               value={draft.token}
               onChange={(e) => set({ token: e.target.value })}
-              placeholder="Paste the token"
+              placeholder={draft.tokenSaved ? SAVED_PLACEHOLDER : "Paste the token"}
               aria-label="Token"
             />
-            <p className="mt-1 text-[11px] text-octo-mute">Sent as Authorization: Bearer &lt;token&gt;.</p>
+            <p className="mt-1 text-[11px] text-octo-mute">
+              Sent as Authorization: Bearer &lt;token&gt;. Kept in your login Keychain.
+            </p>
           </div>
         )}
-        {draft.auth === "headers" && <HeaderRows rows={draft.headers} onChange={(headers) => set({ headers })} />}
+        {draft.auth === "headers" && (
+          <SecretRows
+            kind="header"
+            label="Headers"
+            rows={draft.headers}
+            onChange={(headers) => set({ headers })}
+            namePlaceholder="X-Api-Key"
+            addLabel="Add a header"
+            what="Header"
+          />
+        )}
       </FadeSwap>
       <div>
         <button type="button" aria-expanded={advanced} onClick={() => setAdvanced((v) => !v)} className={disclosureClass}>
@@ -228,16 +244,29 @@ function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
                 </div>
                 <div>
                   <div className={labelClass}>OAuth client secret</div>
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    className={inputClass}
-                    value={draft.clientSecret}
-                    onChange={(e) => set({ clientSecret: e.target.value })}
-                    placeholder="Only if one was issued"
-                    aria-label="OAuth client secret"
-                    disabled={!draft.clientId.trim()}
-                  />
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      className={inputClass}
+                      value={draft.clientSecret}
+                      onChange={(e) => set({ clientSecret: e.target.value })}
+                      placeholder={draft.clientSecretSaved ? SAVED_PLACEHOLDER : "Only if one was issued"}
+                      aria-label="OAuth client secret"
+                      disabled={!draft.clientId.trim()}
+                    />
+                    {draft.clientSecretSaved && (
+                      <button
+                        type="button"
+                        onClick={() => set({ clientSecretSaved: false, clientSecret: "" })}
+                        aria-label="Forget the saved client secret"
+                        title="Forget the saved client secret (the client ID stays)"
+                        className={`octo-fade-in ${iconButtonClass}`}
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
@@ -260,7 +289,10 @@ function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
                 aria-label="Extra arguments"
                 spellCheck={false}
               />
-              <p className="mt-1 text-[11px] text-octo-mute">Added to the mcp-remote command line as written.</p>
+              <p className="mt-1 text-[11px] text-octo-mute">
+                Added to the mcp-remote command line as written. Anything here shows in the process list, so keep
+                secrets in Token or Custom headers.
+              </p>
             </div>
           </div>
         </Reveal>
@@ -269,53 +301,89 @@ function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
   );
 }
 
-function HeaderRows({ rows, onChange }: { rows: HeaderRow[]; onChange: (rows: HeaderRow[]) => void }) {
-  const update = (i: number, patch: Partial<HeaderRow>) => onChange(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+/** Name / value rows (env variables or headers), each with "Keep in
+ *  Keychain": a secret value is masked, and a saved one reads as saved until
+ *  a new value is typed. */
+function SecretRows({
+  kind,
+  label,
+  rows,
+  onChange,
+  namePlaceholder,
+  addLabel,
+  what,
+}: {
+  kind: "env" | "header";
+  label: string;
+  rows: SecretRow[];
+  onChange: (rows: SecretRow[]) => void;
+  namePlaceholder: string;
+  addLabel: string;
+  what: string;
+}) {
+  const update = (i: number, row: SecretRow) => onChange(rows.map((r, j) => (j === i ? row : r)));
   return (
     <div>
-      <div className={labelClass}>Headers</div>
-      <div className="space-y-2">
-        {rows.map((row, i) => (
-          <div key={i} className="octo-rise-in flex items-center gap-2">
-            <div className="w-2/5 shrink-0">
-              <input
-                className={inputClass}
-                value={row.name}
-                onChange={(e) => update(i, { name: e.target.value })}
-                placeholder="X-Api-Key"
-                aria-label={`Header ${i + 1} name`}
-                spellCheck={false}
-              />
-            </div>
-            <input
-              // A value under a secret-looking name (Authorization, X-Api-Key, Cookie…) is masked.
-              type={looksSecret(row.name) ? "password" : "text"}
-              autoComplete="off"
-              className={inputClass}
-              value={row.value}
-              onChange={(e) => update(i, { value: e.target.value })}
-              placeholder="value"
-              aria-label={`Header ${i + 1} value`}
-              spellCheck={false}
-            />
-            <button
-              type="button"
-              onClick={() => onChange(rows.length > 1 ? rows.filter((_, j) => j !== i) : [{ name: "", value: "" }])}
-              aria-label={`Remove header ${i + 1}`}
-              title="Remove header"
-              className={iconButtonClass}
-            >
-              <X size={12} />
-            </button>
-          </div>
-        ))}
-      </div>
-      <button
-        type="button"
-        onClick={() => onChange([...rows, { name: "", value: "" }])}
-        className={`mt-2 ${disclosureClass}`}
-      >
-        <Plus size={12} aria-hidden /> Add a header
+      <div className={labelClass}>{label}</div>
+      {rows.length > 0 && (
+        <div className="space-y-2">
+          {rows.map((row, i) => {
+            const saved = rowSaved(row, kind);
+            const n = i + 1;
+            return (
+              <div key={i} className="octo-rise-in flex items-center gap-2">
+                <div className="w-2/5 shrink-0">
+                  <input
+                    className={inputClass}
+                    value={row.name}
+                    onChange={(e) => update(i, renameRow(row, e.target.value))}
+                    placeholder={namePlaceholder}
+                    aria-label={`${what} ${n} name`}
+                    spellCheck={false}
+                  />
+                </div>
+                <input
+                  type={row.secret ? "password" : "text"}
+                  autoComplete="off"
+                  className={inputClass}
+                  value={row.value}
+                  onChange={(e) => update(i, { ...row, value: e.target.value })}
+                  placeholder={saved ? SAVED_PLACEHOLDER : "value"}
+                  aria-label={`${what} ${n} value`}
+                  spellCheck={false}
+                />
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={row.secret}
+                  aria-label={`Keep ${what.toLowerCase()} ${n} in Keychain`}
+                  title="Keep in Keychain"
+                  onClick={() => update(i, { ...row, secret: !row.secret, touched: true })}
+                  className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                    row.secret ? "text-octo-brass" : "text-octo-mute hover:text-octo-brass"
+                  }`}
+                >
+                  <KeyRound size={12} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = rows.filter((_, j) => j !== i);
+                    onChange(kind === "header" && next.length === 0 ? [newRow()] : next);
+                  }}
+                  aria-label={`Remove ${what.toLowerCase()} ${n}`}
+                  title={`Remove ${what.toLowerCase()}`}
+                  className={iconButtonClass}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <button type="button" onClick={() => onChange([...rows, newRow()])} className={`${rows.length ? "mt-2 " : ""}${disclosureClass}`}>
+        <Plus size={12} aria-hidden /> {addLabel}
       </button>
     </div>
   );

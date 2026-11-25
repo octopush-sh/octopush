@@ -400,6 +400,11 @@ export interface McpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Env names whose values live in the login Keychain; their `env` value
+   *  is "" and the secret itself never reaches the frontend. */
+  secret_env?: string[];
+  /** Env names that look secret but the user keeps in mcp.json. */
+  plain_env?: string[];
   /** A remote server's choices; the backend builds the `mcp-remote` bridge
    *  in command/args/env from them (`mcp::remote::apply_bridge`). */
   remote?: McpRemoteConfig;

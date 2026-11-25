@@ -20,7 +20,7 @@ import { Reveal } from "../primitives/Reveal";
 import { McpServerForm, iconButtonClass } from "./McpServerForm";
 import { configFromDraft, draftFrom, emptyDraft, type Draft } from "./mcpDraft";
 
-export { parseEnv, draftFrom } from "./mcpDraft";
+export { draftFrom } from "./mcpDraft";
 
 type TestState =
   | { kind: "idle" }
@@ -90,19 +90,35 @@ export function McpServersSection() {
       .finally(() => setLoaded(true));
   }, []);
 
-  /** Save the entries; `renamed` (new name → old) carries a rename over to
-   *  the conversations that had the old name switched off. */
-  async function persist(next: Record<string, McpServerConfig>, renamed: Record<string, string> = {}) {
+  /** Save the entries; `secrets` (server → env name → typed value) go to the
+   *  Keychain, `renamed` (new name → old) moves a renamed server's items and its
+   *  conversations' off-list entries. */
+  async function persist(
+    next: Record<string, McpServerConfig>,
+    secrets: Record<string, Record<string, string>> = {},
+    renamed: Record<string, string> = {},
+  ) {
     // Only the latest save's answer is shown: an earlier one arriving late
     // describes entries that were replaced since.
     const seq = ++saveSeq.current;
+    const before = servers;
     setServers(next);
     try {
-      // The entries as saved: a remote entry's bridge is built by the backend.
-      const saved = await ipc.saveMcpConfig(next, renamed);
+      // The entries as saved: a remote entry's bridge is built by the
+      // backend, and no secret value comes back.
+      const saved = await ipc.saveMcpConfig(next, secrets, renamed);
       if (saved && seq === saveSeq.current) setServers(saved);
     } catch (e) {
       pushToast({ level: "error", title: "Save failed", body: String(e) });
+      // Show what is really saved: the optimistic list may hold "" for a
+      // value the Keychain refused, and a later save would write it.
+      let stored: Record<string, McpServerConfig> = before;
+      try {
+        stored = (await ipc.getMcpConfig()) ?? before;
+      } catch {
+        // Keep the list from before this save.
+      }
+      if (seq === saveSeq.current) setServers(stored);
     }
   }
 
@@ -131,7 +147,7 @@ export function McpServersSection() {
     const original = form.mode === "edit" ? form.original : null;
     if (!key || (key !== original && Object.hasOwn(servers, key))) return;
     // Keeps any field the form doesn't show.
-    const config = configFromDraft(draft, original ? servers[original] : undefined);
+    const { config, secrets } = configFromDraft(draft, original ? servers[original] : undefined);
     const next = { ...servers };
     if (original) delete next[original];
     next[key] = config;
@@ -144,7 +160,7 @@ export function McpServersSection() {
       return t;
     });
     closeForm();
-    await persist(next, original && original !== key ? { [key]: original } : {});
+    await persist(next, { [key]: secrets }, original && original !== key ? { [key]: original } : {});
   }
 
   async function clearSignIn(key: string) {
@@ -230,7 +246,8 @@ export function McpServersSection() {
         Model Context Protocol servers whose tools become available to Talk: a
         local command Octopush runs, or a remote URL it reaches through{" "}
         <span className="font-mono text-octo-sage">mcp-remote</span>, which npx
-        fetches the first time (Node required).
+        fetches the first time (Node required). Tokens and other secrets stay on
+        this Mac, in your login Keychain.
       </p>
 
       <div className="space-y-2">
