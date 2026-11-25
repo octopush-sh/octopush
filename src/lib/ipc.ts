@@ -1872,8 +1872,8 @@ export interface ReadinessCheck {
 }
 
 /** A Claude Code fix worth updating for (mirrors Rust `agent_adapter::RecommendedFix`).
- *  `run`: shown while a Run-mode session runs Claude Code; `any`: that, or
- *  while a saved crew or Routine has a Claude Code CLI stage. */
+ *  `run`: shown while a Run-mode session runs Claude Code; `any`: shown to
+ *  anyone on an older Claude Code. */
 export interface RecommendedFix {
   version: string;
   /** "fixes …", one line. */
