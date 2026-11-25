@@ -277,7 +277,7 @@ pub const KNOWN_BAD_STAGE_PREFIX: &str = "Skip Claude Code ";
 pub enum RecommendedAudience {
     /// While a Run-mode session runs Claude Code.
     Run,
-    /// That, or while a saved crew or Routine has a Claude Code CLI stage.
+    /// Anyone on an older Claude Code.
     Any,
 }
 

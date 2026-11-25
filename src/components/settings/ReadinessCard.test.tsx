@@ -153,7 +153,6 @@ describe("ReadinessCard · recommended Claude Code note", () => {
     expect(within(r).queryByTestId("readiness-note")).toBeNull();
   });
 
-
   it("shows nothing when the backend sends no note", async () => {
     useTerminalsStore.setState({ terminalsByWs: { w1: [runSession({})] } });
     readinessCheck.mockResolvedValue([row({ id: "claude", label: "Claude Code", value: "2.1.330" })]);
