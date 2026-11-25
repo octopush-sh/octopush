@@ -35,7 +35,7 @@ import type {
   Workspace,
   WorkspaceGitSummary,
 } from "../../../src/lib/types";
-import { ATELIER, NOW } from "./shared";
+import { ATELIER, BUILTIN_THEMES, NOW } from "./shared";
 import { logbookSummary, missionFor } from "./logbook";
 
 const EARLIER = "2026-10-28T14:12:00Z";
@@ -261,7 +261,7 @@ export const defaultScenario: Scenario = {
   commands: {
     "plugin:app|version": "0.4.88",
     get_theme: ATELIER,
-    list_themes: [ATELIER],
+    list_themes: BUILTIN_THEMES,
     // project & workspaces
     list_recent_projects: [PROJECT],
     list_closed_projects: [],

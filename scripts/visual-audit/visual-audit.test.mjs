@@ -144,3 +144,68 @@ test("Safari: functions are sent to WebDriver as a script that applies the argum
   assert.equal(new Function(body)(21), 42);
   assert.equal(parseArgs(["--engine", "safari"]).engine, "safari");
 });
+
+// ─── The fixtures ship every built-in theme (#1055) ─────────────────────────
+// Screenshots are only as true as the mocked IPC. `list_themes` once returned
+// atelier alone, so the theme picker looked like a list that failed to load
+// and the design review filed it as a product bug. The names come from
+// theme.rs itself, so adding or removing a theme there fails here until the
+// fixtures mirror it.
+import { readFileSync } from "node:fs";
+import { createRequire, register } from "node:module";
+
+/** Theme names of `builtin_themes()` in src-tauri/src/theme.rs, in order. */
+function builtinThemeNames(rust) {
+  const start = rust.indexOf("pub fn builtin_themes()");
+  assert.ok(start >= 0, "theme.rs has no `pub fn builtin_themes()`");
+  const body = rust.slice(start, rust.indexOf("\n}\n", start));
+  const names = [...body.matchAll(/^\s*name:\s*"([^"]+)"\.into\(\)/gm)].map((m) => m[1]);
+  // One name per ThemeConfig literal, or the parser has gone stale.
+  assert.equal(names.length, body.split("ThemeConfig {").length - 1, "couldn't read every theme name in builtin_themes()");
+  assert.ok(names.length > 0, "builtin_themes() parsed as empty");
+  return names;
+}
+
+/** null when a fixture's `list_themes` result has exactly the built-in names, in order. */
+function themeDrift(where, result, expected) {
+  const names = Array.isArray(result) ? result.map((t) => t?.name) : result;
+  if (JSON.stringify(names) === JSON.stringify(expected)) return null;
+  return `${where}: list_themes returns ${JSON.stringify(names)}, but theme.rs builtin_themes() has ${JSON.stringify(expected)}`;
+}
+
+const BUILTIN = builtinThemeNames(readFileSync(new URL("../../src-tauri/src/theme.rs", import.meta.url), "utf8"));
+
+test("builtin_themes() is read from theme.rs, brand default first", () => {
+  assert.equal(BUILTIN[0], "atelier");
+  assert.ok(BUILTIN.includes("vellum"));
+});
+
+test("theme drift: a one-theme fixture fails, the full list passes", () => {
+  assert.match(themeDrift("old", [{ name: "atelier" }], BUILTIN), /^old: list_themes returns \["atelier"\]/);
+  assert.match(themeDrift("unset", undefined, BUILTIN), /^unset:/);
+  assert.match(themeDrift("reordered", [...BUILTIN].reverse().map((name) => ({ name })), BUILTIN), /^reordered:/);
+  assert.equal(themeDrift("full", BUILTIN.map((name) => ({ name })), BUILTIN), null);
+});
+
+test("every clip scenario's list_themes returns every built-in theme", async () => {
+  // The scenarios are TypeScript with extensionless relative imports, as Vite
+  // takes them. Node strips the types; this hook adds the `.ts` Node needs.
+  register("data:text/javascript," + encodeURIComponent(`export async function resolve(spec, ctx, next) {
+    try { return await next(spec, ctx); } catch (e) {
+      if (e?.code === "ERR_MODULE_NOT_FOUND" && /^\\.\\.?\\//.test(spec) && !/\\.[cm]?[jt]s$/.test(spec)) return next(spec + ".ts", ctx);
+      throw e;
+    }
+  }`));
+  const { SCENARIOS } = await import("../clips/scenarios/index.ts");
+  const drift = Object.entries(SCENARIOS).map(([key, s]) => {
+    const h = s.commands.list_themes;
+    return themeDrift(`scenario ${key}`, typeof h === "function" ? h({}) : h, BUILTIN);
+  }).filter(Boolean);
+  assert.ok(Object.keys(SCENARIOS).length > 1);
+  assert.deepEqual(drift, [], "mirror builtin_themes() in BUILTIN_THEMES (scripts/clips/scenarios/shared.ts)");
+});
+
+test("the README screenshot harness mocks every built-in theme", () => {
+  const { THEMES } = createRequire(import.meta.url)("../screenshots/capture.cjs");
+  assert.equal(themeDrift("scripts/screenshots/capture.cjs", THEMES, BUILTIN), null);
+});
