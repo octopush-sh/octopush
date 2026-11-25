@@ -1112,9 +1112,15 @@ export const ipc = {
     return () => offs.forEach((off) => off());
   },
   getMcpConfig: () => invoke<Record<string, McpServerConfig>>("get_mcp_config"),
-  /** Save the user-level servers; returns them as saved (remote bridges rebuilt). */
-  saveMcpConfig: (servers: Record<string, McpServerConfig>) =>
-    invoke<Record<string, McpServerConfig>>("save_mcp_config", { servers }),
+  /** Save the user-level servers; returns them as saved (remote bridges
+   *  rebuilt, no secret value). `secrets` (server → env name → typed value)
+   *  go to the login Keychain, never to mcp.json; `renamed` (new name → old)
+   *  moves a renamed server's Keychain items. */
+  saveMcpConfig: (
+    servers: Record<string, McpServerConfig>,
+    secrets: Record<string, Record<string, string>> = {},
+    renamed: Record<string, string> = {},
+  ) => invoke<Record<string, McpServerConfig>>("save_mcp_config", { servers, secrets, renamed }),
   testMcpServer: (name: string, config: McpServerConfig) =>
     invoke<McpToolInfo[]>("test_mcp_server", { name, config }),
   /** Stop Talk's cached connection to the server, then run the same smoke test as Test. */

@@ -114,9 +114,10 @@ pub fn bridge_args(remote: &RemoteConfig, client_secret: bool) -> Vec<String> {
     args
 }
 
-/// Whether the entry carries a value for env var `name`.
+/// Whether the entry carries a value for env var `name`: in its env, or
+/// saved in the Keychain (`secret_env`).
 fn has_value(cfg: &McpServerConfig, name: &str) -> bool {
-    cfg.env.get(name).is_some_and(|v| !v.is_empty())
+    cfg.env.get(name).is_some_and(|v| !v.is_empty()) || cfg.secret_env.iter().any(|n| n == name)
 }
 
 /// Rebuild a remote entry's bridge from its choices: `npx` as the command,
@@ -153,6 +154,27 @@ pub fn apply_bridge(cfg: &mut McpServerConfig, npx: &str) {
     let client_secret = remote.client_id.is_some() && has_value(cfg, CLIENT_SECRET_ENV);
     if !client_secret {
         cfg.env.remove(CLIENT_SECRET_ENV);
+    }
+    // The token and the client secret always live in the Keychain; a
+    // removed header's or an unused client secret's item goes.
+    cfg.secret_env.retain(|n| {
+        if n == CLIENT_SECRET_ENV {
+            client_secret
+        } else {
+            !n.starts_with(HEADER_ENV_PREFIX) || wanted.contains(n)
+        }
+    });
+    let mut always: Vec<String> = Vec::new();
+    if remote.auth == "token" {
+        always.push(header_env(TOKEN_HEADER));
+    }
+    if client_secret {
+        always.push(CLIENT_SECRET_ENV.to_string());
+    }
+    for name in always {
+        if !cfg.secret_env.contains(&name) {
+            cfg.secret_env.push(name);
+        }
     }
     cfg.command = npx.to_string();
     cfg.args = bridge_args(&remote, client_secret);
@@ -393,6 +415,27 @@ mod tests {
         let mut cfg = entry(RemoteConfig { auth: "magic".into(), ..remote("oauth") }, &[]);
         apply_bridge(&mut cfg, "npx");
         assert_eq!(cfg.remote.unwrap().auth, "oauth");
+    }
+
+    #[test]
+    fn the_token_and_client_secret_are_always_keychain_secrets() {
+        let mut cfg = entry(remote("token"), &[("OCTOPUSH_MCP_H_AUTHORIZATION", "tok-123")]);
+        cfg.secret_env = vec!["OCTOPUSH_MCP_H_GONE".into(), "NODE_PASSWORD".into()];
+        apply_bridge(&mut cfg, "npx");
+        assert_eq!(cfg.secret_env, vec!["NODE_PASSWORD", "OCTOPUSH_MCP_H_AUTHORIZATION"]);
+
+        // A client secret saved earlier (in the Keychain, "" here) still counts.
+        let mut r = remote("oauth");
+        r.client_id = Some("client-abc".into());
+        let mut cfg = entry(r, &[(CLIENT_SECRET_ENV, "")]);
+        cfg.secret_env = vec![CLIENT_SECRET_ENV.into()];
+        apply_bridge(&mut cfg, "npx");
+        assert!(cfg.args[4].contains("${OCTOPUSH_MCP_CLIENT_SECRET}"), "{:?}", cfg.args);
+        assert_eq!(cfg.secret_env, vec![CLIENT_SECRET_ENV]);
+        // Without a client ID it goes.
+        cfg.remote.as_mut().unwrap().client_id = None;
+        apply_bridge(&mut cfg, "npx");
+        assert!(cfg.secret_env.is_empty() && !cfg.env.contains_key(CLIENT_SECRET_ENV));
     }
 
     #[test]

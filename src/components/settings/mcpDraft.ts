@@ -1,14 +1,29 @@
 // The MCP server form's draft and its round trip to a saved entry. Pure, so
 // the form's rules are testable without rendering it.
+//
+// Secret values never come back from the backend: a value kept in the
+// Keychain reads as "saved" (its env name is in `secret_env`, its env value
+// is ""), and stays saved unless a new value is typed. Typed secret values
+// travel apart from the entry (`configFromDraft`'s `secrets`).
 import type { McpRemoteConfig, McpServerConfig } from "../../lib/types";
 
 export type ServerType = "local" | "remote";
 export type RemoteAuth = McpRemoteConfig["auth"];
 export type RemoteTransport = McpRemoteConfig["transport"];
 
-export interface HeaderRow {
+/** An env variable (Local) or a header (Remote, Custom headers). */
+export interface SecretRow {
   name: string;
+  /** As typed; "" for a saved secret no new value was typed for. */
   value: string;
+  /** "Keep in Keychain". */
+  secret: boolean;
+  /** The env name a Keychain value is saved under, or null. The row is
+   *  saved while its env name is still this one (a rename isn't). */
+  savedAs: string | null;
+  /** The user set "Keep in Keychain" (or the row was loaded): its name no
+   *  longer decides it. */
+  touched: boolean;
 }
 
 /** The add/edit form's fields, as typed. Both kinds' fields are kept, so
@@ -19,25 +34,34 @@ export interface Draft {
   // Local command
   command: string;
   argsText: string;
-  envText: string;
+  env: SecretRow[];
   // Remote URL
   url: string;
   auth: RemoteAuth;
   token: string;
-  headers: HeaderRow[];
+  tokenSaved: boolean;
+  headers: SecretRow[];
   clientId: string;
   clientSecret: string;
+  clientSecretSaved: boolean;
   transport: RemoteTransport;
 }
 
-// Mirrors of `mcp::remote`'s names (its tests pin the same examples).
+// Mirrors of `mcp::remote`'s and `mcp::secrets`' names (their tests pin
+// the same examples).
 export const HEADER_ENV_PREFIX = "OCTOPUSH_MCP_H_";
 export const CLIENT_SECRET_ENV = "OCTOPUSH_MCP_CLIENT_SECRET";
 export const TOKEN_HEADER = "Authorization";
+const SECRET_NAME = /TOKEN|KEY|SECRET|PASSWORD|AUTH|BEARER/i;
 
 /** The env var carrying header `name`'s value (`mcp::remote::header_env`). */
 export function headerEnv(name: string): string {
   return HEADER_ENV_PREFIX + name.trim().replace(/[^A-Za-z0-9]/g, "_").toUpperCase();
+}
+
+/** A name that reads as a credential (`mcp::secrets::looks_secret`). */
+export function looksSecret(name: string): boolean {
+  return SECRET_NAME.test(name);
 }
 
 /** An env var the bridge owns (a header's value or the client secret). */
@@ -45,16 +69,25 @@ function isBridgeEnv(name: string): boolean {
   return name.startsWith(HEADER_ENV_PREFIX) || name === CLIENT_SECRET_ENV;
 }
 
-/** Parse a "KEY=value" textarea into an env map (blank/##-comment lines skipped). */
-export function parseEnv(text: string): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (!t || t.startsWith("#")) continue;
-    const eq = t.indexOf("=");
-    if (eq > 0) env[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
-  }
-  return env;
+/** A new, empty row. */
+export function newRow(): SecretRow {
+  return { name: "", value: "", secret: false, savedAs: null, touched: false };
+}
+
+/** A row's name changed: "Keep in Keychain" follows the name until the
+ *  user sets it. */
+export function renameRow(row: SecretRow, name: string): SecretRow {
+  return { ...row, name, secret: row.touched ? row.secret : looksSecret(name) };
+}
+
+/** The env name a row's value goes under. */
+function rowEnv(row: SecretRow, kind: "env" | "header"): string {
+  return kind === "header" ? headerEnv(row.name) : row.name.trim();
+}
+
+/** The row's Keychain value is saved under its current env name. */
+export function rowSaved(row: SecretRow, kind: "env" | "header"): boolean {
+  return row.secret && row.savedAs !== null && row.savedAs === rowEnv(row, kind);
 }
 
 export function emptyDraft(): Draft {
@@ -63,14 +96,29 @@ export function emptyDraft(): Draft {
     type: "local",
     command: "",
     argsText: "",
-    envText: "",
+    env: [],
     url: "",
     auth: "oauth",
     token: "",
-    headers: [{ name: "", value: "" }],
+    tokenSaved: false,
+    headers: [newRow()],
     clientId: "",
     clientSecret: "",
+    clientSecretSaved: false,
     transport: "auto",
+  };
+}
+
+/** A saved row: in the Keychain when its env name is in `secret_env`. */
+function loadedRow(name: string, envName: string, cfg: McpServerConfig, migrates: boolean): SecretRow {
+  const saved = (cfg.secret_env ?? []).includes(envName);
+  const value = cfg.env[envName] ?? "";
+  return {
+    name,
+    value: saved ? "" : value,
+    secret: saved || migrates,
+    savedAs: saved ? envName : null,
+    touched: true,
   };
 }
 
@@ -78,68 +126,115 @@ export function emptyDraft(): Draft {
  *  local command, whatever its command is. */
 export function draftFrom(name: string, cfg: McpServerConfig): Draft {
   const d = { ...emptyDraft(), name };
+  const secretEnv = cfg.secret_env ?? [];
+  const plainEnv = cfg.plain_env ?? [];
   const remote = cfg.remote;
   if (!remote) {
+    const names = [...Object.keys(cfg.env), ...secretEnv.filter((n) => !(n in cfg.env))];
     return {
       ...d,
       command: cfg.command,
       argsText: cfg.args.join("\n"),
-      envText: Object.entries(cfg.env)
-        .map(([k, v]) => `${k}=${v}`)
-        .join("\n"),
+      env: names.map((n) => {
+        const v = cfg.env[n] ?? "";
+        // A plain value that looks secret moves to the Keychain on the next
+        // save (the backend's migration), so it reads as kept there already.
+        const migrates = looksSecret(n) && !plainEnv.includes(n) && v.trim() !== "" && !v.trim().startsWith("$");
+        return loadedRow(n, n, cfg, migrates);
+      }),
     };
   }
-  const env = cfg.env;
+  const tokenEnv = headerEnv(TOKEN_HEADER);
+  const tokenSaved = remote.auth === "token" && secretEnv.includes(tokenEnv);
   const names = remote.header_names ?? [];
+  const clientSecretSaved = secretEnv.includes(CLIENT_SECRET_ENV);
   return {
     ...d,
     type: "remote",
     url: remote.url,
     auth: remote.auth,
-    token: remote.auth === "token" ? (env[headerEnv(TOKEN_HEADER)] ?? "").replace(/^bearer\s+/i, "") : "",
-    headers: names.length ? names.map((n) => ({ name: n, value: env[headerEnv(n)] ?? "" })) : d.headers,
+    token: remote.auth === "token" && !tokenSaved ? (cfg.env[tokenEnv] ?? "").replace(/^bearer\s+/i, "") : "",
+    tokenSaved,
+    headers: names.length ? names.map((n) => loadedRow(n, headerEnv(n), cfg, false)) : d.headers,
     clientId: remote.client_id ?? "",
-    clientSecret: env[CLIENT_SECRET_ENV] ?? "",
+    clientSecret: clientSecretSaved ? "" : (cfg.env[CLIENT_SECRET_ENV] ?? ""),
+    clientSecretSaved,
     transport: remote.transport,
   };
 }
 
-/** The headers a draft sends, named ones only. */
-function namedHeaders(draft: Draft): HeaderRow[] {
-  return draft.headers.map((h) => ({ name: h.name.trim(), value: h.value })).filter((h) => h.name);
+/** The named rows of a list. */
+function named(rows: SecretRow[]): SecretRow[] {
+  return rows.filter((r) => r.name.trim());
+}
+
+/** What a save sends for one server: the entry (secret values as "") and
+ *  the secret values typed (env name → value), which go to the Keychain. */
+export interface SavedDraft {
+  config: McpServerConfig;
+  secrets: Record<string, string>;
 }
 
 /** The entry a draft saves. `base` is the edited entry: fields the form
  *  doesn't show are kept, and so is a remote entry's own env (a CA path, say).
  *  The backend rebuilds a remote entry's command and args from `remote`. */
-export function configFromDraft(draft: Draft, base?: McpServerConfig): McpServerConfig {
+export function configFromDraft(draft: Draft, base?: McpServerConfig): SavedDraft {
   const rest: Partial<McpServerConfig> = { ...base };
   delete rest.remote;
+  const env: Record<string, string> = {};
+  const secretEnv: string[] = [];
+  const plainEnv: string[] = [];
+  const secrets: Record<string, string> = {};
+  const put = (envName: string, row: { value: string; secret: boolean }, plainMayLookSecret: boolean) => {
+    if (row.secret) {
+      env[envName] = "";
+      secretEnv.push(envName);
+      if (row.value) secrets[envName] = row.value;
+    } else {
+      env[envName] = row.value;
+      if (plainMayLookSecret && looksSecret(envName)) plainEnv.push(envName);
+    }
+  };
+
   if (draft.type === "local") {
+    for (const row of named(draft.env)) put(row.name.trim(), row, true);
     return {
-      ...rest,
-      command: draft.command.trim(),
-      args: draft.argsText.split("\n").map((s) => s.trim()).filter(Boolean),
-      env: parseEnv(draft.envText),
+      config: {
+        ...rest,
+        command: draft.command.trim(),
+        args: draft.argsText.split("\n").map((s) => s.trim()).filter(Boolean),
+        env,
+        secret_env: secretEnv,
+        plain_env: plainEnv,
+      },
+      secrets,
     };
   }
-  const env: Record<string, string> = {};
+
   if (base?.remote) {
+    // The remote entry's own env, outside what the form shows.
     for (const [k, v] of Object.entries(base.env)) if (!isBridgeEnv(k)) env[k] = v;
+    for (const n of base.secret_env ?? []) if (!isBridgeEnv(n)) secretEnv.push(n);
+    for (const n of base.plain_env ?? []) if (!isBridgeEnv(n)) plainEnv.push(n);
   }
   const remote: McpRemoteConfig = { url: draft.url.trim(), auth: draft.auth, transport: draft.transport };
-  if (draft.auth === "token") env[headerEnv(TOKEN_HEADER)] = draft.token.trim();
+  if (draft.auth === "token") put(headerEnv(TOKEN_HEADER), { value: draft.token.trim(), secret: true }, false);
   if (draft.auth === "headers") {
-    const headers = namedHeaders(draft);
-    remote.header_names = headers.map((h) => h.name);
-    for (const h of headers) env[headerEnv(h.name)] = h.value;
+    const headers = named(draft.headers);
+    remote.header_names = headers.map((h) => h.name.trim());
+    for (const h of headers) put(headerEnv(h.name), h, false);
   }
   const clientId = draft.clientId.trim();
   if (draft.auth === "oauth" && clientId) {
     remote.client_id = clientId;
-    if (draft.clientSecret) env[CLIENT_SECRET_ENV] = draft.clientSecret;
+    if (draft.clientSecret || draft.clientSecretSaved) {
+      put(CLIENT_SECRET_ENV, { value: draft.clientSecret, secret: true }, false);
+    }
   }
-  return { ...rest, command: "npx", args: [], env, remote };
+  return {
+    config: { ...rest, command: "npx", args: [], env, secret_env: secretEnv, plain_env: plainEnv, remote },
+    secrets,
+  };
 }
 
 /** A URL mcp-remote connects to without `--allow-http`. */
@@ -150,24 +245,39 @@ function allowedUrl(url: string): boolean {
 /** Why a draft can't be saved, as shown beside Save, or null. Empty
  *  required fields only disable Save (`draftComplete`). */
 export function draftProblem(draft: Draft): string | null {
-  if (draft.type === "local") return null;
+  if (draft.type === "local") {
+    const names = named(draft.env).map((r) => r.name.trim());
+    if (names.some((n) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(n))) return "env names use letters, digits and _";
+    if (new Set(names).size !== names.length) return "each variable once";
+    return null;
+  }
   const url = draft.url.trim();
   if (url && !allowedUrl(url)) return "use an https:// URL (http only for localhost)";
   if (draft.auth === "headers") {
-    const headers = namedHeaders(draft);
-    if (headers.some((h) => !/^[A-Za-z0-9_-]+$/.test(h.name))) return "header names use letters, digits, - and _";
+    const headers = named(draft.headers);
+    if (headers.some((h) => !/^[A-Za-z0-9_-]+$/.test(h.name.trim()))) return "header names use letters, digits, - and _";
     const envs = headers.map((h) => headerEnv(h.name));
     if (new Set(envs).size !== envs.length) return "each header once";
   }
   return null;
 }
 
+/** A secret row has a value: typed, or saved under its name. */
+function secretFilled(row: SecretRow, kind: "env" | "header"): boolean {
+  return !row.secret || !!row.value || rowSaved(row, kind);
+}
+
 /** Every field the draft's type needs is filled in. */
 export function draftComplete(draft: Draft): boolean {
   if (!draft.name.trim()) return false;
-  if (draft.type === "local") return !!draft.command.trim();
+  if (draft.type === "local") {
+    return !!draft.command.trim() && named(draft.env).every((r) => secretFilled(r, "env"));
+  }
   if (!draft.url.trim()) return false;
-  if (draft.auth === "token") return !!draft.token.trim();
-  if (draft.auth === "headers") return namedHeaders(draft).length > 0;
+  if (draft.auth === "token") return !!draft.token.trim() || draft.tokenSaved;
+  if (draft.auth === "headers") {
+    const headers = named(draft.headers);
+    return headers.length > 0 && headers.every((h) => secretFilled(h, "header"));
+  }
   return true;
 }

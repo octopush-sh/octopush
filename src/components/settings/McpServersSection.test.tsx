@@ -20,24 +20,18 @@ vi.mock("../../lib/ipc", () => ({
 vi.mock("../../lib/clipboard", () => ({ copyToClipboard: (...a: unknown[]) => copyToClipboard(...a) }));
 vi.mock("../Toasts", () => ({ pushToast: (...a: unknown[]) => pushToast(...a) }));
 
-const { McpServersSection, parseEnv, draftFrom, mcpFailureFrom } = await import("./McpServersSection");
+const { McpServersSection, draftFrom, mcpFailureFrom } = await import("./McpServersSection");
 
 async function settle() {
   await act(async () => { await Promise.resolve(); });
 }
 
-describe("parseEnv", () => {
-  it("parses KEY=value lines and skips blanks/comments", () => {
-    expect(parseEnv("A=1\n\n# comment\nB=two=three")).toEqual({ A: "1", B: "two=three" });
-  });
-});
-
 describe("draftFrom", () => {
-  it("is the inverse of the form's parsing", () => {
+  it("reads a local entry's fields", () => {
     const cfg = { command: "npx", args: ["-y", "example-server"], env: { A: "1", B: "two=three" } };
     const d = draftFrom("example", cfg);
-    expect(d).toMatchObject({ name: "example", type: "local", command: "npx", argsText: "-y\nexample-server", envText: "A=1\nB=two=three" });
-    expect(parseEnv(d.envText)).toEqual(cfg.env);
+    expect(d).toMatchObject({ name: "example", type: "local", command: "npx", argsText: "-y\nexample-server" });
+    expect(d.env.map((r) => [r.name, r.value, r.secret])).toEqual([["A", "1", false], ["B", "two=three", false]]);
   });
 });
 
@@ -212,24 +206,96 @@ describe("McpServersSection", () => {
       expect(screen.getByText("Add MCP server").closest("button")).toBeDisabled();
     });
 
-    it("prefills env as KEY=value lines", async () => {
+    it("prefills env as rows; a plain value that looks secret is kept in the Keychain from the next save", async () => {
       getMcpConfig.mockResolvedValue({ github });
       render(<McpServersSection />);
       await settle();
       fireEvent.click(screen.getByRole("button", { name: "Edit github" }));
-      expect(screen.getByLabelText("Env")).toHaveValue("GITHUB_TOKEN=ghp_x");
+      expect(screen.getByLabelText("Variable 1 name")).toHaveValue("GITHUB_TOKEN");
+      const value = screen.getByLabelText("Variable 1 value");
+      expect(value).toHaveValue("ghp_x");
+      expect(value).toHaveAttribute("type", "password");
+      const keep = screen.getByRole("switch", { name: "Keep variable 1 in Keychain" });
+      expect(keep).toHaveAttribute("aria-checked", "true");
+      expect(keep).toHaveAttribute("title", "Keep in Keychain");
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        { github: { ...github, env: { GITHUB_TOKEN: "" }, secret_env: ["GITHUB_TOKEN"], plain_env: [] } },
+        { github: { GITHUB_TOKEN: "ghp_x" } },
+        {},
+      );
+    });
+
+    it("a saved secret shows as saved and stays saved unless a new value is typed", async () => {
+      const saved = { command: "uvx", args: [], env: { API_KEY: "", LOG: "debug" }, secret_env: ["API_KEY"] };
+      getMcpConfig.mockResolvedValue({ example: saved });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit example" }));
+      const value = screen.getByLabelText("Variable 1 value");
+      expect(screen.getByLabelText("Variable 1 name")).toHaveValue("API_KEY");
+      expect(value).toHaveValue("");
+      expect(value).toHaveAttribute("placeholder", "•••• saved");
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenLastCalledWith(
+        { example: { ...saved, plain_env: [] } },
+        { example: {} },
+        {},
+      );
+      // A new value goes apart from the entry.
+      fireEvent.click(screen.getByRole("button", { name: "Edit example" }));
+      fireEvent.change(screen.getByLabelText("Variable 1 value"), { target: { value: "k-new" } });
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenLastCalledWith(
+        { example: { ...saved, plain_env: [] } },
+        { example: { API_KEY: "k-new" } },
+        {},
+      );
+    });
+
+    it("Keep in Keychain follows a new variable's name until it's set, and a plain one stays in the file", async () => {
+      getMcpConfig.mockResolvedValue({ fs });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit fs" }));
+      fireEvent.click(screen.getByText("Add a variable"));
+      fireEvent.change(screen.getByLabelText("Variable 1 name"), { target: { value: "AUTH_MODE" } });
+      const keep = screen.getByRole("switch", { name: "Keep variable 1 in Keychain" });
+      expect(keep).toHaveAttribute("aria-checked", "true");
+      // A secret needs a value before it can be saved.
+      expect(screen.getByText("Save changes").closest("button")).toBeDisabled();
+      fireEvent.click(keep);
+      expect(keep).toHaveAttribute("aria-checked", "false");
+      fireEvent.change(screen.getByLabelText("Variable 1 value"), { target: { value: "basic" } });
+      expect(screen.getByLabelText("Variable 1 value")).toHaveAttribute("type", "text");
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        { fs: { ...fs, env: { AUTH_MODE: "basic" }, secret_env: [], plain_env: ["AUTH_MODE"] } },
+        { fs: {} },
+        {},
+      );
     });
 
     it("saving replaces the entry through the save path", async () => {
       const { form } = await openEdit();
       fireEvent.change(within(form).getByLabelText("Args"), { target: { value: "server.sh\n--verbose" } });
-      fireEvent.change(within(form).getByLabelText("Env"), { target: { value: "LOG=debug" } });
+      fireEvent.click(within(form).getByText("Add a variable"));
+      fireEvent.change(within(form).getByLabelText("Variable 1 name"), { target: { value: "LOG" } });
+      fireEvent.change(within(form).getByLabelText("Variable 1 value"), { target: { value: "debug" } });
       fireEvent.click(within(form).getByText("Save changes"));
       await settle();
-      expect(saveMcpConfig).toHaveBeenCalledWith({
-        github,
-        fs: { command: "bash", args: ["server.sh", "--verbose"], env: { LOG: "debug" } },
-      });
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        {
+          github,
+          fs: { command: "bash", args: ["server.sh", "--verbose"], env: { LOG: "debug" }, secret_env: [], plain_env: [] },
+        },
+        { fs: {} },
+        {},
+      );
       expect(screen.queryByRole("group")).toBeNull();
       expect(screen.getByText(/bash server.sh --verbose/)).toBeInTheDocument();
     });
@@ -245,7 +311,12 @@ describe("McpServersSection", () => {
       expect(within(form).queryByText("name already exists")).toBeNull();
       fireEvent.click(within(form).getByText("Save changes"));
       await settle();
-      expect(saveMcpConfig).toHaveBeenCalledWith({ github, files: fs });
+      // The rename travels with the save, so the Keychain items move too.
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        { github, files: { ...fs, secret_env: [], plain_env: [] } },
+        { files: {} },
+        { files: "fs" },
+      );
       expect(screen.getByText("files")).toBeInTheDocument();
       expect(screen.queryByText("fs")).toBeNull();
     });
@@ -337,10 +408,14 @@ describe("McpServersSection", () => {
     fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "example" } });
     fireEvent.click(within(form).getByText("Add server"));
     await settle();
-    expect(saveMcpConfig).toHaveBeenCalledWith({
-      fs: { command: "bash", args: [], env: {} },
-      example: { command: "uvx", args: [], env: {} },
-    });
+    expect(saveMcpConfig).toHaveBeenCalledWith(
+      {
+        fs: { command: "bash", args: [], env: {} },
+        example: { command: "uvx", args: [], env: {}, secret_env: [], plain_env: [] },
+      },
+      { example: {} },
+      {},
+    );
   });
 
   describe("remote servers", () => {
@@ -385,13 +460,24 @@ describe("McpServersSection", () => {
       expect(within(form).getByRole("radio", { name: "Browser (OAuth)" })).toHaveAttribute("aria-checked", "true");
       fireEvent.click(within(form).getByText("Add server"));
       await settle();
-      expect(saveMcpConfig).toHaveBeenCalledWith({
-        "example-remote": { command: "npx", args: [], env: {}, remote: { url: URL, auth: "oauth", transport: "auto" } },
-      });
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        {
+          "example-remote": {
+            command: "npx",
+            args: [],
+            env: {},
+            secret_env: [],
+            plain_env: [],
+            remote: { url: URL, auth: "oauth", transport: "auto" },
+          },
+        },
+        { "example-remote": {} },
+        {},
+      );
       expect(screen.getByText(URL)).toBeInTheDocument();
     });
 
-    it("a token sign-in is masked and goes in the header's env var", async () => {
+    it("a token sign-in is masked and goes to the Keychain, never into the entry", async () => {
       getMcpConfig.mockResolvedValue({});
       render(<McpServersSection />);
       await settle();
@@ -407,14 +493,21 @@ describe("McpServersSection", () => {
       fireEvent.change(token, { target: { value: "tok-123" } });
       fireEvent.click(within(form).getByText("Add server"));
       await settle();
-      expect(saveMcpConfig).toHaveBeenCalledWith({
-        "example-remote": {
-          command: "npx",
-          args: [],
-          env: { OCTOPUSH_MCP_H_AUTHORIZATION: "tok-123" },
-          remote: { url: URL, auth: "token", transport: "auto" },
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        {
+          "example-remote": {
+            command: "npx",
+            args: [],
+            env: { OCTOPUSH_MCP_H_AUTHORIZATION: "" },
+            secret_env: ["OCTOPUSH_MCP_H_AUTHORIZATION"],
+            plain_env: [],
+            remote: { url: URL, auth: "token", transport: "auto" },
+          },
         },
-      });
+        { "example-remote": { OCTOPUSH_MCP_H_AUTHORIZATION: "tok-123" } },
+        {},
+      );
+      expect(JSON.stringify(saveMcpConfig.mock.calls[0][0])).not.toContain("tok-123");
     });
 
     it("custom headers and the advanced choices", async () => {
@@ -428,6 +521,9 @@ describe("McpServersSection", () => {
       fireEvent.change(await within(form).findByLabelText("URL"), { target: { value: URL } });
       fireEvent.click(within(form).getByRole("radio", { name: "Custom headers" }));
       fireEvent.change(await within(form).findByLabelText("Header 1 name"), { target: { value: "X-Api-Key" } });
+      // A header that looks secret is kept in the Keychain, and masked.
+      expect(within(form).getByRole("switch", { name: "Keep header 1 in Keychain" })).toHaveAttribute("aria-checked", "true");
+      expect(within(form).getByLabelText("Header 1 value")).toHaveAttribute("type", "password");
       fireEvent.change(within(form).getByLabelText("Header 1 value"), { target: { value: "k" } });
       fireEvent.click(within(form).getByText("Add a header"));
       fireEvent.change(within(form).getByLabelText("Header 2 name"), { target: { value: "x_api_key" } });
@@ -440,14 +536,20 @@ describe("McpServersSection", () => {
       fireEvent.click(within(form).getByRole("radio", { name: "SSE only" }));
       fireEvent.click(within(form).getByText("Add server"));
       await settle();
-      expect(saveMcpConfig).toHaveBeenCalledWith({
-        "example-remote": {
-          command: "npx",
-          args: [],
-          env: { OCTOPUSH_MCP_H_X_API_KEY: "k" },
-          remote: { url: URL, auth: "headers", transport: "sse-only", header_names: ["X-Api-Key"] },
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        {
+          "example-remote": {
+            command: "npx",
+            args: [],
+            env: { OCTOPUSH_MCP_H_X_API_KEY: "" },
+            secret_env: ["OCTOPUSH_MCP_H_X_API_KEY"],
+            plain_env: [],
+            remote: { url: URL, auth: "headers", transport: "sse-only", header_names: ["X-Api-Key"] },
+          },
         },
-      });
+        { "example-remote": { OCTOPUSH_MCP_H_X_API_KEY: "k" } },
+        {},
+      );
     });
 
     it("Edit reopens a remote server's choices, and offers Clear sign-in for a browser sign-in", async () => {
@@ -484,6 +586,27 @@ describe("McpServersSection", () => {
       const form = screen.getByRole("group", { name: "Edit example-remote" });
       expect(within(form).getByLabelText("Token")).toHaveValue("tok-123");
       expect(within(form).queryByText("Clear sign-in")).toBeNull();
+    });
+
+    it("a saved token reads as saved and needn't be typed again", async () => {
+      const tokenServer = {
+        ...saved,
+        env: { OCTOPUSH_MCP_H_AUTHORIZATION: "" },
+        secret_env: ["OCTOPUSH_MCP_H_AUTHORIZATION"],
+        remote: { ...saved.remote, auth: "token" as const },
+      };
+      getMcpConfig.mockResolvedValue({ "example-remote": tokenServer });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit example-remote" }));
+      const token = screen.getByLabelText("Token");
+      expect(token).toHaveValue("");
+      expect(token).toHaveAttribute("placeholder", "•••• saved");
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      const [servers, secrets] = saveMcpConfig.mock.calls[0];
+      expect(servers["example-remote"].secret_env).toEqual(["OCTOPUSH_MCP_H_AUTHORIZATION"]);
+      expect(secrets).toEqual({ "example-remote": {} });
     });
   });
 });

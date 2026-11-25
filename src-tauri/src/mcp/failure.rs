@@ -66,6 +66,9 @@ static CHILD_MISSING: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+/// A Keychain secret the entry names isn't saved (`secrets::resolve`).
+static NO_SECRET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^The token for (.+?) isn't in the Keychain").unwrap());
 /// A browser sign-in that wasn't finished in time.
 static AUTH_TIMEOUT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:authenticat|authoriz|sign[- ]?in)\w*\s+timed out\b").unwrap());
@@ -163,6 +166,9 @@ fn summarize(lines: &[String], text: &str) -> (String, Option<String>) {
                 base_name(program)
             )),
         );
+    }
+    if let Some(c) = NO_SECRET.captures(first) {
+        return (format!("The token for {} isn't in the Keychain.", &c[1]), hint("Edit the server to enter it."));
     }
     if let Some(c) = OUR_TIMEOUT.captures(first) {
         return (
@@ -361,6 +367,16 @@ mod tests {
         assert!(f.hint.as_deref().unwrap().contains("which node"), "{:?}", f.hint);
         let f = classify_failure(&closed("Error: spawn uvx ENOENT\n    at ChildProcess._handle.onexit (node:internal/child_process:286:19)"));
         assert_eq!(f.summary, "The server couldn't start `uvx`.");
+    }
+
+    #[test]
+    fn a_secret_missing_from_the_keychain() {
+        let f = classify_failure(
+            "The token for example-remote isn't in the Keychain; edit the server to enter it.\nOCTOPUSH_MCP_H_AUTHORIZATION has no saved value.",
+        );
+        assert_eq!(f.summary, "The token for example-remote isn't in the Keychain.");
+        assert_eq!(f.hint.as_deref(), Some("Edit the server to enter it."));
+        assert!(f.detail.contains("OCTOPUSH_MCP_H_AUTHORIZATION"));
     }
 
     #[test]

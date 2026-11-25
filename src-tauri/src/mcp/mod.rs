@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 mod failure;
 pub mod remote;
+pub mod secrets;
 pub use failure::{classify_failure, classify_failure_with, McpFailure};
 // Per-conversation server scope and the registry's status read (Companion).
 pub mod scope;
@@ -45,6 +46,14 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Env names whose values live in the login Keychain (`secrets`); their
+    /// `env` value is written as `""`, never the secret.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_env: Vec<String>,
+    /// Env names that look like secrets but the user chose to keep in this
+    /// file ("Keep in Keychain" off): the save's migration leaves them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plain_env: Vec<String>,
     /// A remote server's choices in Settings, from which Octopush builds
     /// the bridge in `command`/`args`/`env` (`remote::apply_bridge`). An
     /// entry without it is a local command.
@@ -119,6 +128,8 @@ pub fn save_user_config(servers: &HashMap<String, McpServerConfig>) -> Result<()
 }
 
 /// Load configured servers for a worktree (project overrides user on name clash).
+/// A project entry can't name Keychain items: its `secret_env` is dropped,
+/// so a repo's file never gets the user's secrets into a command it chose.
 pub fn load_server_configs(worktree: &Path) -> HashMap<String, McpServerConfig> {
     let mut merged: HashMap<String, McpServerConfig> = HashMap::new();
     if let Some(home) = dirs::home_dir() {
@@ -127,9 +138,42 @@ pub fn load_server_configs(worktree: &Path) -> HashMap<String, McpServerConfig> 
         }
     }
     if let Ok(c) = std::fs::read_to_string(worktree.join(".claude/mcp.json")) {
-        merged.extend(parse_mcp_config(&c));
+        merged.extend(project_entries(&c));
     }
     merged
+}
+
+/// A project's `.claude/mcp.json` entries, without `secret_env`.
+fn project_entries(content: &str) -> HashMap<String, McpServerConfig> {
+    let mut entries = parse_mcp_config(content);
+    for cfg in entries.values_mut() {
+        cfg.secret_env.clear();
+    }
+    entries
+}
+
+/// Settings' save of the user-level servers. `new_values` are the secret
+/// values the form sent apart from the entries (server → env name →
+/// value). Remote bridges are rebuilt, every secret value moves to `store`
+/// (`secrets::plan_secrets`, with the migration of plain values that look
+/// secret), `mcp.json` is written without them, and items nothing names any
+/// more are deleted. Returns the old entries, the saved ones, and the
+/// servers whose secret values changed.
+#[allow(clippy::type_complexity)]
+pub fn save_user_servers(
+    mut servers: HashMap<String, McpServerConfig>,
+    new_values: HashMap<String, HashMap<String, String>>,
+    renamed: &HashMap<String, String>,
+    store: &dyn secrets::SecretStore,
+) -> Result<(HashMap<String, McpServerConfig>, HashMap<String, McpServerConfig>, Vec<String>), String> {
+    secrets::merge_new_values(&mut servers, new_values);
+    let mut servers = remote::with_bridges(servers);
+    let old = load_user_config();
+    let plan = secrets::plan_secrets(&old, &mut servers, renamed);
+    secrets::apply_before_save(store, &plan)?;
+    save_user_config(&servers)?;
+    secrets::apply_after_save(store, &plan);
+    Ok((old, servers, plan.touched))
 }
 
 /// The servers whose entry differs between two configs: changed, removed or
@@ -650,6 +694,8 @@ pub struct McpRegistry {
     /// Lock order: `conns` or `failed` may be held while taking `resets`,
     /// never the other way round.
     resets: Mutex<HashMap<String, u64>>,
+    /// Where an entry's `secret_env` values are read at spawn.
+    secrets: Arc<dyn secrets::SecretStore>,
 }
 
 /// How long one MCP `tools/call` may take on the wire before the caller
@@ -706,12 +752,18 @@ pub async fn call_bounded(
 
 impl McpRegistry {
     pub fn new() -> Self {
+        Self::with_secrets(secrets::keychain())
+    }
+
+    /// A registry reading secrets from `store` (the Keychain in the app).
+    pub fn with_secrets(store: Arc<dyn secrets::SecretStore>) -> Self {
         Self {
             conns: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             connecting: Mutex::new(HashMap::new()),
             failed: Mutex::new(HashMap::new()),
             resets: Mutex::new(HashMap::new()),
+            secrets: store,
         }
     }
 
@@ -837,21 +889,32 @@ impl McpRegistry {
     /// The process is registered as `pending` for the length of the
     /// handshake so an abort can reach it.
     fn connect(&self, name: &str, cfg: &McpServerConfig) -> Result<Connection, String> {
-        let child = Self::spawn(cfg)?;
+        let (child, values) = Self::spawn(name, cfg, &*self.secrets)?;
         self.pending.lock().insert(name.to_string(), Arc::clone(&child));
-        // A server that echoes its own env can't show it in the failure.
-        let result = Self::handshake(name, child).map_err(|e| redact_text(&e, &known_secrets(cfg)));
+        // A server that echoes its own env or Keychain values can't show
+        // them in the failure.
+        let result = Self::handshake(name, child)
+            .map_err(|e| redact_text(&secrets::scrub(&e, &values), &known_secrets(cfg)));
         self.pending.lock().remove(name);
         result
     }
 
-    fn spawn(cfg: &McpServerConfig) -> Result<ChildHandle, String> {
+    /// Start a server's process, its `secret_env` values read from `store`
+    /// into its environment. Returns them too, to scrub from a failure.
+    #[allow(clippy::type_complexity)]
+    fn spawn(
+        name: &str,
+        cfg: &McpServerConfig,
+        store: &dyn secrets::SecretStore,
+    ) -> Result<(ChildHandle, Vec<(String, String)>), String> {
         // The PATH CLI stages run with: a GUI app starts from launchd's
         // minimal PATH, where `npx`, `uvx` or `node` aren't found.
         let plan = spawn_plan(cfg, &crate::orchestrator::cli_runner::resolved_cli_path())?;
+        let secret_values = secrets::resolve(name, cfg, store)?;
         let mut cmd = Command::new(&plan.program);
         cmd.args(&cfg.args)
             .envs(&cfg.env)
+            .envs(secret_values.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -868,7 +931,7 @@ impl McpRegistry {
             cmd.process_group(0);
         }
         let child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", plan.program.display()))?;
-        Ok(Arc::new(Mutex::new(child)))
+        Ok((Arc::new(Mutex::new(child)), secret_values))
     }
 
     /// The MCP initialize handshake + `tools/list` over an already-spawned
@@ -948,7 +1011,18 @@ impl McpRegistry {
     /// touch the cache or the failed-set, so testing a broken config doesn't
     /// poison a real session.
     pub fn test_connect(name: &str, cfg: &McpServerConfig) -> Result<Vec<McpToolInfo>, String> {
-        let conn = Self::handshake(name, Self::spawn(cfg)?).map_err(|e| redact_text(&e, &known_secrets(cfg)))?;
+        Self::test_connect_with(name, cfg, &*secrets::keychain())
+    }
+
+    /// [`Self::test_connect`] reading secrets from `store`.
+    pub fn test_connect_with(
+        name: &str,
+        cfg: &McpServerConfig,
+        store: &dyn secrets::SecretStore,
+    ) -> Result<Vec<McpToolInfo>, String> {
+        let (child, values) = Self::spawn(name, cfg, store)?;
+        let conn = Self::handshake(name, child)
+            .map_err(|e| redact_text(&secrets::scrub(&e, &values), &known_secrets(cfg)))?;
         Ok(conn.tools.clone())
     }
 
@@ -1600,6 +1674,54 @@ done
                  Use its full path (run `which octopush-no-such-server-xyz` in Terminal)."
             )
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_servers_keychain_secrets_reach_its_process_and_never_its_failure() {
+        // Writes the token where the test can read it, reads the first
+        // request, echoes the token and exits before answering.
+        const SECRET_FIXTURE: &str =
+            "#!/usr/bin/env bash\nprintf '%s' \"$MY_TOKEN\" > \"$DUMP\"\nread -r line\necho \"token is $MY_TOKEN\"\nexit 1\n";
+        let (dir, _log) = fixture_dir(SECRET_FIXTURE);
+        let dump = dir.path().join("token.txt");
+        let cfg = McpServerConfig {
+            command: "bash".into(),
+            args: vec![dir.path().join("hang.sh").to_string_lossy().into_owned()],
+            env: HashMap::from([
+                ("DUMP".to_string(), dump.to_string_lossy().into_owned()),
+                ("MY_TOKEN".to_string(), String::new()),
+            ]),
+            secret_env: vec!["MY_TOKEN".into()],
+            ..Default::default()
+        };
+        let store = secrets::MemoryStore::with(&[("example/MY_TOKEN", "tok-from-keychain")]);
+        let err = McpRegistry::test_connect_with("example", &cfg, &store).unwrap_err();
+        assert_eq!(std::fs::read_to_string(&dump).unwrap(), "tok-from-keychain", "the process got the value");
+        assert!(err.contains("token is [redacted]") && !err.contains("tok-from-keychain"), "{err}");
+
+        // A secret that isn't saved fails before anything starts.
+        std::fs::remove_file(&dump).unwrap();
+        let err = McpRegistry::test_connect_with("other", &cfg, &store).unwrap_err();
+        assert!(err.starts_with("The token for other isn't in the Keychain; edit the server to enter it."), "{err}");
+        assert!(!dump.exists());
+        assert_eq!(classify_failure(&err).summary, "The token for other isn't in the Keychain.");
+
+        // The same entry in a repo's `.claude/mcp.json` gets nothing from
+        // the Keychain: Talk starts it with the file's empty value.
+        write_servers(dir.path(), &HashMap::from([("example".to_string(), cfg.clone())]));
+        let store = Arc::new(secrets::MemoryStore::with(&[("example/MY_TOKEN", "tok-2")]));
+        let reg = McpRegistry::with_secrets(Arc::clone(&store) as Arc<dyn secrets::SecretStore>);
+        assert!(reg.call(dir.path(), "mcp__example__x", &json!({})).is_err());
+        assert_eq!(std::fs::read_to_string(&dump).unwrap(), "");
+        assert!(store.reads.lock().is_empty(), "the Keychain wasn't even read");
+    }
+
+    #[test]
+    fn a_project_entry_cant_name_keychain_items() {
+        let content = r#"{"mcpServers":{"example":{"command":"uvx","env":{"GITHUB_TOKEN":""},"secret_env":["GITHUB_TOKEN"]}}}"#;
+        assert_eq!(parse_mcp_config(content)["example"].secret_env, vec!["GITHUB_TOKEN"], "user-level entries keep it");
+        assert!(project_entries(content)["example"].secret_env.is_empty());
     }
 
     #[test]

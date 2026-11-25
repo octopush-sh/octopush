@@ -2276,23 +2276,36 @@ pub async fn get_mcp_config(
 /// Replace the user-level MCP server config, then stop Talk's cached
 /// connection to every server whose entry changed or was removed, so the next
 /// call spawns it from the saved config (a call in flight on the old process
-/// fails). A remote entry's bridge is rebuilt from its choices first
-/// (`mcp::remote::with_bridges`). Returns the config as saved.
+/// fails), and tell the Companion. A remote entry's bridge is rebuilt from
+/// its choices first, and secret values move to the login Keychain
+/// (`mcp::save_user_servers`). `secrets` holds the values Settings' secret
+/// fields were given (server → env name → value; never written to
+/// `mcp.json`; an empty value keeps the saved one), `renamed` maps a new
+/// server name to the old one so its Keychain items move with it. Returns
+/// the entries as saved, without any secret value.
 #[tauri::command]
 pub async fn save_mcp_config(
     app: AppHandle,
     state: State<'_, AppState>,
     servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
+    secrets: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+    renamed: Option<std::collections::HashMap<String, String>>,
 ) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
     let registry = Arc::clone(&state.chat.mcp);
-    // `npx` lookup, file I/O, kill + reap: off the runtime thread.
+    // `npx` lookup, Keychain and file I/O, kill + reap: off the runtime thread.
     let saved = tokio::task::spawn_blocking(
         move || -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
-            let servers = crate::mcp::remote::with_bridges(servers);
-            let old = crate::mcp::load_user_config();
-            crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)?;
-            registry.apply_config_change(&old, &servers);
-            Ok(servers)
+            let store = crate::mcp::secrets::keychain();
+            let renamed = renamed.unwrap_or_default();
+            let (old, saved, touched) =
+                crate::mcp::save_user_servers(servers, secrets.unwrap_or_default(), &renamed, &*store)
+                    .map_err(crate::error::AppError::Other)?;
+            registry.apply_config_change(&old, &saved);
+            // A new secret value leaves the entry as it reads: restart it too.
+            for name in touched {
+                registry.reset_server(&name);
+            }
+            Ok(saved)
         },
     )
     .await
