@@ -391,15 +391,11 @@ impl AgentRunner for ApiRunner {
 
         match result {
             Ok(r) => {
-                // Own spend at the stage model's rate, plus any `ask_stage`
-                // peer consultations already priced at each PEER model's rate.
-                let cost = crate::orchestrator::cost::stage_cost(
-                    &stage.agent_model,
-                    r.input_tokens,
-                    r.output_tokens,
-                    r.cache_read_tokens,
-                    r.cache_creation_tokens,
-                ) + r.peer_cost_usd;
+                // Own spend at the stage model's rate, priced request by
+                // request (each request's own long-prompt tier), plus any
+                // `ask_stage` peer consultations already priced at each PEER
+                // model's rate.
+                let cost = r.cost_usd + r.peer_cost_usd;
                 // Escape valve: the stage called `ask_director`. This is neither
                 // a success nor a failure — it's a block. Carry the questions up
                 // so the drive parks the stage as an `awaiting_checkpoint`

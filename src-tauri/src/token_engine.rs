@@ -220,11 +220,12 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         // Haiku 5.5 is tiered per request: prompts over 100,000 tokens (input
         // + cache reads + cache writes) cost 0.50 / 0.625 / 0.05 / 2.50. This
         // is the <=100K tier; per-request paths (Talk director rounds, one-shot
-        // AI calls, Claude Code transcripts, the PTY usage block) apply the
-        // long tier via `request_prices`. Aggregated usage (DIRECT stages,
-        // sub-agent attempts) keeps this tier — the size of each request
-        // inside it is unknown — so long-prompt requests there are
-        // under-counted.
+        // AI calls, Claude Code transcripts, the PTY usage block, API-substrate
+        // DIRECT stages and Talk sub-agents, and the streamed estimate of a
+        // stopped, stalled or crashed Claude Code stage) apply the long tier
+        // via `request_prices`. A finished Claude Code DIRECT stage books
+        // Claude Code's own `total_cost_usd`, so it under-counts only if that
+        // figure leaves out the >100K tier.
         "claude-haiku-5-5" => (0.10, 0.125, 0.01, 0.50),
         "claude-haiku-4-5" => (1.0, 1.25, 0.10, 5.0),
         "claude-3-5-haiku" => (0.80, 1.0, 0.08, 4.0),
@@ -236,10 +237,11 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         // which Octopush never requests).
         //
         // Every GPT-6 price here is the <=272K-input-token tier; per-request
-        // paths (Talk director rounds, one-shot AI calls) apply the long tier
-        // via `request_prices`. Aggregated usage (Codex CLI stages, sub-agent
-        // attempts) keeps this tier — the size of each request inside it is
-        // unknown — so long-prompt requests there are under-counted.
+        // paths (Talk director rounds, one-shot AI calls, API-substrate DIRECT
+        // stages and Talk sub-agents) apply the long tier via
+        // `request_prices`. Codex CLI stages report only turn totals and keep
+        // this tier — the size of each request inside a turn is unknown — so
+        // long-prompt requests there are under-counted.
         "gpt-6.1-terra" => (1.0, 1.25, 0.05, 5.0),
         // The rest of GPT-6: API pricing page (fetched 2026-11-17), the
         // short-context input / 30-minute write / cached input / output
@@ -592,8 +594,8 @@ pub fn long_prompt_tier(model: &str) -> Option<LongPromptTier> {
 
 /// The prices that apply to ONE request of `prompt_tokens` (input + cache
 /// read + cache write). Only per-request callers use this; aggregated usage
-/// (a DIRECT stage, a sub-agent attempt) keeps the base tier, since the
-/// size of each request inside the aggregate is unknown.
+/// (a Codex turn total) keeps the base tier, since the size of each request
+/// inside the aggregate is unknown.
 pub fn request_prices(model: &str, base: ModelPrices, prompt_tokens: u64) -> ModelPrices {
     match long_prompt_tier(model) {
         Some(t) if prompt_tokens > t.threshold => ModelPrices {
@@ -722,7 +724,7 @@ pub fn ledger_cost_basis(model: &str, cost_usd: f64, tokens: i64) -> &'static st
 }
 
 /// Canonical cost for a usage tuple, via [`prices_for`], at the base tier
-/// (safe for aggregated usage). An unpriced model yields `0.0` — callers
+/// (for aggregated usage; one request's usage takes [`request_cost_for`]). An unpriced model yields `0.0` — callers
 /// that care about the distinction consult [`prices_for`] directly.
 pub fn cost_for(
     model: &str,
