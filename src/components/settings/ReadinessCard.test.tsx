@@ -104,7 +104,7 @@ describe("ReadinessCard · crew models", () => {
 
 describe("ReadinessCard · recommended Claude Code note", () => {
   const worktree = { version: "2.1.330", reason: "fixes ExitWorktree removing a worktree another session is using", audience: "run" as const };
-  const mcp = { version: "2.1.331", reason: "fixes MCP tool calls hanging up to 30 minutes on a malformed server reply", audience: "any" as const };
+  const mcp = { version: "2.1.331", reason: "fixes MCP tool calls hanging up to 30 minutes on some malformed replies from a local or WebSocket server", audience: "any" as const };
   const recommended = [worktree, mcp];
   const claudeCrew = () => {
     const crew = relay("sonnet");
@@ -120,30 +120,33 @@ describe("ReadinessCard · recommended Claude Code note", () => {
     expect(within(r).getByText("Ready")).toBeInTheDocument();
     const line = within(r).getByTestId("readiness-note");
     expect(line).toHaveTextContent(
-      "Recommended: Claude Code 2.1.331. 2.1.330 fixes ExitWorktree removing a worktree another session is using. 2.1.331 fixes MCP tool calls hanging up to 30 minutes on a malformed server reply.",
+      "Recommended: Claude Code 2.1.331. 2.1.330 fixes ExitWorktree removing a worktree another session is using. 2.1.331 fixes MCP tool calls hanging up to 30 minutes on some malformed replies from a local or WebSocket server.",
     );
     expect(line).toHaveAttribute("data-tour", "settings-readiness-claude-note");
     expect(line).toHaveClass("text-octo-sage");
   });
 
-  it("shows only the crew fixes when a crew runs Claude Code and no Run session does", async () => {
-    listPipelines.mockResolvedValue([claudeCrew()]);
-    readinessCheck.mockResolvedValue([row({ id: "claude", label: "Claude Code", value: "2.1.325", recommended })]);
-    render(<ReadinessCard />);
-    const r = await screen.findByTestId("readiness-row-claude");
-    const line = await within(r).findByTestId("readiness-note");
-    expect(line).toHaveTextContent(
-      "Recommended: Claude Code 2.1.331 fixes MCP tool calls hanging up to 30 minutes on a malformed server reply.",
-    );
-    expect(line).not.toHaveTextContent("ExitWorktree");
-  });
-
-  it("hides the note with no Run session on Claude Code and no crew on it", async () => {
+  it("shows the fixes for everyone on Claude Code with no Run session, whatever the crews", async () => {
+    // Every install has builtin crews with Claude Code CLI stages, so the
+    // crews don't gate the note: a library with none on Claude Code still shows it.
     useTerminalsStore.setState({
       terminalsByWs: { w1: [runSession({ agentCli: "codex" }), runSession({ id: "t2", running: false })] },
     });
     listPipelines.mockResolvedValue([relay("sonnet")]);
     readinessCheck.mockResolvedValue([row({ id: "claude", label: "Claude Code", value: "2.1.325", recommended })]);
+    render(<ReadinessCard />);
+    const r = await screen.findByTestId("readiness-row-claude");
+    const line = await within(r).findByTestId("readiness-note");
+    expect(line).toHaveTextContent(
+      "Recommended: Claude Code 2.1.331 fixes MCP tool calls hanging up to 30 minutes on some malformed replies from a local or WebSocket server.",
+    );
+    expect(line).not.toHaveTextContent("ExitWorktree");
+  });
+
+  it("hides the note when the only missing fix is for Run sessions and none runs Claude Code", async () => {
+    useTerminalsStore.setState({ terminalsByWs: { w1: [runSession({ agentCli: "codex" })] } });
+    listPipelines.mockResolvedValue([claudeCrew()]);
+    readinessCheck.mockResolvedValue([row({ id: "claude", label: "Claude Code", value: "2.1.329", recommended: [worktree] })]);
     render(<ReadinessCard />);
     const r = await screen.findByTestId("readiness-row-claude");
     await waitFor(() => expect(listPipelines).toHaveBeenCalled());
