@@ -724,8 +724,9 @@ pub fn ledger_cost_basis(model: &str, cost_usd: f64, tokens: i64) -> &'static st
 }
 
 /// Canonical cost for a usage tuple, via [`prices_for`], at the base tier
-/// (for aggregated usage; one request's usage takes [`request_cost_for`]). An unpriced model yields `0.0` — callers
-/// that care about the distinction consult [`prices_for`] directly.
+/// (for aggregated usage; one request's usage takes [`request_cost_for`]).
+/// An unpriced model yields `0.0` — callers that care about the distinction
+/// consult [`prices_for`] directly.
 pub fn cost_for(
     model: &str,
     input: u64,
@@ -784,8 +785,9 @@ impl TokenEngine {
     /// belongs to and whether the director or a sub-agent
     /// (`subagent:<call id>`) spent it.
     ///
-    /// The event may aggregate several requests (a sub-agent attempt), so a
-    /// $0 event is priced at the base tier; use
+    /// The event may aggregate several requests (a sub-agent attempt, which
+    /// brings its own per-request cost), so a $0 event is priced at the base
+    /// tier; use
     /// [`record_request_in_thread`](Self::record_request_in_thread) for ONE
     /// provider response.
     pub fn record_in_thread(

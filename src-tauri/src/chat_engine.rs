@@ -1969,7 +1969,9 @@ impl ChatEngine {
     /// override may differ from the thread's) and under its call id, so the
     /// Companion's conversation cost splits director from crew. An escalated
     /// sub-agent bills every attempt at its own model's price, so each
-    /// attempt is its own ledger row.
+    /// attempt is its own ledger row. The row takes the attempt's own cost,
+    /// priced per request by the agentic loop (Haiku 5.5's long tier); a $0
+    /// attempt is priced (or marked unpriced) by the ledger.
     fn record_subagent_spend(&self, workspace_id: &str, thread_id: &str, call_id: &str, o: &AgentOutcome) {
         let origin = subagent_origin(call_id);
         for a in o.billed_attempts() {
@@ -1986,7 +1988,7 @@ impl ChatEngine {
                 cache_read_tokens: a.cache_read_tokens,
                 cache_creation_tokens: a.cache_creation_tokens,
                 model: a.model.clone(),
-                cost_usd: 0.0,
+                cost_usd: a.cost_usd,
             }, "talk", Some(thread_id), Some(&origin)) {
                 tracing::warn!(error = %e, "failed to record sub-agent token event");
             }
@@ -3878,6 +3880,37 @@ mod continuation_tests {
     fn subagent_origin_is_keyed_by_call_id() {
         assert_eq!(subagent_origin("toolu_01"), "subagent:toolu_01");
         assert_eq!(DIRECTOR_ORIGIN, "director");
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_subagents_ledger_rows_take_each_attempts_per_request_cost() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        // A Haiku 5.5 attempt of a 40K and a 140K request, as the agentic
+        // loop prices them: 40K at 0.10 / 0.01 / 0.50, 140K at 0.50 / 0.05 / 2.50.
+        let short = (10_000.0 * 0.10 + 30_000.0 * 0.01 + 1_000.0 * 0.50) / 1e6;
+        let long = (20_000.0 * 0.50 + 120_000.0 * 0.05 + 2_000.0 * 2.50) / 1e6;
+        let haiku = AgentAttempt {
+            model: "claude-haiku-5-5".into(), input_tokens: 30_000, output_tokens: 3_000,
+            cache_read_tokens: 150_000, cache_creation_tokens: 0, cost_usd: short + long,
+        };
+        // Escalated to a second model; each attempt keeps its own figure.
+        let opus = AgentAttempt { model: "opus".into(), input_tokens: 200, output_tokens: 20, cost_usd: 0.20, ..Default::default() };
+        let o = AgentOutcome { attempts: vec![haiku, opus], cost_usd: short + long + 0.20, ..Default::default() };
+        engine.record_subagent_spend("ws-1", "t-1", "call-1", &o);
+        let c = db.lock().thread_cost("t-1", None).unwrap();
+        assert_eq!(c.calls, 2);
+        assert!((c.subagents_usd - (short + long + 0.20)).abs() < 1e-12, "{}", c.subagents_usd);
+
+        // A $0 attempt on a model with no price still lands unpriced.
+        let unknown = AgentOutcome { model: "mystery-model-9".into(), input_tokens: 100, output_tokens: 10, ..Default::default() };
+        engine.record_subagent_spend("ws-1", "t-2", "call-2", &unknown);
+        let c = db.lock().thread_cost("t-2", None).unwrap();
+        assert_eq!((c.unpriced_calls, c.subagents_usd), (1, 0.0));
     }
 }
 
