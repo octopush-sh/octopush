@@ -225,16 +225,16 @@ export function AccountPane() {
                 <button
                   type="button"
                   onClick={() => void openPortal()}
-                  className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:border-[var(--brass-dim)] hover:text-octo-brass"
+                  className="inline-flex items-center justify-center gap-1.5 rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory"
                 >
-                  Manage account ↗
+                  Manage your account ↗
                 </button>
                 <button
                   type="button"
                   onClick={() => void signOut()}
-                  className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:border-octo-rouge hover:text-octo-rouge"
+                  className="inline-flex items-center justify-center gap-1.5 rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-mute transition-colors duration-[180ms] hover:border-octo-rouge hover:text-octo-rouge"
                 >
-                  Sign out
+                  Sign out of Octopush
                 </button>
               </div>
             </div>
