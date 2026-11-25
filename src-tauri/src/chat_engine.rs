@@ -63,7 +63,7 @@ fn default_talk_system_prompt(workspace_path: &str) -> String {
          Agent, never emulate them one after another yourself. Your `mcp__` tools \
          come from MCP servers that Octopush runs and the user manages in Settings › \
          Integrations (where one can be reconnected), so never point the user to \
-         Claude Code's `/mcp` or any CLI command for them. Use the tools to \
+         Claude Code's `/mcp` or `claude mcp` commands for them. Use the tools to \
          help the user; be concise and take action rather than just explaining \
          what to do."
     )
@@ -3923,7 +3923,9 @@ mod tests {
         let prompt = default_talk_system_prompt("/w");
         assert!(prompt.starts_with("You are a helpful coding assistant working in the project at /w."));
         assert!(prompt.contains("the user manages in Settings › Integrations"), "{prompt}");
-        assert!(prompt.contains("never point the user to Claude Code's `/mcp` or any CLI command"), "{prompt}");
+        assert!(prompt.contains("never point the user to Claude Code's `/mcp` or `claude mcp` commands"), "{prompt}");
+        // A hint such as "run `which npx` in Terminal" may still reach the user.
+        assert!(!prompt.contains("any CLI command"), "{prompt}");
     }
 
     #[test]

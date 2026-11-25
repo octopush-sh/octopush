@@ -682,9 +682,11 @@ pub fn merge_path_dirs(parts: &[&str]) -> String {
 
 /// Find an executable named `name` in the first dir of `path_env` (colon-list)
 /// that contains a regular file with an exec bit. Returns its absolute path.
+/// Empty and relative entries (`.`, `bin`) are skipped: they'd resolve
+/// against whatever the working directory happens to be.
 pub fn resolve_executable(name: &str, path_env: &str) -> Option<PathBuf> {
     for dir in path_env.split(':') {
-        if dir.is_empty() {
+        if !Path::new(dir).is_absolute() {
             continue;
         }
         let candidate = Path::new(dir).join(name);
@@ -761,7 +763,9 @@ pub(crate) const LOGIN_SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Dur
 /// `shell -lic 'env -0'`, parsed, or empty when it fails or outlives `timeout`.
 /// No stdin (an rc file that reads input gets EOF instead of waiting), its
 /// own process group, and on timeout the whole group is killed, so a job the
-/// rc file started can't keep the pipe open either.
+/// rc file started can't keep the pipe open either. When the shell itself
+/// exited cleanly and only such a job held the pipe, the env it printed is
+/// kept.
 pub(crate) fn probe_login_shell_env(shell: &str, timeout: std::time::Duration) -> Vec<(String, String)> {
     use std::io::Read as _;
     use std::os::unix::process::CommandExt as _;
@@ -779,17 +783,29 @@ pub(crate) fn probe_login_shell_env(shell: &str, timeout: std::time::Duration) -
             return Vec::new();
         }
     };
+    // What was read so far stays reachable at the deadline, while a job still
+    // holds the pipe open.
+    let read = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(mut out) = child.stdout.take() {
+        let read = std::sync::Arc::clone(&read);
         std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            let _ = tx.send(buf);
+            let mut chunk = [0u8; 8192];
+            loop {
+                match out.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => read.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(());
         });
     }
+    let printed = || std::mem::take(&mut *read.lock().unwrap_or_else(|e| e.into_inner()));
     let deadline = std::time::Instant::now() + timeout;
     let mut exited = None;
-    let stdout = loop {
+    let closed = loop {
         if exited.is_none() {
             exited = child.try_wait().ok().flatten();
         }
@@ -797,36 +813,47 @@ pub(crate) fn probe_login_shell_env(shell: &str, timeout: std::time::Duration) -
             // Exited: its output is complete once the pipe closes.
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(left.max(std::time::Duration::from_millis(1))) {
-                Ok(buf) => break Some(buf),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Some(Vec::new()),
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break true,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
         if std::time::Instant::now() >= deadline {
-            break None;
+            break false;
         }
         if exited.is_none() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     };
-    match (stdout, exited) {
-        (Some(buf), Some(status)) if status.success() => parse_env0(&buf),
-        (Some(_), _) => Vec::new(),
-        (None, _) => {
-            // SAFETY: signals the probe's own process group (`process_group(0)`).
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            tracing::warn!(
-                shell,
-                timeout_secs = timeout.as_secs(),
-                "the login shell didn't print its env in time; using the app's PATH and the common bin dirs"
-            );
-            Vec::new()
-        }
+    let succeeded = exited.is_some_and(|s| s.success());
+    if closed {
+        return if succeeded { parse_env0(&printed()) } else { Vec::new() };
     }
+    // The deadline, with the pipe still open. SAFETY: signals the probe's own
+    // process group (`process_group(0)`). Its id can't have been reused even
+    // when the shell was already reaped: a group id stays taken while a member
+    // lives, and one still holds the pipe open.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    if succeeded {
+        // The shell printed its env and exited; only a job it started kept
+        // the pipe open. Killed with the group, the pipe closes: keep what was
+        // printed.
+        let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
+        tracing::warn!(
+            shell,
+            "the login shell exited but a job it started kept its output open; stopped the job and kept the env the shell printed"
+        );
+        return parse_env0(&printed());
+    }
+    tracing::warn!(
+        shell,
+        timeout_secs = timeout.as_secs(),
+        "the login shell didn't print its env in time; using the app's PATH and the common bin dirs"
+    );
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -4823,6 +4850,27 @@ mod login_probe_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the job the shell started was killed with it");
+    }
+
+    #[test]
+    fn a_job_holding_the_pipe_after_the_shell_exited_keeps_the_printed_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("job.pid");
+        let shell = stub_shell(
+            dir.path(),
+            &format!("printf 'PATH=/opt/x/bin\\000'\nsleep 30 &\necho $! > '{}'\nexit 0", pidfile.display()),
+        );
+        let started = std::time::Instant::now();
+        let env = probe_login_shell_env(shell.to_str().unwrap(), std::time::Duration::from_millis(800));
+        assert_eq!(env, vec![("PATH".to_string(), "/opt/x/bin".to_string())]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "bounded: {:?}", started.elapsed());
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // SAFETY: signal 0 only checks whether the process still exists.
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the job holding the pipe was stopped");
     }
 
     #[test]
