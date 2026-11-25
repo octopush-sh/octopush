@@ -1328,24 +1328,6 @@ function App() {
   const streamingThreadId = useChatStore((s) =>
     activeWorkspaceId ? (s.streamingThreadByWs[activeWorkspaceId] ?? null) : null,
   );
-  // Connected MCP servers for the workspace — also shown under Capabilities.
-  const [mcpServers, setMcpServers] = useState<string[]>([]);
-  useEffect(() => {
-    const path = activeWorkspace?.worktreePath;
-    if (!path) {
-      setMcpServers([]);
-      return;
-    }
-    let cancelled = false;
-    ipc
-      .listMcpServers(path)
-      .then((s) => !cancelled && setMcpServers(s))
-      .catch(() => !cancelled && setMcpServers([]));
-    return () => {
-      cancelled = true;
-    };
-  }, [activeWorkspace?.worktreePath]);
-
   // Count tool calls live from the active chat's messages — chatStore is
   // updated on every `chat://message-added` event the backend emits, so the
   // counter ticks up in real time as the agent invokes tools.
@@ -1418,7 +1400,6 @@ function App() {
       toolCalls: liveToolCalls,
       budgets,
       spend,
-      mcpServers,
       onReviewClick: () => setMode("review"),
       onSettingsClick: () => setSettingsTab("usage"),
     };
@@ -1429,7 +1410,6 @@ function App() {
     liveToolCalls,
     budgets,
     spend,
-    mcpServers,
     setMode,
   ]);
 

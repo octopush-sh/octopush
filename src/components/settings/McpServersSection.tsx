@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Plus,
   Trash2,
@@ -72,6 +72,14 @@ export function McpServersSection() {
   const [tests, setTests] = useState<Record<string, TestState>>({});
   const [form, setForm] = useState<FormState | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
+  // Per server, bumped when its entry is saved, renamed or removed: a Test
+  // or Reconnect started before then reports on an entry that's gone, so
+  // its result is dropped.
+  const generations = useRef<Record<string, number>>({});
+  const generation = (key: string) => (Object.hasOwn(generations.current, key) ? generations.current[key] : 0);
+  const bump = (...keys: string[]) => {
+    for (const key of keys) generations.current[key] = generation(key) + 1;
+  };
 
   useEffect(() => {
     // Defensive: tolerate environments where the ipc method is absent.
@@ -103,8 +111,8 @@ export function McpServersSection() {
   }
 
   function openEdit(key: string) {
+    if (!Object.hasOwn(servers, key)) return;
     const cfg = servers[key];
-    if (!cfg) return;
     setDraft(draftFrom(key, cfg));
     setForm({ mode: "edit", original: key });
   }
@@ -115,13 +123,14 @@ export function McpServersSection() {
     if (!form) return;
     const key = draft.name.trim();
     const original = form.mode === "edit" ? form.original : null;
-    if (!key || (key !== original && servers[key])) return;
+    if (!key || (key !== original && Object.hasOwn(servers, key))) return;
     // Keeps any field the form doesn't show.
     const config = configFromDraft(draft, original ? servers[original] : undefined);
     const next = { ...servers };
     if (original) delete next[original];
     next[key] = config;
-    // An old result no longer describes the saved entry.
+    // An old result, or one still running, no longer describes the saved entry.
+    bump(key, ...(original ? [original] : []));
     setTests((s) => {
       const t = { ...s };
       if (original) delete t[original];
@@ -150,31 +159,43 @@ export function McpServersSection() {
   async function removeServer(key: string) {
     const next = { ...servers };
     delete next[key];
+    bump(key);
+    setTests((s) => {
+      const t = { ...s };
+      delete t[key];
+      return t;
+    });
     await persist(next);
   }
 
   async function testServer(key: string) {
     const config = servers[key];
     if (!config) return;
+    const gen = generation(key);
     setTests((s) => ({ ...s, [key]: { kind: "testing" } }));
+    let result: TestState;
     try {
       const tools = await ipc.testMcpServer(key, config);
-      setTests((s) => ({ ...s, [key]: { kind: "ok", tools: tools.length, reconnected: false } }));
+      result = { kind: "ok", tools: tools.length, reconnected: false };
     } catch (e) {
-      setTests((s) => ({ ...s, [key]: { kind: "error", failure: mcpFailureFrom(e) } }));
+      result = { kind: "error", failure: mcpFailureFrom(e) };
     }
+    if (generation(key) === gen) setTests((s) => ({ ...s, [key]: result }));
   }
 
   async function reconnectServer(key: string) {
     const config = servers[key];
     if (!config) return;
+    const gen = generation(key);
     setTests((s) => ({ ...s, [key]: { kind: "reconnecting" } }));
+    let result: TestState;
     try {
       const tools = await ipc.reconnectMcpServer(key, config);
-      setTests((s) => ({ ...s, [key]: { kind: "ok", tools: tools.length, reconnected: true } }));
+      result = { kind: "ok", tools: tools.length, reconnected: true };
     } catch (e) {
-      setTests((s) => ({ ...s, [key]: { kind: "error", failure: mcpFailureFrom(e) } }));
+      result = { kind: "error", failure: mcpFailureFrom(e) };
     }
+    if (generation(key) === gen) setTests((s) => ({ ...s, [key]: result }));
   }
 
   if (!loaded) return null;
@@ -188,7 +209,7 @@ export function McpServersSection() {
         draft={draft}
         onChange={setDraft}
         original={original}
-        taken={(name) => name !== original && !!servers[name]}
+        taken={(name) => name !== original && Object.hasOwn(servers, name)}
         onSave={() => void saveForm()}
         onCancel={closeForm}
         onClearSignIn={oauth && original ? () => void clearSignIn(original) : undefined}
@@ -257,9 +278,9 @@ export function McpServersSection() {
                 <button
                   type="button"
                   onClick={() => openEdit(key)}
-                  disabled={form !== null}
+                  disabled={form !== null || busy}
                   aria-label={`Edit ${key}`}
-                  title="Edit server"
+                  title={busy ? "Edit server (once its test finishes)" : "Edit server"}
                   data-tour={i === 0 ? tourId("settings-mcp-edit") : undefined}
                   className={iconButtonClass}
                 >

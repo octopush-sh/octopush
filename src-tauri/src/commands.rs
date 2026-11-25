@@ -2236,16 +2236,34 @@ pub async fn list_mcp_tools(
         .list_tools(std::path::Path::new(&workspace_path)))
 }
 
-/// List the names of MCP servers configured for a worktree (project ∪ user),
-/// whether or not they're currently reachable.
+/// Every MCP server configured for a worktree with what Talk's registry knows
+/// about it (connected · N tools, not started yet, failed and why), for the
+/// Companion's "can use" chips. Spawns nothing.
 #[tauri::command]
-pub async fn list_mcp_servers(workspace_path: String) -> AppResult<Vec<String>> {
-    let mut names: Vec<String> =
-        crate::mcp::load_server_configs(std::path::Path::new(&workspace_path))
-            .into_keys()
-            .collect();
-    names.sort();
-    Ok(names)
+pub async fn list_mcp_server_status(
+    state: State<'_, AppState>,
+    workspace_path: String,
+) -> AppResult<Vec<crate::mcp::scope::McpServerStatus>> {
+    Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
+}
+
+/// The MCP servers switched off in one Talk conversation (none by default).
+#[tauri::command]
+pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<String>> {
+    state.db.lock().thread_mcp_disabled(&thread_id)
+}
+
+/// Turn one MCP server off (or back on) in one Talk conversation and return
+/// the conversation's new off list. Its next call to that server is refused
+/// (or runs), and the next turn and fan-out leave it out (or offer it).
+#[tauri::command]
+pub async fn set_thread_mcp_server(
+    state: State<'_, AppState>,
+    thread_id: String,
+    server: String,
+    off: bool,
+) -> AppResult<Vec<String>> {
+    state.db.lock().set_thread_mcp_server_off(&thread_id, &server, off)
 }
 
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
@@ -2262,20 +2280,25 @@ pub async fn get_mcp_config(
 /// (`mcp::remote::with_bridges`). Returns the config as saved.
 #[tauri::command]
 pub async fn save_mcp_config(
+    app: AppHandle,
     state: State<'_, AppState>,
     servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
 ) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
     let registry = Arc::clone(&state.chat.mcp);
     // `npx` lookup, file I/O, kill + reap: off the runtime thread.
-    tokio::task::spawn_blocking(move || -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
-        let servers = crate::mcp::remote::with_bridges(servers);
-        let old = crate::mcp::load_user_config();
-        crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)?;
-        registry.apply_config_change(&old, &servers);
-        Ok(servers)
-    })
+    let saved = tokio::task::spawn_blocking(
+        move || -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
+            let servers = crate::mcp::remote::with_bridges(servers);
+            let old = crate::mcp::load_user_config();
+            crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)?;
+            registry.apply_config_change(&old, &servers);
+            Ok(servers)
+        },
+    )
     .await
-    .map_err(|e| crate::error::AppError::Other(e.to_string()))?
+    .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
+    let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ()); // Companion "can use" reloads
+    Ok(saved)
 }
 
 /// Smoke-test a single server config: spawn it, run the handshake, and return
@@ -2313,6 +2336,7 @@ pub async fn clear_mcp_sign_in(
 /// run the same smoke test as Test. Talk's next call spawns it afresh.
 #[tauri::command]
 pub async fn reconnect_mcp_server(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     config: crate::mcp::McpServerConfig,
@@ -2322,6 +2346,7 @@ pub async fn reconnect_mcp_server(
     tokio::task::spawn_blocking(move || registry.reset_server(&server))
         .await
         .map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+    let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ()); // Companion "can use" reloads
     smoke_test_mcp_server(name, config).await
 }
 
@@ -2329,6 +2354,8 @@ async fn smoke_test_mcp_server(
     name: String,
     config: crate::mcp::McpServerConfig,
 ) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    // The server's own env values are redacted wherever its output echoes them.
+    let known = crate::mcp::known_secrets(&config);
     let fut = tokio::task::spawn_blocking(move || {
         // A remote entry runs the bridge its choices describe.
         let mut config = config;
@@ -2337,7 +2364,8 @@ async fn smoke_test_mcp_server(
         }
         crate::mcp::McpRegistry::test_connect(&name, &config)
     });
-    let failed = |reason: &str| crate::error::AppError::McpFailure(crate::mcp::classify_failure(reason));
+    let failed =
+        |reason: &str| crate::error::AppError::McpFailure(crate::mcp::classify_failure_with(reason, &known));
     // 120s: OAuth bridge tools (e.g. mcp-remote) may need to open a browser
     // and wait for the user to authenticate. 15s was too short for that flow.
     match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {

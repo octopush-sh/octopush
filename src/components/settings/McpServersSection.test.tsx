@@ -167,6 +167,13 @@ describe("McpServersSection", () => {
       expect(pre.className).not.toMatch(/break-all/);
     });
 
+    it("the summary and hint are selectable", async () => {
+      await failTest();
+      const summary = screen.getByText(failure.summary);
+      expect(summary.closest(".octo-selectable")).not.toBeNull();
+      expect(screen.getByText(failure.hint).closest(".octo-selectable")).toBe(summary.closest(".octo-selectable"));
+    });
+
     it("Copy puts the full output on the clipboard", async () => {
       await failTest();
       fireEvent.click(screen.getByRole("button", { name: "Details" }));
@@ -259,6 +266,48 @@ describe("McpServersSection", () => {
       // Reopening shows the saved values, not the abandoned draft.
       fireEvent.click(screen.getByRole("button", { name: "Edit fs" }));
       expect(screen.getByLabelText("Command")).toHaveValue("bash");
+    });
+
+    it("a test still running can't be overtaken by an edit, and its result is dropped once the entry is gone", async () => {
+      getMcpConfig.mockResolvedValue({ fs });
+      let answer: (tools: unknown[]) => void = () => {};
+      testMcpServer.mockReturnValue(new Promise((r) => { answer = r; }));
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByText("Test"));
+      // Start Test, then Edit: Edit waits for the test.
+      const edit = screen.getByRole("button", { name: "Edit fs" });
+      expect(edit).toBeDisabled();
+      fireEvent.click(edit);
+      expect(screen.queryByRole("group")).toBeNull();
+
+      // The entry goes and comes back with another command while the old
+      // test runs; the old test's answer describes neither.
+      fireEvent.click(screen.getByRole("button", { name: "Remove fs" }));
+      await settle();
+      fireEvent.click(screen.getByText("Add MCP server"));
+      const form = screen.getByRole("group", { name: "Add an MCP server" });
+      fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "fs" } });
+      fireEvent.change(within(form).getByLabelText("Command"), { target: { value: "uvx" } });
+      fireEvent.click(within(form).getByText("Add server"));
+      await settle();
+      await act(async () => {
+        answer([{ server: "fs", name: "a", namespaced: "mcp__fs__a", description: "" }, { server: "fs", name: "b", namespaced: "mcp__fs__b", description: "" }]);
+      });
+      expect(screen.queryByText(/Connected/)).toBeNull();
+      expect(screen.getByRole("button", { name: "Edit fs" })).not.toBeDisabled();
+    });
+
+    it("a duplicate check that a prototype key can't fool", async () => {
+      getMcpConfig.mockResolvedValue({ fs });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByText("Add MCP server"));
+      const form = screen.getByRole("group", { name: "Add an MCP server" });
+      fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "constructor" } });
+      fireEvent.change(within(form).getByLabelText("Command"), { target: { value: "uvx" } });
+      expect(within(form).queryByText("name already exists")).toBeNull();
+      expect(within(form).getByText("Add server").closest("button")).not.toBeDisabled();
     });
 
     it("an old test result is dropped once the entry is saved", async () => {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Server, Maximize2 } from "lucide-react";
+import { Maximize2 } from "lucide-react";
 import type { Budget, BudgetPeriod, BudgetScope, SpendSnapshot, ThreadCost } from "../lib/types";
 import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
@@ -8,6 +8,7 @@ import { fmtHours } from "../lib/logbook";
 import { formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
 import { ContextMeter, contextTone } from "./ContextMeter";
+import { CompanionMcpScope } from "./CompanionMcpScope";
 
 interface Props {
   tokensUsed: number;
@@ -18,8 +19,8 @@ interface Props {
   workspaceId?: string;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
-  /** Connected MCP servers for the workspace (capabilities row). */
-  mcpServers?: string[];
+  /** The workspace's worktree: whose MCP servers the "can use" row lists. */
+  worktreePath?: string;
   /** Jump to Review mode (e.g. clicking the unstaged-changes row). */
   onReviewClick?: () => void;
   /** Open Settings (e.g. clicking a spending row to manage budgets). */
@@ -77,7 +78,7 @@ export function CompanionContext({
   workspaceId,
   budgets = [],
   spend = {},
-  mcpServers = [],
+  worktreePath,
   onReviewClick,
   onSettingsClick,
   onOpenLogbook,
@@ -89,7 +90,6 @@ export function CompanionContext({
   const cost = useThreadCost(workspaceId ?? "");
   const logbook = useMissionLogbook(workspaceId ?? "");
   const spendingRows = buildSpendingRows(budgets, spend, workspaceId ?? "");
-  const hasCapabilities = mcpServers.length > 0;
   const lines = costLines(cost);
   const logbookHasWork = !!logbook.row && (logbook.row.hoursSecs > 0 || logbook.row.costUsd > 0);
 
@@ -168,20 +168,11 @@ export function CompanionContext({
           )}
         </div>
 
-        {/* Capabilities — the MCP servers this conversation can use. Skills
-            are per message now (`/name` in the text), not a conversation
-            setting, so none is listed here. */}
-        {hasCapabilities && (
-          <div className="octo-rise-in mt-3 flex flex-wrap items-center gap-x-3 gap-y-1">
-            <span className="text-octo-sage">can use</span>
-            {mcpServers.map((s) => (
-              <span key={s} className="flex items-center gap-1 text-[10px]" title="MCP server">
-                <Server size={10} className="shrink-0 text-octo-brass" />
-                <span className="font-mono text-octo-ivory">{s}</span>
-              </span>
-            ))}
-          </div>
-        )}
+        {/* Capabilities — the MCP servers this conversation can use, each a
+            toggle for this conversation only. Skills are per message now
+            (`/name` in the text), not a conversation setting, so none is
+            listed here. */}
+        <CompanionMcpScope worktreePath={worktreePath} workspaceId={workspaceId} />
 
         {/* Budgets — only when one exists (an empty block earns no space). */}
         {spendingRows.length > 0 && (

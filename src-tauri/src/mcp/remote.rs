@@ -387,8 +387,8 @@ mod tests {
         r.transport = "carrier-pigeon".into();
         let mut cfg = entry(r, &[(CLIENT_SECRET_ENV, "shh"), ("OCTOPUSH_MCP_H_X_TENANT", "sample")]);
         apply_bridge(&mut cfg, "npx");
-        let remote = cfg.remote.as_ref().unwrap();
-        assert_eq!((remote.client_id.as_deref(), remote.header_names.len(), remote.transport.as_str()), (None, 0, "auto"));
+        let saved = cfg.remote.as_ref().unwrap();
+        assert_eq!((saved.client_id.as_deref(), saved.header_names.len(), saved.transport.as_str()), (None, 0, "auto"));
         assert!(!cfg.env.contains_key(CLIENT_SECRET_ENV) && !cfg.env.contains_key("OCTOPUSH_MCP_H_X_TENANT"));
         let mut cfg = entry(RemoteConfig { auth: "magic".into(), ..remote("oauth") }, &[]);
         apply_bridge(&mut cfg, "npx");

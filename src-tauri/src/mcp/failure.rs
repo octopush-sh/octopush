@@ -43,9 +43,11 @@ static DCR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)dynamic client registration|does not support dynamic (?:client )?registration").unwrap()
 });
 /// An HTTP 401/403 next to a word that says it is a status ("HTTP 401",
-/// "status code (403)"), so a pid or a stack trace's `:401:` doesn't count.
-static AUTH_STATUS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(?:https?|status|code)\b[^0-9\n]{0,12}\b40[13]\b").unwrap());
+/// "HTTP/1.1 403", "status code (403)"), so a pid, a stack trace's `:401:`
+/// or a URL's port doesn't count.
+static AUTH_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bhttp(?:/\d(?:\.\d)?)?\s+40[13]\b|\b(?:status|code)\b[^0-9\n]{0,12}\b40[13]\b").unwrap()
+});
 static AUTH_WORDS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bunauthori[sz]ed\b|\bforbidden\b|\binvalid[_ ]token\b|\binvalid_client\b|\binvalid_grant\b|\b(?:token|credentials?) (?:is |are |was |were )?(?:invalid|expired|revoked)\b")
         .unwrap()
@@ -56,10 +58,22 @@ static NOT_ON_PATH: LazyLock<Regex> =
 /// The spawn itself (`McpRegistry::spawn`): `spawn /path: No such file…`.
 static SPAWN_MISSING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^spawn (.+?): No such file or directory").unwrap());
-/// Node (`spawn node ENOENT`) or `/usr/bin/env` (`env: node: No such file…`).
+/// Node (`spawn node ENOENT`), `/usr/bin/env` (`env: node: No such file…`)
+/// or a shell (`sh: npx: command not found`, `zsh: command not found: npx`).
 static CHILD_MISSING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\bspawn (\S+) ENOENT\b|\benv: ['‘"]?([^\s'’":]+)['’"]?:? No such file or directory"#).unwrap()
+    Regex::new(
+        r#"(?i)\bspawn (\S+) ENOENT\b|\benv: ['‘"]?([^\s'’":]+)['’"]?:? No such file or directory|([^\s:]+): command not found(?:$|[^:])|command not found: (\S+)"#,
+    )
+    .unwrap()
 });
+/// A browser sign-in that wasn't finished in time.
+static AUTH_TIMEOUT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:authenticat|authoriz|sign[- ]?in)\w*\s+timed out\b").unwrap());
+/// The OAuth callback port is taken (another sign-in still listening).
+static PORT_IN_USE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bEADDRINUSE\b|callback port \d+ is already in use").unwrap());
+/// The line a bridge logs when it gives up (mcp-remote's "Fatal error:").
+static FATAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bfatal\b").unwrap());
 static OUR_TIMEOUT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^connection timed out after (\d+)s").unwrap());
 static NET_TIMEOUT: LazyLock<Regex> = LazyLock::new(|| {
@@ -81,10 +95,16 @@ static ERRORISH: LazyLock<Regex> = LazyLock::new(|| {
 const CLOSED: &str = "MCP server closed the connection";
 
 /// Classify why a server failed to connect (see the module docs for the
-/// input). Every line is redacted first, so neither the summary nor the
-/// details can show a token the output carried.
+/// input). Every line is redacted first (`redact_output_line`), the summary
+/// and the details alike.
 pub fn classify_failure(reason: &str) -> McpFailure {
-    let raw: Vec<String> = reason.trim().lines().map(super::redact_output_line).collect();
+    classify_failure_with(reason, &[])
+}
+
+/// [`classify_failure`], also redacting `known` values (the server's own
+/// env, `known_secrets`).
+pub fn classify_failure_with(reason: &str, known: &[crate::secret_scan::KnownSecret]) -> McpFailure {
+    let raw: Vec<String> = reason.trim().lines().map(|l| super::redact_output_line(l, known)).collect();
     let detail = raw.join("\n");
     // The lines to match on: no pid prefix, trimmed, none empty.
     let lines: Vec<String> = raw
@@ -97,9 +117,24 @@ pub fn classify_failure(reason: &str) -> McpFailure {
     McpFailure { summary, hint, detail }
 }
 
+/// The lines that say how it ended: from the first fatal line, else from
+/// the last line that reads as an error, to the end. A bridge logs a 401
+/// on its way into a browser sign-in, so an earlier error isn't the cause.
+fn decisive(lines: &[String]) -> &[String] {
+    if let Some(i) = lines.iter().position(|l| FATAL.is_match(l)) {
+        return &lines[i..];
+    }
+    match lines.iter().rposition(|l| ERRORISH.is_match(l)) {
+        Some(i) => &lines[i..],
+        None => lines,
+    }
+}
+
 fn summarize(lines: &[String], text: &str) -> (String, Option<String>) {
     let first = lines.first().map(String::as_str).unwrap_or("");
     let hint = |s: &str| Some(s.to_string());
+    let ending = decisive(lines);
+    let end = ending.join("\n");
 
     if DCR.is_match(text) {
         return (
@@ -120,7 +155,7 @@ fn summarize(lines: &[String], text: &str) -> (String, Option<String>) {
         );
     }
     if let Some(c) = CHILD_MISSING.captures(text) {
-        let program = c.get(1).or_else(|| c.get(2)).map_or("", |m| m.as_str());
+        let program = (1..=4).find_map(|i| c.get(i)).map_or("", |m| m.as_str());
         return (
             format!("The server couldn't start `{program}`."),
             hint(&format!(
@@ -135,41 +170,57 @@ fn summarize(lines: &[String], text: &str) -> (String, Option<String>) {
             hint("If it signs in through a browser, finish signing in there, then test again."),
         );
     }
-    if REFUSED.is_match(text) {
+    if AUTH_TIMEOUT.is_match(text) {
+        return (
+            "Signing in timed out.".into(),
+            hint("Finish signing in in the browser window that opened, then test again."),
+        );
+    }
+    if PORT_IN_USE.is_match(text) {
+        return (
+            "The sign-in callback port is in use.".into(),
+            hint("Another sign-in for this server may still be open in your browser; finish or close it, then test again."),
+        );
+    }
+    if REFUSED.is_match(&end) {
         return (
             "The server refused the connection.".into(),
             hint("Check the URL and port, and that the server is running."),
         );
     }
-    if DNS.is_match(text) {
-        let summary = match DNS_HOST.captures(text) {
+    if DNS.is_match(&end) {
+        let summary = match DNS_HOST.captures(&end) {
             Some(c) => format!("Octopush couldn't find the host {}.", &c[1]),
             None => "Octopush couldn't find the server's host.".into(),
         };
         return (summary, hint("Check the URL's host name and your network or VPN."));
     }
-    if NET_TIMEOUT.is_match(text) {
+    if NET_TIMEOUT.is_match(&end) {
         return (
             "The connection to the server timed out.".into(),
             hint("Check the URL and your network or VPN, then test again."),
         );
     }
-    if AUTH_STATUS.is_match(text) || AUTH_WORDS.is_match(text) {
+    if AUTH_STATUS.is_match(&end) || AUTH_WORDS.is_match(&end) {
         return (
             "The server rejected the credentials.".into(),
             hint("Check the token or headers it sends, or sign in again."),
         );
     }
-    fallback(lines)
+    fallback(lines, ending)
 }
 
-/// No known cause: the first line that reads as an error, else the first
-/// line, without its error label.
-fn fallback(lines: &[String]) -> (String, Option<String>) {
-    let output: Vec<&String> = match lines.first() {
-        Some(l) if l == CLOSED => lines[1..].iter().collect(),
-        _ => lines.iter().collect(),
-    };
+/// A line with something to say once its error label is gone (a bare
+/// `Error:` has nothing).
+fn meaningful(line: &str) -> bool {
+    line != CLOSED && !ERROR_LABEL.replace(line, "").trim().is_empty()
+}
+
+/// No known cause: the first line of the ending that reads as an error,
+/// else the first such line anywhere, else the first line, without its
+/// error label.
+fn fallback(lines: &[String], ending: &[String]) -> (String, Option<String>) {
+    let output: Vec<&String> = lines.iter().filter(|l| meaningful(l)).collect();
     if output.is_empty() {
         return match lines.first() {
             Some(l) if l == CLOSED => (
@@ -180,7 +231,11 @@ fn fallback(lines: &[String]) -> (String, Option<String>) {
             None => ("The server failed to connect.".into(), None),
         };
     }
-    let line = output.iter().find(|l| ERRORISH.is_match(l)).unwrap_or(&output[0]);
+    let line = ending
+        .iter()
+        .find(|l| meaningful(l) && ERRORISH.is_match(l))
+        .or_else(|| output.iter().copied().find(|l| ERRORISH.is_match(l)))
+        .unwrap_or(output[0]);
     (clip(&tidy(line)), None)
 }
 
@@ -306,6 +361,89 @@ mod tests {
         assert!(f.hint.as_deref().unwrap().contains("which node"), "{:?}", f.hint);
         let f = classify_failure(&closed("Error: spawn uvx ENOENT\n    at ChildProcess._handle.onexit (node:internal/child_process:286:19)"));
         assert_eq!(f.summary, "The server couldn't start `uvx`.");
+    }
+
+    #[test]
+    fn an_initial_401_on_the_way_to_a_browser_sign_in_isnt_the_cause() {
+        let challenge = "[7] Received error (status 401): Unauthorized\n[7] Authentication required. Initializing auth...";
+        let f = classify_failure(&closed(&format!(
+            "{challenge}\n[7] Fatal error: Error: listen EADDRINUSE: address already in use :::3334"
+        )));
+        assert_eq!(f.summary, "The sign-in callback port is in use.");
+        assert!(f.hint.as_deref().unwrap().contains("browser"), "{:?}", f.hint);
+
+        let f = classify_failure(&closed(&format!(
+            "{challenge}\n[7] Fatal error: ServerError: HTTP 500: Internal Server Error from https://auth.example.com/token"
+        )));
+        assert_eq!(f.summary, "ServerError: HTTP 500: Internal Server Error from https://auth.example.com/token.");
+        assert_eq!(f.hint, None);
+
+        // The 401 alone is the cause.
+        let f = classify_failure(&closed(challenge));
+        assert_eq!(f.summary, "The server rejected the credentials.");
+    }
+
+    #[test]
+    fn a_url_port_isnt_a_status() {
+        let f = classify_failure(&closed("[2] Error: connect to http://localhost:401/mcp failed: socket hang up"));
+        assert_ne!(f.summary, "The server rejected the credentials.");
+        let f = classify_failure(&closed("[2] Fatal error: HTTP/1.1 403 Forbidden"));
+        assert_eq!(f.summary, "The server rejected the credentials.");
+    }
+
+    #[test]
+    fn a_shell_that_cant_find_the_program() {
+        let f = classify_failure(&closed("sh: npx: command not found"));
+        assert_eq!(f.summary, "The server couldn't start `npx`.");
+        let f = classify_failure(&closed("zsh: command not found: uvx"));
+        assert_eq!(f.summary, "The server couldn't start `uvx`.");
+        let f = classify_failure(&closed("bash: line 1: node: command not found"));
+        assert_eq!(f.summary, "The server couldn't start `node`.");
+    }
+
+    #[test]
+    fn a_sign_in_that_timed_out_has_its_own_hint() {
+        let f = classify_failure(&closed("[4] Authentication timed out after 30s"));
+        assert_eq!(f.summary, "Signing in timed out.");
+        assert_eq!(f.hint.as_deref(), Some("Finish signing in in the browser window that opened, then test again."));
+    }
+
+    #[test]
+    fn a_bare_error_label_falls_through_to_the_next_line() {
+        let f = classify_failure(&closed("[5] Error:\n[5]   unexpected end of JSON input from the server"));
+        assert_eq!(f.summary, "Unexpected end of JSON input from the server.");
+    }
+
+    #[test]
+    fn credentials_in_other_shapes_are_redacted_too() {
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzYW1wbGUifQ.c2lnbmF0dXJl";
+        let output = closed(&format!(
+            "[3] Using custom headers: {{\"Authorization\":\"Basic dXNlcjpwYXNzd29yZA==\"}}\n\
+             Authorization: Basic c2FtcGxlOnNlY3JldA==\n\
+             X-API-Key: k3y-v4lue\n\
+             {{\"refresh_token\":\"rt-abc\",\"id_token\":\"{jwt}\"}}\n\
+             token was {jwt}\n\
+             {{\"client_secret\":\"shh-1\",\"password\":\"hunter2\"}}\n\
+             [3] echo: my-own-env-value-42\n\
+             [3] Fatal error: Error: Unexpected token"
+        ));
+        let known = [crate::secret_scan::KnownSecret::new("env SAMPLE_VAR", "my-own-env-value-42")];
+        let f = classify_failure_with(&output, &known);
+        for secret in [
+            "dXNlcjpwYXNzd29yZA==",
+            "c2FtcGxlOnNlY3JldA==",
+            "k3y-v4lue",
+            "rt-abc",
+            jwt,
+            "shh-1",
+            "hunter2",
+            "my-own-env-value-42",
+        ] {
+            assert!(!f.detail.contains(secret) && !f.summary.contains(secret), "{secret} in {}", f.detail);
+        }
+        assert!(f.detail.contains("Authorization: [redacted]") && f.detail.contains("X-API-Key: [redacted]"), "{}", f.detail);
+        // Lines that only name a credential keep their words.
+        assert!(f.detail.contains("Fatal error: Error: Unexpected token"), "{}", f.detail);
     }
 
     #[test]
