@@ -998,6 +998,30 @@ pub fn thread_mcp_off(db: &Mutex<Db>, thread_id: &str) -> std::collections::Hash
     db.lock().thread_mcp_disabled(thread_id).unwrap_or_default().into_iter().collect()
 }
 
+/// [`discover_mcp_tools`] for one conversation: its off list is read now.
+/// The one path a Talk turn, a sub-agent fan-out and a sub-agent
+/// continuation discover through. The list is fixed for what it offers: a
+/// running loop keeps the tools it started with.
+pub async fn discover_thread_mcp_tools(
+    mcp: Arc<crate::mcp::McpRegistry>,
+    db: &Mutex<Db>,
+    workspace_path: &str,
+    thread_id: &str,
+) -> Vec<crate::mcp::McpToolInfo> {
+    discover_mcp_tools(mcp, workspace_path, thread_mcp_off(db, thread_id)).await
+}
+
+/// Why a call to `tool` is refused, when it is an MCP tool whose server is in
+/// `off` (the conversation's list as it is at the call, so a server turned
+/// off or back on mid-turn counts from its next call). `None` lets it run.
+pub fn mcp_off_refusal(tool: &str, off: &std::collections::HashSet<String>) -> Option<String> {
+    let server = crate::mcp::server_of(tool).filter(|s| crate::mcp::is_mcp_tool(tool) && off.contains(s))?;
+    Some(format!(
+        "{server} is turned off in this conversation, so its tools are unavailable here. \
+         The user can turn it back on in the Companion's \"can use\" row."
+    ))
+}
+
 /// The configured model ids and the user's tier map, for definition/call
 /// model specs (`haiku`, `fast`, an id…).
 pub fn model_catalog() -> (Vec<String>, HashMap<String, String>) {
@@ -1029,7 +1053,9 @@ pub async fn run_subagents(
     // sees the subset its definition grants.
     let mcp_tools: Arc<Vec<crate::mcp::McpToolInfo>> = Arc::new(match specs.first() {
         Some(first) => {
-            discover_mcp_tools(Arc::clone(&mcp), &first.workspace_path, thread_mcp_off(&db, &first.thread_id)).await
+            let found = discover_thread_mcp_tools(Arc::clone(&mcp), &db, &first.workspace_path, &first.thread_id).await;
+            let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
+            found
         }
         None => Vec::new(),
     });

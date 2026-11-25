@@ -42,7 +42,7 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
   const threadId = useChatStore((s) => (workspaceId ? (s.activeThreadByWs[workspaceId] ?? null) : null));
   const streaming = useChatStore((s) => s.streamingByWs[workspaceId] ?? false);
   const status = useMcpScopeStore((s) => (worktreePath ? s.statusByPath[worktreePath] : undefined) ?? NO_STATUS);
-  const off = useMcpScopeStore((s) => (threadId ? s.offByThread[threadId] : undefined) ?? NONE_OFF);
+  const loadedOff = useMcpScopeStore((s) => (threadId ? s.offByThread[threadId] : undefined));
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
@@ -69,18 +69,20 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
     if (threadId) void useMcpScopeStore.getState().loadOff(threadId);
   }, [threadId]);
 
-  return { threadId, status, off };
+  // Clicks wait for the thread's own list: a list still loading (a thread
+  // switch) would otherwise be toggled from another conversation's state.
+  return { threadId, status, off: loadedOff ?? NONE_OFF, loaded: loadedOff !== undefined };
 }
 
 /**
  * The Conversation section's "can use" row: one chip per MCP server
- * configured for the workspace (Settings › Integrations, or the repo's
+ * configured for the workspace (Settings › Integrations and the project's
  * `.claude/mcp.json`). Every server is on in every conversation; clicking a
  * chip turns it off for this conversation only, and clicking again turns it
  * back on. Hidden when no server is configured.
  */
 export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?: string; workspaceId?: string }) {
-  const { threadId, status, off } = useMcpScope(worktreePath, workspaceId ?? "");
+  const { threadId, status, off, loaded } = useMcpScope(worktreePath, workspaceId ?? "");
   if (status.length === 0) return null;
   return (
     <div
@@ -90,7 +92,7 @@ export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?
     >
       <span
         className="text-octo-sage"
-        title="MCP servers from Settings › Integrations. Click one to turn it off or back on in this conversation."
+        title="MCP servers from Settings › Integrations and this project's .claude/mcp.json. Click one to turn it off or back on in this conversation."
       >
         can use
       </span>
@@ -121,6 +123,7 @@ export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?
             key={s.name}
             type="button"
             aria-pressed={!isOff}
+            aria-disabled={!loaded}
             title={title}
             data-state={isOff ? "off" : s.state}
             onClick={() => void useMcpScopeStore.getState().toggle(threadId, s.name)}

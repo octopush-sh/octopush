@@ -2236,18 +2236,6 @@ pub async fn list_mcp_tools(
         .list_tools(std::path::Path::new(&workspace_path)))
 }
 
-/// List the names of MCP servers configured for a worktree (project ∪ user),
-/// whether or not they're currently reachable.
-#[tauri::command]
-pub async fn list_mcp_servers(workspace_path: String) -> AppResult<Vec<String>> {
-    let mut names: Vec<String> =
-        crate::mcp::load_server_configs(std::path::Path::new(&workspace_path))
-            .into_keys()
-            .collect();
-    names.sort();
-    Ok(names)
-}
-
 /// Every MCP server configured for a worktree with what Talk's registry knows
 /// about it (connected · N tools, not started yet, failed and why), for the
 /// Companion's "can use" chips. Spawns nothing.
@@ -2265,15 +2253,17 @@ pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: Stri
     state.db.lock().thread_mcp_disabled(&thread_id)
 }
 
-/// Replace the MCP servers switched off in one Talk conversation. The next
-/// turn (and its sub-agents) leaves their tools out.
+/// Turn one MCP server off (or back on) in one Talk conversation and return
+/// the conversation's new off list. Its next call to that server is refused
+/// (or runs), and the next turn and fan-out leave it out (or offer it).
 #[tauri::command]
-pub async fn set_thread_mcp_disabled(
+pub async fn set_thread_mcp_server(
     state: State<'_, AppState>,
     thread_id: String,
-    servers: Vec<String>,
-) -> AppResult<()> {
-    state.db.lock().set_thread_mcp_disabled(&thread_id, &servers)
+    server: String,
+    off: bool,
+) -> AppResult<Vec<String>> {
+    state.db.lock().set_thread_mcp_server_off(&thread_id, &server, off)
 }
 
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.

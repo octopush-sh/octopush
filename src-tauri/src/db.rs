@@ -3951,6 +3951,21 @@ impl Db {
         Ok(())
     }
 
+    /// Turn one MCP server off (or back on) in a conversation, leaving the
+    /// others as stored, and return the new list. Read and written under the
+    /// one connection the caller holds locked, so two toggles never lose
+    /// each other's change.
+    pub fn set_thread_mcp_server_off(&self, thread_id: &str, server: &str, off: bool) -> AppResult<Vec<String>> {
+        let server = server.trim();
+        let mut names = self.thread_mcp_disabled(thread_id)?;
+        names.retain(|n| n != server);
+        if off && !server.is_empty() {
+            names.push(server.to_string());
+        }
+        self.set_thread_mcp_disabled(thread_id, &names)?;
+        self.thread_mcp_disabled(thread_id)
+    }
+
     pub fn rename_chat_thread(&self, thread_id: &str, title: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE chat_threads SET title = ?1 WHERE id = ?2",

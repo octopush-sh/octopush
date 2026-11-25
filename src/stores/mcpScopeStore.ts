@@ -6,9 +6,9 @@ import type { McpServerStatus } from "../lib/types";
  *  knows about each server (the Companion's "can use" chips).
  *
  *  Every configured server is on in every conversation until the user turns
- *  one off there. The off list is stored per thread (`chat_threads.mcp_disabled`)
- *  and read by the backend at the start of each turn and each sub-agent
- *  fan-out, so a turn never offers the model a server that is off. */
+ *  one off there. The off list is stored per thread (`chat_threads.mcp_disabled`);
+ *  the backend reads it at the start of each turn and fan-out (what the model
+ *  is offered) and again at every MCP call (what may run). */
 interface McpScopeState {
   /** The last status read per worktree path. Kept while a reload runs, so
    *  the chips never blink out. */
@@ -17,17 +17,23 @@ interface McpScopeState {
   offByThread: Record<string, string[]>;
   loadStatus: (worktreePath: string) => Promise<void>;
   loadOff: (threadId: string) => Promise<void>;
-  /** Turn one server off in a conversation, or back on. Optimistic: the
-   *  chip changes at once and goes back if the write fails. */
+  /** Turn one server off in a conversation, or back on. Ignored until the
+   *  thread's list has loaded. The chip changes at once; writes for one
+   *  thread go out one at a time, in click order, each setting just that
+   *  server, and the last one's answer is the list shown. A failed write
+   *  re-reads the list. Resolves false when ignored or failed. */
   toggle: (threadId: string, server: string) => Promise<boolean>;
 }
 
 /** Bumped per path by every status load, so a slower, older answer never
  *  overwrites a newer one. */
 const statusSeq: Record<string, number> = {};
-/** Bumped per thread by every load and write, so a load that started before
- *  a write never overwrites what the write set. */
+/** Bumped per thread by every load and toggle, so only the newest of them
+ *  sets the thread's list: a load that started before a click never
+ *  overwrites it. */
 const offSeq: Record<string, number> = {};
+/** The tail of each thread's queue of writes. */
+const writeTail: Record<string, Promise<unknown>> = {};
 
 export const useMcpScopeStore = create<McpScopeState>((set, get) => ({
   statusByPath: {},
@@ -51,20 +57,31 @@ export const useMcpScopeStore = create<McpScopeState>((set, get) => ({
       if (offSeq[threadId] !== seq) return;
       set((s) => ({ offByThread: { ...s.offByThread, [threadId]: off } }));
     } catch {
-      /* unknown: the chips read as on, which is what the backend defaults to */
+      /* still unloaded: the chips read as on (the backend's default) and ignore clicks */
     }
   },
 
   toggle: async (threadId, server) => {
-    const before = get().offByThread[threadId] ?? [];
-    const next = before.includes(server) ? before.filter((n) => n !== server) : [...before, server].sort();
+    const current = get().offByThread[threadId];
+    if (!current) return false;
+    const off = !current.includes(server);
     const seq = (offSeq[threadId] = (offSeq[threadId] ?? 0) + 1);
-    set((s) => ({ offByThread: { ...s.offByThread, [threadId]: next } }));
+    set((s) => ({
+      offByThread: {
+        ...s.offByThread,
+        [threadId]: off ? [...current, server].sort() : current.filter((n) => n !== server),
+      },
+    }));
+    const write = (writeTail[threadId] ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => ipc.setThreadMcpServer(threadId, server, off));
+    writeTail[threadId] = write;
     try {
-      await ipc.setThreadMcpDisabled(threadId, next);
+      const stored = await write;
+      if (offSeq[threadId] === seq) set((s) => ({ offByThread: { ...s.offByThread, [threadId]: stored } }));
       return true;
     } catch {
-      if (offSeq[threadId] === seq) set((s) => ({ offByThread: { ...s.offByThread, [threadId]: before } }));
+      if (offSeq[threadId] === seq) await get().loadOff(threadId);
       return false;
     }
   },

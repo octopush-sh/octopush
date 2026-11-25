@@ -25,9 +25,11 @@ export const talkMcp: Scenario = {
     ...defaultScenario.commands,
     list_mcp_server_status: STATUS,
     get_thread_mcp_disabled: (a) => off[String(a.threadId)] ?? [],
-    set_thread_mcp_disabled: (a) => {
-      off[String(a.threadId)] = a.servers as string[];
-      return null;
+    set_thread_mcp_server: (a) => {
+      const t = String(a.threadId);
+      const rest = (off[t] ?? []).filter((n) => n !== a.server);
+      off[t] = (a.off ? [...rest, String(a.server)] : rest).sort();
+      return off[t];
     },
   },
 };

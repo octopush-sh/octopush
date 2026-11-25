@@ -10,19 +10,31 @@ import type { McpServerStatus } from "../lib/types";
 const mcpListeners: Array<() => void> = [];
 const listMcpServerStatus = vi.fn();
 const getThreadMcpDisabled = vi.fn();
-const setThreadMcpDisabled = vi.fn();
+const setThreadMcpServer = vi.fn();
 const unlisten = vi.fn();
+const onMcpChanged = vi.fn();
 vi.mock("../lib/ipc", () => ({
   ipc: {
     listMcpServerStatus: (...a: unknown[]) => listMcpServerStatus(...a),
     getThreadMcpDisabled: (...a: unknown[]) => getThreadMcpDisabled(...a),
-    setThreadMcpDisabled: (...a: unknown[]) => setThreadMcpDisabled(...a),
-    onMcpChanged: (h: () => void) => {
-      mcpListeners.push(h);
-      return Promise.resolve(unlisten);
-    },
+    setThreadMcpServer: (...a: unknown[]) => setThreadMcpServer(...a),
+    onMcpChanged: (h: () => void) => onMcpChanged(h),
   },
 }));
+
+/** The backend's per-thread lists: one server set per write, as the command does. */
+let stored: Record<string, string[]> = {};
+const backendSet = (t: string, server: string, off: boolean) => {
+  const rest = (stored[t] ?? []).filter((n) => n !== server);
+  stored[t] = (off ? [...rest, server] : rest).sort();
+  return Promise.resolve(stored[t]);
+};
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => ((resolve = res), (reject = rej)));
+  return { promise, resolve, reject };
+}
 
 import { useChatStore } from "../stores/chatStore";
 import { useMcpScopeStore } from "../stores/mcpScopeStore";
@@ -42,10 +54,15 @@ const chip = (name: string) => screen.getByRole("button", { name });
 
 beforeEach(() => {
   mcpListeners.length = 0;
+  stored = {};
   unlisten.mockReset();
+  onMcpChanged.mockReset().mockImplementation((h: () => void) => {
+    mcpListeners.push(h);
+    return Promise.resolve(unlisten);
+  });
   listMcpServerStatus.mockReset().mockResolvedValue([docs, remote]);
-  getThreadMcpDisabled.mockReset().mockResolvedValue([]);
-  setThreadMcpDisabled.mockReset().mockResolvedValue(undefined);
+  getThreadMcpDisabled.mockReset().mockImplementation((t: string) => Promise.resolve(stored[t] ?? []));
+  setThreadMcpServer.mockReset().mockImplementation(backendSet);
   useMcpScopeStore.setState({ statusByPath: {}, offByThread: {} });
   useChatStore.setState({ activeThreadByWs: { ws: "t-1" }, streamingByWs: {} });
 });
@@ -94,7 +111,7 @@ describe("CompanionMcpScope", () => {
     await act(async () => {
       fireEvent.click(chip("docs-server"));
     });
-    expect(setThreadMcpDisabled).toHaveBeenLastCalledWith("t-1", ["docs-server"]);
+    expect(setThreadMcpServer).toHaveBeenLastCalledWith("t-1", "docs-server", true);
     const d = chip("docs-server");
     expect(d).toHaveAttribute("aria-pressed", "false");
     expect(d.title).toBe("docs-server · off in this conversation · click to turn it back on");
@@ -104,12 +121,12 @@ describe("CompanionMcpScope", () => {
     await act(async () => {
       fireEvent.click(chip("docs-server"));
     });
-    expect(setThreadMcpDisabled).toHaveBeenLastCalledWith("t-1", []);
+    expect(setThreadMcpServer).toHaveBeenLastCalledWith("t-1", "docs-server", false);
     expect(chip("docs-server")).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("goes back when the write fails", async () => {
-    setThreadMcpDisabled.mockRejectedValue(new Error("db locked"));
+  it("re-reads the stored list when the write fails", async () => {
+    setThreadMcpServer.mockRejectedValue(new Error("db locked"));
     await mount();
     await act(async () => {
       fireEvent.click(chip("example-remote"));
@@ -119,7 +136,7 @@ describe("CompanionMcpScope", () => {
   });
 
   it("reads each conversation's own off list", async () => {
-    getThreadMcpDisabled.mockImplementation((t: string) => Promise.resolve(t === "t-2" ? ["docs-server"] : []));
+    stored = { "t-2": ["docs-server"] };
     await mount();
     expect(chip("docs-server")).toHaveAttribute("aria-pressed", "true");
     await act(async () => {
@@ -170,5 +187,76 @@ describe("CompanionMcpScope", () => {
     first([docs, remote]);
     await a;
     expect(useMcpScopeStore.getState().statusByPath["/wt"]).toEqual([docs]);
+  });
+
+  it("ignores a click right after a thread switch until that thread's list has loaded", async () => {
+    stored = { "t-2": ["docs-server"] };
+    await mount();
+    const load = deferred<string[]>();
+    getThreadMcpDisabled.mockImplementation(() => load.promise);
+    await act(async () => {
+      useChatStore.setState({ activeThreadByWs: { ws: "t-2" } });
+    });
+    expect(chip("docs-server")).toHaveAttribute("aria-disabled", "true");
+    await act(async () => {
+      fireEvent.click(chip("docs-server"));
+    });
+    expect(setThreadMcpServer).not.toHaveBeenCalled();
+    await act(async () => {
+      load.resolve(["docs-server"]);
+    });
+    expect(chip("docs-server")).toHaveAttribute("aria-pressed", "false");
+    await act(async () => {
+      fireEvent.click(chip("docs-server"));
+    });
+    expect(setThreadMcpServer).toHaveBeenLastCalledWith("t-2", "docs-server", false);
+    expect(stored["t-2"]).toEqual([]);
+  });
+
+  it("two quick clicks write in click order, one server each, and the last answer wins", async () => {
+    await mount();
+    const first = deferred<string[]>();
+    setThreadMcpServer.mockImplementationOnce(() => first.promise);
+    await act(async () => {
+      fireEvent.click(chip("docs-server"));
+      fireEvent.click(chip("docs-server"));
+    });
+    // The second write waits for the first: the backend sees off, then on.
+    expect(setThreadMcpServer.mock.calls).toEqual([["t-1", "docs-server", true]]);
+    expect(chip("docs-server")).toHaveAttribute("aria-pressed", "true");
+    await act(async () => {
+      stored["t-1"] = ["docs-server"];
+      first.resolve(["docs-server"]);
+    });
+    expect(setThreadMcpServer.mock.calls).toEqual([
+      ["t-1", "docs-server", true],
+      ["t-1", "docs-server", false],
+    ]);
+    // The first answer is stale by then and never flips the chip back.
+    expect(chip("docs-server")).toHaveAttribute("aria-pressed", "true");
+    expect(stored["t-1"]).toEqual([]);
+  });
+
+  it("a load that started before a click never overwrites what the click stored", async () => {
+    useMcpScopeStore.setState({ offByThread: { "t-1": [] } });
+    const load = deferred<string[]>();
+    getThreadMcpDisabled.mockImplementationOnce(() => load.promise);
+    const store = useMcpScopeStore.getState();
+    const loading = store.loadOff("t-1");
+    await store.toggle("t-1", "docs-server");
+    load.resolve([]);
+    await loading;
+    expect(useMcpScopeStore.getState().offByThread["t-1"]).toEqual(["docs-server"]);
+  });
+
+  it("unsubscribes even when the subscription lands after unmount", async () => {
+    const sub = deferred<() => void>();
+    onMcpChanged.mockImplementation(() => sub.promise);
+    const view = await mount();
+    view.unmount();
+    await act(async () => {
+      sub.resolve(unlisten);
+    });
+    expect(unlisten).toHaveBeenCalledTimes(1);
   });
 });

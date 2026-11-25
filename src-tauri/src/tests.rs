@@ -29257,9 +29257,44 @@ mod talk_mcp_scope_tests {
         dir
     }
 
+    #[test]
+    fn one_toggle_never_loses_another() {
+        let (_tmp, db, t) = thread_db();
+        assert_eq!(db.set_thread_mcp_server_off(&t, "docs-server", true).unwrap(), vec!["docs-server".to_string()]);
+        assert_eq!(
+            db.set_thread_mcp_server_off(&t, "example-remote", true).unwrap(),
+            vec!["docs-server".to_string(), "example-remote".to_string()]
+        );
+        assert_eq!(db.set_thread_mcp_server_off(&t, "docs-server", false).unwrap(), vec!["example-remote".to_string()]);
+        // Idempotent both ways.
+        assert_eq!(db.set_thread_mcp_server_off(&t, "docs-server", false).unwrap(), vec!["example-remote".to_string()]);
+        assert_eq!(db.set_thread_mcp_server_off(&t, "example-remote", true).unwrap(), vec!["example-remote".to_string()]);
+    }
+
+    #[test]
+    fn a_call_is_checked_against_the_list_as_it_is_at_the_call() {
+        use crate::chat_agents::{mcp_off_refusal, thread_mcp_off};
+        let (_tmp, db, t) = thread_db();
+        let db = parking_lot::Mutex::new(db);
+        let call = |db: &parking_lot::Mutex<Db>| mcp_off_refusal("mcp__docs-server__search", &thread_mcp_off(db, &t));
+        // The turn starts with the server on; it is turned off mid-turn.
+        assert_eq!(call(&db), None);
+        db.lock().set_thread_mcp_server_off(&t, "docs-server", true).unwrap();
+        let refusal = call(&db).expect("off from the next call");
+        assert!(refusal.starts_with("docs-server is turned off in this conversation"), "{refusal}");
+        assert!(refusal.contains("Companion's \"can use\" row"), "{refusal}");
+        // Another server's tools and built-in tools are untouched.
+        let off = thread_mcp_off(&db, &t);
+        assert_eq!(mcp_off_refusal("mcp__example-remote__fetch", &off), None);
+        assert_eq!(mcp_off_refusal("read_file", &off), None);
+        // Turned back on mid-turn: the next call runs.
+        db.lock().set_thread_mcp_server_off(&t, "docs-server", false).unwrap();
+        assert_eq!(call(&db), None);
+    }
+
     #[tokio::test]
     async fn a_turn_and_its_sub_agents_discover_only_the_servers_on_in_their_conversation() {
-        use crate::chat_agents::{discover_mcp_tools, thread_mcp_off};
+        use crate::chat_agents::{discover_thread_mcp_tools, thread_mcp_off};
         let (_tmp, db, t) = thread_db();
         let other = db.create_chat_thread("w-mcp", "Other").unwrap().id;
         db.set_thread_mcp_disabled(&t, &["docs-server".into()]).unwrap();
@@ -29270,7 +29305,8 @@ mod talk_mcp_scope_tests {
 
         let off = thread_mcp_off(&db, &t);
         assert_eq!(off.iter().cloned().collect::<Vec<_>>(), vec!["docs-server".to_string()]);
-        assert!(discover_mcp_tools(Arc::clone(&reg), &wp, off).await.is_empty());
+        // The one discovery path the turn, the fan-out and a continuation use.
+        assert!(discover_thread_mcp_tools(Arc::clone(&reg), &db, &wp, &t).await.is_empty());
         let status = reg.status(wt.path());
         assert_eq!(status[0].name, "docs-server");
         assert_eq!(status[0].state, McpServerState::Idle, "an off server is never started for the conversation");
@@ -29280,7 +29316,7 @@ mod talk_mcp_scope_tests {
 
         // Another conversation in the same workspace has both on, so it tries both.
         assert!(thread_mcp_off(&db, &other).is_empty());
-        discover_mcp_tools(Arc::clone(&reg), &wp, thread_mcp_off(&db, &other)).await;
+        discover_thread_mcp_tools(Arc::clone(&reg), &db, &wp, &other).await;
         assert!(reg.status(wt.path()).iter().all(|s| s.state == McpServerState::Failed));
     }
 }
