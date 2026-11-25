@@ -47,6 +47,21 @@ describe("names", () => {
   });
 });
 
+describe("extra arguments", () => {
+  it("are kept in remote, one per line, and read back", () => {
+    const draft = remote({ extraArgsText: " --enable-proxy \n\n--resource\nhttps://api.example.com" });
+    const cfg = configFromDraft(draft).config;
+    expect(cfg.remote?.extra_args).toEqual(["--enable-proxy", "--resource", "https://api.example.com"]);
+    expect(draftFrom("x", cfg).extraArgsText).toBe("--enable-proxy\n--resource\nhttps://api.example.com");
+    expect(configFromDraft(remote({})).config.remote?.extra_args).toBeUndefined();
+  });
+
+  it("looksSecret marks the header names whose values are masked", () => {
+    for (const n of ["Authorization", "X-Api-Key", "Cookie", "X-Session"]) expect(looksSecret(n)).toBe(true);
+    for (const n of ["X-Tenant", "Accept"]) expect(looksSecret(n)).toBe(false);
+  });
+});
+
 describe("configFromDraft", () => {
   it("a Browser (OAuth) server is its URL; the backend builds the bridge", () => {
     expect(configFromDraft(remote({}))).toEqual({
@@ -210,12 +225,20 @@ describe("draftFrom", () => {
 });
 
 describe("draftProblem and draftComplete", () => {
-  it("wants an https URL, or http on localhost", () => {
+  it("wants an https URL, or http on localhost or 127.0.0.1, as mcp-remote 0.16 does", () => {
+    expect(draftProblem(remote({ url: "http://[::1]:8808/mcp" }))).toMatch(/https/);
+    expect(draftProblem(remote({ url: "http://mcp.example.com/mcp", extraArgsText: "--allow-http" }))).toBeNull();
     expect(draftProblem(remote({ url: "http://mcp.example.com/mcp" }))).toMatch(/https/);
     expect(draftProblem(remote({ url: "mcp.example.com" }))).toMatch(/https/);
     expect(draftProblem(remote({ url: "http://localhost:8808/mcp" }))).toBeNull();
     expect(draftProblem(remote({ url: "http://127.0.0.1:3000" }))).toBeNull();
     expect(draftProblem(remote({}))).toBeNull();
+  });
+
+  it("refuses a client secret that would break the client info's JSON", () => {
+    expect(draftProblem(remote({ clientId: "client-abc", clientSecret: 'a"b' }))).toBe("the client secret can't contain \" or \\");
+    expect(draftProblem(remote({ clientId: "client-abc", clientSecret: "a\\b" }))).toBe("the client secret can't contain \" or \\");
+    expect(draftProblem(remote({ clientId: "client-abc", clientSecret: "plain-secret" }))).toBeNull();
   });
 
   it("checks header and env names and duplicates", () => {

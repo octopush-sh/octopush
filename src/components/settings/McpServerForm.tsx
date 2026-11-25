@@ -163,7 +163,9 @@ function LocalFields({ draft, set }: { draft: Draft; set: Patch }) {
 
 function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
   // Advanced starts open when it holds something.
-  const [advanced, setAdvanced] = useState(() => !!draft.clientId || draft.transport !== "auto");
+  const [advanced, setAdvanced] = useState(
+    () => !!draft.clientId || draft.transport !== "auto" || !!draft.extraArgsText.trim(),
+  );
   return (
     <>
       <div>
@@ -263,6 +265,18 @@ function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
                 onChange={(transport) => set({ transport })}
                 ariaLabel="Transport"
               />
+            </div>
+            <div>
+              <div className={labelClass}>Extra arguments (one per line)</div>
+              <textarea
+                className={`${inputClass} h-16 resize-none`}
+                value={draft.extraArgsText}
+                onChange={(e) => set({ extraArgsText: e.target.value })}
+                placeholder={"--enable-proxy\n--resource\nhttps://api.example.com"}
+                aria-label="Extra arguments"
+                spellCheck={false}
+              />
+              <p className="mt-1 text-[11px] text-octo-mute">Added to the mcp-remote command line as written.</p>
             </div>
           </div>
         </Reveal>

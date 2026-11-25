@@ -17,8 +17,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// The bridge package `npx` runs.
-pub const BRIDGE_PACKAGE: &str = "mcp-remote";
+/// The bridge package `npx` runs, held to the 0.16 line (the latest on npm
+/// as of 2026-11): it expands `${VAR}` inside `--static-oauth-client-info`
+/// (older releases send the placeholder as is, so a client secret would
+/// fail), keeps its sign-ins in `mcp-remote-v1` (what Clear sign-in looks
+/// for), and carries the security fixes of that line (header values are
+/// never logged, a failed JSON parse never quotes a secret). Moving to a
+/// newer line is a deliberate change: check those three again.
+pub const BRIDGE_PACKAGE: &str = "mcp-remote@^0.16";
 /// What every header's env var starts with.
 pub const HEADER_ENV_PREFIX: &str = "OCTOPUSH_MCP_H_";
 /// The env var holding a pre-registered OAuth client's secret.
@@ -46,6 +52,10 @@ pub struct RemoteConfig {
     /// Registration (`auth: oauth` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// More mcp-remote arguments, appended as given (`--enable-proxy`,
+    /// `--allow-http`, `--resource <uri>`…).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
 }
 
 fn default_auth() -> String {
@@ -111,6 +121,7 @@ pub fn bridge_args(remote: &RemoteConfig, client_secret: bool) -> Vec<String> {
         args.push("--transport".into());
         args.push(remote.transport.clone());
     }
+    args.extend(remote.extra_args.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).map(str::to_string));
     args
 }
 
@@ -140,6 +151,7 @@ pub fn apply_bridge(cfg: &mut McpServerConfig, npx: &str) {
         .take()
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty() && remote.auth == "oauth");
+    remote.extra_args = remote.extra_args.iter().map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
 
     let wanted: HashSet<String> = effective_headers(&remote).iter().map(|n| header_env(n)).collect();
     cfg.env.retain(|k, _| !k.starts_with(HEADER_ENV_PREFIX) || wanted.contains(k));
@@ -349,7 +361,7 @@ mod tests {
         let mut cfg = entry(remote("oauth"), &[]);
         apply_bridge(&mut cfg, "/opt/homebrew/bin/npx");
         assert_eq!(cfg.command, "/opt/homebrew/bin/npx");
-        assert_eq!(cfg.args, vec!["-y", "mcp-remote", URL]);
+        assert_eq!(cfg.args, vec!["-y", "mcp-remote@^0.16", URL]);
         assert!(cfg.env.is_empty());
     }
 
@@ -357,7 +369,7 @@ mod tests {
     fn a_token_goes_in_an_env_var_never_in_the_args() {
         let mut cfg = entry(remote("token"), &[("OCTOPUSH_MCP_H_AUTHORIZATION", "tok-123")]);
         apply_bridge(&mut cfg, "npx");
-        assert_eq!(cfg.args, vec!["-y", "mcp-remote", URL, "--header", "Authorization:${OCTOPUSH_MCP_H_AUTHORIZATION}"]);
+        assert_eq!(cfg.args, vec!["-y", "mcp-remote@^0.16", URL, "--header", "Authorization:${OCTOPUSH_MCP_H_AUTHORIZATION}"]);
         assert_eq!(cfg.env["OCTOPUSH_MCP_H_AUTHORIZATION"], "Bearer tok-123");
         assert!(!cfg.args.iter().any(|a| a.contains("tok-123")));
         // Already prefixed: left as it is (so a re-save doesn't double it).
@@ -373,7 +385,7 @@ mod tests {
         apply_bridge(&mut cfg, "npx");
         assert_eq!(
             cfg.args,
-            vec!["-y", "mcp-remote", URL, "--header", "X-Api-Key:${OCTOPUSH_MCP_H_X_API_KEY}", "--header", "X-Tenant:${OCTOPUSH_MCP_H_X_TENANT}"]
+            vec!["-y", "mcp-remote@^0.16", URL, "--header", "X-Api-Key:${OCTOPUSH_MCP_H_X_API_KEY}", "--header", "X-Tenant:${OCTOPUSH_MCP_H_X_TENANT}"]
         );
         let remote = cfg.remote.as_ref().unwrap();
         assert_eq!(remote.header_names, vec!["X-Api-Key", "X-Tenant"], "trimmed, deduplicated, invalid names dropped");
@@ -390,7 +402,7 @@ mod tests {
         apply_bridge(&mut cfg, "npx");
         assert_eq!(
             cfg.args,
-            vec!["-y", "mcp-remote", URL, "--static-oauth-client-info", r#"{"client_id":"client-abc"}"#, "--transport", "http-only"]
+            vec!["-y", "mcp-remote@^0.16", URL, "--static-oauth-client-info", r#"{"client_id":"client-abc"}"#, "--transport", "http-only"]
         );
         let mut cfg = entry(r, &[(CLIENT_SECRET_ENV, "shh")]);
         apply_bridge(&mut cfg, "npx");
@@ -436,6 +448,18 @@ mod tests {
         cfg.remote.as_mut().unwrap().client_id = None;
         apply_bridge(&mut cfg, "npx");
         assert!(cfg.secret_env.is_empty() && !cfg.env.contains_key(CLIENT_SECRET_ENV));
+    }
+
+    #[test]
+    fn extra_arguments_are_appended_and_kept() {
+        let mut r = remote("oauth");
+        r.extra_args = vec![" --enable-proxy ".into(), "".into(), "--resource".into(), "https://api.example.com".into()];
+        let mut cfg = entry(r, &[]);
+        apply_bridge(&mut cfg, "npx");
+        assert_eq!(cfg.args, vec!["-y", "mcp-remote@^0.16", URL, "--enable-proxy", "--resource", "https://api.example.com"]);
+        assert_eq!(cfg.remote.as_ref().unwrap().extra_args, vec!["--enable-proxy", "--resource", "https://api.example.com"]);
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["remote"]["extra_args"], serde_json::json!(["--enable-proxy", "--resource", "https://api.example.com"]));
     }
 
     #[test]

@@ -76,6 +76,7 @@ export function McpServersSection() {
   // or Reconnect started before then reports on an entry that's gone, so
   // its result is dropped.
   const generations = useRef<Record<string, number>>({});
+  const saveSeq = useRef(0);
   const generation = (key: string) => (Object.hasOwn(generations.current, key) ? generations.current[key] : 0);
   const bump = (...keys: string[]) => {
     for (const key of keys) generations.current[key] = generation(key) + 1;
@@ -97,12 +98,15 @@ export function McpServersSection() {
     secrets: Record<string, Record<string, string>> = {},
     renamed: Record<string, string> = {},
   ) {
+    // Only the latest save's answer is shown: an earlier one arriving late
+    // describes entries that were replaced since.
+    const seq = ++saveSeq.current;
     setServers(next);
     try {
       // The entries as saved: a remote entry's bridge is built by the
       // backend, and no secret value comes back.
       const saved = await ipc.saveMcpConfig(next, secrets, renamed);
-      if (saved) setServers(saved);
+      if (saved && seq === saveSeq.current) setServers(saved);
     } catch (e) {
       pushToast({ level: "error", title: "Save failed", body: String(e) });
     }

@@ -29240,7 +29240,7 @@ mod talk_mcp_scope_tests {
         db.set_thread_mcp_disabled(&other, &["example-remote".into()]).unwrap();
         db.conn_ref().execute("UPDATE chat_threads SET mcp_disabled = 'not json' WHERE id = ?1", [&broken]).unwrap();
         let renames = vec![("docs-server".to_string(), "docs".to_string())];
-        assert_eq!(db.rename_thread_mcp_servers(&renames).unwrap(), 1);
+        assert_eq!(db.rename_thread_mcp_servers(&renames, |_, _| false).unwrap(), 1);
         assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs".to_string(), "example-remote".to_string()]);
         assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["example-remote".to_string()], "untouched");
         assert!(db.thread_mcp_disabled(&none).unwrap().is_empty(), "all on stays all on");
@@ -29249,10 +29249,22 @@ mod talk_mcp_scope_tests {
         assert_eq!(raw.as_deref(), Some("not json"), "an unreadable value is left alone");
         // Two servers swapping names swap in the list too.
         let swap = vec![("docs".to_string(), "example-remote".to_string()), ("example-remote".to_string(), "docs".to_string())];
-        db.rename_thread_mcp_servers(&swap).unwrap();
+        db.rename_thread_mcp_servers(&swap, |_, _| false).unwrap();
         assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["docs".to_string()]);
         assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs".to_string(), "example-remote".to_string()]);
-        assert_eq!(db.rename_thread_mcp_servers(&[]).unwrap(), 0);
+        assert_eq!(db.rename_thread_mcp_servers(&[], |_, _| false).unwrap(), 0);
+
+        // A project that defines the old name itself keeps it in its conversations.
+        let renames = vec![("docs".to_string(), "docs-renamed".to_string())];
+        let asked: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
+        db.rename_thread_mcp_servers(&renames, |path, name| {
+            asked.borrow_mut().push((path.to_string(), name.to_string()));
+            path == "/tmp/p-mcp" && name == "docs"
+        })
+        .unwrap();
+        assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["docs".to_string()], "the project's own docs");
+        let asked = asked.into_inner();
+        assert!(!asked.is_empty() && asked.iter().all(|(p, n)| p == "/tmp/p-mcp" && n == "docs"), "{asked:?}");
     }
 
     #[test]
