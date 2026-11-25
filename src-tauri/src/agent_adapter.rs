@@ -292,7 +292,7 @@ pub const CLAUDE_RECOMMENDED_FIXES: &[(&str, &str, RecommendedAudience)] = &[
         "fixes settings changes being lost when several Claude Code processes save them at once",
         RecommendedAudience::Any,
     ),
-    ("2.1.331", "fixes MCP tool calls hanging up to 30 minutes on a malformed server reply", RecommendedAudience::Any),
+    ("2.1.331", "fixes MCP tool calls hanging up to 30 minutes on some malformed replies from a local or WebSocket server", RecommendedAudience::Any),
 ];
 
 /// A [`CLAUDE_RECOMMENDED_FIXES`] row the installed Claude Code lacks.

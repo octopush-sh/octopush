@@ -11,7 +11,7 @@ import { useRoutinesStore } from "../../stores/routinesStore";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import { useModelRetirements } from "../../hooks/useModelRetirements";
 import { libraryModels, readinessRetirementCheck } from "../../lib/modelRetirement";
-import { claudeRecommendedNote, libraryUsesClaudeCode } from "../../lib/claudeCli";
+import { claudeRecommendedNote } from "../../lib/claudeCli";
 import { tourId } from "../../lib/tour/ids";
 import { SectionLabel, formatRelative } from "./shared";
 
@@ -78,7 +78,6 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
   const claudeInRun = useTerminalsStore((s) =>
     Object.values(s.terminalsByWs).some((ts) => ts.some((t) => t.running && t.agentCli === "claude")),
   );
-  const claudeInCrews = libraryUsesClaudeCode(pipelines, routines);
 
   const neverChecked = !checks && !loading && !error;
 
@@ -138,7 +137,7 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
                 check={c}
                 index={i}
                 note={
-                  c.id === "claude" ? claudeRecommendedNote(c.recommended, { inRun: claudeInRun, inCrews: claudeInCrews }) : null
+                  c.id === "claude" ? claudeRecommendedNote(c.recommended, { inRun: claudeInRun }) : null
                 }
                 onShowCaches={c.id === "disk" ? onShowCaches : undefined}
               />
