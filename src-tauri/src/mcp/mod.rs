@@ -2170,6 +2170,24 @@ done
     }
 
     #[test]
+    fn a_bridge_value_is_known_from_four_characters() {
+        let known = |v: &str| {
+            let cfg = McpServerConfig {
+                command: "npx".into(),
+                env: HashMap::from([
+                    ("OCTOPUSH_MCP_H_X_SESSION".to_string(), v.to_string()),
+                    ("OCTOPUSH_MCP_CLIENT_SECRET".to_string(), v.to_string()),
+                ]),
+                ..Default::default()
+            };
+            known_secrets(&cfg).len()
+        };
+        assert_eq!(known("abc"), 0, "three characters would redact every `abc` in the output");
+        assert_eq!(known("abcd"), 2, "four are enough, whatever their shape");
+        assert_eq!(known("  ab  "), 0, "trimmed first");
+    }
+
+    #[test]
     fn a_bridges_header_values_and_a_webhook_url_are_always_known() {
         let cfg = McpServerConfig {
             command: "npx".into(),

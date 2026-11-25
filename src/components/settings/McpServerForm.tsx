@@ -276,7 +276,10 @@ function RemoteFields({ draft, set }: { draft: Draft; set: Patch }) {
                 aria-label="Extra arguments"
                 spellCheck={false}
               />
-              <p className="mt-1 text-[11px] text-octo-mute">Added to the mcp-remote command line as written.</p>
+              <p className="mt-1 text-[11px] text-octo-mute">
+                Added to the mcp-remote command line as written. Anything here shows in the process list, so keep
+                secrets in Token or Custom headers.
+              </p>
             </div>
           </div>
         </Reveal>
