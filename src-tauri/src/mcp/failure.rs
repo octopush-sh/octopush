@@ -49,7 +49,7 @@ static AUTH_STATUS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bhttp(?:/\d(?:\.\d)?)?\s+40[13]\b|\b(?:status|code)\b[^0-9\n]{0,12}\b40[13]\b").unwrap()
 });
 static AUTH_WORDS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bunauthori[sz]ed\b|\bforbidden\b|\binvalid[_ ]token\b|\binvalid_client\b|\binvalid_grant\b|\b(?:token|credentials?) (?:is |are |was |were )?(?:invalid|expired|revoked)\b")
+    Regex::new(r"(?i)\bunauthori[sz]ed\b|\bforbidden\b|\binvalid[_ ]token\b|\binvalid_client\b|\binvalid_grant\b|\b(?:token|credentials?) (?:is |are |was |were )?(?:invalid|expired|revoked)\b|\b(?:InvalidToken|TokenExpired|Unauthori[sz]ed|Authorization|InvalidGrant|InvalidClient)Error\b")
         .unwrap()
 });
 /// Octopush's own lookup failure (`spawn_plan`).
@@ -88,7 +88,7 @@ static DNS_HOST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:ENOTFOUND|EAI_AGAIN)\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})").unwrap());
 /// A line that reads as the error rather than as progress.
 static ERRORISH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:error|failed|failure|fatal|cannot|can't|couldn't|unable|denied|refused|invalid|exception|giving up)\b").unwrap()
+    Regex::new(r"(?i)\b(?:error|failed|failure|fatal|cannot|can't|couldn't|unable|denied|refused|invalid|exception|giving up)\b|\b\w+(?:Error|Exception)\b").unwrap()
 });
 
 /// The header line of a reason whose process exited mid-handshake.
@@ -170,13 +170,13 @@ fn summarize(lines: &[String], text: &str) -> (String, Option<String>) {
             hint("If it signs in through a browser, finish signing in there, then test again."),
         );
     }
-    if AUTH_TIMEOUT.is_match(text) {
+    if AUTH_TIMEOUT.is_match(&end) {
         return (
             "Signing in timed out.".into(),
             hint("Finish signing in in the browser window that opened, then test again."),
         );
     }
-    if PORT_IN_USE.is_match(text) {
+    if PORT_IN_USE.is_match(&end) {
         return (
             "The sign-in callback port is in use.".into(),
             hint("Another sign-in for this server may still be open in your browser; finish or close it, then test again."),
@@ -444,6 +444,36 @@ mod tests {
         assert!(f.detail.contains("Authorization: [redacted]") && f.detail.contains("X-API-Key: [redacted]"), "{}", f.detail);
         // Lines that only name a credential keep their words.
         assert!(f.detail.contains("Fatal error: Error: Unexpected token"), "{}", f.detail);
+    }
+
+    #[test]
+    fn error_classes_and_plain_words_keep_their_text() {
+        for (line, class) in [
+            ("[6] InvalidTokenError: Invalid token", "InvalidTokenError: Invalid token"),
+            ("[6] TokenExpiredError: jwt expired", "TokenExpiredError: jwt expired"),
+            ("[6] AuthorizationError: the grant was revoked", "AuthorizationError: the grant was revoked"),
+        ] {
+            let f = classify_failure(&closed(line));
+            assert!(f.detail.contains(class), "{class} redacted: {}", f.detail);
+            assert_eq!(f.summary, "The server rejected the credentials.", "{line}");
+        }
+        // "basic" before a word isn't a credential.
+        let f = classify_failure(&closed("[6] Fatal error: this server only offers basic authentication"));
+        assert!(f.detail.contains("basic authentication"), "{}", f.detail);
+        assert!(classify_failure(&closed("Authorization: Basic dXNlcjpwYXNz")).detail.contains("[redacted]"));
+    }
+
+    #[test]
+    fn the_port_and_sign_in_timeout_classes_read_the_ending_too() {
+        // A sign-in that timed out earlier, then succeeded, isn't why it failed now.
+        let f = classify_failure(&closed(
+            "[8] Authentication timed out, retrying\n[8] Connected\n[8] Fatal error: Error: connect ECONNREFUSED 127.0.0.1:8808",
+        ));
+        assert_eq!(f.summary, "The server refused the connection.");
+        let f = classify_failure(&closed(
+            "[8] Callback port 3334 is already in use, trying 3335\n[8] Fatal error: Error: getaddrinfo ENOTFOUND mcp.example.invalid",
+        ));
+        assert_eq!(f.summary, "Octopush couldn't find the host mcp.example.invalid.");
     }
 
     #[test]

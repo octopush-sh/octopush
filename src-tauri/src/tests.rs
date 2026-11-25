@@ -29231,6 +29231,31 @@ mod talk_mcp_scope_tests {
     }
 
     #[test]
+    fn renaming_a_server_keeps_it_off_where_it_was_off() {
+        let (_tmp, db, t) = thread_db();
+        let other = db.create_chat_thread("w-mcp", "Other").unwrap().id;
+        let none = db.create_chat_thread("w-mcp", "All on").unwrap().id;
+        let broken = db.create_chat_thread("w-mcp", "Broken").unwrap().id;
+        db.set_thread_mcp_disabled(&t, &["docs-server".into(), "example-remote".into()]).unwrap();
+        db.set_thread_mcp_disabled(&other, &["example-remote".into()]).unwrap();
+        db.conn_ref().execute("UPDATE chat_threads SET mcp_disabled = 'not json' WHERE id = ?1", [&broken]).unwrap();
+        let renames = vec![("docs-server".to_string(), "docs".to_string())];
+        assert_eq!(db.rename_thread_mcp_servers(&renames).unwrap(), 1);
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs".to_string(), "example-remote".to_string()]);
+        assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["example-remote".to_string()], "untouched");
+        assert!(db.thread_mcp_disabled(&none).unwrap().is_empty(), "all on stays all on");
+        let raw: Option<String> =
+            db.conn_ref().query_row("SELECT mcp_disabled FROM chat_threads WHERE id = ?1", [&broken], |r| r.get(0)).unwrap();
+        assert_eq!(raw.as_deref(), Some("not json"), "an unreadable value is left alone");
+        // Two servers swapping names swap in the list too.
+        let swap = vec![("docs".to_string(), "example-remote".to_string()), ("example-remote".to_string(), "docs".to_string())];
+        db.rename_thread_mcp_servers(&swap).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["docs".to_string()]);
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs".to_string(), "example-remote".to_string()]);
+        assert_eq!(db.rename_thread_mcp_servers(&[]).unwrap(), 0);
+    }
+
+    #[test]
     fn a_fork_keeps_the_conversations_mcp_scope() {
         let (_tmp, db, t) = thread_db();
         let u = db.insert_chat_message("w-mcp", &t, "user", "one", None, None, None, None).unwrap();

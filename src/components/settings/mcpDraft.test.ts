@@ -69,6 +69,25 @@ describe("configFromDraft", () => {
     expect(configFromDraft(remote({}), local).env).toEqual({});
   });
 
+  it("keeps the keys the form doesn't show, local or remote", () => {
+    const local: McpServerConfig = { command: "uvx", args: [], env: {}, cwd: "/repo", type: "stdio" };
+    expect(configFromDraft({ ...emptyDraft(), name: "x", command: "uvx", argsText: "a" }, local)).toEqual({
+      command: "uvx",
+      args: ["a"],
+      env: {},
+      cwd: "/repo",
+      type: "stdio",
+    });
+    const remoteBase: McpServerConfig = {
+      command: "npx",
+      args: [],
+      env: {},
+      disabled: false,
+      remote: { url: URL, auth: "oauth", transport: "auto" },
+    };
+    expect(configFromDraft(remote({}), remoteBase)).toMatchObject({ disabled: false, remote: { url: URL } });
+  });
+
   it("a remote entry turned local loses its remote choices", () => {
     const base: McpServerConfig = { command: "npx", args: [], env: {}, remote: { url: URL, auth: "oauth", transport: "auto" } };
     const cfg = configFromDraft({ ...emptyDraft(), name: "x", command: "uvx", argsText: "example-server" }, base);

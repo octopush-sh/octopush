@@ -89,11 +89,13 @@ export function McpServersSection() {
       .finally(() => setLoaded(true));
   }, []);
 
-  async function persist(next: Record<string, McpServerConfig>) {
+  /** Save the entries; `renamed` (new name → old) carries a rename over to
+   *  the conversations that had the old name switched off. */
+  async function persist(next: Record<string, McpServerConfig>, renamed: Record<string, string> = {}) {
     setServers(next);
     try {
       // The entries as saved: a remote entry's bridge is built by the backend.
-      const saved = await ipc.saveMcpConfig(next);
+      const saved = await ipc.saveMcpConfig(next, renamed);
       if (saved) setServers(saved);
     } catch (e) {
       pushToast({ level: "error", title: "Save failed", body: String(e) });
@@ -138,7 +140,7 @@ export function McpServersSection() {
       return t;
     });
     closeForm();
-    await persist(next);
+    await persist(next, original && original !== key ? { [key]: original } : {});
   }
 
   async function clearSignIn(key: string) {

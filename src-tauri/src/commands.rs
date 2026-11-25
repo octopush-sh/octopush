@@ -2277,20 +2277,26 @@ pub async fn get_mcp_config(
 /// connection to every server whose entry changed or was removed, so the next
 /// call spawns it from the saved config (a call in flight on the old process
 /// fails). A remote entry's bridge is rebuilt from its choices first
-/// (`mcp::remote::with_bridges`). Returns the config as saved.
+/// (`mcp::remote::with_bridges`). `renamed` maps a new server name to the
+/// old one it replaces: conversations that had the old name switched off
+/// get the new one instead. Returns the config as saved.
 #[tauri::command]
 pub async fn save_mcp_config(
     app: AppHandle,
     state: State<'_, AppState>,
     servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
+    renamed: Option<std::collections::HashMap<String, String>>,
 ) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
     let registry = Arc::clone(&state.chat.mcp);
+    let db = Arc::clone(&state.db);
     // `npx` lookup, file I/O, kill + reap: off the runtime thread.
     let saved = tokio::task::spawn_blocking(
         move || -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
             let servers = crate::mcp::remote::with_bridges(servers);
             let old = crate::mcp::load_user_config();
             crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)?;
+            let renames = crate::mcp::real_renames(&old, &servers, &renamed.unwrap_or_default());
+            db.lock().rename_thread_mcp_servers(&renames)?;
             registry.apply_config_change(&old, &servers);
             Ok(servers)
         },

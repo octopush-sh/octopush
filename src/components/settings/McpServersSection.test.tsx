@@ -229,7 +229,7 @@ describe("McpServersSection", () => {
       expect(saveMcpConfig).toHaveBeenCalledWith({
         github,
         fs: { command: "bash", args: ["server.sh", "--verbose"], env: { LOG: "debug" } },
-      });
+      }, {});
       expect(screen.queryByRole("group")).toBeNull();
       expect(screen.getByText(/bash server.sh --verbose/)).toBeInTheDocument();
     });
@@ -245,7 +245,8 @@ describe("McpServersSection", () => {
       expect(within(form).queryByText("name already exists")).toBeNull();
       fireEvent.click(within(form).getByText("Save changes"));
       await settle();
-      expect(saveMcpConfig).toHaveBeenCalledWith({ github, files: fs });
+      // The rename travels with the save, for the conversations' off lists.
+      expect(saveMcpConfig).toHaveBeenCalledWith({ github, files: fs }, { files: "fs" });
       expect(screen.getByText("files")).toBeInTheDocument();
       expect(screen.queryByText("fs")).toBeNull();
     });
@@ -298,6 +299,62 @@ describe("McpServersSection", () => {
       expect(screen.getByRole("button", { name: "Edit fs" })).not.toBeDisabled();
     });
 
+    it("a Reconnect still running drops its result once its entry was removed", async () => {
+      getMcpConfig.mockResolvedValue({ fs });
+      let answer: (tools: unknown[]) => void = () => {};
+      reconnectMcpServer.mockReturnValue(new Promise((r) => { answer = r; }));
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Reconnect fs" }));
+      expect(screen.getByRole("button", { name: "Edit fs" })).toBeDisabled();
+      // Remove bumps the generation; the same name comes back with another command.
+      fireEvent.click(screen.getByRole("button", { name: "Remove fs" }));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenLastCalledWith({}, {});
+      fireEvent.click(screen.getByText("Add MCP server"));
+      const form = screen.getByRole("group", { name: "Add an MCP server" });
+      fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "fs" } });
+      fireEvent.change(within(form).getByLabelText("Command"), { target: { value: "uvx" } });
+      fireEvent.click(within(form).getByText("Add server"));
+      await settle();
+      await act(async () => {
+        answer([{ server: "fs", name: "a", namespaced: "mcp__fs__a", description: "" }]);
+      });
+      expect(screen.queryByText(/Reconnected/)).toBeNull();
+      expect(screen.getByRole("button", { name: "Reconnect fs" })).not.toBeDisabled();
+    });
+
+    it("a Reconnect that finishes on the same entry still shows its result", async () => {
+      getMcpConfig.mockResolvedValue({ fs, github });
+      let answer: (tools: unknown[]) => void = () => {};
+      reconnectMcpServer.mockReturnValue(new Promise((r) => { answer = r; }));
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Reconnect fs" }));
+      // Removing another server leaves this one's generation alone.
+      fireEvent.click(screen.getByRole("button", { name: "Remove github" }));
+      await settle();
+      await act(async () => {
+        answer([{ server: "fs", name: "a", namespaced: "mcp__fs__a", description: "" }]);
+      });
+      expect(screen.getByText(/Reconnected · 1 tool/)).toBeInTheDocument();
+    });
+
+    it("saving an edit keeps the keys the form doesn't show", async () => {
+      const withExtras = { ...fs, cwd: "/repo", type: "stdio", disabled: false };
+      getMcpConfig.mockResolvedValue({ fs: withExtras });
+      render(<McpServersSection />);
+      await settle();
+      fireEvent.click(screen.getByRole("button", { name: "Edit fs" }));
+      fireEvent.change(screen.getByLabelText("Args"), { target: { value: "server.sh\n--verbose" } });
+      fireEvent.click(screen.getByText("Save changes"));
+      await settle();
+      expect(saveMcpConfig).toHaveBeenCalledWith(
+        { fs: { ...withExtras, args: ["server.sh", "--verbose"] } },
+        {},
+      );
+    });
+
     it("a duplicate check that a prototype key can't fool", async () => {
       getMcpConfig.mockResolvedValue({ fs });
       render(<McpServersSection />);
@@ -340,7 +397,7 @@ describe("McpServersSection", () => {
     expect(saveMcpConfig).toHaveBeenCalledWith({
       fs: { command: "bash", args: [], env: {} },
       example: { command: "uvx", args: [], env: {} },
-    });
+    }, {});
   });
 
   describe("remote servers", () => {
@@ -387,7 +444,7 @@ describe("McpServersSection", () => {
       await settle();
       expect(saveMcpConfig).toHaveBeenCalledWith({
         "example-remote": { command: "npx", args: [], env: {}, remote: { url: URL, auth: "oauth", transport: "auto" } },
-      });
+      }, {});
       expect(screen.getByText(URL)).toBeInTheDocument();
     });
 
@@ -414,7 +471,7 @@ describe("McpServersSection", () => {
           env: { OCTOPUSH_MCP_H_AUTHORIZATION: "tok-123" },
           remote: { url: URL, auth: "token", transport: "auto" },
         },
-      });
+      }, {});
     });
 
     it("custom headers and the advanced choices", async () => {
@@ -447,7 +504,7 @@ describe("McpServersSection", () => {
           env: { OCTOPUSH_MCP_H_X_API_KEY: "k" },
           remote: { url: URL, auth: "headers", transport: "sse-only", header_names: ["X-Api-Key"] },
         },
-      });
+      }, {});
     });
 
     it("Edit reopens a remote server's choices, and offers Clear sign-in for a browser sign-in", async () => {
