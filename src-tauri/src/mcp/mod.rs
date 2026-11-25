@@ -32,6 +32,9 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
+mod failure;
+pub use failure::{classify_failure, McpFailure};
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub command: String,
@@ -211,18 +214,19 @@ const SERVER_OUTPUT_CAP: usize = 1024;
 static AUTH_CODE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bcode=([^\s&]+)").unwrap());
 
-/// A server's stdout/stderr as the model may read it: token-like values
-/// redacted line by line (`secret_scan::redact_line`: provider key prefixes,
-/// `TOKEN=…`, `Bearer …`; plus `code=…`), then cut to its last
-/// [`SERVER_OUTPUT_CAP`] bytes from a line start, where the error usually is.
+/// One line of a server's output with token-like values redacted
+/// (`secret_scan::redact_line`: provider key prefixes, `TOKEN=…`,
+/// `Bearer …`; plus `code=…`), for the model or for Settings' details.
+pub(crate) fn redact_output_line(line: &str) -> String {
+    let line = crate::secret_scan::redact_line(line, &[]);
+    AUTH_CODE.replace_all(&line, format!("code={}", crate::secret_scan::REDACTED)).into_owned()
+}
+
+/// A server's stdout/stderr as the model may read it: redacted line by line
+/// (`redact_output_line`), then cut to its last [`SERVER_OUTPUT_CAP`] bytes
+/// from a line start, where the error usually is.
 fn server_output(detail: &str) -> String {
-    let redacted: Vec<String> = detail
-        .lines()
-        .map(|line| {
-            let line = crate::secret_scan::redact_line(line, &[]);
-            AUTH_CODE.replace_all(&line, format!("code={}", crate::secret_scan::REDACTED)).into_owned()
-        })
-        .collect();
+    let redacted: Vec<String> = detail.lines().map(redact_output_line).collect();
     let text = redacted.join("\n");
     if text.len() <= SERVER_OUTPUT_CAP {
         return text;

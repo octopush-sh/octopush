@@ -391,6 +391,17 @@ export interface McpServerConfig {
   env: Record<string, string>;
 }
 
+/** Why Settings' Test or Reconnect failed (`mcp::classify_failure`), the
+ *  payload of an `AppError` with `kind: "McpFailure"`. */
+export interface McpFailure {
+  /** One short line: what went wrong. */
+  summary: string;
+  /** What to do about it, when Octopush knows. */
+  hint: string | null;
+  /** The whole reason and server output, redacted. */
+  detail: string;
+}
+
 export interface ChatMessage {
   id: number;
   workspaceId: string;
