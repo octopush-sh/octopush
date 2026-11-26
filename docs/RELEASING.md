@@ -124,9 +124,32 @@ twice a day ([`ROUTINES.md`](ROUTINES.md)):
   commits `chore: release v<next>`, pushes, opens a PR labelled `release`, waits
   for CI (≤ 45 min; a run that only lost its runner is re-run), merges it (merge commit, pinned to the head sha), and pushes
   the annotated tag `v<next>` on the merge commit. `release.yml` then publishes the beta.
+- **The tag lands only on a tree CI tested** (#1063: v0.4.142 tagged a merge
+  that had never been built). A merge commit has the PR head's exact tree only
+  if the head still contains `main`, so after CI passes the routine fetches
+  `main` again:
+  - if `main` moved while CI ran, it cuts the release again from the new
+    `main` (same branch and PR, new head; what landed is in the notes) and
+    waits for CI again — at most `OCTOPUSH_RELEASE_RECUTS` times (default 1),
+    then it stops;
+  - after the merge it checks that the merge commit's tree is the tested
+    head's; if `main` slipped in between, nothing is tagged, CI is started on
+    `main`, and the next run's resume tags that merge only once CI passed on
+    it (or on a head with its exact tree).
+
+  Auto-merge of agent PRs pauses while a release PR is open
+  ([`ROUTINES.md`](ROUTINES.md)), so `main` rarely moves in the first place.
+- **A failed build's notes are not lost.** Before collecting, the routine walks
+  back from the newest tag: every `v*` tag without a published GitHub release
+  (its `release.yml` build failed) is carried, up to the newest published one,
+  which becomes `--since`. `whats-new.mjs collect <next> --since <published>
+  --carry <failed,…>` then puts the carried versions' changesets into the
+  notes, with a line saying they were never published. (Their What's new tips
+  already reach users: the modal shows every bundled version since the last
+  one seen.)
 - On any failure it stops, leaves no tag behind, and comments on and closes the
   PR. Re-running is safe: an open PR is reused, and a release that merged but
-  never got its tag is only tagged.
+  never got its tag is only tagged, once CI passed on that tree.
 
 ### The updater endpoint (host indirection)
 

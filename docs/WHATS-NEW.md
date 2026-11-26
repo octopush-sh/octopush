@@ -253,7 +253,9 @@ Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/c
 
 1. moves `whats-new/unreleased/*` into `whats-new/<version>/`;
 2. writes `whats-new/<version>/notes.md` — grouped **Features / Improvements / Fixes**, then
-   a **Maintenance** line listing merged PRs without a changeset;
+   a **Maintenance** line listing merged PRs without a changeset; with `--carry <X.Y.Z>,…`
+   (versions tagged after the last published release whose build failed) their changesets are
+   in the notes too, under a line saying they were never published (docs/RELEASING.md);
 3. the clip recorder then records `<slug>.webm` for every app changeset with `steps`.
 
 The app bundles the released `whats-new/X.Y.Z/` directories at build time (`unreleased/` is

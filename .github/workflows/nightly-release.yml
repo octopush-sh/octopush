@@ -1,8 +1,10 @@
 # Nightly beta release (VISION.md §8, docs/ROUTINES.md, docs/RELEASING.md).
 #
 # If main moved since the last tag and CI is green: collect the changesets,
-# bump, open the release PR, wait for CI, merge,
-# tag, and start release.yml on the tag — which publishes a beta (prerelease).
+# bump, open the release PR, wait for CI, merge only if the PR's head still
+# contains main (else cut it again from the new main), tag the merge — which
+# has the tree CI tested — and start release.yml on the tag, which publishes a
+# beta (prerelease).
 # The owner promotes it to stable. No agent involved. Twice a day: 05:13 and
 # 17:13 Bogotá.
 name: nightly-release
@@ -25,7 +27,9 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Up to 30 min for main's CI, then CI on the release PR (≤ 45 min) — twice
+    # when main moved meanwhile and the release is cut again (release-beta.sh).
+    timeout-minutes: 150
     env:
       OCTOPUSH_DISPATCH: "1"
       OCTOPUSH_SKIP_CLIPS: "1"

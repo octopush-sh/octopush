@@ -36,6 +36,7 @@ case "$args" in
       && git push --quiet origin HEAD:main && git rev-parse HEAD
     ;;
   *"repos/${SLUG}/pulls "*"-f title="*) echo 42 ;;
+  *"repos/${SLUG}/releases?per_page="*) printf '%s\\n' \${STUB_PUBLISHED-v0.4.89} ;;
   *) : ;;
 esac
 `;
@@ -297,4 +298,115 @@ test("run: re-run after a merged-but-untagged release only tags", () => {
   assert.ok(!r.calls.some((c) => /-f title=/.test(c)), "no second PR");
   assert.ok(existsSync(fx.ws));
   rmSync(fx.dir, { recursive: true, force: true });
+});
+
+/** A stub line that pushes one more commit (with a changeset) to the bare origin's main, as a merge landing would. */
+const MOVE_MAIN = (slug, title) => `( w="$(mktemp -d)"; git clone --quiet "$STUB_ORIGIN" "$w" && cd "$w" && mkdir -p whats-new/unreleased \\
+  && printf -- '---\\ntitle: ${title}\\nkind: fix\\narea: app\\n---\\nIt landed while CI ran.\\n' > whats-new/unreleased/${slug}.md \\
+  && git add -A && git commit --quiet -m "Merge pull request #8 from octo/${slug}" && git push --quiet origin HEAD:main ) >/dev/null 2>&1`;
+const CI_LINE = '*"actions/runs?head_sha="*) echo "${STUB_CI:-success}" ;;';
+/** CI reads: the first is main's (the check); on read number `at` (or every read from it, with `always`) main moves. */
+const moveMainOnCi = (fx, { at = 1, always = false } = {}) => writeFileSync(join(fx.bin, "gh"), GH_STUB.replace(CI_LINE,
+  `*"actions/runs?head_sha="*) n=$(cat "$STUB_LOG.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUB_LOG.n"
+    if [ "$n" ${always ? "-ge" : "-eq"} ${at} ]; then ${MOVE_MAIN("landed-meanwhile-$n", "Landed meanwhile $n")}; fi; echo success ;;`));
+
+test("run: main moved while CI ran → the release is cut again from the new main, tested, merged and tagged", () => {
+  const fx = fixture();
+  moveMainOnCi(fx);
+  const r = routine(fx, "run");
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /main moved to [0-9a-f]{40} while CI ran on [0-9a-f]{40} — cutting v0\.4\.90 again from it \(1 of 1\)/);
+  const head = git(fx.origin, "rev-parse", "main^2");
+  const puts = r.calls.filter((c) => /-X PUT .*\/merge/.test(c));
+  assert.equal(puts.length, 1, r.calls.join("\n"));
+  assert.match(puts[0], new RegExp(`sha=${head} `), "the head CI ran on last is the one merged");
+  assert.equal(git(fx.origin, "rev-parse", "main^{tree}"), git(fx.origin, "rev-parse", "main^2^{tree}"), "the tagged merge is exactly the tested tree");
+  assert.equal(git(fx.origin, "rev-parse", "v0.4.90^{commit}"), git(fx.origin, "rev-parse", "main"));
+  const notes = git(fx.origin, "show", "main:whats-new/0.4.90/notes.md");
+  assert.match(notes, /A nicer thing/);
+  assert.match(notes, /Landed meanwhile/, "what landed meanwhile is in the release and its notes");
+  assert.ok(r.calls.some((c) => /-X PATCH repos\/octo\/app\/pulls\/42 -f body=/.test(c)), "the PR's description follows the new cut");
+  rmSync(fx.dir, { recursive: true, force: true });
+});
+
+test("run: main keeps moving → stops after the allowed re-cuts: no merge, no tag, PR closed", () => {
+  const fx = fixture();
+  moveMainOnCi(fx, { always: true });
+  const r = routine(fx, "run");
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /stopping so nothing untested is tagged/);
+  assert.ok(!r.calls.some((c) => /\/merge/.test(c)), r.calls.join("\n"));
+  assert.equal(originTags(fx), "v0.4.89");
+  assert.ok(r.calls.some((c) => /-X PATCH repos\/octo\/app\/pulls\/42 -f state=closed/.test(c)));
+  const calm = fixture();
+  assert.equal(routine(calm, "run", { OCTOPUSH_RELEASE_RECUTS: "0" }).code, 0, "with no move, RECUTS=0 changes nothing");
+  rmSync(fx.dir, { recursive: true, force: true });
+  rmSync(calm.dir, { recursive: true, force: true });
+});
+
+test("run: main moved during the merge → that merge is not tagged; a later run tags it only once CI passed on it", () => {
+  const fx = fixture();
+  const gh = join(fx.bin, "gh");
+  writeFileSync(gh, GH_STUB
+    .replace(CI_LINE, `*"actions/runs?head_sha="*) s="$(echo "$args" | sed -nE 's/.*head_sha=([0-9a-f]+).*/\\1/p')"; if [ -f "$STUB_LOG.ci.$s" ]; then cat "$STUB_LOG.ci.$s"; else echo "\${STUB_CI:-success}"; fi ;;`)
+    .replace('    work="$(mktemp -d)"', `    if [ ! -f "$STUB_LOG.raced" ]; then touch "$STUB_LOG.raced"; ${MOVE_MAIN("raced", "Raced the merge")}; fi
+    work="$(mktemp -d)"`));
+  const r = routine(fx, "run");
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /main moved during the merge: [0-9a-f]{40} is not the tree CI tested/);
+  assert.equal(originTags(fx), "v0.4.89", "nothing untested is tagged");
+  const merge = git(fx.origin, "rev-parse", "main");
+  assert.notEqual(git(fx.origin, "rev-parse", `${merge}^{tree}`), git(fx.origin, "rev-parse", `${merge}^2^{tree}`));
+
+  // Later: another PR lands on top (green), the merge itself has no green CI → resume refuses.
+  const seed = join(fx.dir, "seed");
+  git(seed, "pull", "--quiet", "origin", "main");
+  writeFileSync(join(seed, "later.txt"), "later");
+  git(seed, "add", "-A"); git(seed, "commit", "--quiet", "-m", "Merge pull request #11 from octo/later");
+  git(seed, "push", "--quiet", "origin", "main");
+  writeFileSync(`${fx.log}.ci.${merge}`, "failure");
+  writeFileSync(fx.log, "");
+  const refused = routine(fx, "run");
+  assert.equal(refused.code, 2, refused.out);
+  assert.match(refused.out, /v0\.4\.90 is merged \([0-9a-f]{40}\) but untested: CI is failure on the merge/);
+  assert.equal(originTags(fx), "v0.4.89");
+
+  writeFileSync(`${fx.log}.ci.${merge}`, "success");
+  const tagged = routine(fx, "run");
+  assert.equal(tagged.code, 0, tagged.out);
+  assert.match(tagged.out, /already merged \([0-9a-f]{40}; CI green on the merge/);
+  assert.equal(git(fx.origin, "rev-parse", "v0.4.90^{commit}"), merge);
+  rmSync(fx.dir, { recursive: true, force: true });
+});
+
+test("run: a version that was tagged but never published (its build failed) is carried into the next notes", () => {
+  const fx = fixture({ after: [] });
+  const seed = join(fx.dir, "seed");
+  const put = (rel, text) => { mkdirSync(dirname(join(seed, rel)), { recursive: true }); writeFileSync(join(seed, rel), text); };
+  // v0.4.90: collected and tagged, but release.yml failed — no GitHub release.
+  put("whats-new/0.4.90/failed-thing.md", "---\ntitle: Shipped by no one yet\nkind: feature\narea: app\n---\nThe v0.4.90 build never published this.\n");
+  put("whats-new/0.4.90/notes.md", "## Octopush 0.4.90\n\n### Features\n\n- **Shipped by no one yet** — The v0.4.90 build never published this.\n");
+  for (const f of ["package.json", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/tauri.conf.json"]) put(f, readFileSync(join(seed, f), "utf8").replace("0.4.89", "0.4.90"));
+  git(seed, "add", "-A"); git(seed, "commit", "--quiet", "-m", "chore: release v0.4.90");
+  git(seed, "tag", "-a", "v0.4.90", "-m", "v0.4.90");
+  put("whats-new/unreleased/the-fix.md", "---\ntitle: The fix\nkind: fix\narea: app\n---\nWhat made the build pass again.\n");
+  git(seed, "add", "-A"); git(seed, "commit", "--quiet", "-m", "Merge pull request #12 from octo/the-fix");
+  git(seed, "push", "--quiet", "origin", "main", "--tags");
+  const r = routine(fx, "run", { STUB_BRANCH: "release/v0.4.91", STUB_PUBLISHED: "v0.4.89" });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /collecting changesets for 0\.4\.91 \(since v0\.4\.89; carrying 0\.4\.90, tagged but never published\)/);
+  const notes = git(fx.origin, "show", "main:whats-new/0.4.91/notes.md");
+  assert.match(notes, /This release also ships the changes of 0\.4\.90, whose build failed, so it was never published\./);
+  assert.match(notes, /Shipped by no one yet/);
+  assert.match(notes, /The fix/);
+  assert.ok(existsSync(fx.ws));
+  assert.equal(git(fx.origin, "rev-parse", "v0.4.91^{commit}"), git(fx.origin, "rev-parse", "main"));
+
+  // Published after all (a starved build re-ran): nothing is carried.
+  const fx2 = fixture();
+  const plain = routine(fx2, "run", { STUB_PUBLISHED: "v0.4.89" });
+  assert.match(plain.out, /collecting changesets for 0\.4\.90 \(since v0\.4\.89\)/);
+  assert.doesNotMatch(git(fx2.origin, "show", "main:whats-new/0.4.90/notes.md"), /also ships/);
+  rmSync(fx.dir, { recursive: true, force: true });
+  rmSync(fx2.dir, { recursive: true, force: true });
 });

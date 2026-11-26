@@ -10,9 +10,15 @@
 #   run     cut the next patch version: temp worktree of origin/main → branch
 #           release/v<next> → collect changesets → (record clips) → bump →
 #           commit → PR (label `release`) → wait for CI → merge → tag v<next>.
+#           The tag only ever lands on a tree CI tested (#1063): the PR merges
+#           only if its head still contains main (if main moved while CI ran,
+#           the release is cut again from the new main, up to
+#           OCTOPUSH_RELEASE_RECUTS times, and CI runs again), and the merge
+#           commit must have the head's exact tree. Notes carry the changes of
+#           versions tagged since the last published release whose build failed.
 #           Safe to re-run: reuses an open PR, and if the bump already landed on
-#           main untagged, only tags it. On failure: no tag is left behind and
-#           the PR gets a comment and is closed.
+#           main untagged, only tags it — once CI passed on that tree. On
+#           failure: no tag is left behind and the PR gets a comment and is closed.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -22,6 +28,10 @@ OWNER="${REPO%%/*}"
 CI_TIMEOUT="${OCTOPUSH_RELEASE_CI_TIMEOUT:-2700}"   # seconds (45 min)
 CI_POLL="${OCTOPUSH_RELEASE_CI_POLL:-30}"           # seconds
 CI_STARVED_RETRIES="${OCTOPUSH_RELEASE_CI_STARVED_RETRIES:-3}"   # re-runs of a CI that only lost its runner
+# Times the release is cut again because main moved while CI ran on it (then it stops).
+RECUTS="${OCTOPUSH_RELEASE_RECUTS:-1}"
+# Tags walked back looking for the last published release (failed builds in between are carried).
+CARRY_MAX=5
 # How long the check waits for main's CI to settle (default the smaller of the
 # CI timeout and 30 min): a merge minutes before the release window must not
 # cost the day's beta. One deadline covers the waiting and any re-runs.
@@ -198,7 +208,9 @@ do_run() {
   if [[ "$main_version" == "$next" ]]; then
     merge="$(g log --merges --format='%H %s' "v$prev..origin/main" | grep -E "/release/v$next\$" | head -n 1 | cut -d' ' -f1 || true)"
     [[ -n "$merge" ]] || die "main is already at $next but has no release/v$next merge — tag it by hand"
-    echo "v$next already merged ($merge) — tagging only"
+    local tested
+    tested="$(merge_tested "$merge")" || die "v$next is merged ($merge) but untested: $tested — run CI on it (or fix main) and re-run"
+    echo "v$next already merged ($merge; $tested) — tagging only"
     tag_and_push "$next" "$merge"
     print_notes "$next"
     return 0
@@ -210,17 +222,99 @@ do_run() {
   rmdir "$WT"
   g worktree add --quiet --detach "$WT" origin/main || fail "could not create a worktree of origin/main"
   git -C "$WT" checkout --quiet -B "$BRANCH" || fail "could not create branch $BRANCH"
+  install_deps
 
-  echo "installing dependencies"
-  # In Actions, no install scripts: main's src/ is agent work and must not run where the token is.
-  if [[ "$DISPATCH" == 1 ]]; then
-    (cd "$WT" && npm ci --no-audit --no-fund --ignore-scripts) || fail "npm ci failed"
-  else
-    (cd "$WT" && npm ci --no-audit --no-fund) || fail "npm ci failed"
+  local base cuts=0 main_now
+  base="$(git -C "$WT" rev-parse HEAD)"
+  while :; do
+    cut_release "$next" "$prev"
+    head="$HEAD_SHA"
+    echo "waiting for CI on $head (≤ $((CI_TIMEOUT / 60)) min)"
+    wait_for_ci "$head"
+    # The PR merges with a merge commit: unless its head still contains main,
+    # that commit — the one tagged — is a tree CI never built (#1063).
+    g fetch --quiet origin main || fail "git fetch origin failed"
+    main_now="$(g rev-parse origin/main)"
+    if g merge-base --is-ancestor "$main_now" "$head"; then break; fi
+    cuts=$((cuts + 1))
+    if [[ "$cuts" -gt "$RECUTS" ]]; then
+      fail "main moved to $main_now while CI ran on the release (cut $cuts times) — stopping so nothing untested is tagged; the next run starts over"
+    fi
+    echo "main moved to $main_now while CI ran on $head — cutting v$next again from it ($cuts of $RECUTS)"
+    git -C "$WT" checkout --quiet --force -B "$BRANCH" origin/main || fail "could not reset $BRANCH to origin/main"
+    git -C "$WT" clean -fdq -- whats-new >/dev/null 2>&1 || true
+    if ! git -C "$WT" diff --quiet "$base" HEAD -- package-lock.json; then install_deps; fi
+    base="$(git -C "$WT" rev-parse HEAD)"
+  done
+
+  merge="$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=merge -f sha="$head" --jq .sha)" \
+    || fail "could not merge PR #$PR"
+  [[ -n "$merge" ]] || fail "merge of PR #$PR returned no sha"
+  echo "merged PR #$PR as $merge"
+  local merged_pr="$PR"; PR=""   # from here on a failure must not close a merged PR
+
+  # Main can still move between the check above and the merge: tag only the tree CI tested.
+  g fetch --quiet origin main || fail "git fetch origin failed"
+  if [[ "$(g rev-parse "$merge^{tree}")" != "$(g rev-parse "$head^{tree}")" ]]; then
+    dispatch ci.yml main || true
+    fail "main moved during the merge: $merge is not the tree CI tested on $head, so it is not tagged. The next run tags it once CI passes on it"
   fi
 
-  echo "collecting changesets for $next (since v$prev)"
-  (cd "$WT" && node scripts/whats-new.mjs collect "$next" --since "v$prev") || fail "whats-new collect failed"
+  tag_and_push "$next" "$merge"
+  gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null 2>&1 || true
+  echo "PR:      https://github.com/$REPO/pull/$merged_pr"
+  echo "---- whats-new/$next/notes.md ----"
+  cat "$WT/whats-new/$next/notes.md" 2>/dev/null || echo "(no notes.md)"
+}
+
+# Was `merge` (the release PR's merge commit) tested? Yes when CI passed on it,
+# or when it has exactly the tree of its second parent (the PR head) and CI
+# passed on that head. Prints the CI status that decided; returns 1 if untested.
+merge_tested() {
+  local merge="$1" head ci
+  ci="$(ci_status_for "$REPO" "$merge" || echo error)"
+  if [[ "$ci" == success ]]; then echo "CI green on the merge $merge"; return 0; fi
+  head="$(g rev-parse --verify --quiet "$merge^2" || true)"
+  if [[ -n "$head" && "$(g rev-parse "$merge^{tree}")" == "$(g rev-parse "$head^{tree}")" ]]; then
+    ci="$(ci_status_for "$REPO" "$head" || echo error)"
+    if [[ "$ci" == success ]]; then echo "the merge $merge has the tree CI passed on ($head)"; return 0; fi
+  fi
+  echo "CI is $ci on the merge $merge and its tree is not one CI passed on"
+  return 1
+}
+
+# The versions to carry into this release's notes, and where its changes start.
+# Walking back from the newest tag: every tag with no published GitHub release
+# (its release.yml build failed, so nothing of it reached anyone) is carried,
+# until the newest published one, which becomes --since. Prints
+# "<since-tag> <comma-separated versions>" (versions empty when nothing is
+# carried); falls back to "<prev-tag> " when the releases can't be read.
+carry_plan() {
+  local prev="$1" wt="$2" published tag since="" carry="" n=0
+  if ! published="$(gh api "repos/$REPO/releases?per_page=100" --jq '.[] | select(.draft | not) | .tag_name')"; then
+    echo "could not list the published releases — carrying no failed build's notes" >&2
+    echo "$prev "; return 0
+  fi
+  while read -r tag; do
+    [[ -n "$tag" ]] || continue
+    if grep -qxF -- "$tag" <<< "$published"; then since="$tag"; break; fi
+    n=$((n + 1)); [[ "$n" -le "$CARRY_MAX" ]] || break
+    # Only a version whose changesets were collected has anything to carry.
+    if [[ -d "$wt/whats-new/${tag#v}" ]]; then carry="${tag#v}${carry:+,$carry}"; fi
+  done <<< "$(g tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+  if [[ -z "$since" ]]; then echo "$prev "; return 0; fi   # none published within reach: as before
+  echo "$since $carry"
+}
+
+# Cut (or cut again) release/v<next> in the worktree from origin/main: collect,
+# clips, bump, commit, push, CI, PR. Sets HEAD_SHA.
+HEAD_SHA=""
+cut_release() {
+  local next="$1" prev="$2" plan since carry body
+  plan="$(carry_plan "v$prev" "$WT")"
+  since="${plan%% *}"; carry="${plan#* }"
+  echo "collecting changesets for $next (since $since${carry:+; carrying $carry, tagged but never published})"
+  (cd "$WT" && node scripts/whats-new.mjs collect "$next" --since "$since" ${carry:+--carry "$carry"}) || fail "whats-new collect failed"
   git -C "$WT" add -A whats-new || fail "git add whats-new failed"
 
   # Recording clips runs the app's frontend (agent work) — never next to the
@@ -247,41 +341,40 @@ do_run() {
   git -C "$WT" commit --quiet -m "chore: release v$next
 
 $TRAILERS" || fail "git commit failed"
-  head="$(git -C "$WT" rev-parse HEAD)"
+  HEAD_SHA="$(git -C "$WT" rev-parse HEAD)"
   git -C "$WT" "${PUSH_AUTH[@]}" push --quiet --force origin "HEAD:refs/heads/$BRANCH" || fail "could not push $BRANCH"
   dispatch ci.yml "$BRANCH" || fail "could not start CI on $BRANCH"
 
-  PR="$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$BRANCH&per_page=1" --jq '.[0].number // empty')" \
-    || fail "could not look up an existing PR for $BRANCH"
-  if [[ -z "$PR" ]]; then
-    local body
-    body="Nightly beta release of **v$next** (\`scripts/routines/release-beta.sh\`, docs/ROUTINES.md).
+  body="Nightly beta release of **v$next** (\`scripts/routines/release-beta.sh\`, docs/ROUTINES.md).
 
 Merging this and tagging \`v$next\` publishes a **beta** (GitHub prerelease). Promote it to stable with \`promote.yml\` (docs/RELEASING.md).
 
 $(cat "$WT/whats-new/$next/notes.md" 2>/dev/null || true)"
-    PR="$(gh api "repos/$REPO/pulls" -f title="chore: release v$next" -f head="$BRANCH" -f base=main -f body="$body" --jq .number)" \
-      || { PR=""; fail "could not open the release PR"; }
-    echo "opened PR #$PR"
+  if [[ -z "$PR" ]]; then
+    PR="$(gh api "repos/$REPO/pulls?state=open&head=$OWNER:$BRANCH&per_page=1" --jq '.[0].number // empty')" \
+      || fail "could not look up an existing PR for $BRANCH"
+    if [[ -z "$PR" ]]; then
+      PR="$(gh api "repos/$REPO/pulls" -f title="chore: release v$next" -f head="$BRANCH" -f base=main -f body="$body" --jq .number)" \
+        || { PR=""; fail "could not open the release PR"; }
+      echo "opened PR #$PR"
+    else
+      echo "reusing open PR #$PR"
+    fi
+    gh api "repos/$REPO/issues/$PR/labels" -f "labels[]=release" >/dev/null || fail "could not label PR #$PR"
   else
-    echo "reusing open PR #$PR"
+    # Cut again: same PR, new head; its description follows the new notes.
+    gh api -X PATCH "repos/$REPO/pulls/$PR" -f body="$body" >/dev/null || echo "could not update PR #$PR's description" >&2
   fi
-  gh api "repos/$REPO/issues/$PR/labels" -f "labels[]=release" >/dev/null || fail "could not label PR #$PR"
+}
 
-  echo "waiting for CI on $head (≤ $((CI_TIMEOUT / 60)) min)"
-  wait_for_ci "$head"
-
-  merge="$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=merge -f sha="$head" --jq .sha)" \
-    || fail "could not merge PR #$PR"
-  [[ -n "$merge" ]] || fail "merge of PR #$PR returned no sha"
-  echo "merged PR #$PR as $merge"
-  local merged_pr="$PR"; PR=""   # from here on a failure must not close a merged PR
-
-  tag_and_push "$next" "$merge"
-  gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null 2>&1 || true
-  echo "PR:      https://github.com/$REPO/pull/$merged_pr"
-  echo "---- whats-new/$next/notes.md ----"
-  cat "$WT/whats-new/$next/notes.md" 2>/dev/null || echo "(no notes.md)"
+install_deps() {
+  echo "installing dependencies"
+  # In Actions, no install scripts: main's src/ is agent work and must not run where the token is.
+  if [[ "$DISPATCH" == 1 ]]; then
+    (cd "$WT" && npm ci --no-audit --no-fund --ignore-scripts) || fail "npm ci failed"
+  else
+    (cd "$WT" && npm ci --no-audit --no-fund) || fail "npm ci failed"
+  fi
 }
 
 case "${1:-}" in
