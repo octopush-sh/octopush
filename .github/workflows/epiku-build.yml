@@ -42,13 +42,13 @@
 #
 # Merging is epiku-review.yml's job, never this one's.
 #
-# Manual runs only until the owner enables the schedule: uncomment the two
-# `schedule` lines (even hours at :22, a slot no other lane uses).
+# Scheduled on even UTC hours at :22 (a slot no other lane uses), enabled
+# 2026-11-26 after the first manual build, review and merge cycle worked.
 name: epiku-build
 
 on:
-  # schedule:
-  #   - cron: "22 */2 * * *"
+  schedule:
+    - cron: "22 */2 * * *"
   workflow_dispatch:
 
 permissions:

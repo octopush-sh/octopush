@@ -1836,7 +1836,7 @@ test("publish-build for epiku: branch agent/issue-<n>, PR and labels in epiku on
   }
 });
 
-test("workflows: the Epiku lane starts nothing by itself, holds least privilege, pins its actions and keeps the App key and the merge away from agents", async () => {
+test("workflows: the Epiku lane runs only on its schedule or by hand, holds least privilege, pins its actions and keeps the App key and the merge away from agents", async () => {
   const { readFileSync, readdirSync } = await import("node:fs");
   const dir = new URL("../../.github/workflows/", import.meta.url);
   const wf = (f) => readFileSync(new URL(f, dir), "utf8");
@@ -1859,8 +1859,12 @@ test("workflows: the Epiku lane starts nothing by itself, holds least privilege,
   const PINS = { "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1", "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0", "actions/create-github-app-token": "f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0" };
   for (const [name, text] of [["build", build], ["review", review]]) {
     const live = code(text);
-    assert.match(live, /\non:\n  workflow_dispatch:\n/, `${name}: manual runs only`);
-    assert.doesNotMatch(live, /schedule:|cron:|pull_request|workflow_run|issue_comment|repository_dispatch|\bpush:/, `${name}: no other trigger — merging this starts nothing`);
+    // Scheduled since 2026-11-26: the builder on even UTC hours and the reviewer on odd UTC
+    // hours, at :22. Any other trigger (or another cron) is still refused.
+    const cron = name === "build" ? '"22 */2 * * *"' : '"22 1-23/2 * * *"';
+    assert.match(live, new RegExp(`\\non:\\n  schedule:\\n    - cron: ${cron.replace(/[*]/g, "\\*")}\\n  workflow_dispatch:\\n`), `${name}: its own schedule plus manual runs`);
+    assert.equal((live.match(/cron:/g) ?? []).length, 1, `${name}: exactly one schedule`);
+    assert.doesNotMatch(live, /pull_request|workflow_run|issue_comment|repository_dispatch|\bpush:/, `${name}: no event trigger, so a merge or a comment starts nothing`);
     assert.match(live, /\npermissions:\n  contents: read\n\n/, `${name}: the workflow's own token is read-only`);
     assert.equal((live.match(/\n\s*permissions:/g) ?? []).length, 1, `${name}: no job widens it`);
     assert.doesNotMatch(live, /github\.token|secrets\.GITHUB_TOKEN|GH_TOKEN: \$\{\{ (?!steps\.(pick|read)-token\.outputs\.token)/, `${name}: this repo's token goes to no step; GH_TOKEN only to revoke an Epiku token`);
