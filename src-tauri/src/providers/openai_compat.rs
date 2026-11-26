@@ -14,11 +14,14 @@
 
 use super::{
     Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
-    LlmStopReason, LlmToolUse,
+    LlmStopReason, LlmToolUse, StreamEvent,
 };
 use crate::error::{AppError, AppResult, ProviderErrorKind};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+
+mod streaming;
+pub use streaming::read_stream;
 
 pub struct OpenAICompatibleProvider {
     /// The configured provider's name (`openai`, a custom provider…). With
@@ -28,27 +31,59 @@ pub struct OpenAICompatibleProvider {
     pub provider: String,
 }
 
-#[async_trait]
-impl LlmProvider for OpenAICompatibleProvider {
-    async fn complete(
-        &self,
+/// How a request error's message opens.
+const WHAT: &str = "OpenAI-compat request failed";
+
+/// Which of the two APIs a request goes to (`uses_responses_api`), with what
+/// the Responses parser needs to record where its reasoning came from.
+pub enum Api<'a> {
+    Chat,
+    Responses { model: &'a str, provider: &'a str, api_base: &'a str },
+}
+
+impl<'a> Api<'a> {
+    pub fn of(provider: &'a str, req: &'a LlmRequest, api_base: &'a str) -> Self {
+        if uses_responses_api(&req.model, api_base) {
+            Api::Responses { model: &req.model, provider, api_base }
+        } else {
+            Api::Chat
+        }
+    }
+
+    /// The request body and the endpoint it is POSTed to.
+    fn request(&self, req: &LlmRequest, api_base: &str) -> (Value, String) {
+        match self {
+            Api::Chat => (build_request(req), chat_completions_url(api_base)),
+            Api::Responses { provider, .. } => {
+                (build_responses_request(req, provider, api_base), responses_url(api_base))
+            }
+        }
+    }
+
+    /// A whole response body, parsed by this API's parser.
+    fn parse(&self, body: Value) -> LlmResponse {
+        match self {
+            Api::Chat => parse_response(body),
+            Api::Responses { model, provider, api_base } => parse_responses_response(body, model, provider, api_base),
+        }
+    }
+}
+
+impl OpenAICompatibleProvider {
+    /// POST `body` to `url`; a non-success status becomes the classified
+    /// provider error. Shared by `complete` and `stream`.
+    async fn post(
         api_base: &str,
         api_key: Option<&str>,
-        req: &LlmRequest,
+        url: &str,
+        body: &Value,
         client: &reqwest::Client,
-    ) -> AppResult<LlmResponse> {
-        let responses = uses_responses_api(&req.model, api_base);
-        let (body, url) = if responses {
-            (build_responses_request(req, &self.provider, api_base), responses_url(api_base))
-        } else {
-            (build_request(req), chat_completions_url(api_base))
-        };
-
+    ) -> AppResult<reqwest::Response> {
         // A model server on this Mac gets the loopback client (no read bound).
         let client = super::client_for(api_base, client);
-        let mut request = client.post(&url)
+        let mut request = client.post(url)
             .header("content-type", "application/json")
-            .json(&body);
+            .json(body);
 
         // Some local providers (Ollama) don't require an Authorization header.
         if let Some(key) = api_key {
@@ -60,7 +95,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         let resp = request.send().await
             // Only a connection that never opened is transient; a request
             // that went out and wasn't answered is final (`request_error`).
-            .map_err(|e| super::request_error("OpenAI-compat request failed", api_base, &e))?;
+            .map_err(|e| super::request_error(WHAT, api_base, &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -76,18 +111,63 @@ impl LlmProvider for OpenAICompatibleProvider {
                 message: format!("OpenAI-compat API error {status}: {text}"),
             });
         }
-
-        // Read the body first: a connection lost mid-answer is not a JSON error.
-        let bytes = resp.bytes().await.map_err(|e| super::body_error("OpenAI-compat request failed", &e))?;
-        let response: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::Other(format!("JSON parse error: {e}")))?;
-
-        Ok(if responses {
-            parse_responses_response(response, &req.model, &self.provider, api_base)
-        } else {
-            parse_response(response)
-        })
+        Ok(resp)
     }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAICompatibleProvider {
+    async fn complete(
+        &self,
+        api_base: &str,
+        api_key: Option<&str>,
+        req: &LlmRequest,
+        client: &reqwest::Client,
+    ) -> AppResult<LlmResponse> {
+        let api = Api::of(&self.provider, req, api_base);
+        let (body, url) = api.request(req, api_base);
+        let resp = Self::post(api_base, api_key, &url, &body, client).await?;
+        // Read the body first: a connection lost mid-answer is not a JSON error.
+        let bytes = resp.bytes().await.map_err(|e| super::body_error(WHAT, &e))?;
+        Ok(api.parse(parse_json(&bytes)?))
+    }
+
+    /// The same request with `stream: true`, read by `read_stream`.
+    async fn stream(
+        &self,
+        api_base: &str,
+        api_key: Option<&str>,
+        req: &LlmRequest,
+        client: &reqwest::Client,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> AppResult<LlmResponse> {
+        let api = Api::of(&self.provider, req, api_base);
+        let (mut body, url) = api.request(req, api_base);
+        body["stream"] = Value::Bool(true);
+        if matches!(api, Api::Chat) {
+            // A Chat Completions stream reports usage only when asked to,
+            // in a last chunk; without it every streamed turn would price at 0.
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+        let resp = Self::post(api_base, api_key, &url, &body, client).await?;
+        let whole = is_json(resp.headers());
+        // A model server on this Mac may think for longer than any bound.
+        let idle = (!super::is_loopback_base(api_base)).then_some(super::STREAM_IDLE);
+        read_stream(super::sse::Body(resp, WHAT), whole, idle, &api, sink).await
+    }
+}
+
+fn parse_json(bytes: &[u8]) -> AppResult<Value> {
+    serde_json::from_slice(bytes).map_err(|e| AppError::Other(format!("JSON parse error: {e}")))
+}
+
+/// Whether a streamed request was answered with a whole JSON body instead,
+/// by a server that ignores `stream`. Anything else, no content type
+/// included, is read as an event stream.
+fn is_json(headers: &reqwest::header::HeaderMap) -> bool {
+    let kind = headers.get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let kind = kind.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    kind == "application/json" || kind.ends_with("+json")
 }
 
 /// Resolve the chat-completions endpoint from a configured base URL. The
