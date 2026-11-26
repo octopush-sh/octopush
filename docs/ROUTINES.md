@@ -53,7 +53,8 @@ before the PR is parked:
   anything) and puts an excerpt in the prompt: the failing step, the first error lines of the
   tools (rustc's whole diagnostic, tsc, Vitest, node:test, panics, `##[error]`), the failing test
   names, and, when none of those matched, the last lines before the step failed. Every line is
-  cleaned of control and invisible characters, then redacted whole, then capped. Redacted: known
+  cleaned of control and invisible characters, cut to 4,000 characters, redacted (every pattern
+  is bounded, so a megabyte of hex redacts in milliseconds), then capped to 300. Redacted: known
   secret values (plain and base64), the credential shapes of `social.mjs`, `sk_live_`/`sk_test_`/
   `whsec_` keys, an `Authorization:` value, basic/bearer credentials, `token <hex>`, a URL's
   user:password, the value after `=` of any name that says secret/token/password/credential or

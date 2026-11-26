@@ -2551,3 +2551,28 @@ test("redaction: provider keys, Authorization headers, *_KEY/_SECRET/_TOKEN valu
   const known = `error: ${"y".repeat(MAX_LINE - 10)} mysecretvalue123`;
   assert.ok(!logSummary(known, { secrets: ["mysecretvalue123"] }).errors[0].includes("mysecr"), "a known value cut in half isn't left either");
 });
+
+test("redaction is linear: a 1 MB line of hex, base64 or name characters redacts in well under a second", async () => {
+  const { redact, logSummary, MAX_REDACT_LINE } = await import("./ci-failures.mjs");
+  const MB = 1 << 20;
+  const fill = (unit) => unit.repeat(Math.ceil(MB / unit.length)).slice(0, MB);
+  for (const unit of ["0123456789abcdef", "abcdefghij_", "a.b-c_d", "QUJDREVGR0hJSktMTU5P+/", "key=", "x: '", "\"secretKey\": \"", "token "]) {
+    const line = fill(unit);
+    const t = performance.now();
+    redact(line, ["mysecretvalue123"]);
+    const ms = performance.now() - t;
+    assert.ok(ms < 1000, `${JSON.stringify(unit)}: ${Math.round(ms)} ms`);
+  }
+  const t = performance.now();
+  const s = logSummary(`2026-11-26T10:00:00.0Z error: ${fill("0123456789abcdef")}\n`, { secrets: [] });
+  assert.ok(performance.now() - t < 1000);
+  assert.ok(s.errors[0].length <= 301 && MAX_REDACT_LINE >= 1000, "cut to the line cap after redaction");
+});
+
+test("redaction: `token <hex>` (git's and gh's header form) is redacted; a word after token isn't", async () => {
+  const { redact } = await import("./ci-failures.mjs");
+  assert.equal(redact("using token 0123456789abcdef0123456789abcdef01234567 for the push"), "using token [redacted] for the push");
+  assert.equal(redact("TOKEN ABCDEF0123456789ABCD"), "TOKEN [redacted]");
+  assert.equal(redact("the token cache expired"), "the token cache expired");
+  assert.equal(redact("token 0123456789abc"), "token 0123456789abc", "under 20 hex digits: an ordinary number");
+});

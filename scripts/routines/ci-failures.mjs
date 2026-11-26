@@ -51,6 +51,13 @@ export const clean = (s) => String(s ?? "")
   .replace(/ {2,}/g, " ");
 
 const cap = (line) => (line.length > MAX_LINE ? `${line.slice(0, MAX_LINE)}…` : line);
+/**
+ * A log line is cut to this before it is redacted (and to MAX_LINE after): a
+ * multi-megabyte line of test output is never worth reading whole, and a key
+ * this far in can't straddle the later MAX_LINE cut.
+ */
+export const MAX_REDACT_LINE = 4000;
+const precut = (line) => (line.length > MAX_REDACT_LINE ? line.slice(0, MAX_REDACT_LINE) : line);
 const EXIT_LINE = /^Process completed with exit code \d+\.?$/;
 
 /** The `##[error]` lines of a job log, cleaned, redacted and capped (the exit-code line is noise). */
@@ -60,7 +67,7 @@ export function errorLines(log, max = MAX_LINES, secrets = []) {
     const i = raw.indexOf("##[error]");
     if (i < 0) continue;
     // Redacted whole, before any cut: half a key matches no pattern.
-    const line = redact(clean(raw.slice(i + "##[error]".length)).trim(), secrets);
+    const line = redact(precut(clean(raw.slice(i + "##[error]".length)).trim()), secrets);
     if (!line || EXIT_LINE.test(line)) continue;
     out.push(cap(line));
     if (out.length >= max) break;
@@ -72,7 +79,7 @@ export function errorLines(log, max = MAX_LINES, secrets = []) {
 
 /** Each log line without its runner timestamp, cleaned and redacted — whole, before anything is cut. */
 const STAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?/;
-const logLines = (log, secrets) => String(log ?? "").split("\n").map((l) => redact(clean(l.replace(STAMP, "")).trim(), secrets));
+const logLines = (log, secrets) => String(log ?? "").split("\n").map((l) => redact(precut(clean(l.replace(STAMP, "")).trim()), secrets));
 
 /**
  * Lines that say what broke. `next` also keeps the line after (a panic's
@@ -173,19 +180,23 @@ const PROVIDER_KEYS = [/\b[spr]k_(?:live|test)_[A-Za-z0-9]{8,}/g, /\bwhsec_[A-Za
  * Callers redact a line before cutting it (ci-failures' caps): half a key
  * matches no pattern.
  */
+// Every name and gap above is bounded ({0,63}, \s{0,8}): on a long run of name
+// characters (a hex dump, a base64 blob) an unbounded one backtracks from every
+// position — quadratic, minutes for a megabyte. Callers also cut a line to
+// MAX_REDACT_LINE before redacting it.
 export function redact(text, values = []) {
   let s = String(text ?? "");
   const known = [...new Set(values.map((v) => String(v ?? "").trim()).filter((v) => v.length >= 8))].sort((a, b) => b.length - a.length);
   for (const v of known) for (const form of [v, Buffer.from(v).toString("base64")]) s = s.split(form).join(REDACTED);
   for (const re of [...SECRET_PATTERNS, ...PROVIDER_KEYS]) s = s.replace(global(re), REDACTED);
-  s = s.replace(/\b(authorization\s*[:=]\s*(?:(?:token|bearer|basic)\s+)?)(?!\[redacted\])\S+/gi, `$1${REDACTED}`);
+  s = s.replace(/\b(authorization\s{0,8}[:=]\s{0,8}(?:(?:token|bearer|basic)\s{1,8})?)(?!\[redacted\])\S+/gi, `$1${REDACTED}`);
   s = s.replace(/\b(bearer|basic)(\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{8,}/gi, `$1$2${REDACTED}`);
   s = s.replace(/\b(token\s+)[0-9a-f]{20,}\b/gi, `$1${REDACTED}`);
   s = s.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED}@`);
-  s = s.replace(/\b([A-Za-z][A-Za-z0-9_.-]*)=(?!\[redacted\])([^\s&"'`,;]+)/g, (m, k) => (SECRET_NAME.test(k) ? `${k}=${REDACTED}` : m));
-  s = s.replace(/(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1(\s*[:=]\s*)(["'`])([^"'`\n]{4,})\4/g,
+  s = s.replace(/\b([A-Za-z][A-Za-z0-9_.-]{0,63})=(?!\[redacted\])([^\s&"'`,;]+)/g, (m, k) => (SECRET_NAME.test(k) ? `${k}=${REDACTED}` : m));
+  s = s.replace(/(["']?)\b([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s{0,8}[:=]\s{0,8})(["'`])([^"'`\n]{4,})\4/g,
     (m, q, k, sep, quote, v) => (SECRET_NAME.test(k) && v !== REDACTED ? `${q}${k}${q}${sep}${quote}${REDACTED}${quote}` : m));
-  s = s.replace(new RegExp(`\\b([\\w-]*(?:${KEYWORD}))(["']?\\s*[:=]\\s*["']?)([A-Za-z0-9_\\-+/=.~]{12,})`, "gi"),
+  s = s.replace(new RegExp(`\\b([\\w-]{0,63}?(?:${KEYWORD}))(["']?\\s{0,8}[:=]\\s{0,8}["']?)([A-Za-z0-9_\\-+/=.~]{12,})`, "gi"),
     (m, k, sep, v) => (/\d/.test(v) && v !== REDACTED ? `${k}${sep}${REDACTED}` : m));
   s = s.replace(/[A-Za-z0-9+/_-]{40,}={0,2}/g, (m) => (/[a-z]/.test(m) && /[A-Z]/.test(m) && /\d/.test(m) ? REDACTED : m));
   return s;

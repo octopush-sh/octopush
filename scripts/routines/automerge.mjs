@@ -523,7 +523,7 @@ const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0
  */
 export const RELEASE_BRANCH = /^release\/v\d+\.\d+\.\d+$/;
 /**
- * A release run lasts at most nightly-release.yml's timeout (150 min). A release
+ * A release run lasts at most nightly-release.yml's job timeout (230 min). A release
  * PR untouched for longer was left by a run that was killed: it no longer pauses
  * anything (the next release run reuses or closes it).
  */

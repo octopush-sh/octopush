@@ -384,20 +384,23 @@ merge_tested() {
 # collected version on main (whats-new/X.Y.Z/) after it that was never
 # published — its tagged build failed, or its merge failed CI and was
 # abandoned — at most CARRY_MAX. Prints "<since-tag> <comma-separated
-# versions>"; falls back to "<prev-tag> " (carry nothing) when the releases
-# can't be read or no published one is within reach.
+# versions>"; falls back to "<newest v* tag> " (carry nothing) when the
+# releases can't be read or no published one is within reach.
 carry_plan() {
-  local prev="$1" wt="$2" next="$3" published tag since="" carry="" n=0 d v
+  local wt="$2" next="$3" published tag since="" carry="" n=0 d v fallback
+  # The fallback --since is the newest real v* tag: after an abandon, the
+  # release before this one ($1) has no tag of its own.
+  fallback="$(latest_tag)"
   if ! published="$(gh api "repos/$REPO/releases?per_page=100" --jq '.[] | select(.draft | not) | .tag_name')"; then
     echo "could not list the published releases — carrying no failed build's notes" >&2
-    echo "$prev "; return 0
+    echo "$fallback "; return 0
   fi
   while read -r tag; do
     [[ -n "$tag" ]] || continue
     if grep -qxF -- "$tag" <<< "$published"; then since="$tag"; break; fi
     n=$((n + 1)); [[ "$n" -le "$CARRY_MAX" ]] || break
   done <<< "$(g tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)"
-  if [[ -z "$since" ]]; then echo "$prev "; return 0; fi
+  if [[ -z "$since" ]]; then echo "$fallback "; return 0; fi
   while read -r v; do
     [[ -n "$v" && "$v" != "$next" && "$v" != "${since#v}" ]] || continue
     [[ "$(printf '%s\n%s\n' "${since#v}" "$v" | sort -V | tail -n 1)" == "$v" ]] || continue   # newer than since

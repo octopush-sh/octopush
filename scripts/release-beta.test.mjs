@@ -496,3 +496,23 @@ test("run: a version that was tagged but never published (its build failed) is c
   rmSync(fx.dir, { recursive: true, force: true });
   rmSync(fx2.dir, { recursive: true, force: true });
 });
+
+test("after an abandon, a releases API that fails still gives --since a real tag", () => {
+  const fx = fixture();
+  writeFileSync(join(fx.bin, "gh"), RACE(GH_STUB.replace(CI_LINE, PER_SHA_CI)));
+  assert.equal(routine(fx, "run", { STUB_CHECK_CI: "failure" }).code, 2);
+  assert.match(originTags(fx), /abandoned\/v0\.4\.90/);
+  const seed = join(fx.dir, "seed");
+  git(seed, "pull", "--quiet", "origin", "main");
+  writeFileSync(join(seed, "fix.txt"), "fix");
+  git(seed, "add", "-A"); git(seed, "commit", "--quiet", "-m", "Merge pull request #13 from octo/fix-main");
+  git(seed, "push", "--quiet", "origin", "main");
+  writeFileSync(join(fx.bin, "gh"), RACE(GH_STUB.replace(CI_LINE, PER_SHA_CI))
+    .replace(`*"repos/${SLUG}/releases?per_page="*)`, `*"repos/${SLUG}/releases?per_page="*) echo "gh: HTTP 502" >&2; exit 1 ;; *"never-matches"*)`));
+  const r = routine(fx, "run", { STUB_BRANCH: "release/v0.4.91" });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /could not list the published releases/);
+  assert.match(r.out, /collecting changesets for 0\.4\.91 \(since v0\.4\.89\)/, "the newest real tag, not the abandoned version");
+  assert.equal(git(fx.origin, "rev-parse", "v0.4.91^{commit}"), git(fx.origin, "rev-parse", "main"));
+  rmSync(fx.dir, { recursive: true, force: true });
+});
