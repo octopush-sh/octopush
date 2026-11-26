@@ -15,18 +15,17 @@ describe("EffortSelector tooltips", () => {
     // The caps as the tooltips round them.
     expect(EFFORT_MAX_TOKENS).toEqual({ swift: 8192, standard: 32768, deep: 64000 });
     const cap = { swift: "8K", standard: "32K", deep: "64K" } as const;
-    // What each preset sends, as its tooltip says it (Deep's `max` is clamped
-    // per model by the backend's adapters).
-    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: "high", deep: "max" });
+    // What each preset sends, as its tooltip says it (Deep's `max` is turned
+    // into each model's highest by the backend's adapters).
+    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: null, deep: "max" });
     const said = {
       swift: "low reasoning effort",
-      standard: "high reasoning effort",
-      deep: "the highest reasoning effort the model takes (max where supported, otherwise high)",
+      standard: "the model's own default reasoning, with no effort or thinking setting sent",
+      deep: "the most reasoning the model takes: effort max, or high where max isn't offered, or a 24K thinking budget",
     } as const;
     for (const o of OPTIONS) {
       expect(o.title).toContain(said[o.value]);
       expect(o.title).toContain(`up to ${cap[o.value]} output tokens`);
-      expect(o.title).toContain("A model without an effort setting gets only the cap.");
     }
   });
 });

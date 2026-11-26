@@ -576,15 +576,16 @@ describe("chatStore — stop + effort (P3)", () => {
     }
   });
 
-  it("send() sends the preset's reasoning effort: Swift low, Standard high, Deep max", async () => {
-    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: "high", deep: "max" });
-    for (const [preset, effort] of [["swift", "low"], ["standard", "high"], ["deep", "max"]] as const) {
+  it("send() sends the preset's reasoning effort: Swift low, Standard none, Deep max", async () => {
+    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: null, deep: "max" });
+    for (const [preset, effort] of [["swift", "low"], ["standard", undefined], ["deep", "max"]] as const) {
       vi.clearAllMocks();
       useChatStore.getState().setEffort(preset);
       await useChatStore.getState().send("ws-1", "/tmp", "hi");
-      expect(ipc.sendChatMessage).toHaveBeenCalledWith(
-        expect.objectContaining({ effort, maxTokens: EFFORT_MAX_TOKENS[preset] }),
-      );
+      const req = (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      // Standard sends no effort at all, so the model keeps its own default.
+      expect(req.effort).toBe(effort);
+      expect(req.maxTokens).toBe(EFFORT_MAX_TOKENS[preset]);
     }
   });
 

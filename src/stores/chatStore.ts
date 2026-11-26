@@ -164,14 +164,17 @@ export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
 };
 
 /** The reasoning effort each preset sends with every request of the turn.
- *  Standard is `high`, the level the API runs at when none is sent (Talk's
- *  behaviour before presets set effort). Deep asks for `max`, which the
- *  backend's provider adapters clamp to the highest level each model takes
- *  (`max` where supported, otherwise `high`). A model without an effort
- *  setting gets none, and only the output cap applies there. */
-export const EFFORT_REASONING: Record<Effort, ReasoningEffort> = {
+ *  - Swift: `low`, the lowest; a model without effort control (a chat
+ *    model, or one that thinks only with a budget) gets nothing.
+ *  - Standard: none (`null`), so no effort or thinking setting is sent and
+ *    every model keeps its own default, exactly as before presets set effort.
+ *  - Deep: `max`, which the backend's provider adapters turn into the
+ *    highest the model takes (`max`, or `high` where max isn't offered, or a
+ *    thinking budget on models that use one).
+ *  Sub-agents keep their own tier's effort either way. */
+export const EFFORT_REASONING: Record<Effort, ReasoningEffort | null> = {
   swift: "low",
-  standard: "high",
+  standard: null,
   deep: "max",
 };
 
@@ -1195,7 +1198,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           userMessage: opts.userMessage,
           system: opts.systemPrompt,
           maxTokens: EFFORT_MAX_TOKENS[get().effort],
-          effort: EFFORT_REASONING[get().effort],
+          effort: EFFORT_REASONING[get().effort] ?? undefined,
           attachments: attachments.length
             ? attachments.map((a) => ({ mediaType: a.mediaType, data: a.data }))
             : undefined,
