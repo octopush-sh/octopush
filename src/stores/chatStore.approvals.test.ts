@@ -93,8 +93,16 @@ describe("an approval card raises the workspace's needs-you state", () => {
     expect(flag()).toBeUndefined();
   });
 
+  it("Mission Control names the oldest card still waiting, never one already answered", () => {
+    emit("chat://approval-request", request("c1", "t1", "git push --force"));
+    emit("chat://approval-request", request("c2", "t2", "git reset --hard"));
+    expect(flag()?.detail).toBe("git push --force");
+    const since = flag()?.since;
+    emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "c1" });
+    expect(flag()).toMatchObject({ reason: "approval", detail: "git reset --hard", since });
+  });
+
   it("a duplicate request neither chimes nor notifies twice", () => {
-    vi.spyOn(document, "hasFocus").mockReturnValue(false);
     emit("chat://approval-request", request("c1"));
     const chimedAt = useAttentionStore.getState().lastChimeAt;
     emit("chat://approval-request", request("c1"));
@@ -120,21 +128,18 @@ describe("it reaches you where you are", () => {
     expect(flag()?.reason).toBe("approval");
   });
 
-  it("posts a native notification only while Octopush is in the background", () => {
+  it("posts a native notification even while the app looks focused (a locked screen does), without the command", () => {
+    // `document.hasFocus()` is true here, as on a locked screen.
     emit("chat://approval-request", request("c1"));
-    expect(sendNotification).not.toHaveBeenCalled();
-
-    vi.spyOn(document, "hasFocus").mockReturnValue(false);
-    emit("chat://approval-request", request("c2"));
     expect(sendNotification).toHaveBeenCalledWith({
       title: "Talk needs a decision",
-      body: "a workspace — approve or deny git push --force",
+      body: "A workspace — A command is waiting for your approval",
     });
+    expect(JSON.stringify(sendNotification.mock.calls)).not.toContain("git push");
   });
 
   it("respects the notification setting", () => {
     useNotifyPrefs.setState({ crewNotifications: false });
-    vi.spyOn(document, "hasFocus").mockReturnValue(false);
     emit("chat://approval-request", request("c1"));
     expect(sendNotification).not.toHaveBeenCalled();
   });
@@ -149,6 +154,44 @@ describe("a waiting card is never lost", () => {
     await vi.waitFor(() => expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(1));
     expect(useChatStore.getState().getPendingApprovals("ws-1")[0]).toMatchObject({ callId: "c9", threadId: "t3" });
     expect(flag()).toMatchObject({ reason: "approval", detail: "git reset --hard" });
+  });
+
+  it("a rehydrate racing an answer never brings the answered card back, nor its flag", async () => {
+    // The reload read the list while the card still waited…
+    let release!: (cards: unknown[]) => void;
+    (ipc.pendingApprovals as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const opening = useChatStore.getState().selectThread("ws-1", "t4");
+    emit("chat://approval-request", request("c7", "t4"));
+    // …then the card was answered, before the read landed.
+    emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "c7" });
+    await vi.waitFor(() => expect(ipc.pendingApprovals).toHaveBeenCalledWith("t4"));
+    release([request("c7", "t4")]);
+    await opening;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(0);
+    expect(flag()).toBeUndefined();
+  });
+
+  it("an answer clicked while a rehydrate is in flight stays answered", async () => {
+    let release!: (cards: unknown[]) => void;
+    (ipc.pendingApprovals as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    emit("chat://approval-request", request("c8", "t5"));
+    const opening = useChatStore.getState().selectThread("ws-1", "t5");
+    useChatStore.getState().respondApproval("ws-1", "c8", "approve");
+    await vi.waitFor(() => expect(ipc.pendingApprovals).toHaveBeenCalledWith("t5"));
+    release([request("c8", "t5")]);
+    await opening;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(0);
+    expect(flag()).toBeUndefined();
   });
 
   it("Mission Control and the menu bar open the conversation the oldest card waits in", async () => {
@@ -170,5 +213,18 @@ describe("a turn parked on an approval isn't working", () => {
     expect(
       workingTalkWorkspaces({ "ws-1": true, "ws-2": true, "ws-3": false }, { "ws-1": [card], "ws-2": [] }),
     ).toEqual(["ws-2"]);
+  });
+});
+
+describe("the secret guard asking again under the same call id", () => {
+  it("shows the card again after the first answer", () => {
+    const secret = { ...request("s1"), secret: true, reason: "possible secret · GitHub token in a.ts:3" };
+    emit("chat://approval-request", secret);
+    useChatStore.getState().respondApproval("ws-1", "s1", "approve");
+    emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "s1" });
+    // The rescan found something new: the guard parks the same call again.
+    emit("chat://approval-request", secret);
+    expect(useChatStore.getState().getPendingApprovals("ws-1").map((a) => a.callId)).toEqual(["s1"]);
+    expect(flag()?.reason).toBe("approval");
   });
 });

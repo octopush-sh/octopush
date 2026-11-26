@@ -150,14 +150,15 @@ pub struct Waiting {
 }
 
 /// A Talk conversation whose approval card waits on you, as the menu lists
-/// it: its oldest card ([`crate::fleet_status::talk_conversations`]).
+/// it: its oldest card ([`crate::fleet_status::talk_conversations`]). What
+/// kind of thing waits, never the command or its arguments.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TalkWaiting {
     pub thread_id: String,
-    /// The workspace's name, else "Talk".
+    /// The workspace's name, else "a workspace".
     pub name: String,
-    /// The command the card asks to run.
-    pub command: String,
+    /// The secret guard's card (a commit or push), not a flagged command.
+    pub secret: bool,
     /// When the card was raised (ms): the FIFO key, shared with the crews.
     pub since_ms: i64,
 }
@@ -166,8 +167,8 @@ impl TalkWaiting {
     pub fn new(wait: &crate::chat_engine::ApprovalWait, workspace_name: Option<String>) -> Self {
         TalkWaiting {
             thread_id: wait.thread_id.clone(),
-            name: workspace_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Talk".to_string()),
-            command: wait.command.lines().next().unwrap_or_default().to_string(),
+            name: workspace_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "a workspace".to_string()),
+            secret: wait.secret,
             since_ms: wait.since_ms,
         }
     }
@@ -306,9 +307,12 @@ pub fn label(w: &Waiting) -> String {
     }
 }
 
-/// `{workspace} · {command} — wants approval`, each cut to fit.
+/// `{workspace} · Talk — a command wants approval` (or `— a commit or push
+/// wants approval` for the secret guard's card): the kind of thing, never
+/// its arguments.
 pub fn talk_label(t: &TalkWaiting) -> String {
-    format!("{} · {} — wants approval", clip(t.name.trim(), NAME_MAX_CHARS), clip(t.command.trim(), STAGE_MAX_CHARS))
+    let what = if t.secret { "a commit or push wants approval" } else { "a command wants approval" };
+    format!("{} · Talk — {what}", clip(t.name.trim(), NAME_MAX_CHARS))
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -614,16 +618,17 @@ mod tests {
         let wait = crate::chat_engine::ApprovalWait {
             workspace_id: "w".into(),
             thread_id: "th-1".into(),
-            command: "git push --force origin main\nsecond line".into(),
+            secret: false,
             since_ms: 50,
         };
         let talk = TalkWaiting::new(&wait, Some("auth-flow".into()));
-        assert_eq!(talk.command, "git push --force origin main", "only the command's first line");
         let fleet = FleetStatus { needs_you: 1, in_flight: 0, talk: 1 };
         let m = model(fleet, 0, vec![waiting_run("r1", "billing", 100)], vec![talk]);
         let ids: Vec<&str> = m.items.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["menu-bar:talk:th-1", "menu-bar:run:r1"], "the conversation waited longer");
-        assert_eq!(m.items[0].label, "auth-flow · git push --force origin… — wants approval");
+        assert_eq!(m.items[0].label, "auth-flow · Talk — a command wants approval");
+        let secret = TalkWaiting::new(&crate::chat_engine::ApprovalWait { secret: true, ..wait.clone() }, Some("auth-flow".into()));
+        assert_eq!(talk_label(&secret), "auth-flow · Talk — a commit or push wants approval");
         assert_eq!(talk_of(ids[0]), Some("th-1"));
         assert_eq!(run_of(ids[0]), None);
         assert_eq!(talk_of(ids[1]), None);
@@ -633,7 +638,7 @@ mod tests {
 
         // Talk alone, and a workspace with no name.
         let alone = TalkWaiting::new(&wait, None);
-        assert_eq!(alone.name, "Talk");
+        assert_eq!(alone.name, "a workspace");
         let m = model(FleetStatus { talk: 2, ..FleetStatus::default() }, 0, Vec::new(), vec![alone.clone(), alone]);
         assert_eq!(m.header, "2 conversations need you");
         assert_eq!(m.state, TrayState::Blocked);

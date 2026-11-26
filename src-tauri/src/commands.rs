@@ -1571,9 +1571,11 @@ pub async fn delete_workspace(
     branch: String,
     worktree_path: Option<String>,
 ) -> AppResult<()> {
-    // A Talk approval card in this workspace would wait for an answer that
-    // can no longer come, and keep counting on the Dock badge: deny it.
-    state.chat.approvals().deny_workspace(&workspace_id);
+    // Stop the workspace's Talk turns, as Stop would, and retire it in the
+    // approval broker: a card here would wait for an answer that can no
+    // longer come, and keep counting on the Dock badge.
+    let threads = state.db.lock().chat_thread_ids(&workspace_id).unwrap_or_default();
+    state.chat.cancel_workspace(&workspace_id, &threads);
     let project_path = expand_tilde(&project_path);
     let is_main = worktree_path
         .as_deref()
@@ -1937,9 +1939,9 @@ pub async fn set_thread_pinned(
 
 #[tauri::command]
 pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
-    // Stop any in-flight turn first — this also resolves a parked dangerous-
-    // command approval (as Deny) so the agent loop doesn't stay blocked for the
-    // full 300s timeout after the conversation is gone.
+    // Stop any in-flight turn first — this also resolves a parked approval
+    // card (as Deny), which would otherwise wait for an answer that can no
+    // longer come once the conversation is gone.
     state.chat.cancel(&thread_id);
     // Tear down the thread's TALK shell (kills the daemon PTY + releases the
     // session entry) so deleting conversations doesn't leak bash processes.

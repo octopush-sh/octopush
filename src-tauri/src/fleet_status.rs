@@ -284,18 +284,18 @@ mod tests {
 
     #[test]
     fn a_talk_approval_counts_once_per_conversation_on_the_badge() {
-        let wait = |thread: &str, command: &str, since_ms: i64| crate::chat_engine::ApprovalWait {
+        let wait = |thread: &str, since_ms: i64| crate::chat_engine::ApprovalWait {
             workspace_id: "w".into(),
             thread_id: thread.into(),
-            command: command.into(),
+            secret: false,
             since_ms,
         };
         // Oldest first, as the broker lists them: a sub-agent fan-out's two
         // cards in t1 are one conversation waiting on you.
-        let waits = vec![wait("t1", "git push -f", 1), wait("t2", "rm -rf build", 2), wait("t1", "git reset --hard", 3)];
+        let waits = vec![wait("t1", 1), wait("t2", 2), wait("t1", 3)];
         let talk = talk_conversations(&waits);
-        let commands: Vec<&str> = talk.iter().map(|w| w.command.as_str()).collect();
-        assert_eq!(commands, ["git push -f", "rm -rf build"]);
+        let picked: Vec<(&str, i64)> = talk.iter().map(|w| (w.thread_id.as_str(), w.since_ms)).collect();
+        assert_eq!(picked, [("t1", 1), ("t2", 2)]);
 
         let mut fleet = derive([("paused", false), ("running", false)]);
         assert_eq!(fleet.badge(), Some(1));

@@ -520,12 +520,14 @@ pub struct ApprovalRequestEvent {
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
-/// bar Octo count it (`fleet_status::refresh`).
+/// bar Octo count it (`fleet_status::refresh`). Never the command: what
+/// leaves the window says what kind of thing waits, not its arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalWait {
     pub workspace_id: String,
     pub thread_id: String,
-    pub command: String,
+    /// The secret guard's card (a commit or push), not a flagged command.
+    pub secret: bool,
     /// When the card was raised (ms): the FIFO key.
     pub since_ms: i64,
 }
@@ -543,9 +545,11 @@ struct ParkedApproval {
 /// "don't ask again" grant is per thread so a crew inherits it.
 ///
 /// A card waits until it is answered: there is no timeout. Stop, deleting the
-/// conversation and deleting the workspace deny it; a reloaded webview shows
-/// it again (`pending_for_thread`); and while it waits it counts as needs-you
-/// on the Dock badge and the menu bar Octo (`waiting`).
+/// conversation and deleting the workspace deny it (a deleted workspace is
+/// retired, so a turn still winding down there can never park a new card);
+/// a reloaded webview shows it again (`pending_for_thread`); and while it
+/// waits it counts as needs-you on the Dock badge and the menu bar Octo
+/// (`waiting`).
 #[derive(Default)]
 pub(crate) struct ApprovalBroker {
     /// In-flight requests keyed by the tool call id: the request as the card
@@ -555,6 +559,9 @@ pub(crate) struct ApprovalBroker {
     /// Threads where the user chose "don't ask again" — dangerous agent commands
     /// run without prompting (in-memory; resets on restart, by design).
     auto_approve: Mutex<std::collections::HashSet<String>>,
+    /// Deleted workspaces: nobody can answer a card there any more, so a
+    /// request from one is denied at once instead of parked.
+    retired: Mutex<std::collections::HashSet<String>>,
 }
 
 impl ApprovalBroker {
@@ -568,10 +575,17 @@ impl ApprovalBroker {
         self.deny_where(|r| r.thread_id == thread_id);
     }
 
-    /// Deny every card of a workspace that is going away, so none outlives it
-    /// on the Dock badge or the menu bar.
-    pub fn deny_workspace(&self, workspace_id: &str) {
+    /// A workspace is going away: deny every card it holds, and every card it
+    /// would raise from now on, so none can wait for an answer that can no
+    /// longer come (or outlive it on the Dock badge and the menu bar).
+    pub fn retire_workspace(&self, workspace_id: &str) {
+        self.retired.lock().insert(workspace_id.to_string());
         self.deny_where(|r| r.workspace_id == workspace_id);
+    }
+
+    /// Whether a card from `workspace_id` may wait for an answer.
+    fn admits(&self, workspace_id: &str) -> bool {
+        !self.retired.lock().contains(workspace_id)
     }
 
     fn deny_where(&self, matches: impl Fn(&ApprovalRequestEvent) -> bool) {
@@ -610,7 +624,7 @@ impl ApprovalBroker {
                     ApprovalWait {
                         workspace_id: p.request.workspace_id.clone(),
                         thread_id: p.request.thread_id.clone(),
-                        command: p.request.command.clone(),
+                        secret: p.request.secret,
                         since_ms: p.since_ms,
                     },
                 )
@@ -704,6 +718,9 @@ impl ApprovalBroker {
         reason: &str,
         secret: Option<bool>,
     ) -> ApprovalDecision {
+        if !self.admits(workspace_id) {
+            return ApprovalDecision::Deny;
+        }
         let request = ApprovalRequestEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
@@ -2002,6 +2019,16 @@ impl ChatEngine {
         // A turn-limit card waiting on the thread resolves as "accept what it
         // has" — the stop ends the turn either way.
         self.cap_gate.deny_thread(thread_id);
+    }
+
+    /// A workspace is being deleted: stop every turn of its conversations
+    /// (`thread_ids`), as Stop would, and retire it in the approval broker,
+    /// so a turn still winding down can't park a card nobody can answer.
+    pub fn cancel_workspace(&self, workspace_id: &str, thread_ids: &[String]) {
+        for thread_id in thread_ids {
+            self.cancel(thread_id);
+        }
+        self.approvals.retire_workspace(workspace_id);
     }
 
     /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
@@ -4408,8 +4435,9 @@ mod tests {
 
         // What the Dock badge and the menu bar count: every card, longest-waiting first.
         let waits = broker.waiting();
-        let order: Vec<&str> = waits.iter().map(|w| w.command.as_str()).collect();
-        assert_eq!(order, ["git reset --hard", "git push --force", "git clean -fd"]);
+        let order: Vec<&str> = waits.iter().map(|w| w.thread_id.as_str()).collect();
+        assert_eq!(order, ["t2", "t1", "t1"]);
+        assert!(waits.iter().all(|w| !w.secret));
         assert_eq!((waits[0].workspace_id.as_str(), waits[0].thread_id.as_str(), waits[0].since_ms), ("w2", "t2", 1_000));
 
         // What a reloaded webview shows again for one conversation.
@@ -4435,12 +4463,41 @@ mod tests {
         broker.deny_thread("t1");
         assert_eq!(a.try_recv().ok(), Some(ApprovalDecision::Deny));
         assert!(b.try_recv().is_err() && c.try_recv().is_err(), "other conversations still wait");
+        assert!(broker.admits("w1"), "Stop is not a deletion: the next turn may ask");
 
-        broker.deny_workspace("w1");
+        broker.retire_workspace("w1");
         assert_eq!(b.try_recv().ok(), Some(ApprovalDecision::Deny));
         assert!(c.try_recv().is_err(), "another workspace still waits");
         let left: Vec<String> = broker.waiting().into_iter().map(|w| w.thread_id).collect();
         assert_eq!(left, ["t3"]);
+        // A turn still winding down in the deleted workspace can't park a new card.
+        assert!(!broker.admits("w1"));
+        assert!(broker.admits("w2"));
+    }
+
+    #[test]
+    fn deleting_a_workspace_stops_its_turns_and_retires_it() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let flag = |key: &str| {
+            let f = Arc::new(AtomicBool::new(false));
+            engine.cancels.lock().insert(key.to_string(), Arc::clone(&f));
+            f
+        };
+        let turn = flag("t1");
+        let continuation = flag("t1#continue:call-1");
+        let elsewhere = flag("t9");
+        let mut card = engine.approvals.park(approval_request("w1", "t2", "c", "git push -f"), 1);
+        let mut other = engine.approvals.park(approval_request("w2", "t9", "d", "rm -rf x"), 2);
+
+        engine.cancel_workspace("w1", &["t1".to_string(), "t2".to_string()]);
+
+        assert!(turn.load(Ordering::Relaxed) && continuation.load(Ordering::Relaxed), "its turns stop, as Stop would");
+        assert!(!elsewhere.load(Ordering::Relaxed), "another workspace's turn runs on");
+        assert_eq!(card.try_recv().ok(), Some(ApprovalDecision::Deny));
+        assert!(other.try_recv().is_err());
+        assert!(!engine.approvals.admits("w1"));
     }
 
     #[test]

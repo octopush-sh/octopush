@@ -36,54 +36,80 @@ describe("ApprovalCard", () => {
 describe("ApprovalCard at the keyboard", () => {
   const plain = { ...base, command: "git push --force", reason: "force-push" };
 
-  it("Enter on the focused card approves, Esc denies, and the card says so", () => {
+  it("⌘↵ on the focused card approves, Esc denies, and the card says so", () => {
     const onRespond = vi.fn();
     render(<ApprovalCard approval={plain} onRespond={onRespond} />);
     const card = screen.getByRole("group", { name: "Approval needed: git push --force" });
     expect(card).toHaveAttribute("tabindex", "0");
-    expect(card).toHaveAttribute("title", "Enter approves · Esc denies");
+    expect(card).toHaveAttribute("title", "⌘↵ approves · Esc denies");
+    expect(card).toHaveAttribute("aria-keyshortcuts", "Meta+Enter Escape");
     expect(card).toHaveAttribute("data-tour", "talk-approval");
-    expect(screen.getByRole("button", { name: "Approve" })).toHaveAttribute("title", "Approve (Enter)");
+    expect(screen.getByRole("button", { name: "Approve" })).toHaveAttribute("title", "Approve (⌘↵)");
     expect(screen.getByRole("button", { name: "Deny" })).toHaveAttribute("title", "Deny (Esc)");
 
-    fireEvent.keyDown(card, { key: "Enter" });
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
     expect(onRespond).toHaveBeenLastCalledWith("approve");
     fireEvent.keyDown(card, { key: "Escape" });
     expect(onRespond).toHaveBeenLastCalledWith("deny");
     expect(onRespond).toHaveBeenCalledTimes(2);
   });
 
-  it("a focused button answers Enter itself; Esc from it still denies", () => {
+  it("plain Enter never approves a destructive command", () => {
     const onRespond = vi.fn();
     render(<ApprovalCard approval={plain} onRespond={onRespond} />);
-    const deny = screen.getByRole("button", { name: "Deny" });
-    // Enter on a button is the button's own click (native), never the card's approve.
-    fireEvent.keyDown(deny, { key: "Enter" });
+    fireEvent.keyDown(screen.getByRole("group"), { key: "Enter" });
     expect(onRespond).not.toHaveBeenCalled();
-    fireEvent.keyDown(deny, { key: "Escape" });
-    expect(onRespond).toHaveBeenCalledWith("deny");
   });
 
-  it("ignores Enter with a modifier and keys typed in an IME", () => {
+  it("answers only its own focus: keys on a button inside it, or from elsewhere, are not the card's", () => {
+    const onRespond = vi.fn();
+    render(
+      <div>
+        <textarea aria-label="composer" />
+        <ApprovalCard approval={plain} onRespond={onRespond} />
+      </div>,
+    );
+    const deny = screen.getByRole("button", { name: "Deny" });
+    fireEvent.keyDown(deny, { key: "Enter", metaKey: true });
+    fireEvent.keyDown(deny, { key: "Escape" });
+    // The composer's own ⌘↵ never reaches the card.
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "composer" }), { key: "Enter", metaKey: true });
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  it("ignores held keys, other chords and IME composition", () => {
     const onRespond = vi.fn();
     render(<ApprovalCard approval={plain} onRespond={onRespond} />);
     const card = screen.getByRole("group");
-    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
-    fireEvent.keyDown(card, { key: "Enter", shiftKey: true });
-    fireEvent.keyDown(card, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true, repeat: true });
+    fireEvent.keyDown(card, { key: "Escape", repeat: true });
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true, shiftKey: true });
+    fireEvent.keyDown(card, { key: "Enter", ctrlKey: true });
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true, isComposing: true });
     expect(onRespond).not.toHaveBeenCalled();
   });
 
-  it("on the secret card, Enter takes the safe lead answer: leave it out", () => {
+  it("stops a handled key there, so nothing behind the card acts on it too", () => {
+    const behind = vi.fn();
+    render(
+      <div onKeyDown={behind}>
+        <ApprovalCard approval={plain} onRespond={() => {}} />
+      </div>,
+    );
+    fireEvent.keyDown(screen.getByRole("group"), { key: "Enter", metaKey: true });
+    fireEvent.keyDown(screen.getByRole("group"), { key: "Escape" });
+    expect(behind).not.toHaveBeenCalled();
+  });
+
+  it("on the secret card, Enter and ⌘↵ take the safe lead answer: leave it out", () => {
     const onRespond = vi.fn();
     render(<ApprovalCard approval={{ ...base, secret: true }} onRespond={onRespond} />);
     const card = screen.getByRole("group", { name: /^Possible secret: / });
-    expect(card).toHaveAttribute("title", "Enter or Esc leaves it out");
+    expect(card).toHaveAttribute("title", "⌘↵, Enter or Esc leaves it out");
     fireEvent.keyDown(card, { key: "Enter" });
-    expect(onRespond).toHaveBeenLastCalledWith("deny");
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
     fireEvent.keyDown(card, { key: "Escape" });
-    expect(onRespond).toHaveBeenLastCalledWith("deny");
-    expect(onRespond).not.toHaveBeenCalledWith("approve");
-    expect(screen.getByRole("button", { name: "Leave it out" })).toHaveAttribute("title", "Leave it out (Enter or Esc)");
+    expect(onRespond.mock.calls).toEqual([["deny"], ["deny"], ["deny"]]);
+    expect(screen.getByRole("button", { name: "Leave it out" })).toHaveAttribute("title", "Leave it out (⌘↵, Enter or Esc)");
   });
 });

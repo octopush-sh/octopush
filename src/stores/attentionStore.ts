@@ -113,9 +113,10 @@ interface AttentionState {
   ) => void;
   /** A Talk approval card waits on the user in `workspaceId`: raise its
    *  needs-you flag (`kind: "chat"`, `reason: "approval"`), which no focus
-   *  clears and no later ping replaces until `settleApproval`. Its wait
-   *  starts at the first card (`since` is kept while one waits). Chimes
-   *  only when `chime` (the user isn't already looking at the card). */
+   *  clears and no later ping replaces until `settleApproval`. `command` is
+   *  the oldest card still waiting (the flag's `detail` follows it as cards
+   *  are answered); the wait itself starts at the first card (`since` and
+   *  `at` are kept while one waits). Chimes only when `chime`. */
   raiseApproval: (workspaceId: string, command: string, chime: boolean) => void;
   /** The workspace's last approval card was answered: drop its flag (and
    *  only an approval flag). */
@@ -207,9 +208,12 @@ export const useAttentionStore = create<AttentionState>((set, get) => {
       const now = Date.now();
       set((s) => {
         const existing = s.flagsByWs[workspaceId];
-        // Already raised for an earlier card: the oldest card's command and
-        // time stand, so the beacon can't hop to a newer wait.
-        if (isApprovalFlag(existing)) return s;
+        // Already raised: the wait's time stands, so the beacon can't hop to
+        // a newer wait; only the command follows the oldest card left.
+        if (isApprovalFlag(existing)) {
+          if (existing.detail === command) return s;
+          return { flagsByWs: { ...s.flagsByWs, [workspaceId]: { ...existing, detail: command } } };
+        }
         return {
           flagsByWs: {
             ...s.flagsByWs,

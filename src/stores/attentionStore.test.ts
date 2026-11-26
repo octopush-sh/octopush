@@ -153,13 +153,18 @@ describe("attentionStore — a Talk approval card is a needs-you state", () => {
     vi.useRealTimers();
   });
 
-  it("keeps the oldest card's wait: a second card neither moves `since` nor the command", () => {
+  it("keeps the wait's time while the command follows the oldest card left", () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
     useAttentionStore.getState().raiseApproval("ws-a", "git push --force", false);
     vi.setSystemTime(8_000);
+    // The push was answered; the reset is now the oldest card waiting.
     useAttentionStore.getState().raiseApproval("ws-a", "git reset --hard", false);
-    expect(useAttentionStore.getState().flagsByWs["ws-a"]).toMatchObject({ since: 1_000, detail: "git push --force" });
+    expect(useAttentionStore.getState().flagsByWs["ws-a"]).toMatchObject({
+      since: 1_000,
+      at: 1_000,
+      detail: "git reset --hard",
+    });
     vi.useRealTimers();
   });
 
