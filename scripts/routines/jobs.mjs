@@ -29,7 +29,7 @@ import { execFileSync } from "node:child_process";
 import { makeGh, ghForRepo, APP_REPO, WEB_REPO, isPrivateLane, markPrivate, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 import { verdictFor, reviewRounds, MAX_REVIEW_ROUNDS } from "./automerge.mjs";
-import { mainCi, findMainRedIssue, syncMainRed, takeable } from "./main-health.mjs";
+import { mainCi, headIsRed, findMainRedIssue, syncMainRed, takeable } from "./main-health.mjs";
 
 export const CLAIM_TTL_MS = 24 * 3600e3;
 export const RED_CI_MAX_AGE_MS = 7 * 24 * 3600e3;
@@ -111,17 +111,43 @@ export function mainState(gh, repo, ids, { write = false } = {}) {
 }
 
 /**
- * The jobs in order, for `check` and `next` (app repo): while main is red,
- * its issue first (if the builder may take it) and no red-CI rounds except on
- * the PR that fixes main; then fixes; then `ready` issues.
+ * The PR that fixes main, when main moved past it while red: auto-merge is
+ * paused, and only a head that contains main may merge, so a green, approved
+ * fix that fell behind would wait forever. It gets a "behind-main" round
+ * (nightly-build.yml merges main in; a round that is only that merge is
+ * pushed as is). Anything unreadable gives no round.
+ */
+export function behindMainJobs(gh, repo, ids, now, { health, issue }, taken = []) {
+  if (health?.state !== "red" || !health.sha || !issue) return [];
+  const out = [];
+  for (const p of builderPrs(gh, repo, ids)) {
+    if (taken.includes(p.number) || !closingRefs(`${p.title}\n${p.body}`).includes(issue.number)) continue;
+    if (labelsOf(p).includes("needs-owner") || isFreshClaim(gh, repo, p, now)) continue;
+    let behind = null;
+    try { behind = gh.get(`repos/${repo}/compare/${health.sha}...${p.head.sha}`)?.behind_by; } catch { behind = null; }
+    if (!Number.isInteger(behind) || behind === 0) continue;
+    const comments = gh.list(`repos/${repo}/issues/${p.number}/comments`);
+    const rounds = comments.filter((c) => sameLogin(c.user?.login, ids.builder) && (c.body ?? "").trimEnd().endsWith(UPDATE_MARK)).length;
+    out.push({ pr: p, reason: "behind-main", stale: rounds >= MAX_FIX_ROUNDS });
+  }
+  return out;
+}
+
+/**
+ * The jobs in order, for `check` and `next` (app repo). While main's HEAD is
+ * red: its issue first (if the builder may take it), and no red-CI rounds
+ * except on the PR that fixes main. While main is red at all (a head still
+ * running inherits its parent's red), the fix PR gets a round if it fell
+ * behind main. Then fixes; then `ready` issues.
  */
 export function orderedJobs(gh, repo, ids, now, { health, issue, opened = false }) {
-  const red = health?.state === "red";
+  const headRed = headIsRed(health);
   const issues = issueJobs(gh, repo, ids, now);
   const fixesMain = (p) => !!issue && closingRefs(`${p.title}\n${p.body}`).includes(issue.number);
-  const fixes = fixJobs(gh, repo, ids, now).filter((j) => !red || j.reason !== "red-ci" || fixesMain(j.pr));
+  const fixes = fixJobs(gh, repo, ids, now).filter((j) => !headRed || j.reason !== "red-ci" || fixesMain(j.pr));
+  fixes.push(...behindMainJobs(gh, repo, ids, now, { health, issue }, fixes.map((j) => j.pr.number)));
   // Just opened: nobody can have claimed it yet, even if the list hasn't caught up.
-  const top = red && takeable(issue) ? issues.find((i) => i.number === issue.number) ?? (opened ? issue : null) : null;
+  const top = headRed && takeable(issue) ? issues.find((i) => i.number === issue.number) ?? (opened ? issue : null) : null;
   return { top, fixes, issues: top ? issues.filter((i) => i.number !== top.number) : issues };
 }
 
@@ -194,7 +220,7 @@ async function main() {
   if (cmd === "check") {
     const state = mainState(gh, repo, ids);
     // Red with no issue yet: `next` opens it, so that is work.
-    if (state.health?.state === "red" && !state.issue) { console.log("work: main is red (its issue is opened by the next build)"); return 0; }
+    if (headIsRed(state.health) && !state.issue) { console.log("work: main is red (its issue is opened by the next build)"); return 0; }
     const { top, fixes, issues } = orderedJobs(gh, repo, ids, now, state);
     if (top) { console.log(`work: issue #${top.number} (main is red)`); return 0; }
     const f = fixes.filter((j) => !j.stale);

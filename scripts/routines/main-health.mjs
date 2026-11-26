@@ -11,14 +11,14 @@
 // Pure helpers plus a few reads; every write is done by the caller's client.
 // main's CI itself is read by gh.mjs `mainCi` (next to ciStatus), so that
 // automerge.mjs needs nothing of this module.
-import { APP_REPO, labelsOf, sanitize } from "./gh.mjs";
+import { APP_REPO, labelsOf, sanitize, headIsRed } from "./gh.mjs";
 import { sameLogin } from "./identity.mjs";
 import { ciFailureList, formatFailures, NONE } from "./ci-failures.mjs";
 import { fence } from "./social.mjs";
 
 /** Ends the body of the cycle's "main is red" issue (agent text can't carry it: sanitize). */
 export const MAIN_RED_MARK = "<!-- octopush-main-red -->";
-export { mainCi } from "./gh.mjs";
+export { mainCi, headIsRed } from "./gh.mjs";
 
 /** The open "main is red" issue the cycle filed, or null. Only the builder's own issues count. */
 export function findMainRedIssue(gh, repo, ids) {
@@ -54,9 +54,11 @@ export function mainRedBody({ repo, redSha, report }) {
 }
 
 /**
- * Keep the "main is red" issue in step with `health` (from mainCi). Red: open
- * it (label `ready`), or update its title and body; a parked one stays parked.
- * Green: close it with a comment. Unknown: leave it alone. `failures` is
+ * Keep the "main is red" issue in step with `health` (from mainCi). Main's
+ * head itself red: open it (label `ready`), or update its title and body; a
+ * parked one stays parked. Green: close it with a comment. Red only by
+ * inheritance (the head's CI is still running, as right after a fix merges) or
+ * unknown: leave it alone. `failures` is
  * `ciFailureList` for the red commit (read here when not given). Returns
  * `{ issue, opened?, closed? }`.
  */
@@ -68,7 +70,7 @@ export function syncMainRed(gh, repo, ids, health, { failures } = {}) {
     gh.send("PATCH", `repos/${repo}/issues/${open.number}`, { state: "closed", state_reason: "completed" });
     return { issue: null, closed: open.number };
   }
-  if (health?.state !== "red" || !health.redSha) return { issue: open };
+  if (!headIsRed(health)) return { issue: open };
   let list = failures;
   if (list === undefined) { try { list = ciFailureList(gh, repo, health.redSha); } catch { list = null; } }
   const title = mainRedTitle(list ?? []);

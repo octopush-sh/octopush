@@ -91,11 +91,36 @@ export function makeGh(run = ghRun) {
  */
 export const NON_VERDICT = ["action_required", "cancelled", "skipped", "stale", "neutral"];
 
-/** The newest "CI" run for a commit that says something about the code, or null. */
+/**
+ * A failed run that only lost its runners (lib.sh ci_starved_run_for): every
+ * job that didn't succeed or skip was cancelled before any step ran — GitHub's
+ * "job was not acquired by Runner" when macOS capacity runs out. It says
+ * nothing about the code (rerun-starved.sh re-runs it). A job that hit its
+ * timeout is also "cancelled", but it ran steps: that is a real result.
+ */
+export function starvedRun(gh, repo, run) {
+  if (run?.status !== "completed" || run.conclusion !== "failure") return false;
+  const bad = (gh.get(`repos/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`)?.jobs ?? [])
+    .filter((j) => !["success", "skipped"].includes(j.conclusion ?? ""));
+  return bad.length > 0 && bad.every((j) => j.conclusion === "cancelled" && !(j.steps ?? []).length);
+}
+
+/** At most this many starved runs are looked through for a commit's verdict. */
+const STARVED_LOOKBACK = 3;
+
+/** The newest "CI" run for a commit that says something about the code (not superseded, not starved), or null. */
 export function latestCiRun(gh, repo, sha) {
-  return (gh.get(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=50`)?.workflow_runs ?? [])
+  const runs = (gh.get(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=50`)?.workflow_runs ?? [])
     .filter((r) => r.name === "CI" && !(r.status === "completed" && NON_VERDICT.includes(r.conclusion)) && r.status !== "waiting")
-    .sort((a, b) => (a.created_at < b.created_at ? -1 : 1)).at(-1) ?? null;
+    .sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+  for (let i = runs.length - 1, looked = 0; i >= 0; i--) {
+    if (looked < STARVED_LOOKBACK && runs[i].conclusion === "failure") {
+      looked++;
+      if (starvedRun(gh, repo, runs[i])) continue;
+    }
+    return runs[i];
+  }
+  return null;
 }
 
 export function ciStatus(gh, repo, sha) {
@@ -123,7 +148,10 @@ function failingWhileRunning(gh, repo, sha) {
  *             the head's running CI has already failed;
  *   unknown — no verdict on the last MAIN_LOOKBACK commits (nothing pauses).
  * A head whose CI is still running or never ran (a release merge) inherits the
- * verdict of its first parent, so "red" lasts until a newer commit is green.
+ * verdict of its first parent, so "red" lasts until a newer commit is green —
+ * that is what pauses auto-merge. Whether main's HEAD itself is red
+ * (`redSha === sha`, headIsRed) is what files the "main is red" issue: a fix
+ * that just merged, its CI still running, must not open a new one.
  * API errors propagate: each caller decides what "can't tell" means.
  */
 export function mainCi(gh, repo = APP_REPO) {
@@ -142,6 +170,8 @@ export function mainCi(gh, repo = APP_REPO) {
   }
   return { state: "unknown", sha: head, redSha: null };
 }
+/** Did CI fail on main's head commit itself (not inherited from its parent)? */
+export const headIsRed = (health) => health?.state === "red" && !!health.sha && health.redSha === health.sha;
 
 export const labelsOf = (issueOrPr) => (issueOrPr.labels ?? []).map((l) => (typeof l === "string" ? l : l.name));
 

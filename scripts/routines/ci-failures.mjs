@@ -53,13 +53,14 @@ export const clean = (s) => String(s ?? "")
 const cap = (line) => (line.length > MAX_LINE ? `${line.slice(0, MAX_LINE)}…` : line);
 const EXIT_LINE = /^Process completed with exit code \d+\.?$/;
 
-/** The `##[error]` lines of a job log, cleaned and capped (the exit-code line is noise). */
-export function errorLines(log, max = MAX_LINES) {
+/** The `##[error]` lines of a job log, cleaned, redacted and capped (the exit-code line is noise). */
+export function errorLines(log, max = MAX_LINES, secrets = []) {
   const out = [];
   for (const raw of String(log ?? "").split("\n")) {
     const i = raw.indexOf("##[error]");
     if (i < 0) continue;
-    const line = clean(raw.slice(i + "##[error]".length)).trim();
+    // Redacted whole, before any cut: half a key matches no pattern.
+    const line = redact(clean(raw.slice(i + "##[error]".length)).trim(), secrets);
     if (!line || EXIT_LINE.test(line)) continue;
     out.push(cap(line));
     if (out.length >= max) break;
@@ -69,9 +70,9 @@ export function errorLines(log, max = MAX_LINES) {
 
 // ------------------------------------------------------------------ the log's own words
 
-/** Each log line without its runner timestamp, cleaned. */
+/** Each log line without its runner timestamp, cleaned and redacted — whole, before anything is cut. */
 const STAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?/;
-const logLines = (log) => String(log ?? "").split("\n").map((l) => clean(l.replace(STAMP, "")).trim());
+const logLines = (log, secrets) => String(log ?? "").split("\n").map((l) => redact(clean(l.replace(STAMP, "")).trim(), secrets));
 
 /**
  * Lines that say what broke. `next` also keeps the line after (a panic's
@@ -106,8 +107,8 @@ const TEST_NAME = [
  * `tests` (failing test names) and `tail` (the last lines before the step
  * failed, only when nothing else was found). All cleaned and capped.
  */
-export function logSummary(log, { maxLines = MAX_LINES, maxTests = MAX_TESTS, tailLines = TAIL_LINES } = {}) {
-  const lines = logLines(log);
+export function logSummary(log, { maxLines = MAX_LINES, maxTests = MAX_TESTS, tailLines = TAIL_LINES, secrets = secretValues() } = {}) {
+  const lines = logLines(log, secrets);
   const errors = [];
   const tests = [];
   const seen = new Set();
@@ -151,24 +152,39 @@ export function logSummary(log, { maxLines = MAX_LINES, maxTests = MAX_TESTS, ta
 export const REDACTED = "[redacted]";
 const global = (re) => new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
 const KEYWORD = "token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|credentials?";
+/** A name that holds a credential: says secret/token/password/credential, or ends in key (`STRIPE_KEY`, `secretKey`, `api-key`). */
+const SECRET_NAME = /secret|token|passw(?:or)?d|credential|api[_-]?key|private[_-]?key|access[_-]?key|key$/i;
+/** Credential shapes of payment and webhook providers, at any length from 8. */
+const PROVIDER_KEYS = [/\b[spr]k_(?:live|test)_[A-Za-z0-9]{8,}/g, /\bwhsec_[A-Za-z0-9+/=_-]{8,}/g];
 
 /**
  * Replace anything that could be a credential with REDACTED (pure).
  * Conservative on purpose — a lost commit id costs nothing, a leaked key does:
- * the known secret `values` (plain and base64), the credential shapes of
- * social.mjs (SECRET_PATTERNS), a basic/bearer header, a URL's user:password,
- * the value of an UPPER_CASE variable whose name says token/secret/password/key,
- * an opaque value (digits in it) after a lower-case such name, and any run of
- * 40+ base64/URL-safe characters that mixes upper case, lower case and digits.
+ *   - the known secret `values` (plain and base64) and the credential shapes of
+ *     social.mjs (SECRET_PATTERNS), plus `sk_live_`/`sk_test_`/`whsec_` keys;
+ *   - an `Authorization:` header's value (token/bearer/basic), a basic/bearer
+ *     credential anywhere, `token <hex>`, a URL's user:password;
+ *   - the value after `=` of any name that says secret/token/password/
+ *     credential or ends in key (`GH_TOKEN=…`, `STRIPE_KEY=…`, `?api_key=…`);
+ *   - a quoted value of such a name (`secretKey: '…'`, `"apiToken": "…"`);
+ *   - an opaque value (digits in it) after such a name and `:` or `=`;
+ *   - any run of 40+ base64/URL-safe characters that mixes upper case, lower
+ *     case and digits.
+ * Callers redact a line before cutting it (ci-failures' caps): half a key
+ * matches no pattern.
  */
 export function redact(text, values = []) {
   let s = String(text ?? "");
   const known = [...new Set(values.map((v) => String(v ?? "").trim()).filter((v) => v.length >= 8))].sort((a, b) => b.length - a.length);
   for (const v of known) for (const form of [v, Buffer.from(v).toString("base64")]) s = s.split(form).join(REDACTED);
-  for (const re of SECRET_PATTERNS) s = s.replace(global(re), REDACTED);
-  s = s.replace(/\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}/gi, `$1$2${REDACTED}`);
+  for (const re of [...SECRET_PATTERNS, ...PROVIDER_KEYS]) s = s.replace(global(re), REDACTED);
+  s = s.replace(/\b(authorization\s*[:=]\s*(?:(?:token|bearer|basic)\s+)?)(?!\[redacted\])\S+/gi, `$1${REDACTED}`);
+  s = s.replace(/\b(bearer|basic)(\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{8,}/gi, `$1$2${REDACTED}`);
+  s = s.replace(/\b(token\s+)[0-9a-f]{20,}\b/gi, `$1${REDACTED}`);
   s = s.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED}@`);
-  s = s.replace(new RegExp(`\\b([A-Z0-9_]*(?:${KEYWORD.toUpperCase()})[A-Z0-9_]*)=(?!\\[redacted\\])\\S+`, "g"), `$1=${REDACTED}`);
+  s = s.replace(/\b([A-Za-z][A-Za-z0-9_.-]*)=(?!\[redacted\])([^\s&"'`,;]+)/g, (m, k) => (SECRET_NAME.test(k) ? `${k}=${REDACTED}` : m));
+  s = s.replace(/(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1(\s*[:=]\s*)(["'`])([^"'`\n]{4,})\4/g,
+    (m, q, k, sep, quote, v) => (SECRET_NAME.test(k) && v !== REDACTED ? `${q}${k}${q}${sep}${quote}${REDACTED}${quote}` : m));
   s = s.replace(new RegExp(`\\b([\\w-]*(?:${KEYWORD}))(["']?\\s*[:=]\\s*["']?)([A-Za-z0-9_\\-+/=.~]{12,})`, "gi"),
     (m, k, sep, v) => (/\d/.test(v) && v !== REDACTED ? `${k}${sep}${REDACTED}` : m));
   s = s.replace(/[A-Za-z0-9+/_-]{40,}={0,2}/g, (m) => (/[a-z]/.test(m) && /[A-Z]/.test(m) && /\d/.test(m) ? REDACTED : m));
@@ -203,7 +219,7 @@ export const forPrompt = (report) => (report === NONE || report === UNAVAILABLE 
  * couldn't be read). Listing errors propagate (the caller says UNAVAILABLE), a
  * single unreadable job log does not. `gh` is a makeGh client.
  */
-export function ciFailureList(gh, repo, sha) {
+export function ciFailureList(gh, repo, sha, { secrets = secretValues() } = {}) {
   const runs = failedRuns(gh.get(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`)?.workflow_runs);
   const out = [];
   let jobs = 0;
@@ -214,7 +230,7 @@ export function ciFailureList(gh, repo, sha) {
     for (const job of failed) {
       if (jobs++ >= MAX_JOBS) { out.push({ more: true }); return out; }
       let summary = null;
-      try { summary = logSummary(gh.raw(`repos/${repo}/actions/jobs/${job.id}/logs`)); } catch { summary = null; }
+      try { summary = logSummary(gh.raw(`repos/${repo}/actions/jobs/${job.id}/logs`), { secrets }); } catch { summary = null; }
       out.push({
         workflow: clean(run.name), job: clean(job.name), conclusion: job.conclusion,
         steps: (job.steps ?? []).filter((s) => FAILED.includes(s.conclusion)).map((s) => clean(s.name)),
@@ -245,7 +261,7 @@ export function formatFailures(list, { secrets = secretValues() } = {}) {
 }
 
 /** Markdown lines describing the failing runs/jobs/steps on `sha`, or NONE. */
-export const ciFailures = (gh, repo, sha, opts) => formatFailures(ciFailureList(gh, repo, sha), opts);
+export const ciFailures = (gh, repo, sha, opts) => formatFailures(ciFailureList(gh, repo, sha, opts), opts);
 
 function main() {
   const [repo, sha] = process.argv.slice(2);

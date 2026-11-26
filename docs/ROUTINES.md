@@ -41,26 +41,35 @@ Every workflow also has **Run workflow** (Actions tab) for a manual run. Schedul
 
 ### Fix rounds
 
-The cycle parks a PR (`needs-owner`) only for what it can't fix itself. Three things send a builder PR
-back to the builder instead (`jobs.mjs fixJobs`), and together they get `MAX_FIX_ROUNDS` (3)
-rounds before the PR is parked:
+The cycle parks a PR (`needs-owner`) only for what it can't fix itself. These send a builder PR
+back to the builder instead (`jobs.mjs`), and together they get `MAX_FIX_ROUNDS` (3) rounds
+before the PR is parked:
 
 - **The review asked for changes.**
-- **CI is red.** A fixed step of `nightly-build.yml`, holding the workflow's token, reads the failed
-  jobs' logs through the Actions API (`ci-failures.mjs`; the agent never fetches anything) and
-  puts an excerpt in the prompt: the failing step, the first error lines of the tools (rustc's
-  whole diagnostic, tsc, Vitest, node:test, panics, `##[error]`), the failing test names, and,
-  when none of those matched, the last lines before the step failed. Every line is cleaned of
-  control and invisible characters and capped; the excerpt is redacted (known secret values plain
-  and base64, credential shapes, basic/bearer headers, a URL's user:password, the value of a
-  `*TOKEN*`/`*SECRET*`/`*PASSWORD*`/`*KEY*` variable, opaque runs of 40+ mixed-case characters),
-  bounded to 12,000 characters and fenced as untrusted data.
+- **CI is red.** A run whose jobs never got a runner (every job that didn't pass cancelled before
+  any step ran, as `lib.sh` `ci_starved_run_for` tests it) is not red: `ciStatus` skips it and
+  `rerun-starved.sh` re-runs it. A fixed step of `nightly-build.yml`, holding the workflow's token,
+  reads the failed jobs' logs through the Actions API (`ci-failures.mjs`; the agent never fetches
+  anything) and puts an excerpt in the prompt: the failing step, the first error lines of the
+  tools (rustc's whole diagnostic, tsc, Vitest, node:test, panics, `##[error]`), the failing test
+  names, and, when none of those matched, the last lines before the step failed. Every line is
+  cleaned of control and invisible characters, then redacted whole, then capped. Redacted: known
+  secret values (plain and base64), the credential shapes of `social.mjs`, `sk_live_`/`sk_test_`/
+  `whsec_` keys, an `Authorization:` value, basic/bearer credentials, `token <hex>`, a URL's
+  user:password, the value after `=` of any name that says secret/token/password/credential or
+  ends in key (`STRIPE_KEY=`, `?api_key=`), a quoted value of such a name (`secretKey: '…'`), an
+  opaque value after such a name, and runs of 40+ mixed-case characters with digits. The excerpt
+  is bounded to 12,000 characters and fenced as untrusted data.
 - **The PR conflicts with main** (app PRs; GitHub reports it not mergeable). The workflow merges
-  main into the branch and commits the merge with Git's conflict markers left in (zdiff3 style);
-  resolving them is the round's work. `publish-build.mjs` pushes nothing while a conflicted file
-  still has a marker (it parks the PR instead), and a conflict in a path agents may not touch is
-  refused as any such change is. The new head is reviewed again. A conflicted PR is not reviewed
-  until then; `automerge.mjs` treats conflicts as "not yet", never as a park.
+  main into the branch (`merge-main.sh`). If every conflicted file got Git's markers (zdiff3), the
+  merge is committed with them and resolving them is the round's work; `publish-build.mjs` pushes
+  nothing while a conflicted file still has a marker (it parks the PR instead), and a conflict in
+  a path agents may not touch is refused as any such change is. A conflict Git can't mark — a
+  binary file, a file deleted on one side, a symlink — would be settled silently, so the merge is
+  aborted and the PR is parked whatever the agent writes. The new head is reviewed again. A
+  conflicted PR is not reviewed until then; `automerge.mjs` treats conflicts as "not yet", never
+  as a park.
+- **Main moved past the fix for a red main.** See below.
 
 A missing changeset parks a PR only when the reviewer says users will notice the change: its
 verdict file carries `user_visible: true|false` and a one-line `user_visible_reason`, which the
@@ -74,20 +83,27 @@ posting step shows in the comment and signs next to the verdict, for that commit
 When CI fails on `main` (a merge of two PRs that were each green, say), every PR that merges main
 goes red too, and no beta goes out (the release waits for a green main). So:
 
-- **One issue, at the top of the queue.** `jobs.mjs next` (main-health.mjs) opens a `ready` issue
-  titled "main is red: <failing job>", by the workflow's bot, ending in `<!-- octopush-main-red -->`,
-  with the red commit and the same redacted, fenced log excerpt; it updates that one issue (title
-  and body, never its labels) while main stays red, and offers it before every other job. If you
-  park it (`needs-owner`), it stays parked. Once main is green again the cycle comments and closes
-  it (the fix PR's `Closes #n` usually does first).
 - **"Red"** is the newest verdict on main's first-parent line within 5 commits: a head whose CI is
   still running or never ran (a release merge) inherits its parent's, so red lasts until a newer
-  commit is green; a running CI whose job already failed counts as red at once.
-- **Red-CI fix rounds wait** while main is red (main is the likelier cause), except on the PR that
-  closes the main-red issue. Review and conflict rounds go on.
+  commit is green; a running CI whose job already failed counts as red at once. That inherited red
+  is used only to pause merges; the issue and the queue below react only when CI failed on main's
+  **head** itself, so a fix whose CI is still running doesn't open a second issue.
+- **One issue, at the top of the queue.** While main's head is red, `jobs.mjs next`
+  (main-health.mjs) opens a `ready` issue titled "main is red: <failing job>", by the workflow's
+  bot, ending in `<!-- octopush-main-red -->`, with the red commit and the same redacted, fenced
+  log excerpt; it updates that one issue (title and body, never its labels) while the head stays
+  red, and offers it before every other job. If you park it (`needs-owner`), it stays parked. Once
+  main is green again the cycle comments and closes it (the fix PR's `Closes #n` usually does
+  first).
+- **Red-CI fix rounds wait** while main's head is red (main is the likelier cause), except on the
+  PR that closes the main-red issue. Review and conflict rounds go on.
 - **Auto-merge pauses** while main is red, except for a PR whose head already contains main's head
   — its green CI then proves the fix, and merging it is how main turns green. A lookup that fails
-  counts as paused.
+  (main's CI, the compare) counts as paused.
+- **No deadlock.** If something lands on main meanwhile, the fix PR no longer contains main's head
+  and would wait forever: while main is red, the PR that closes the main-red issue gets a
+  "behind-main" round when it is behind main (the workflow merges main in; a round that is only
+  that merge is pushed as is), under the same round limit.
 - **Right away, not at the next cron:** `ci.yml`'s `main-red` job starts the builder when a job of
   main's CI fails (push or dispatch on `main`, never a PR run).
 

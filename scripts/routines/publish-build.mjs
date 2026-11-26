@@ -27,8 +27,10 @@
 // reach), OCTOPUSH_SECRETS (newline-separated values that must never be
 // published — the Claude token), GITHUB_REPOSITORY, and optionally
 // OCTOPUSH_CONFLICTS_FILE (the files main's merge left with conflict markers,
-// one per line, written by nightly-build.yml where the agent can't reach it:
-// nothing is pushed while one of them still has a marker).
+// one per line, written by merge-main.sh where the agent can't reach it:
+// nothing is pushed while one of them still has a marker) and
+// OCTOPUSH_UNMERGEABLE_FILE (files whose conflict with main Git can't mark —
+// binary, deleted on one side: any at all parks the PR, whatever the agent did).
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
@@ -90,7 +92,7 @@ export function parseResult(text, kind) {
   return { error: `action "${r.action}" is not valid for a${kind === "issue" ? "n issue" : " PR"} job` };
 }
 
-/** A line Git writes into a conflicted file (any conflict style). */
+/** A line Git writes into a conflicted file (any conflict style; with /m, `$` also ends a CRLF line's text). */
 const CONFLICT_MARKER = /^(<{7}|\|{7}|>{7})( |$)|^={7}$/m;
 export const hasConflictMarkers = (text) => CONFLICT_MARKER.test(String(text ?? ""));
 /** The conflicted files that still carry a marker (pure but for reading them). */
@@ -196,8 +198,9 @@ async function main() {
   // Every token-holding value must be scanned for, not only the Claude one.
   const secrets = (process.env.OCTOPUSH_SECRETS ?? "").split("\n");
   const conflicts = kind === "pr" ? conflictList(process.env.OCTOPUSH_CONFLICTS_FILE) : [];
+  const unmergeable = kind === "pr" ? conflictList(process.env.OCTOPUSH_UNMERGEABLE_FILE) : [];
   try {
-    return await publish({ kind, n, existingBranch, repo, gitDir, token, secrets, conflicts, gh: ghForRepo(repo), appGh: makeGh() });
+    return await publish({ kind, n, existingBranch, repo, gitDir, token, secrets, conflicts, unmergeable, gh: ghForRepo(repo), appGh: makeGh() });
   } catch (e) {
     throw isPrivateLane(repo) ? privateFailure(e) : e;
   }
@@ -220,7 +223,7 @@ export function privateFailure(e, stage = STAGE) {
  * The whole publishing flow, run in the current directory (the agent's
  * checkout). `pushUrl` is only for tests (a local bare repo).
  */
-export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, conflicts = [], gh, appGh = gh, pushUrl }) {
+export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, conflicts = [], unmergeable = [], gh, appGh = gh, pushUrl }) {
   QUIET = isPrivateLane(repo);
   STAGE = "result";
   // Where the job's issue lives: an app-issue job's issue is in the app repo.
@@ -229,6 +232,8 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   const parsed = existsSync(file) ? parseResult(readFileSync(file, "utf8"), kind) : { error: "the agent wrote no .agent-out/result.json" };
   rmSync(".agent-out", { recursive: true, force: true });
   rmSync(REF_DIR, { recursive: true, force: true });
+  // Main conflicts with the branch where Git leaves no marker: the merge was aborted, nothing to push.
+  if (unmergeable.length) { park(jobGh, jobRepo, kind, n, `Main conflicts with this branch in files Git can't mark (binary, or deleted on one side): ${unmergeable.join(", ")}. They need a person to resolve.`); return 1; }
   if (parsed.error) { park(jobGh, jobRepo, kind, n, `Its output was unusable: ${parsed.error}.`); return 1; }
   const r = parsed.result;
   if (r.action === "stop") { park(jobGh, jobRepo, kind, n, r.reason); console.log(`parked #${n}`); return 0; }
