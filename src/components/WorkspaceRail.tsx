@@ -991,10 +991,12 @@ export function WorkspaceRail({
                 onKeyDown={(e) => {
                   if (e.key === "Escape") setFilter("");
                 }}
-                placeholder="Find a project, group or mission"
+                // Short enough to fit beside the filter and "+" at the rail's
+                // default width; the full phrase lives in the title and label.
+                placeholder="Find a project or mission"
                 spellCheck={false}
                 aria-label="Find a project, group or mission"
-                className="min-w-0 flex-1 bg-transparent text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
+                className="min-w-0 flex-1 text-ellipsis bg-transparent text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
               />
             </label>
             <RailStateFilter value={statePick} counts={stateCounts} onChange={setStatePick} />

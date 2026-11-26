@@ -875,7 +875,7 @@ describe("WorkspaceRail", () => {
       />,
     );
     const input = screen.getByRole("textbox", { name: "Find a project, group or mission" });
-    expect(input).toHaveAttribute("placeholder", "Find a project, group or mission");
+    expect(input).toHaveAttribute("placeholder", "Find a project or mission");
 
     fireEvent.change(input, { target: { value: "amm" } });
     // Only Gamma survives; Backend (no hit anywhere) leaves the rail.
