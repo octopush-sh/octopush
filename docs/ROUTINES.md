@@ -226,7 +226,12 @@ trusted:
   diff drivers.
 - **The nightly release runs no agent code:** no credentials persisted in the checkout,
   dependencies installed without scripts, and no clip recording in Actions (it would run the
-  frontend next to the token).
+  frontend next to the token). **It tags only a tree its CI tested:** the release PR merges only
+  while its head contains the current `main` (else it is cut again from the new `main` and
+  re-tested, once, then it stops), and the merge commit must have that head's exact tree — or CI
+  runs on the merge itself (branch `release-check/v<version>`), and a red one is abandoned
+  (`abandoned/v<version>`, never a `v*` tag). A version whose build failed, or that was abandoned,
+  is carried into the next release's notes (docs/RELEASING.md).
 - **Agents read GitHub only through `read.mjs`**, which shows text by you and the routines and
   never anyone else's — an outsider can edit their issue after you approve it, so when you mark an
   outsider's issue `ready`, restate the work in a comment of yours.
