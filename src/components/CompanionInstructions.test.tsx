@@ -39,12 +39,14 @@ describe("instructionsTitle", () => {
       user,
       { ...claude, tokens: 4000, trimmed: true },
       { label: "CLAUDE.local.md", path: "/wt/CLAUDE.local.md", tokens: 0, trimmed: true },
+      { label: "~/.aws/credentials", path: "/Users/dev/.aws/credentials", tokens: 0, trimmed: false, skipped: "outside the project" },
     ]);
     expect(title.split("\n")).toEqual([
-      "Talk and its sub-agents follow these files, read again on every turn: the CLAUDE.md chain Claude Code loads, or AGENTS.md when there is no CLAUDE.md.",
+      "Talk and its sub-agents follow these files, read again on every turn: your ~/.claude/CLAUDE.md and this project's CLAUDE.md files, or its AGENTS.md when it has no CLAUDE.md. A file outside the project is skipped.",
       "~/.claude/CLAUDE.md · 850 tokens",
       "CLAUDE.md · 4k tokens · trimmed to fit",
       "CLAUDE.local.md · left out, the instructions were already at their limit",
+      "~/.aws/credentials · skipped: outside the project",
     ]);
   });
 });
@@ -57,6 +59,15 @@ describe("CompanionInstructions", () => {
     expect(row).toHaveAttribute("data-tour", "companion-follows");
     expect(row).toHaveTextContent("follows~/.claude/CLAUDE.mdCLAUDE.md");
     expect(row.getAttribute("title")).toContain("CLAUDE.md · 3k tokens");
+  });
+
+  it("strikes through a skipped file and says why in the tooltip", async () => {
+    const linked: InstructionFile = { label: "AGENTS.md", path: "/wt/AGENTS.md", tokens: 0, trimmed: false, skipped: "outside the project" };
+    listProjectInstructions.mockResolvedValue([linked]);
+    await mount();
+    const row = screen.getByTestId("companion-follows");
+    expect(screen.getByText("AGENTS.md")).toHaveClass("line-through");
+    expect(row.getAttribute("title")).toContain("AGENTS.md · skipped: outside the project");
   });
 
   it("is hidden when the worktree has no instruction file", async () => {

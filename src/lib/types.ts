@@ -400,12 +400,14 @@ export interface McpServerStatus {
  *  or its AGENTS.md when it has no CLAUDE.md. `label` is the path as the user
  *  knows it (`CLAUDE.md`, `~/.claude/CLAUDE.md`); `tokens` estimates what the
  *  file adds to each request; `trimmed` means it wasn't sent whole (with 0
- *  tokens: left out, the section was full). */
+ *  tokens: left out, the section was full); `skipped` names why a file was
+ *  never read (`outside the project`, `over 4 MiB`). */
 export interface InstructionFile {
   label: string;
   path: string;
   tokens: number;
   trimmed: boolean;
+  skipped?: string | null;
 }
 
 /** A configured MCP server (stdio): the command to spawn + its args/env. */

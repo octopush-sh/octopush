@@ -650,7 +650,9 @@ fn init_and_wait_ready(
     //   `$(__octo_ps)`, NOT the marker (a command printing the env can't forge a
     //   false completion).
     // - PROMPT_COMMAND re-asserts PS1 each prompt, so a command that overwrites
-    //   PS1 (venv/conda activate, a sourced script) can't break detection.
+    //   PS1 (venv/conda activate, a sourced script) can't break detection. It
+    //   re-asserts `set +H` too (below), so a command or sourced script that
+    //   turns history expansion back on can't break the next command.
     //
     // Commands are typed into this interactive shell's readline as written
     // (`run`), so two of its interactive features would rewrite them:
@@ -670,7 +672,7 @@ fn init_and_wait_ready(
         "__octo_ps() {{ printf '%s%sOCTO_DONE_{nonce}:%d:%s%s%s' \"$__OCTORS\" \"$__OCTORS\" \"$__octo_oc\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
     ));
     init.push_str("__octo_setps() { PS1='$(__octo_ps)'; }\n");
-    init.push_str("__octo_oc=0; PROMPT_COMMAND='__octo_oc=$?; __octo_setps'\n");
+    init.push_str("__octo_oc=0; PROMPT_COMMAND='__octo_oc=$?; set +H; __octo_setps'\n");
     init.push_str("__octo_setps\n");
     client.write(id, init.as_bytes())?;
 
@@ -1139,6 +1141,10 @@ mod e2e {
         // `$` commands share the shell, and its settings.
         let r = done(shell.run("h", "/tmp", r#"echo "ok!then""#, quick, true).unwrap());
         assert_eq!(r.output, "ok!then");
+        // A command that turns history expansion back on doesn't keep it on.
+        done(shell.run("h", "/tmp", "set -H", quick, true).unwrap());
+        let r = cap(shell.run_capture("h", "/tmp", r#"echo "again!x""#, quick).unwrap());
+        assert_eq!(r.output, "again!x", "the next prompt turns it off again");
 
         let dir = TempDir::new().unwrap();
         let makefile = dir.path().join("Makefile");

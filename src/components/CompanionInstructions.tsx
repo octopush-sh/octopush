@@ -7,6 +7,7 @@ import { useChatStore } from "../stores/chatStore";
 /** One file's line in the row's tooltip: its tokens, or why it wasn't sent
  *  whole. */
 function fileLine(f: InstructionFile): string {
+  if (f.skipped) return `${f.label} · skipped: ${f.skipped}`;
   if (f.trimmed && f.tokens === 0) return `${f.label} · left out, the instructions were already at their limit`;
   return `${f.label} · ${formatTokens(f.tokens)}${f.trimmed ? " · trimmed to fit" : ""}`;
 }
@@ -15,7 +16,7 @@ function fileLine(f: InstructionFile): string {
  *  Pure so the copy is tested. */
 export function instructionsTitle(files: InstructionFile[]): string {
   return [
-    "Talk and its sub-agents follow these files, read again on every turn: the CLAUDE.md chain Claude Code loads, or AGENTS.md when there is no CLAUDE.md.",
+    "Talk and its sub-agents follow these files, read again on every turn: your ~/.claude/CLAUDE.md and this project's CLAUDE.md files, or its AGENTS.md when it has no CLAUDE.md. A file outside the project is skipped.",
     ...files.map(fileLine),
   ].join("\n");
 }
@@ -51,7 +52,9 @@ function useProjectInstructions(worktreePath: string | undefined, workspaceId: s
  * The Conversation section's "follows" row: the instruction files Talk and
  * its sub-agents carry in their system prompt (the worktree's CLAUDE.md
  * chain, or its AGENTS.md), in the order they're sent, with each file's
- * tokens in the tooltip. Hidden when there is none.
+ * tokens in the tooltip. A file that wasn't sent (left out, or skipped
+ * because it points outside the project) is struck through, and the tooltip
+ * says why. Hidden when there is none.
  */
 export function CompanionInstructions({ worktreePath, workspaceId }: { worktreePath?: string; workspaceId?: string }) {
   const files = useProjectInstructions(worktreePath, workspaceId ?? "");

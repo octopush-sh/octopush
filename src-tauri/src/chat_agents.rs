@@ -922,7 +922,7 @@ pub async fn run_subagent_core(
 ) -> AppResult<AgentOutcome> {
     let started = std::time::Instant::now();
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
-    let instructions = crate::project_instructions::for_workspace(Path::new(&spec.workspace_path));
+    let instructions = crate::project_instructions::for_workspace_off_runtime(spec.workspace_path.clone().into()).await;
     let system = subagent_system_prompt(&spec.workspace_path, &spec.call, spec.definition.as_ref(), &instructions.section);
     let allowed_tools = spec.definition.as_ref().and_then(|d| d.tools.as_deref());
     let effort = spec.plan.as_ref().and_then(|p| p.effort);

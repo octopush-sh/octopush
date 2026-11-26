@@ -2803,8 +2803,8 @@ impl ChatEngine {
 
         // The project's CLAUDE.md chain (or AGENTS.md), re-read every turn so
         // an edit applies at once; unchanged files give the same text, so the
-        // cached system block holds.
-        let instructions = crate::project_instructions::for_workspace(&workspace_path);
+        // cached system block holds. Read on a blocking thread.
+        let instructions = crate::project_instructions::for_workspace_off_runtime(workspace_path.clone()).await;
         let mut system_prompt = director_system_prompt(
             request.system,
             &request.workspace_path,

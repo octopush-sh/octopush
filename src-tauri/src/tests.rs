@@ -28631,8 +28631,8 @@ mod talk_checkpoint_tests {
 #[cfg(test)]
 mod request_context_tests {
     use crate::request_context::{
-        agents_item, apportion, estimate_tokens, memory_files, memory_imports, request_context, session_files, skills_item,
-        CarriedItem, MAX_SESSIONS,
+        agents_item, apportion, estimate_tokens, memory_chain, memory_files, memory_imports, read_memory_file, request_context,
+        session_files, skills_item, CarriedItem, MemorySkip, MAX_MEMORY_FILE_BYTES, MAX_SESSIONS,
     };
     use crate::transcripts::project_dir_name;
     use std::collections::HashSet;
@@ -28720,11 +28720,12 @@ mod request_context_tests {
     }
 
     #[test]
-    fn the_claude_md_chain_is_user_then_top_down_with_imports() {
+    fn the_claude_md_chain_is_user_then_the_project_with_imports() {
         let home = TempDir::new().unwrap();
         let tree = TempDir::new().unwrap();
         let project = tree.path().join("work").join("repo");
         write(&home.path().join(".claude/CLAUDE.md"), "user rules");
+        // An ancestor's file is outside the project: named, never read.
         write(&tree.path().join("work/CLAUDE.md"), "parent rules");
         // AGENTS.md counts only because CLAUDE.md imports it; it imports
         // CLAUDE.md back, which is not counted twice.
@@ -28735,13 +28736,97 @@ mod request_context_tests {
         write(&project.join("sub/AGENTS.md"), "never imported");
 
         let items = memory_files(&project, Some(home.path()));
-        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
         assert_eq!(
             labels_under(&items, &[home.path(), tree.path()]),
-            ["~/.claude/CLAUDE.md".to_string(), parent, "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
+            ["~/.claude/CLAUDE.md".to_string(), "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
         );
         let local = items.iter().find(|i| i.label == "CLAUDE.local.md").unwrap();
         assert_eq!((local.kind.as_str(), local.count, local.bytes), ("memory", 1, 5));
+        let parent = tree.path().join("work").join("CLAUDE.md");
+        let chain = memory_chain(&project, Some(home.path()));
+        let skipped = chain.iter().find(|f| f.path == parent).expect("the ancestor's file is listed");
+        assert_eq!((skipped.skipped, skipped.bytes, skipped.text.as_str()), (Some(MemorySkip::OutsideProject), 0, ""));
+    }
+
+    /// A project's files can't pull anything from outside it into a request:
+    /// not by import (`~/`, `../`, an absolute path), not as a symlink, and
+    /// not through a symlink further down an import chain. The user's own
+    /// `~/.claude/CLAUDE.md` may still import from anywhere.
+    #[test]
+    fn project_files_never_read_outside_the_project() {
+        let home = TempDir::new().unwrap();
+        let tree = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let project = tree.path().join("repo");
+        write(&home.path().join(".aws/credentials"), "HOME-SECRET");
+        write(&tree.path().join("sibling.md"), "SIBLING-SECRET");
+        let abs = outside.path().join("abs.md");
+        write(&abs, "ABS-SECRET");
+        write(
+            &project.join("CLAUDE.md"),
+            &format!("Rules. @~/.aws/credentials @../sibling.md @{} @docs/notes.md @docs/inside.md", abs.display()),
+        );
+        // A symlink inside the import chain: out of the project, and within it.
+        write(&project.join("docs/real.md"), "inside rules");
+        std::os::unix::fs::symlink(&abs, project.join("docs/notes.md")).unwrap();
+        std::os::unix::fs::symlink(project.join("docs/real.md"), project.join("docs/inside.md")).unwrap();
+        // The user's own file may import from anywhere.
+        write(&home.path().join("notes.md"), "user notes");
+        write(&home.path().join(".claude/CLAUDE.md"), "@~/notes.md");
+
+        let chain = memory_chain(&project, Some(home.path()));
+        let read: String = chain.iter().map(|f| f.text.as_str()).collect();
+        for secret in ["HOME-SECRET", "SIBLING-SECRET", "ABS-SECRET"] {
+            assert!(!read.contains(secret), "{secret} was read: {chain:?}");
+        }
+        assert!(read.contains("inside rules") && read.contains("user notes"), "{chain:?}");
+        let skipped: Vec<&str> = chain
+            .iter()
+            .filter(|f| f.skipped == Some(MemorySkip::OutsideProject))
+            .map(|f| f.label.as_str())
+            .collect();
+        for label in ["~/.aws/credentials", "../sibling.md", "docs/notes.md"] {
+            assert!(skipped.contains(&label), "{label} not skipped: {skipped:?}");
+        }
+        assert!(skipped.iter().any(|l| l.ends_with("abs.md")), "{skipped:?}");
+
+        // A symlinked CLAUDE.md that points out of the project is skipped.
+        let linked = tree.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&abs, linked.join("CLAUDE.md")).unwrap();
+        let chain = memory_chain(&linked, None);
+        assert!(chain.iter().all(|f| !f.text.contains("ABS-SECRET")), "{chain:?}");
+        assert!(chain.iter().any(|f| f.label == "CLAUDE.md" && f.skipped == Some(MemorySkip::OutsideProject)));
+        assert!(memory_files(&linked, None).iter().all(|i| i.label != "CLAUDE.md"));
+    }
+
+    #[test]
+    fn a_memory_file_over_4_mib_is_skipped_unread() {
+        let project = TempDir::new().unwrap();
+        let big = std::fs::File::create(project.path().join("CLAUDE.md")).unwrap();
+        big.set_len(MAX_MEMORY_FILE_BYTES + 1).unwrap();
+        assert_eq!(read_memory_file(&project.path().join("CLAUDE.md"), None), Err(MemorySkip::TooLarge));
+        let chain = memory_chain(project.path(), None);
+        let f = chain.iter().find(|f| f.label == "CLAUDE.md").unwrap();
+        assert_eq!(f.skipped, Some(MemorySkip::TooLarge));
+        // Not a regular file: nothing to read, nothing listed.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(read_memory_file(&dir.path().join("CLAUDE.md"), None), Ok(None));
+    }
+
+    /// Direct's API stages read the root's convention files the same way.
+    #[test]
+    fn direct_stages_skip_a_convention_file_that_points_out_of_the_workspace() {
+        use crate::orchestrator::runner::repo_conventions_section;
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("secret.md"), "OUTSIDE-SECRET");
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), ws.path().join("CLAUDE.md")).unwrap();
+        write(&ws.path().join("AGENTS.md"), "Use tabs.");
+        let s = repo_conventions_section(ws.path());
+        assert!(!s.contains("OUTSIDE-SECRET"), "{s}");
+        assert!(s.contains("from AGENTS.md") && s.contains("Use tabs."), "{s}");
     }
 
     #[test]
@@ -29481,7 +29566,7 @@ mod talk_mcp_scope_tests {
 #[cfg(test)]
 mod project_instructions_tests {
     use crate::chat_engine::director_system_prompt;
-    use crate::project_instructions::{load, INSTRUCTIONS_CAP_CHARS};
+    use crate::project_instructions::{load, INSTRUCTIONS_CAP_BYTES};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -29496,7 +29581,7 @@ mod project_instructions_tests {
     }
 
     #[test]
-    fn talk_reads_claude_code_s_chain_in_its_order_with_imports() {
+    fn talk_reads_the_user_s_file_then_the_project_s_chain_with_imports() {
         let home = TempDir::new().unwrap();
         let tree = TempDir::new().unwrap();
         let ws = tree.path().join("work").join("repo");
@@ -29509,15 +29594,40 @@ mod project_instructions_tests {
         write(&ws.join("AGENTS.md"), "agents rules");
 
         let got = load(&ws, Some(home.path()));
-        let at = positions(&got.section, &["user rules", "parent rules", "project rules", "style rules", "local rules"]);
-        assert!(at.windows(2).all(|w| w[0] < w[1]), "user, then top down, imports after their file: {}", got.section);
+        let at = positions(&got.section, &["user rules", "project rules", "style rules", "local rules"]);
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "user, then the project, imports after their file: {}", got.section);
         assert!(!got.section.contains("agents rules"), "{}", got.section);
         assert!(got.section.contains("Contents of CLAUDE.md:\n\nproject rules"), "{}", got.section);
-        let labels: Vec<&str> = got.files.iter().map(|f| f.label.as_str()).collect();
-        for l in ["~/.claude/CLAUDE.md", "CLAUDE.md", "docs/style.md", "CLAUDE.local.md"] {
-            assert!(labels.contains(&l), "{l} in {labels:?}");
-        }
-        assert!(got.files.iter().all(|f| !f.trimmed && f.tokens > 0), "{:?}", got.files);
+        // The ancestor's file is outside the project: listed as skipped, never sent.
+        assert!(!got.section.contains("parent rules"), "{}", got.section);
+        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
+        let skipped = got.files.iter().find(|f| f.path == parent).expect("the ancestor's file is listed");
+        assert_eq!((skipped.skipped.as_deref(), skipped.tokens), (Some("outside the project"), 0));
+        let sent: Vec<&str> = got.files.iter().filter(|f| f.skipped.is_none()).map(|f| f.label.as_str()).collect();
+        assert_eq!(sent, ["~/.claude/CLAUDE.md", "CLAUDE.md", "docs/style.md", "CLAUDE.local.md"]);
+        assert!(got.files.iter().filter(|f| f.skipped.is_none()).all(|f| !f.trimmed && f.tokens > 0), "{:?}", got.files);
+    }
+
+    #[test]
+    fn a_secret_outside_the_project_never_reaches_the_prompt() {
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(&home.path().join(".aws/credentials"), "HOME-SECRET");
+        write(&outside.path().join("x.md"), "ABS-SECRET");
+        write(&ws.path().join("CLAUDE.md"), &format!("Rules. @~/.aws/credentials @{}", outside.path().join("x.md").display()));
+        let got = load(ws.path(), Some(home.path()));
+        assert!(!got.section.contains("HOME-SECRET") && !got.section.contains("ABS-SECRET"), "{}", got.section);
+        assert!(got.section.contains("Rules."), "{}", got.section);
+        let creds = got.files.iter().find(|f| f.label == "~/.aws/credentials").unwrap();
+        assert_eq!(creds.skipped.as_deref(), Some("outside the project"));
+        // A symlinked AGENTS.md standing in for CLAUDE.md is skipped too.
+        let bare = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("x.md"), bare.path().join("AGENTS.md")).unwrap();
+        let got = load(bare.path(), None);
+        assert_eq!(got.section, "");
+        let agents = got.files.iter().find(|f| f.label == "AGENTS.md").expect("listed");
+        assert_eq!((agents.skipped.as_deref(), agents.tokens), (Some("outside the project"), 0));
     }
 
     #[test]
@@ -29541,13 +29651,12 @@ mod project_instructions_tests {
     }
 
     #[test]
-    fn a_worktree_under_its_checkout_sends_an_unchanged_claude_md_once() {
-        let tree = TempDir::new().unwrap();
-        let checkout = tree.path().join("repo");
-        let wt = checkout.join(".octopus-worktrees").join("feature");
-        write(&checkout.join("CLAUDE.md"), "Use tabs.\n");
-        write(&wt.join("CLAUDE.md"), "Use tabs.\n");
-        let got = load(&wt, None);
+    fn the_same_text_in_two_files_is_sent_once() {
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        write(&home.path().join(".claude/CLAUDE.md"), "Use tabs.\n");
+        write(&ws.path().join("CLAUDE.md"), "Use tabs.\n");
+        let got = load(ws.path(), Some(home.path()));
         assert_eq!(got.section.matches("Use tabs.").count(), 1, "{}", got.section);
     }
 
@@ -29558,34 +29667,57 @@ mod project_instructions_tests {
         write(&ws.path().join("CLAUDE.md"), "  \n");
         std::fs::create_dir_all(ws.path().join("CLAUDE.local.md")).unwrap();
         let got = load(ws.path(), None);
-        assert!(got.files.is_empty(), "{:?}", got.files);
+        assert!(got.files.iter().all(|f| f.skipped.is_some()), "{:?}", got.files);
         assert_eq!(got.section, "");
         // A workspace that isn't there.
         let gone = load(&ws.path().join("missing"), None);
-        assert!(gone.files.is_empty() && gone.section.is_empty());
+        assert!(gone.files.iter().all(|f| f.skipped.is_some()) && gone.section.is_empty());
         // The director's prompt is then exactly its base.
         assert_eq!(director_system_prompt(Some("Base.".into()), "/repo", &got.section, None), "Base.");
     }
 
     #[test]
-    fn each_file_and_the_whole_section_are_capped() {
+    fn the_workspace_s_own_claude_md_is_budgeted_first() {
         let home = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
         let big = |c: char| c.to_string().repeat(30_000);
         write(&home.path().join(".claude/CLAUDE.md"), &big('a'));
-        write(&ws.path().join("CLAUDE.md"), &big('b'));
-        write(&ws.path().join(".claude/CLAUDE.md"), &big('c'));
-        write(&ws.path().join("CLAUDE.local.md"), &big('d'));
+        write(&ws.path().join("CLAUDE.md"), &format!("own rules @x.md @y.md\n{}", big('b')));
+        write(&ws.path().join("x.md"), &big('c'));
+        write(&ws.path().join("y.md"), &big('d'));
         let got = load(ws.path(), Some(home.path()));
-        assert!(got.section.len() < INSTRUCTIONS_CAP_CHARS + 2_000, "{} chars", got.section.len());
+        assert!(got.section.len() < INSTRUCTIONS_CAP_BYTES + 2_000, "{} bytes", got.section.len());
         assert!(got.section.contains("section truncated for length"));
-        let labels: Vec<&str> = got.files.iter().map(|f| f.label.as_str()).collect();
-        assert_eq!(labels, ["~/.claude/CLAUDE.md", "CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"]);
-        assert!(got.files.iter().all(|f| f.trimmed), "{:?}", got.files);
-        // The fourth no longer fits: named, not sent.
-        assert_eq!(got.files[3].tokens, 0);
+        // (A skipped file of another ancestor on this machine isn't the test's.)
+        let files: Vec<_> = got.files.iter().filter(|f| f.skipped.is_none()).collect();
+        let labels: Vec<&str> = files.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["~/.claude/CLAUDE.md", "CLAUDE.md", "x.md", "y.md"]);
+        // The workspace's CLAUDE.md got its full share, though it loads after the user's file…
+        assert!(got.section.contains("own rules"));
+        assert!(files[1].tokens >= 4_000 && files[1].trimmed, "{:?}", files[1]);
+        // …and the last file no longer fits: named, not sent.
+        assert_eq!(files[3].tokens, 0);
         assert!(!got.section.contains('d'.to_string().repeat(100).as_str()));
-        assert!(got.section.ends_with("(Left out for length: CLAUDE.local.md.)"), "{}", &got.section[got.section.len() - 200..]);
+        assert!(got.section.ends_with("(Left out for length: y.md.)"), "{}", &got.section[got.section.len() - 200..]);
+    }
+
+    #[test]
+    fn a_small_file_that_fits_is_never_left_out() {
+        let ws = TempDir::new().unwrap();
+        let big = |c: char, n: usize| c.to_string().repeat(n);
+        // 16k + 16k leaves under 8k: a 7.5k file still fits whole, and then a
+        // 200-byte one fits in what is left, under 1,000 bytes.
+        write(&ws.path().join("CLAUDE.md"), &format!("@a.md @b.md @c.md @d.md\n{}", big('w', 30_000)));
+        write(&ws.path().join("a.md"), &big('a', 30_000));
+        write(&ws.path().join("b.md"), &big('b', 7_500));
+        write(&ws.path().join("c.md"), &big('c', 200));
+        write(&ws.path().join("d.md"), &big('d', 30_000));
+        let got = load(ws.path(), None);
+        let by = |l: &str| got.files.iter().find(|f| f.label == l).unwrap().clone();
+        assert!(!by("b.md").trimmed && by("b.md").tokens == 7_500 / 4, "{:?}", by("b.md"));
+        assert!(!by("c.md").trimmed && by("c.md").tokens == 50, "{:?}", by("c.md"));
+        assert!(got.section.contains(&big('c', 200)));
+        assert_eq!(by("d.md").tokens, 0, "{:?}", by("d.md"));
     }
 
     #[test]
