@@ -152,13 +152,16 @@ pub fn parse_agent_call(input: &serde_json::Value) -> Result<AgentCall, String> 
 
 /// The system prompt a sub-agent runs under: the same workspace/tool
 /// guidance as TALK, minus the human — it must decide alone and hand back a
-/// report the parent can act on without reading its journal. A matched
-/// `.claude/agents` definition appends its body as the agent's own
-/// instructions (the same way an active skill rides on the Talk prompt).
+/// report the parent can act on without reading its journal. The project's
+/// instructions (`instructions`, the `project_instructions` section the
+/// director carries too) follow it, and a matched `.claude/agents`
+/// definition appends its body last as the agent's own instructions (the
+/// same way an active skill rides on the Talk prompt).
 pub fn subagent_system_prompt(
     workspace_path: &str,
     call: &AgentCall,
     definition: Option<&AgentDefinition>,
+    instructions: &str,
 ) -> String {
     let role = definition
         .map(|d| d.name.as_str())
@@ -180,6 +183,7 @@ pub fn subagent_system_prompt(
          then anything left undone.",
         description = call.description,
     );
+    prompt.push_str(instructions);
     if let Some(d) = definition {
         if !d.body.is_empty() {
             prompt.push_str(&format!("\n\n# Agent: {}\n{}", d.name, d.body));
@@ -918,7 +922,8 @@ pub async fn run_subagent_core(
 ) -> AppResult<AgentOutcome> {
     let started = std::time::Instant::now();
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
-    let system = subagent_system_prompt(&spec.workspace_path, &spec.call, spec.definition.as_ref());
+    let instructions = crate::project_instructions::for_workspace(Path::new(&spec.workspace_path));
+    let system = subagent_system_prompt(&spec.workspace_path, &spec.call, spec.definition.as_ref(), &instructions.section);
     let allowed_tools = spec.definition.as_ref().and_then(|d| d.tools.as_deref());
     let effort = spec.plan.as_ref().and_then(|p| p.effort);
     let out = run_agentic_loop(
@@ -1436,7 +1441,7 @@ mod tests {
             subagent_type: Some("security-reviewer".into()),
             model: None,
         };
-        let p = subagent_system_prompt("/w", &call, None);
+        let p = subagent_system_prompt("/w", &call, None, "");
         assert!(p.contains("/w"));
         assert!(p.contains("Check security"));
         assert!(p.contains("Your role: security-reviewer."));
@@ -1501,9 +1506,68 @@ mod tests {
     fn a_matched_definition_appends_its_body_and_names_the_role() {
         let call = AgentCall { description: "Audit".into(), prompt: "…".into(), subagent_type: Some("security-reviewer".into()), model: None };
         let d = def("security-reviewer", None, None);
-        let p = subagent_system_prompt("/w", &call, Some(&d));
+        let p = subagent_system_prompt("/w", &call, Some(&d), "");
         assert!(p.contains("Your role: security-reviewer."));
         assert!(p.ends_with("# Agent: security-reviewer\nYou are the security-reviewer."), "{p}");
+    }
+
+    #[test]
+    fn the_project_instructions_sit_between_the_guidance_and_the_definition() {
+        let call = AgentCall { description: "Audit".into(), prompt: "…".into(), subagent_type: Some("security-reviewer".into()), model: None };
+        let d = def("security-reviewer", None, None);
+        let section = "\n\n# Project instructions\n\nContents of CLAUDE.md:\n\nUse tabs.";
+        let p = subagent_system_prompt("/w", &call, Some(&d), section);
+        let (rules, report, agent) = (
+            p.find("Use tabs.").expect("instructions included"),
+            p.find("self-contained report").unwrap(),
+            p.find("# Agent: security-reviewer").unwrap(),
+        );
+        assert!(report < rules && rules < agent, "guidance, then the project's rules, then the role: {p}");
+    }
+
+    /// Records the system prompt of the one request it answers.
+    struct SystemRecorder {
+        system: Mutex<String>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for SystemRecorder {
+        async fn complete(&self, _b: &str, _k: Option<&str>, req: &LlmRequest, _c: &reqwest::Client) -> AppResult<LlmResponse> {
+            *self.system.lock() = req.system.clone();
+            Ok(resp("done", vec![], LlmStopReason::EndTurn))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subagent_runs_under_the_workspace_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "Run `npm test` before you report.\n").unwrap();
+        let provider = SystemRecorder { system: Mutex::new(String::new()) };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Check".into(), prompt: "check".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(3), max_tokens: 1, sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, None, None).await.unwrap();
+        assert!(out.ok);
+        let system = provider.system.lock().clone();
+        assert!(system.contains("# Project instructions"), "{system}");
+        assert!(system.contains("Contents of CLAUDE.md:\n\nRun `npm test` before you report."), "{system}");
+
+        // No instruction file in the workspace: the sub-agent still runs.
+        let bare = tempfile::tempdir().unwrap();
+        let spec = SubagentSpec { workspace_path: bare.path().to_string_lossy().into_owned(), ..spec };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, None, None).await.unwrap();
+        assert!(out.ok);
+        assert!(!provider.system.lock().contains("Contents of CLAUDE.md"));
     }
 
     #[test]

@@ -395,6 +395,19 @@ export interface McpServerStatus {
   reason: string | null;
 }
 
+/** One instruction file Talk and its sub-agents follow
+ *  (`list_project_instructions`): a file of the workspace's CLAUDE.md chain,
+ *  or its AGENTS.md when it has no CLAUDE.md. `label` is the path as the user
+ *  knows it (`CLAUDE.md`, `~/.claude/CLAUDE.md`); `tokens` estimates what the
+ *  file adds to each request; `trimmed` means it wasn't sent whole (with 0
+ *  tokens: left out, the section was full). */
+export interface InstructionFile {
+  label: string;
+  path: string;
+  tokens: number;
+  trimmed: boolean;
+}
+
 /** A configured MCP server (stdio): the command to spawn + its args/env. */
 export interface McpServerConfig {
   command: string;

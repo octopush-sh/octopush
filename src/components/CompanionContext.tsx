@@ -9,6 +9,7 @@ import { formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
 import { ContextMeter, contextTone } from "./ContextMeter";
 import { CompanionMcpScope } from "./CompanionMcpScope";
+import { CompanionInstructions } from "./CompanionInstructions";
 
 interface Props {
   tokensUsed: number;
@@ -19,7 +20,8 @@ interface Props {
   workspaceId?: string;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
-  /** The workspace's worktree: whose MCP servers the "can use" row lists. */
+  /** The workspace's worktree: whose instruction files the "follows" row and
+   *  whose MCP servers the "can use" row list. */
   worktreePath?: string;
   /** Jump to Review mode (e.g. clicking the unstaged-changes row). */
   onReviewClick?: () => void;
@@ -66,8 +68,8 @@ export function costLines(cost: ThreadCost | null): Array<{ key: string; label: 
  * The Conversation section — everything about the thread on screen in one
  * place: how full its context is, what it has cost (from the ledger, so the
  * figure matches Settings › Usage: director rounds and sub-agent runs,
- * cache-aware), the mission's logbook line, what it can use (skill, MCP
- * servers) and the budgets it counts against. One eyebrow, quiet labels,
+ * cache-aware), the mission's logbook line, the instruction files it
+ * follows, the MCP servers it can use and the budgets it counts against. One eyebrow, quiet labels,
  * no boxes inside boxes.
  */
 export function CompanionContext({
@@ -168,10 +170,11 @@ export function CompanionContext({
           )}
         </div>
 
-        {/* Capabilities — the MCP servers this conversation can use, each a
-            toggle for this conversation only. Skills are per message now
-            (`/name` in the text), not a conversation setting, so none is
-            listed here. */}
+        {/* Capabilities — the instruction files this conversation follows,
+            then the MCP servers it can use, each a toggle for this
+            conversation only. Skills are per message now (`/name` in the
+            text), not a conversation setting, so none is listed here. */}
+        <CompanionInstructions worktreePath={worktreePath} workspaceId={workspaceId} />
         <CompanionMcpScope worktreePath={worktreePath} workspaceId={workspaceId} />
 
         {/* Budgets — only when one exists (an empty block earns no space). */}

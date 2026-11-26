@@ -70,6 +70,25 @@ fn default_talk_system_prompt(workspace_path: &str) -> String {
     )
 }
 
+/// The director's system prompt before any per-turn addition: the request's
+/// own prompt (or Talk's), then the project's instructions
+/// (`project_instructions`), then the Auto doctrine. None of the three
+/// changes from one turn to the next, so the cached system block holds; an
+/// invoked skill is appended after them, for its turn only.
+pub(crate) fn director_system_prompt(
+    system: Option<String>,
+    workspace_path: &str,
+    instructions: &str,
+    doctrine: Option<&str>,
+) -> String {
+    let mut prompt = system.unwrap_or_else(|| default_talk_system_prompt(workspace_path));
+    prompt.push_str(instructions);
+    if let Some(doctrine) = doctrine {
+        prompt.push_str(doctrine);
+    }
+    prompt
+}
+
 fn recall_tool_definition() -> LlmTool {
     LlmTool {
         name: RECALL_TOOL_NAME.to_string(),
@@ -2782,13 +2801,16 @@ impl ChatEngine {
             }
         }
 
-        let mut system_prompt = request
-            .system
-            .unwrap_or_else(|| default_talk_system_prompt(&request.workspace_path));
-
-        if let Some(doctrine) = &doctrine {
-            system_prompt.push_str(doctrine);
-        }
+        // The project's CLAUDE.md chain (or AGENTS.md), re-read every turn so
+        // an edit applies at once; unchanged files give the same text, so the
+        // cached system block holds.
+        let instructions = crate::project_instructions::for_workspace(&workspace_path);
+        let mut system_prompt = director_system_prompt(
+            request.system,
+            &request.workspace_path,
+            &instructions.section,
+            doctrine.as_deref(),
+        );
 
         let mut tools = build_llm_tools();
 

@@ -29477,3 +29477,140 @@ mod talk_mcp_scope_tests {
         assert!(reg.status(wt.path()).iter().all(|s| s.state == McpServerState::Failed));
     }
 }
+
+#[cfg(test)]
+mod project_instructions_tests {
+    use crate::chat_engine::director_system_prompt;
+    use crate::project_instructions::{load, INSTRUCTIONS_CAP_CHARS};
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Where each text first appears in `section`, failing on a missing one.
+    fn positions(section: &str, texts: &[&str]) -> Vec<usize> {
+        texts.iter().map(|t| section.find(t).unwrap_or_else(|| panic!("{t:?} missing from: {section}"))).collect()
+    }
+
+    #[test]
+    fn talk_reads_claude_code_s_chain_in_its_order_with_imports() {
+        let home = TempDir::new().unwrap();
+        let tree = TempDir::new().unwrap();
+        let ws = tree.path().join("work").join("repo");
+        write(&home.path().join(".claude/CLAUDE.md"), "user rules");
+        write(&tree.path().join("work/CLAUDE.md"), "parent rules");
+        write(&ws.join("CLAUDE.md"), "project rules, see @docs/style.md");
+        write(&ws.join("docs/style.md"), "style rules");
+        write(&ws.join("CLAUDE.local.md"), "local rules");
+        // The workspace has a CLAUDE.md, so its AGENTS.md isn't read.
+        write(&ws.join("AGENTS.md"), "agents rules");
+
+        let got = load(&ws, Some(home.path()));
+        let at = positions(&got.section, &["user rules", "parent rules", "project rules", "style rules", "local rules"]);
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "user, then top down, imports after their file: {}", got.section);
+        assert!(!got.section.contains("agents rules"), "{}", got.section);
+        assert!(got.section.contains("Contents of CLAUDE.md:\n\nproject rules"), "{}", got.section);
+        let labels: Vec<&str> = got.files.iter().map(|f| f.label.as_str()).collect();
+        for l in ["~/.claude/CLAUDE.md", "CLAUDE.md", "docs/style.md", "CLAUDE.local.md"] {
+            assert!(labels.contains(&l), "{l} in {labels:?}");
+        }
+        assert!(got.files.iter().all(|f| !f.trimmed && f.tokens > 0), "{:?}", got.files);
+    }
+
+    #[test]
+    fn agents_md_stands_in_when_the_workspace_has_no_claude_md() {
+        let ws = TempDir::new().unwrap();
+        write(&ws.path().join("AGENTS.md"), "agents rules");
+        // A mirror of AGENTS.md is sent once.
+        write(&ws.path().join("CONVENTIONS.md"), "agents rules\n");
+        let got = load(ws.path(), None);
+        assert_eq!(got.section.matches("agents rules").count(), 1, "{}", got.section);
+        assert!(got.section.contains("Contents of AGENTS.md:"), "{}", got.section);
+        assert!(got.files.iter().any(|f| f.label == "AGENTS.md"));
+        assert!(!got.files.iter().any(|f| f.label == "CONVENTIONS.md"), "a duplicate isn't listed: {:?}", got.files);
+
+        // A CLAUDE.md that imports AGENTS.md reads it once, through the chain.
+        write(&ws.path().join("CLAUDE.md"), "@AGENTS.md");
+        let got = load(ws.path(), None);
+        assert_eq!(got.section.matches("agents rules").count(), 1, "{}", got.section);
+        let at = positions(&got.section, &["Contents of CLAUDE.md:", "Contents of AGENTS.md:"]);
+        assert!(at[0] < at[1]);
+    }
+
+    #[test]
+    fn a_worktree_under_its_checkout_sends_an_unchanged_claude_md_once() {
+        let tree = TempDir::new().unwrap();
+        let checkout = tree.path().join("repo");
+        let wt = checkout.join(".octopus-worktrees").join("feature");
+        write(&checkout.join("CLAUDE.md"), "Use tabs.\n");
+        write(&wt.join("CLAUDE.md"), "Use tabs.\n");
+        let got = load(&wt, None);
+        assert_eq!(got.section.matches("Use tabs.").count(), 1, "{}", got.section);
+    }
+
+    #[test]
+    fn no_instruction_file_is_fine() {
+        let ws = TempDir::new().unwrap();
+        // An empty CLAUDE.md, and a directory where a file could be.
+        write(&ws.path().join("CLAUDE.md"), "  \n");
+        std::fs::create_dir_all(ws.path().join("CLAUDE.local.md")).unwrap();
+        let got = load(ws.path(), None);
+        assert!(got.files.is_empty(), "{:?}", got.files);
+        assert_eq!(got.section, "");
+        // A workspace that isn't there.
+        let gone = load(&ws.path().join("missing"), None);
+        assert!(gone.files.is_empty() && gone.section.is_empty());
+        // The director's prompt is then exactly its base.
+        assert_eq!(director_system_prompt(Some("Base.".into()), "/repo", &got.section, None), "Base.");
+    }
+
+    #[test]
+    fn each_file_and_the_whole_section_are_capped() {
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let big = |c: char| c.to_string().repeat(30_000);
+        write(&home.path().join(".claude/CLAUDE.md"), &big('a'));
+        write(&ws.path().join("CLAUDE.md"), &big('b'));
+        write(&ws.path().join(".claude/CLAUDE.md"), &big('c'));
+        write(&ws.path().join("CLAUDE.local.md"), &big('d'));
+        let got = load(ws.path(), Some(home.path()));
+        assert!(got.section.len() < INSTRUCTIONS_CAP_CHARS + 2_000, "{} chars", got.section.len());
+        assert!(got.section.contains("section truncated for length"));
+        let labels: Vec<&str> = got.files.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, ["~/.claude/CLAUDE.md", "CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"]);
+        assert!(got.files.iter().all(|f| f.trimmed), "{:?}", got.files);
+        // The fourth no longer fits: named, not sent.
+        assert_eq!(got.files[3].tokens, 0);
+        assert!(!got.section.contains('d'.to_string().repeat(100).as_str()));
+        assert!(got.section.ends_with("(Left out for length: CLAUDE.local.md.)"), "{}", &got.section[got.section.len() - 200..]);
+    }
+
+    #[test]
+    fn the_section_is_the_same_text_on_every_turn() {
+        let home = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        write(&home.path().join(".claude/CLAUDE.md"), "user rules");
+        write(&ws.path().join("CLAUDE.md"), "project rules");
+        let first = load(ws.path(), Some(home.path()));
+        assert_eq!(first, load(ws.path(), Some(home.path())));
+        // An edit applies on the next turn.
+        write(&ws.path().join("CLAUDE.md"), "new project rules");
+        assert!(load(ws.path(), Some(home.path())).section.contains("new project rules"));
+    }
+
+    #[test]
+    fn the_director_prompt_carries_the_instructions_before_the_doctrine() {
+        let ws = TempDir::new().unwrap();
+        write(&ws.path().join("CLAUDE.md"), "Never write italics.");
+        let got = load(ws.path(), None);
+        let p = director_system_prompt(None, "/repo", &got.section, Some("\n\nAUTO DOCTRINE"));
+        let at = positions(&p, &["helpful coding assistant", "# Project instructions", "Never write italics.", "AUTO DOCTRINE"]);
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{p}");
+        // A request's own prompt is followed by them too.
+        let own = director_system_prompt(Some("Custom.".into()), "/repo", &got.section, None);
+        assert!(own.starts_with("Custom.") && own.contains("Never write italics."), "{own}");
+    }
+}
