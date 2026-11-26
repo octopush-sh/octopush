@@ -1378,6 +1378,30 @@ mod workspace_tests {
     }
 
     #[test]
+    fn sent_context_is_kept_on_its_row_scoped_and_forked() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        let old = db.insert_chat_message("ws", &t.id, "user", "plain", None, None, None, None).unwrap();
+        let ask = db.insert_chat_message("ws", &t.id, "user", "fix @a.ts\n\na.ts\n```\nx\n```", None, None, None, None).unwrap();
+        let ctx = r#"[{"token":"a.ts","kind":"file","label":"a.ts","tokens":4,"start":9,"end":25}]"#;
+        db.set_chat_message_context(ask, ctx).unwrap();
+        let rows = db.list_chat_messages(&t.id).unwrap();
+        assert_eq!(rows[0].context_blocks, None, "a row without context stays as it was");
+        assert_eq!(rows[1].context_blocks.as_deref(), Some(ctx));
+        // Recall reaches it only from its own thread, and only on a row with context.
+        assert!(db.get_chat_sent_context(&t.id, ask).unwrap().is_some());
+        assert!(db.get_chat_sent_context(&t.id, old).unwrap().is_none());
+        let other = db.create_chat_thread("ws", "U").unwrap();
+        assert!(db.get_chat_sent_context(&other.id, ask).unwrap().is_none());
+        // A fork keeps the record on the rows it copies.
+        let next = db.insert_chat_message("ws", &t.id, "user", "next", None, None, None, None).unwrap();
+        let (fork, _, _) = db.fork_chat_thread(&t.id, next).unwrap();
+        assert_eq!(db.list_chat_messages(&fork.id).unwrap()[1].context_blocks.as_deref(), Some(ctx));
+    }
+
+    #[test]
     fn shell_history_recall_dedups_and_orders_by_recency() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();

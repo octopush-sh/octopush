@@ -6,13 +6,14 @@ const fileMeta = vi.fn();
 const getGitDiff = vi.fn();
 const getStagedDiff = vi.fn();
 const secretScanText = vi.fn();
+const listWorkspaceFiles = vi.fn();
 vi.mock("./ipc", () => ({
-  ipc: { readFileChecked, readFileLines, fileMeta, getGitDiff, getStagedDiff, secretScanText },
+  ipc: { readFileChecked, readFileLines, fileMeta, getGitDiff, getStagedDiff, secretScanText, listWorkspaceFiles },
 }));
 
-const { joinBlocks, resolveContextBlock, resolveContextBlocks, scanContextBlocks } = await import(
-  "./talkContextResolve"
-);
+const { expandDraft, joinBlocks, resolveContextBlock, resolveContextBlocks, scanContextBlocks, withContext } =
+  await import("./talkContextResolve");
+const { blockBody, parseSentContext, typedText } = await import("./sentContext");
 const { registerTerminalBuffer } = await import("./terminalBuffers");
 const { dirsOf, extractContextRefs, sessionRefs } = await import("./talkContext");
 
@@ -262,5 +263,30 @@ describe("scanContextBlocks", () => {
     // …so it is held, and the finding names the file.
     expect(verdict?.flagged).toEqual(new Set([0]));
     expect(verdict?.refusal.findings).toEqual([expect.objectContaining({ file: "deploy.sh", line: 4 })]);
+  });
+
+  it("records where each block sits, so the row reads back as typed (#1150)", async () => {
+    const blocks = await resolveContextBlocks(extractContextRefs("@src/a.ts @diff", cat), "/w", files);
+    // Offsets are UTF-16 units: an emoji counts two.
+    const typed = "¿qué pasa? 😀 @src/a.ts @diff";
+    const { content, context } = withContext(typed, blocks, new Set([1]));
+    expect(content).toBe(typed + joinBlocks(blocks, new Set([1])));
+    const sent = parseSentContext(JSON.stringify(context), content)!;
+    expect(typedText(content, sent)).toBe(typed);
+    expect(blockBody(content, sent[0])).toBe("src/a.ts\n```\nk\n```");
+    expect(sent[0]).toMatchObject({ token: "src/a.ts", kind: "file", label: "a.ts" });
+    expect(sent[1]).toMatchObject({ token: "diff", label: "diff", notIncluded: "possible secret" });
+    // A record that doesn't fit its content is no record.
+    expect(parseSentContext(JSON.stringify([{ ...context[0], end: 9_999 }]), content)).toBeNull();
+    expect(parseSentContext("not json", content)).toBeNull();
+  });
+
+  it("resolves a resent draft fresh, leaving a flagged block out (#1150)", async () => {
+    listWorkspaceFiles.mockResolvedValue(files);
+    secretScanText.mockResolvedValue({ findings: [finding("src/a.ts")], total: 1, partial: false });
+    const sent = await expandDraft("look @src/a.ts", "/w", []);
+    expect(sent.content).toBe("look @src/a.ts\n\nsrc/a.ts _(not included: possible secret)_");
+    expect(sent.context).toEqual([expect.objectContaining({ notIncluded: "possible secret" })]);
+    expect(await expandDraft("no tokens here", "/w", [])).toEqual({ content: "no tokens here", context: [] });
   });
 });

@@ -12,9 +12,9 @@ interface Props {
   over?: number;
 }
 
-const ICON = { file: FileText, folder: Folder, session: SquareTerminal, diff: GitCompare } as const;
+export const ICON = { file: FileText, folder: Folder, session: SquareTerminal, diff: GitCompare } as const;
 
-const WHAT = {
+export const WHAT = {
   file: "File",
   folder: "Folder listing",
   session: "Run session output",
