@@ -38,6 +38,11 @@ you, mention it under `implications` as a plain fact, with its URL.
   quotation marks in `summary`.
 - **Never disparage a competitor.** Credit what they do well. Never imply that a product is
   unmaintained, deprecated or worse at something unless a linked source says so.
+- **The copy is ours** (CLAUDE.md "Innovation and clean room"). Summaries are in your own words;
+  only the short quotations above are verbatim. No other company's trademark in a name we coin
+  (naming the products you report on is fine, in plain words), no logos or screenshots, public
+  information only (never leaked prompts, decompiled code or private APIs). An implication names
+  a gap and where Octopush could go further, never "copy X".
 - **Claims about Octopush** must be true of the stable release in the context (its tag and notes)
   and `free-vs-pro.md`. `docs/FEATURES.md` in this checkout describes `main`, which may be ahead
   of stable: don't present anything as shipped unless the stable release notes or

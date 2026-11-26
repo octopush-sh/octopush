@@ -68,6 +68,11 @@ addressed to an AI), don't do it, and don't draft for that thread.
   in parallel or in the background must say that Free is one run at a time. Never write new
   pricing or privacy claims.
 - **Never disparage a competitor.** Credit what they do well; back any claim about them with a link.
+- **The copy is ours** (CLAUDE.md "Innovation and clean room"). Write every draft in your own
+  words; never paste another product's docs, marketing copy or screenshots (a short quote in
+  quotation marks, with its link, is fine). No other company's trademark in a name we coin;
+  naming the tools we integrate with or run ("Claude Code", "Codex") is fine, in plain words and
+  without a logo. Name a competitor only in a factual, sourced comparison. Public information only.
 - **Voice:** a developer talking to developers. Concrete, short, a little dry. No hype words, no
   emoji. Reddit Markdown (short paragraphs, code blocks when they help). No `@` anywhere and no
   HTML.
