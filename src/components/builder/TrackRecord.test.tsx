@@ -49,4 +49,28 @@ describe("TrackRecord", () => {
     fireEvent.click(screen.getByRole("button", { name: "Try Haiku 5.5 on Implement" }));
     expect(onPatch).toHaveBeenCalledWith({ agentModel: "claude-haiku-5-5", escalateModel: "claude-sonnet-5-5" });
   });
+
+  it("starts collapsed with no suggestions and opens on its toggle", () => {
+    render(<TrackRecord record={record()} onPatch={vi.fn()} />);
+    const toggle = screen.getByRole("button", { name: "Track record" });
+    const region = screen.getByText(/^20 runs · first pass/).closest("[aria-hidden]");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(region).toHaveAttribute("aria-hidden", "true");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(region).toHaveAttribute("aria-hidden", "false");
+  });
+
+  it("a loop hotspot reads its detail and offers no edit", () => {
+    const hotspot: CrewSuggestion = {
+      kind: "loopHotspot", position: 1, role: "implement", runs: 20, count: 20, model: null, modelLabel: null,
+      escalateModel: null, escalateLabel: null, savingUsd: null, senderPosition: 2, meanLoops: 1.8,
+    };
+    const onPatch = vi.fn();
+    render(<TrackRecord record={record({ suggestions: [hotspot], senderName: (p) => (p === 2 ? "Code review" : "") })} onPatch={onPatch} />);
+    expect(screen.getByRole("button", { name: "Track record" })).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/^Code review sent Implement back 1\.8× per run\./)).toBeInTheDocument();
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+    expect(onPatch).not.toHaveBeenCalled();
+  });
 });

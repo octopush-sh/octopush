@@ -89,8 +89,64 @@ describe("CrewSuggestionLine", () => {
     const onOpenBuilder = vi.fn();
     render(<CrewSuggestionLine pipeline={crew()} onApplied={vi.fn()} onOpenBuilder={onOpenBuilder} />);
     fireEvent.click(await screen.findByText("1 suggestion · Code review sends Implement back 1.8× per run"));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Open Implement in the builder" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open this crew in the builder" }));
     expect(onOpenBuilder).toHaveBeenCalledWith("p");
+    expect(ipcMock.savePipeline).not.toHaveBeenCalled();
+  });
+
+  it("an unpriced start-strong holds for either kind of escalation", async () => {
+    ipcMock.getCrewReport.mockResolvedValue(report([suggestion({ savingUsd: null })]));
+    render(<CrewSuggestionLine pipeline={crew()} onApplied={vi.fn()} onOpenBuilder={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("launcher-crew-suggestion"));
+    expect(screen.getByText("Escalated in 7 of 10 runs, each paying for the earlier attempts and then for Opus 5.5.")).toBeInTheDocument();
+    expect(screen.queryByText(/\$/)).not.toBeInTheDocument();
+  });
+
+  it("renders nothing when the report can't be read", async () => {
+    ipcMock.getCrewReport.mockRejectedValue(new Error("db locked"));
+    render(<CrewSuggestionLine pipeline={crew()} onApplied={vi.fn()} onOpenBuilder={vi.fn()} />);
+    await waitFor(() => expect(ipcMock.getCrewReport).toHaveBeenCalledWith("p"));
+    await Promise.resolve();
+    expect(screen.queryByTestId("launcher-crew-suggestion")).not.toBeInTheDocument();
+  });
+
+  it("a failed save says so and keeps the menu open", async () => {
+    ipcMock.getCrewReport.mockResolvedValue(report([suggestion({})]));
+    ipcMock.savePipeline.mockRejectedValue(new Error("other: disk full"));
+    const { pushToast } = await import("../Toasts");
+    const onApplied = vi.fn();
+    render(<CrewSuggestionLine pipeline={crew()} onApplied={onApplied} onOpenBuilder={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("launcher-crew-suggestion"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Start Plan on Opus 5.5" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Change this crew" }));
+    await waitFor(() => expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "error", body: "disk full" })));
+    expect(onApplied).not.toHaveBeenCalled();
+    expect(screen.getByRole("menu", { name: "Crew suggestions" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "Change this crew" })).not.toBeDisabled());
+  });
+
+  it("\"Not now\" goes back to the offer without saving", async () => {
+    ipcMock.getCrewReport.mockResolvedValue(report([suggestion({})]));
+    render(<CrewSuggestionLine pipeline={crew()} onApplied={vi.fn()} onOpenBuilder={vi.fn()} />);
+    fireEvent.click(await screen.findByTestId("launcher-crew-suggestion"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Start Plan on Opus 5.5" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Not now" }));
+    expect(screen.getByRole("menuitem", { name: "Start Plan on Opus 5.5" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Change this crew" })).not.toBeInTheDocument();
+    expect(ipcMock.savePipeline).not.toHaveBeenCalled();
+  });
+
+  it("Escape closes the menu, forgets the confirm step and saves nothing", async () => {
+    ipcMock.getCrewReport.mockResolvedValue(report([suggestion({})]));
+    render(<CrewSuggestionLine pipeline={crew()} onApplied={vi.fn()} onOpenBuilder={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-crew-suggestion");
+    fireEvent.click(line);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Start Plan on Opus 5.5" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu", { name: "Crew suggestions" })).not.toBeInTheDocument();
+    fireEvent.click(line);
+    expect(screen.getByRole("menuitem", { name: "Start Plan on Opus 5.5" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Change this crew" })).not.toBeInTheDocument();
     expect(ipcMock.savePipeline).not.toHaveBeenCalled();
   });
 });

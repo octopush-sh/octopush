@@ -42,7 +42,7 @@ export function suggestionDetail(s: CrewSuggestion, name: string, sender: string
     case "startStrong":
       return saving != null
         ? `Escalated in ${s.count} of ${s.runs} runs. Starting on ${s.modelLabel} would have cost about ${formatEstimateUsd(saving)} less per run (estimate).`
-        : `Escalated in ${s.count} of ${s.runs} runs, each paying for the failed attempt and then for ${s.modelLabel}.`;
+        : `Escalated in ${s.count} of ${s.runs} runs, each paying for the earlier attempts and then for ${s.modelLabel}.`;
     case "lighterTier":
       return `Passed first time in ${s.count} of ${s.runs} runs. Try ${s.modelLabel} here; ${s.escalateLabel} stays as the escalation.${
         saving != null ? ` About ${formatEstimateUsd(saving)} less per run (estimate).` : ""
@@ -60,7 +60,7 @@ export function suggestionCta(s: CrewSuggestion, name: string): string {
     case "lighterTier":
       return `Try ${s.modelLabel} on ${name}`;
     case "loopHotspot":
-      return `Open ${name} in the builder`;
+      return "Open this crew in the builder";
   }
 }
 
