@@ -161,7 +161,9 @@ pub struct LlmTool {
 
 // ─── Response types ───────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+/// `Default` is an empty answer that ended its turn, for fixtures: a literal
+/// ending in `..Default::default()` keeps compiling when a field is added.
+#[derive(Debug, Default)]
 pub struct LlmResponse {
     pub text: String,
     pub tool_uses: Vec<LlmToolUse>,
@@ -205,8 +207,9 @@ pub struct RateLimitSnapshot {
     pub reset_after_secs: Option<f64>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub enum LlmStopReason {
+    #[default]
     EndTurn,
     ToolUse,
     MaxTokens,

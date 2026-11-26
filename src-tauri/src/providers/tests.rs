@@ -1384,7 +1384,7 @@ mod retry {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
-            usage_unreported: false,
+            ..Default::default()
         }
     }
 
@@ -1527,7 +1527,7 @@ mod cancellable {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
-            usage_unreported: false,
+            ..Default::default()
         }
     }
 
