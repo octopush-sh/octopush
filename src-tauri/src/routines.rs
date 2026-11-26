@@ -66,6 +66,10 @@ pub enum SkipReason {
     /// A fresh worktree's setup script failed — the worktree is discarded and
     /// no run is created.
     SetupFailed(String),
+    /// The crew runs Claude Code and the last Claude plan snapshot says a
+    /// window is `rejected` until `resets_at` (epoch seconds): the fire would
+    /// halt within seconds, so no worktree, setup, run or tokens (#731).
+    PlanLimit { resets_at: i64 },
 }
 
 impl SkipReason {
@@ -78,6 +82,10 @@ impl SkipReason {
             SkipReason::WorkspaceUnavailable => "workspace unavailable".to_string(),
             SkipReason::LaunchRefused(msg) => msg.clone(),
             SkipReason::SetupFailed(msg) => format!("setup failed: {msg}"),
+            SkipReason::PlanLimit { resets_at } => format!(
+                "plan limit · resets {}",
+                crate::orchestrator::plan_wait::clock_label(*resets_at, Utc::now().timestamp())
+            ),
         }
     }
 
@@ -91,6 +99,7 @@ impl SkipReason {
             SkipReason::WorkspaceUnavailable => "workspace_unavailable",
             SkipReason::LaunchRefused(_) => "launch_refused",
             SkipReason::SetupFailed(_) => "setup_failed",
+            SkipReason::PlanLimit { .. } => "plan_limit",
         }
     }
 }
@@ -302,16 +311,46 @@ async fn read_to_string_lossy(mut pipe: impl tokio::io::AsyncRead + Unpin) -> St
 /// with the user's login-shell PATH (`condition_path`) so `gh`, `node`, `npx`
 /// and `claude` resolve — the SAME trust model as a run's `run_command` (their
 /// command, their machine). See `evaluate_condition_with_path`.
+///
+/// With "Quiet Claude Code in crews and Routines" on, the command also gets
+/// [`routine_quiet_env`], so a `claude` it starts is quiet too.
 pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) -> ConditionEval {
     let path = condition_path().await;
-    evaluate_condition_with_path(command, cwd, timeout, &path).await
+    let env = routine_quiet_env(crate::settings::quiet_claude_code());
+    evaluate_condition_with_env(command, cwd, timeout, &path, &env).await
+}
+
+/// The variables a Routine's own shell commands (its fire condition, the
+/// fresh worktree's setup script) get from Settings › Privacy › "Quiet Claude
+/// Code in crews and Routines" (#703): `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+/// when on, so any `claude` they start skips its nonessential traffic as the
+/// Routine's crew stages do (those get it through the stage spawn,
+/// `cli_runner::apply_stage_env`). Off ⇒ nothing — the docs say even `0`
+/// disables the traffic, so no value is ever written. Pure.
+pub fn routine_quiet_env(quiet: bool) -> Vec<(&'static str, String)> {
+    if quiet {
+        vec![(crate::orchestrator::cli_runner::QUIET_TRAFFIC_ENV, "1".to_string())]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Run `command` under `bash -c` with `PATH = path`. exit 0 ⇒ `Met`; exit 1 ⇒
 /// `NotMet`; any other exit, spawn failure or timeout ⇒ `Error` (with the last
 /// stderr lines, so the Routines list shows *why*).
 pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Duration, path: &str) -> ConditionEval {
-    match run_bounded("condition", command, cwd, timeout, path).await {
+    evaluate_condition_with_env(command, cwd, timeout, path, &[]).await
+}
+
+/// See `evaluate_condition_with_path`; `env` adds variables for the command.
+pub async fn evaluate_condition_with_env(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    path: &str,
+    env: &[(&str, String)],
+) -> ConditionEval {
+    match run_bounded("condition", command, cwd, timeout, path, env).await {
         Ok((code, stderr)) => classify_condition_exit(code, &stderr),
         Err(msg) => ConditionEval::Error(msg),
     }
@@ -319,15 +358,31 @@ pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Du
 
 /// Run a project's setup script headless in a Routine's fresh worktree, before
 /// its crew launches: the same `bash -c` + login-shell PATH as a fire
-/// condition. `Err` carries why it failed, for `last_outcome`.
-pub async fn run_setup(script: &str, cwd: &Path, timeout: Duration) -> Result<(), String> {
+/// condition. `env` adds variables for the script only (Conductor's, from
+/// `workspace_setup::conductor_env`), plus [`routine_quiet_env`] when "Quiet
+/// Claude Code in crews and Routines" is on. `Err` carries why it failed, for
+/// `last_outcome`.
+pub async fn run_setup(script: &str, cwd: &Path, timeout: Duration, env: &[(&str, String)]) -> Result<(), String> {
     let path = condition_path().await;
-    run_setup_with_path(script, cwd, timeout, &path).await
+    let mut env = env.to_vec();
+    env.extend(routine_quiet_env(crate::settings::quiet_claude_code()));
+    run_setup_with_env(script, cwd, timeout, &path, &env).await
 }
 
 /// See `run_setup`; `path` is the PATH the script runs with.
 pub async fn run_setup_with_path(script: &str, cwd: &Path, timeout: Duration, path: &str) -> Result<(), String> {
-    let (code, stderr) = run_bounded("setup", script, cwd, timeout, path).await?;
+    run_setup_with_env(script, cwd, timeout, path, &[]).await
+}
+
+/// See `run_setup`; `path` is the PATH, `env` the extra variables.
+pub async fn run_setup_with_env(
+    script: &str,
+    cwd: &Path,
+    timeout: Duration,
+    path: &str,
+    env: &[(&str, String)],
+) -> Result<(), String> {
+    let (code, stderr) = run_bounded("setup", script, cwd, timeout, path, env).await?;
     classify_setup_exit(code, &stderr)
 }
 
@@ -357,12 +412,20 @@ pub fn classify_setup_exit(code: Option<i32>, stderr: &str) -> Result<(), String
 /// on timeout the WHOLE group is killed — a pipeline like `gh … | grep -q .`
 /// leaves no orphaned `gh` reparented past the tick. `kill_on_drop` is the
 /// backstop.
-async fn run_bounded(what: &str, command: &str, cwd: &Path, timeout: Duration, path: &str) -> Result<(Option<i32>, String), String> {
+async fn run_bounded(
+    what: &str,
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    path: &str,
+    env: &[(&str, String)],
+) -> Result<(Option<i32>, String), String> {
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .env("PATH", path)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -807,6 +870,9 @@ impl Orchestrator {
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
+                // Claude plan parks resume for everyone (Free included), so
+                // before the Routines entitlement check.
+                self.plan_resume_tick();
                 self.routine_tick().await;
             }
         });
@@ -905,11 +971,38 @@ impl Orchestrator {
     /// touch the schedule). Returns whether a run was dispatched or the window
     /// skipped (with the reason).
     async fn fire_routine_inner(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
+        // A crew on Claude Code whose plan is at its wall would halt within
+        // seconds: skip before any workspace, setup or condition work.
+        if let Some(resets_at) = self.routine_plan_wall(r)? {
+            return Ok(FireOutcome::Skipped(SkipReason::PlanLimit { resets_at }));
+        }
         if r.workspace_mode == "fresh" {
             self.fire_fresh(r).await
         } else {
             self.fire_fixed(r).await
         }
+    }
+
+    /// When the routine's crew (its own model overrides applied) has a Claude
+    /// Code CLI stage and the stored Claude plan snapshot has a window
+    /// `rejected` (not covered by extra usage) with a future reset: that reset.
+    fn routine_plan_wall(&self, r: &RoutineRow) -> crate::error::AppResult<Option<i64>> {
+        let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
+        let stages = self.db().lock().get_pipeline_stages(&r.pipeline_id)?;
+        let crew: Vec<(String, String)> = stages
+            .iter()
+            .map(|s| {
+                let model = overrides
+                    .iter()
+                    .find(|(p, _)| *p == s.position)
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_else(|| s.agent_model.clone());
+                (s.substrate.clone(), model)
+            })
+            .collect();
+        let snapshots = crate::claude_plan::load(&self.db().lock())?;
+        let now = Utc::now().timestamp();
+        Ok(plan_wall(&crew, &fresh_plan_windows(&snapshots, now), now))
     }
 
     /// Fixed mode: resolve + guard the chosen workspace FIRST (so a deleted
@@ -984,7 +1077,14 @@ impl Orchestrator {
         if !setup_script.trim().is_empty() {
             self.emit_phase(r, PHASE_SETUP);
             let result = match ws.worktree_path.as_deref() {
-                Some(wt) => run_setup(&setup_script, Path::new(wt), SETUP_TIMEOUT).await,
+                Some(wt) => {
+                    // Conductor's variables for every setup script, so scripts written
+                    // for Conductor work unchanged, unless the app's env sets them.
+                    let env = crate::workspace_setup::conductor_env(&project_path, wt, &ws.name, |k| {
+                        std::env::var_os(k).is_some()
+                    });
+                    run_setup(&setup_script, Path::new(wt), SETUP_TIMEOUT, &env).await
+                }
                 None => Err("the fresh workspace has no worktree".into()),
             };
             if let Err(msg) = result {
@@ -1166,9 +1266,65 @@ impl Orchestrator {
     }
 }
 
+/// A Claude plan snapshot older than this no longer skips a Routine: the
+/// wall may have lifted another way (extra usage turned on, a plan upgrade,
+/// an API-key sign-in), and a fire that does meet it parks cheaply and
+/// refreshes the snapshot.
+pub(crate) const PLAN_WALL_MAX_AGE_SECS: i64 = 6 * 3_600;
+
+/// Pure: the stored plan windows seen within [`PLAN_WALL_MAX_AGE_SECS`] of
+/// `now` (a snapshot whose time can't be read is dropped).
+pub(crate) fn fresh_plan_windows(
+    snapshots: &[crate::claude_plan::PlanSnapshot],
+    now: i64,
+) -> Vec<crate::orchestrator::cli_runner::PlanWindow> {
+    snapshots
+        .iter()
+        .filter(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.seen_at)
+                .is_ok_and(|t| now - t.timestamp() <= PLAN_WALL_MAX_AGE_SECS)
+        })
+        .map(|s| s.window.clone())
+        .collect()
+}
+
+/// Pure: the latest future reset among `rejected` plan windows (not covered
+/// by extra usage) that apply to the crew — `(substrate, model)` per stage —
+/// through one of its Claude Code CLI stages. A window for every model
+/// (`five_hour`, `seven_day`) applies to any such stage; a model's own
+/// window (`seven_day_opus`) only to a stage on that model, so a rejected
+/// Opus week doesn't skip a Sonnet crew. `None` otherwise (an API or
+/// Codex-only crew, or no wall), so API-key users and API crews never skip.
+pub(crate) fn plan_wall(
+    crew: &[(String, String)],
+    windows: &[crate::orchestrator::cli_runner::PlanWindow],
+    now: i64,
+) -> Option<i64> {
+    use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+    let claude_models: Vec<String> = crew
+        .iter()
+        .filter(|(sub, model)| sub == "cli" && dialect_for_model(model) == CliDialect::Claude)
+        .map(|(_, model)| model.to_ascii_lowercase())
+        .collect();
+    if claude_models.is_empty() {
+        return None;
+    }
+    let applies = |kind: &str| match kind.strip_prefix("seven_day_") {
+        // `opusplan` plans on Opus: it meets an Opus wall too.
+        Some(family) => claude_models.iter().any(|m| m.contains(family)),
+        None => true,
+    };
+    windows
+        .iter()
+        .filter(|w| w.status.as_deref() == Some("rejected") && !w.using_overage && applies(&w.kind))
+        .filter_map(|w| w.resets_at)
+        .filter(|t| *t > now)
+        .max()
+}
+
 /// Parse the stored `[[position, model], …]` JSON overrides into the shape
 /// `create_run` wants. A malformed blob degrades to no overrides.
-fn parse_stage_overrides(json: Option<&str>) -> Vec<(i64, String)> {
+pub(crate) fn parse_stage_overrides(json: Option<&str>) -> Vec<(i64, String)> {
     let Some(json) = json else { return Vec::new() };
     serde_json::from_str::<Vec<(i64, String)>>(json).unwrap_or_default()
 }

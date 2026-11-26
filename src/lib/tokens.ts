@@ -79,6 +79,19 @@ export const talkSeat = {
   chatFloor: "18rem",
 } as const;
 
+/** Shell spacing (mirrors `--shell-*` in styles.css): `<main>`'s inset from
+ *  the rail and the Companion, the gap between the ContextHeader, the mode
+ *  band and the canvas, and the canvas's bottom padding. */
+export const shell = {
+  gutter: "8px",
+  stack: "8px",
+  foot: "8px",
+} as const;
+
+/** The Settings content column (mirrors `--settings-content` in styles.css):
+ *  the one max width every Settings pane renders in. */
+export const settingsContent = "720px";
+
 export const dur = {
   quick: 220,
   standard: 280,

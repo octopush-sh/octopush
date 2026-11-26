@@ -6,10 +6,19 @@ import { SegmentedControl } from "../controls/SegmentedControl";
 import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
-import { archetypes, archetypeFor, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
+import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
-import { cliTooOldForEffort, effortApplies, loadClaudeCliVersion } from "../../lib/claudeCli";
+import {
+  cliTooOldForEffort,
+  codexClampTitle,
+  codexEffortLevel,
+  codexEffortLevels,
+  effortApplies,
+  loadClaudeCliVersion,
+  runsOnClaudeCode,
+} from "../../lib/claudeCli";
+import { apiEffortOffTitle, EFFORT_OFF_TITLE } from "../../lib/apiEffort";
 import type { ClaudeCliVersion, Effort } from "../../lib/ipc";
 
 const SUBSTRATE_OPTIONS = [
@@ -20,10 +29,11 @@ const MODE_OPTIONS = [
   { value: "gated" as const, label: "Gated" },
   { value: "auto" as const, label: "Auto" },
 ];
-/** Reasoning-effort segments. `off` is the null state (no thinking). Labels are
- *  compact so all six fit the inspector's full-width track. */
+/** Reasoning-effort segments. `off` is the null state (no thinking; on GPT-6
+ *  see `apiEffortOptions`). Labels are compact so all six fit the inspector's
+ *  full-width track. */
 const EFFORT_OPTIONS = [
-  { value: "off" as const, label: "Off", title: "No extra thinking (fastest, cheapest)" },
+  { value: "off" as const, label: "Off", title: EFFORT_OFF_TITLE },
   { value: "low" as const, label: "Low", title: "A little reasoning before answering" },
   { value: "medium" as const, label: "Med", title: "Moderate reasoning" },
   { value: "high" as const, label: "High", title: "Deep reasoning (slower, pricier)" },
@@ -36,10 +46,41 @@ const CLI_EFFORT_OPTIONS = [
   { value: "off" as const, label: "Auto", title: "Claude Code's own default effort for this model" },
   ...EFFORT_OPTIONS.slice(1),
 ];
+/** On a Codex stage no effort means Codex's own default (its config file's
+ *  `model_reasoning_effort`), and a level the model doesn't list in Codex's
+ *  catalog runs as the one `clampToListedLevels` picks. A model without known
+ *  levels gets no effort at all (the control is disabled), and the control
+ *  says why (`codexEffortOffTitle`). */
+const CODEX_LEVEL_LABELS: Record<string, string> = { low: "Low", medium: "Med", high: "High", xhigh: "XHi", max: "Max" };
+const codexLevelLabel = (level: string) => CODEX_LEVEL_LABELS[level] ?? level;
+function codexEffortOffTitle(model: string): string | null {
+  if (codexEffortLevel(model, "low") !== null) return null;
+  return codexEffortLevels(model)
+    ? "Codex's catalog lists no reasoning levels for this model, so it runs at Codex's own default"
+    : "This model isn't in Octopush's copy of Codex's model catalog, so it runs at Codex's own default";
+}
+function codexEffortOptions(model: string) {
+  const listed = codexEffortLevels(model) ?? [];
+  return [
+    { value: "off" as const, label: "Auto", title: codexEffortOffTitle(model) ?? "Codex's own default effort for this model" },
+    ...EFFORT_OPTIONS.slice(1).map((o) => {
+      const title = codexClampTitle(listed, o.value, codexLevelLabel);
+      return title ? { ...o, title } : o;
+    }),
+  ];
+}
+
+/** On an API stage, Off says what it does on this model (GPT-6 has no "no
+ *  reasoning" on every model; see `apiEffortOffTitle`). */
+function apiEffortOptions(model: string) {
+  const [off, ...levels] = EFFORT_OPTIONS;
+  return [{ ...off, title: apiEffortOffTitle(model) }, ...levels];
+}
 
 /** One effort segment (base or escalation). API: the full track. Claude Code
  *  CLI: the same levels, passed as `--effort`, hidden on a CLI older than the
- *  tested floor (it would not get the flag). Codex: disabled, it ignores effort. */
+ *  tested floor (it would not get the flag). Codex: the same levels, passed as
+ *  `-c model_reasoning_effort`. */
 function EffortControl({
   substrate,
   model,
@@ -57,29 +98,34 @@ function EffortControl({
 }) {
   const isCli = substrate === "cli";
   const applies = effortApplies(substrate, model);
-  // Auto only where Claude Code actually supplies its own default; Codex keeps
-  // the plain track (disabled).
-  const claudeCli = isCli && applies;
+  // Auto on the CLI, where the null state is the CLI's own default.
+  const claudeCli = isCli && runsOnClaudeCode(model);
   const tooOld = claudeCli && cliTooOldForEffort(cli);
+  const options = !isCli ? apiEffortOptions(model) : claudeCli ? CLI_EFFORT_OPTIONS : codexEffortOptions(model);
   return (
     <>
       <Reveal open={!tooOld}>
-        <SegmentedControl
-          fill
-          disabled={!applies}
-          options={claudeCli ? CLI_EFFORT_OPTIONS : EFFORT_OPTIONS}
-          value={value ?? "off"}
-          onChange={(v) => onChange(v === "off" ? null : v)}
-          ariaLabel={ariaLabel}
-        />
+        {/* A disabled button may fire no mouse events in WebKit, so the
+            reason rides this wrapper, and the pointer passes through the
+            disabled control to it. */}
+        <div
+          title={!applies ? (codexEffortOffTitle(model) ?? undefined) : undefined}
+          className={!applies ? "cursor-not-allowed *:pointer-events-none" : undefined}
+        >
+          <SegmentedControl
+            fill
+            disabled={!applies}
+            options={options}
+            value={value ?? "off"}
+            onChange={(v) => onChange(v === "off" ? null : v)}
+            ariaLabel={ariaLabel}
+          />
+        </div>
       </Reveal>
       <Reveal open={tooOld}>
         <span className="font-mono text-[9px] text-octo-mute">
           Update Claude Code ({cli?.floor} or newer) to set reasoning on this stage.
         </span>
-      </Reveal>
-      <Reveal open={!applies}>
-        <span className="font-mono text-[9px] text-octo-mute">Codex manages its own reasoning.</span>
       </Reveal>
     </>
   );
@@ -223,15 +269,15 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
           </div>
 
           {/* Reasoning effort — how hard the model thinks per turn. API: Off =
-              no thinking. Claude Code CLI: passed as `--effort`, Auto = the
-              CLI's default. Codex ignores it. */}
+              no thinking (GPT-6: `none` or the model's default). CLI: passed as Claude Code's `--effort` or Codex's
+              `model_reasoning_effort`, Auto = the CLI's default. */}
           <div className="flex flex-col gap-1" data-tour="builder-stage-reasoning">
             <span
               className="font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute"
               title={
                 isCli
-                  ? "How hard the model thinks on this stage — the cost/quality lever. Claude Code gets it as --effort; Auto keeps the CLI's default for the model."
-                  : "How hard the model thinks on this stage — the cost/quality lever. Off adds no thinking."
+                  ? "How hard the model thinks on this stage — the cost/quality lever. Claude Code gets it as --effort, Codex as model_reasoning_effort; Auto keeps the CLI's default for the model."
+                  : `How hard the model thinks on this stage — the cost/quality lever. Off: ${apiEffortOffTitle(data.agentModel)}.`
               }
             >
               Reasoning
@@ -394,7 +440,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
               <div className="flex items-center justify-between gap-2 pt-1">
                 <label className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-octo-mute">
                   max ×
-                  <Stepper value={loop.max} min={1} max={9} onChange={(v) => applyLoop({ ...loop, max: v })} ariaLabel="Max loop-backs" />
+                  <Stepper value={loop.max} min={1} max={MAX_LOOP_ITERATIONS} onChange={(v) => applyLoop({ ...loop, max: v })} ariaLabel="Max loop-backs" />
                 </label>
                 <SegmentedControl options={MODE_OPTIONS} value={loop.mode} onChange={(v) => applyLoop({ ...loop, mode: v })} ariaLabel="Loop mode" />
               </div>

@@ -7,6 +7,12 @@ use serde_json::{json, Value};
 /// Frontend event name for live per-stage activity (mirrors `RUN_EVENTS.log`).
 pub const RUN_LOG_EVENT: &str = "run://log";
 
+/// Frontend event name for a Claude CLI stage's latest context reading
+/// (mirrors `RUN_EVENTS.context`, #895). Not a journal entry:
+/// `PersistingSink` keeps it on the stage row, and the detached bridge
+/// re-emits it from there.
+pub const RUN_CONTEXT_EVENT: &str = "run://context";
+
 /// Tool-input keys to surface as the one-line hint, in priority order.
 const TOOL_HINT_KEYS: &[&str] = &["command", "file_path", "path", "pattern", "query", "url", "prompt"];
 
@@ -54,24 +60,49 @@ impl<'a> LiveEmitter<'a> {
     pub fn plan_windows(&self, windows: &[crate::orchestrator::cli_runner::PlanWindow]) {
         self.events.emit(crate::claude_plan::PLAN_EVENT, json!({ "windows": windows }));
     }
+    /// The stage's latest context reading: the context size of its latest
+    /// top-level assistant message and the window of the model that answered
+    /// (`None`: unknown, the meter stays hidden). Not a journal entry —
+    /// `PersistingSink` keeps it on the stage row (#895).
+    pub fn context(&self, tokens: u64, window: Option<u64>) {
+        self.events.emit(
+            RUN_CONTEXT_EVENT,
+            json!({
+                "runId": self.run_id,
+                "stageId": self.stage_id,
+                "contextTokens": tokens,
+                "contextWindow": window,
+            }),
+        );
+    }
     /// When the claude.ai sign-in ends (a `result` event's
     /// `credential_expires_at`) — `PersistingSink` keeps it (`claude_login`).
     pub fn login_expiry(&self, expires_at: i64) {
         self.events.emit(crate::claude_login::LOGIN_EVENT, json!({ "expiresAt": expires_at }));
+    }
+    /// The session runs on an API key, not the sign-in: `PersistingSink`
+    /// forgets the stored end (`expiresAt: null`).
+    pub fn login_cleared(&self) {
+        self.events.emit(crate::claude_login::LOGIN_EVENT, json!({ "expiresAt": null }));
     }
 }
 
 /// A descriptive one-line hint from a tool-call input object (path/command/…),
 /// else the first string value, else "".
 pub fn tool_hint(input: &Value) -> String {
-    let Some(obj) = input.as_object() else { return String::new() };
+    tool_hint_line(input).chars().take(120).collect()
+}
+
+/// [`tool_hint`]'s first line, uncut — for a caller that redacts it before
+/// cutting (`cli_runner::deferred_call_preview`).
+pub fn tool_hint_line(input: &Value) -> &str {
+    let Some(obj) = input.as_object() else { return "" };
     let pick = TOOL_HINT_KEYS
         .iter()
         .find_map(|k| obj.get(*k).and_then(Value::as_str))
         .or_else(|| obj.values().find_map(Value::as_str))
         .unwrap_or("");
-    let first = pick.lines().next().unwrap_or(pick);
-    first.chars().take(120).collect()
+    pick.lines().next().unwrap_or(pick)
 }
 
 /// First line of a tool result, capped to 120 chars — for the result detail line.
@@ -177,6 +208,14 @@ pub fn api_retry_cause(v: &Value) -> Option<String> {
     Some(first_str(v, &["error"]).unwrap_or("").to_string())
 }
 
+/// How long the CLI says it will wait before the retry a `system/api_retry`
+/// event announces (its numeric `retry_delay_ms`); `None` for any other
+/// event or a missing/non-numeric delay.
+pub fn api_retry_delay(v: &Value) -> Option<std::time::Duration> {
+    api_retry_cause(v)?;
+    v.get("retry_delay_ms").and_then(Value::as_u64).map(std::time::Duration::from_millis)
+}
+
 /// How long consecutive retries for one cause share a single notice.
 pub const RETRY_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -208,9 +247,12 @@ impl RetryThrottle {
     }
 }
 
+/// The journal line after a stage's `AskUserQuestion` tool call.
+pub const ASK_USER_QUESTION_REFUSED: &str = "the agent tried to ask a question; it was refused";
+
 /// Map ONE claude `--output-format stream-json` event to zero or more entries
 /// (as the JSON values `LiveEmitter` would emit). `assistant` → text + tool
-/// entries; `user` tool_result → tool_result entries; `system/api_retry` →
+/// entries (an `AskUserQuestion` call adds [`ASK_USER_QUESTION_REFUSED`]); `user` tool_result → tool_result entries; `system/api_retry` →
 /// a retry notice; `system/notification` → its message; `system/init` → a
 /// notice per MCP server / plugin that failed to load; everything else → none.
 ///
@@ -280,6 +322,11 @@ pub fn entries_from_stream_event(v: &Value) -> Vec<Value> {
                             }
                         }
                         out.push(entry);
+                        // Every Claude stage disallows the question tool; an
+                        // older CLI may still offer it, and headless nobody answers.
+                        if name == crate::orchestrator::cli_runner::ASK_USER_QUESTION_TOOL {
+                            out.push(json!({ "kind": "notice", "text": ASK_USER_QUESTION_REFUSED }));
+                        }
                     }
                     _ => {}
                 }

@@ -11,7 +11,6 @@
 // Requires the Vite dev server on http://localhost:1420.
 
 const path = require("path");
-const { chromium } = require("playwright");
 
 const OUT_DIR = path.resolve(__dirname, "../../docs/screenshots");
 const URL = "http://localhost:1420";
@@ -19,12 +18,44 @@ const URL = "http://localhost:1420";
 // ─── Seed data ────────────────────────────────────────────────────────────
 const now = "2026-06-20T12:00:00Z";
 
-const ATELIER = {
-  name: "atelier", bg: "#0c0a08", panel: "#14110d", panel2: "#1a160f",
-  border: "#2a2419", accent: "#d4a574", accentDim: "#e8c39a", success: "#8fc9a8",
-  warning: "#dfae4a", danger: "#d18b8b", text: "#f4ecdb", textDim: "#95897a",
-  textMuted: "#6d6354", terminalBg: "#0c0a08",
-};
+// Every built-in theme, as `list_themes` returns it: `builtin_themes()` in
+// src-tauri/src/theme.rs, same order and values, camelCased by serde. The
+// names are checked against theme.rs by scripts/visual-audit/visual-audit.test.mjs.
+const THEMES = [
+  { name: "atelier", bg: "#0c0a08", panel: "#14110d", panel2: "#1a160f", border: "#2a2419",
+    borderStrong: "#786747", accent: "#d4a574", accentDim: "#e8c39a", success: "#8fc9a8",
+    warning: "#dfae4a", danger: "#d18b8b", text: "#f4ecdb", textDim: "#95897a",
+    textMuted: "#8c7f6c", terminalBg: "#0c0a08" },
+  { name: "vellum", bg: "#f2ece0", panel: "#faf6ec", panel2: "#ece4d4", border: "#c9ba95",
+    borderStrong: "#8a7a5f", accent: "#91522c", accentDim: "#6d3710", success: "#246f47",
+    warning: "#7f5300", danger: "#b33024", text: "#2a201a", textDim: "#6d5e4b",
+    textMuted: "#6f5f4a", terminalBg: "#f2ece0" },
+  { name: "mossbank", bg: "#0a120c", panel: "#121b14", panel2: "#1a261c", border: "#233028",
+    borderStrong: "#597a66", accent: "#c89669", accentDim: "#dbac82", success: "#8fc9a8",
+    warning: "#c89669", danger: "#d18b8b", text: "#e8e5da", textDim: "#95a098",
+    textMuted: "#7f8f84", terminalBg: "#0a120c" },
+  { name: "porcelain-indigo", bg: "#0a0e1c", panel: "#121830", panel2: "#1a223d", border: "#2a3252",
+    borderStrong: "#606fad", accent: "#d4a5b8", accentDim: "#e6c3d2", success: "#8fc8b4",
+    warning: "#d4b074", danger: "#d18888", text: "#e8e8ee", textDim: "#999fb5",
+    textMuted: "#858a9f", terminalBg: "#0a0e1c" },
+  { name: "ember", bg: "#100806", panel: "#1a0e0a", panel2: "#251510", border: "#2d1d15",
+    borderStrong: "#915e44", accent: "#d4805c", accentDim: "#e09975", success: "#9bc89d",
+    warning: "#d4805c", danger: "#c86060", text: "#f0e0d0", textDim: "#a09080",
+    textMuted: "#937f6c", terminalBg: "#100806" },
+  { name: "dark", bg: "#0a0a0b", panel: "#101013", panel2: "#16161c", border: "#1f1f25",
+    borderStrong: "#67677a", accent: "#a78bfa", accentDim: "#7c6dd8", success: "#34d399",
+    warning: "#fbbf24", danger: "#f87171", text: "#e4e4e7", textDim: "#a1a1aa",
+    textMuted: "#7f7f8c", terminalBg: "#0a0a0b" },
+  { name: "midnight", bg: "#0d1117", panel: "#161b22", panel2: "#1a212a", border: "#21262d",
+    borderStrong: "#627185", accent: "#58a6ff", accentDim: "#388bfd", success: "#3fb950",
+    warning: "#d29922", danger: "#f85149", text: "#c9d1d9", textDim: "#8b949e",
+    textMuted: "#7e8996", terminalBg: "#0d1117" },
+  { name: "solarized-dark", bg: "#002b36", panel: "#073642", panel2: "#0a4351", border: "#586e75",
+    borderStrong: "#779199", accent: "#268bd2", accentDim: "#2176b8", success: "#859900",
+    warning: "#b58900", danger: "#dc322f", text: "#839496", textDim: "#657b83",
+    textMuted: "#586e75", terminalBg: "#002b36" },
+];
+const ATELIER = THEMES[0];
 
 const PROJECT = {
   id: "proj-octo", name: "octopush", path: "/Users/dev/code/octopush",
@@ -219,7 +250,7 @@ function makeInitScript(data) {
   function mock(cmd, a) {
     switch (cmd) {
       case "get_theme": return D.theme;
-      case "list_themes": return [D.theme];
+      case "list_themes": return D.themes;
       case "list_recent_projects": return D.projects;
       case "list_closed_projects": return [];
       case "open_project": return D.project;
@@ -302,7 +333,7 @@ function makeInitScript(data) {
 }
 
 const DATA = {
-  now, theme: ATELIER, project: PROJECT, projects: [PROJECT], workspaces: WORKSPACES,
+  now, theme: ATELIER, themes: THEMES, project: PROJECT, projects: [PROJECT], workspaces: WORKSPACES,
   gitSummaries: GIT_SUMMARIES, openPrs: OPEN_PRS, gitStatus: GIT_STATUS, diff: DIFF,
   threads: THREADS, messages: MESSAGES, models: MODELS_WITH_PROVIDER, providers: PROVIDERS,
   pipelines: PIPELINES, pipelinesWs: PIPELINES_WS, ffStages: FF_STAGES, roles: ROLES, perf: PERF, tokenReport: TOKEN_REPORT,
@@ -325,7 +356,12 @@ async function clickMode(page, label) {
   return false;
 }
 
-(async () => {
+module.exports = { THEMES };
+
+// Run only as a script: the drift test requires this file for THEMES, and CI
+// has no Playwright.
+if (require.main === module) (async () => {
+  const { chromium } = require("playwright");
   const browser = await chromium.launch();
   const errors = [];
   const context = await browser.newContext({

@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ContextHeader } from "./ContextHeader";
+import { MidTruncate } from "./primitives/MidTruncate";
 import { useIssuesStore } from "../stores/issuesStore";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { ipc } from "../lib/ipc";
@@ -231,6 +232,77 @@ describe("ContextHeader", () => {
       // The name owns its own row, so it is present and titled whatever the
       // branch does beside it.
       expect(screen.getByText("a-workspace")).toHaveAttribute("title", "a-workspace");
+    });
+
+    describe("in a pass shared with a row that can't be measured (#870)", () => {
+      // The visual audit's stress data at 1024px: the active branch, and a rail
+      // row WebKit couldn't measure in the same shared pass. That row's throw
+      // used to strand the whole pass at `data-measuring`, so the header's head
+      // sat at `text-overflow: clip` — 138px of branch hidden, no ellipsis.
+      const BRANCH = "feature/JIRA-1000-production-deploy-octopush-api-";
+      const BROKEN = "Ü/ñ émojis 🐙 and CJK 長い名前のパイプライン-5";
+      const GLYPH = 7;
+      const ELL = 9;
+      let frames: FrameRequestCallback[] = [];
+      const realRangeRect = Range.prototype.getBoundingClientRect;
+
+      beforeEach(() => {
+        frames = [];
+        vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+        vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+          const width = this.classList.contains("octo-midtrunc-head") ? 120 : 0;
+          return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+        });
+        Range.prototype.getBoundingClientRect = function (this: Range) {
+          if (this.startContainer.textContent?.startsWith("Ü/ñ")) throw new Error("no layout");
+          const inEll = this.startContainer.parentElement?.classList.contains("octo-midtrunc-ell");
+          const w = (this.endOffset - this.startOffset) * (inEll ? ELL : GLYPH);
+          return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+        };
+      });
+      afterEach(() => {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+        Range.prototype.getBoundingClientRect = realRangeRect;
+      });
+
+      it("still cuts the branch on its own ellipsis, never held at clip", () => {
+        render(
+          <div style={{ display: "flex" }}>
+            <div style={{ display: "flex", flexGrow: 1 }}>
+              <MidTruncate text={BROKEN} tail={12} />
+            </div>
+          </div>,
+        );
+        render(<ContextHeader {...baseProps} workspaceName="X" branch={BRANCH} gitStatus={null} />);
+        expect(frames).toHaveLength(1); // the rail row and the chip share one pass
+        act(() => frames.splice(0).forEach((cb) => cb(0)));
+
+        const chip = screen.getByRole("button", { name: `Branch ${BRANCH}` });
+        const box = chip.querySelector(".octo-midtrunc")!;
+        const head = box.querySelector<HTMLElement>(":scope > .octo-midtrunc-head")!;
+        expect(head).toHaveTextContent("feature/JIRA-1000-production-deploy-o");
+        // Released, so the head is back on `.octo-midtrunc-head`'s ellipsis…
+        expect(box).not.toHaveAttribute("data-measuring");
+        expect(head.style.textOverflow).toBe("");
+        // …and cut by hand: 120px less the 9px `…` keeps 15 glyphs.
+        expect(box).toHaveAttribute("data-elided");
+        expect(head.style.maxWidth).toBe(`${15 * GLYPH + ELL + 0.5}px`);
+        expect(box.querySelector(":scope > .octo-midtrunc-tail")).toHaveTextContent("ctopush-api-");
+        // The row that couldn't be measured is released too, on the CSS ellipsis.
+        for (const b of document.querySelectorAll(".octo-midtrunc")) {
+          expect(b).not.toHaveAttribute("data-measuring");
+          expect(b.querySelector<HTMLElement>(":scope > .octo-midtrunc-head")!.style.textOverflow).toBe("");
+        }
+      });
+
+      it("never clips the head from the stylesheet — the measuring hold is inline (#872)", async () => {
+        const css = (await readStylesCss()).replace(/\/\*[\s\S]*?\*\//g, "");
+        const rules = Array.from(css.matchAll(/([^{}]*\.octo-midtrunc-head[^{]*)\{([^}]*)\}/g));
+        const clips = rules.filter((m) => /text-overflow\s*:\s*clip/.test(m[2])).map((m) => m[1].trim());
+        expect(clips).toEqual([]);
+        expect(css).toMatch(/\.octo-midtrunc-head\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/);
+      });
     });
   });
 
@@ -873,5 +945,78 @@ describe("ContextHeader", () => {
       expect(statusEl).toHaveClass(expectedClass);
       unmount();
     }
+  });
+});
+
+describe("ContextHeader — PR chip checks", () => {
+  const pr: Pr = { number: 7, title: "Feat", url: "https://x/7", isDraft: false, state: "open" };
+
+  function renderWithChecks(checks: Pr["checks"], onFixChecks?: (p: Pr) => void) {
+    return render(
+      <ContextHeader
+        workspaceName="X"
+        branch="feat/x"
+        gitStatus={null}
+        pr={{ ...pr, checks }}
+        onFixChecks={onFixChecks}
+      />,
+    );
+  }
+
+  it("shows no checks glyph when the checks couldn't be read", () => {
+    const { container } = renderWithChecks(undefined, vi.fn());
+    expect(container.querySelector('[data-tour="pr-chip-checks"]')).toBeNull();
+    expect(screen.queryByRole("button", { name: "Fix failing checks…" })).not.toBeInTheDocument();
+  });
+
+  it("tints the glyph by state: sage passing, amber pending", () => {
+    const { unmount } = renderWithChecks({ state: "passing", failing: [] });
+    expect(screen.getByRole("img", { name: "Checks passing" })).toHaveClass("text-octo-sage");
+    unmount();
+    renderWithChecks({ state: "pending", failing: [] }, vi.fn());
+    expect(screen.getByRole("img", { name: "Checks running" })).toHaveClass("text-octo-warning");
+    expect(screen.queryByRole("button", { name: "Fix failing checks…" })).not.toBeInTheDocument();
+  });
+
+  it("on failing checks: rouge glyph naming them, and Fix failing checks… hands the PR over", async () => {
+    const onFix = vi.fn();
+    const checks = { state: "failing" as const, failing: [{ name: "test", runId: 3 }, { name: "lint", runId: null }] };
+    renderWithChecks(checks, onFix);
+    const glyph = screen.getByRole("img", { name: "Checks failing: test, lint" });
+    expect(glyph).toHaveClass("text-octo-rouge");
+    expect(glyph).toHaveAttribute("title", "Checks failing: test, lint");
+    await userEvent.click(screen.getByRole("button", { name: "Fix failing checks…" }));
+    expect(onFix).toHaveBeenCalledWith({ ...pr, checks });
+    expect(ipc.openFileInSystem).not.toHaveBeenCalledWith("https://x/7");
+  });
+
+  it("while the logs load: the fix button is busy, says so, and ignores clicks", async () => {
+    let finish!: () => void;
+    const onFix = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    renderWithChecks({ state: "failing", failing: [{ name: "test", runId: 3 }] }, onFix);
+    const button = screen.getByRole("button", { name: "Fix failing checks…" });
+    expect(button).toHaveAttribute("title", "Fix failing checks…");
+    expect(button).not.toBeDisabled();
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(onFix).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(button).toHaveAttribute("title", "Reading the failed logs…");
+
+    finish();
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(button).toHaveAttribute("title", "Fix failing checks…");
+  });
+
+  it("frees the fix button again when the handler fails", async () => {
+    const onFix = vi.fn().mockRejectedValue(new Error("boom"));
+    renderWithChecks({ state: "failing", failing: [{ name: "test", runId: 3 }] }, onFix);
+    const button = screen.getByRole("button", { name: "Fix failing checks…" });
+    fireEvent.click(button);
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(button).toHaveAttribute("title", "Fix failing checks…");
   });
 });

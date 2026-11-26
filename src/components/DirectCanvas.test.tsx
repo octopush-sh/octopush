@@ -25,9 +25,12 @@ vi.mock("./StageFocus", () => ({ StageFocus: () => <div /> }));
 vi.mock("./RunLedger", () => ({ RunLedger: () => <div /> }));
 const TERMINAL = new Set(["completed", "aborted", "failed"]);
 vi.mock("./RunControlBar", () => ({
-  RunControlBar: ({ run, blockedStage, onRunAgain }: any) => (
+  RunControlBar: ({ run, blockedStage, beacon, onRunAgain, onApprove }: any) => (
     <div>
       {blockedStage && <div>CHECKPOINT</div>}
+      {blockedStage && <div>decides:{blockedStage.id}</div>}
+      <div>decision-beacon:{String(!!beacon)}</div>
+      {blockedStage && <button onClick={onApprove}>approve</button>}
       {TERMINAL.has(run.status) && <button onClick={onRunAgain}>again</button>}
     </div>
   ),
@@ -146,6 +149,25 @@ describe("DirectCanvas viewed-run routing", () => {
     });
     // navigates to the launcher
     expect(useRunsStore.getState().selectedRunIdByWs.w1).toBeNull();
+  });
+
+  it("a sibling's gate beside a scheduled plan wait takes the bar and the beacon, and Approve names it", () => {
+    const resolve = vi.fn(async () => true);
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const paused: Run = { ...run, status: "paused",
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: true } };
+    const plan = { ...mkStage("p1", 1, "failed"), error: "Paused by your Claude plan\n(plan_limit)" };
+    const gate = { ...mkStage("g1", 2, "awaiting_checkpoint"), checkpoint: true };
+    // A gate's approve goes through the store's gate approve (#957), with no comments here.
+    const approveWithComments = vi.fn(async () => {});
+    useRunsStore.setState({ resolve, approveWithComments, detailByRun: { r1: { run: paused, stages: [mkStage("s0", 0, "done"), plan, gate] } } });
+    useRunsStore.getState().selectRun("w1", "r1");
+    render(<DirectCanvas active workspaceId="w1" defaultTask="" linkedIssueKey={null} workspacePath="/tmp" />);
+    expect(screen.getByText("decides:g1")).toBeInTheDocument();
+    expect(screen.getByText("decision-beacon:true")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("approve"));
+    expect(approveWithComments).toHaveBeenCalledWith("r1", "g1", []);
+    expect(resolve).not.toHaveBeenCalled();
   });
 
   it("shows the decision surface when paused at a checkpoint, and the running controls once resumed", () => {

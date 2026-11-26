@@ -1,0 +1,267 @@
+// What the rail's menus and gestures do to groups, at both scopes: mission
+// groups (folders of one project's missions) and project groups (sections of
+// projects). The store
+// (`groupsStore`) owns the data and its rollbacks; this module adds what a
+// gesture needs around it: the name goes into inline edit after a create, the
+// target of a move unfolds so the result is visible, and Ungroup can be undone.
+
+import { pushToast } from "../components/Toasts";
+import { useGroupsStore } from "../stores/groupsStore";
+import { useProjectStore } from "../stores/projectStore";
+import { useRailGroupUi } from "../stores/railGroupUiStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
+import { layoutProjects, projectGroupsOf, resolveTopDrop, sectionHeadId, type RailTopItem } from "./railGroups";
+import type { ProjectInfo } from "./types";
+
+/** The name a group is born with; the header opens in edit mode with it selected. */
+export const NEW_GROUP_NAME = "New group";
+
+/** Create a mission group in `projectId`, around the given missions (one,
+ *  several from a rail selection, or none for an empty group), and put its
+ *  name into inline edit. Every member goes in the one `create_group` call. */
+export async function createMissionGroup(
+  projectId: string,
+  workspaceIds?: string | readonly string[],
+): Promise<string | null> {
+  const memberIds = workspaceIds === undefined ? [] : typeof workspaceIds === "string" ? [workspaceIds] : [...workspaceIds];
+  const rows = useWorkspaceStore.getState().workspacesByProjectId[projectId] ?? [];
+  const before = new Map(memberIds.map((id) => [id, rows.find((w) => w.id === id)?.groupId ?? null] as const));
+  const created = await useGroupsStore.getState().create({
+    scope: "workspace",
+    projectId,
+    name: NEW_GROUP_NAME,
+    memberIds,
+  });
+  if (!created) return null;
+  // An empty group (the project's "New group") has nothing to put back.
+  if (memberIds.length > 0) justCreated.set(created.id, { scope: "workspace", before });
+  const ui = useRailGroupUi.getState();
+  ui.setCollapsed(created.id, false);
+  ui.startRename(created.id);
+  return created.id;
+}
+
+/** Move a mission into a group (which unfolds, so the mission stays in
+ *  sight), or out of any group (`null`). */
+export function moveMissionToGroup(workspaceId: string, groupId: string | null): Promise<boolean> {
+  if (groupId) useRailGroupUi.getState().setCollapsed(groupId, false);
+  return useGroupsStore.getState().moveItem("workspace", workspaceId, groupId);
+}
+
+/** Move several missions (a rail selection) into one group, or out of any
+ *  (`null`), all in one backend call: a refusal leaves every one where it
+ *  was and shows one toast. Missions already where they are going are left
+ *  alone. */
+export function moveMissionsToGroup(workspaceIds: readonly string[], groupId: string | null): Promise<boolean> {
+  if (groupId) useRailGroupUi.getState().setCollapsed(groupId, false);
+  return useGroupsStore.getState().moveItems("workspace", workspaceIds, groupId);
+}
+
+/**
+ * Bring a group into sight in the rail and give its header the focus (⌘K's
+ * "Groups"): the rail unfolds the group, the project that holds a mission
+ * group and the project group around either, clears a filter that hides it,
+ * scrolls the header into view and focuses it. The rail does the work (the
+ * project folds are its own state); this only asks.
+ */
+export function revealGroup(groupId: string): void {
+  useRailGroupUi.getState().requestReveal(groupId);
+}
+
+/** The loaded (non-archived) missions of a group. */
+function loadedMembers(projectId: string | null, groupId: string): string[] {
+  if (!projectId) return [];
+  return (useWorkspaceStore.getState().workspacesByProjectId[projectId] ?? [])
+    .filter((w) => w.groupId === groupId)
+    .map((w) => w.id);
+}
+
+/** Remove a group and keep its members. When it had any, the toast offers
+ *  Undo, which calls `restore` with the ids that were in it. */
+async function ungroup(
+  groupId: string,
+  members: string[],
+  body: (count: number) => string,
+  restore: (memberIds: string[]) => void,
+): Promise<void> {
+  const store = useGroupsStore.getState();
+  const group = store.groups.find((g) => g.id === groupId);
+  if (!group) return;
+  if (!(await store.remove(groupId))) return;
+  useRailGroupUi.getState().forget(groupId);
+  if (members.length === 0) return;
+  pushToast({
+    level: "info",
+    title: `Ungrouped "${group.name}"`,
+    body: body(members.length),
+    action: { label: "Undo", onClick: () => restore(members) },
+  });
+}
+
+/**
+ * Remove a group and keep its missions ("Ungroup", or "Remove group" on an
+ * empty one). When it had missions the toast offers Undo, which makes a group
+ * of the same name and tint around the ones that are still loose. The new
+ * group is a new row: it opens unfolded, and archived missions that sat in the
+ * old group do not return to it. Undo does nothing once the project has been
+ * closed or deleted.
+ */
+export async function ungroupMissions(groupId: string): Promise<void> {
+  const group = useGroupsStore.getState().groups.find((g) => g.id === groupId);
+  if (!group) return;
+  await ungroup(
+    groupId,
+    loadedMembers(group.projectId, groupId),
+    (count) => (count === 1 ? "Its mission is back in the list." : "Its missions are back in the list."),
+    (members) => {
+      // The project was closed or deleted since: its rows are gone from the
+      // rail, and a group made now would be an empty one nobody can see.
+      const rows = group.projectId
+        ? useWorkspaceStore.getState().workspacesByProjectId[group.projectId]
+        : undefined;
+      if (!rows) return;
+      const stillLoose = new Set(rows.filter((w) => !w.groupId).map((w) => w.id));
+      void useGroupsStore.getState().create({
+        scope: "workspace",
+        projectId: group.projectId,
+        name: group.name,
+        tint: group.tint,
+        memberIds: members.filter((id) => stillLoose.has(id)),
+      });
+    },
+  );
+}
+
+// ───────────────────────────── project groups ─────────────────────────────
+
+/** The projects the rail lists, in its order: the open ones, then the current
+ *  one when it is not among them yet (one just created). */
+function railProjects(): ProjectInfo[] {
+  const { recent, current } = useProjectStore.getState();
+  return current && !recent.some((p) => p.id === current.id) ? [...recent, current] : recent;
+}
+
+/** The rail's top level as it stands: loose projects and sections. */
+function railLayout(): RailTopItem<ProjectInfo>[] {
+  return layoutProjects(railProjects(), projectGroupsOf(useGroupsStore.getState().groups));
+}
+
+/** Create a project group around `projectId` and put its name into inline
+ *  edit. It stands where the project stands. */
+export async function createProjectGroup(projectId: string): Promise<string | null> {
+  const before = new Map([[projectId, railProjects().find((p) => p.id === projectId)?.groupId ?? null]]);
+  const created = await useGroupsStore.getState().create({
+    scope: "project",
+    name: NEW_GROUP_NAME,
+    memberIds: [projectId],
+  });
+  if (!created) return null;
+  justCreated.set(created.id, { scope: "project", before });
+  const ui = useRailGroupUi.getState();
+  ui.setCollapsed(created.id, false);
+  ui.startRename(created.id);
+  return created.id;
+}
+
+/**
+ * Move a project into a project group, where it becomes the last project
+ * (the group unfolds so it stays in sight), or out of any group (`null`),
+ * where it stays at its own place in the order. `order` is the project order
+ * that goes with the move when the caller already knows it (a drag); left
+ * out, joining a group stores the order that puts the project last in it.
+ * The move and its order reach the rail together, and a refusal of either
+ * puts both back (`moveProject`).
+ */
+export async function moveProjectToGroup(
+  projectId: string,
+  groupId: string | null,
+  order?: string[] | null,
+): Promise<boolean> {
+  if (groupId) useRailGroupUi.getState().setCollapsed(groupId, false);
+  const next =
+    order !== undefined
+      ? order
+      : groupId
+        ? (resolveTopDrop(railLayout(), projectId, sectionHeadId(groupId))?.order ?? null)
+        : null;
+  return useGroupsStore.getState().moveProject(projectId, groupId, next);
+}
+
+// ───────────────────────────── cancelling a new group ─────────────────────────────
+
+/** Groups made from a project, a mission or a selection whose name is still
+ *  in its first edit: where each member was before (its group, or null). */
+const justCreated = new Map<string, { scope: "project" | "workspace"; before: Map<string, string | null> }>();
+
+// The first edit ends however it ends (Enter, blur, the slim rail, the group
+// gone): from then on Escape on its name is a rename's Escape. A cancel reads
+// its entry before it stops the edit.
+useRailGroupUi.subscribe((state, prev) => {
+  if (prev.renamingId && state.renamingId !== prev.renamingId) justCreated.delete(prev.renamingId);
+});
+
+/**
+ * Escape on the name of a group that was just created around a project, a
+ * mission or a selection: delete it and put each member back in the group it
+ * came from (or none). The order never changed, so each lands where it was.
+ * False when the group is not a just-created one (a rename: the caller keeps
+ * the old name).
+ */
+export async function cancelNewGroup(groupId: string): Promise<boolean> {
+  const made = justCreated.get(groupId);
+  if (!made) return false;
+  justCreated.delete(groupId);
+  const store = useGroupsStore.getState();
+  if (!(await store.remove(groupId))) return true;
+  useRailGroupUi.getState().forget(groupId);
+  const exists = new Set(useGroupsStore.getState().groups.map((g) => g.id));
+  const back = [...made.before].filter(([, from]) => from !== null && exists.has(from));
+  await Promise.all(
+    back.map(([id, from]) =>
+      made.scope === "project"
+        ? useGroupsStore.getState().moveProject(id, from, null)
+        : useGroupsStore.getState().moveItem("workspace", id, from),
+    ),
+  );
+  return true;
+}
+
+/** Test-only: forget the groups still in their first edit. */
+export function __resetJustCreated(): void {
+  justCreated.clear();
+}
+
+/**
+ * Remove a project group and keep its projects ("Ungroup", or "Remove group"
+ * on an empty one). When it had projects the toast offers Undo, which makes a
+ * group of the same name and tint around the ones that are still loose and
+ * still open; closed projects that sat in the old group do not return to it.
+ */
+export async function ungroupProjects(groupId: string): Promise<void> {
+  const group = useGroupsStore.getState().groups.find((g) => g.id === groupId);
+  if (!group) return;
+  await ungroup(
+    groupId,
+    railProjects()
+      .filter((p) => p.groupId === groupId)
+      .map((p) => p.id),
+    (count) => (count === 1 ? "Its project is back in the list." : "Its projects are back in the list."),
+    (members) => {
+      const stillLoose = new Set(
+        railProjects()
+          .filter((p) => !p.groupId)
+          .map((p) => p.id),
+      );
+      const memberIds = members.filter((id) => stillLoose.has(id));
+      // Every project was closed, deleted or grouped again since: a group
+      // made now would be an empty one at the foot of the rail.
+      if (memberIds.length === 0) return;
+      void useGroupsStore.getState().create({
+        scope: "project",
+        name: group.name,
+        tint: group.tint,
+        memberIds,
+      });
+    },
+  );
+}

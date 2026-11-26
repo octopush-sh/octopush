@@ -118,15 +118,40 @@ pub enum AppError {
         limit: u32,
     },
 
+    /// The secret guard (#730) found possible credentials in what a commit,
+    /// push or pull request would send, or couldn't scan all of it
+    /// (`partial`). The frontend detects `kind == "SecretsFound"` to show the
+    /// confirm dialog, and echoes `fingerprint` back to override exactly what
+    /// it showed. Findings carry the file, line and kind only — never any
+    /// part of the value; `findings` is capped, `total` is not.
+    #[error("possible secret: {}", crate::secret_scan::refusal_summary(.findings, *.total, *.partial))]
+    SecretsFound {
+        findings: Vec<crate::secret_scan::SecretFinding>,
+        total: usize,
+        partial: bool,
+        fingerprint: String,
+    },
+
+    /// An MCP server failed Settings' Test or Reconnect, classified
+    /// (`mcp::classify_failure`). The frontend detects `kind == "McpFailure"`
+    /// to show the summary and hint, with the redacted output behind Details.
+    #[error("{0}")]
+    McpFailure(crate::mcp::McpFailure),
+
     /// Returned when a backend budget gate blocks a spend (Phase 3 enforcement).
     /// The frontend detects `kind == "BudgetExceeded"` to surface the budget UI /
     /// override affordance. `scope` is a human string like "workspace daily".
-    #[error("budget exceeded: {scope} — spent ${spent:.2} of ${limit:.2}")]
+    #[error("budget exceeded: {scope} — spent {} of {}", usd(.spent), usd(.limit))]
     BudgetExceeded {
         scope: String,
         spent: f64,
         limit: f64,
     },
+}
+
+/// [`crate::token_engine::format_usd`] for a field borrowed by `#[error]`.
+fn usd(n: &f64) -> String {
+    crate::token_engine::format_usd(*n)
 }
 
 impl From<anyhow::Error> for AppError {
@@ -187,6 +212,25 @@ impl Serialize for AppError {
                 map.serialize_entry("limit", limit)?;
                 map.end()
             }
+            AppError::SecretsFound { findings, total, partial, fingerprint } => {
+                let mut map = ser.serialize_map(Some(6))?;
+                map.serialize_entry("kind", "SecretsFound")?;
+                map.serialize_entry("message", &self.to_string())?;
+                map.serialize_entry("findings", findings)?;
+                map.serialize_entry("total", total)?;
+                map.serialize_entry("partial", partial)?;
+                map.serialize_entry("fingerprint", fingerprint)?;
+                map.end()
+            }
+            AppError::McpFailure(f) => {
+                let mut map = ser.serialize_map(Some(5))?;
+                map.serialize_entry("kind", "McpFailure")?;
+                map.serialize_entry("message", &f.summary)?;
+                map.serialize_entry("summary", &f.summary)?;
+                map.serialize_entry("hint", &f.hint)?;
+                map.serialize_entry("detail", &f.detail)?;
+                map.end()
+            }
             other => ser.serialize_str(&other.to_string()),
         }
     }
@@ -231,6 +275,37 @@ mod tests {
         assert_eq!(val["feature"], "direct.unlimited");
         assert_eq!(val["used"], 25);
         assert_eq!(val["limit"], 25);
+    }
+
+    #[test]
+    fn mcp_failure_serializes_as_structured_object() {
+        let err = AppError::McpFailure(crate::mcp::classify_failure("MCP server closed the connection"));
+        let val: serde_json::Value = serde_json::from_str(&serde_json::to_string(&err).unwrap()).unwrap();
+        assert_eq!(val["kind"], "McpFailure");
+        assert_eq!(val["summary"], "The server exited before it answered.");
+        assert_eq!(val["message"], val["summary"]);
+        assert_eq!(val["hint"], "Run its command in Terminal to see why.");
+        assert_eq!(val["detail"], "MCP server closed the connection");
+        assert_eq!(err.to_string(), "The server exited before it answered.");
+    }
+
+    #[test]
+    fn budget_exceeded_message_groups_dollars() {
+        let err = AppError::BudgetExceeded { scope: "workspace daily".into(), spent: 1234.5, limit: 1000.0 };
+        assert_eq!(err.to_string(), "budget exceeded: workspace daily — spent $1,234.50 of $1,000.00");
+    }
+
+    #[test]
+    fn format_usd_groups_thousands_like_the_frontend() {
+        use crate::token_engine::format_usd;
+        assert_eq!(format_usd(0.0), "$0.00");
+        assert_eq!(format_usd(0.004), "$0.00");
+        assert_eq!(format_usd(1.275), format!("${:.2}", 1.275));
+        assert_eq!(format_usd(999.999), "$1,000.00");
+        assert_eq!(format_usd(12345.6), "$12,345.60");
+        assert_eq!(format_usd(1234567.0), "$1,234,567.00");
+        assert_eq!(format_usd(-3.0), "-$3.00");
+        assert_eq!(format_usd(-0.001), "$0.00");
     }
 
     #[test]

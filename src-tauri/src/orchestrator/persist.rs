@@ -2,11 +2,13 @@
 //! entry into the `stage_log` table, so stage journals survive app reloads
 //! and loop-back resets (a reset becomes a `{"kind":"reset"}` marker row).
 //! It also keeps the Claude plan snapshot (`plan://updated`, see `claude_plan`)
-//! and the claude.ai sign-in end (`claude-login://updated`, see `claude_login`).
+//! and the claude.ai sign-in end (`claude-login://updated`, see `claude_login`),
+//! and a Claude CLI stage's latest context reading (`run://context`, #895) on
+//! its stage row, so a detached run's context meter reaches the app too.
 
 use crate::db::Db;
 use crate::orchestrator::events::EventSink;
-use crate::orchestrator::live::RUN_LOG_EVENT;
+use crate::orchestrator::live::{RUN_CONTEXT_EVENT, RUN_LOG_EVENT};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::sync::Arc;
@@ -41,6 +43,18 @@ impl EventSink for PersistingSink {
                     let _ = self.db.lock().append_stage_log(run_id, stage_id, &entry);
                 }
             }
+        } else if event == RUN_CONTEXT_EVENT {
+            // The stage row keeps the latest reading only; the stream sends
+            // one per message at most (`ContextWatch`). A cleared reading
+            // (null tokens, at a stage start) is already cleared on the row
+            // (`set_run_stage_status`) and is only forwarded. Never breaks
+            // the run.
+            let stage_id = payload.get("stageId").and_then(Value::as_str);
+            let tokens = payload.get("contextTokens").and_then(Value::as_i64);
+            if let (Some(stage_id), Some(tokens)) = (stage_id, tokens) {
+                let window = payload.get("contextWindow").and_then(Value::as_i64);
+                let _ = self.db.lock().set_run_stage_context(stage_id, tokens, window);
+            }
         } else if event == crate::claude_plan::PLAN_EVENT {
             // The Claude plan snapshot (detached workers included: the app
             // reads it back from `app_meta`). Never breaks the run.
@@ -48,9 +62,17 @@ impl EventSink for PersistingSink {
             let now = chrono::Utc::now().to_rfc3339();
             let _ = crate::claude_plan::record(&self.db.lock(), &windows, &now);
         } else if event == crate::claude_login::LOGIN_EVENT {
-            if let Some(expires_at) = payload.get("expiresAt").and_then(Value::as_i64) {
-                let now = chrono::Utc::now().to_rfc3339();
-                let _ = crate::claude_login::record(&self.db.lock(), expires_at, &now);
+            match payload.get("expiresAt") {
+                Some(Value::Null) => {
+                    let _ = crate::claude_login::clear(&self.db.lock());
+                }
+                Some(v) => {
+                    if let Some(expires_at) = v.as_i64() {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let _ = crate::claude_login::record(&self.db.lock(), expires_at, &now);
+                    }
+                }
+                None => {}
             }
         }
         self.inner.emit(event, payload);

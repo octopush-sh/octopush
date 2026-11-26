@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../lib/ipc";
+import { useGroupsStore } from "../stores/groupsStore";
 import type { Workspace } from "../lib/types";
 
 interface Props {
@@ -22,6 +23,15 @@ export function ArchivedWorkspacesModal({
   const [busyId, setBusyId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // An archived mission keeps its group (`group_id` stays on its row), so
+  // restoring it returns it to that group if the group still exists. Removing
+  // a group clears its members' `group_id`, archived ones included, so a
+  // mission whose group is gone shows no group here and comes back loose. A
+  // group of another project, or one not loaded, counts as none (the rail's
+  // `ownGroupId` rule).
+  const groups = useGroupsStore((s) => s.groups);
+  const groupNameOf = (w: Workspace) =>
+    groups.find((g) => g.id === w.groupId && g.scope === "workspace" && g.projectId === w.projectId)?.name ?? null;
 
   useEffect(() => {
     let alive = true;
@@ -65,6 +75,14 @@ export function ArchivedWorkspacesModal({
             {items.map((w) => (
               <li key={w.id} className="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-octo-panel-2">
                 <span className="flex-1 truncate text-[13px] text-octo-sage">{w.name}</span>
+                {groupNameOf(w) && (
+                  <span
+                    className="max-w-[90px] shrink-0 truncate font-mono text-[10px] text-octo-mute"
+                    title={`In the group "${groupNameOf(w)}": restoring returns it there`}
+                  >
+                    {groupNameOf(w)} ·
+                  </span>
+                )}
                 <span className="truncate font-mono text-[10px] text-octo-mute">{w.branch}</span>
                 <button
                   type="button"

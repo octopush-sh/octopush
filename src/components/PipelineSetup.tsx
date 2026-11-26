@@ -1,18 +1,26 @@
 import { useEffect, useRef, useState } from "react";
-import { ipc, type ClaudeCliVersion, type PipelineWithStages, type RunEstimate } from "../lib/ipc";
-import { CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
+import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type CodexTrustNote, type PipelineWithStages, type RepoCrew, type RepoHooksNotice, type RunEstimate } from "../lib/ipc";
+import { repoHooksItems, repoHooksLine } from "../lib/repoHooks";
+import { dragHasFiles, openDroppedCrew } from "../lib/crew";
+import { useCrewImportStore } from "../stores/crewImportStore";
+import {
+  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, codexCommitNote, codexReadOnlySandboxNote, crewClaudeModels, crewUsesClaudeCode, crewUsesCodex, loadClaudeCliVersion, modelFloorLabel,
+} from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
-import { useRunsStore } from "../stores/runsStore";
+import { useRolesStore } from "../stores/rolesStore";
+import { prefilledTask, useRunsStore } from "../stores/runsStore";
 import { usePerfStore } from "../stores/perfStore";
 import { lowDiskLine } from "../lib/diskSpace";
 import { beaconAnchor } from "../lib/beacon";
 import { useEntitlement } from "../hooks/useEntitlement";
 import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
+import { SupersededModelLine } from "./direct/SupersededModelLine";
+import { RetiringModelLine } from "./direct/RetiringModelLine";
 import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
-import { CircleDot } from "lucide-react";
+import { CircleDot, FileUp } from "lucide-react";
 import { UnattendedReadiness } from "./UnattendedReadiness";
 import { RichPromptTextarea } from "./direct/RichPromptTextarea";
 import { useMissionsStore } from "../stores/missionsStore";
@@ -91,6 +99,17 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   const missionIntent = useMissionsStore((s) =>
     workspaceId ? s.missionByWorkspaceId[workspaceId]?.intent ?? null : null,
   );
+  const execIsolation = useMissionsStore((s) =>
+    workspaceId ? s.missionByWorkspaceId[workspaceId]?.execIsolation ?? null : null,
+  );
+  const gitIsolation = useMissionsStore((s) =>
+    workspaceId ? s.missionByWorkspaceId[workspaceId]?.gitIsolation ?? null : null,
+  );
+  const roles = useRolesStore((s) => s.roles);
+  const rolesLoaded = useRolesStore((s) => s.loaded);
+  useEffect(() => {
+    if (!rolesLoaded) void useRolesStore.getState().load().catch(() => {});
+  }, [rolesLoaded]);
 
   useEffect(() => { if (!loaded) void load(); }, [loaded, load]);
   useEffect(() => {
@@ -124,7 +143,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     if (pendingPrefill.workspaceId && pendingPrefill.workspaceId !== workspaceId) return;
     const prefill = consumeLauncherPrefill();
     if (!prefill) return;
-    setTask(prefill.task);
+    setTask((current) => prefilledTask(current, prefill));
     if (pipelines.some((p) => p.pipeline.id === prefill.pipelineId)) {
       setSelectedId(prefill.pipelineId);
       setOverrides(Object.fromEntries(prefill.overrides));
@@ -154,6 +173,33 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
 
   const selected: PipelineWithStages | undefined = pipelines.find((p) => p.pipeline.id === selectedId);
 
+  // Crews committed under .octopush/crews/, re-read each time the launcher opens.
+  const [repoCrews, setRepoCrews] = useState<RepoCrew[]>([]);
+  useEffect(() => {
+    if (!workspacePath) return;
+    let alive = true;
+    Promise.resolve()
+      .then(() => ipc.listRepoCrews(workspacePath))
+      .then((c) => { if (alive) setRepoCrews(c ?? []); })
+      .catch(() => { if (alive) setRepoCrews([]); });
+    return () => { alive = false; };
+  }, [workspacePath]);
+
+  // Fork reads the file's text only now, through the backend's safe reader.
+  const forkRepoCrew = async (file: string) => {
+    if (!workspacePath) return;
+    try {
+      const text = await ipc.readRepoCrew(workspacePath, file);
+      useCrewImportStore.getState().show(text, `.octopush/crews/${file}`);
+    } catch (e) {
+      pushToast({
+        level: "error",
+        title: "Couldn't read that crew",
+        body: (e instanceof Error ? e.message : String(e)).replace(/^other: /, ""),
+      });
+    }
+  };
+
   // Model overrides are keyed by stage POSITION. If the selected pipeline is
   // restructured under us — e.g. octopush-mcp's `update_pipeline` while the
   // window was unfocused, surfaced by the focus refresh — a kept override
@@ -174,16 +220,81 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   // Preflight: a crew with a Claude Code CLI stage on an old CLI gets an
   // amber note under the foot. Informational only — it never gates Begin.
   const usesClaudeCode = !!selected && crewUsesClaudeCode(selected.stages, overrides);
+  // Every model that will run on Claude Code, escalations included — a Codex
+  // stage escalating to a Claude model still needs the version read below.
+  const claudeModels = selected ? crewClaudeModels(selected.stages, overrides) : [];
+  const claudeModelsKey = claudeModels.join("\n");
+  const needsCliVersion = usesClaudeCode || claudeModels.length > 0;
   const [cli, setCli] = useState<ClaudeCliVersion | null>(null);
   useEffect(() => {
-    if (!usesClaudeCode) return;
+    if (!needsCliVersion) return;
     let alive = true;
     void loadClaudeCliVersion().then((v) => { if (alive) setCli(v); });
     return () => { alive = false; };
-  }, [usesClaudeCode]);
+  }, [needsCliVersion]);
   const cliUpdate = usesClaudeCode ? claudeUpdateLabel(cli) : null;
   const cliSecurity = usesClaudeCode ? claudeSecurityLabel(cli) : null;
   const cliNote = cliUpdate ?? cliSecurity;
+  // A CLI stage (or its escalation) on a model this CLI is too old to launch
+  // — e.g. Fable 5.2 before 2.1.321. Once the version is known, the backend
+  // checks against its cached copy; an unknown version never warns.
+  const [floorNote, setFloorNote] = useState<ClaudeModelFloorNote | null>(null);
+  useEffect(() => {
+    setFloorNote(null);
+    if (!cli?.version || !claudeModelsKey) return;
+    let alive = true;
+    ipc.claudeModelFloorNote(claudeModelsKey.split("\n"))
+      .then((n) => { if (alive) setFloorNote(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [cli?.version, claudeModelsKey]);
+  const modelFloorLine = cli?.version ? modelFloorLabel(floorNote) : null;
+  // A Claude Code release to skip (2.1.329) when a CLI stage runs a gateway
+  // model; the backend decides which models are gateway ones.
+  const [knownBadLine, setKnownBadLine] = useState<string | null>(null);
+  const knownBad = cli?.knownBad?.version ?? null;
+  useEffect(() => {
+    setKnownBadLine(null);
+    if (!knownBad || !claudeModelsKey) return;
+    let alive = true;
+    ipc.claudeKnownBadNote(claudeModelsKey.split("\n"))
+      .then((n) => { if (alive) setKnownBadLine(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [knownBad, claudeModelsKey]);
+  // A Codex stage in a repo whose .codex/ config Codex will skip, because the
+  // project isn't trusted in Codex. Octopush never trusts it for the user.
+  const usesCodex = !!selected && crewUsesCodex(selected.stages, overrides);
+  const [codexTrust, setCodexTrust] = useState<CodexTrustNote | null>(null);
+  useEffect(() => {
+    setCodexTrust(null);
+    if (!usesCodex || !workspacePath) return;
+    let alive = true;
+    ipc.codexTrustNote(workspacePath)
+      .then((n) => { if (alive) setCodexTrust(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [usesCodex, workspacePath]);
+  // What the repo's own committed Claude Code config (hooks, status line,
+  // .mcp.json servers) runs in a Claude Code stage. Read-only, calm.
+  const [repoHooks, setRepoHooks] = useState<RepoHooksNotice | null>(null);
+  useEffect(() => {
+    setRepoHooks(null);
+    if (!usesClaudeCode || !workspacePath) return;
+    let alive = true;
+    ipc.repoHooksNotice(workspacePath)
+      .then((n) => { if (alive) setRepoHooks(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [usesClaudeCode, workspacePath]);
+  const sandboxed = execIsolation === "sandbox" || gitIsolation === "readonly";
+  // An Action stage on Codex outside a sandboxed mission can't commit.
+  const codexCommitLine = selected ? codexCommitNote(selected.stages, overrides, roles, execIsolation) : null;
+  // A read-only Codex stage in a sandboxed (or readonly) mission is refused
+  // at launch: Codex's own read-only sandbox can't run inside Octopush's.
+  const codexReadOnlyLine = selected
+    ? codexReadOnlySandboxNote(selected.stages, overrides, roles, execIsolation, gitIsolation)
+    : null;
 
   const estimateRange = estimate ? estimateRangeText(estimate) : "";
   const estimateSavings = estimate ? estimateSavingsText(estimate) : "";
@@ -209,7 +320,11 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   };
 
   return (
-    <div className="min-h-0 flex-1 overflow-auto px-8 py-7 octo-fade-in">
+    <div
+      className="min-h-0 flex-1 overflow-auto px-8 py-7 octo-fade-in"
+      onDragOver={(e) => { if (dragHasFiles(e)) e.preventDefault(); }}
+      onDrop={(e) => { openDroppedCrew(e); }}
+    >
       <div className="mx-auto max-w-[940px]">
         {/* Ceremony — serif title + one sans line. No eyebrow, no rule. */}
         <h1 className="m-0 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Direct the work</h1>
@@ -291,7 +406,19 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
         )}
 
         {/* The ensemble. */}
-        <p className="mb-3 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">ensemble</p>
+        <div className="mb-3 flex items-center">
+          <p className="m-0 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">ensemble</p>
+          <button
+            type="button"
+            data-tour="direct-launcher-import-crew"
+            onClick={() => useCrewImportStore.getState().show()}
+            title="Import a crew — a .octocrew.json file or pasted JSON. You review it before anything is saved; you can also drop a file here."
+            className="ml-auto flex items-center gap-1 rounded p-1 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          >
+            <FileUp size={11} aria-hidden />
+            import a crew
+          </button>
+        </div>
         {!loaded ? (
           <div className="mb-10 flex gap-2">
             {[0, 1, 2].map((i) => (
@@ -349,6 +476,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
 
             {selected && (
               <div className="mt-5">
+                <SupersededModelLine
+                  key={`superseded-${selected.pipeline.id}`}
+                  pipeline={selected}
+                  onSwitched={(id, fromId) => {
+                    // A builtin forks into a new crew with the same stages;
+                    // a launcher pick of the old model would undo the switch.
+                    setSelectedId(id);
+                    setOverrides((prev) => Object.fromEntries(Object.entries(prev).filter(([, m]) => m !== fromId)));
+                  }}
+                />
                 {selected.pipeline.description && (
                   <p className="mb-3 font-serif text-[13px] text-octo-sage">{selected.pipeline.description}</p>
                 )}
@@ -360,6 +497,34 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 />
               </div>
             )}
+          </div>
+        )}
+
+        {/* Crews committed in the repo: read-only until forked. */}
+        {repoCrews.length > 0 && (
+          <div className="octo-fade-in mb-6" data-tour="direct-launcher-repo-crews">
+            <p className="mb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">from this repo</p>
+            <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
+              {repoCrews.map((c) => (
+                <li key={c.file} data-testid="repo-crew" className="flex min-w-0 items-baseline gap-2">
+                  <span className="min-w-0 truncate font-serif text-[13px] text-octo-ivory">{c.name}</span>
+                  <span className="shrink-0 font-mono text-[10px] text-octo-mute" title={`.octopush/crews/${c.file}`}>
+                    {c.problem ? c.file : `${c.stageCount} ${c.stageCount === 1 ? "stage" : "stages"}`}
+                  </span>
+                  {c.problem ? (
+                    <span className="min-w-0 truncate font-mono text-[10px] text-octo-rouge" title={c.problem}>{c.problem}</span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void forkRepoCrew(c.file)}
+                      className="ml-auto shrink-0 font-serif text-[12px] text-octo-brass transition-opacity duration-[180ms] hover:opacity-80"
+                    >
+                      Fork into my library
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 
@@ -484,6 +649,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 </p>
               </div>
             </div>
+            {repoHooks && (
+              <div data-tour="direct-launcher-repo-hooks" data-testid="launcher-repo-hooks" className="octo-rise-in mt-3">
+                <p className="m-0 text-[11px] leading-[1.55] text-octo-sage">{repoHooksLine(repoHooks, sandboxed)}</p>
+                <ul className="m-0 mt-0.5 list-none p-0">
+                  {repoHooksItems(repoHooks).map((item, i) => (
+                    <li key={i} title={item} className="truncate font-mono text-[10px] text-octo-mute">{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {cliNote && cli?.version && (
               <div
                 data-tour="direct-launcher-cli-version"
@@ -497,6 +672,63 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                   {cliUpdate ? `${CLAUDE_UPDATE_REASON} ` : ""}The run can still begin.
                 </p>
               </div>
+            )}
+            {modelFloorLine && (
+              <p
+                data-tour="direct-launcher-model-floor"
+                data-testid="launcher-claude-model-floor"
+                title="A stage on this model may not run until Claude Code is updated. The run can still begin."
+                className="octo-rise-in octo-tabular m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {modelFloorLine}
+              </p>
+            )}
+            {knownBadLine && (
+              <p
+                data-tour="direct-launcher-known-bad"
+                data-testid="launcher-claude-known-bad"
+                title="Only this one release is affected. The run can still begin."
+                className="octo-rise-in octo-tabular m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {knownBadLine}
+              </p>
+            )}
+            <RetiringModelLine
+              key={`retiring-${selected.pipeline.id}`}
+              pipeline={selected}
+              overrides={overrides}
+              onSwitched={(id, fromIds) => {
+                // As with a superseded model: follow a builtin's fork, and drop
+                // launcher picks of the retiring model.
+                setSelectedId(id);
+                setOverrides((prev) => Object.fromEntries(Object.entries(prev).filter(([, m]) => !fromIds.includes(m))));
+              }}
+            />
+            {codexTrust && (
+              <div data-tour="direct-launcher-codex-trust" data-testid="launcher-codex-trust" className="octo-rise-in mt-3">
+                <p className="m-0 font-mono text-[11px] text-octo-warning">{codexTrust.line}</p>
+                <p className="m-0 mt-0.5 text-[11px] leading-[1.55] text-octo-sage">{codexTrust.how} The run can still begin.</p>
+              </div>
+            )}
+            {codexCommitLine && (
+              <p
+                data-tour="direct-launcher-codex-commit"
+                data-testid="launcher-codex-commit"
+                title="Codex keeps the worktree's git data read-only in its own sandbox. The run can still begin."
+                className="octo-rise-in m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {codexCommitLine}
+              </p>
+            )}
+            {codexReadOnlyLine && (
+              <p
+                data-tour="direct-launcher-codex-read-only"
+                data-testid="launcher-codex-read-only"
+                title="Codex's own read-only sandbox can't run inside Octopush's sandbox, so this stage would fail when it starts. The run can still begin."
+                className="octo-rise-in m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {codexReadOnlyLine}
+              </p>
             )}
           </>
         )}

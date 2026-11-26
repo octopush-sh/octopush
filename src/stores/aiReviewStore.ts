@@ -2,9 +2,16 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
-import { AI_REVIEW_SCHEMA, AI_REVIEW_SYSTEM, buildReviewPrompt, parseAiReview, type AiReviewResult } from "../lib/aiReview";
-
-const DEFAULT_MODEL = "claude-sonnet-4-6";
+import {
+  AI_REVIEW_SCHEMA,
+  AI_REVIEW_SYSTEM,
+  buildReviewPrompt,
+  fitReviewDiff,
+  parseAiReview,
+  type AiReviewResult,
+  type ReviewPartial,
+} from "../lib/aiReview";
+import { helperModelNow, resolveHelperModel } from "../lib/helperModels";
 
 export type ReviewStatus = "idle" | "running" | "done" | "error";
 export interface WsReview {
@@ -12,8 +19,22 @@ export interface WsReview {
   result: AiReviewResult | null;
   diffHash: string | null;
   error: string | null;
+  /** What the result didn't read (#943); null when it read the whole diff.
+   *  Kept with the result, so a stale result still says it was partial. */
+  partial: ReviewPartial | null;
 }
-const EMPTY: WsReview = { status: "idle", result: null, diffHash: null, error: null };
+const EMPTY: WsReview = { status: "idle", result: null, diffHash: null, error: null, partial: null };
+
+/** The model's context window from the catalog; null when it isn't listed
+ *  or the catalog can't be read (the diff then goes as is). */
+async function modelContextWindow(model: string): Promise<number | null> {
+  try {
+    const catalog = await ipc.listModels();
+    return catalog.find((m) => m.model.id === model)?.model.maxContext ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /** Stable FNV-1a hash of the diff string — used to detect "diff changed". */
 export function diffHash(s: string): string {
@@ -59,7 +80,8 @@ export const useAiReview = create<State>()(
       reviews: {},
       runGen: {},
       collapsed: {},
-      modelFor: (ws) => get().models[ws] ?? DEFAULT_MODEL,
+      // No pick for this workspace → the review tier of the builtin lineup.
+      modelFor: (ws) => get().models[ws] ?? helperModelNow("review"),
       reviewFor: (ws) => get().reviews[ws] ?? EMPTY,
       collapsedFor: (ws) => get().collapsed[ws] ?? true,
       setModel: (ws, model) => set((s) => ({ models: { ...s.models, [ws]: model } })),
@@ -68,26 +90,34 @@ export const useAiReview = create<State>()(
       clearError: (ws) =>
         set((s) => ({ reviews: { ...s.reviews, [ws]: { ...(s.reviews[ws] ?? EMPTY), error: null } } })),
       run: async (ws, gitDiff) => {
-        const model = get().modelFor(ws);
+        const picked = get().models[ws];
         const gen = (get().runGen[ws] ?? 0) + 1;
         set((s) => ({
           runGen: { ...s.runGen, [ws]: gen },
           reviews: { ...s.reviews, [ws]: { ...EMPTY, status: "running" } },
         }));
         try {
-          const res = await ipc.aiComplete(model, AI_REVIEW_SYSTEM, buildReviewPrompt(gitDiff), {
+          const model = picked ?? (await resolveHelperModel("review"));
+          const fitted = fitReviewDiff(gitDiff, await modelContextWindow(model));
+          const res = await ipc.aiComplete(model, AI_REVIEW_SYSTEM, buildReviewPrompt(fitted.diff, fitted.partial), {
             workspaceId: ws,
             jsonSchema: AI_REVIEW_SCHEMA,
           });
           if (get().runGen[ws] !== gen) return; // a newer run superseded this one
           const result = parseAiReview(res.text);
           set((s) => ({
-            reviews: { ...s.reviews, [ws]: { status: "done", result, diffHash: diffHash(gitDiff), error: null } },
+            reviews: {
+              ...s.reviews,
+              [ws]: { status: "done", result, diffHash: diffHash(gitDiff), error: null, partial: fitted.partial },
+            },
           }));
         } catch (e) {
           if (get().runGen[ws] !== gen) return;
           set((s) => ({
-            reviews: { ...s.reviews, [ws]: { status: "error", result: null, diffHash: null, error: e instanceof Error ? e.message : String(e) } },
+            reviews: {
+              ...s.reviews,
+              [ws]: { status: "error", result: null, diffHash: null, error: e instanceof Error ? e.message : String(e), partial: null },
+            },
           }));
         }
       },
@@ -112,15 +142,13 @@ export const useAiReview = create<State>()(
 // (Settings · Models & Providers — the same `list_providers` source the
 // ModelPicker renders) can drop or disable them between sessions.
 
-/** Map persisted per-workspace model ids that are no longer in the live
- *  catalog (retired, or their provider disabled) back to the default model,
- *  with a one-time info toast naming what was dropped. */
+/** Drop persisted per-workspace model ids that are no longer in the live
+ *  catalog (retired, or their provider disabled), so those workspaces use the
+ *  default model again, with a one-time info toast naming what was dropped. */
 export async function reconcileAiReviewModels(): Promise<void> {
   if (reconciled) return;
   reconciled = true;
-  const entries = Object.entries(useAiReview.getState().models).filter(
-    ([, id]) => id !== DEFAULT_MODEL,
-  );
+  const entries = Object.entries(useAiReview.getState().models);
   if (entries.length === 0) return;
   let providers;
   try {
@@ -134,13 +162,15 @@ export async function reconcileAiReviewModels(): Promise<void> {
   );
   const stale = entries.filter(([, id]) => !valid.has(id));
   if (stale.length === 0) return;
+  const staleWs = new Set(stale.map(([ws]) => ws));
   useAiReview.setState((s) => ({
-    models: { ...s.models, ...Object.fromEntries(stale.map(([ws]) => [ws, DEFAULT_MODEL])) },
+    models: Object.fromEntries(Object.entries(s.models).filter(([ws]) => !staleWs.has(ws))),
   }));
   const retired = [...new Set(stale.map(([, id]) => id))];
+  const fallback = await resolveHelperModel("review");
   pushToast({
     level: "info",
     title: "AI review model reset",
-    body: `${retired.join(", ")} ${retired.length > 1 ? "are" : "is"} no longer in the model catalog — using ${DEFAULT_MODEL}.`,
+    body: `${retired.join(", ")} ${retired.length > 1 ? "are" : "is"} no longer in the model catalog — using ${fallback}.`,
   });
 }

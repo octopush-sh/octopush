@@ -5,6 +5,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { readable } from "../test-utils/readable";
 
 // ─── IPC mocks ────────────────────────────────────────────────────────
 
@@ -213,6 +214,28 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     const inputs = screen.getAllByPlaceholderText(/project key/i) as HTMLInputElement[];
     expect(inputs[0].value).toBe("CLPNSNS");
     expect(inputs[1].value).toBe("");
+  });
+
+  it("middle-truncates long project names so sibling projects keep their distinct tails", async () => {
+    listRecentProjectsMock.mockResolvedValue([
+      { id: "p1", name: "octopush-enterprise-mobile", path: "/p1", jiraProjectKey: null },
+      { id: "p2", name: "octopush-enterprise-billing", path: "/p2", jiraProjectKey: null },
+    ]);
+
+    await renderIntegrationsPane();
+    await screen.findByText(/project links/i);
+
+    const mobile = screen.getByTitle("octopush-enterprise-mobile");
+    const billing = screen.getByTitle("octopush-enterprise-billing");
+    // The tail is pinned outside the ellipsizing head, so it can't be cut.
+    expect(mobile.querySelector(".octo-midtrunc-tail")?.textContent).toBe("prise-mobile");
+    expect(billing.querySelector(".octo-midtrunc-tail")?.textContent).toBe("rise-billing");
+    // The label is the elastic column (a definite width), not a fixed 160px one.
+    // …and a FLEX box: as a block, the inline-flex MidTruncate inside it was
+    // sized from its own text and ran under the key input, hard-cut (#757).
+    expect(mobile).toHaveClass("flex", "min-w-0", "flex-1");
+    // Full name in the DOM; the only extra glyph is the aria-hidden `…`.
+    expect(readable(mobile)).toBe("octopush-enterprise-mobile");
   });
 
   it("saving a Project links row calls updateProjectJiraKey with the right args", async () => {

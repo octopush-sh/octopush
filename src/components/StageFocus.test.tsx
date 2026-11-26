@@ -33,7 +33,7 @@ const baseStage = {
 
 describe("StageFocus live journal", () => {
   beforeEach(() => {
-    useRunsStore.setState({ liveByStage: {} });
+    useRunsStore.setState({ liveByStage: {}, liveContextByStage: {} });
     vi.mocked(ipc.getStageLog).mockResolvedValue([]);
     vi.mocked(ipc.listStageIterations).mockResolvedValue([]);
   });
@@ -55,13 +55,17 @@ describe("StageFocus live journal", () => {
     expect(document.body.textContent).not.toContain("§");          // the glyph is retired
   });
 
-  it("holds the journal slot with a waiting row and the inline Player before the first entry", () => {
+  it("shows one waiting indicator before the first entry: the inline Player", () => {
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
-    const waiting = screen.getByText("Waiting for the first tool call…");
+    // No second, mono waiting row — the run-track card's live line says it (#586).
+    expect(screen.queryByText(/first tool call/i)).not.toBeInTheDocument();
+    expect(document.querySelector('[data-tour="direct-focus-waiting"]')).toBeNull();
+    expect(screen.getAllByText("Thinking…")).toHaveLength(1);
     const player = screen.getByText("Thinking…").closest("[data-placement]")!;
     expect(player.getAttribute("data-placement")).toBe("inline");
     // Docked at the journal's tail, in the same scroll flow — not pinned to the canvas bottom.
-    const scroller = waiting.closest(".overflow-auto")!;
+    const scroller = player.closest(".overflow-auto")!;
+    expect(scroller).not.toBeNull();
     expect(scroller.contains(player)).toBe(true);
     expect(scroller.lastElementChild).toBe(player);
     expect(player.className).not.toMatch(/\babsolute\b/);
@@ -92,11 +96,44 @@ describe("StageFocus live journal", () => {
     expect(player.className).not.toMatch(/\babsolute\b/);
   });
 
+  it("a gate's text artifact reads as a document the director can comment on (#957)", () => {
+    const parkedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "running",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: null, budgetUsd: null, detached: false,
+    } as any;
+    const artifact = JSON.stringify({ kind: "plan", text: "## Steps\n\n1. Add the column" });
+    const gate = { ...baseStage, status: "awaiting_checkpoint", checkpoint: true, startedAt: "t", artifact };
+    const { rerender } = render(<StageFocus stage={gate} workspacePath="/tmp" run={parkedRun} runBlocked />);
+    const doc = document.querySelector('[data-tour="direct-gate-document"]')!;
+    expect(doc).not.toBeNull();
+    expect(doc.querySelector("h2")?.textContent).toBe("Steps"); // rendered, not raw Markdown
+    expect(screen.getByText("Select a passage, then Comment. From the keyboard: ↑ ↓ and ⏎.")).toBeInTheDocument();
+    // Once decided, the same artifact is read-only text again.
+    rerender(<StageFocus stage={{ ...gate, status: "done" }} workspacePath="/tmp" run={parkedRun} />);
+    expect(document.querySelector('[data-tour="direct-gate-document"]')).toBeNull();
+  });
+
   it("puts a budget-parked stage's Player under the header too", () => {
     useRunsStore.setState({ liveByStage: { st1: [{ kind: "notice", text: "budget reached" }] } });
     render(<StageFocus stage={{ ...baseStage, status: "awaiting_checkpoint" }} workspacePath="/tmp" />);
     const scroller = screen.getByText(/budget reached/).closest(".overflow-auto")!;
     expect(scroller.contains(screen.getByText("Waiting for you"))).toBe(false);
+  });
+
+  it("an aborted run's checkpoint stage shows the abort, not \"Waiting for you\" (#844)", () => {
+    const parkedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "running",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: null, budgetUsd: null, detached: false,
+    } as any;
+    const gate = { ...baseStage, status: "awaiting_checkpoint", checkpoint: true, startedAt: "t" };
+    const { rerender } = render(<StageFocus stage={gate} workspacePath="/tmp" run={parkedRun} runBlocked />);
+    expect(screen.getByText("Waiting for you")).toBeInTheDocument();
+    expect(screen.queryByTestId("stage-aborted")).not.toBeInTheDocument();
+    rerender(<StageFocus stage={gate} workspacePath="/tmp" run={{ ...parkedRun, status: "aborted" }} />);
+    expect(screen.queryByText("Waiting for you")).not.toBeInTheDocument();
+    expect(screen.getByTestId("stage-aborted").textContent).toMatch(/aborted/);
   });
 
   it("plays the done beat where the Player was when the stage finishes with an artifact", () => {
@@ -109,16 +146,14 @@ describe("StageFocus live journal", () => {
     expect(beat!.closest(".overflow-auto")).not.toBeNull();
   });
 
-  it("drops the waiting row once the first entry lands", () => {
+  it("fills the journal slot once the first entry lands", () => {
     useRunsStore.setState({ liveByStage: { st1: [{ kind: "tool", tool: "Read", hint: "src/a.ts" }] } });
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
-    expect(screen.queryByText("Waiting for the first tool call…")).not.toBeInTheDocument();
     expect(screen.getByText("src/a.ts")).toBeInTheDocument();
   });
 
-  it("shows no waiting row on a stage that isn't running", () => {
+  it("keeps the idle empty state on a stage that isn't running", () => {
     render(<StageFocus stage={{ ...baseStage, status: "pending" }} workspacePath="/tmp" />);
-    expect(screen.queryByText("Waiting for the first tool call…")).not.toBeInTheDocument();
     expect(screen.getByText("Nothing produced yet.")).toBeInTheDocument();
   });
 
@@ -194,6 +229,89 @@ describe("StageFocus live journal", () => {
     const artifact = JSON.stringify({ kind: "note", text: "final artifact text" });
     render(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
     expect(screen.queryByRole("button", { name: /work journal/i })).not.toBeInTheDocument();
+  });
+
+  it("shows the stage's context reading in the header, toned, running or finished (#895)", () => {
+    const { container, rerender } = render(
+      <StageFocus stage={{ ...baseStage, contextTokens: 142_000, contextWindow: 200_000 }} workspacePath="/tmp" />,
+    );
+    const ctx = () => container.querySelector('[data-tour="direct-focus-context"]');
+    expect(ctx()).toHaveTextContent("ctx 142k / 200k");
+    expect(ctx()).toHaveClass("text-octo-mute");
+    rerender(
+      <StageFocus stage={{ ...baseStage, contextTokens: 194_000, contextWindow: 200_000 }} workspacePath="/tmp" />,
+    );
+    expect(ctx()).toHaveClass("text-octo-rouge");
+    // A finished stage keeps its final reading here.
+    rerender(
+      <StageFocus
+        stage={{ ...baseStage, status: "done", artifact: JSON.stringify({ kind: "note", text: "ok" }), contextTokens: 170_000, contextWindow: 200_000 }}
+        workspacePath="/tmp"
+      />,
+    );
+    expect(ctx()).toHaveTextContent("ctx 170k / 200k");
+    expect(ctx()).toHaveClass("text-octo-warning");
+  });
+
+  it("prefers the newest live reading, and hides a pending stage's or an over-window one (#895)", () => {
+    useRunsStore.setState({ liveContextByStage: { st1: { contextTokens: 180_000, contextWindow: 200_000 } } });
+    const { container, rerender } = render(
+      <StageFocus stage={{ ...baseStage, contextTokens: 120_000, contextWindow: 200_000 }} workspacePath="/tmp" />,
+    );
+    const ctx = () => container.querySelector('[data-tour="direct-focus-context"]');
+    expect(ctx()).toHaveTextContent("ctx 180k / 200k");
+    useRunsStore.setState({ liveContextByStage: {} });
+    rerender(<StageFocus stage={{ ...baseStage, status: "pending", contextTokens: 120_000, contextWindow: 200_000 }} workspacePath="/tmp" />);
+    expect(ctx()).toBeNull();
+    rerender(<StageFocus stage={{ ...baseStage, contextTokens: 400_000, contextWindow: 200_000 }} workspacePath="/tmp" />);
+    expect(ctx()).toBeNull();
+  });
+
+  it("hides the context reading when the model's window is unknown (#895)", () => {
+    const { container } = render(
+      <StageFocus stage={{ ...baseStage, contextTokens: 142_000, contextWindow: null }} workspacePath="/tmp" />,
+    );
+    expect(container.querySelector('[data-tour="direct-focus-context"]')).toBeNull();
+    expect(container.textContent).not.toMatch(/ctx /);
+  });
+
+  it("shows the stage's cost in the header in ivory, leaving brass to the role eyebrow (#1017)", () => {
+    render(<StageFocus stage={{ ...baseStage, costUsd: 0.08 }} workspacePath="/tmp" />);
+    const cost = screen.getByText("$0.08");
+    expect(cost).toHaveClass("text-octo-ivory", "octo-tabular");
+    expect(cost).not.toHaveClass("text-octo-brass");
+  });
+
+  it("says in the header how many tool calls Claude Code refused, in amber (#893)", () => {
+    const artifact = JSON.stringify({ kind: "diff", text: "done" });
+    const { rerender } = render(
+      <StageFocus stage={{ ...baseStage, status: "done", artifact, refusedCalls: 1 }} workspacePath="/tmp" />,
+    );
+    const note = screen.getByText("1 tool call refused");
+    expect(note).toHaveClass("text-octo-warning");
+    expect(note.getAttribute("data-tour")).toBe("direct-focus-refused");
+    rerender(<StageFocus stage={{ ...baseStage, status: "done", artifact, refusedCalls: 0 }} workspacePath="/tmp" />);
+    expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
+  });
+
+  it("hides a previous attempt's refused count while the stage runs again or an abort cut it (#893)", () => {
+    const { rerender } = render(
+      <StageFocus stage={{ ...baseStage, status: "running", refusedCalls: 3 }} workspacePath="/tmp" />,
+    );
+    expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
+    const abortedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "aborted",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: "t", budgetUsd: null, detached: false,
+    } as any;
+    rerender(
+      <StageFocus
+        stage={{ ...baseStage, status: "awaiting_checkpoint", refusedCalls: 3 }}
+        workspacePath="/tmp"
+        run={abortedRun}
+      />,
+    );
+    expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
   });
 });
 
@@ -376,6 +494,19 @@ describe("StageFocus journal hydration (D1)", () => {
     expect(useRunsStore.getState().getLiveEntries("st1")).toEqual([
       { kind: "text", text: "live line" },
     ]);
+  });
+
+  it("hydrates a stage an abort froze at running (#891)", async () => {
+    vi.mocked(ipc.getStageLog).mockResolvedValue([{ kind: "text", text: "persisted" }]);
+    const abortedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "aborted",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: "t", budgetUsd: null, detached: false,
+    } as any;
+    render(<StageFocus stage={baseStage} workspacePath="/tmp" run={abortedRun} />);
+    await waitFor(() =>
+      expect(useRunsStore.getState().getLiveEntries("st1")).toEqual([{ kind: "text", text: "persisted" }]),
+    );
   });
 
   it("does not hydrate a running stage from the persisted log", async () => {

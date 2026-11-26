@@ -1,10 +1,10 @@
 [package]
 name = "octopush"
-version = "0.4.111"
+version = "0.4.150"
 description = "The IDE for Agentic Developers"
 authors = ["Octopush contributors"]
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.95"
 # `[[bin]]` adds octopush-pty-server below; with multiple binaries Tauri
 # needs to be told which one is the app shell.
 default-run = "octopush"
@@ -42,6 +42,8 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-clipboard-manager = "2"
+# Used only in release builds (`#[cfg(not(debug_assertions))]` in lib.rs), so a
+# debug-profile clippy reports it as unused. It is needed: keep it.
 tauri-plugin-single-instance = "2"
 # Canonical paths without Windows' `\\?\` verbatim prefix (Open With).
 dunce = "1"
@@ -49,12 +51,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 portable-pty = "0.9"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "7"
 anyhow = "1"
-git2 = { version = "0.19", features = ["vendored-openssl", "vendored-libgit2"] }
+git2 = { version = "0.21", features = ["vendored-openssl", "vendored-libgit2"] }
 thiserror = "2"
 parking_lot = "0.12"
 bytes = "1"
@@ -91,14 +93,18 @@ ignore = "0.4"
 globset = "0.4"
 base64 = "0.23"
 urlencoding = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 # Verifies the server-signed entitlement token (entitlement_token.rs).
 # Verification only: the private key never exists on a client.
 ed25519-dalek = "2"
 keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 ctrlc = "3"
-sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
+# Reads a repo's `.conductor/settings.toml` to prefill the setup script
+# (`workspace_setup::conductor_setup_script`). Pinned to the toml already in
+# the lockfile (via tauri-utils), so it adds no crates.
+toml = "1.1.2"
 
 # `tls.rs` evaluates server certificates with macOS `SecTrust` itself (one
 # evaluation whose verdict and built chain, incl. AIA / keychain completion,
@@ -109,7 +115,7 @@ security-framework = { version = "3", default-features = false }
 core-foundation = "0.10"
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!

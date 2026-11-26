@@ -10,6 +10,10 @@
 #
 # (The daily digest's `promote <version>` answer dispatches exactly this.)
 #
+# After the promotion, `web-version` opens the website's version PR and
+# `homebrew-tap` publishes the Homebrew cask (docs/DISTRIBUTION.md). Neither
+# can undo the promotion.
+#
 # OWNER-ONLY, ENFORCED: the job runs in the `stable` environment, which must
 # require the owner's approval (repo → Settings → Environments → stable →
 # Required reviewers: the owner; and the repo variable OCTOPUSH_OWNER_LOGIN set
@@ -217,3 +221,143 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning::could not revoke the web token (it expires within the hour)"
+
+  homebrew-tap:
+    # Publish the Homebrew cask (brew install --cask octopush-sh/tap/octopush)
+    # for the version just promoted: render packaging/homebrew-tap/Casks/octopush.rb
+    # with the version and the sha256 of the release's Octopush.dmg, check it
+    # with brew style + brew audit, and push it to octopush-sh/homebrew-tap
+    # (main) with an Octopush Cycle app token scoped to that one repo. Betas
+    # never get here: this job needs `promote`, and it re-checks that the
+    # release is a full (non-pre) release. The first run on the empty tap repo
+    # creates its main branch. A failure here never undoes or fails the
+    # promotion above (the release is already stable); it is reported in the
+    # job summary, and re-running this job retries it.
+    needs: promote
+    runs-on: macos-15   # brew style / brew audit
+    timeout-minutes: 20
+    permissions:
+      contents: read   # this repo's release and the template
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      VERSION: ${{ github.event.inputs.version }}
+      TAP: octopush-sh/homebrew-tap
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Read the promoted DMG's sha256
+        id: dmg
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
+          rel="$(gh api "repos/$REPO/releases/tags/v$VERSION")"
+          if [ "$(jq -r '.prerelease or .draft' <<<"$rel")" != "false" ]; then
+            echo "::error::v$VERSION is not a full release — the tap only follows stable"; exit 1
+          fi
+          digest="$(jq -r '[.assets[] | select(.name == "Octopush.dmg")][0].digest // empty' <<<"$rel")"
+          if [[ "$digest" =~ ^sha256:([0-9a-f]{64})$ ]]; then
+            sha="${BASH_REMATCH[1]}"
+            echo "Octopush.dmg digest from the release: $sha"
+          else
+            echo "the release reports no sha256 digest for Octopush.dmg, hashing the asset"
+            dl="$RUNNER_TEMP/dmg"
+            mkdir -p "$dl"
+            gh release download "v$VERSION" --repo "$REPO" --pattern Octopush.dmg --dir "$dl"
+            sha="$(shasum -a 256 "$dl/Octopush.dmg" | awk '{print $1}')"
+            [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::could not hash Octopush.dmg"; exit 1; }
+            echo "Octopush.dmg sha256 (downloaded): $sha"
+          fi
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Render and check the cask
+        env:
+          SHA256: ${{ steps.dmg.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          node scripts/homebrew-cask.mjs render packaging/homebrew-tap/Casks/octopush.rb "$VERSION" "$SHA256" > "$RUNNER_TEMP/octopush.rb"
+          bash scripts/homebrew-cask-check.sh "$RUNNER_TEMP/octopush.rb"
+
+      - name: Tap token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: homebrew-tap
+          skip-token-revoke: true   # revoked explicitly below
+          permission-contents: write
+
+      - name: Push the cask to the tap
+        env:
+          TAP_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          tap="$RUNNER_TEMP/tap"
+          # The token reaches git through the environment, never argv; only git gets it.
+          auth="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          withtoken() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" "$@"; }
+          git init --quiet -b main "$tap"
+          git -C "$tap" remote add origin "https://github.com/$TAP.git"
+          # Exit 2 = the remote has no main branch (the tap repo is still empty).
+          rc=0
+          withtoken git -C "$tap" ls-remote --exit-code --heads origin main >/dev/null || rc=$?
+          if [ "$rc" = 0 ]; then
+            withtoken git -C "$tap" fetch --quiet --depth 1 origin main
+            git -C "$tap" checkout --quiet -B main FETCH_HEAD
+            first=""
+          elif [ "$rc" = 2 ]; then
+            echo "the tap has no main branch yet — this push creates it"
+            first=1
+          else
+            echo "::error::could not read $TAP (git ls-remote exit $rc) — is the Octopush Cycle app installed on it?"; exit 1
+          fi
+          cask="$tap/Casks/octopush.rb"
+          if [ -f "$cask" ]; then
+            current="$(sed -nE 's/^  version "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' "$cask" | head -n 1)"
+            if [ -n "$current" ] && [ "$current" != "$VERSION" ] && \
+               [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" = "$current" ]; then
+              echo "the tap already carries v$current, newer than v$VERSION — leaving it"
+              echo "Homebrew tap: left at **v$current** (newer than v$VERSION)." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          mkdir -p "$tap/Casks"
+          cp "$RUNNER_TEMP/octopush.rb" "$cask"
+          git -C "$tap" add Casks/octopush.rb
+          if [ -z "$first" ] && git -C "$tap" diff --cached --quiet; then
+            echo "the tap already has this cask"
+            echo "Homebrew tap: already at **v$VERSION**, nothing to push." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git -C "$tap" -c core.hooksPath=/dev/null -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet --no-verify -m "octopush $VERSION" \
+            -m "Rendered by octopush-sh/octopush promote.yml (run $GITHUB_RUN_ID) from packaging/homebrew-tap/Casks/octopush.rb."
+          withtoken git -C "$tap" push --quiet origin HEAD:refs/heads/main
+          echo "pushed octopush $VERSION to $TAP"
+          echo "Homebrew tap: **octopush $VERSION** pushed to https://github.com/$TAP${first:+ (first commit)} — \`brew install --cask octopush-sh/tap/octopush\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revoke the tap token
+        if: always() && steps.token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning::could not revoke the tap token (it expires within the hour)"
+
+      - name: Report a tap failure
+        if: failure()
+        run: |
+          {
+            echo "### Homebrew tap NOT updated"
+            echo
+            echo "v$VERSION **is** stable (the promote job succeeded and nothing was undone), but octopush-sh/homebrew-tap still has the previous cask."
+            echo "See the failed step above, then re-run this job (\`homebrew-tap\`) — it is safe to repeat."
+          } >> "$GITHUB_STEP_SUMMARY"

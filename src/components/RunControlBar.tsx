@@ -1,13 +1,19 @@
 import { useEffect, useState } from "react";
-import { Ban, RotateCcw, ChevronRight } from "lucide-react";
+import { Ban, RotateCcw, ChevronRight, Hourglass } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
-import { isTransientHalt } from "../lib/runStatus";
+import { isTerminalRun, isTransientHalt } from "../lib/runStatus";
 import { labelForRole } from "../lib/stageMeta";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
 import { Stepper } from "./controls/Stepper";
 import { ModalShell } from "./ModalShell";
-import { haltCause } from "../lib/stageHalt";
+import { haltCause, isDeferredToolUnavailable } from "../lib/stageHalt";
+import { formatUsd } from "../lib/cost";
+import { isPlanLimitHalt, planWaitSentence, planWaitWhy } from "../lib/planWait";
+import { useRunsStore } from "../stores/runsStore";
+import { findingLocation, holdSummary } from "../lib/secretGuard";
+import { commentCount, composeGateFeedback, gateKey, type GateComment } from "../lib/gateComments";
+import { useGateComments } from "../stores/gateCommentsStore";
 
 interface LoopState {
   iteration: number;
@@ -28,9 +34,19 @@ interface Props {
   onPause: () => void;
   onStopStage: () => void;
   onAbort: () => void;
-  onApprove: () => void;
+  /** Approve; at a gate with the director's comments (#957), they come
+   *  along: to the next stage as guidance, or, with no stage left to take
+   *  them, to be set aside once the approve went through. Whoever handles
+   *  the decision clears the comments, and only when it succeeded. */
+  onApprove: (comments?: GateComment[]) => void;
+  /** Who an approve with comments hands them to ("Implement", "2 stages"),
+   *  or null when no stage that hasn't begun follows. */
+  nextStageLabel?: string | null;
   onReject: (feedback: string, maxTurns?: number) => void;
   onResume: (maxTurns?: number) => void;
+  /** Resume a stage whose deferred tool is gone, dropping that call. Offered
+   *  only on that halt, beside "Reconnect and resume". */
+  onDropCall?: (maxTurns?: number) => void;
   onDiscard: () => void;
   onSendBack: (feedback: string) => void;
   /** Answer a stage parked via the `ask_director` escape valve (positional). */
@@ -38,7 +54,6 @@ interface Props {
   onRunAgain: () => void;
 }
 
-const TERMINAL = new Set(["completed", "aborted", "failed"]);
 
 function firstLine(error: string | null): string {
   const line = (error ?? "").split("\n")[0].trim();
@@ -72,6 +87,28 @@ function IconCtl({
   );
 }
 
+/** Abort is irreversible (#849): every Abort on the bar asks first. Returns
+ *  the guarded trigger and the confirm dialog (ModalShell, Escape cancels) to
+ *  render beside it. The run ends; the worktree keeps whatever the stages
+ *  already wrote. */
+function useAbortConfirm(onAbort: () => void): [() => void, React.ReactNode] {
+  const [open, setOpen] = useState(false);
+  const dialog = open ? (
+    <ModalShell onClose={() => setOpen(false)} closeOnBackdrop={false} ariaLabel="Confirm abort"
+      panelClassName="w-[420px] rounded-lg border border-octo-hairline bg-octo-panel p-6">
+      <p className="font-serif text-[17px] text-octo-ivory">End this run here?</p>
+      <p className="mt-2 text-sm text-octo-sage">Aborting stops the run for good: it can&apos;t be resumed, only started again. The worktree keeps what the stages already wrote.</p>
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" autoFocus onClick={() => setOpen(false)}
+          className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory">Keep the run</button>
+        <button type="button" onClick={() => { setOpen(false); onAbort(); }}
+          className="rounded-md border border-[color:var(--rouge-border)] px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]">Abort the run</button>
+      </div>
+    </ModalShell>
+  ) : null;
+  return [() => setOpen(true), dialog];
+}
+
 /**
  * The single, state-adaptive command surface for a run. It subsumes the old
  * RunTrack controls and the CheckpointBar: while running it offers pause / stop
@@ -82,7 +119,7 @@ function IconCtl({
 export function RunControlBar(props: Props) {
   const { run, blockedStage } = props;
 
-  if (TERMINAL.has(run.status)) {
+  if (isTerminalRun(run.status)) {
     return <TerminalBar run={run} onRunAgain={props.onRunAgain} />;
   }
   if (run.status === "draft") {
@@ -98,6 +135,18 @@ export function RunControlBar(props: Props) {
           blockedStage={blockedStage}
           beacon={props.beacon ?? false}
           onAnswer={props.onAnswerBlocker}
+        />
+      );
+    }
+    // A Claude plan limit: the stage waits for the plan's window to reset.
+    if (blockedStage.status === "failed" && isPlanLimitHalt(blockedStage.error)) {
+      return (
+        <PlanWaitBar
+          run={run}
+          blockedStage={blockedStage}
+          beacon={props.beacon ?? false}
+          onResume={props.onResume}
+          onAbort={props.onAbort}
         />
       );
     }
@@ -236,6 +285,71 @@ function BlockedAskBar({
   );
 }
 
+/** The beacon on an amber halt's CTA (transient fault, plan limit): the same
+ *  pulse, in amber ink — amber is caution, never brass (#818). */
+const AMBER_BEACON = "octo-stage-pulse octo-stage-pulse-warning";
+
+/** A stage stopped by the director's Claude plan (#731). With an automatic
+ *  resume scheduled the bar is calm — nobody has to decide, so it never
+ *  carries the beacon: "Resume now" continues early, "Don't resume
+ *  automatically" leaves it for a manual Resume. Without one (cap reached,
+ *  budget spent, turned off) Resume is the decision, and takes the beacon. */
+function PlanWaitBar({
+  run,
+  blockedStage,
+  beacon,
+  onResume,
+  onAbort,
+}: {
+  run: Run;
+  blockedStage: RunStage;
+  beacon: boolean;
+  onResume: (maxTurns?: number) => void;
+  onAbort: () => void;
+}) {
+  const cancelPlanResume = useRunsStore((s) => s.cancelPlanResume);
+  const [requestAbort, abortDialog] = useAbortConfirm(onAbort);
+  const scheduled = run.planWait?.resumeAt != null;
+  const why = planWaitWhy(run);
+  return (
+    <div className="octo-fade-in border-t border-[var(--warning-border)] bg-[var(--warning-ghost)] px-4 py-3" data-tour="direct-plan-wait">
+      <div className="flex items-center gap-3">
+        <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-warning">
+          <Hourglass size={11} aria-hidden />
+          plan limit
+        </span>
+        <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={why}>
+          <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> {planWaitSentence(run, Date.now())}
+        </span>
+        <button
+          type="button"
+          onClick={() => onResume()}
+          title={scheduled ? "Continue the same session now, before the plan's window resets" : "Continue the same session"}
+          className={`${!scheduled && beacon ? `${AMBER_BEACON} ` : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}
+        >
+          {scheduled ? "Resume now" : "Resume the stage"}
+        </button>
+        {scheduled && (
+          <button
+            type="button"
+            onClick={() => void cancelPlanResume(run.id).catch(console.error)}
+            title="Keep it parked until you resume it yourself"
+            data-tour="direct-plan-wait-cancel"
+            className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory"
+          >
+            Don&apos;t resume automatically
+          </button>
+        )}
+        <button type="button" onClick={requestAbort}
+          className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
+          Abort
+        </button>
+      </div>
+      {abortDialog}
+    </div>
+  );
+}
+
 function DecisionBar({
   blockedStage,
   loopTargetRole,
@@ -244,22 +358,42 @@ function DecisionBar({
   onApprove,
   onReject,
   onResume,
+  onDropCall,
   onDiscard,
   onSendBack,
   onAbort,
+  nextStageLabel = null,
 }: Props & { blockedStage: RunStage }) {
   const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
+  // The director's inline comments on the gate's artifact (#957).
+  const comments = useGateComments(gateKey(blockedStage));
   const [feedback, setFeedback] = useState("");
   const [showWhy, setShowWhy] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [requestAbort, abortDialog] = useAbortConfirm(onAbort);
   const defaultTurns = Math.min(100, Math.max(5, Math.round((blockedStage.maxIterations * 2) / 5) * 5));
   const [turns, setTurns] = useState(() => defaultTurns);
 
   const failed = blockedStage.status === "failed";
-  const transient = failed && isTransientHalt(blockedStage.error);
+  // Secret guard (#730): an Action stage held before it started because the
+  // worktree holds a possible secret, the scan stopped at its 16 MB budget,
+  // or the worktree couldn't be read (fail closed). Approving is the
+  // explicit override.
+  const secret = !failed && blockedStage.secretHold && !blockedStage.secretHold.acknowledged
+    ? blockedStage.secretHold
+    : null;
+  const secretCount = secret ? Math.max(secret.total ?? 0, secret.findings.length) : 0;
+  const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
+  // A cause that prefers a re-run (a deferred tool) is never a transient wait.
+  const transient = failed && !cause.preferRerun && isTransientHalt(blockedStage.error);
   const canResume = blockedStage.substrate === "cli" && !!blockedStage.sessionId;
   const canDiscard = !!blockedStage.baselineCommit;
-  const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
+  // Resume is the primary action when it can continue the session, unless the
+  // cause says a fresh attempt is the likelier way forward (a deferred tool).
+  const resumeFirst = canResume && !cause.preferRerun;
+  // A resumed session waiting on a tool that's gone: resume once it's back,
+  // or drop the call and let Claude carry on without it.
+  const toolGone = failed && canResume && isDeferredToolUnavailable(blockedStage.error);
 
   // Reset the editor whenever a new checkpoint arrives (the bar stays mounted).
   useEffect(() => {
@@ -274,11 +408,27 @@ function DecisionBar({
   const canSendBack = loopTargetRole !== null && !atCap;
 
   function submitFeedback() {
-    if (mode === "reject") onReject(feedback, failed ? turns : undefined);
-    else onSendBack(feedback);
+    // With comments, the feedback is structured: each quoted passage and its
+    // note in document order, then the free-text note.
+    const fb = comments.length > 0 ? composeGateFeedback(comments, feedback) : feedback;
+    if (mode === "reject") onReject(fb, failed ? turns : undefined);
+    else onSendBack(fb);
     setMode("decide");
     setFeedback("");
   }
+
+  function approveGate() {
+    // The comments go with the approve either way; the store hands them to
+    // the next stage, or sets them aside when none follows, and keeps them
+    // if the approve is refused.
+    if (comments.length > 0) onApprove(comments);
+    else onApprove();
+  }
+  const hasComments = comments.length > 0;
+  // An approve of this gate is on its way (guidance being written, then the
+  // decision): the button waits, so a second click can't race the first.
+  const approving = useRunsStore((s) => !!s.approvingGates?.[`${blockedStage.runId}:${blockedStage.id}`]);
+  const them = comments.length === 1 ? "it" : "them";
 
   const tone = transient
     ? "border-[var(--warning-border)] bg-[var(--warning-ghost)]"
@@ -309,20 +459,40 @@ function DecisionBar({
             <div className="flex flex-col gap-2">
               <div className="flex items-center gap-3">
                 <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</span>
-                <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={blockedStage.error ?? undefined}>
+                <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={blockedStage.error ?? undefined} data-tour="direct-halt-cause">
                   <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> {cause.title}
                 </span>
-                <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
+                <button type="button" onClick={() => (resumeFirst ? onResume(turns) : onReject("", turns))}
                   className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]`}>
-                  {canResume ? `Resume · ${turns} turns` : `Re-run · ${turns} turns`}
+                  {resumeFirst ? `Resume · ${turns} turns` : `Re-run · ${turns} turns`}
                 </button>
-                {canResume && (
+                {resumeFirst && (
                   <button type="button" onClick={() => setMode("reject")}
                     className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
                     Re-run
                   </button>
                 )}
-                <button type="button" onClick={onAbort}
+                {!resumeFirst && (
+                  <button type="button" onClick={() => setMode("reject")} data-tour="direct-halt-rerun-feedback"
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    Re-run with feedback
+                  </button>
+                )}
+                {canResume && !resumeFirst && (
+                  <button type="button" onClick={() => onResume(turns)}
+                    title={toolGone ? "Once the tool is back, resume the session and run the paused call" : undefined}
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    {toolGone ? "Reconnect and resume" : "Resume"}
+                  </button>
+                )}
+                {toolGone && onDropCall && (
+                  <button type="button" onClick={() => onDropCall(turns)} data-tour="direct-halt-drop-call"
+                    title="Resume without the paused call: Claude gets an error as its result and carries on"
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    Drop the call and continue
+                  </button>
+                )}
+                <button type="button" onClick={requestAbort}
                   className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
                   Abort
                 </button>
@@ -341,7 +511,7 @@ function DecisionBar({
                   <div className="mb-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-octo-mute">
                     {blockedStage.sessionId && <span>session {blockedStage.sessionId.slice(0, 8)}</span>}
                     <span className="octo-tabular">{(blockedStage.inputTokens + blockedStage.outputTokens).toLocaleString()} tokens</span>
-                    <span className="octo-tabular">${blockedStage.costUsd.toFixed(2)}</span>
+                    <span className="octo-tabular">{formatUsd(blockedStage.costUsd)}</span>
                   </div>
                   <pre className="mb-3 max-h-32 overflow-auto rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-2 font-mono text-[11px] text-octo-mute whitespace-pre-wrap">{blockedStage.error ?? "no detail"}</pre>
                   <div className="flex flex-wrap items-center gap-3">
@@ -349,11 +519,11 @@ function DecisionBar({
                       turn budget
                       <Stepper value={turns} min={5} max={100} step={5} ariaLabel="Turn budget" onChange={setTurns} />
                     </span>
-                    <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
+                    <button type="button" onClick={() => (resumeFirst ? onResume(turns) : onReject("", turns))}
                       className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
-                      {canResume ? `Resume with ${turns} turns` : `Re-run with ${turns} turns`}
+                      {resumeFirst ? `Resume with ${turns} turns` : `Re-run with ${turns} turns`}
                     </button>
-                    <button type="button" onClick={onApprove}
+                    <button type="button" onClick={() => onApprove()}
                       className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
                       Accept partial work
                     </button>
@@ -385,8 +555,8 @@ function DecisionBar({
           ) : (
             /* ── Transient or checkpoint decide row ── */
             <div className="flex items-center gap-3">
-              <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed ? "text-octo-rouge" : "text-octo-brass"}`}>
-                {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : "⟜ checkpoint"}
+              <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed || secret ? "text-octo-rouge" : "text-octo-brass"}`}>
+                {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : secret ? "possible secret" : "⟜ checkpoint"}
               </span>
               <span
                 className="min-w-0 flex-1 truncate text-sm text-octo-sage"
@@ -396,24 +566,48 @@ function DecisionBar({
                   <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> paused on a transient fault: {firstLine(blockedStage.error)}</>
                 ) : failed ? (
                   <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
+                ) : secret ? (
+                  <span data-tour="direct-secret-hold" title={secret.findings.map((f) => `${f.kind} · ${findingLocation(f)}`).join("\n") || undefined}>
+                    Held before <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {holdSummary(secret)}
+                  </span>
+                ) : hasComments ? (
+                  <span data-tour="direct-gate-comment-count">
+                    <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {nextStageLabel
+                      ? `${commentCount(comments.length)} ${comments.length === 1 ? "goes" : "go"} with your decision.`
+                      // Said here, before the click: no stage is left to take them.
+                      : `${commentCount(comments.length)}. No stage follows to take ${them}: Approve leaves ${them} out, Reject${canSendBack ? " or Send back" : ""} carries ${them}.`}
+                  </span>
                 ) : (
                   <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
                 )}
               </span>
               {transient ? (
                 <button type="button" onClick={() => onResume()}
-                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}>
+                  className={`${beacon ? `${AMBER_BEACON} ` : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}>
                   Resume the stage
                 </button>
               ) : failed ? (
-                <button type="button" onClick={onApprove}
+                <button type="button" onClick={() => onApprove()}
                   className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
                   Accept &amp; continue
                 </button>
+              ) : secret ? (
+                <button type="button" onClick={() => onApprove()}
+                  title={secretCount > 0
+                    ? "Start this stage anyway, with exactly these findings. Remove them from the worktree first to continue without overriding."
+                    : "Start this stage anyway, without a complete check."}
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-[color:var(--rouge-border)] px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]`}>
+                  {secretCount > 1 ? "Proceed past them" : "Proceed regardless"}
+                </button>
               ) : (
-                <button type="button" onClick={onApprove}
-                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi`}>
-                  Approve &amp; continue
+                <button type="button" onClick={approveGate} disabled={approving}
+                  title={hasComments
+                    ? nextStageLabel
+                      ? `Your comments go to ${nextStageLabel} as guidance`
+                      : "No stage that hasn't begun follows, so approving sets your comments aside"
+                    : undefined}
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-50`}>
+                  {hasComments ? (nextStageLabel ? "Approve with comments" : "Approve without comments") : <>Approve &amp; continue</>}
                 </button>
               )}
               {canSendBack && (
@@ -426,7 +620,7 @@ function DecisionBar({
                 className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
                 {failed ? "Re-run" : "Reject"}
               </button>
-              <button type="button" onClick={onAbort}
+              <button type="button" onClick={requestAbort}
                 className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
                 Abort
               </button>
@@ -434,11 +628,18 @@ function DecisionBar({
           )
         ) : (
           <div className="flex flex-col gap-2">
+            {hasComments && (
+              <span className="font-mono text-[11px] text-octo-mute">
+                {commentCount(comments.length)} on the output {comments.length === 1 ? "goes" : "go"} with it, in document order.
+              </span>
+            )}
             <textarea
               autoFocus
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
-              placeholder={mode === "reject" ? "Optional feedback for the re-run…" : "Optional feedback for the send-back…"}
+              placeholder={hasComments
+                ? "Optional overall note…"
+                : mode === "reject" ? "Optional feedback for the re-run…" : "Optional feedback for the send-back…"}
               className="h-20 resize-none rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
             />
             <div className="flex gap-2">
@@ -455,6 +656,7 @@ function DecisionBar({
           </div>
         )}
       </FadeSwap>
+      {abortDialog}
     </div>
   );
 }

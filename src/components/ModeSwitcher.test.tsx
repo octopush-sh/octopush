@@ -24,4 +24,43 @@ describe("ModeSwitcher", () => {
     fireEvent.click(screen.getByRole("button", { name: /review/i }));
     expect(onChange).toHaveBeenCalledWith("review");
   });
+
+  it("names every mode without its label, so an icon-only segment still has a name and a tooltip", () => {
+    render(<ModeSwitcher mode="run" onChange={vi.fn()} />);
+    for (const [name, title] of [
+      ["Run", "Run (⌘⇧1)"],
+      ["Talk", "Talk (⌘⇧2)"],
+      ["Review", "Review (⌘⇧3)"],
+      ["Direct", "Direct (⌘⇧D)"],
+    ]) {
+      const segment = screen.getByRole("button", { name });
+      expect(segment).toHaveAttribute("aria-label", name);
+      expect(segment).toHaveAttribute("title", title);
+      expect(segment.querySelector("svg")).not.toBeNull();
+    }
+  });
+
+  it("numbers the shortcuts in the order the segments sit, left to right", () => {
+    render(<ModeSwitcher mode="run" onChange={vi.fn()} />);
+    expect(screen.getAllByRole("button").map((s) => s.getAttribute("title"))).toEqual([
+      "Run (⌘⇧1)",
+      "Talk (⌘⇧2)",
+      "Review (⌘⇧3)",
+      "Direct (⌘⇧D)",
+    ]);
+  });
+
+  it("puts each label on the band's ladder; the pressed one is the rung that never sheds", () => {
+    render(<ModeSwitcher mode="review" onChange={vi.fn()} />);
+    const segments = screen.getAllByRole("button");
+    expect(segments).toHaveLength(4);
+    for (const segment of segments) {
+      expect(segment.className).toContain("octo-mode-seg");
+      const label = segment.querySelector(".octo-demote-mode-label")!;
+      expect(label.className).toContain("octo-demote");
+      expect(label).toHaveTextContent(segment.getAttribute("aria-label")!);
+    }
+    // The sheet sheds `.octo-mode-seg:not([aria-pressed="true"])` labels only.
+    expect(segments.filter((s) => s.getAttribute("aria-pressed") === "true").map((s) => s.textContent)).toEqual(["Review"]);
+  });
 });

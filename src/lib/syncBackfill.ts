@@ -61,6 +61,8 @@ export function runSyncBackfill(kind: SyncKind, opts: { announce?: boolean } = {
       // Launch: silent — offline just means it syncs on a later launch.
     } finally {
       delete inflight[kind];
+      // The backfill's pushes just updated the line under the toggle.
+      void useSyncPrefsStore.getState().loadStatus();
     }
   })();
   inflight[kind] = run;

@@ -16,6 +16,11 @@
 
 import type { Node, Edge } from "@xyflow/react";
 import type { AgentSubstrate, Effort, PipelineWithStages, PipelineStage, Role, StageDraft } from "../../lib/ipc";
+import { helperModelNow } from "../../lib/helperModelIds";
+
+/** The most loop-backs a review stage may take. Matches Rust
+ *  `db::MAX_LOOP_ITERATIONS`, which the stage validator enforces. */
+export const MAX_LOOP_ITERATIONS = 9;
 
 // ─── Tools ────────────────────────────────────────────────────────────────
 // Keep in sync with KNOWN_TOOLS in src-tauri/src/db.rs and tool_definitions().
@@ -118,13 +123,13 @@ export interface StageNodeData {
   customName: string | null;
   agentModel: string;
   /** Per-stage reasoning effort; null = off (no thinking) on the API, Claude
-   *  Code's own default on a Claude Code CLI stage; Codex ignores it. */
+   *  Code's or Codex's own default on a CLI stage. */
   effort: Effort | null;
   /** Escalation policy — the stronger model to retry with on failure; null =
    *  no model swap. Either escalate field set = the stage escalates. */
   escalateModel: string | null;
   /** Escalation policy — the effort to bump to on the failed-retry (API, or a
-   *  Claude Code CLI stage as `--effort`; Codex ignores it). */
+   *  CLI stage as Claude Code's `--effort` or Codex's `model_reasoning_effort`). */
   escalateEffort: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
@@ -149,7 +154,6 @@ export interface EdgeData {
 export type StageEdge = Edge<EdgeData>;
 
 export const DEFAULT_MAX_TURNS = 25;
-const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 /** Whether a model id maps to a CLI dialect the backend can run — mirrors
  *  `dialect_for_model` in src-tauri/src/orchestrator/cli_runner.rs:
@@ -182,7 +186,7 @@ export function newStageData(role: string): StageNodeData {
   return {
     role,
     customName: null,
-    agentModel: DEFAULT_MODEL,
+    agentModel: helperModelNow("review"),
     effort: null,
     escalateModel: null,
     escalateEffort: null,

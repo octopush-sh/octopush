@@ -3,8 +3,16 @@ import type { Run, RunStage } from "../lib/ipc";
 import { savingsVsBaseline } from "../lib/runStatus";
 import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
+import { ranOnNote, ranOnTitle } from "../lib/modelLabel";
 import { OctoMark } from "./icons/OctoMark";
-import { budgetUnenforceableNote, unpricedTitle } from "../lib/cost";
+import {
+  budgetUnenforceableNote,
+  formatUsd,
+  unpricedTitle,
+  USAGE_UNREPORTED_TITLE,
+  usageUnreportedNote,
+  usageUnreportedTitle,
+} from "../lib/cost";
 
 interface Props {
   run: Run;
@@ -12,11 +20,11 @@ interface Props {
 }
 
 /** The ledger strip — Direct's cost surface, savings-first (the differentiator
- *  leads). Single calm line + 2px progress inset; click to unfold the per-stage
+ *  leads). A single calm line, no progress bar: the printed "N% under
+ *  all-premium" is the one encoding of that fact. Click to unfold the per-stage
  *  breakdown. On run completion, a one-shot brass sweep + serif phrase. */
 export function RunLedger({ run, stages }: Props) {
   const { saved, pct } = savingsVsBaseline(run.costUsd, run.baselineUsd);
-  const fillPct = run.baselineUsd > 0 ? Math.min(100, (run.costUsd / run.baselineUsd) * 100) : 0;
   const tokIn = stages.reduce((a, s) => a + s.inputTokens, 0);
   const tokOut = stages.reduce((a, s) => a + s.outputTokens, 0);
   const [expanded, setExpanded] = useState(false);
@@ -37,9 +45,19 @@ export function RunLedger({ run, stages }: Props) {
     prevStatus.current = run.status;
   }, [run.status, run.baselineUsd]);
 
-  const billed = stages.filter((s) => s.costUsd > 0 || (s.unpricedModel && s.inputTokens + s.outputTokens > 0));
-  const unpriced = stages.filter((s) => s.unpricedModel);
-  const unpricedModels = [...new Set(unpriced.map((s) => s.agentModel))];
+  const billed = stages.filter(
+    (s) => s.costUsd > 0 || s.usageUnreported || (s.unpricedModel && s.inputTokens + s.outputTokens > 0),
+  );
+  // Spend the budget cannot see: an unpriced model, or a stage whose CLI
+  // stopped before it reported usage.
+  const unpriced = stages.filter((s) => s.unpricedModel || s.usageUnreported);
+  const unpricedModels = [...new Set(stages.filter((s) => s.unpricedModel).map((s) => s.ranModel ?? s.agentModel))];
+  const unreported = stages.filter((s) => s.usageUnreported).length;
+  const unenforceableTitle = [
+    "The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend.",
+    unpricedModels.length > 0 ? unpricedTitle(unpricedModels) : "",
+    unreported > 0 ? usageUnreportedTitle(unreported) : "",
+  ].filter(Boolean).join(" ");
 
   return (
     <div className="border-t border-octo-hairline bg-octo-panel">
@@ -47,32 +65,43 @@ export function RunLedger({ run, stages }: Props) {
         type="button"
         aria-expanded={expanded}
         onClick={() => setExpanded((e) => !e)}
+        data-tour="direct-ledger-strip"
         className="flex w-full items-center gap-2 px-4 py-2 text-left font-mono text-[11px]"
       >
         <span className="text-octo-mute">saved</span>
         {run.baselineUsd > 0 ? (
           <>
-            <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span>
+            <span className="octo-tabular text-octo-verdigris">{formatUsd(saved)}</span>
             <span className="octo-tabular text-octo-mute">· {pct}% under all-premium</span>
           </>
         ) : (
           <span className="text-octo-mute">baseline unavailable</span>
         )}
         <span className="ml-auto text-octo-mute">spent</span>
-        <span className="octo-tabular text-octo-brass">${run.costUsd.toFixed(2)}</span>
+        <span className="octo-tabular text-octo-ivory">{formatUsd(run.costUsd)}</span>
+        {unreported > 0 && (
+          <span
+            className="octo-tabular text-octo-mute"
+            title={usageUnreportedTitle(unreported)}
+            data-testid="ledger-usage-unreported"
+            data-tour="direct-ledger-usage-unreported"
+          >
+            · {usageUnreportedNote(unreported)}
+          </span>
+        )}
         {run.budgetUsd != null && (
           <span
             className={`octo-tabular ${
               run.costUsd >= run.budgetUsd ? "text-octo-rouge" : "text-octo-mute"
             }`}
           >
-            · budget ${run.budgetUsd.toFixed(2)}
+            · budget {formatUsd(run.budgetUsd)}
           </span>
         )}
         {run.budgetUsd != null && unpriced.length > 0 && (
           <span
             className="octo-tabular text-octo-rouge"
-            title={`The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend. ${unpricedTitle(unpricedModels)}`}
+            title={unenforceableTitle}
             data-testid="ledger-budget-unenforceable"
           >
             · {budgetUnenforceableNote(unpriced.length)}
@@ -85,21 +114,29 @@ export function RunLedger({ run, stages }: Props) {
         )}
         <span className="font-mono text-[9px] text-octo-mute">{expanded ? "▾" : "▸"}</span>
       </button>
-      <div className="mx-4 h-0.5 overflow-hidden rounded-sm bg-octo-onyx">
-        <div
-          className="h-full rounded-sm bg-octo-brass transition-[width] duration-[280ms]"
-          style={{ width: `${fillPct}%`, transitionTimingFunction: "var(--ease-octo)" }}
-        />
-      </div>
       <Reveal open={expanded}>
         <div className="flex flex-wrap gap-x-5 gap-y-1 px-4 py-2 font-mono text-[10px] text-octo-mute">
           {billed.map((s) => (
             <span key={s.id}>
               {labelForRole(s.role)}{" "}
-              {s.unpricedModel && s.costUsd === 0 ? (
-                <span className="text-octo-mute" title={unpricedTitle([s.agentModel])}>unpriced</span>
+              {s.usageUnreported && s.costUsd === 0 ? (
+                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported-stage">
+                  usage not reported
+                </span>
+              ) : s.unpricedModel && s.costUsd === 0 ? (
+                <span className="text-octo-mute" title={unpricedTitle([s.ranModel ?? s.agentModel])}>unpriced</span>
               ) : (
-                <span className="octo-tabular text-octo-sage">${s.costUsd.toFixed(2)}</span>
+                <span className="octo-tabular text-octo-sage">{formatUsd(s.costUsd)}</span>
+              )}
+              {s.usageUnreported && s.costUsd > 0 && (
+                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported-stage">
+                  {" "}+ usage not reported
+                </span>
+              )}
+              {s.ranModel && (
+                <span className="text-octo-warning" title={ranOnTitle(s.agentModel, s.ranModel)}>
+                  {" "}· {ranOnNote(s.ranModel)}
+                </span>
               )}
               {(s.inputTokens > 0 || s.outputTokens > 0) && (
                 <span className="octo-tabular text-octo-mute"> · ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}</span>
@@ -120,7 +157,7 @@ export function RunLedger({ run, stages }: Props) {
               <OctoMark size={20} state="pushed" className="[--octo-eye:var(--color-octo-panel)]" />
             )}
             <p className="m-0 font-serif text-sm text-octo-ivory">
-              This run saved <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span> against the all-premium baseline.
+              This run saved <span className="octo-tabular text-octo-verdigris">{formatUsd(saved)}</span> against the all-premium baseline.
             </p>
           </div>
         </div>

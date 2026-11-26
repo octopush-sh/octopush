@@ -21,6 +21,8 @@ import type {
   ChatMessage,
   ChatThread,
   GitStatus,
+  McpServerConfig,
+  McpToolInfo,
   ModelInfo,
   ModelWithProvider,
   PerfStats,
@@ -33,7 +35,8 @@ import type {
   Workspace,
   WorkspaceGitSummary,
 } from "../../../src/lib/types";
-import { ATELIER, NOW } from "./shared";
+import { ATELIER, BUILTIN_THEMES, NOW } from "./shared";
+import { logbookSummary, missionFor } from "./logbook";
 
 const EARLIER = "2026-10-28T14:12:00Z";
 
@@ -216,9 +219,14 @@ const RUN_STAGES: RunStage[] = PIPELINE_STAGES.map((s, i) => ({
 }));
 const RUN_DETAIL: RunDetail = { run: RUN, stages: RUN_STAGES };
 
+// ─── Logbook ─────────────────────────────────────────────────────────────
+// The run and the Talk thread above belong to the active workspace's mission,
+// so the Logbook reads the same ledger as the Direct companion and Talk.
+const MISSION = missionFor(ACTIVE, EARLIER);
+
 // ─── Account & usage ─────────────────────────────────────────────────────
 const AUTH: AuthStatus = { signedIn: true, email: "dev@example.com", name: "Demo Developer" };
-const ENTITLEMENT: Entitlement = { plan: "pro", features: ["direct_unlimited", "detached_runs", "routines", "history_sync"], directRunsPerMonth: null };
+const ENTITLEMENT: Entitlement = { plan: "pro", features: ["direct.unlimited", "runs.parallel", "history.sync", "library.sync", "runs.detached", "routines.scheduled", "logbook.reports"], directRunsPerMonth: null };
 const RUN_USAGE: DirectRunUsage = { used: 7, limit: null, remaining: null };
 
 const TOKEN_REPORT: TokenReport = {
@@ -234,6 +242,15 @@ const PERF: PerfStats = {
   ts: 0,
 };
 
+const MCP_SERVERS = {
+  github: { command: "npx", args: ["-y", "@modelcontextprotocol/server-github"], env: {} },
+} satisfies Record<string, McpServerConfig>;
+
+const MCP_TOOLS = [
+  { server: "github", name: "get_issue", namespaced: "mcp__github__get_issue", description: "Read an issue" },
+  { server: "github", name: "list_pull_requests", namespaced: "mcp__github__list_pull_requests", description: "List pull requests" },
+] satisfies McpToolInfo[];
+
 export const defaultScenario: Scenario = {
   name: "default",
   description: "Signed-in Pro user · project “octopush” with two workspaces · a finished Direct run · a short Talk thread · three providers.",
@@ -244,7 +261,7 @@ export const defaultScenario: Scenario = {
   commands: {
     "plugin:app|version": "0.4.88",
     get_theme: ATELIER,
-    list_themes: [ATELIER],
+    list_themes: BUILTIN_THEMES,
     // project & workspaces
     list_recent_projects: [PROJECT],
     list_closed_projects: [],
@@ -262,6 +279,7 @@ export const defaultScenario: Scenario = {
     list_providers: PROVIDERS,
     list_models: MODELS,
     get_settings: SETTINGS,
+    unreadable_settings_path: null,
     get_sync_prefs: { historySync: false, librarySync: false } satisfies SyncPrefs,
     sketchbook_path: "/Users/dev/.octopush/sketchbook",
     detect_editors: [],
@@ -300,6 +318,8 @@ export const defaultScenario: Scenario = {
     list_active_runs: [],
     has_ever_started_run: true,
     estimate_run_cost: { estimateUsd: 0.43, baselineUsd: 1.95 },
+    // logbook
+    logbook_summary: logbookSummary([{ mission: MISSION, runs: [RUN], threads: [THREAD], messages: MESSAGES }]),
     // account & usage
     auth_status: AUTH,
     auth_refresh: AUTH,
@@ -309,8 +329,12 @@ export const defaultScenario: Scenario = {
     get_perf_stats: PERF,
     get_workspace_cache_sizes: { entries: [], totalBytes: 0 },
     mcp_connection_status: { binaryFound: true, claudeFound: true, registered: true, manualCommand: "claude mcp add octopush -s user -- octopush-mcp" },
+    // Settings › Integrations › MCP Servers
+    get_mcp_config: MCP_SERVERS,
+    test_mcp_server: MCP_TOOLS,
+    reconnect_mcp_server: MCP_TOOLS,
   },
 };
 
 /** The building blocks above, for scenarios that vary them (e.g. `stress`). */
-export const DEFAULT_FIXTURES = { PROJECT, WORKSPACES, GIT_SUMMARIES, PIPELINES, ROLES, RUN, RUN_STAGES, THREAD, MESSAGES, PROVIDERS, MODELS };
+export const DEFAULT_FIXTURES = { EARLIER, PROJECT, WORKSPACES, GIT_SUMMARIES, PIPELINES, ROLES, RUN, RUN_STAGES, THREAD, MESSAGES, PROVIDERS, MODELS };

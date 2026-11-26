@@ -79,8 +79,14 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
   release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`). An
   older `release/v*` PR still open is closed as superseded. The owner merges it
   (`merge web#N`); until then the website's consistency gate fails for web builds.
-  If only `web-version` failed, use **Re-run failed jobs**: re-running all jobs stops at
-  promote's "not a prerelease" check, because the version is already stable.
+  Its third job, `homebrew-tap`, renders `packaging/homebrew-tap/Casks/octopush.rb`
+  with the version and the `Octopush.dmg` sha256, checks it with `brew style` +
+  `brew audit`, and pushes it to `octopush-sh/homebrew-tap` (see
+  [`DISTRIBUTION.md`](DISTRIBUTION.md) → "Homebrew cask"). Neither job can undo the
+  promotion.
+  If only `web-version` or `homebrew-tap` failed, use **Re-run failed jobs**: re-running
+  all jobs stops at promote's "not a prerelease" check, because the version is already
+  stable.
 
   **Owner-only is enforced, once set up:** the job runs in the `stable` environment.
   Repo → Settings → Environments → New environment `stable` → *Required reviewers*:
@@ -241,8 +247,8 @@ When both signing and notarization creds are present, Tauri 2 signs, submits to
    `APPLE_TEAM_ID`.
 4. ✅ v0.4.63 cut; `spctl -a -vv` reports **accepted**.
 5. ✅ The `xattr` note removed from the docs install page (`octopush-web`).
-6. ⏳ Homebrew cask — cleared to publish, needs the tap repo created. See
-   [`DISTRIBUTION.md`](DISTRIBUTION.md).
+6. ✅ Homebrew cask — `promote.yml` publishes it to `octopush-sh/homebrew-tap`
+   on every promotion. See [`DISTRIBUTION.md`](DISTRIBUTION.md).
 
 **Certificate renewal:** the Developer ID Application certificate expires in
 2031. Renewing means repeating steps 1–2 and refreshing the two certificate

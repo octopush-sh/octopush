@@ -9,7 +9,10 @@ pub mod events;
 pub mod launch;
 pub mod git_baseline;
 pub mod live;
+pub mod notify;
 pub mod persist;
+pub mod plan_wait;
+pub mod read_only;
 pub mod roles;
 pub mod runner;
 pub mod sandbox;
@@ -48,8 +51,9 @@ pub(crate) fn cap_diff(text: &str) -> String {
 /// reaches the agent (see [`cli_runner::effort_applies`]), judged on the model
 /// the stage escalates to. Shared by failure and loop-cap escalation. A Claude
 /// Code CLI older than the tested floor gets no `--effort`, so there an
-/// effort-only change is inert; the version comes from the session cache (the
-/// failed attempt already probed it), never a fresh probe.
+/// effort-only change is inert; the version is the last one probed (the
+/// failed attempt already probed it, and a Readiness check doesn't clear it),
+/// read without waiting and never a fresh probe.
 pub(crate) fn escalation_changes_tier(stage: &RunStageRow) -> bool {
     let old_cli = crate::agent_adapter::claude_cli_version_cached().is_some_and(|v| v.below_floor);
     escalation_changes_tier_on(stage, old_cli)
@@ -63,12 +67,22 @@ pub(crate) fn escalation_changes_tier_on(stage: &RunStageRow, claude_cli_below_f
         .as_deref()
         .is_some_and(|m| m != stage.agent_model);
     let target_model = stage.escalate_model.as_deref().unwrap_or(stage.agent_model.as_str());
-    // On the CLI, effort applies only to Claude Code — which drops it when old.
+    // An old Claude Code drops `--effort`; Codex gets its effort on any
+    // version (its version only drives the Readiness sandbox-fix note).
+    let below_floor = claude_cli_below_floor
+        && cli_runner::dialect_for_model(target_model) == cli_runner::CliDialect::Claude;
     let effort_reaches = cli_runner::effort_applies(&stage.substrate, target_model)
-        && !(stage.substrate == "cli" && claude_cli_below_floor);
-    let effort_changes = effort_reaches
-        && stage.escalate_effort.is_some()
-        && stage.escalate_effort != stage.effort;
+        && !(stage.substrate == "cli" && below_floor);
+    // On the CLI, compare the levels each CLI actually gets (Codex clamps to
+    // the model's listed levels, so xhigh → max on gpt-5.5 is no change).
+    let effort_differs = match stage.substrate.as_str() {
+        "cli" => {
+            let level = |m: &str, e| cli_runner::dialect_for_model(m).effort_level(m, e);
+            level(target_model, stage.escalate_effort) != level(&stage.agent_model, stage.effort)
+        }
+        _ => stage.escalate_effort != stage.effort,
+    };
+    let effort_changes = effort_reaches && stage.escalate_effort.is_some() && effort_differs;
     model_changes || effort_changes
 }
 
@@ -123,6 +137,22 @@ pub(crate) fn downstream_of(
         .collect()
 }
 
+/// The first line of [`format_blocker_feedback`]: how a resumed session's
+/// prompt tells answered questions apart from review findings
+/// (`CliDialect::resume_prompt`).
+pub(crate) const BLOCKER_FEEDBACK_HEADER: &str =
+    "You paused and asked the director; here are their decisions — proceed with these and do not ask again unless a NEW blocking ambiguity arises:\n";
+
+/// A decision named a stage that is no longer waiting for one.
+pub(crate) fn stale_stage_error() -> AppError {
+    AppError::Other("This stage was already decided — refresh to see what's waiting.".into())
+}
+
+/// A decision reached a run that has already ended.
+pub(crate) fn finished_run_error(status: &str) -> AppError {
+    AppError::Other(format!("This run is {status} — nothing is waiting for a decision."))
+}
+
 /// Format the director's answers to a blocked stage's `ask_director` questions
 /// into the feedback block that `user_input_for` injects on the re-run. Answers
 /// are positional; a missing or empty answer falls back to that question's
@@ -133,9 +163,7 @@ pub(crate) fn format_blocker_feedback(
     ask: Option<&crate::orchestrator::types::BlockedAsk>,
     answers: &[String],
 ) -> String {
-    let mut s = String::from(
-        "You paused and asked the director; here are their decisions — proceed with these and do not ask again unless a NEW blocking ambiguity arises:\n",
-    );
+    let mut s = String::from(BLOCKER_FEEDBACK_HEADER);
     let questions = ask.map(|a| a.questions.as_slice()).unwrap_or(&[]);
     if questions.is_empty() {
         for (i, a) in answers.iter().enumerate() {
@@ -212,6 +240,42 @@ impl<'o> Drop for ActiveGuard<'o> {
     }
 }
 
+/// True when a stage CANNOT mutate the worktree — the bar for running it
+/// concurrently with a writer. API: the tool allowlist grants no
+/// write/edit/run. CLI: only a CODEX worktree review counts — codex's
+/// `--sandbox read-only` is kernel-enforced; a Claude CLI review keeps
+/// Bash (reviewers run builds/tests), and a Bash that can `git stash` or
+/// `npm install` into the shared checkout is a writer for scheduling
+/// purposes, whatever the edit-tool denial says. Writers — including any
+/// stage whose tools are unknown — serialize. Plain fields, so a crew import
+/// can show the same verdict before anything is saved.
+pub fn stage_read_only(
+    substrate: &str,
+    agent_model: &str,
+    tools: Option<&[String]>,
+    role: Option<&roles::RoleDef>,
+) -> bool {
+    use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+    match AgentSubstrate::from_db(substrate) {
+        Some(AgentSubstrate::Api) => tools
+            .map(|t| {
+                !t.iter()
+                    .any(|x| matches!(x.as_str(), "write_file" | "edit_file" | "run_command"))
+            })
+            .unwrap_or(false),
+        Some(AgentSubstrate::Cli) => {
+            matches!(dialect_for_model(agent_model), CliDialect::Codex)
+                && role
+                    .map(|rd| {
+                        matches!(rd.artifact_kind, ArtifactKind::Review)
+                            && matches!(rd.environment, types::RoleEnvironment::Worktree)
+                    })
+                    .unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
 /// Drives runs: one stage at a time, pausing at checkpoints.
 pub struct Orchestrator {
     db: Arc<Mutex<Db>>,
@@ -246,6 +310,10 @@ pub struct Orchestrator {
     /// The bridge's watch table for leased (worker-driven) runs: journal
     /// cursor + last-emitted snapshot per run id (see `bridge`).
     bridge_watch: Mutex<std::collections::HashMap<String, crate::orchestrator::bridge::Watch>>,
+    /// Claude Code's transcript directory (`~/.claude/projects`): a stage's
+    /// session rows a mid-run ingest pass metered are dropped from it the
+    /// moment the stage reports its session (#863).
+    transcripts_root: std::path::PathBuf,
 }
 
 impl Orchestrator {
@@ -277,7 +345,23 @@ impl Orchestrator {
             headless,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
+            transcripts_root: crate::transcripts::projects_root(),
         }
+    }
+
+    /// Read Claude Code transcripts from `root` instead of
+    /// `~/.claude/projects` (tests).
+    pub fn with_transcripts_root(mut self, root: std::path::PathBuf) -> Self {
+        self.transcripts_root = root;
+        self
+    }
+
+    /// Tests: drive as `octopush-run-worker` does (`new_headless`), with the
+    /// test runner.
+    #[cfg(test)]
+    pub(crate) fn into_headless(mut self) -> Self {
+        self.headless = true;
+        self
     }
 
     /// Test constructor: force a specific runner for every stage.
@@ -298,6 +382,11 @@ impl Orchestrator {
             headless: false,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
+            // Tests never read the real `~/.claude/projects`: an empty root
+            // (a path nobody creates) unless `with_transcripts_root` sets one.
+            transcripts_root: std::env::temp_dir()
+                .join(format!("octopush-test-transcripts-{}", std::process::id()))
+                .join("none"),
         }
     }
 
@@ -313,6 +402,17 @@ impl Orchestrator {
             return Err(AppError::Other(busy_msg.into()));
         }
         Ok(ActiveGuard { orchestrator: self, run_id: run_id.to_string(), forgotten: false })
+    }
+
+    /// Tests: mark `run_id` as executing (as another driver holding its
+    /// claim would), or release that mark.
+    #[cfg(test)]
+    pub(crate) fn set_active_for_test(&self, run_id: &str, active: bool) {
+        if active {
+            self.active.lock().insert(run_id.to_string());
+        } else {
+            self.active.lock().remove(run_id);
+        }
     }
 
     fn runner_for(&self, substrate: &AgentSubstrate) -> Box<dyn AgentRunner> {
@@ -407,7 +507,18 @@ impl Orchestrator {
     /// notifications must ping for the former and stay silent for the latter
     /// (a false "needs you" for the user's own action trains them to ignore
     /// the ping). Other consumers ignore the extra field.
+    ///
+    /// Also the one trigger of "Notify me elsewhere" for a park (#964), in
+    /// process and in the detached worker alike.
     fn emit_checkpoint(&self, run_id: &str, stage_id: &str, reason: &str) {
+        self.relay_checkpoint(run_id, stage_id, reason);
+        self.notify_elsewhere_park(run_id, stage_id, reason);
+    }
+
+    /// The `run://checkpoint` event alone: the bridge's relay of a park the
+    /// detached worker already announced (and sent elsewhere), so the
+    /// webhook never hears about one park twice.
+    fn relay_checkpoint(&self, run_id: &str, stage_id: &str, reason: &str) {
         self.events.emit(
             "run://checkpoint",
             serde_json::json!({ "runId": run_id, "stageId": stage_id, "reason": reason }),
@@ -467,12 +578,60 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// The model the stage's next attempt runs on: the escalate model once the
+    /// stage is escalated (falling back to the base when only effort was
+    /// bumped), the base model otherwise.
+    fn effective_model(s: &crate::db::RunStageRow) -> &str {
+        if s.escalated { s.escalate_model.as_deref().unwrap_or(&s.agent_model) } else { &s.agent_model }
+    }
+
+    /// A CLI stage row that runs on Codex (its effective model, escalation applied).
+    fn is_codex_cli(s: &crate::db::RunStageRow) -> bool {
+        s.substrate == "cli"
+            && matches!(
+                crate::orchestrator::cli_runner::dialect_for_model(Self::effective_model(s)),
+                crate::orchestrator::cli_runner::CliDialect::Codex
+            )
+    }
+
+    /// True when the stage's next run can continue its CLI session: a CLI
+    /// stage with a session id, on Claude Code (`--resume`), or on Codex
+    /// (`codex exec resume`) when the session's reported total is recorded —
+    /// without it the resumed run's thread-wide usage can't be counted, and a
+    /// fresh run is the honest choice. (Whether the installed Codex has
+    /// `exec resume` is the runner's call; it falls back to a fresh run.)
+    fn cli_session_resumable(&self, s: &crate::db::RunStageRow) -> AppResult<bool> {
+        let Some(sid) = s.session_id.as_deref().filter(|_| s.substrate == "cli") else {
+            return Ok(false);
+        };
+        if Self::is_codex_cli(s) {
+            return Ok(self.db.lock().get_stage_session_usage(&s.id, sid)?.is_some());
+        }
+        Ok(matches!(
+            crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
+            crate::orchestrator::cli_runner::CliDialect::Claude
+        ))
+    }
+
     /// Reset the contiguous [target..=review] range to pending (re-running the
     /// target + intervening stages with `feedback` on the target), retiring the
     /// erased cost and bumping the loop counter. Shared by gated SendBack and the
     /// auto loop. Caller guarantees `review` has a valid `loop_target_position`
     /// strictly before `review.position` and iterations remaining.
-    fn loop_back(&self, run_id: &str, review: &crate::db::RunStageRow, feedback: Option<&str>) -> AppResult<()> {
+    ///
+    /// `resume_codex`: the loop target, if it is a Codex writer, CONTINUES its session
+    /// (`codex exec resume`, the findings as the prompt) instead of re-reading
+    /// the repo and the whole dossier. False when the loop-back comes with an
+    /// escalation, which is defined as a fresh attempt at the strong tier.
+    /// Claude stages and reviews always re-run fresh here: a re-review must
+    /// not anchor on its own earlier verdict.
+    fn loop_back(
+        &self,
+        run_id: &str,
+        review: &crate::db::RunStageRow,
+        feedback: Option<&str>,
+        resume_codex: bool,
+    ) -> AppResult<()> {
         let target_pos = review.loop_target_position.expect("loop_back requires a target");
         let stages = self.db.lock().list_run_stages(run_id)?;
         // In an authored graph the [target..=review] position window can span a
@@ -500,6 +659,22 @@ impl Orchestrator {
                 let cf = if s.id == review.id { feedback } else { None };
                 let fb = if s.id == review.id { None } else { feedback };
                 self.archive_and_reset_stage(run_id, s, cf, fb, false)?;
+                let has_findings = fb.is_some_and(|f| !f.trim().is_empty());
+                // Only the loop TARGET continues its session. Every other
+                // Codex writer in the window (e.g. an implement stage between
+                // a plan target and the review) must re-run fresh: its inputs
+                // — the target's new artifact — changed, so the refreshed
+                // dossier is the point, not a delta on its old thread.
+                if resume_codex
+                    && s.position == target_pos
+                    && has_findings
+                    && Self::is_codex_cli(s)
+                    && !self.stage_is_read_only(s)
+                    && self.cli_session_resumable(s)?
+                {
+                    self.db.lock().set_stage_resume_pending(&s.id, true)?;
+                    self.db.lock().set_stage_resume_prior_cost(&s.id, s.cost_usd)?;
+                }
                 // An INNER review inside the window gets a fresh loop budget
                 // for each outer iteration — without this, its counter
                 // persisted across outer loops and the inner loop arrived
@@ -705,6 +880,40 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Claude Code refused the stage's settings at start-up: a stronger
+        // model starts with the same settings.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_settings_refused)
+        {
+            return Ok(false);
+        }
+        // Claude Code's own Bash sandbox couldn't start, and its refusal was
+        // the stage's last Bash result: a stronger model meets the same refusal.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_inner_sandbox_off)
+        {
+            return Ok(false);
+        }
+        // A hook deferred a tool call, or a resumed session's deferred tool is
+        // gone: a stronger model meets the same hook and won't bring the tool back.
+        if fresh.error.as_deref().is_some_and(|e| {
+            crate::orchestrator::cli_runner::is_tool_deferred(e)
+                || crate::orchestrator::cli_runner::is_deferred_tool_unavailable(e)
+        }) {
+            return Ok(false);
+        }
+        // A Claude plan limit: a stronger model meets the same wall.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        {
+            return Ok(false);
+        }
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
         if fresh.escalated {
@@ -713,9 +922,9 @@ impl Orchestrator {
         // Escalate only if the tier would ACTUALLY change — otherwise the retry
         // re-runs identically and burns spend for nothing. `escalate_model`
         // must differ from the base; `escalate_effort` counts only where effort
-        // reaches the agent — the API, or a Claude Code CLI stage (`--effort`)
-        // judged on the model it escalates to. Codex ignores effort, so an
-        // effort-only policy there is inert. No real change ⇒ halt as before.
+        // reaches the agent — the API, or a CLI stage (Claude Code's `--effort`,
+        // Codex's `model_reasoning_effort`) judged on the model it escalates
+        // to. No real change ⇒ halt as before.
         if !escalation_changes_tier(&fresh) {
             return Ok(false);
         }
@@ -833,6 +1042,7 @@ impl Orchestrator {
                 return Ok((StageStatus::Failed, None));
             }
         };
+        let drop_deferred = self.db.lock().get_stage_drop_deferred(&stage.id)?;
         let spec = StageSpec {
             position: stage.position,
             role: stage.role.clone(),
@@ -858,6 +1068,13 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            drop_deferred_call: stage.resume_pending && drop_deferred,
+            // A resumed Codex session reports its running total; the runner
+            // subtracts what it had reported by the end of its last run.
+            resume_baseline: match (&stage.session_id, stage.resume_pending) {
+                (Some(sid), true) if Self::is_codex_cli(stage) => self.db.lock().get_stage_session_usage(&stage.id, sid)?,
+                _ => None,
+            },
             // Recorded from the stage row by whichever action set
             // resume_pending (Resume or an answered block) — not read from
             // the iteration history, whose latest entry need not be this
@@ -866,6 +1083,13 @@ impl Orchestrator {
                 self.db.lock().get_stage_resume_prior_cost(&stage.id)?
             } else {
                 0.0
+            },
+            // Recorded the same way: the reset that follows a Resume or an
+            // answer forgets the stage's context reading.
+            resume_context_tokens: if stage.resume_pending {
+                self.db.lock().get_stage_resume_context(&stage.id)?
+            } else {
+                None
             },
             blocked_transcript: stage.blocked_transcript.clone(),
             stage_id: stage.id.clone(),
@@ -879,6 +1103,10 @@ impl Orchestrator {
         if stage.resume_pending {
             self.db.lock().set_stage_resume_pending(&stage.id, false)?;
         }
+        // The same for a dropped deferred call: only this run drops it.
+        if drop_deferred {
+            self.db.lock().set_stage_drop_deferred(&stage.id, false)?;
+        }
         // Consume-once: the ask_director transcript feeds exactly the run it
         // was answered for — any later re-run starts fresh.
         if stage.blocked_transcript.is_some() {
@@ -886,9 +1114,22 @@ impl Orchestrator {
         }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
-        // A resuming CLI stage discards the input for its resumed session, so
-        // don't spend a worktree-diff capture on it.
-        let input = self.assemble_stage_input(run, stage.position, !resuming)?;
+        // A resuming CLI stage discards the input for its resumed session, but
+        // still captures it: when `codex exec resume` fails, or a Claude
+        // `--resume` comes back on an empty conversation, the runner falls back
+        // to a fresh run, which needs the full dossier.
+        let fresh_input = !resuming || stage.substrate == "cli";
+        let mut input = self.assemble_stage_input(run, stage.position, fresh_input)?;
+        // Collision radar, phase 2 (#732): a code-writing stage (its artifact
+        // is the worktree diff — implement, fix) hears which other live
+        // workspaces of the project change the same files, so it keeps clear
+        // of them. Skipped when the dossier is built without the live diff.
+        if fresh_input
+            && matches!(spec.artifact_kind, ArtifactKind::Diff)
+            && matches!(spec.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree)
+        {
+            input.concurrent_work = self.concurrent_work_note(run);
+        }
 
         // Peers for the `ask_stage` consultation channel: completed upstream
         // stages (same ancestry rule as the dossier) with their archived
@@ -941,6 +1182,12 @@ impl Orchestrator {
         };
 
         self.db.lock().set_run_stage_status(&stage.id, "running")?;
+        // That forgot the last attempt's context reading (#895): tell the app,
+        // so its newest reading for the stage is "none", not the old one.
+        self.events.emit(
+            crate::orchestrator::live::RUN_CONTEXT_EVENT,
+            serde_json::json!({ "runId": run.id, "stageId": stage.id, "contextTokens": null, "contextWindow": null }),
+        );
         // Reset any prior live log for this stage (re-runs reuse the same id).
         self.events.emit(
             crate::orchestrator::live::RUN_LOG_EVENT,
@@ -959,6 +1206,15 @@ impl Orchestrator {
                 Ok(None) => {}
                 Err(e) => tracing::warn!(stage_id = %stage.id, "baseline capture failed: {e}"),
             }
+        }
+
+        // A custom read-only role whose saved allowlist grants write tools:
+        // they are removed (`read_only::read_only_api_tools`, and the CLI
+        // denies its own write tools), so say so instead of silently
+        // ignoring what the author saved.
+        let stage_read_only = crate::orchestrator::read_only::role_is_read_only(&spec.artifact_kind, spec.role_environment);
+        if let Some(note) = crate::orchestrator::read_only::stripped_write_tools_notice(stage_read_only, spec.tools.as_deref()) {
+            self.journal_notice(&run.id, &stage.id, &note);
         }
 
         // Build the context and run the agent. ANY hard error here (missing worktree,
@@ -980,11 +1236,8 @@ impl Orchestrator {
                 .map(|m| m.exec_isolation)
                 .unwrap_or_else(|| "none".to_string());
             let ws_str = workspace_path.to_string_lossy().into_owned();
-            let (exec_isolation, allowed_write_roots) =
-                match crate::orchestrator::sandbox::sandbox_write_roots(&git_isolation, &exec_choice, &ws_str) {
-                    Some(roots) => ("sandbox".to_string(), roots),
-                    None => (exec_choice, vec![ws_str]),
-                };
+            let crate::orchestrator::sandbox::StageIsolation { exec_isolation, exec_choice, allowed_write_roots } =
+                crate::orchestrator::sandbox::stage_isolation(&git_isolation, &exec_choice, &ws_str);
             // Resolve the brief's `/slug` references against THIS worktree, at
             // the moment the stage starts — a skill added (or edited) since the
             // run was created is picked up, and a run whose worktree has no
@@ -1009,10 +1262,12 @@ impl Orchestrator {
                 stage_id: stage.id.clone(),
                 cancel,
                 exec_isolation,
+                exec_choice,
                 allowed_write_roots,
                 skills,
                 spend_limit,
                 peers,
+                quiet_claude_code: crate::settings::quiet_claude_code(),
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,
@@ -1052,6 +1307,51 @@ impl Orchestrator {
                 return Ok((StageStatus::Failed, None));
             }
         };
+
+        // A CLI session's reported running total: the next `codex exec resume`
+        // of it subtracts this (Codex reports thread-wide usage on resume).
+        if let Some(sid) = outcome.session_id.as_deref() {
+            self.db.lock().set_stage_session_usage(&stage.id, sid, outcome.cli.session_usage.as_ref())?;
+            // Every attempt's session, kept for good: the transcript ingestor
+            // skips it — this stage's `direct` row already meters it (#861).
+            self.db.lock().record_direct_cli_session(&stage.id, sid)?;
+            // A transcript pass that ran while the stage did already metered
+            // part of this session as RUN rows; the stage's `direct` row is
+            // about to count it all. Drop them now, not at the next pass, so
+            // the budget, Talk and AI-review gates never see it twice (#863).
+            // It stats and re-reads transcript files, so it runs on the
+            // blocking pool, not on this tokio worker (#890).
+            let (db, root, session) = (Arc::clone(&self.db), self.transcripts_root.clone(), sid.to_string());
+            match tokio::task::spawn_blocking(move || crate::transcripts::drop_direct_session(&db, &root, &session)).await {
+                Ok(Ok(n)) if n > 0 => tracing::info!(stage_id = %stage.id, removed = n, "dropped RUN rows already ingested from the stage's session"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(stage_id = %stage.id, error = %e, "direct-session transcript cleanup failed"),
+                Err(e) => tracing::warn!(stage_id = %stage.id, error = %e, "direct-session transcript cleanup task failed"),
+            }
+        }
+        // The model this attempt actually ran on (Claude Code's settings can
+        // pick another than `--model`), recorded before any completion below
+        // so the spend ledger attributes and prices it to what ran. `None`
+        // clears an earlier attempt's.
+        self.db.lock().set_run_stage_ran_model(&stage.id, outcome.cli.ran_model.as_deref())?;
+        // The tool calls Claude Code refused (journaled by the runner): the
+        // stage reads "N tool calls refused". `0` clears an earlier attempt's.
+        self.db.lock().set_run_stage_refused_calls(
+            &stage.id,
+            crate::orchestrator::cli_runner::refused_total(&outcome.cli.refused_calls),
+        )?;
+        // Part of the spend is unknown even if the stage finished (a failed
+        // Codex resume before its fresh fallback) — flag it like an error
+        // that carries the marker (that path flags and journals it itself).
+        // A usage drift already journaled its own reason: flag, don't repeat.
+        if outcome.cli.usage_unreported
+            && !outcome.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_usage_unreported)
+        {
+            self.db.lock().set_run_stage_usage_unreported(&stage.id)?;
+            if !outcome.cli.usage_unreported_journaled {
+                self.journal_notice(&run.id, &stage.id, crate::orchestrator::cli_runner::USAGE_UNREPORTED);
+            }
+        }
 
         // Escape valve: the stage called `ask_director`. Persist its questions
         // and the spend it burned asking, then park it as `awaiting_checkpoint`
@@ -1117,6 +1417,8 @@ impl Orchestrator {
                     self.capture_stage_diff_snapshot(run, &stage.id);
                 }
                 self.recompute_run_cost(&run.id)?;
+                // Past the wall: a fresh allowance of automatic plan resumes.
+                self.db.lock().reset_plan_resume_count(&run.id)?;
                 Ok((StageStatus::Done, verdict))
             }
             _ => {
@@ -1143,6 +1445,14 @@ impl Orchestrator {
                 if session_not_saved {
                     self.db.lock().set_stage_session(&stage.id, None)?;
                 }
+                // A Codex stage stopped before it reported usage, or a stopped
+                // stage with streamed usage it can't price (a subagent model or
+                // fast mode with no price): that cost is unknown, never $0 —
+                // flag it for the ledger and say why once.
+                if let Some(line) = crate::orchestrator::cli_runner::usage_unreported_line(&err) {
+                    self.db.lock().set_run_stage_usage_unreported(&stage.id)?;
+                    self.journal_notice(&run.id, &stage.id, line);
+                }
                 // Persist whatever usage the failed attempt burned (e.g. an
                 // iteration-capped agentic loop) so run cost stays truthful,
                 // then mark the failure. Reset-on-rerun retires it as usual.
@@ -1165,15 +1475,20 @@ impl Orchestrator {
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 self.record_halt(&run.id, &stage.id, &err);
+                // A Claude plan limit parks the run until the window resets
+                // (the stage keeps its spend and session for the Resume).
+                if let Some(limit) = outcome.cli.plan_limit.as_ref() {
+                    self.park_for_plan(&run.id, &stage.id, limit)?;
+                }
                 // A Claude Code budget stop parks with the budget gate's own
                 // notice; its session (persisted above) lets Resume continue.
                 if crate::orchestrator::cli_runner::is_budget_stop(&err) {
                     let fresh_run = self.db.lock().get_run(&run.id)?;
                     if let Some(r) = fresh_run {
                         self.journal_notice(&run.id, &stage.id, &format!(
-                            "budget reached — ${:.2} of ${:.2} spent",
-                            r.cost_usd,
-                            r.budget_usd.unwrap_or(0.0)
+                            "budget reached — {} of {} spent",
+                            crate::token_engine::format_usd(r.cost_usd),
+                            crate::token_engine::format_usd(r.budget_usd.unwrap_or(0.0))
                         ));
                     }
                 }
@@ -1318,8 +1633,8 @@ impl Orchestrator {
         // the producer's prose summary of them. Best-effort: a capture failure
         // or empty diff degrades to the "inspect with your tools" hint at
         // render time (user_input_for owns emptiness), never blocks the run.
-        // Skipped for a CLI-resume stage, whose runner discards the input in
-        // favor of the resumed session. Deliberate semantics: the worktree is
+        // Skipped when the caller says so (`capture_diff`); a resuming CLI
+        // stage still captures it for its fresh fallback. Deliberate semantics: the worktree is
         // the run's shared blackboard, so in a multi-branch authored graph the
         // diff can include a sibling branch's edits — the same visibility the
         // reviewer always had by inspecting the workspace; the rendered prompt
@@ -1339,7 +1654,27 @@ impl Orchestrator {
             .find(|s| s.position == position)
             .and_then(|s| self.attempt_history_digest(&s.id));
 
-        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff, history })
+        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff, history, concurrent_work: None })
+    }
+
+    /// The dossier's concurrent-work line for this run's workspace: one
+    /// read-only collision scan of the project's live workspaces (the same
+    /// inputs as `project_collisions`). Best-effort: `None` on any lookup
+    /// failure, a single live workspace, or no overlap.
+    fn concurrent_work_note(&self, run: &crate::db::RunRow) -> Option<String> {
+        let (rows, project_path) = {
+            let db = self.db.lock();
+            let ws = db.get_workspace(&run.workspace_id).ok()??;
+            let rows = db.list_workspaces(&ws.project_id).ok()?;
+            let path = db.get_project(&ws.project_id).ok()?.map(|p| p.path);
+            (rows, path)
+        };
+        if rows.len() < 2 {
+            return None;
+        }
+        let inputs = crate::collisions::scan_inputs(rows, project_path.as_deref());
+        let report = crate::collisions::CollisionCache::default().scan(&inputs);
+        crate::collisions::concurrent_work_note(&report, &run.workspace_id)
     }
 
     /// Compact digest of a stage's archived attempts (`stage_iterations`),
@@ -1477,7 +1812,11 @@ impl Orchestrator {
                 "stageId": stage_id,
                 "entry": {
                     "kind": "notice",
-                    "text": format!("budget reached — ${cost:.2} of ${budget:.2} spent"),
+                    "text": format!(
+                        "budget reached — {} of {} spent",
+                        crate::token_engine::format_usd(cost),
+                        crate::token_engine::format_usd(budget)
+                    ),
                 },
             }),
         );
@@ -1507,13 +1846,90 @@ impl Orchestrator {
                 "stageId": stage_id,
                 "entry": {
                     "kind": "notice",
-                    "text": format!("{scope} budget reached — ${spent:.2} of ${limit:.2} spent"),
+                    "text": format!(
+                        "{scope} budget reached — {} of {} spent",
+                        crate::token_engine::format_usd(spent),
+                        crate::token_engine::format_usd(limit)
+                    ),
                 },
             }),
         );
         self.emit_run_update(run_id);
         self.emit_checkpoint(run_id, stage_id, "decision");
         Ok(())
+    }
+
+    /// The secret guard's boundary check for one about-to-start stage (#730).
+    /// Only Action-environment roles are checked. Scans the worktree's
+    /// changes against the workspace's base (commits + staged + unstaged +
+    /// untracked) on a blocking thread; on a finding, a partial scan (the
+    /// 16 MB budget ran out) or a worktree it couldn't read — fail closed, so
+    /// a detached run or a Routine never ships unchecked — parks the stage
+    /// `awaiting_checkpoint` (never started, like a budget park) with its
+    /// `secret_hold`, journals the reason and fires the "decision" checkpoint
+    /// unless the director already approved exactly this hold (same
+    /// fingerprint). Returns `true` when it parked. With the guard off, a stale
+    /// hold is cleared. Never journals or stores a value: the hold and the
+    /// notice carry the file, the line and the kind only.
+    async fn secret_gate(&self, run: &crate::db::RunRow, stage: &RunStageRow) -> AppResult<bool> {
+        let role = self.db.lock().get_role(&stage.role).ok().flatten();
+        let Some(role) = role else { return Ok(false) };
+        if role.environment != crate::orchestrator::types::RoleEnvironment::Action {
+            return Ok(false);
+        }
+        let settings = crate::settings::load_settings().unwrap_or_default();
+        if !crate::secret_scan::guard_enabled(&settings) {
+            if stage.secret_hold.is_some() {
+                self.db.lock().set_stage_secret_hold(&stage.id, None)?;
+            }
+            return Ok(false);
+        }
+        let base = self
+            .db
+            .lock()
+            .get_workspace(&run.workspace_id)
+            .ok()
+            .flatten()
+            .and_then(|w| w.from_branch);
+        let known = crate::secret_scan::known_secrets_from(&settings);
+        let scanned = match self.workspace_path(run) {
+            Ok(path) => tokio::task::spawn_blocking(move || {
+                crate::secret_scan::worktree_files(&path, base.as_deref())
+                    .map(|c| crate::secret_scan::scan_collected(&c, &known))
+            })
+            .await
+            .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}")))),
+            Err(e) => Err(e),
+        };
+        let hold = match scanned {
+            Ok(report) if !report.needs_confirmation() => {
+                if stage.secret_hold.is_some() {
+                    self.db.lock().set_stage_secret_hold(&stage.id, None)?;
+                }
+                return Ok(false);
+            }
+            Ok(report) => crate::secret_scan::SecretHold::from_report(report),
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, "secret guard couldn't scan the worktree: {e}");
+                crate::secret_scan::SecretHold::unreadable()
+            }
+        };
+        if let Some(h) = &stage.secret_hold {
+            if h.acknowledged && h.fingerprint == hold.fingerprint {
+                self.journal_notice(&run.id, &stage.id, &format!(
+                    "secret guard: the director approved proceeding · {}",
+                    hold.summary()
+                ));
+                return Ok(false);
+            }
+        }
+        self.db.lock().set_stage_secret_hold(&stage.id, Some(&hold))?;
+        self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
+        let label = secret_hold_stage_label(&stage.role, &role.label);
+        self.journal_notice(&run.id, &stage.id, &crate::secret_scan::hold_notice(&label, &hold));
+        self.emit_run_update(&run.id);
+        self.emit_checkpoint(&run.id, &stage.id, "decision");
+        Ok(true)
     }
 
     /// Ask a running run to pause at its next stage boundary. Consumed once, in
@@ -1584,6 +2000,7 @@ impl Orchestrator {
                 self.db.lock().set_run_status(run_id, "completed", true)?;
                 self.emit_run_update(run_id);
                 self.sync_run_history(run_id);
+                self.notify_elsewhere_completed(run_id);
                 return Ok(RunStatus::Completed);
             }
 
@@ -1687,6 +2104,21 @@ impl Orchestrator {
             }
             skip_budget_once = false; // only the drive's first batch may bypass
 
+            // Secret guard (#730): an Action stage (commit / push / PR /
+            // merge / release) never starts while the worktree's changes hold
+            // a possible secret the director hasn't approved. Independent of
+            // the budget override above: approving a budget park never
+            // approves a secret. Detached runs and Routines park the same way.
+            let mut held = false;
+            for s in &batch {
+                held |= self.secret_gate(&run, s).await?;
+            }
+            if held {
+                self.db.lock().set_run_status(run_id, "paused", false)?;
+                self.emit_run_update(run_id);
+                return Ok(RunStatus::Paused);
+            }
+
             // Intra-stage budget headroom, SHARED across the batch: the
             // remaining run budget divided by the batch size, so N concurrent
             // stages can't each spend the whole remainder (the serial drive
@@ -1735,8 +2167,17 @@ impl Orchestrator {
             let mut must_pause = false;
             let mut first_err: Option<AppError> = None;
             let mut looped_targets: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            // Plan-limited stages fire their checkpoint after every sibling is
+            // handled: a sibling's gate or halt decides whether the park is
+            // calm (`park_reason`), and it may only be marked below.
+            let mut plan_parked: Vec<&crate::db::RunStageRow> = Vec::new();
             for (stage, result) in batch.iter().zip(results) {
                 match result {
+                    // A plan limit never escalates (`try_escalate`): it parks.
+                    Ok((StageStatus::Failed, _)) if self.stage_hit_plan_limit(run_id, &stage.id) => {
+                        plan_parked.push(stage);
+                        must_pause = true;
+                    }
                     Ok((status, verdict)) => {
                         match self.handle_stage_outcome(run_id, stage, status, verdict, &mut looped_targets) {
                             Ok(pause) => must_pause |= pause,
@@ -1756,6 +2197,10 @@ impl Orchestrator {
                     }
                 }
             }
+            for stage in plan_parked {
+                let reason = self.park_reason(run_id, stage);
+                self.emit_checkpoint(run_id, &stage.id, reason);
+            }
             if let Some(e) = first_err {
                 // Leave the run visibly paused (a stage may be parked) before
                 // surfacing the error — a run stranded as "running" has no
@@ -1772,44 +2217,27 @@ impl Orchestrator {
         }
     }
 
-    /// True when a stage CANNOT mutate the worktree — the bar for running it
-    /// concurrently with a writer. API: the tool allowlist grants no
-    /// write/edit/run. CLI: only a CODEX worktree review counts — codex's
-    /// `--sandbox read-only` is kernel-enforced; a Claude CLI review keeps
-    /// Bash (reviewers run builds/tests), and a Bash that can `git stash` or
-    /// `npm install` into the shared checkout is a writer for scheduling
-    /// purposes, whatever the edit-tool denial says. Writers — including any
-    /// stage whose tools are unknown — serialize.
+    /// Whether `stage_id` just failed on a Claude plan limit (its fresh row).
+    fn stage_hit_plan_limit(&self, run_id: &str, stage_id: &str) -> bool {
+        self.db
+            .lock()
+            .list_run_stages(run_id)
+            .ok()
+            .and_then(|st| st.into_iter().find(|s| s.id == stage_id))
+            .is_some_and(|s| s.status == "failed" && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit))
+    }
+
+    /// [`stage_read_only`] for a run stage, judged on its EFFECTIVE model
+    /// (escalation applied) — the same model [`Self::is_codex_cli`] uses, so
+    /// an escalated stage isn't classed on a dialect it no longer runs.
     fn stage_is_read_only(&self, s: &crate::db::RunStageRow) -> bool {
         use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
-        match AgentSubstrate::from_db(&s.substrate) {
-            Some(AgentSubstrate::Api) => s
-                .tools
-                .as_ref()
-                .map(|t| {
-                    !t.iter()
-                        .any(|x| matches!(x.as_str(), "write_file" | "edit_file" | "run_command"))
-                })
-                .unwrap_or(false),
-            Some(AgentSubstrate::Cli) => {
-                matches!(dialect_for_model(&s.agent_model), CliDialect::Codex)
-                    && self
-                        .db
-                        .lock()
-                        .get_role(&s.role)
-                        .ok()
-                        .flatten()
-                        .map(|rd| {
-                            matches!(rd.artifact_kind, ArtifactKind::Review)
-                                && matches!(
-                                    rd.environment,
-                                    crate::orchestrator::types::RoleEnvironment::Worktree
-                                )
-                        })
-                        .unwrap_or(false)
-            }
-            None => false,
-        }
+        let model = Self::effective_model(s);
+        // The role matters only for a Codex CLI stage; skip the lookup otherwise.
+        let needs_role = matches!(AgentSubstrate::from_db(&s.substrate), Some(AgentSubstrate::Cli))
+            && matches!(dialect_for_model(model), CliDialect::Codex);
+        let role = if needs_role { self.db.lock().get_role(&s.role).ok().flatten() } else { None };
+        stage_read_only(&s.substrate, model, s.tools.as_deref(), role.as_ref())
     }
 
     /// The freshly-persisted artifact text of `stage` (its review findings).
@@ -1834,13 +2262,14 @@ impl Orchestrator {
         run_id: &str,
         review: &RunStageRow,
         looped: &mut std::collections::HashSet<i64>,
+        resume_codex: bool,
     ) -> AppResult<()> {
         let findings = self.fresh_artifact_text(run_id, &review.id)?;
         let target_pos = review
             .loop_target_position
             .expect("loop_back_or_merge requires a loop target");
         if looped.insert(target_pos) {
-            self.loop_back(run_id, review, findings.as_deref())?;
+            self.loop_back(run_id, review, findings.as_deref(), resume_codex)?;
             return Ok(());
         }
         // Merge path: the window is already reset this batch.
@@ -1889,7 +2318,9 @@ impl Orchestrator {
                     self.emit_run_update(run_id);
                     return Ok(false);
                 }
-                self.emit_checkpoint(run_id, &stage.id, "decision");
+                // A plan-parked stage with a scheduled resume needs nobody.
+                let reason = self.park_reason(run_id, stage);
+                self.emit_checkpoint(run_id, &stage.id, reason);
                 Ok(true)
             }
             StageStatus::AwaitingCheckpoint => {
@@ -1909,7 +2340,7 @@ impl Orchestrator {
                             // Fall through to checkpoint/continue below.
                         }
                         Some(ReviewVerdict::ChangesRequested) if remaining => {
-                            self.loop_back_or_merge(run_id, stage, looped_targets)?;
+                            self.loop_back_or_merge(run_id, stage, looped_targets, true)?;
                             self.emit_run_update(run_id);
                             return Ok(false);
                         }
@@ -1921,7 +2352,7 @@ impl Orchestrator {
                             // tier couldn't satisfy the reviewer), yet it
                             // historically only fired on hard failures.
                             if self.try_escalate_loop_target(run_id, stage)? {
-                                self.loop_back_or_merge(run_id, stage, looped_targets)?;
+                                self.loop_back_or_merge(run_id, stage, looped_targets, false)?;
                                 self.emit_run_update(run_id);
                                 return Ok(false);
                             }
@@ -2014,6 +2445,52 @@ impl Orchestrator {
         self.apply_checkpoint_action(run_id, stage_id, action)
     }
 
+    /// Refuse every decision but Abort on a run that has ended (completed,
+    /// aborted or failed). An abort leaves the parked stage at
+    /// `awaiting_checkpoint`, so without this a late Approve or Send-back
+    /// would archive and reset stages of a run nobody drives any more.
+    /// `dispatch_checkpoint` calls it so the caller hears the refusal on the
+    /// in-process path too; the apply itself checks again
+    /// (`apply_checkpoint_action`). A run that isn't found is left to the
+    /// existing checks.
+    pub fn check_run_open(&self, run_id: &str, action: &CheckpointAction) -> AppResult<()> {
+        if matches!(action, CheckpointAction::Abort) {
+            return Ok(());
+        }
+        match self.db.lock().get_run(run_id)? {
+            Some(run) if matches!(run.status.as_str(), "completed" | "aborted" | "failed") => {
+                Err(finished_run_error(&run.status))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuse a decision on a named stage that is no longer waiting for one
+    /// (decided elsewhere since the caller looked), before anything changes.
+    /// `dispatch_checkpoint` calls it so the in-process path, which applies
+    /// in the background, still answers the caller with the error; the apply
+    /// itself checks again (`apply_checkpoint_action`). Abort and `None`
+    /// always pass.
+    pub fn check_named_stage(&self, run_id: &str, stage_id: Option<&str>, action: &CheckpointAction) -> AppResult<()> {
+        let Some(id) = stage_id else {
+            return Ok(());
+        };
+        if matches!(action, CheckpointAction::Abort) {
+            return Ok(());
+        }
+        let resolvable = self
+            .db
+            .lock()
+            .list_run_stages(run_id)?
+            .iter()
+            .any(|s| s.id == id && (s.status == "awaiting_checkpoint" || s.status == "failed"));
+        if resolvable {
+            Ok(())
+        } else {
+            Err(stale_stage_error())
+        }
+    }
+
     /// The shared mutation section of a checkpoint resolution (in-process and
     /// detached paths). The caller MUST hold this run's `active` claim.
     /// Returns `Some(budget_override)` when the run should be driven again,
@@ -2024,18 +2501,25 @@ impl Orchestrator {
         stage_id: Option<&str>,
         action: CheckpointAction,
     ) -> AppResult<Option<bool>> {
+        self.check_run_open(run_id, &action)?;
         let stages = self.db.lock().list_run_stages(run_id)?;
         let is_resolvable =
             |s: &crate::db::RunStageRow| s.status == "awaiting_checkpoint" || s.status == "failed";
-        // Prefer the caller's VALIDATED stage_id (e.g. `answer_blocker` checked
-        // exactly this stage): resolve THAT parked/failed stage. Only when no
-        // resolvable stage matches the id (stale/absent) do we fall back to the
-        // single-parked-stage `.find` — so nothing regresses for callers that
-        // pass no id (the plain `resolve_checkpoint`).
-        let blocked = stage_id
-            .and_then(|id| stages.iter().find(|s| s.id == id && is_resolvable(s)))
-            .or_else(|| stages.iter().find(|s| is_resolvable(s)))
-            .cloned();
+        // A caller that names a stage (the canvas's decision bar, the escape
+        // valve, the automatic plan resume) resolves exactly THAT parked/failed
+        // stage. A named stage that is no longer resolvable (decided elsewhere
+        // since the caller looked) is refused, never redirected to another
+        // stage of the run (`stale_stage_error`). Abort tears the whole run
+        // down, so it needs no stage. No id = the single-parked-stage rule.
+        let is_abort = matches!(action, CheckpointAction::Abort);
+        let blocked = match stage_id {
+            Some(id) => match stages.iter().find(|s| s.id == id && is_resolvable(s)) {
+                Some(s) => Some(s.clone()),
+                None if is_abort => stages.iter().find(|s| is_resolvable(s)).cloned(),
+                None => return Err(stale_stage_error()),
+            },
+            None => stages.iter().find(|s| is_resolvable(s)).cloned(),
+        };
 
         // Escape-valve guard: a stage parked via `ask_director` (awaiting a
         // checkpoint WITH questions) can ONLY be resolved by AnswerBlocker (or
@@ -2044,7 +2528,6 @@ impl Orchestrator {
         // empty hand-off — refuse it with a clear message. Conversely,
         // AnswerBlocker only makes sense on an actual block.
         let is_answer = matches!(action, CheckpointAction::AnswerBlocker { .. });
-        let is_abort = matches!(action, CheckpointAction::Abort);
         if let Some(s) = &blocked {
             let is_block = s.status == "awaiting_checkpoint" && s.blocked_questions.is_some();
             if is_block && !is_answer && !is_abort {
@@ -2061,6 +2544,36 @@ impl Orchestrator {
             return Err(AppError::Other(
                 "no stage is awaiting a director decision".into(),
             ));
+        }
+
+        // Dropping a deferred call only makes sense on a stage whose resumed
+        // session waits on one whose tool is gone, and that can be resumed.
+        let drop_deferred = matches!(action, CheckpointAction::DropDeferredCall { .. });
+        if drop_deferred {
+            let droppable = match &blocked {
+                Some(s) => {
+                    s.status == "failed"
+                        && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_deferred_tool_unavailable)
+                        && self.cli_session_resumable(s)?
+                }
+                None => false,
+            };
+            if !droppable {
+                return Err(AppError::Other(
+                    "this stage isn't waiting on a tool call that can be dropped — resume or re-run it instead".into(),
+                ));
+            }
+        }
+
+        // Resolving a plan-limited stage (an automatic resume comes through
+        // here too, after claiming it) or aborting ends a Claude plan park.
+        // Resolving a sibling (a real halt, a gate) leaves the park and its
+        // scheduled resume in place for the plan-limited stages.
+        let plan_stage = |s: &crate::db::RunStageRow| {
+            s.status == "failed" && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        };
+        if is_abort || blocked.as_ref().is_none_or(|s| plan_stage(s)) {
+            self.db.lock().clear_run_plan_wait(run_id)?;
         }
 
         // Approving a budget-parked stage (it never ran) is a conscious
@@ -2091,6 +2604,9 @@ impl Orchestrator {
                             >(json)
                             .ok();
                             let feedback = format_blocker_feedback(ask.as_ref(), &answers);
+                            // Before the reset forgets it: what the resumed
+                            // session's context should come back near.
+                            self.db.lock().keep_stage_resume_context(&s.id)?;
                             // preserve_transcript: the answered re-run CONTINUES
                             // the asking conversation (D18).
                             self.archive_and_reset_stage(run_id, s, None, Some(&feedback), true)?;
@@ -2104,17 +2620,9 @@ impl Orchestrator {
                             // the answers reach the SAME conversation via the
                             // resume nudge (the CLI counterpart of the API's
                             // transcript continuation).
-                            // Resume only when the stage's CLI DIALECT can actually
-                            // continue a session — codex can't (no stable resume
-                            // contract), and setting resume_pending there would
-                            // skip the dossier's worktree-diff capture for a run
-                            // that then starts fresh and NEEDS the dossier.
-                            let can_resume = s.substrate == "cli"
-                                && s.session_id.is_some()
-                                && matches!(
-                                    crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
-                                    crate::orchestrator::cli_runner::CliDialect::Claude
-                                );
+                            // Resume only when the stage's CLI session can be
+                            // continued (`cli_session_resumable`).
+                            let can_resume = self.cli_session_resumable(s)?;
                             if can_resume {
                                 self.db.lock().set_stage_resume_pending(&s.id, true)?;
                                 // A blocked stage is never archived (no artifact
@@ -2129,7 +2637,17 @@ impl Orchestrator {
             CheckpointAction::Approve | CheckpointAction::Edit => {
                 if let Some(s) = &blocked {
                     if s.status == "awaiting_checkpoint" {
-                        if s.started_at.is_none() && s.artifact.is_none() {
+                        let secret_held = s.secret_hold.as_ref().filter(|h| !h.acknowledged);
+                        if s.started_at.is_none() && s.artifact.is_none() && secret_held.is_some() {
+                            // Held by the secret guard (#730): approving is the
+                            // director's explicit "proceed regardless" for
+                            // exactly these findings. It doesn't skip a budget
+                            // gate — that gate still fires on the re-drive.
+                            let mut ack = secret_held.cloned().expect("checked above");
+                            ack.acknowledged = true;
+                            self.db.lock().set_stage_secret_hold(&s.id, Some(&ack))?;
+                            self.db.lock().set_run_stage_status(&s.id, "pending")?;
+                        } else if s.started_at.is_none() && s.artifact.is_none() {
                             // Budget-parked: the stage never ran. Release it to
                             // pending so it actually executes (past the gate).
                             self.db.lock().set_run_stage_status(&s.id, "pending")?;
@@ -2229,7 +2747,8 @@ impl Orchestrator {
                     self.recompute_run_cost(run_id)?;
                 }
             }
-            CheckpointAction::Resume { max_turns_override } => {
+            CheckpointAction::Resume { max_turns_override }
+            | CheckpointAction::DropDeferredCall { max_turns_override } => {
                 // Recover a transient/infra halt: re-run the SAME stage without
                 // treating its output as wrong. Only a failed stage can resume —
                 // an awaiting_checkpoint stage isn't a failure, so this is a no-op
@@ -2243,7 +2762,15 @@ impl Orchestrator {
                 // `blocked_transcript` (which this reset deliberately preserves;
                 // consume-once in `run_stage_once` clears it) — the re-run
                 // CONTINUES that conversation instead of starting over.
-                if let Some(s) = &blocked {
+                // Resuming a plan-limited stage resumes EVERY plan-limited
+                // stage of the run: they hit the same wall and the window that
+                // reset reopens for all of them (#731).
+                let targets: Vec<&crate::db::RunStageRow> = match &blocked {
+                    Some(b) if plan_stage(b) => stages.iter().filter(|s| plan_stage(s)).collect(),
+                    Some(b) => vec![b],
+                    None => Vec::new(),
+                };
+                for s in targets {
                     if s.status == "failed" {
                         if s.artifact.is_some() || s.error.is_some() {
                             self.db.lock().archive_stage_attempt(s, None)?;
@@ -2257,24 +2784,20 @@ impl Orchestrator {
                         if let Some(mt) = max_turns_override {
                             self.db.lock().set_stage_max_iterations(&s.id, mt)?;
                         }
-                        // Resume only when the stage's CLI DIALECT can actually
-                            // continue a session — codex can't (no stable resume
-                            // contract), and setting resume_pending there would
-                            // skip the dossier's worktree-diff capture for a run
-                            // that then starts fresh and NEEDS the dossier.
-                            let can_resume = s.substrate == "cli"
-                                && s.session_id.is_some()
-                                && matches!(
-                                    crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
-                                    crate::orchestrator::cli_runner::CliDialect::Claude
-                                );
+                        // Resume only when the stage's CLI session can be
+                        // continued (`cli_session_resumable`).
+                        let can_resume = self.cli_session_resumable(s)?;
                         self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
+                        // Drop the call (#973) on this resume only; a plain
+                        // Resume never inherits an earlier choice.
+                        self.db.lock().set_stage_drop_deferred(&s.id, drop_deferred && can_resume)?;
                         // The session's spend so far, taken from THIS row: the
                         // resumed run's budget cap sits on top of it.
                         self.db.lock().set_stage_resume_prior_cost(
                             &s.id,
                             if can_resume { s.cost_usd } else { 0.0 },
                         )?;
+                        self.db.lock().keep_stage_resume_context(&s.id)?;
                         self.db.lock().reset_run_stage(&s.id, None, None)?;
                         self.recompute_run_cost(run_id)?;
                     }
@@ -2334,7 +2857,7 @@ impl Orchestrator {
                                 (None, Some(n)) => Some(n.to_string()),
                                 (None, None) => None,
                             };
-                            self.loop_back(run_id, review, composed.as_deref())?;
+                            self.loop_back(run_id, review, composed.as_deref(), true)?;
                         } else {
                             // No usable loop (no/invalid target or cap reached) → accept the review.
                             self.db.lock().set_run_stage_status(&review.id, "done")?;
@@ -2456,6 +2979,17 @@ impl Orchestrator {
                 p.loop_mode.as_deref(),
             )?;
         }
+        // A Claude plan park (#731) whose plan-limited stages this re-run
+        // reset has nothing left to wait for: end it, or the scheduled resume
+        // would claim a run that is no longer parked. The director acted, so
+        // the automatic-resume allowance starts fresh either way.
+        let plan_left = self.db.lock().list_run_stages(run_id)?.iter().any(|s| {
+            s.status == "failed" && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        });
+        if !plan_left {
+            self.db.lock().clear_run_plan_wait(run_id)?;
+        }
+        self.db.lock().reset_plan_resume_count(run_id)?;
         // `archive_and_reset_stage` already retired each stage's spend onto
         // the run (append, never reset) — recompute folds that in.
         self.recompute_run_cost(run_id)?;
@@ -2539,6 +3073,7 @@ impl Orchestrator {
 
     pub async fn abort_run(&self, run_id: &str) -> AppResult<()> {
         self.db.lock().set_run_status(run_id, "aborted", true)?;
+        self.db.lock().clear_run_plan_wait(run_id)?;
         // Aborting must kill in-flight work, not just mark the DB: the drive
         // loop only checks the status BETWEEN stages.
         self.stop_current_stage(run_id)?;
@@ -2605,5 +3140,16 @@ impl Orchestrator {
                 );
             }
         });
+    }
+}
+
+/// How a held stage reads in the journal: "the pull request", "the merge",
+/// "the release", else "the <label> stage".
+pub(crate) fn secret_hold_stage_label(role: &str, label: &str) -> String {
+    match role {
+        "pull_request" => "the pull request".into(),
+        "merge" => "the merge".into(),
+        "release" => "the release".into(),
+        _ => format!("the {} stage", label.to_lowercase()),
     }
 }

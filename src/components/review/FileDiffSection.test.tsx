@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, waitFor } from "@testing-library/react";
 import { FileDiffSection, pathTail } from "./FileDiffSection";
 import { parseFullDiff, type DiffFile } from "../../lib/diffParser";
+import { readable } from "../../test-utils/readable";
 
 const { readFileChecked } = vi.hoisted(() => ({ readFileChecked: vi.fn() }));
 vi.mock("../../lib/ipc", () => ({ ipc: { readFileChecked } }));
@@ -30,8 +31,58 @@ describe("FileDiffSection", () => {
     const long = { ...file, filePath: "src-tauri/src/very/deep/module/sync.rs" };
     const { container, getByTitle } = render(<FileDiffSection file={long} focusedHunk={-1} viewed={false} collapsed={false}
       onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
-    expect(getByTitle(long.filePath)).toHaveTextContent(long.filePath);
+    // Full path in the DOM; the only extra glyph is the aria-hidden `…`.
+    expect(readable(getByTitle(long.filePath))).toBe(long.filePath);
     expect(container.querySelector(".octo-midtrunc-tail")?.textContent).toContain("/sync.rs");
+  });
+  it("gives the path box a definite width to elide into, long or short (#868)", () => {
+    // A cell sized from its own text (`flex min-w-0` alone) left WebKit cutting
+    // the head (`src-tauri`) with no ellipsis; the cell must grow into the row.
+    for (const filePath of ["src-tauri/src/sync.rs", "src-tauri/a.rs"]) {
+      const { container, getByTitle, unmount } = render(<FileDiffSection file={{ ...file, filePath }} focusedHunk={-1} viewed={false} collapsed={false}
+        onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+      const cell = getByTitle(filePath);
+      expect(cell).toHaveClass("flex", "min-w-0", "flex-1");
+      expect(cell.parentElement).toBe(container.querySelector(".octo-filehead"));
+      // The MidTruncate box is the cell's only child, so the cell is its width anchor.
+      expect(cell.children).toHaveLength(1);
+      expect(cell.firstElementChild!.className).toMatch(/^octo-midtrunc(-whole)?$/);
+      unmount();
+    }
+  });
+  it("cuts the path's head on its own ellipsis, never left held at clip (#872)", () => {
+    // Safari's audit found the `src-tauri` head cut with no ellipsis. The head
+    // is `.octo-midtrunc-head` (ellipsis); the measuring hold is its inline
+    // style and must be gone once the pass ends.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    const rect = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const width = this.classList.contains("octo-midtrunc-head") ? 30 : 0;
+      return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+    });
+    const realRange = Range.prototype.getBoundingClientRect;
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      const w = (this.endOffset - this.startOffset) * 7;
+      return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+    };
+    try {
+      const filePath = "src-tauri/src/sync.rs";
+      const { getByTitle } = render(<FileDiffSection file={{ ...file, filePath }} focusedHunk={-1} viewed={false} collapsed={false}
+        onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+      act(() => frames.splice(0).forEach((cb) => cb(0)));
+      const box = getByTitle(filePath).querySelector(":scope > .octo-midtrunc")!;
+      const head = box.querySelector<HTMLElement>(":scope > .octo-midtrunc-head")!;
+      expect(head).toHaveTextContent(/^src-tauri$/);
+      expect(head.className).toBe("octo-midtrunc-head");
+      expect(box).toHaveAttribute("data-elided");
+      expect(box).not.toHaveAttribute("data-measuring");
+      expect(head.style.textOverflow).toBe("");
+      expect(box.querySelector(":scope > .octo-midtrunc-tail")).toHaveTextContent("/src/sync.rs");
+    } finally {
+      Range.prototype.getBoundingClientRect = realRange;
+      rect.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
   it("renders a short path as one nowrap line, not a bare string in the flex row", () => {
     const { getByText } = render(<FileDiffSection file={{ ...file, filePath: "src-tauri/a.rs" }} focusedHunk={-1} viewed={false} collapsed={false}

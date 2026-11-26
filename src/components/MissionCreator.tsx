@@ -5,15 +5,19 @@ import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
 import { Reveal } from "./primitives/Reveal";
 import { Listbox } from "./controls/Listbox";
-import type { PrInfo } from "../lib/types";
+import { TogglePill } from "./controls/TogglePill";
+import type { PrInfo, ShareSpec } from "../lib/types";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { moveMissionToGroup } from "../lib/groupActions";
 import { useMissionsStore } from "../stores/missionsStore";
 import { BRANCH_NAME_MAX, branchFromTask, shortenSlug, uniqueBranch, worktreeSlugMax } from "../lib/branchName";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { pushToast } from "./Toasts";
+import { SETUP_FIELD_ROWS, conductorSourceLine, wantsConductorPrefill } from "../lib/conductorSetup";
+import { type ShareRow, sameSpec, setupInstallWarning, shareRows, specFromRows } from "../lib/shareWithMissions";
 
 interface Props {
   projectId: string;
@@ -27,6 +31,9 @@ interface Props {
   /** The project's Jira key: only a ticket of this project found in the task
    *  text leads the suggested branch (a bare `UTF-8` is never a ticket). */
   projectJiraKey?: string | null;
+  /** A mission group of this project the new mission joins (the creator was
+   *  opened from that group's "+" in the rail). */
+  groupId?: string | null;
 }
 
 type Step = 1 | 2 | 3;
@@ -86,7 +93,7 @@ const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: strin
   perf: { icon: Gauge, title: "Chase a regression", desc: "Profile & find what got slow. Read-only." },
 };
 
-export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate, projectJiraKey }: Props) {
+export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate, projectJiraKey, groupId }: Props) {
   const [step, setStep] = useState<Step>(1);
   const [intent, setIntent] = useState<Intent>("build");
   const [task, setTask] = useState(initialTask ?? "");
@@ -95,6 +102,16 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const [setupScript, setSetupScript] = useState(
     () => useCompanionPrefs.getState().setupScriptByProject[projectId] ?? "",
   );
+  /** The script read from the repo's `.conductor/settings.toml` (asked for
+   *  only while the project has no saved template). The provenance line shows
+   *  only while the field still holds exactly this. */
+  const [conductorScript, setConductorScript] = useState<string | null>(null);
+  /** Set once the user types in the field: a late prefill never overwrites it. */
+  const setupEditedRef = useRef(false);
+  /** "Share with new missions": the main checkout's dependency folders and
+   *  env files, checked where the project shares them (opt-in). */
+  const [shareList, setShareList] = useState<ShareRow[]>([]);
+  const savedShareRef = useRef<ShareSpec>({ link: [], copy: [] });
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
@@ -114,6 +131,42 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const prevBaseRef = useRef<string | null>(null);
 
   const create = useWorkspaceStore((s) => s.create);
+
+  // A Conductor repo already declares its setup: offer it, unrun, when the
+  // project has no setup template of its own (the backend also checks
+  // `projects.setup_script`). Fails quietly — the field just stays empty.
+  useEffect(() => {
+    if (!wantsConductorPrefill(useCompanionPrefs.getState().setupScriptByProject[projectId])) return;
+    let cancelled = false;
+    ipc
+      .conductorSetupScript(projectId)
+      .then((script) => {
+        if (cancelled || !script?.trim() || setupEditedRef.current) return;
+        setSetupScript(script);
+        setConductorScript(script);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  // What the main checkout could share, and what the project already shares.
+  // Fails quietly — the section just doesn't show.
+  useEffect(() => {
+    let cancelled = false;
+    ipc
+      .shareWithMissions(projectId)
+      .then((opts) => {
+        if (cancelled || !opts) return;
+        savedShareRef.current = opts.saved;
+        setShareList(shareRows(opts));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
 
   async function handlePickPr(pr: PrInfo) {
     setPrError(null);
@@ -225,6 +278,19 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
       : fromPr
         ? "pr"
         : gitIsolation;
+    // The share list is a project setting the backend applies while it makes
+    // the worktree, so it is saved first; a failed save stops here.
+    const shareSpec = specFromRows(shareList);
+    if (!sameSpec(shareSpec, savedShareRef.current)) {
+      try {
+        await ipc.setShareWithMissions(projectId, shareSpec);
+        savedShareRef.current = shareSpec;
+      } catch (e) {
+        setError(`Couldn't save what this project shares with new missions: ${String(e)}`);
+        setCreating(false);
+        return;
+      }
+    }
     let newWs;
     try {
       newWs = await create(
@@ -244,6 +310,11 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
       setCreating(false);
       return;
     }
+    // Started from a mission group's "+": the mission joins that group. A
+    // workspace the backend adopted (the branch already had one) that sits in
+    // another group is left where it is. A refusal is reported by the store
+    // and never fails the creation.
+    if (groupId && !newWs.groupId) void moveMissionToGroup(newWs.id, groupId);
     // `create_workspace` creates the mission (intent) server-side as a side
     // effect but its response only carries the workspace — refresh
     // missionsStore so the rail resolves this workspace's intent icon right
@@ -289,6 +360,17 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     setCreating(false);
     onCreated();
   }
+
+  // A linked dependency folder is the main checkout's own folder: say so
+  // when the setup script would install into it or clean it. A sandboxed
+  // mission gets no links, so there is nothing to warn about.
+  const shareInstallWarning =
+    execIsolation === "sandbox"
+      ? null
+      : setupInstallWarning(
+          setupScript,
+          shareList.filter((r) => r.kind === "link" && r.checked).map((r) => r.name),
+        );
 
   return (
     <div
@@ -562,12 +644,24 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                 <textarea
                   data-tour="mission-setup-script"
                   value={setupScript}
-                  onChange={(e) => setSetupScript(e.target.value)}
+                  onChange={(e) => {
+                    setupEditedRef.current = true;
+                    setSetupScript(e.target.value);
+                  }}
                   placeholder="npm install"
-                  rows={6}
+                  rows={SETUP_FIELD_ROWS}
                   className="w-full resize-y rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] leading-[1.6] text-octo-ivory outline-none placeholder:font-mono placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
+
+              {conductorScript !== null && setupScript === conductorScript && (
+                <div
+                  data-tour="mission-setup-conductor"
+                  className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute"
+                >
+                  {conductorSourceLine(setupScript)}
+                </div>
+              )}
 
               <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
                 {branchCollides ? (
@@ -584,6 +678,57 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
               >
                 Saved as this project&apos;s setup script: new missions start from it, and a Routine&apos;s fresh workspace runs it before its crew.
               </div>
+
+              {shareList.length > 0 && (
+                <div data-tour="mission-share" className="octo-rise-in mt-8">
+                  <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+                    SHARE WITH NEW MISSIONS
+                  </div>
+                  <ul className="m-0 list-none p-0">
+                    {shareList.map((row) => (
+                      <li key={`${row.kind}:${row.name}`} className="flex items-center gap-3 py-1">
+                        <span className="font-mono text-[12px] text-octo-ivory">{row.name}</span>
+                        <span className="font-mono text-[10px] text-octo-mute">
+                          {row.kind === "link"
+                            ? "the main checkout's own folder, linked"
+                            : "copied into the worktree, readable by the mission's agents"}
+                        </span>
+                        <span className="ml-auto">
+                          <TogglePill
+                            on={row.checked}
+                            label={row.kind === "link" ? "Link" : "Copy"}
+                            ariaLabel={`${row.kind === "link" ? "Link" : "Copy"} ${row.name} into new missions`}
+                            onChange={(on) =>
+                              setShareList((cur) =>
+                                cur.map((r) => (r.kind === row.kind && r.name === row.name ? { ...r, checked: on } : r)),
+                              )
+                            }
+                          />
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
+                    Applied to a new worktree before its setup script, and saved for this project. A linked folder is the main checkout&apos;s own folder, not a copy: an install or a clean run inside a mission changes it for the main checkout and for every other mission. A copied env file is a plain file in the mission&apos;s worktree, so agents in the mission can read it. Copies stay git-ignored, so they never stage. To keep a link out of commits, Octopush adds its name to this repo&apos;s local .git/info/exclude, where it stays. Routines and workspaces created over MCP don&apos;t share.
+                  </div>
+                  {shareInstallWarning && (
+                    <div
+                      data-tour="mission-share-install"
+                      className="octo-rise-in mt-1 font-mono text-[10px] tracking-[0.05em] text-octo-warning"
+                    >
+                      {shareInstallWarning}
+                    </div>
+                  )}
+                  {execIsolation === "sandbox" && shareList.some((r) => r.checked) && (
+                    <div
+                      data-tour="mission-share-sandbox"
+                      className="octo-rise-in mt-1 font-mono text-[10px] tracking-[0.05em] text-octo-warning"
+                    >
+                      A sandboxed mission gets neither the links nor the env files: nothing points its agents outside the worktree, and no env file is placed inside it. Turning the sandbox on later removes a mission&apos;s links and its unchanged env copies.
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {error && (

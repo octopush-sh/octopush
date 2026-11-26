@@ -16,7 +16,7 @@ vi.mock("../../lib/ipc", () => ({ ipc: ipcMock }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: vi.fn() }));
 vi.mock("@tauri-apps/api/app", () => ({ getVersion: vi.fn(async () => "1.3.0") }));
 
-import { AboutPane } from "./AboutPane";
+import { AboutPane, REFERENCE_LINK_CLASS } from "./AboutPane";
 import { useUpdaterStore } from "../../stores/updaterStore";
 
 const INITIAL = useUpdaterStore.getState();
@@ -66,5 +66,38 @@ describe("AboutPane — update channel", () => {
     render(<AboutPane />);
     expect(screen.getByRole("heading", { name: "Fixes" })).toBeInTheDocument();
     expect(screen.getByText("Faster").tagName).toBe("STRONG");
+  });
+});
+
+describe("AboutPane — reference links (#560)", () => {
+  it("renders both links in sage with an underline that turns ivory on hover, motion-safe", () => {
+    const { container } = render(<AboutPane />);
+    const repo = screen.getByText("github.com/octopush-sh/octopush");
+    const notes = container.querySelector('[data-tour="about-whats-new"]')!;
+    for (const el of [repo, notes]) {
+      expect(el).toHaveClass(...REFERENCE_LINK_CLASS.split(" "));
+      expect(el).toHaveClass("text-octo-sage", "hover:decoration-octo-ivory", "motion-reduce:transition-none");
+      expect(el).not.toHaveClass("text-octo-brass");
+    }
+  });
+
+  it("sets both links in the same sans voice (#876)", () => {
+    const { container } = render(<AboutPane />);
+    const repo = screen.getByText("github.com/octopush-sh/octopush");
+    const notes = container.querySelector('[data-tour="about-whats-new"]')!;
+    for (const el of [repo, notes]) {
+      expect(el).not.toHaveClass("font-serif");
+      expect(el).not.toHaveClass("font-mono");
+    }
+    expect(notes.className).not.toMatch(/text-\[\d+px\]/);
+  });
+});
+
+describe("AboutPane — last checked (#876)", () => {
+  it("says when it last checked once, beside the status line", () => {
+    useUpdaterStore.setState({ phase: "no-update", currentVersion: "1.3.0", lastCheckedAt: Date.now() });
+    render(<AboutPane />);
+    expect(screen.getByText(/^Checked /)).toBeInTheDocument();
+    expect(screen.queryByText(/Last checked for updates/)).toBeNull();
   });
 });

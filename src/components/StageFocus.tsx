@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
-import { ChevronLeft, ChevronRight, Hourglass, SlidersHorizontal, RotateCcw } from "lucide-react";
+import { ChevronLeft, ChevronRight, SlidersHorizontal, RotateCcw } from "lucide-react";
 import type { LiveEntry, Run, RunStage, RunStagePatch, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
-import { isTransientHalt } from "../lib/runStatus";
+import { isTransientHalt, runStatusMeta } from "../lib/runStatus";
 import { iconForRole } from "../lib/roleIcons";
-import { stageTitle, fmtTokens } from "../lib/stageMeta";
+import { stageTitle, fmtTokens, stageContextReading, contextToneClass, currentContext } from "../lib/stageMeta";
+import { formatUsd } from "../lib/cost";
+import { refusedCallsNote, REFUSED_CALLS_TITLE } from "../lib/refusedCalls";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
@@ -17,6 +19,10 @@ import { Stepper } from "./controls/Stepper";
 import { SegmentedControl } from "./controls/SegmentedControl";
 import { ModelPicker } from "./ModelPicker";
 import { ModalShell } from "./ModalShell";
+import { CommentableDocument } from "./comments/CommentableDocument";
+import { useGateComments, useGateCommentsStore } from "../stores/gateCommentsStore";
+import { tourId } from "../lib/tour/ids";
+import { gateKey } from "../lib/gateComments";
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
 
@@ -101,6 +107,10 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   /** 1-based archived attempt being viewed; null = the current attempt. */
   const [viewedAttempt, setViewedAttempt] = useState<number | null>(null);
   const liveEntries = useRunsStore((s) => s.liveByStage[stage?.id ?? ""] ?? EMPTY_ENTRIES);
+  const liveContext = useRunsStore((s) => s.liveContextByStage?.[stage?.id ?? ""]);
+  const gateComments = useGateComments(stage ? gateKey(stage) : null);
+  const addGateComment = useGateCommentsStore((s) => s.add);
+  const removeGateComment = useGateCommentsStore((s) => s.remove);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ── Director controls: gate toggle, edit-stage modal, re-run confirm ──
@@ -228,6 +238,8 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   // Looking at a different stage = back to its current attempt.
   useEffect(() => { setViewedAttempt(null); }, [stage?.id]);
 
+  const frozenByAbort = run?.status === "aborted" && stage?.status === "running";
+
   // D5 + D1 — fetch the archive list and the persisted journal for this stage.
   // Re-fetched on status changes too: a loop-back both archives an attempt and
   // resets the live journal. Hydration fills the in-memory journal of a
@@ -241,7 +253,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
     const stageId = stage.id;
     // Any non-running stage may hydrate from the persisted log (done/failed,
     // and budget-parked awaiting_checkpoint stages whose only content is a notice).
-    const terminal = stage.status !== "running";
+    // So may a stage an abort froze at `running`: nothing streams into it any
+    // more, so after a relaunch its journal would otherwise stay empty (#891).
+    const terminal = stage.status !== "running" || frozenByAbort;
     void ipc.listStageIterations(stageId)
       .then((rows) => { if (!cancelled) setIterations(rows); })
       .catch(() => {});
@@ -257,7 +271,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [stage?.id, stage?.status]);
+  }, [stage?.id, stage?.status, frozenByAbort]);
 
   // Keep the live journal pinned to the newest activity while a stage runs (S6: smooth).
   useEffect(() => {
@@ -274,7 +288,20 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   // "Waiting for you" never drops below the diff. Held while the stage is
   // inactive so its exit (✓ beat, fade) plays where it was instead of
   // remounting, hidden, in the other slot.
-  const playerLive = stage?.status === "running" || stage?.status === "awaiting_checkpoint";
+  // An aborted run freezes the stage it was on at running / awaiting_checkpoint
+  // (the abort never rewrites the stage row) — the pane shows the abort, not
+  // the gate's "Waiting for you" (#844).
+  const runAborted = run?.status === "aborted";
+  // A gate holding a finished stage's text (#957): the director can comment
+  // on the passages; the decision bar sends the comments with the decision.
+  const commentable =
+    controllable &&
+    viewedAttempt === null &&
+    stage.status === "awaiting_checkpoint" &&
+    !!artifact?.text.trim();
+  const stageCutByAbort =
+    runAborted && (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
+  const playerLive = !runAborted && (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
   const playerWantsTail = stage?.status === "running" && !artifact;
   const [playerAtTail, setPlayerAtTail] = useState(playerWantsTail);
   if (playerLive && playerAtTail !== playerWantsTail) setPlayerAtTail(playerWantsTail);
@@ -305,6 +332,14 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
     : artifact ? "artifact"
     : stage.status === "running" ? "running"
     : "idle";
+  // As on the stage card: a stage that is running again (a loop-back attempt)
+  // or that an abort cut still carries its previous attempt's count — hide it.
+  const refused = stage.status !== "running" && !stageCutByAbort ? stage.refusedCalls ?? 0 : 0;
+  // The context reading (#895) is the current attempt's: a running stage's
+  // live one, a finished stage's final one. Hidden while an archived attempt
+  // is on screen, on a pending stage (a re-run reset it), and whenever the
+  // window is unknown.
+  const ctx = viewedRow || stage.status === "pending" ? null : stageContextReading(currentContext(stage, liveContext));
   const swapKey = viewedRow ? `${stage.id}:attempt-${attemptN}` : `${stage.id}:${mode}`;
 
   return (
@@ -375,12 +410,32 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
             </span>
           )}
           <span className="ml-auto flex shrink-0 items-center gap-2.5 font-mono">
+            {refused > 0 && (
+              <span
+                className="octo-pop-in whitespace-nowrap text-[10px] text-octo-warning"
+                title={REFUSED_CALLS_TITLE}
+                data-tour="direct-focus-refused"
+              >
+                {refusedCallsNote(refused)}
+              </span>
+            )}
+            {ctx && (
+              <span
+                className={`octo-pop-in octo-tabular whitespace-nowrap text-[10px] ${contextToneClass(ctx.tone)}`}
+                title={ctx.title}
+                data-tour="direct-focus-context"
+                data-tone={ctx.tone}
+              >
+                {ctx.label}
+              </span>
+            )}
             {(stage.inputTokens > 0 || stage.outputTokens > 0) && (
               <span className="octo-tabular text-[10px] text-octo-mute" title="input / output tokens">
                 ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}
               </span>
             )}
-            <span className="octo-tabular text-xs text-octo-brass">${stage.costUsd.toFixed(2)}</span>
+            {/* A cost is data, never brass: the role eyebrow keeps the accent (#1017). */}
+            <span className="octo-tabular text-xs text-octo-ivory">{formatUsd(stage.costUsd)}</span>
           </span>
         </div>
         <div className="truncate font-serif text-[15px] text-octo-ivory" title={stageTitle(stage)}>
@@ -422,9 +477,18 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
       {/* The Player outside the live journal (spec 2026-07-19 §4, extended to
           DIRECT): right under the header, outside the scroller, so the gate's
           "Waiting for you" stays in view however long the diff is. */}
+      {viewedRow == null && stageCutByAbort && (
+        <div
+          data-testid="stage-aborted"
+          className="octo-fade-in flex items-center gap-2 px-4 pt-2.5 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute"
+        >
+          <span aria-hidden>{runStatusMeta("aborted").glyph}</span>
+          <span>aborted · the run ended at this stage</span>
+        </div>
+      )}
       {viewedRow == null && !playerAtTail && (
         <div className="px-4 pt-2.5 empty:hidden">
-          <StageOctoStatus stage={stage} entries={liveEntries} />
+          <StageOctoStatus stage={stage} entries={liveEntries} runAborted={runAborted} />
         </div>
       )}
       <div
@@ -449,7 +513,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               )}
               {viewedRow.diffSnapshot != null && <SnapshotDiff diff={viewedRow.diffSnapshot} />}
               <div className="octo-tabular font-mono text-[11px] text-octo-mute">
-                ${viewedRow.costUsd.toFixed(2)}
+                {formatUsd(viewedRow.costUsd)}
               </div>
               {viewedRow.closingFeedback && (
                 <div className="flex flex-col gap-1">
@@ -490,8 +554,22 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
             </>
           ) : mode === "artifact" ? (
             <>
-              <div className="whitespace-pre-wrap">
-                {artifact!.text || "(no output text)"}
+              <div className={commentable ? undefined : "whitespace-pre-wrap"}>
+                {commentable ? (
+                  <CommentableDocument
+                    text={artifact!.text}
+                    comments={gateComments}
+                    onAdd={(quote, note, at, len) => addGateComment(gateKey(stage), quote, note, at, len)}
+                    onRemove={(id) => removeGateComment(gateKey(stage), id)}
+                    tour={{
+                      document: tourId("direct-gate-document"),
+                      compose: tourId("direct-gate-comment-compose"),
+                      list: tourId("direct-gate-comments"),
+                    }}
+                  />
+                ) : (
+                  artifact!.text || "(no output text)"
+                )}
                 {artifact!.refsWorktree && (
                   snapshot != null ? (
                     <SnapshotDiff diff={snapshot} />
@@ -509,22 +587,11 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               {journal.length > 0 && <JournalDrawer key={stage.id} items={journal} />}
             </>
           ) : mode === "running" ? (
-            /* The live journal slot sits right under the header in every
-               state: before the first entry lands it holds a mute waiting
-               row, so a just-started stage never reads as a blank canvas. */
-            journal.length > 0 ? (
-              <>{journal}</>
-            ) : (
-              <div
-                data-tour="direct-focus-waiting"
-                className="octo-rise-in flex items-baseline gap-2 font-mono text-[12px] text-octo-mute"
-              >
-                <span className="translate-y-[1px] shrink-0" title="Waiting">
-                  <Hourglass size={11} strokeWidth={1.75} />
-                </span>
-                <span>Waiting for the first tool call…</span>
-              </div>
-            )
+            /* The live journal slot sits right under the header. Before the
+               first entry lands it stays empty: the inline Player below is the
+               pane's one waiting indicator, and the run-track card's live line
+               says "waiting for first tool call" (S1, one chrome per concept). */
+            <>{journal}</>
           ) : journal.length > 0 ? (
             <div className="flex flex-col gap-2">{journal}</div>
           ) : (
@@ -533,7 +600,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
         </FadeSwap>
         {/* The Player while the live journal runs: docked inline at its tail
             so it follows the newest line. Hidden while viewing an archived attempt. */}
-        {viewedRow == null && playerAtTail && <StageOctoStatus stage={stage} entries={liveEntries} />}
+        {viewedRow == null && playerAtTail && (
+          <StageOctoStatus stage={stage} entries={liveEntries} runAborted={runAborted} />
+        )}
       </div>
     </div>
     {editOpen && (

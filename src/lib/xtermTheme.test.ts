@@ -10,6 +10,15 @@ describe("xtermTheme", () => {
     expect(XTERM_FONT_FAMILY).toContain("JetBrains Mono");
   });
 
+  it("falls back to an installed Nerd Font for prompt glyphs, after the mono faces", () => {
+    const faces = XTERM_FONT_FAMILY.split(", ");
+    expect(faces[0]).toBe('"JetBrains Mono"');
+    expect(faces[faces.length - 1]).toBe("monospace");
+    const nerd = faces.indexOf('"Symbols Nerd Font Mono"');
+    expect(nerd).toBeGreaterThan(faces.indexOf("Consolas"));
+    expect(faces).toContain('"MesloLGS NF"');
+  });
+
   it("falls back to the Onyx & Brass palette when no CSS var is set", () => {
     // jsdom has no stylesheet, so getPropertyValue returns "" → fallbacks.
     const theme = getXtermTheme();

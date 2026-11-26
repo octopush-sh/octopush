@@ -32,6 +32,10 @@ pub struct StageContext {
     /// substrate acts on it (it wraps the spawn in a sandbox); `ApiRunner`
     /// ignores it (it never spawns a subprocess).
     pub exec_isolation: String,
+    /// The mission's own `exec_isolation` choice. Differs from `exec_isolation`
+    /// for a `readonly` (review/probe) mission, whose sandbox is forced on;
+    /// the Claude read guard follows this choice, not the forced tier.
+    pub exec_choice: String,
     /// Directories a sandbox may write to (the workspace worktree at minimum).
     pub allowed_write_roots: Vec<String>,
     /// Skills the run's brief named (`/slug`), resolved against this worktree
@@ -48,6 +52,12 @@ pub struct StageContext {
     /// tool (API substrate): archived artifact + journal digest + the model
     /// that produced them.
     pub peers: Vec<crate::orchestrator::agentic::PeerStage>,
+    /// Settings › Privacy › "Quiet Claude Code in crews and Routines" (#703),
+    /// read from `settings.json` when the stage starts — so the detached
+    /// worker sees it too. A Claude CLI stage then gets
+    /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (see
+    /// `CliDialect::stage_quiet_env`); Codex and `ApiRunner` ignore it.
+    pub quiet_claude_code: bool,
 }
 
 /// The error message for a stage whose agentic work ended without a final
@@ -221,6 +231,11 @@ pub fn user_input_for(
     } else if input.refs_worktree {
         s.push_str("The current code changes are present in the workspace; inspect them with your tools.\n\n");
     }
+    // Collision radar (#732): other live workspaces changing the same files.
+    if let Some(note) = input.concurrent_work.as_deref().filter(|n| !n.trim().is_empty()) {
+        s.push_str(note);
+        s.push_str("\n\n");
+    }
     // Attempt history BEFORE the current feedback: the history is context,
     // the feedback below is the binding directive for THIS attempt.
     if let Some(h) = input.history.as_deref().filter(|h| !h.trim().is_empty()) {
@@ -279,7 +294,10 @@ impl AgentRunner for ApiRunner {
         let (provider, api_base, api_key) = resolve_provider(&stage.agent_model)?;
         // API substrate: the `ask_director` escape valve is available, so the
         // carve-out is included (`can_ask_director = true`).
-        let mut system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
+        // A read-only role (#847) gets the firm instruction, loses the file
+        // write tools and has its git writes refused (`read_only`).
+        let read_only = crate::orchestrator::read_only::role_is_read_only(&stage.artifact_kind, stage.role_environment);
+        let mut system = crate::orchestrator::roles::compose_stage_system_prompt(&stage.role_prompt, stage.role_environment, read_only, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
         // Repo conventions (CLAUDE.md/AGENTS.md/…): the CLI substrate reads
         // them itself; the API substrate must be handed them explicitly or a
         // non-Claude implementer works blind to the project's rules.
@@ -343,6 +361,7 @@ impl AgentRunner for ApiRunner {
         // The per-stage tool-turn budget (validated 1..=100 at save time);
         // clamp defensively so a corrupt row can never yield a zero-turn loop.
         let max_iterations = stage.max_iterations.max(1) as usize;
+        let read_only_tools = read_only.then(|| crate::orchestrator::read_only::read_only_api_tools(stage.tools.as_deref()));
         let result = run_agentic_loop(
             provider.as_ref(),
             &api_base,
@@ -355,7 +374,7 @@ impl AgentRunner for ApiRunner {
             max_iterations,
             &ctx.cancel,
             &emitter,
-            stage.tools.as_deref(),
+            if read_only { read_only_tools.as_deref() } else { stage.tools.as_deref() },
             stage.effort,
             if ctx.exec_isolation == "sandbox" {
                 Some(ctx.allowed_write_roots.as_slice())
@@ -365,28 +384,25 @@ impl AgentRunner for ApiRunner {
             matches!(stage.loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)),
             ctx.spend_limit,
             &ctx.peers,
-            None,
+            if read_only { Some(&crate::orchestrator::read_only::ReadOnlyGitGate as &dyn crate::orchestrator::agentic::ToolGate) } else { None },
             None,
         )
         .await;
 
         match result {
             Ok(r) => {
-                // Own spend at the stage model's rate, plus any `ask_stage`
-                // peer consultations already priced at each PEER model's rate.
-                let cost = crate::orchestrator::cost::stage_cost(
-                    &stage.agent_model,
-                    r.input_tokens,
-                    r.output_tokens,
-                    r.cache_read_tokens,
-                    r.cache_creation_tokens,
-                ) + r.peer_cost_usd;
+                // Own spend at the stage model's rate, priced request by
+                // request (each request's own long-prompt tier), plus any
+                // `ask_stage` peer consultations already priced at each PEER
+                // model's rate.
+                let cost = r.cost_usd + r.peer_cost_usd;
                 // Escape valve: the stage called `ask_director`. This is neither
                 // a success nor a failure — it's a block. Carry the questions up
                 // so the drive parks the stage as an `awaiting_checkpoint`
                 // decision; the spend it burned asking is preserved for the meter.
                 if let Some(ask) = r.blocked.clone() {
                     return Ok(StageOutcome {
+                        cli: Default::default(),
                         artifact: StageArtifact {
                             kind: ArtifactKind::Note,
                             text: String::new(),
@@ -418,6 +434,7 @@ impl AgentRunner for ApiRunner {
                 if !r.finished {
                     let cancelled = ctx.cancel.load(std::sync::atomic::Ordering::Relaxed);
                     return Ok(StageOutcome {
+                        cli: Default::default(),
                         artifact: StageArtifact {
                             kind: ArtifactKind::Note,
                             text: String::new(),
@@ -467,6 +484,7 @@ impl AgentRunner for ApiRunner {
                     r.text.clone()
                 };
                 Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact {
                         kind,
                         text,
@@ -488,6 +506,7 @@ impl AgentRunner for ApiRunner {
                 })
             }
             Err(e) => Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: String::new(),

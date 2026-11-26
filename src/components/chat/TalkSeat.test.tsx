@@ -76,7 +76,13 @@ describe("TalkSeat", () => {
     renderSeat({ onToggle });
     expect(published().map((s) => [s.mode, s.terminalId])).toEqual([["talk", "b"]]);
     expect(screen.getByText("Label b")).toBeTruthy();
-    fireEvent.click(screen.getByTestId("talk-seat-leave"));
+    const leave = screen.getByTestId("talk-seat-leave");
+    expect(leave.getAttribute("title")).toBe("Leave the view · the session keeps running");
+    expect(leave.getAttribute("aria-label")).toBe("Leave the view");
+    // A minus, as in Run: × reads as "close" while the session keeps running.
+    expect(leave.querySelector("svg.lucide-minus")).not.toBeNull();
+    expect(leave.querySelector("svg.lucide-x")).toBeNull();
+    fireEvent.click(leave);
     expect(onToggle).toHaveBeenCalledTimes(1);
   });
 

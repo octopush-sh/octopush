@@ -20,7 +20,7 @@ import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
 import { pushToast } from "../Toasts";
-import { modelCostCell } from "../../lib/cost";
+import { formatUsd, modelCostCell } from "../../lib/cost";
 import {
   PaneHeader, SectionLabel, Segments, Stat, Row, formatTokens, formatRelative, usd, useChartColors,
   type ChartColors,
@@ -68,8 +68,8 @@ function surfaceColor(surface: string, chart: ChartColors): string {
 // The boxes and line classes the figures render into. UsageSkeleton draws
 // its placeholders with the same strings, so each slot is the same height
 // as what replaces it and the two cannot drift apart.
-const HEADLINE = "mt-6 grid max-w-[860px] grid-cols-2 gap-3 md:grid-cols-4";
-const SECTION = "mt-8 max-w-[860px]";
+const HEADLINE = "mt-6 grid grid-cols-2 gap-3 md:grid-cols-4";
+const SECTION = "mt-8";
 const MODE_GRID = "grid grid-cols-2 gap-3 md:grid-cols-4";
 const CARD_SHELL = "rounded-md border px-3 py-3 text-left";
 const CARD_LABEL = "flex items-center gap-2 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute";
@@ -337,7 +337,7 @@ export function UsagePane() {
       />
 
       {/* ── Period · mode ── */}
-      <div className="flex max-w-[860px] flex-wrap items-center gap-x-6 gap-y-3">
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
         <Segments ariaLabel="Period" testId="usage-period" value={period} options={PERIODS} onChange={setPeriod} />
         {period === "custom" && (
           <div className="octo-fade-in flex items-center gap-2">
@@ -375,7 +375,7 @@ export function UsagePane() {
       </div>
 
       {currentError && (
-        <div data-testid="usage-error" className="mt-4 max-w-[860px] rounded-md border border-octo-hairline bg-octo-panel px-4 py-3 text-[12px] text-octo-rouge">
+        <div data-testid="usage-error" className="mt-4 rounded-md border border-octo-hairline bg-octo-panel px-4 py-3 text-[12px] text-octo-rouge">
           {currentError}
         </div>
       )}
@@ -396,7 +396,7 @@ export function UsagePane() {
           {pricingStale && (
             <div
               data-testid="usage-pricing-stale"
-              className="mt-4 flex max-w-[860px] items-center gap-3 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2.5"
+              className="mt-4 flex items-center gap-3 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2.5"
             >
               <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: "var(--color-octo-warning)" }} />
               <span className="min-w-0 flex-1 text-[12px] text-octo-sage">
@@ -443,7 +443,7 @@ export function UsagePane() {
           </div>
 
           {report.unpricedCalls > 0 && (
-            <p className="mt-2 flex max-w-[860px] flex-wrap items-baseline gap-x-2 text-[11px] text-octo-mute">
+            <p className="mt-2 flex flex-wrap items-baseline gap-x-2 text-[11px] text-octo-mute">
               <span>
                 {report.unpricedCalls === 1 ? "1 call" : `${report.unpricedCalls} calls`} carried tokens but no price — a model the catalog did not know, or had no price for, when it ran. They are left out of the totals and of any savings, not counted as free.
               </span>
@@ -528,7 +528,7 @@ export function UsagePane() {
                       labelFormatter={(b) => bucketLabel(String(b), report.trendBucket)}
                       formatter={(v, _name, item) => {
                         const tokens = (item?.payload as { tokens?: number } | undefined)?.tokens ?? 0;
-                        return [`$${Number(v).toFixed(2)} · ${formatTokens(tokens)} tokens`, "Cost"];
+                        return [`${formatUsd(Number(v))} · ${formatTokens(tokens)} tokens`, "Cost"];
                       }}
                     />
                     <Area type="monotone" dataKey="costUsd" stroke={chart.accent} fill="url(#grad-cost-brass)" strokeWidth={2} />
@@ -610,7 +610,7 @@ export function UsagePane() {
           {gateway && <GatewaySection report={gateway} filtered={mode !== "all"} />}
 
           {breakdown && breakdown.localTokens > 0 && (
-            <div className="mt-8 max-w-[860px]">
+            <div className="mt-8">
               <SectionLabel>Cloud vs local</SectionLabel>
               <div className="grid grid-cols-3 gap-3">
                 <Stat label="Cloud spend" value={usd(breakdown.cloudCostUsd)} />
@@ -627,12 +627,12 @@ export function UsagePane() {
       <ClaudePlanCard />
 
       {/* ── Budgets ── */}
-      <div className="mt-8 max-w-[860px]">
+      <div className="mt-8">
         <BudgetsSection budgets={budgets} spend={spend} onRefresh={refreshAllSpend} />
       </div>
 
       {/* ── Export ── */}
-      <div className="mt-8 max-w-[860px]">
+      <div className="mt-8">
         <SectionLabel>Export ledger</SectionLabel>
         <div className="flex items-center gap-3 rounded-md border border-octo-hairline bg-octo-panel px-4 py-3">
           <span className="min-w-0 flex-1 text-[12px] text-octo-sage">
@@ -1047,11 +1047,11 @@ function BudgetRow({
             onClick={() => { setDraft(budget.limitUsd.toFixed(2)); setEditing(true); }}
             className="octo-tabular w-20 rounded border border-octo-hairline px-2 py-0.5 text-left font-mono text-[11px] text-octo-ivory transition hover:border-octo-brass"
           >
-            ${budget.limitUsd.toFixed(2)}
+            {formatUsd(budget.limitUsd)}
           </button>
         )}
         <span className="flex-1 text-octo-mute">
-          Spent: <span className="octo-tabular text-octo-ivory">${spentUsd.toFixed(2)}</span>
+          Spent: <span className="octo-tabular text-octo-ivory">{formatUsd(spentUsd)}</span>
           <span className="octo-tabular ml-1 text-octo-mute">{pct.toFixed(0)}%</span>
         </span>
         <IconButton label="Remove budget" danger onClick={onClear}>

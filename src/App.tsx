@@ -21,6 +21,7 @@ import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
 import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { formatBytes } from "./lib/formatBytes";
+import { formatUsd } from "./lib/cost";
 import { BacklogRowContextMenu } from "./components/BacklogRowContextMenu";
 import { ProjectPickerModal } from "./components/ProjectPickerModal";
 import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlertModal";
@@ -45,9 +46,8 @@ import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
 import { TerminalHost } from "./components/TerminalHost";
 import { RunPanes } from "./components/run/RunPanes";
-import { SessionRail } from "./components/run/SessionRail";
+import { LINE_FLOOR_PX, LINE_LAST_PX, SessionLine } from "./components/run/SessionLine";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
-import { SessionAnchor } from "./components/run/SessionAnchor";
 import { ReviewTail } from "./components/ReviewTail";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
@@ -64,14 +64,18 @@ import { FirstRunInvite } from "./components/FirstRunInvite";
 import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
 import { initGenesisRename } from "./lib/genesisRename";
+import { resolveHelperModel } from "./lib/helperModels";
 import { deriveProjectName } from "./lib/genesis";
 import { useSyncPrefsStore } from "./stores/syncPrefsStore";
 import { runSyncBackfill } from "./lib/syncBackfill";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
 import { WhatsNewHost } from "./components/WhatsNewHost";
+import { CrewImportHost } from "./components/CrewImportSheet";
+import { useCrewImportStore } from "./stores/crewImportStore";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
+import { useCollisionStore } from "./stores/collisionStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useMissionsStore } from "./stores/missionsStore";
 import { useThemeStore } from "./stores/themeStore";
@@ -86,6 +90,17 @@ import { useShallow } from "zustand/react/shallow";
 import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
+import { useGroupsStore } from "./stores/groupsStore";
+import { layoutProjects, missionGroupsOf, projectGroupsOf, stepInRail } from "./lib/railGroups";
+import { holdMissionRowFocus, holdProjectLineFocus } from "./lib/railFocus";
+import {
+  createMissionGroup,
+  revealGroup,
+  createProjectGroup,
+  moveMissionToGroup,
+  moveProjectToGroup,
+} from "./lib/groupActions";
+import type { Group } from "./lib/types";
 import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
@@ -98,18 +113,37 @@ import { useCompanionFold } from "./hooks/useCompanionFold";
 import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
+import { diffFileCount, isDiffTruncated, resolveReviewSource } from "./lib/reviewSource";
+import {
+  gitStatusSig,
+  NO_CHANGE_STATS,
+  runChangesReader,
+  runChangesTick,
+  type ChangeStats,
+  type CommitsAhead,
+} from "./lib/runChanges";
+import { refetchForWorkspace } from "./lib/workspaceRefetch";
+import { useReviewSource } from "./stores/reviewSourceStore";
+import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
+import { noticeUnreadableSettings } from "./lib/settingsNotice";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
-import type { GitStatus, TintName, Issue, ProjectInfo } from "./lib/types";
+import type { GitStatus, TintName, Issue, ProjectInfo, Pr, Workspace } from "./lib/types";
+import { archivableMissions, archiveMergedBody, runStatesByWs } from "./lib/railState";
+import { archiveMergedMissions } from "./lib/archiveMerged";
+import { prefillFixChecks } from "./lib/fixChecks";
 import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
-import { revealDiffTarget, stripDiffPrefix } from "./lib/diffJump";
+import { DIFF_ARRIVAL_WAIT_MS, revealDiffTargetWhenReady, stripDiffPrefix } from "./lib/diffJump";
 
 
 type AppView = "project" | "new-project";
+
+/** What the group menus' selectors return while no menu is open. */
+const NO_GROUPS: Group[] = [];
 
 // Workspace ids whose terminal hydration is currently in flight. Guards the
 // "auto-create Main when empty" branch against double-creation: StrictMode's
@@ -144,6 +178,7 @@ function App() {
   const loadGitSummaries = useWorkspaceStore((s) => s.loadGitSummaries);
   const prByWs = useWorkspaceStore((s) => s.prByWs);
   const loadProjectPrs = useWorkspaceStore((s) => s.loadProjectPrs);
+  const mergedPrByWs = useWorkspaceStore((s) => s.mergedPrByWs);
   // The active mission's intent, derived from the active workspace (missions are
   // 1:1 with code workspaces). Drives the ContextHeader intent chip.
   const activeMissionIntent = useMissionsStore((s) =>
@@ -169,6 +204,8 @@ function App() {
     useShallow((s) => Object.keys(s.runsByWs).filter((id) => hasActiveDirectRun(s.runsByWs[id]))),
   );
   const loadActiveRuns = useRunsStore((s) => s.loadActiveRuns);
+  // What each mission's crews say (#963), for "Archive merged missions…".
+  const runStateByWs = useRunsStore(useShallow((s) => runStatesByWs(s.runsByWs)));
   // Hydrate the global runs tray on launch — surfaces background (running/paused)
   // runs in workspaces not opened this session. Live events keep it fresh after.
   useEffect(() => {
@@ -185,6 +222,10 @@ function App() {
     // Post-build rename: a one-shot suggestion after a genesis project's first
     // crew ships (the built thing knows what it is).
     initGenesisRename();
+    // Look up the helper models once, so new builder stages and the AI review
+    // default use the builtin lineup's ids.
+    void resolveHelperModel("review");
+    void resolveHelperModel("fast");
   }, [loadActiveRuns]);
 
   // Cloud sync is OPT-IN (Settings › Account › Sync; both off by default).
@@ -263,6 +304,7 @@ function App() {
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const markRunning = useTerminalsStore((s) => s.markRunning);
   const markFailed = useTerminalsStore((s) => s.markFailed);
+  const markStarted = useTerminalsStore((s) => s.markStarted);
   const setActiveTerminal = useTerminalsStore((s) => s.setActive);
   // Every (workspace, terminal) pair, by id, so the TerminalHost can mount
   // every TerminalPane simultaneously. This is the only way to keep PTYs and
@@ -286,7 +328,12 @@ function App() {
   const closeProjectAction = useProjectStore((s) => s.closeProject);
   const reopenProjectAction = useProjectStore((s) => s.reopenProject);
   const setProjectPinnedAction = useProjectStore((s) => s.setPinned);
-  const setProjectOrderAction = useProjectStore((s) => s.setOrder);
+  const storeProjectOrder = useProjectStore((s) => s.setOrder);
+  // A refused reorder is already undone in the store: say so.
+  const setProjectOrderAction = (ids: string[]) =>
+    storeProjectOrder(ids).catch(() =>
+      pushToast({ level: "error", title: "Couldn't reorder the projects", body: "Your rail is back as it was." }),
+    );
   const openProject = useProjectStore((s) => s.open);
   const getLastOpenedPath = useProjectStore((s) => s.getLastOpenedPath);
   const saveLastOpenedPath = useProjectStore((s) => s.saveLastOpenedPath);
@@ -388,6 +435,9 @@ function App() {
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
   const [showCreator, setShowCreator] = useState(false);
   const [creatorProjectId, setCreatorProjectId] = useState<string | null>(null);
+  // Set when the creator was opened from a mission group's "+": the new
+  // mission joins that group.
+  const [creatorGroupId, setCreatorGroupId] = useState<string | null>(null);
   const [customizingWorkspaceId, setCustomizingWorkspaceId] = useState<string | null>(null);
   const [renamingWorkspace, setRenamingWorkspace] = useState<{ id: string; name: string } | null>(null);
   // When the user opens NewProjectFlow from the switcher (not from the welcome
@@ -396,7 +446,41 @@ function App() {
   // live somewhere else.
   const [showAddProject, setShowAddProject] = useState(false);
   // Context menu: which workspace and where
-  const [contextMenu, setContextMenu] = useState<{ workspaceId: string; x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    workspaceId: string;
+    x: number;
+    y: number;
+    /** Opened with ⇧F10 / the context-menu key on the rail row. */
+    fromKeyboard?: boolean;
+  } | null>(null);
+  // A mission menu the keyboard opened gives its row the focus back when it
+  // closes, whichever action closed it (held, not only set: "Move to group"
+  // renders the row under another parent). A dialog an action opened keeps
+  // the focus it took (`holdMissionRowFocus` only fills a lost focus).
+  const keyboardMenuFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (contextMenu) {
+      keyboardMenuFor.current = contextMenu.fromKeyboard ? contextMenu.workspaceId : null;
+      return;
+    }
+    const closing = keyboardMenuFor.current;
+    keyboardMenuFor.current = null;
+    if (closing) holdMissionRowFocus(closing);
+  }, [contextMenu]);
+  // The open mission menu lists its project's groups ("Move to group"). The
+  // selector is that narrow on purpose: with no menu open it returns one
+  // constant, so a group change elsewhere never re-renders the whole shell.
+  const contextMenuProjectId = useMemo(() => {
+    if (!contextMenu) return null;
+    for (const list of Object.values(workspacesByProjectId)) {
+      const hit = list.find((w) => w.id === contextMenu.workspaceId);
+      if (hit) return hit.projectId;
+    }
+    return null;
+  }, [contextMenu, workspacesByProjectId]);
+  const contextMenuGroups = useGroupsStore(
+    useShallow((s) => (contextMenuProjectId ? missionGroupsOf(s.groups, contextMenuProjectId) : NO_GROUPS)),
+  );
   // Jira ticket picker modal (from workspace context menu)
   const [jiraTicketPickerOpen, setJiraTicketPickerOpen] = useState<{ workspaceId: string; mode: "link" | "change" } | null>(null);
   // Jira project key editor modal (from project context menu)
@@ -409,8 +493,29 @@ function App() {
   const [showProjectCustomizer, setShowProjectCustomizer] = useState(false);
   const [customizingProjectId, setCustomizingProjectId] = useState<string | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
-  const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
+  const [projectContextMenu, setProjectContextMenu] = useState<{
+    projectId: string;
+    x: number;
+    y: number;
+    /** Opened with ⇧F10 or the context-menu key: the project line gets the
+     *  focus back when the menu closes. */
+    fromKeyboard?: boolean;
+  } | null>(null);
+  // The open project menu lists the project groups ("Move to group"). Narrow
+  // on purpose, like `contextMenuGroups`: one constant while no menu is open.
+  const projectMenuOpen = projectContextMenu !== null;
+  const projectScopeGroups = useGroupsStore(
+    useShallow((s) => (projectMenuOpen ? projectGroupsOf(s.groups) : NO_GROUPS)),
+  );
   const [archivedForProject, setArchivedForProject] = useState<{ id: string; name: string; path: string } | null>(null);
+  // "Archive merged missions…" (#963): the missions it lists, until confirmed.
+  // `localFiles`: what the confirm named, the only local files it may delete.
+  const [archivingMerged, setArchivingMerged] = useState<{
+    projectId: string;
+    path: string;
+    missions: Workspace[];
+    localFiles: Record<string, string[]>;
+  } | null>(null);
   // Counter to trigger re-renders when project customizations change
   const [projectCustomizationsVersion, setProjectCustomizationsVersion] = useState(0);
 
@@ -423,9 +528,28 @@ function App() {
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitDiff, setGitDiff] = useState<string>("");
+  // The workspace `gitDiff` was fetched for; null while none is (a switch
+  // with its fetch in flight, or outside Review, where no diff is read). Lets
+  // Review's open comment draft wait instead of being read against another
+  // workspace's diff (#1051).
+  const [gitDiffWs, setGitDiffWs] = useState<string | null>(null);
+  // Lines added and removed per uncommitted file, for Run's Companion
+  // (Changes). Counted from the working diff the poll below reads while that
+  // panel is open in Run; the diff itself is not kept, so the Review canvas
+  // (mounted but hidden outside Review) never renders it.
+  const [runChangeStats, setRunChangeStats] = useState<ChangeStats>(NO_CHANGE_STATS);
+  // Commits since the base, for the same panel's clean state. Only the count
+  // and its base: the committed diff is Review's, and never reaches the
+  // store (and so the hidden Review canvas) from Run.
+  const [runAhead, setRunAhead] = useState<CommitsAhead | null>(null);
   // Live for the shortcut table, which doesn't re-register on every status poll.
   const gitStatusRef = useRef<GitStatus | null>(null);
   gitStatusRef.current = gitStatus;
+  // The git status and committed answer one Review refresh fetched together,
+  // tagged with their workspace (#903). Only Review's refresh sets it; a
+  // workspace switch or leaving Review drops it, so it is always fresh for
+  // this visit. It feeds the default-source pin, never the display.
+  const [reviewAnswers, setReviewAnswers] = useState<ReviewAnswers | null>(null);
   // Per-workspace cache of the most recently fetched PR (or null when there
   // isn't one). Keyed by workspace id so switching back to a workspace
   // doesn't flicker until the next refresh; lives in prStore so a PR opened
@@ -460,6 +584,14 @@ function App() {
     }
   }, [terminalsByWs]);
 
+  // ── Startup notice: settings.json exists but can't be read (#642) ──
+  const settingsNoticeFiredRef = useRef(false);
+  useEffect(() => {
+    if (settingsNoticeFiredRef.current) return;
+    settingsNoticeFiredRef.current = true;
+    void noticeUnreadableSettings();
+  }, []);
+
   // ── Theme load ──
   useEffect(() => {
     loadTheme();
@@ -479,17 +611,23 @@ function App() {
     (async () => {
       await loadRecentProjects();
       void loadClosedProjects();
+      void useGroupsStore.getState().load();
       // Check if we have projects stored and no current project
       const state = useProjectStore.getState();
       if (!state.current && state.recent.length > 0) {
         // Try to restore last opened project
         const lastPath = getLastOpenedPath();
         if (lastPath) {
+          // What this reopening makes active is the launch restore: the rail
+          // leaves its groups folded for it (`workspaceStore.launchRestoredId`).
+          useWorkspaceStore.getState().beginLaunchRestore();
           try {
             await openProject(lastPath);
           } catch {
             // If last project can't be opened, leave the welcome screen
           }
+          // `open` reports a failure in the store rather than throwing.
+          if (!useProjectStore.getState().current) useWorkspaceStore.getState().cancelLaunchRestore();
         }
       }
     })();
@@ -564,19 +702,19 @@ function App() {
                   pushToast({
                     level: "error",
                     title: `Budget cap hit — Send blocked`,
-                    body: `${scopeLabel} ${b.period} budget: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                    body: `${scopeLabel} ${b.period} budget: ${formatUsd(snap.costUsd)} / ${formatUsd(b.limitUsd)}`,
                   });
                 } else if (threshold === 80) {
                   pushToast({
                     level: "warning",
                     title: `80% of ${scopeLabel} budget used`,
-                    body: `${b.period}: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                    body: `${b.period}: ${formatUsd(snap.costUsd)} / ${formatUsd(b.limitUsd)}`,
                   });
                 } else {
                   pushToast({
                     level: "info",
                     title: `50% of ${scopeLabel} budget used`,
-                    body: `${b.period}: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                    body: `${b.period}: ${formatUsd(snap.costUsd)} / ${formatUsd(b.limitUsd)}`,
                   });
                 }
               }
@@ -623,6 +761,10 @@ function App() {
 
     const ids = Array.from(projectIds);
     loadAllWorkspaces(ids);
+    // Rail groups ride with the rows they group: reread them whenever the
+    // projects and workspaces are, so a group can never be missing for rows
+    // that already point at it.
+    void useGroupsStore.getState().load();
     void useMissionsStore.getState().loadAll(ids);
     const pathById = new Map<string, string>();
     recentProjects.forEach((p) => pathById.set(p.id, p.path));
@@ -633,6 +775,23 @@ function App() {
       if (p) void loadProjectPrs(id, p);
     });
   }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
+
+  // Collision radar (#732): poll the open projects at a modest interval while
+  // the window is visible; the store throttles and the backend caches. Read at
+  // tick time, only projects with two or more loaded workspaces on a worktree
+  // are polled: a lone workspace can't collide with anything.
+  useEffect(() => {
+    if (!project && recentProjects.length === 0) return;
+    const ids = () => {
+      const set = new Set<string>(recentProjects.map((p) => p.id));
+      if (project) set.add(project.id);
+      const byProject = useWorkspaceStore.getState().workspacesByProjectId;
+      return [...set].filter(
+        (id) => (byProject[id] ?? []).filter((w) => w.worktreePath).length >= 2,
+      );
+    };
+    return useCollisionStore.getState().startPolling(ids);
+  }, [project, recentProjects]);
 
   // Refresh externally-authored data when the window regains focus — calm,
   // event-driven (no polling). octopush-mcp is a separate process writing to
@@ -648,10 +807,12 @@ function App() {
       if (project) byId.set(project.id, project.path);
       recentProjects.forEach((p) => byId.set(p.id, p.path));
       void loadAllWorkspaces([...byId.keys()]);
+      void useGroupsStore.getState().load();
       void useMissionsStore.getState().loadAll([...byId.keys()]);
       byId.forEach((path, id) => {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
+        void useCollisionStore.getState().refresh(id);
       });
       // Pipelines (the ensemble picker) + the active workspace's runs list —
       // both read via getState at fire time, so the listener neither
@@ -723,6 +884,7 @@ function App() {
   );
   const panesFold = (activeMode === "run" && runPaneCount > 1) || (activeMode === "talk" && talkSeatOpen);
   const companionFold = useCompanionFold(panesFold, isCompanionCollapsed, setIsCompanionCollapsed);
+  const companionCollapsed = companionFold.collapsed;
   // A mode switch that glides the Companion to or from its strip holds every
   // PTY's size until the glide ends: one resize per visible session.
   const companionStrip = isCompanionCollapsed || panesFold;
@@ -749,9 +911,16 @@ function App() {
   useEffect(() => {
     setGitStatus(null);
     setGitDiff("");
+    setGitDiffWs(null);
+    setRunChangeStats(NO_CHANGE_STATS);
+    setRunAhead(null);
+    setReviewAnswers(null);
     gitSigRef.current = "";
     gitDiffRef.current = "";
   }, [activeWorkspaceId]);
+  useEffect(() => {
+    if (activeMode !== "review") setReviewAnswers(null);
+  }, [activeMode]);
 
   useEffect(() => {
     const ws = workspaces.find((w) => w.id === activeWorkspaceId);
@@ -759,29 +928,77 @@ function App() {
     if (!path) {
       setGitStatus(null);
       setGitDiff("");
+      setGitDiffWs(null);
       gitSigRef.current = "";
       gitDiffRef.current = "";
       return;
     }
     let cancelled = false;
+    // Run's Companion lists the uncommitted files with their line counts, and
+    // the commits ahead once the tree is clean. Only while that panel is open
+    // in Run; a Companion folded for the panes shows neither.
+    const runChanges = activeMode === "run" && !companionCollapsed;
+    // What each tick reads for that panel (`runChangesReader`): the working
+    // diff while the tree is dirty, the commits-ahead count once per clean
+    // state. Review reads its own diffs every tick, as before.
+    const runReader = runChangesReader();
+    // One refresh at a time: a slow git read (a large diff) must not let the
+    // 3 s ticks pile up behind it. A skipped tick loses nothing; the one in
+    // flight reports the same state, and the next tick follows it.
+    let inFlight = false;
     const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         // The diff is only consumed by the review panel (ChangesPanel /
         // ReviewCanvas / EditorPane), which is hidden outside review mode, so
         // skip the (non-trivial) diff build in talk/run. Entering review
         // re-runs this effect (activeMode is a dep), fetching the diff then.
         const needDiff = activeMode === "review";
-        const [s, d] = await Promise.all([
+        const [s, d, reviewCommitted] = await Promise.all([
           ipc.getGitStatus(path),
           needDiff ? ipc.getGitDiff(path, ignoreWs).catch(() => "") : Promise.resolve(""),
+          // Review's "Since base" view (#851): what the workspace committed.
+          needDiff && ws ? ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null) : Promise.resolve(undefined),
         ]);
         if (cancelled) return;
         // Status change-detection (file metadata). hasUpstream is intentionally
         // omitted — no App-level gitStatus consumer reads it (ChangesPanel keeps
         // its own git status). The diff is compared separately, by content.
-        const sig =
-          `${s?.branch ?? ""}|${s?.ahead ?? 0}|${s?.behind ?? 0}|` +
-          `${(s?.changedFiles ?? []).map((f) => `${f.path}:${f.status}:${f.staged ? 1 : 0}:${f.unstaged ? 1 : 0}`).join(",")}`;
+        const sig = gitStatusSig(s);
+        if (runChanges) {
+          // The backend builds the working diff off the async runtime; only
+          // its counts are kept (see `runChangeStats`).
+          await runChangesTick(runReader, s, {
+            readDiff: () => ipc.getGitDiff(path, ignoreWs).catch(() => ""),
+            readAhead: ws
+              ? async () => {
+                  const c = await ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null);
+                  return c ? { commits: c.commits, base: c.base, mergeBase: c.mergeBase } : null;
+                }
+              : null,
+            setStats: setRunChangeStats,
+            setAhead: setRunAhead,
+            cancelled: () => cancelled,
+          });
+          if (cancelled) return;
+        }
+        if (ws && reviewCommitted !== undefined) {
+          useReviewSource.getState().setCommitted(ws.id, reviewCommitted);
+          const fresh: ReviewAnswers = {
+            workspaceId: ws.id,
+            dirty: (s?.changedFiles.length ?? 0) > 0,
+            commitsAhead: reviewCommitted?.commits ?? 0,
+          };
+          setReviewAnswers((prev) =>
+            prev &&
+            prev.workspaceId === fresh.workspaceId &&
+            prev.dirty === fresh.dirty &&
+            prev.commitsAhead === fresh.commitsAhead
+              ? prev
+              : fresh,
+          );
+        }
         if (sig !== gitSigRef.current) {
           gitSigRef.current = sig;
           setGitStatus(s);
@@ -790,8 +1007,11 @@ function App() {
           gitDiffRef.current = d;
           setGitDiff(d);
         }
+        setGitDiffWs(needDiff ? ws?.id ?? null : null);
       } catch {
         /* non-fatal */
+      } finally {
+        inFlight = false;
       }
     };
     refresh(); // immediate on workspace/mode change
@@ -813,7 +1033,7 @@ function App() {
       if (id) clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
-  }, [activeWorkspaceId, workspaces, project, activeMode, ignoreWs]);
+  }, [activeWorkspaceId, workspaces, project, activeMode, ignoreWs, companionCollapsed]);
 
   // ── Open-PR fetch ──
   // Fetch once per workspace switch and then every 60s. GitHub's
@@ -1108,24 +1328,6 @@ function App() {
   const streamingThreadId = useChatStore((s) =>
     activeWorkspaceId ? (s.streamingThreadByWs[activeWorkspaceId] ?? null) : null,
   );
-  // Connected MCP servers for the workspace — also shown under Capabilities.
-  const [mcpServers, setMcpServers] = useState<string[]>([]);
-  useEffect(() => {
-    const path = activeWorkspace?.worktreePath;
-    if (!path) {
-      setMcpServers([]);
-      return;
-    }
-    let cancelled = false;
-    ipc
-      .listMcpServers(path)
-      .then((s) => !cancelled && setMcpServers(s))
-      .catch(() => !cancelled && setMcpServers([]));
-    return () => {
-      cancelled = true;
-    };
-  }, [activeWorkspace?.worktreePath]);
-
   // Count tool calls live from the active chat's messages — chatStore is
   // updated on every `chat://message-added` event the backend emits, so the
   // counter ticks up in real time as the agent invokes tools.
@@ -1198,7 +1400,6 @@ function App() {
       toolCalls: liveToolCalls,
       budgets,
       spend,
-      mcpServers,
       onReviewClick: () => setMode("review"),
       onSettingsClick: () => setSettingsTab("usage"),
     };
@@ -1209,7 +1410,6 @@ function App() {
     liveToolCalls,
     budgets,
     spend,
-    mcpServers,
     setMode,
   ]);
 
@@ -1219,8 +1419,9 @@ function App() {
   // band costs no extra IPC. The diff stat is only non-zero in review mode —
   // that is the only mode this component fetches `gitDiff` for — which is
   // also the only mode whose tail reads it.
-  // ⌘⌥K — the session switcher (Run mode). Opened from the band anchor too;
-  // "pair" is its Open beside mode (⌘D, the rail flyout, an empty seat).
+  // ⌘⌥K — the session switcher (Run mode). Opened from the session line too
+  // (its `+N` cell, or the one button a narrow band folds the cells into);
+  // "pair" is its Open beside mode (⌘D, a pane caption's menu, an empty seat).
   // "talk" is the same pairing, for Talk's seat.
   const [sessionSwitcher, setSessionSwitcher] = useState<"switch" | "pair" | "talk" | null>(null);
   const openBeside = useCallback(() => void shortcutCtx.openBeside(), [shortcutCtx]);
@@ -1238,15 +1439,37 @@ function App() {
     return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
   }, [activeWorkspaceId, shortcutCtx]);
   const activeRuns = useRunsStore((s) => s.getRuns(activeWorkspaceId ?? ""));
-  const workingDiffStat = useMemo(() => diffStat(gitDiff), [gitDiff]);
+  // Review's source (#851): the working tree, or what the workspace committed
+  // since its base when the tree is clean (or the user picked it).
+  const committed = useReviewSource((s) =>
+    activeWorkspaceId ? s.committedByWs[activeWorkspaceId] ?? null : null,
+  );
+  const reviewPick = useReviewSource((s) => (activeWorkspaceId ? s.pickByWs[activeWorkspaceId] : undefined));
+  const reviewPinned = useReviewSource((s) => (activeWorkspaceId ? s.pinnedByWs[activeWorkspaceId] : undefined));
+  const reviewSource = resolveReviewSource(
+    reviewPick ?? reviewPinned,
+    (gitStatus?.changedFiles.length ?? 0) > 0,
+    committed?.commits ?? 0,
+  );
+  // Pin the default once Review has shown it (#903), from this visit's fresh
+  // answers only: a crew touching a file must not switch a reader of Since
+  // base to the working tree mid-read. Leaving Review drops the pins.
+  useReviewDefaultPin(activeMode, activeWorkspaceId, reviewAnswers);
+  const reviewDiff = reviewSource === "committed" ? committed?.diff ?? "" : gitDiff;
+  const reviewDiffStat = useMemo(() => diffStat(reviewDiff), [reviewDiff]);
+  const reviewChangedCount =
+    reviewSource === "committed" ? diffFileCount(reviewDiff) : gitStatus?.changedFiles.length ?? 0;
+  // The 1 MiB cap can cut the committed diff, so its file count is a floor.
+  const reviewCountPartial = reviewSource === "committed" && isDiffTruncated(reviewDiff);
   const modeMetaText = useMemo(
     () =>
       modeMetaLabel(activeMode, {
         terminalCount: terminals.length,
         tokensUsed: lastTurnInputTokens,
         tokensLimit: activeModelMaxContext,
-        changedCount: gitStatus?.changedFiles.length ?? 0,
-        diffStat: workingDiffStat,
+        changedCount: reviewChangedCount,
+        changedCountPartial: reviewCountPartial,
+        diffStat: reviewDiffStat,
         runState: runTailState(activeRuns),
       }),
     [
@@ -1254,27 +1477,28 @@ function App() {
       terminals.length,
       lastTurnInputTokens,
       activeModelMaxContext,
-      gitStatus,
-      workingDiffStat,
+      reviewChangedCount,
+      reviewCountPartial,
+      reviewDiffStat,
       activeRuns,
     ],
   );
 
   // In Run mode the tail stops reporting and starts working: the session
-  // anchor names the active session and opens the ⌘⌥K switcher, which is what
-  // makes a keyboard-only palette discoverable. With no sessions open there is
-  // nothing to anchor, so the plain "No terminals" reading stands.
+  // line holds one cell per open session, a new-session control and the
+  // layout button. With no sessions open there is nothing to line up, so the
+  // plain "No terminals" reading stands.
   // In Review the tail is a demotion ladder rather than one truncating line,
   // so a narrow band sheds whole atoms instead of ending on "· …".
   const reviewParts = useMemo(
-    () => reviewTailParts(gitStatus?.changedFiles.length ?? 0, workingDiffStat),
-    [gitStatus, workingDiffStat],
+    () => reviewTailParts(reviewChangedCount, reviewDiffStat, reviewCountPartial),
+    [reviewChangedCount, reviewDiffStat, reviewCountPartial],
   );
   const modeMeta: React.ReactNode =
     activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
-      <SessionAnchor
+      <SessionLine
         workspaceId={activeWorkspaceId}
-        onOpen={() => setSessionSwitcher("switch")}
+        onOpenSwitcher={() => setSessionSwitcher("switch")}
       />
     ) : activeMode === "review" && reviewParts && modeMetaText ? (
       <ReviewTail parts={reviewParts} label={modeMetaText} />
@@ -1382,6 +1606,18 @@ function App() {
    *              line (EditorPane consumes the store's pending reveal).
    * @param col   Optional 1-based column on `line` (editor view only).
    */
+  // The diff jump still waiting for its file to render, if any (see
+  // `navigateToFile`). Dropped when the user leaves Review or the workspace.
+  const diffJumpRef = useRef<AbortController | null>(null);
+  const dropDiffJump = useCallback(() => {
+    diffJumpRef.current?.abort();
+    diffJumpRef.current = null;
+  }, []);
+  // (Not on every mode change: the jump itself switches to Review.)
+  useEffect(() => {
+    if (activeMode !== "review") dropDiffJump();
+  }, [activeMode, dropDiffJump]);
+  useEffect(() => dropDiffJump, [activeWorkspaceId, dropDiffJump]);
   const navigateToFile = useCallback(
     (path: string, view: ReviewViewMode = "editor", line?: number | null, col?: number) => {
       if (!activeWorkspace) return;
@@ -1411,8 +1647,20 @@ function App() {
       } else {
         // Diff view — scroll to the anchor for that file. Defer one frame so
         // the canvas has switched modes before we try to find the anchor.
-        requestAnimationFrame(() => {
-          if (!revealDiffTarget(relative, line ?? null)) {
+        // A jump from another mode (a changed file in Run's Companion) lands
+        // before Review has its diff, which is only read there: wait for the
+        // anchor instead of reporting a file that is about to appear.
+        const waitMs = activeMode === "review" ? 0 : DIFF_ARRIVAL_WAIT_MS;
+        // One jump at a time, and none that outlives its moment: a newer
+        // jump, leaving Review or switching workspace drops the wait, so no
+        // toast arrives about a file the user is no longer going to.
+        diffJumpRef.current?.abort();
+        const jump = new AbortController();
+        diffJumpRef.current = jump;
+        void revealDiffTargetWhenReady(relative, line ?? null, waitMs, { signal: jump.signal }).then((found) => {
+          if (diffJumpRef.current === jump) diffJumpRef.current = null;
+          // `null`: dropped. Only a wait that ran out is worth a word.
+          if (found === false) {
             // File isn't in the current diff (committed, reverted, or the
             // model hallucinated a path) — say so instead of doing nothing.
             pushToast({
@@ -1424,7 +1672,7 @@ function App() {
         });
       }
     },
-    [activeWorkspace, project, openFileAsJump, setMode, confirmLargeFile],
+    [activeWorkspace, project, openFileAsJump, setMode, confirmLargeFile, activeMode],
   );
 
   // ── Open With → "Continue in the workspace" (from a Quick View window) ──
@@ -1470,10 +1718,23 @@ function App() {
     navigateToFile(`${root}/${pendingWorkspaceOpen.relativePath}`, "editor");
   }, [pendingWorkspaceOpen, activeWorkspace, project, navigateToFile]);
 
+  // The Changes rail, the secret guard and the provenance chips point at the
+  // working tree, so a jump from them while Since base is on screen switches
+  // to the working tree first instead of toasting "Not in the current diff"
+  // (#903). The switch is an explicit pick, like a click on the toggle.
+  const toWorkingTree = useCallback(() => {
+    if (activeWorkspaceId && reviewSource === "committed") {
+      useReviewSource.getState().pick(activeWorkspaceId, "working");
+    }
+  }, [activeWorkspaceId, reviewSource]);
+
   // Companion provenance chips jump into the diff at the file (best-effort line).
   const handleJumpToFile = useCallback(
-    (file: string, line: number | null) => navigateToFile(file, "diff", line),
-    [navigateToFile],
+    (file: string, line: number | null) => {
+      toWorkingTree();
+      navigateToFile(file, "diff", line);
+    },
+    [navigateToFile, toWorkingTree],
   );
 
   // ── Review · locate the open file in the tree ────────────────────
@@ -1677,6 +1938,18 @@ function App() {
     setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
   }, [activeWorkspaceId, workspaces]);
 
+  // PR chip "Fix failing checks…": seed the Direct launcher on this workspace
+  // with a brief naming the failed checks and their log tail. The launcher
+  // keeps its usual crew selection; nothing starts until the user presses Start.
+  const handleFixChecks = useCallback(async (pr: Pr) => {
+    const wsId = activeWorkspaceId;
+    const ws = workspaces.find((w) => w.id === wsId);
+    const path = ws?.worktreePath ?? project?.path;
+    if (!wsId || !path || !pr.checks) return;
+    await prefillFixChecks(pr, wsId, path);
+    setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
+  }, [activeWorkspaceId, workspaces, project]);
+
   // Prompt genesis: a prompt becomes a project + a staged crew (intent before
   // the repo). Composes create_project (born in <1s, local) with the same crew
   // handoff FirstRunInvite uses. Genesis projects live in a visible ~/Octopush —
@@ -1809,8 +2082,8 @@ function App() {
   }, [activeWorkspaceId, handleGenesis]);
 
   // ── Project context menu handler ──
-  const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
-    setProjectContextMenu({ projectId, x, y });
+  const handleProjectContextMenu = (projectId: string, x: number, y: number, fromKeyboard?: boolean) => {
+    setProjectContextMenu({ projectId, x, y, fromKeyboard });
   };
 
   // ── Project rename handler ──
@@ -1826,6 +2099,7 @@ function App() {
       try {
         await closeProjectAction(projectId); // soft-close; clears current if active (C2)
         pruneProject(projectId); // drop its workspaces from the rail map (C8)
+        useGroupsStore.getState().pruneProject(projectId); // and its mission groups
         pushToast({
           level: "success",
           title: "Project closed",
@@ -1874,6 +2148,7 @@ function App() {
         await loadRecentProjects();
         await loadClosedProjects();
         pruneProject(projectId);
+        useGroupsStore.getState().pruneProject(projectId);
 
         // If current project was deleted, go to welcome screen
         if (project?.id === projectId) {
@@ -1996,11 +2271,23 @@ function App() {
     // just created this session). We deliberately do NOT hoist the active
     // project to the top — selecting a workspace must never reorder the rail,
     // and newly added projects stay at the end.
-    const byId: Record<string, { name: string; tint: string | null }> = {};
-    recentProjects.forEach((p) => { byId[p.id] = { name: p.name, tint: p.tint }; });
-    if (project) byId[project.id] = { name: project.name, tint: project.tint };
+    const byId: Record<string, { name: string; tint: string | null; groupId: string | null; pinned: boolean }> = {};
+    recentProjects.forEach((p) => {
+      byId[p.id] = { name: p.name, tint: p.tint, groupId: p.groupId ?? null, pinned: p.pinned };
+    });
+    if (project) {
+      // Membership is read from the listed row when there is one: the list is
+      // reloaded often, the open project's own row only when it is opened.
+      const listed = byId[project.id];
+      byId[project.id] = {
+        name: project.name,
+        tint: project.tint,
+        groupId: listed ? listed.groupId : (project.groupId ?? null),
+        pinned: listed ? listed.pinned : project.pinned,
+      };
+    }
 
-    const ordered: { id: string; name: string; tint?: string }[] = [];
+    const ordered: { id: string; name: string; tint?: string; groupId: string | null; pinned: boolean }[] = [];
     const seen = new Set<string>();
     const pushProject = (id: string, fallbackName: string) => {
       if (seen.has(id)) return;
@@ -2011,6 +2298,8 @@ function App() {
         id,
         name: backend?.name || custom?.name || fallbackName,
         tint: backend?.tint ?? custom?.tint,
+        groupId: backend?.groupId ?? null,
+        pinned: backend?.pinned ?? false,
       });
     };
     recentProjects.forEach((p) => pushProject(p.id, p.name));
@@ -2026,6 +2315,8 @@ function App() {
       id: p.id,
       name: p.name,
       tint: p.tint,
+      groupId: p.groupId,
+      pinned: p.pinned,
       jiraProjectKey: jiraKeyById[p.id] ?? null,
       workspaces: workspacesByProjectId[p.id] || [],
     }));
@@ -2081,9 +2372,15 @@ function App() {
         activeWorkspaceId={activeWorkspaceId}
         onSelect={handleSelectWorkspace}
         onCustomize={(id) => setCustomizingWorkspaceId(id)}
-        onContextMenu={(workspaceId, x, y) => setContextMenu({ workspaceId, x, y })}
+        onContextMenu={(workspaceId, x, y, fromKeyboard) => setContextMenu({ workspaceId, x, y, fromKeyboard })}
         onNewWorkspaceForProject={(projectId) => {
           setCreatorProjectId(projectId);
+          setCreatorGroupId(null);
+          setShowCreator(true);
+        }}
+        onNewWorkspaceInGroup={(projectId, groupId) => {
+          setCreatorProjectId(projectId);
+          setCreatorGroupId(groupId);
           setShowCreator(true);
         }}
         onAddProject={() => setShowAddProject(true)}
@@ -2096,9 +2393,22 @@ function App() {
         isCollapsed={isRailCollapsed}
         onReorderProjects={(ids) => void setProjectOrderAction(ids)}
         shortcutByWs={shortcutByWs}
+        onArchiveMerged={(workspaceId) => {
+          const ws = Object.values(workspacesByProjectId).flat().find((w) => w.id === workspaceId);
+          const path = ws
+            ? (recentProjects.find((p) => p.id === ws.projectId)?.path ??
+              (project?.id === ws.projectId ? project.path : undefined))
+            : undefined;
+          if (!ws || !path) return;
+          // Undo can't bring local files back, so those are confirmed first.
+          const localFiles = useWorkspaceStore.getState().localFilesByWs[ws.id] ?? [];
+          if (localFiles.length > 0) {
+            setArchivingMerged({ projectId: ws.projectId, path, missions: [ws], localFiles: { [ws.id]: localFiles } });
+          } else void archiveMergedMissions(ws.projectId, path, [ws]);
+        }}
       />
 
-      <main className="mx-4 flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main className="mx-[var(--shell-gutter)] flex min-w-0 flex-1 flex-col overflow-hidden">
         {/* TOP HEADER BAND — workspace identity (ticket / name, branch, PR).
             It spans the middle column only: the rail and the Companion are
             both full-height siblings of <main>, so the header sits between
@@ -2111,6 +2421,7 @@ function App() {
             gitStatus={gitStatus}
             pr={openPrByWs[activeWorkspace.id] ?? null}
             onOpenPr={(url) => ipc.openFileInSystem(url)}
+            onFixChecks={handleFixChecks}
             workspace={activeWorkspace}
             issueTrackerConfigured={issueTrackerConfigured}
             jiraProjectKey={activeProject?.jiraProjectKey ?? null}
@@ -2128,7 +2439,7 @@ function App() {
             {activeWorkspace ? <shell> : <EmptyState>} conditional was
             unmounting every running PTY whenever the user crossed that
             boundary. */}
-        <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
+        <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden pb-[var(--shell-foot)]">
           {/* MODE BAND — the switcher's own line, spanning the canvas column
               only (the modes govern the canvas, not the Companion). Gated on
               an active workspace like the ContextHeader is: with no workspace
@@ -2140,6 +2451,10 @@ function App() {
               onChange={setMode}
               workspaceId={activeWorkspaceId ?? undefined}
               meta={modeMeta}
+              // The session line keeps its floor while that fits beside the
+              // switcher, and its ⌘⌥K list button always.
+              tailMin={activeMode === "run" && terminals.length > 0 ? LINE_FLOOR_PX : undefined}
+              tailLastMin={LINE_LAST_PX}
             />
           )}
           <CanvasSplit>
@@ -2170,19 +2485,16 @@ function App() {
                 </ErrorBoundary>
               </ModeOverlay>
 
-              {/* Run panel — the session rail and the slot the focused
-                  session's pane is drawn over. The panes themselves live in
-                  the TerminalHost below, so they survive project switches,
-                  new-project creation and a crash here. */}
+              {/* Run panel — the captioned slots the sessions' panes are
+                  drawn over. The panes themselves live in the TerminalHost
+                  below, so they survive project switches, new-project
+                  creation and a crash here. Switching session lives in the
+                  mode band (the session line), not here and not in the
+                  Companion: collapsing the Companion must never remove the
+                  only way to change session. */}
               <ModeOverlay active={!!activeWorkspace && activeMode === "run"}>
-                {/* The rail lives INSIDE the canvas (not the Companion) so
-                    collapsing the Companion no longer removes the only way
-                    to change session. */}
                 <ErrorBoundary surface="Run">
                 <div className="flex h-full w-full min-h-0">
-                  {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
-                    <SessionRail workspaceId={activeWorkspaceId} onOpenBeside={openBeside} />
-                  )}
                   <div className="relative min-w-0 flex-1">
                   {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
                     <RunPanes workspaceId={activeWorkspaceId} onOpenBeside={openBeside} />
@@ -2210,7 +2522,10 @@ function App() {
                       projectPath={activeWorkspace.worktreePath || project.path}
                       workspaceId={activeWorkspaceId!}
                       diff={gitDiff}
-                      onChangesFileClick={(filePath) => navigateToFile(filePath, "diff")}
+                      onChangesFileClick={(filePath) => {
+                        toWorkingTree();
+                        navigateToFile(filePath, "diff");
+                      }}
                       registerFocusCommit={registerFocusCommit}
                       fileTree={fileTreeProps ?? {
                         rootPath: activeWorkspace.worktreePath || project.path,
@@ -2219,17 +2534,26 @@ function App() {
                       }}
                       onChangesChange={() => {
                         // Refetch diff + status after commit / push so the
-                        // canvas catches up immediately.
+                        // canvas catches up immediately — unless the user has
+                        // switched workspace meanwhile (#908).
                         const path = activeWorkspace.worktreePath || project.path;
-                        Promise.all([
-                          ipc.getGitStatus(path),
-                          ipc.getGitDiff(path, ignoreWs).catch(() => ""),
-                        ])
-                          .then(([s, d]) => {
+                        const wsId = activeWorkspaceId!;
+                        refetchForWorkspace(
+                          wsId,
+                          () =>
+                            Promise.all([
+                              ipc.getGitStatus(path),
+                              ipc.getGitDiff(path, ignoreWs).catch(() => ""),
+                              ipc.getCommittedDiff(wsId, ignoreWs).catch(() => null),
+                            ]),
+                          () => useWorkspaceStore.getState().activeId,
+                          ([s, d, c]) => {
                             setGitStatus(s);
                             setGitDiff(d);
-                          })
-                          .catch(() => {});
+                            setGitDiffWs(wsId);
+                            useReviewSource.getState().setCommitted(wsId, c);
+                          },
+                        ).catch(() => {});
                       }}
                     />
 
@@ -2243,22 +2567,35 @@ function App() {
                         workspaceId={activeWorkspaceId!}
                         workspacePath={activeWorkspace.worktreePath || project.path}
                         gitStatus={gitStatus}
-                        gitDiff={gitDiff}
+                        gitDiff={reviewDiff}
+                        diffWorkspaceId={gitDiffWs}
+                        source={reviewSource}
+                        commitsAhead={committed?.commits ?? 0}
+                        base={committed?.base ?? null}
+                        mergeBase={committed?.mergeBase ?? null}
+                        onSourceChange={(src) => useReviewSource.getState().pick(activeWorkspaceId!, src)}
                         viewMode={reviewViewMode}
                         onViewModeChange={setReviewViewMode}
                         onOpenFileAtLine={(p, line) => navigateToFile(p, "editor", line)}
                         onDiffChange={() => {
-                          // Re-fetch git status + diff after a hunk action
+                          // Re-fetch git status + diff after a hunk action,
+                          // for the workspace it was taken in (#908).
                           const path = activeWorkspace.worktreePath || project.path;
-                          Promise.all([
-                            ipc.getGitStatus(path),
-                            ipc.getGitDiff(path, ignoreWs).catch(() => ""),
-                          ])
-                            .then(([s, d]) => {
+                          const wsId = activeWorkspaceId!;
+                          refetchForWorkspace(
+                            wsId,
+                            () =>
+                              Promise.all([
+                                ipc.getGitStatus(path),
+                                ipc.getGitDiff(path, ignoreWs).catch(() => ""),
+                              ]),
+                            () => useWorkspaceStore.getState().activeId,
+                            ([s, d]) => {
                               setGitStatus(s);
                               setGitDiff(d);
-                            })
-                            .catch(() => {});
+                              setGitDiffWs(wsId);
+                            },
+                          ).catch(() => {});
                         }}
                         initialTestCommand={activeWorkspace.testCommand ?? null}
                         onFocusCommit={() => focusCommitFn.current?.()}
@@ -2342,6 +2679,7 @@ function App() {
                       layoutVersion={layoutVersion}
                       onSpawn={() => markRunning(t.workspaceId, t.id, true)}
                       onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
+                      onFirstOutput={() => markStarted(t.workspaceId, t.id)}
                       onExit={() => markRunning(t.workspaceId, t.id, false)}
                       onReattach={() => {
                         // Mark as running (it already was, but be explicit).
@@ -2366,6 +2704,7 @@ function App() {
                   onDismiss={() => {
                     setShowCreator(false);
                     setCreatorProjectId(null);
+                    setCreatorGroupId(null);
                   }}
                 >
                 <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
@@ -2373,13 +2712,16 @@ function App() {
                     projectId={targetProject.id}
                     projectPath={targetProject.path}
                     projectJiraKey={targetProject.jiraProjectKey}
+                    groupId={creatorGroupId}
                     onCreated={() => {
                       setShowCreator(false);
                       setCreatorProjectId(null);
+                      setCreatorGroupId(null);
                     }}
                     onCancel={() => {
                       setShowCreator(false);
                       setCreatorProjectId(null);
+                      setCreatorGroupId(null);
                     }}
                   />
                 </div>
@@ -2481,12 +2823,13 @@ function App() {
               activeWorkspace
                 ? {
                     gitStatus,
-                    gitDiff,
                     workspacePath: activeWorkspace.worktreePath || activeProject?.path || "",
                   }
                 : null
             }
+            runProps={activeWorkspace ? { gitStatus, changeStats: runChangeStats, ahead: runAhead } : null}
             onJumpToFile={handleJumpToFile}
+            onOpenReview={() => setMode("review")}
             collapsed={companionFold.collapsed}
             foldedForPanes={companionFold.folded}
             onToggleCollapsed={toggleCompanion}
@@ -2545,7 +2888,7 @@ function App() {
         </ErrorBoundary>
       )}
 
-      {/* Session switcher (⌘⌥K / the band anchor). Available with zero
+      {/* Session switcher (⌘⌥K / the session line). Available with zero
           sessions too — its last row opens one, which is exactly what an empty
           workspace needs. */}
       {sessionSwitcher && activeWorkspaceId && (
@@ -2571,6 +2914,14 @@ function App() {
         onOpenPullRequest={
           activeWorkspaceId ? () => usePrStore.getState().openComposer(activeWorkspaceId) : undefined
         }
+        projects={projectGroups}
+        runningByWs={runningByWs}
+        onSelectWorkspace={handleSelectWorkspace}
+        onRevealGroup={(groupId) => {
+          // The slim rail draws no group names: open it to show the one asked for.
+          setIsRailCollapsed(false);
+          revealGroup(groupId);
+        }}
       />
       </ErrorBoundary>
 
@@ -2624,6 +2975,31 @@ function App() {
           setProjectContextMenu(null);
           await copyToClipboard(projPath, "Path copied");
         };
+        // The rail's top level as it is drawn, so "Move up" and "Move down"
+        // step the way the eye expects: among a group's projects for a
+        // project in one, over a whole group for a loose project.
+        const railLayout = layoutProjects(projectGroups, projectScopeGroups);
+        const stepUp = stepInRail(railLayout, proj.id, -1);
+        const stepDown = stepInRail(railLayout, proj.id, 1);
+        const projGroupId = projectScopeGroups.some((g) => g.id === proj.groupId) ? (proj.groupId ?? null) : null;
+        // Exactly the rows that say "merged · archive?" (#963).
+        const mergedMissions = archivableMissions(
+          workspacesByProjectId[proj.id] ?? [],
+          runStateByWs,
+          runningByWs,
+          mergedPrByWs,
+          prByWs,
+          gitSummaryByWs,
+        );
+        const dismissProjectMenu = () => {
+          const closing = projectContextMenu;
+          setProjectContextMenu(null);
+          // A menu the keyboard opened gives the focus back to its project
+          // line, so Escape does not drop the keyboard out of the rail.
+          // Held, not only set: "Move to group" renders the line under another
+          // parent, and the focus has to follow it there.
+          if (closing.fromKeyboard) holdProjectLineFocus(closing.projectId);
+        };
         return (
           <ErrorBoundary surface="Project menu" variant="overlay" onDismiss={() => setProjectContextMenu(null)}>
           <ProjectContextMenu
@@ -2664,37 +3040,37 @@ function App() {
               setArchivedForProject({ id: proj.id, name: proj.name, path: proj.path });
               setProjectContextMenu(null);
             }}
+            mergedCount={mergedMissions.length}
+            onArchiveMerged={() => {
+              const files = useWorkspaceStore.getState().localFilesByWs;
+              const localFiles = Object.fromEntries(mergedMissions.map((w) => [w.id, files[w.id] ?? []]));
+              setArchivingMerged({ projectId: proj.id, path: proj.path, missions: mergedMissions, localFiles });
+              setProjectContextMenu(null);
+            }}
+            onNewGroup={() => void createMissionGroup(proj.id)}
+            projectGroups={projectScopeGroups}
+            projectGroupId={projGroupId}
+            onMoveToGroup={(groupId) => void moveProjectToGroup(proj.id, groupId)}
+            onNewProjectGroup={() => void createProjectGroup(proj.id)}
+            onRemoveFromGroup={() => void moveProjectToGroup(proj.id, null)}
             pinned={proj.pinned}
-            canMoveUp={projectGroups.findIndex((g) => g.id === projectContextMenu.projectId) > 0}
-            canMoveDown={(() => {
-              const i = projectGroups.findIndex((g) => g.id === projectContextMenu.projectId);
-              return i >= 0 && i < projectGroups.length - 1;
-            })()}
+            canMoveUp={stepUp !== null}
+            canMoveDown={stepDown !== null}
             onTogglePin={() => {
               void setProjectPinnedAction(projectContextMenu.projectId, !proj.pinned);
               setProjectContextMenu(null);
             }}
             onMoveUp={() => {
-              const ids = projectGroups.map((g) => g.id);
-              const i = ids.indexOf(projectContextMenu.projectId);
-              if (i > 0) {
-                [ids[i - 1], ids[i]] = [ids[i], ids[i - 1]];
-                void setProjectOrderAction(ids);
-              }
+              if (stepUp) void setProjectOrderAction(stepUp);
               setProjectContextMenu(null);
             }}
             onMoveDown={() => {
-              const ids = projectGroups.map((g) => g.id);
-              const i = ids.indexOf(projectContextMenu.projectId);
-              if (i >= 0 && i < ids.length - 1) {
-                [ids[i + 1], ids[i]] = [ids[i], ids[i + 1]];
-                void setProjectOrderAction(ids);
-              }
+              if (stepDown) void setProjectOrderAction(stepDown);
               setProjectContextMenu(null);
             }}
             onClose={() => handleCloseProject(projectContextMenu.projectId)}
             onDelete={() => handleDeleteProject(projectContextMenu.projectId)}
-            onDismiss={() => setProjectContextMenu(null)}
+            onDismiss={dismissProjectMenu}
           />
           </ErrorBoundary>
         );
@@ -2709,6 +3085,7 @@ function App() {
             projectPath={archivedForProject.path}
             onRestored={(pid) => {
               void loadAllWorkspaces([pid]);
+              void useGroupsStore.getState().load();
               void loadGitSummaries(pid);
               const p = recentProjects.find((x) => x.id === pid)?.path ?? (project?.id === pid ? project.path : undefined);
               if (p) void loadProjectPrs(pid, p);
@@ -2716,6 +3093,32 @@ function App() {
             onClose={() => setArchivedForProject(null)}
           />
         </ModalShell>
+        </ErrorBoundary>
+      )}
+
+      {archivingMerged && (
+        <ErrorBoundary surface="Archive merged missions" variant="overlay" onDismiss={() => setArchivingMerged(null)}>
+          <ConfirmDialog
+            title={
+              archivingMerged.missions.length === 1
+                ? "Archive this merged mission?"
+                : `Archive ${archivingMerged.missions.length} merged missions?`
+            }
+            body={archiveMergedBody(
+              archivingMerged.missions.map((w) => ({
+                name: w.name || w.branch || "Mission",
+                localFiles: archivingMerged.localFiles[w.id] ?? [],
+              })),
+            )}
+            destructiveLabel={archivingMerged.missions.length === 1 ? "Archive it" : "Archive them"}
+            onConfirm={() => {
+              const { projectId, path, missions, localFiles } = archivingMerged;
+              setArchivingMerged(null);
+              // Exactly the paths this confirm named: any other stops that mission.
+              void archiveMergedMissions(projectId, path, missions, localFiles);
+            }}
+            onCancel={() => setArchivingMerged(null)}
+          />
         </ErrorBoundary>
       )}
 
@@ -2796,6 +3199,7 @@ function App() {
           setContextMenu(null);
           await copyToClipboard(text, label);
         };
+        const wsGroups = contextMenuGroups;
         return (
           <ErrorBoundary surface="Workspace menu" variant="overlay" onDismiss={() => setContextMenu(null)}>
           <WorkspaceContextMenu
@@ -2858,6 +3262,11 @@ function App() {
               await useWorkspaceStore.getState().load(workspace.projectId);
               setContextMenu(null);
             }}
+            groups={wsGroups}
+            groupId={wsGroups.some((g) => g.id === workspace.groupId) ? workspace.groupId : null}
+            onMoveToGroup={(groupId) => void moveMissionToGroup(workspace.id, groupId)}
+            onNewGroup={() => void createMissionGroup(workspace.projectId, workspace.id)}
+            onRemoveFromGroup={() => void moveMissionToGroup(workspace.id, null)}
           />
           </ErrorBoundary>
         );
@@ -3046,6 +3455,9 @@ function App() {
       <ErrorBoundary surface="Upgrade" variant="overlay" onDismiss={() => useUpgradeStore.getState().hide()}>
         <UpgradeSheet />
       </ErrorBoundary>
+      <ErrorBoundary surface="Crew import" variant="overlay" onDismiss={() => useCrewImportStore.getState().close()}>
+        <CrewImportHost />
+      </ErrorBoundary>
       <ErrorBoundary surface="Run history" variant="overlay" onDismiss={() => useHistoryStore.getState().close()}>
         <HistorySheet />
       </ErrorBoundary>
@@ -3082,7 +3494,7 @@ function RunEmptyState({ onStart }: { onStart: () => Promise<void> | void }) {
         Start a new terminal.
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
-        A terminal opens in the workspace's worktree directory. You can keep several sessions open, switch from the rail, or open them side by side.
+        A terminal opens in the workspace's worktree directory. You can keep several sessions open, switch between them from the line above, or open them side by side.
       </p>
       <button
         type="button"

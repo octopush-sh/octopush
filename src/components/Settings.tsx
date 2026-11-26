@@ -75,26 +75,30 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
         </aside>
 
         {/* Pane — keyed so the active pane crossfades when the tab changes, and
-            scroll resets to top on switch. */}
+            scroll resets to top on switch. Every pane renders in the one
+            content column (`--settings-content`), so cards end at the same x
+            on every tab; panes set no width of their own. */}
         <main key={tab} className="octo-fade-in flex-1 overflow-y-auto px-10 py-8">
-          {tab === "general" && (
-            <GeneralPane
-              onShowCaches={() => {
-                usePerfStore.getState().setDetailsOpen(true);
-                onClose();
-              }}
-            />
-          )}
-          {tab === "editor" && <EditorPane />}
-          {tab === "models" && <ModelsPane />}
-          {tab === "routines" && <RoutinesPane />}
-          {tab === "appearance" && <AppearancePane />}
-          {tab === "usage" && <UsagePane />}
-          {tab === "shortcuts" && <ShortcutsPane />}
-          {tab === "privacy" && <PrivacyPane />}
-          {tab === "integrations" && <IntegrationsPane onConfigSaved={onIssueTrackerConfigSaved} />}
-          {tab === "account" && <AccountPane />}
-          {tab === "about" && <AboutPane />}
+          <div data-testid="settings-content" className="max-w-[var(--settings-content)]">
+            {tab === "general" && (
+              <GeneralPane
+                onShowCaches={() => {
+                  usePerfStore.getState().setDetailsOpen(true);
+                  onClose();
+                }}
+              />
+            )}
+            {tab === "editor" && <EditorPane />}
+            {tab === "models" && <ModelsPane />}
+            {tab === "routines" && <RoutinesPane />}
+            {tab === "appearance" && <AppearancePane />}
+            {tab === "usage" && <UsagePane />}
+            {tab === "shortcuts" && <ShortcutsPane />}
+            {tab === "privacy" && <PrivacyPane />}
+            {tab === "integrations" && <IntegrationsPane onConfigSaved={onIssueTrackerConfigSaved} />}
+            {tab === "account" && <AccountPane />}
+            {tab === "about" && <AboutPane />}
+          </div>
         </main>
       </div>
     </OverlayRoom>
@@ -122,23 +126,26 @@ function TabButton({ label, tour, active, onClick }: {
   active: boolean;
   onClick: () => void;
 }) {
+  // Every row has the same height, font and 1px border slot in every state;
+  // only the ground, border colour and text colour mark the active row, so
+  // switching tabs never moves a row below it.
   return (
     <button
       type="button"
       data-tour={tour}
       onClick={onClick}
       aria-current={active ? "page" : undefined}
-      className="mb-0.5 flex w-full items-baseline rounded-md px-3 py-1.5 text-left transition"
+      className="mb-0.5 flex h-8 w-full items-center rounded-md border border-solid px-3 text-left transition"
       style={
         active
-          ? { background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }
-          : { border: "1px solid transparent" }
+          ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" }
+          : { borderColor: "transparent" }
       }
     >
       <span
         className={
           active
-            ? "font-serif text-[14px] text-octo-brass"
+            ? "font-sans text-[13px] text-octo-brass"
             : "font-sans text-[13px] text-octo-sage hover:text-octo-ivory"
         }
       >

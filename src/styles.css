@@ -42,6 +42,9 @@
 
   --color-octo-brass:     #d4a574;
   --color-octo-brass-hi:  #e8c39a;
+  /* Class alias (`border-octo-brass-dim`, `decoration-octo-brass-dim`) for the
+     per-theme `--brass-dim` alpha below; themeStore repaints the source. */
+  --color-octo-brass-dim: var(--brass-dim);
 
   --color-octo-ivory:     #f4ecdb;
   --color-octo-sage:      #95897a;
@@ -194,6 +197,23 @@
   --talk-seat-min:   21rem;
   --talk-chat-floor: 18rem;
 
+  /* Shell spacing: the air between the app's standing surfaces. `<main>` is
+     inset `--shell-gutter` from the rail and from the Companion;
+     `--shell-stack` separates the ContextHeader, the mode band and the canvas
+     (and sits above the header); `--shell-foot` is the canvas's bottom
+     padding, above the status bar. The surfaces' own inner spacing is not
+     governed here. See docs/design-system.md, section 3. */
+  --shell-gutter: 8px;
+  --shell-stack:  8px;
+  --shell-foot:   8px;
+
+  /* Settings content column: the one max width every Settings pane renders
+     in (`Settings.tsx`), so cards and notes end at the same x on every tab.
+     A pane that needs two columns (Models, Integrations) splits inside it;
+     no pane sets a width of its own. See docs/design-system.md, section 8,
+     "Full-screen rooms". */
+  --settings-content: 720px;
+
   /* Motion */
   --ease-octo:    cubic-bezier(0.2, 0.8, 0.3, 1);
   --dur-quick:    220ms;
@@ -305,8 +325,10 @@
    the attention pulse (which means paused/finished).
    The colour comes from --rail-bar (brass on the active row / cell, sage on
    every other — never a status in brass, never the workspace tint). Consumers
-   size the edge inline (the workspace rail's 2px edge, the Run session rail's
-   3px one). Reduced motion falls back to a solid bar — never a frozen dash. */
+   size the edge inline (the workspace rail's 2px edge). Reduced motion falls
+   back to a solid bar — never a frozen dash.
+   `.rail-bar-running-x` is the same idiom laid horizontally: the Run session
+   line's 2px underline, which its cell positions and sizes. */
 @keyframes rail-march {
   to {
     background-position-y: -11px;
@@ -328,8 +350,25 @@
   animation: rail-march 1.2s linear infinite;
 }
 
+@keyframes rail-march-x {
+  to {
+    background-position-x: 14px;
+  }
+}
+
+.rail-bar-running-x {
+  background: repeating-linear-gradient(
+    to right,
+    var(--rail-bar) 0 4px,
+    transparent 4px 7px
+  );
+  background-size: 14px 100%;
+  animation: rail-march-x 1.2s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .rail-bar-running {
+  .rail-bar-running,
+  .rail-bar-running-x {
     background: var(--rail-bar);
     animation: none;
   }
@@ -417,12 +456,69 @@
 /* Calm pulse for the active pipeline stage in the Direct run track. */
 @keyframes octo-stage-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }
-  50%      { box-shadow: 0 0 0 3px var(--brass-ghost); }
+  50%      { box-shadow: 0 0 0 3px var(--pulse-ink, var(--brass-ghost)); }
 }
 .octo-stage-pulse { animation: octo-stage-pulse 2.4s var(--ease-octo, cubic-bezier(0.2,0.8,0.3,1)) infinite; }
+/* A RUNNING stage holding the beacon pulses in its own status ink, never
+   brass (§5 StageDots: "a running stage is never brass"). Without this the
+   reduced-motion halo drew a 1px brass ring hugging the verdigris border, and
+   a working card read exactly like an awaiting-gate one (#749). */
+.octo-stage-pulse-running { --pulse-ink: var(--verdigris-ghost); --pulse-halo: var(--verdigris-strong); }
+/* An AMBER halt's CTA (transient fault, Claude plan limit) holding the beacon
+   pulses amber: amber is caution, never brass (§5 halt glyphs). A brass ring
+   on the amber border read as a gate, not a pause awaiting Resume (#818). */
+.octo-stage-pulse-warning { --pulse-ink: var(--warning-ghost); --pulse-halo: var(--warning-border); }
 @media (prefers-reduced-motion: reduce) {
-  .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--brass-dim); }
+  .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--pulse-halo, var(--brass-dim)); }
 }
+
+/* ── Talk work ledger (ToolCallCard, chat/WorkBlock.tsx) ───────────
+   A resolved tool call is a quiet row hung on the work block's hairline,
+   not a card. Its colours are inline tokens (ToolCallCard renders beside
+   react-markdown, where Tailwind's cascade leaked once), so the hover and
+   focus states that inline styles can't express live here. The hover is a
+   faint wash over the whole row, never a brass border. The row's action
+   icons show while it is hovered or holds focus (they keep their room, so
+   nothing moves), and turn brass on hover. Focus rings are inset: the work
+   block's fold clips anything drawn outside a row. */
+.octo-ledger { transition: background-color var(--dur-quick) var(--ease-octo); }
+.octo-ledger:hover { background: var(--brass-faint); }
+.octo-ledger-actions { opacity: 0; transition: opacity var(--dur-quick) var(--ease-octo); }
+.octo-ledger:hover .octo-ledger-actions,
+.octo-ledger:focus-within .octo-ledger-actions { opacity: 1; }
+.octo-ledger-action { transition: color var(--dur-quick) var(--ease-octo); }
+.octo-ledger-action:hover { color: var(--color-octo-brass) !important; }
+.octo-ledger-head:focus-visible,
+.octo-ledger-action:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--color-octo-brass);
+}
+
+/* ── Row actions over a fade (Talk chat rows, #756) ────────────────
+   Hover/focus actions that sit ON the row's right end instead of beside the
+   title, so revealing them never moves or rewraps anything. The fade repaints
+   exactly what the row shows beneath it: the panel the list sits on (panel-2
+   on the open, boxed row) plus, on a hovered unboxed row, the brass-ghost wash
+   — two layers, so the composite matches the row rather than approximating it.
+   The first 20px (the element's left padding) fade to transparent.
+   `--row-wash` is a registered colour so it fades with the element's opacity
+   (same 220ms + --ease-octo as the row's own wash) instead of dropping at
+   once on unhover and baring an unwashed patch at the row's end (#818). */
+@property --row-wash {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: transparent;
+}
+.octo-row-actions-fade {
+  --row-fill: var(--color-octo-panel);
+  --row-wash: transparent;
+  transition-property: opacity, --row-wash;
+  background:
+    linear-gradient(to left, var(--row-wash) calc(100% - 20px), transparent),
+    linear-gradient(to left, var(--row-fill) calc(100% - 20px), transparent);
+}
+[data-active] > .octo-row-actions-fade { --row-fill: var(--color-octo-panel-2); }
+.group:not([data-active]):hover > .octo-row-actions-fade { --row-wash: var(--brass-ghost); }
 
 /* ── Elision primitives · middle truncation ──────────────────────
    For any identifier whose HEAD and TAIL both disambiguate — branch names,
@@ -440,7 +536,8 @@
    ellipsis, so if it ever IS squeezed the elision is visible rather than a
    silent hard cut.
 
-   `--split` is the elided path: head ellipsizes, tail pinned.
+   `--split` is the elided path: head ellipsizes, tail pinned. The head's
+   ellipsis is the only one ever drawn, cut or not.
 
    NEITHER carries `max-width: 100%`. A percentage max-width on a flex item
    inside a shrink-to-fit chain is a cyclic reference, and it resolved to less
@@ -450,7 +547,28 @@
 .octo-midtrunc-whole { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .octo-midtrunc       { display: inline-flex; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
 .octo-midtrunc-head  { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.octo-midtrunc-tail  { flex: none; white-space: nowrap; }
+/* `pre`, not `nowrap`: the seam's space starts the tail (`splitAt`) and would
+   collapse at the flex item's edge otherwise. A plain space, so a copy and
+   the accessible name stay the string itself. */
+.octo-midtrunc-tail  { flex: none; white-space: pre; }
+/* Once the head overflows, MidTruncate sets its max-width to the glyphs that
+   fit at a grapheme boundary plus one `…`, so the head's OWN ellipsis butts
+   against the tail in every row. Left to flex alone, the engine's ellipsis
+   leaves up to a glyph of empty room after it (#750). The head stays
+   `text-overflow: ellipsis` once cut (#864): a head held at `clip` beside a
+   separate `…` is text cut with no ellipsis to WebKit and the visual audit.
+   `-ell` is only the ruler for that `…`: laid out in the box's font so its
+   glyph can be measured in the same pass, but zero-width, invisible,
+   `aria-hidden` and unselectable — never shown. */
+.octo-midtrunc-ell   { flex: none; width: 0; visibility: hidden; user-select: none; -webkit-user-select: none; }
+/* While MidTruncate measures (one frame, never painted) it holds the head at
+   `text-overflow: clip` — WebKit clips a Range's rects at its own ellipsis
+   point, which would hide every glyph past it from the grapheme search
+   (#833). That hold is the head's inline style, set and cleared in the same
+   pass, never a rule here (#872): a rule keyed on the box's `data-measuring`
+   left the head restyled only once the attribute change reached it, and in
+   Safari a head still at `clip` is text cut with no ellipsis. No rule in this
+   file clips the head. */
 /* The optional `lead` glyph. One rule serves both boxes: `align-self` centres
    it as a flex item in the split box, `vertical-align` as inline content in
    the whole one — each property is ignored by the box it doesn't apply to. */
@@ -548,6 +666,8 @@
    Accept all are the floor; below 600px the secondary toggles (inline/split,
    ±WS, tests) shed together and a "More" button grows in their place, opening
    a menu with the same controls — so nothing is lost and nothing is clipped.
+   The Working tree / Since base toggle sheds its commit count on the same
+   rung ("Since base · 3 commits" → "Since base"); both segments are floor.
    The header is the containing block of the menu and the tests popover (they
    can't live inside a rung, whose `overflow: hidden` would clip them). Its
    z-index lifts them above what follows it in the canvas — the diff and the
@@ -561,7 +681,14 @@
   max-width: 0; opacity: 0; margin-right: -8px;
   visibility: hidden; --demote-vis-delay: var(--dur-standard);
 }
+/* The Since base segment's commit count is a rung inside a button: no gap to
+   eat and no focus ring to make room for (the button draws its own). */
+.octo-demote.octo-demote-source-count { gap: 0; padding: 0; margin-left: 0; }
 @container octo-reviewbar (max-width: 600px) {
+  .octo-demote-source-count {
+    max-width: 0; opacity: 0;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
   .octo-demote-secondary {
     max-width: 0; opacity: 0; margin-right: -8px;
     visibility: hidden; --demote-vis-delay: var(--dur-standard);
@@ -570,6 +697,57 @@
     max-width: 40ch; opacity: 1; margin-right: 0;
     visibility: visible; --demote-vis-delay: 0s;
   }
+}
+
+/* The mode band (ModeBand.tsx) is a ladder too. Its switcher is centred and
+   its tail sits in the right track, so on a narrow canvas the two compete for
+   the same pixels. As the band narrows it sheds:
+
+     ≤ 720px   with a control tail (Run's session line): the inactive modes'
+               labels → icon + tooltip. A redundant word goes before a
+               session's cell does; the labels buy the line about 73px
+     ≤ 600px   the same labels in every mode: a centred, fully labelled
+               switcher would leave each side track under 120px
+     ≤ 334px   a control tail's floor (LINE_FLOOR_PX, SessionLine.tsx) no
+               longer fits beside even the compact switcher, so its track
+               keeps only the last rung's (`--modeband-tail-last`,
+               LINE_LAST_PX: the ⌘⌥K list button), and the session line,
+               which measures its track, sheds down to that button. Nothing
+               is clipped, so nothing hidden stays in the tab order
+     floor     the switcher, the active mode always with its label, so the
+               band never stops naming where you are
+
+   The container (`.octo-modeband`) wraps the grid (`.octo-modeband-grid`):
+   a container query styles only what is inside it, and the last rung
+   changes the grid's own columns.
+
+   The label is a rung inside a button: no gap of its own to eat and no focus
+   ring to make room for (the button draws its own); the negative margin eats
+   the button's 6px icon gap instead. */
+.octo-modeband { container-type: inline-size; container-name: octo-modeband; }
+/* Capped near the longest label ("Review", "Direct": six mono characters of
+   `1ch` plus the segment's 0.2em tracking, and one of slack), not the generic
+   40ch: the collapse tweens from the cap, so a far cap spent most of its
+   duration shrinking room the label never had. */
+.octo-demote.octo-demote-mode-label {
+  gap: 0; padding: 0; margin-left: 0;
+  max-width: calc(7 * (1ch + 0.2em));
+  transition: max-width var(--dur-standard) var(--ease-octo),
+              opacity var(--dur-quick) var(--ease-octo),
+              margin-left var(--dur-standard) var(--ease-octo),
+              visibility 0s linear var(--demote-vis-delay, 0s);
+}
+/* One rung for every mode. With a second, later rung for the modes that
+   have no control tail, the switcher changed width as the mode changed, and
+   the segment under the pointer became another mode mid-click. */
+@container octo-modeband (max-width: 720px) {
+  .octo-mode-seg:not([aria-pressed="true"]) > .octo-demote-mode-label {
+    max-width: 0; opacity: 0; margin-left: -6px;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
+}
+@container octo-modeband (max-width: 334px) {
+  .octo-modeband-grid[data-tail="control"] { --modeband-tail-min: var(--modeband-tail-last); }
 }
 
 /* The composer's cost estimate (ComposerEstimate.tsx) is a fixed slot on its
@@ -962,6 +1140,22 @@ button:not(:disabled),
   -webkit-user-select: text;
 }
 
+/* Commented passages in a document the director annotates (CommentableDocument):
+   painted through the CSS Custom Highlight API, so the rendered Markdown is
+   never re-wrapped to mark them. */
+::highlight(octo-comment) {
+  background-color: var(--brass-ghost);
+  text-decoration: underline;
+  text-decoration-color: var(--brass-dim);
+}
+
+/* The passage under the keyboard cursor of such a document (↑ ↓ move it,
+   ⏎ comments on it). */
+.octo-commentable [data-comment-cursor] {
+  background-color: var(--brass-ghost);
+  box-shadow: inset 2px 0 0 var(--brass-dim);
+}
+
 /* Attention indicator pulse animation */
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
@@ -973,6 +1167,43 @@ button:not(:disabled),
    library's default light chrome. Nodes/edges are fully custom components;
    these rules only retheme the handles, controls, minimap, and connection
    line that @xyflow renders itself. */
+
+/* @xyflow v13 fills these variables with `light-dark()` pairs resolved
+   against the OS appearance. The canvas follows the app theme instead: the
+   builder forces the flow's color mode from the active theme
+   (`builder/flowTheme.ts`), and every variable the library would fill from
+   its own palette is set here from tokens, so Onyx and Vellum look the same
+   under light and dark macOS. `flowTheme.test.ts` checks that this block
+   covers each `light-dark()` default in the library's stylesheet. */
+.octo-flow {
+  --xy-background-color: transparent;
+  --xy-background-pattern-color: var(--brass-faint);
+  --xy-edge-stroke: var(--brass-rule-dim);
+  --xy-edge-stroke-selected: var(--color-octo-brass);
+  --xy-connectionline-stroke: var(--brass-dim);
+  --xy-attribution-background-color: transparent;
+  --xy-minimap-background-color: var(--color-octo-panel);
+  --xy-minimap-mask-background-color: color-mix(in srgb, var(--color-octo-onyx) 72%, transparent);
+  --xy-minimap-node-background-color: var(--color-octo-hairline);
+  --xy-minimap-node-stroke-color: var(--brass-dim);
+  --xy-node-color: var(--color-octo-ivory);
+  --xy-node-border: 1px solid var(--color-octo-hairline);
+  --xy-node-background-color: var(--color-octo-panel);
+  --xy-node-boxshadow-hover: none;
+  --xy-node-boxshadow-selected: 0 0 0 1px var(--brass-dim);
+  --xy-handle-background-color: var(--color-octo-onyx);
+  --xy-handle-border-color: var(--brass-dim);
+  --xy-selection-background-color: var(--brass-ghost);
+  --xy-selection-border: 1px dotted var(--brass-dim);
+  --xy-controls-button-background-color: var(--color-octo-panel);
+  --xy-controls-button-background-color-hover: var(--brass-ghost);
+  --xy-controls-button-color: var(--color-octo-sage);
+  --xy-controls-button-color-hover: var(--color-octo-brass);
+  --xy-controls-button-border-color: var(--color-octo-hairline);
+  --xy-controls-box-shadow: none;
+  --xy-edge-label-background-color: var(--color-octo-panel);
+  --xy-edge-label-color: var(--color-octo-ivory);
+}
 .octo-flow .react-flow__handle {
   width: 9px;
   height: 9px;

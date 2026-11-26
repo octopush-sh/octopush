@@ -28,13 +28,18 @@ import { ipc } from "../lib/ipc";
 import { canOpenPrFrom } from "../lib/prDraft";
 import type { LastCommit } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
+import { STATUS_LETTER } from "../lib/runChanges";
 import { pushToast } from "./Toasts";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { SecretGuardDialog } from "./SecretGuardDialog";
+import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
 import { ModalShell } from "./ModalShell";
 import { ConflictAiModal } from "./ConflictAiModal";
 import { GitOpsMenu } from "./GitOpsMenu";
 import { HistoryModal } from "./HistoryModal";
 import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
+import { resolveHelperModel } from "../lib/helperModels";
+import { useCollisionStore } from "../stores/collisionStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useAiReview } from "../stores/aiReviewStore";
@@ -91,6 +96,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
   const [lastCommit, setLastCommit] = useState<LastCommit | null>(null);
   const [drafting, setDrafting] = useState(false);
   const [discardTarget, setDiscardTarget] = useState<string | null>(null);
+  const [secretHold, setSecretHold] = useState<{ action: "commit" | "push"; refusal: SecretRefusal } | null>(null);
   const [reconcile, setReconcile] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [resolvingPath, setResolvingPath] = useState<string | null>(null);
@@ -215,7 +221,8 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     setDrafting(true);
     try {
       const d = await ipc.getStagedDiff(projectPath);
-      const r = await ipc.aiComplete("claude-sonnet-4-6", COMMIT_SYSTEM, buildCommitPrompt(d), {
+      const model = await resolveHelperModel("review");
+      const r = await ipc.aiComplete(model, COMMIT_SYSTEM, buildCommitPrompt(d), {
         workspaceId,
       });
       setCommitMessage(r.text.trim());
@@ -249,21 +256,32 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     }
   }
 
-  async function handleCommitOrAmend() {
+  /** `allowFindings`: the fingerprint of the refusal the user confirmed. */
+  async function handleCommitOrAmend(allowFindings?: string) {
     const msg = commitMessage.trim();
     if (!msg || (!amend && staged.length === 0)) return;
     setCommitting(true);
     try {
-      const sha = amend ? await ipc.amendCommit(projectPath, msg) : await ipc.commitChanges(projectPath, msg);
+      const sha = allowFindings
+        ? amend ? await ipc.amendCommit(projectPath, msg, allowFindings) : await ipc.commitChanges(projectPath, msg, allowFindings)
+        : amend ? await ipc.amendCommit(projectPath, msg) : await ipc.commitChanges(projectPath, msg);
       // A commit changes the worktree's dirty state — refresh the rail signal.
       const pid = useProjectStore.getState().current?.id;
-      if (pid) void useWorkspaceStore.getState().loadGitSummaries(pid);
+      if (pid) {
+        void useWorkspaceStore.getState().loadGitSummaries(pid);
+        void useCollisionStore.getState().refresh(pid, { force: true });
+      }
       pushToast({ level: "success", title: amend ? "Amended" : "Committed", body: sha });
       setCommitMessage(""); setAmend(false); setLastCommit(null);
       await refresh();
       onChange?.();
     } catch (e) {
-      pushToast({ level: "error", title: amend ? "Amend failed" : "Commit failed", body: String(e) });
+      // Secret guard (#730): a possible credential in the staged diff asks
+      // first instead of failing. A confirmed fingerprint that no longer
+      // matches comes back as a new refusal with the new findings.
+      const refusal = secretRefusal(e);
+      if (refusal) setSecretHold({ action: "commit", refusal });
+      else pushToast({ level: "error", title: amend ? "Amend failed" : "Commit failed", body: String(e) });
     } finally {
       setCommitting(false);
     }
@@ -283,10 +301,10 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     }
   }
 
-  async function handlePush() {
+  async function handlePush(allowFindings?: string) {
     setPushing(true);
     try {
-      const result = await ipc.pushBranch(projectPath);
+      const result = allowFindings ? await ipc.pushBranch(projectPath, allowFindings) : await ipc.pushBranch(projectPath);
       pushToast({
         level: "success",
         title: "Branch published",
@@ -303,7 +321,9 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
           .catch(() => {});
       }
     } catch (e) {
-      pushToast({ level: "error", title: "Push failed", body: String(e) });
+      const refusal = secretRefusal(e);
+      if (refusal) setSecretHold({ action: "push", refusal });
+      else pushToast({ level: "error", title: "Push failed", body: String(e) });
     } finally {
       setPushing(false);
     }
@@ -657,7 +677,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
 
         <button
           type="button"
-          onClick={handleCommitOrAmend}
+          onClick={() => void handleCommitOrAmend()}
           disabled={!canCommit}
           className="flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
           style={{
@@ -677,7 +697,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
         </button>
 
         <button
-          onClick={handlePush}
+          onClick={() => void handlePush()}
           disabled={!canPush}
           title={
             !hasUpstream
@@ -717,6 +737,25 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
           </p>
         )}
       </div>
+
+      {secretHold && (
+        <SecretGuardDialog
+          action={secretHold.action}
+          refusal={secretHold.refusal}
+          onLeaveOut={() => {
+            // Take the user to the first finding's diff so they can drop it.
+            const first = secretHold.refusal.findings[0];
+            setSecretHold(null);
+            if (first) onFileClick?.(first.file);
+          }}
+          onOverride={() => {
+            const { action, refusal } = secretHold;
+            setSecretHold(null);
+            if (action === "commit") void handleCommitOrAmend(refusal.fingerprint);
+            else void handlePush(refusal.fingerprint);
+          }}
+        />
+      )}
 
       {discardTarget && (
         <ConfirmDialog
@@ -940,18 +979,17 @@ function FileStatusIcon({ status }: { status: FileChange["status"] }) {
 }
 
 function StatusGlyph({ status }: { status: FileChange["status"] }) {
-  const map: Record<FileChange["status"], { letter: string; color: string }> = {
-    new: { letter: "N", color: "text-octo-verdigris" },
-    modified: { letter: "M", color: "text-octo-brass" },
-    deleted: { letter: "D", color: "text-octo-rouge" },
-    renamed: { letter: "R", color: "text-octo-sage" },
-    unknown: { letter: "?", color: "text-octo-mute" },
-    conflicted: { letter: "!", color: "text-octo-rouge" },
+  const color: Record<FileChange["status"], string> = {
+    new: "text-octo-verdigris",
+    modified: "text-octo-brass",
+    deleted: "text-octo-rouge",
+    renamed: "text-octo-sage",
+    unknown: "text-octo-mute",
+    conflicted: "text-octo-rouge",
   };
-  const { letter, color } = map[status];
   return (
-    <span className={`font-mono text-[9px] uppercase tracking-[0.2em] ${color}`}>
-      {letter}
+    <span className={`font-mono text-[9px] uppercase tracking-[0.2em] ${color[status]}`}>
+      {STATUS_LETTER[status]}
     </span>
   );
 }

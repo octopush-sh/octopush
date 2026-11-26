@@ -198,7 +198,10 @@ pub fn normalize_model_id(model: &str) -> String {
 pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
     // (input, cache write 5m, cache hit, output) — USD per million tokens.
     let (input, cache_write, cache_hit, output) = match normalize_model_id(model).as_str() {
-        // Claude Fable
+        // Claude Fable (and Mythos 5.2, limited availability: priced so its
+        // transcripts count, but not in the catalog). Pricing page, fetched
+        // 2026-11-09: Fable 5.2 and Mythos 5.2 both $8 / $10 / $0.20 / $40.
+        "claude-fable-5-2" | "claude-mythos-5-2" => (8.0, 10.0, 0.20, 40.0),
         "claude-fable-5-1" => (10.0, 12.50, 0.25, 50.0),
         "claude-fable-5" => (10.0, 12.50, 1.0, 50.0),
         // Claude Opus
@@ -217,15 +220,38 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         // Haiku 5.5 is tiered per request: prompts over 100,000 tokens (input
         // + cache reads + cache writes) cost 0.50 / 0.625 / 0.05 / 2.50. This
         // is the <=100K tier; per-request paths (Talk director rounds, one-shot
-        // AI calls, Claude Code transcripts, the PTY usage block) apply the
-        // long tier via `request_prices`. Aggregated usage (DIRECT stages,
-        // sub-agent attempts) keeps this tier — the size of each request
-        // inside it is unknown — so long-prompt requests there are
-        // under-counted.
+        // AI calls, Claude Code transcripts, the PTY usage block, API-substrate
+        // DIRECT stages and Talk sub-agents, and the streamed estimate of a
+        // stopped, stalled or crashed Claude Code stage) apply the long tier
+        // via `request_prices`. A finished Claude Code DIRECT stage books
+        // Claude Code's own `total_cost_usd`, so it under-counts only if that
+        // figure leaves out the >100K tier.
         "claude-haiku-5-5" => (0.10, 0.125, 0.01, 0.50),
         "claude-haiku-4-5" => (1.0, 1.25, 0.10, 5.0),
         "claude-3-5-haiku" => (0.80, 1.0, 0.08, 4.0),
         // OpenAI
+        //
+        // GPT-6.1 Terra: OpenAI's model page and API pricing page (fetched
+        // 2026-11-10): $1 input, $0.05 cached input, $5 output, and cache
+        // writes $1.25 for the default 30-minute retention ($2.50 for 12-hour,
+        // which Octopush never requests).
+        //
+        // Every GPT-6 price here is the <=272K-input-token tier; per-request
+        // paths (Talk director rounds, one-shot AI calls, API-substrate DIRECT
+        // stages and Talk sub-agents) apply the long tier via
+        // `request_prices`. Codex CLI stages report only turn totals and keep
+        // this tier — the size of each request inside a turn is unknown — so
+        // long-prompt requests there are under-counted.
+        "gpt-6.1-terra" => (1.0, 1.25, 0.05, 5.0),
+        // The rest of GPT-6: API pricing page (fetched 2026-11-17), the
+        // short-context input / 30-minute write / cached input / output
+        // columns.
+        "gpt-6.2-astra" => (8.0, 10.0, 0.40, 40.0),
+        "gpt-6.2-sol" | "gpt-6.1-sol" => (2.0, 2.50, 0.10, 10.0),
+        "gpt-6-astra" => (10.0, 12.50, 1.0, 50.0),
+        "gpt-6-sol" => (2.0, 2.50, 0.20, 10.0),
+        "gpt-6-luna" => (0.10, 0.125, 0.01, 0.50),
+        // GPT-4o family: no cache-write charge, so writes cost the input price.
         "gpt-4o" => (2.50, 2.50, 1.25, 10.0),
         "gpt-4o-mini" => (0.15, 0.15, 0.075, 0.60),
         // Anything else is unknown — unpriced, not free.
@@ -238,6 +264,69 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         cache_creation_per_m: cache_write,
         cache_creation_1h_per_m: one_hour_write_per_m(model, input, cache_write),
     })
+}
+
+/// Models with a published retirement date: (normalized id prefix, display
+/// name, retirement date `YYYY-MM-DD`, replacement id, replacement name).
+///
+/// Source: Anthropic's model deprecations page
+/// (<https://platform.claude.com/docs/en/about-claude/model-deprecations>,
+/// fetched 2026-11-12): requests to a model past its retirement date fail.
+/// A prefix matches first-party Claude API ids only: the id itself, or the
+/// id followed by `-` and a `YYYYMMDD` snapshot date (the dated
+/// `claude-sonnet-4-5-20250929`). Bedrock and Vertex ids
+/// (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`,
+/// `claude-sonnet-4-5@20250929`) never match: the page says partner
+/// platforms set their own schedules, and switching such an id to a bare
+/// first-party one would silently change the provider.
+pub const MODEL_RETIREMENTS: &[(&str, &str, &str, &str, &str)] = &[
+    ("claude-sonnet-4-5", "Sonnet 4.5", "2026-11-30", "claude-sonnet-5-5", "Sonnet 5.5"),
+];
+
+/// A crew model that retires — the launcher, Readiness and Routines line.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRetirement {
+    /// The id as the stage names it.
+    pub model: String,
+    /// Display name, e.g. "Sonnet 4.5".
+    pub label: String,
+    /// `YYYY-MM-DD`; requests fail after this day.
+    pub retires: String,
+    pub replacement: String,
+    pub replacement_label: String,
+}
+
+/// The [`MODEL_RETIREMENTS`] row for `model`, if any.
+pub fn model_retirement(model: &str) -> Option<ModelRetirement> {
+    let id = model.trim();
+    let is_date = |d: &str| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit());
+    MODEL_RETIREMENTS
+        .iter()
+        .find(|(prefix, ..)| {
+            id == *prefix || id.strip_prefix(*prefix).and_then(|rest| rest.strip_prefix('-')).is_some_and(is_date)
+        })
+        .map(|(_, label, retires, replacement, replacement_label)| ModelRetirement {
+            model: model.to_string(),
+            label: label.to_string(),
+            retires: retires.to_string(),
+            replacement: replacement.to_string(),
+            replacement_label: replacement_label.to_string(),
+        })
+}
+
+/// The retiring models among `models`, each id once, in order.
+pub fn model_retirements(models: &[String]) -> Vec<ModelRetirement> {
+    let mut out: Vec<ModelRetirement> = Vec::new();
+    for m in models {
+        if out.iter().any(|r| r.model == *m) {
+            continue;
+        }
+        if let Some(r) = model_retirement(m) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// The 1-hour cache-write price per million tokens. Anthropic's pricing page
@@ -419,15 +508,24 @@ pub fn catalog() -> Option<Arc<crate::provider_router::ProviderRouter>> {
 /// the user deliberately priced at zero). A `provider/model` id whose prefix
 /// names a **local** catalog provider is free even when the model itself is
 /// not listed. Then the builtin table; `None` means genuinely unknown.
+///
+/// A catalog entry with a `$0` cache-write price but a non-zero input price
+/// (a user-added model: Settings → Models saves `cacheCreationCostPerM: 0`)
+/// prices its cache writes at the input rate, the way OpenAI-compatible
+/// usage was billed before cache writes were split out of the prompt total.
+/// A `$0` write column there means "not set", not "free"; an explicitly free
+/// model has a `$0` input price too and stays free. Every builtin catalog
+/// entry carries an explicit write price, so builtins are unaffected.
 pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model: &str) -> Option<ModelPrices> {
     if let Some(router) = router {
         if let Some((_, mi)) = router.find_model(model) {
+            let write_per_m = effective_write_per_m(mi.input_cost_per_m, mi.cache_creation_cost_per_m);
             return Some(ModelPrices {
                 input_per_m: mi.input_cost_per_m,
                 output_per_m: mi.output_cost_per_m,
                 cache_read_per_m: mi.cache_read_cost_per_m,
-                cache_creation_per_m: mi.cache_creation_cost_per_m,
-                cache_creation_1h_per_m: one_hour_write_per_m(&mi.id, mi.input_cost_per_m, mi.cache_creation_cost_per_m),
+                cache_creation_per_m: write_per_m,
+                cache_creation_1h_per_m: one_hour_write_per_m(&mi.id, mi.input_cost_per_m, write_per_m),
             });
         }
         if router.provider_for_prefix(model).is_some_and(|p| p.local) {
@@ -435,6 +533,16 @@ pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model:
         }
     }
     builtin_prices(model)
+}
+
+/// A catalog cache-write price, with an unset (`$0`) column on a paid model
+/// falling back to the input price (see [`prices_in`]).
+pub fn effective_write_per_m(input_per_m: f64, cache_creation_per_m: f64) -> f64 {
+    if cache_creation_per_m == 0.0 && input_per_m > 0.0 {
+        input_per_m
+    } else {
+        cache_creation_per_m
+    }
 }
 
 /// Resolve a model's prices, catalog-first (see [`prices_in`]). `None` means
@@ -450,30 +558,52 @@ pub fn is_priced(model: &str) -> bool {
     prices_for(model).is_some()
 }
 
-/// Per-request price tiers: `(prompt-token threshold, multiplier)`. Above the
-/// threshold — prompt = input + cache reads + cache writes of ONE request —
-/// every column costs `multiplier`× the base price (official pricing,
-/// 2026-10-29: Haiku 5.5 prompts over 100K tokens cost 5× — 0.50 / 0.625 /
-/// 0.05 / 2.50). Applied as a multiplier so a user-edited base price scales.
-fn long_prompt_tier(model: &str) -> Option<(u64, f64)> {
-    match normalize_model_id(model).as_str() {
-        "claude-haiku-5-5" => Some((100_000, 5.0)),
-        _ => None,
-    }
+/// A per-request price tier: above `threshold` prompt tokens — input + cache
+/// reads + cache writes of ONE request — each column costs its multiplier ×
+/// the base price. Multipliers, so a user-edited base price scales.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LongPromptTier {
+    pub threshold: u64,
+    pub input: f64,
+    pub cache_read: f64,
+    /// Both write columns (5-minute and 1-hour).
+    pub cache_write: f64,
+    pub output: f64,
+}
+
+/// The long-prompt tier of `model`, if it has one.
+///
+/// - Haiku 5.5 (official pricing, 2026-10-29): prompts over 100K tokens cost
+///   5× on every column — 0.50 / 0.625 / 0.05 / 2.50.
+/// - GPT-6 (OpenAI's API pricing page, fetched 2026-11-17): "Long context:
+///   >272K input tokens" costs 2× input, cached input and cache writes, 1.5×
+///   output — input / write / hit / output: GPT-6.1 Terra 2.00 / 2.50 / 0.10
+///   / 7.50, GPT-6.2 Astra 16 / 20 / 0.80 / 60.
+///   OpenAI counts cached input and cache writes as input tokens, so the
+///   prompt total here matches its threshold.
+pub fn long_prompt_tier(model: &str) -> Option<LongPromptTier> {
+    // (threshold, input, cache hit, cache write, output) multipliers.
+    let (threshold, input, cache_read, cache_write, output) = match normalize_model_id(model).as_str() {
+        "claude-haiku-5-5" => (100_000, 5.0, 5.0, 5.0, 5.0),
+        "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6.1-terra" | "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol"
+        | "gpt-6-luna" => (272_000, 2.0, 2.0, 2.0, 1.5),
+        _ => return None,
+    };
+    Some(LongPromptTier { threshold, input, cache_read, cache_write, output })
 }
 
 /// The prices that apply to ONE request of `prompt_tokens` (input + cache
 /// read + cache write). Only per-request callers use this; aggregated usage
-/// (a DIRECT stage, a sub-agent attempt) keeps the base tier, since the
-/// size of each request inside the aggregate is unknown.
+/// (a Codex turn total) keeps the base tier, since the size of each request
+/// inside the aggregate is unknown.
 pub fn request_prices(model: &str, base: ModelPrices, prompt_tokens: u64) -> ModelPrices {
     match long_prompt_tier(model) {
-        Some((threshold, k)) if prompt_tokens > threshold => ModelPrices {
-            input_per_m: base.input_per_m * k,
-            output_per_m: base.output_per_m * k,
-            cache_read_per_m: base.cache_read_per_m * k,
-            cache_creation_per_m: base.cache_creation_per_m * k,
-            cache_creation_1h_per_m: base.cache_creation_1h_per_m * k,
+        Some(t) if prompt_tokens > t.threshold => ModelPrices {
+            input_per_m: base.input_per_m * t.input,
+            output_per_m: base.output_per_m * t.output,
+            cache_read_per_m: base.cache_read_per_m * t.cache_read,
+            cache_creation_per_m: base.cache_creation_per_m * t.cache_write,
+            cache_creation_1h_per_m: base.cache_creation_1h_per_m * t.cache_write,
         },
         _ => base,
     }
@@ -594,8 +724,9 @@ pub fn ledger_cost_basis(model: &str, cost_usd: f64, tokens: i64) -> &'static st
 }
 
 /// Canonical cost for a usage tuple, via [`prices_for`], at the base tier
-/// (safe for aggregated usage). An unpriced model yields `0.0` — callers
-/// that care about the distinction consult [`prices_for`] directly.
+/// (for aggregated usage; one request's usage takes [`request_cost_for`]).
+/// An unpriced model yields `0.0` — callers that care about the distinction
+/// consult [`prices_for`] directly.
 pub fn cost_for(
     model: &str,
     input: u64,
@@ -611,6 +742,23 @@ pub fn cost_for_split(model: &str, input: u64, output: u64, cache_read: u64, cac
     prices_for(model)
         .map(|p| p.cost_split(input, output, cache_read, cache_creation, cache_creation_1h))
         .unwrap_or(0.0)
+}
+
+/// A dollar amount the way the frontend's `formatUsd` shows it: two decimals,
+/// thousands grouped ("$1,234.50", "-$3.00"), for budget messages the app
+/// shows verbatim.
+pub fn format_usd(n: f64) -> String {
+    let fixed = format!("{:.2}", n.abs());
+    let (int, frac) = fixed.split_once('.').unwrap_or((&fixed, "00"));
+    let mut grouped = String::with_capacity(int.len() + int.len() / 3);
+    for (i, d) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(d);
+    }
+    let sign = if n < 0.0 && fixed != "0.00" { "-" } else { "" };
+    format!("{sign}${grouped}.{frac}")
 }
 
 // ─── Engine ───────────────────────────────────────────────────────────
@@ -637,8 +785,9 @@ impl TokenEngine {
     /// belongs to and whether the director or a sub-agent
     /// (`subagent:<call id>`) spent it.
     ///
-    /// The event may aggregate several requests (a sub-agent attempt), so a
-    /// $0 event is priced at the base tier; use
+    /// The event may aggregate several requests (a sub-agent attempt, which
+    /// brings its own per-request cost), so a $0 event is priced at the base
+    /// tier; use
     /// [`record_request_in_thread`](Self::record_request_in_thread) for ONE
     /// provider response.
     pub fn record_in_thread(
@@ -1186,5 +1335,62 @@ mod pty_scan_tests {
     fn summary_scan_needs_the_word_total() {
         assert!(scan_pty_output("s", b"\x1b[2Gcost:\x1b[8G$1.00").is_none());
         assert!(scan_pty_output("s", b"\x1b[2GTotal\x1b[8Gcost:\x1b[24G$1.00").is_some());
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+
+    #[test]
+    fn every_retirement_is_a_normalized_id_a_date_and_a_priced_replacement() {
+        for (prefix, label, retires, replacement, replacement_label) in MODEL_RETIREMENTS {
+            assert_eq!(normalize_model_id(prefix), *prefix, "{prefix} is normalized");
+            assert!(chrono::NaiveDate::parse_from_str(retires, "%Y-%m-%d").is_ok(), "{retires} is a date");
+            assert!(builtin_prices(replacement).is_some(), "{replacement} is priced");
+            assert!(model_retirement(replacement).is_none(), "{replacement} doesn't retire itself");
+            assert!(!label.is_empty() && !replacement_label.is_empty());
+        }
+    }
+
+    #[test]
+    fn sonnet_4_5_retires_by_prefix_dated_id_included() {
+        let r = model_retirement("claude-sonnet-4-5-20250929").expect("the dated id matches the prefix");
+        assert_eq!(r.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(r.label, "Sonnet 4.5");
+        assert_eq!(r.retires, "2026-11-30");
+        assert_eq!(r.replacement, "claude-sonnet-5-5");
+        assert_eq!(r.replacement_label, "Sonnet 5.5");
+        assert!(model_retirement("claude-sonnet-4-5").is_some());
+        assert!(model_retirement(" claude-sonnet-4-5 ").is_some(), "the raw id is trimmed");
+        assert!(model_retirement("claude-sonnet-4-6").is_none());
+        assert!(model_retirement("claude-sonnet-4-50").is_none(), "a prefix only ends at a dash");
+        assert!(model_retirement("claude-sonnet-5-5").is_none());
+        assert!(model_retirement("claude-sonnet-4-5-latest").is_none(), "only a dated snapshot follows the dash");
+    }
+
+    #[test]
+    fn partner_platform_ids_never_retire_on_the_first_party_date() {
+        // Bedrock and Vertex set their own schedules, and Switch would rewrite
+        // these to a bare first-party id, changing the provider.
+        for id in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4-5@20250929",
+        ] {
+            assert!(model_retirement(id).is_none(), "{id}");
+        }
+        assert!(model_retirements(&["claude-sonnet-4-5@20250929".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn model_retirements_lists_each_retiring_id_once() {
+        let models: Vec<String> = ["claude-sonnet-4-5", "claude-opus-5-5", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ids: Vec<String> = model_retirements(&models).into_iter().map(|r| r.model).collect();
+        assert_eq!(ids, vec!["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"]);
+        assert!(model_retirements(&[]).is_empty());
     }
 }

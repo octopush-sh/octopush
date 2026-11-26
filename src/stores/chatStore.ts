@@ -9,6 +9,8 @@ import { isBudgetExceeded } from "../lib/budgetError";
 import { useAttentionStore } from "./attentionStore";
 import { focus } from "../lib/focus";
 import { deriveChatTitle } from "../lib/chatTitle";
+import { helperModelNow } from "../lib/helperModels";
+import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
 
 export interface ToolExecution {
   toolName: string;
@@ -127,6 +129,18 @@ export interface PendingApproval {
   threadId: string;
   command: string;
   reason: string;
+  /** The secret guard asks (#819): no "don't ask again" on this card. */
+  secret?: boolean;
+  /** The command also stages, so the scan read uncommitted changes. */
+  coversUncommitted?: boolean;
+}
+
+/** A `$`-direct command the secret guard refused (#819): the confirm shows
+ *  what it found, and "Run regardless" re-runs it with the fingerprint. */
+export interface ShellSecretRefusal {
+  workspacePath: string;
+  command: string;
+  refusal: SecretRefusal;
 }
 
 /** A writing sub-agent that ran out of turns mid-work; the director's turn
@@ -246,6 +260,14 @@ interface MessageUpdatedEvent {
   content: string;
 }
 
+/** The highest message id in a list (0 for none): the mark a running turn's
+ *  rows are newer than. */
+function maxMessageId(msgs: ChatMessage[]): number {
+  let max = 0;
+  for (const m of msgs) if (m.id > max) max = m.id;
+  return max;
+}
+
 // Stable empty values returned by selectors when a workspace has no data.
 // Critical: returning a NEW empty array per call would make Zustand selectors
 // invalidate every render → infinite re-render loop (caught in Phase 4 bug fix).
@@ -299,6 +321,13 @@ interface ChatState {
   messagesByWs: Record<string, ChatMessage[]>;
   /** Streaming flag per workspace. `true` only while THAT workspace's agentic loop runs. */
   streamingByWs: Record<string, boolean>;
+  /** The highest message id on screen when the running turn started, per
+   *  workspace. The turn's own rows (its user row, narration, tool calls)
+   *  are saved after it, so they are the ones above it: Talk's work blocks
+   *  use it to tell the turn in flight from the turns before it, even while
+   *  the backend hasn't saved the new user row yet. Survives a thread switch
+   *  (ids are global), so a running thread shown again still reads as live. */
+  streamSinceByWs: Record<string, number>;
   /** Partial assistant text being streamed per workspace. */
   streamBufferByWs: Record<string, string>;
   /** Last error per workspace. */
@@ -324,6 +353,10 @@ interface ChatState {
   /** Pending image attachments per workspace — sent with the next turn, then
    *  cleared. */
   attachmentsByWs: Record<string, Attachment[]>;
+  /** Text another surface hands to a workspace's Talk draft (Review's "Ask
+   *  Talk about this" queues `@path#L5-10 `); the composer appends it and
+   *  takes it. */
+  draftInsertByWs: Record<string, string>;
   /** Working directory of each thread's TALK shell (keyed by threadId), updated
    *  after every `$`-direct command so the composer can show a cwd badge once
    *  the user has `cd`'d away from the workspace root. */
@@ -342,6 +375,8 @@ interface ChatState {
   /** Pending dangerous-command approval requests per workspace (inline cards).
    *  Present between chat://approval-request and approval-resolved. */
   pendingApprovalsByWs: Record<string, PendingApproval[]>;
+  /** A `$` command the secret guard refused, per workspace (the confirm). */
+  shellSecretByWs: Record<string, ShellSecretRefusal | null>;
   /** Turn-limit cards per workspace (see `PendingCap`). Present between
    *  chat://subagent-cap and subagent-cap-resolved. */
   pendingCapsByWs: Record<string, PendingCap[]>;
@@ -358,6 +393,8 @@ interface ChatState {
   continuingCalls: Record<string, boolean>;
   /** The last continuation error per call id (shown in the journal). */
   continueErrorByCall: Record<string, string>;
+  /** Text the composer takes once as its draft (a fork's turn), per workspace. */
+  composerSeedByWs: Record<string, string | null>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -395,13 +432,23 @@ interface ChatState {
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
+  /** Resolves when the whole turn has ENDED (the IPC runs the agentic loop
+   *  inline, which can take minutes): `true` when it ran through, `false`
+   *  when it didn't (the budget cap, no thread, or an IPC error, before or
+   *  during the turn — each shown via `errorByWs`). `onDispatched` is called
+   *  much earlier, once: the pre-flight checks passed (budget, a thread) and
+   *  the turn has started; a refusal before that never calls it.
+   *  `attachments: false` sends without the staged attachments and leaves
+   *  them staged (Review's "Send to the agent", #956). */
   send: (
     workspaceId: string,
     workspacePath: string,
     content: string,
     systemPrompt?: string,
-  ) => Promise<void>;
-  /** Internal: dispatch one agentic turn (shared by send / regenerate). */
+    opts?: { attachments?: boolean; onDispatched?: () => void },
+  ) => Promise<boolean>;
+  /** Internal: dispatch one agentic turn (shared by send / regenerate).
+   *  Resolves `false` when the IPC failed. */
   runTurn: (
     workspaceId: string,
     workspacePath: string,
@@ -414,7 +461,7 @@ interface ChatState {
       /** The turn's budget override was consumed → tell the backend to skip its gate. */
       overrideBudget?: boolean;
     },
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   /** Internal: budget-gate, truncate from a cutoff message id, then dispatch.
    *  Shared by regenerate / editAndResend. */
   truncateAndRun: (
@@ -453,7 +500,11 @@ interface ChatState {
     workspaceId: string,
     workspacePath: string,
     command: string,
+    allowFindings?: string,
   ) => Promise<void>;
+  /** Answer the secret guard's confirm for a refused `$` command: leave it
+   *  out (close), or run it regardless for exactly what was shown. */
+  resolveShellSecret: (workspaceId: string, runRegardless: boolean) => Promise<void>;
   /** SIGINT (Ctrl-C) the active thread's live `$`-direct process. */
   stopShellProcess: (workspaceId: string) => void;
   /** Load the workspace's recent `$`-command history into the cache. */
@@ -470,6 +521,10 @@ interface ChatState {
   addAttachment: (workspaceId: string, attachment: Attachment) => void;
   removeAttachment: (workspaceId: string, index: number) => void;
   clearAttachments: (workspaceId: string) => void;
+  /** Queue text for the workspace's Talk draft (several queue in order). */
+  queueDraftInsert: (workspaceId: string, text: string) => void;
+  /** Take (and clear) the text queued for the workspace's Talk draft. */
+  takeDraftInsert: (workspaceId: string) => string | null;
   /** Stop the in-flight turn for this workspace (best-effort; backend halts
    *  before its next iteration/tool and emits the done event). */
   stop: (workspaceId: string) => void;
@@ -497,6 +552,17 @@ interface ChatState {
   /** Pin/unpin a conversation (pinned sort to the top). */
   pinThread: (workspaceId: string, threadId: string, pinned: boolean) => Promise<void>;
   deleteThread: (workspaceId: string, threadId: string) => Promise<void>;
+  /** Re-read the shown thread's rows in place (after a rewind left its note). */
+  refreshThread: (workspaceId: string) => Promise<void>;
+  /** Fork from a user turn (#958): open a new thread holding the history
+   *  before it, with the turn's text as the composer's draft. */
+  forkThread: (workspaceId: string, threadId: string, messageId: number) => Promise<void>;
+  /** Hand the composer its seeded draft once (null when there is none). */
+  takeComposerSeed: (workspaceId: string) => string | null;
+  /** Give a workspace's composer a draft to take (after any seed it hasn't
+   *  taken yet): a Talk message the secret guard held when its workspace
+   *  was left. */
+  seedComposer: (workspaceId: string, draft: string) => void;
 }
 
 /** A turn parked on a turn-limit card outlives a webview reload; when a
@@ -808,6 +874,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     callId: string;
     command: string;
     reason: string;
+    secret?: boolean;
+    coversUncommitted?: boolean;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
@@ -819,7 +887,13 @@ export const useChatStore = create<ChatState>((set, get) => {
           ...s.pendingApprovalsByWs,
           [p.workspaceId]: [
             ...cur,
-            { callId: p.callId, threadId: p.threadId, command: p.command, reason: p.reason },
+            {
+              callId: p.callId,
+              threadId: p.threadId,
+              command: p.command,
+              reason: p.reason,
+              ...(p.secret ? { secret: true, coversUncommitted: p.coversUncommitted === true } : {}),
+            },
           ],
         },
       };
@@ -928,6 +1002,7 @@ export const useChatStore = create<ChatState>((set, get) => {
   return {
     messagesByWs: {},
     streamingByWs: {},
+    streamSinceByWs: {},
     streamBufferByWs: {},
     stopRequestedByWs: {},
     errorByWs: {},
@@ -937,18 +1012,21 @@ export const useChatStore = create<ChatState>((set, get) => {
     streamingThreadByWs: {},
     skillNamesByWs: {},
     attachmentsByWs: {},
+    draftInsertByWs: {},
     shellCwdByThread: {},
     shellCwdAbsByThread: {},
     liveProcessByThread: {},
     liveOutputByCallId: {},
     shellHistoryByWs: {},
     pendingApprovalsByWs: {},
+    shellSecretByWs: {},
     agentLogByCall: {},
     crewFocusByWs: {},
     pendingCapsByWs: {},
     continuingCalls: {},
     continueErrorByCall: {},
-    model: "claude-sonnet-4-6",
+    composerSeedByWs: {},
+    model: helperModelNow("review"),
     effort: "standard",
 
     getMessages: (workspaceId) => get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES,
@@ -1021,14 +1099,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    send: async (workspaceId, workspacePath, content, systemPrompt) => {
+    send: async (workspaceId, workspacePath, content, systemPrompt, sendOpts) => {
       // ── Budget hard-stop (client fast-path; the backend gate is authoritative) ──
       const gate = budgetGate(workspaceId);
       if (gate.blocked) {
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG },
         }));
-        return;
+        return false;
       }
 
       // Guarantee a real thread BEFORE persisting, so a fast first-send during
@@ -1038,7 +1116,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: "Could not start a conversation." },
         }));
-        return;
+        return false;
       }
 
       // The first message names the thread: persist a derived title if it's
@@ -1056,17 +1134,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
 
       // Snapshot + clear pending attachments — they ride along on this turn only.
-      const attachments = get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
+      const attachments =
+        sendOpts?.attachments === false
+          ? EMPTY_ATTACHMENTS
+          : get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
       if (attachments.length > 0) {
         set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } }));
       }
 
-      await get().runTurn(workspaceId, workspacePath, threadId, {
+      // `runTurn` runs up to its IPC call before it yields: by the time it
+      // hands back its promise the turn is marked as streaming and on its way.
+      const turn = get().runTurn(workspaceId, workspacePath, threadId, {
         userMessage: content,
         systemPrompt,
         attachments,
         overrideBudget: gate.overrode,
       });
+      sendOpts?.onDispatched?.();
+      return turn;
     },
 
     // Core turn dispatch shared by send / regenerate. Sets the streaming flags,
@@ -1074,6 +1159,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     runTurn: async (workspaceId, workspacePath, threadId, opts) => {
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
+        // Read after regenerate/editAndResend truncated the view, so the rows
+        // they cut can't count as the previous turn's.
+        streamSinceByWs: {
+          ...s.streamSinceByWs,
+          [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
+        },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
@@ -1129,7 +1220,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (!(last && last.role === "error" && last.content === errText)) {
           set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: errText } }));
         }
+        return false;
       }
+      return true;
     },
 
     // Shared core for regenerate / editAndResend: budget-gate, truncate from the
@@ -1204,7 +1297,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
     },
 
-    runShell: async (workspaceId, workspacePath, command) => {
+    runShell: async (workspaceId, workspacePath, command, allowFindings) => {
       const threadId = await get().ensureThread(workspaceId);
       if (!threadId) {
         set((s) => ({
@@ -1234,6 +1327,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       // `RUN` card are the "process running" indicators while it streams.
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
+        streamSinceByWs: {
+          ...s.streamSinceByWs,
+          [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
+        },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
         stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
@@ -1246,6 +1343,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           threadId,
           workspacePath,
           command,
+          ...(allowFindings ? { allowFindings } : {}),
         });
         // Update the badge from the backend-computed label (the single source).
         // Only when a command actually RAN in the shell (result.cwd non-empty):
@@ -1260,7 +1358,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         // Refresh the recall history so the just-run command surfaces.
         void get().loadShellHistory(workspaceId);
       } catch (e) {
-        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
+        // The secret guard refused it before it ran: ask, don't error.
+        const refusal = secretRefusal(e);
+        if (refusal) {
+          set((s) => ({
+            shellSecretByWs: { ...s.shellSecretByWs, [workspaceId]: { workspacePath, command, refusal } },
+          }));
+        } else {
+          set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
+        }
       } finally {
         // Only clear if THIS run still owns the streaming slot — a normal LLM
         // turn that started on the same workspace meanwhile must not be clobbered.
@@ -1273,6 +1379,14 @@ export const useChatStore = create<ChatState>((set, get) => {
             : {},
         );
       }
+    },
+
+    resolveShellSecret: async (workspaceId, runRegardless) => {
+      const pending = get().shellSecretByWs[workspaceId];
+      set((s) => ({ shellSecretByWs: { ...s.shellSecretByWs, [workspaceId]: null } }));
+      if (!pending || !runRegardless) return;
+      // The core rescans: anything new since the confirm asks again.
+      await get().runShell(workspaceId, pending.workspacePath, pending.command, pending.refusal.fingerprint);
     },
 
     stopShellProcess: (workspaceId) => {
@@ -1325,6 +1439,22 @@ export const useChatStore = create<ChatState>((set, get) => {
     setEffort: (effort) => set({ effort }),
     setSkillNames: (workspaceId, names) =>
       set((s) => ({ skillNamesByWs: { ...s.skillNamesByWs, [workspaceId]: names } })),
+    queueDraftInsert: (workspaceId, text) =>
+      set((s) => ({
+        draftInsertByWs: {
+          ...s.draftInsertByWs,
+          [workspaceId]: (s.draftInsertByWs[workspaceId] ?? "") + text,
+        },
+      })),
+    takeDraftInsert: (workspaceId) => {
+      const text = get().draftInsertByWs[workspaceId];
+      if (!text) return null;
+      set((s) => {
+        const { [workspaceId]: _taken, ...rest } = s.draftInsertByWs;
+        return { draftInsertByWs: rest };
+      });
+      return text;
+    },
     addAttachment: (workspaceId, attachment) =>
       set((s) => ({
         attachmentsByWs: {
@@ -1552,5 +1682,47 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
       }
     },
+
+    refreshThread: async (workspaceId) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      if (!threadId) return;
+      const messages = await ipc.listChatMessages(threadId);
+      if (get().activeThreadByWs[workspaceId] !== threadId) return;
+      set((s) => ({
+        messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
+      }));
+    },
+
+    forkThread: async (workspaceId, threadId, messageId) => {
+      const { thread, draft } = await ipc.forkChatThread(threadId, messageId);
+      set((s) => ({
+        threadsByWs: {
+          ...s.threadsByWs,
+          [workspaceId]: [thread, ...(s.threadsByWs[workspaceId] ?? EMPTY_THREADS)],
+        },
+        // A seed the composer hasn't taken yet is kept: the new one goes after it.
+        composerSeedByWs: {
+          ...s.composerSeedByWs,
+          [workspaceId]: s.composerSeedByWs[workspaceId] ? `${s.composerSeedByWs[workspaceId]}\n\n${draft}` : draft,
+        },
+      }));
+      await get().selectThread(workspaceId, thread.id);
+    },
+
+    takeComposerSeed: (workspaceId) => {
+      const seed = get().composerSeedByWs[workspaceId] ?? null;
+      if (seed !== null) {
+        set((s) => ({ composerSeedByWs: { ...s.composerSeedByWs, [workspaceId]: null } }));
+      }
+      return seed;
+    },
+
+    seedComposer: (workspaceId, draft) =>
+      set((s) => ({
+        composerSeedByWs: {
+          ...s.composerSeedByWs,
+          [workspaceId]: s.composerSeedByWs[workspaceId] ? `${s.composerSeedByWs[workspaceId]}\n\n${draft}` : draft,
+        },
+      })),
   };
 });

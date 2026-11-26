@@ -2,7 +2,7 @@
 //
 // The daemon reports the foreground process's argv summary on every busy
 // transition (`pty://foreground`'s `command`); this module turns that string
-// into a role, which the rail, the switcher and the Companion render as a
+// into a role, which the session line, the pane caption and the switcher render as a
 // single icon. Kept pure and store-free so the vocabulary is unit-testable and
 // has exactly one definition.
 //
@@ -84,6 +84,27 @@ export function roleForCommand(command: string | null | undefined): SessionRole 
   if (!command) return "shell";
   const tokens = command.trim().toLowerCase().split(/\s+/).filter(Boolean);
   return classify(tokens, 0);
+}
+
+/**
+ * Which agent CLI a foreground command is (`claude`, `codex`, `aider`, …), or
+ * null when it isn't one. `roleForCommand` answers "agent" for all of them;
+ * what Octopush knows about a session's context and spend it knows only for
+ * Claude Code, so the Companion asks this before it asks for usage. Looks
+ * through the same delegators as the role (`npx claude`, `env X=1 claude`).
+ */
+export function agentCliForCommand(command: string | null | undefined): string | null {
+  if (!command) return null;
+  let tokens = command.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  for (let depth = 0; depth < 4; depth++) {
+    const raw = tokens[0];
+    if (!raw) return null;
+    const bin = (raw.split("/").pop() ?? raw).replace(/\.(exe|cmd|bat)$/, "");
+    if (AGENTS.has(bin)) return bin;
+    if (!DELEGATORS.has(bin)) return null;
+    tokens = tokens.slice(1).filter((a) => !a.startsWith("-") && !/^[\w.]+=/.test(a));
+  }
+  return null;
 }
 
 function classify(tokens: string[], depth: number): SessionRole {

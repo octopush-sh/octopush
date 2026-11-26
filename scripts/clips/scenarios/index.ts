@@ -6,6 +6,12 @@ import { empty } from "./empty";
 import { stress } from "./stress";
 import { runTwoSessions } from "./run-two-sessions";
 import { runFourSessions } from "./run-four-sessions";
+import { railGroups } from "./rail-groups";
+import { railProjectGroups } from "./rail-project-groups";
+import { railGroupsEverywhere } from "./rail-groups-everywhere";
+import { directRunning } from "./direct-running";
+import { talkWork } from "./talk-work";
+import { talkMcp } from "./talk-mcp";
 
 export const SCENARIOS: Record<string, Scenario> = {
   default: defaultScenario,
@@ -13,4 +19,10 @@ export const SCENARIOS: Record<string, Scenario> = {
   stress,
   "run-two-sessions": runTwoSessions,
   "run-four-sessions": runFourSessions,
+  "rail-groups": railGroups,
+  "rail-project-groups": railProjectGroups,
+  "rail-groups-everywhere": railGroupsEverywhere,
+  "direct-running": directRunning,
+  "talk-work": talkWork,
+  "talk-mcp": talkMcp,
 };

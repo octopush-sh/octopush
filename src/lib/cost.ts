@@ -35,6 +35,21 @@ export function formatTokenCount(n: number): string {
   return `${n}`;
 }
 
+/**
+ * The one context-window formatter (#853): every surface that shows context
+ * size or usage — the Talk header tail, the Companion's context meter, the
+ * model pickers — goes through this, so a 1M window reads "1M" everywhere and
+ * never "1000k". 4_200 → "4k", 200_000 → "200k", 1_000_000 → "1M",
+ * 1_500_000 → "1.5M", 999_600 → "1M" (rounding never yields "1000k").
+ */
+export function formatContextTokens(n: number): string {
+  if (!Number.isFinite(n) || n < 1000) return String(Math.max(0, Math.round(Number.isFinite(n) ? n : 0)));
+  const k = Math.round(n / 1000);
+  if (k < 1000) return `${k}k`;
+  const m = Math.round(n / 100_000) / 10;
+  return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+}
+
 /** Compact token count: "12k tokens" or "850 tokens". */
 export function formatTokens(n: number): string {
   return `${formatTokenCount(n)} tokens`;
@@ -87,6 +102,26 @@ export function unpricedTitle(models: string[]): string {
 }
 
 /**
+ * Tooltip for a stage with usage whose cost is unknown: Codex stopped before
+ * reporting its usage, or a stopped Claude stage streamed usage Octopush
+ * can't price (a subagent model or fast mode with no price).
+ */
+export const USAGE_UNREPORTED_TITLE =
+  "Codex stopped before reporting usage, or a stopped stage streamed usage with no price (a subagent model or fast mode), so part of this stage's cost is unknown — that part is not counted as spend or as savings.";
+
+/** The run-level tooltip for `n` stages with usage not reported. */
+export function usageUnreportedTitle(n: number): string {
+  if (n === 1) return USAGE_UNREPORTED_TITLE;
+  return `Codex stopped before reporting usage, or a stopped stage streamed usage with no price (a subagent model or fast mode), in ${n} stages, so part of their cost is unknown — that part is not counted as spend or as savings.`;
+}
+
+/** The ledger strip's note that part of the spend is unknown. "" when none is. */
+export function usageUnreportedNote(n: number): string {
+  if (n <= 0) return "";
+  return `${n === 1 ? "1 stage" : `${n} stages`} usage not reported`;
+}
+
+/**
  * The cost cell of one model in a usage table. A model whose calls are all
  * unpriced reads "unpriced", never "$0.00"; a model with some unpriced
  * calls keeps its priced figure and says so in the tooltip.
@@ -111,10 +146,22 @@ export function budgetUnenforceableNote(unpricedStages: number): string {
   return `budget not enforceable: ${unpricedStages === 1 ? "1 stage" : `${unpricedStages} stages`} unpriced`;
 }
 
+const USD = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+/** The one currency formatter: "$0.41", "$85,393.45" — grouped, two decimals. */
+export function formatUsd(n: number): string {
+  return USD.format(n);
+}
+
 /** "$0.40"; a positive amount under a cent reads "<$0.01", never "$0.00". */
 export function formatEstimateUsd(n: number): string {
   if (n > 0 && n < 0.005) return "<$0.01";
-  return `$${n.toFixed(2)}`;
+  return formatUsd(n);
 }
 
 /** True when the estimate has stages and none of them is priced. */

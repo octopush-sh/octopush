@@ -6,11 +6,14 @@ pub mod billing;
 pub mod chat_agents;
 pub mod chat_engine;
 pub mod chat_history;
+pub mod collisions;
 pub mod claude_hooks;
 pub mod claude_login;
 pub mod claude_plan;
+pub mod codex_trust;
 mod commands;
 pub mod context_guard;
+pub mod crew;
 // `db` and `error` are public so the `octopush-mcp` binary (a sibling bin in
 // this crate) can drive the data layer directly. The MCP server is a thin,
 // read-and-author surface over the same SQLite store the desktop app uses.
@@ -19,24 +22,30 @@ pub mod entitlement;
 pub mod entitlement_token;
 pub mod error;
 mod file_open;
+mod fleet_status;
 pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
 pub mod mcp;
+pub mod notify_elsewhere;
 pub mod provider_router;
 pub mod providers;
 pub mod pty_client;
 pub mod pty_daemon;
 mod pty_manager;
+pub mod repo_hooks;
 mod session;
 pub mod session_recap;
+pub mod secret_scan;
 pub mod settings;
 pub mod skills;
 mod state;
 pub mod sync;
+pub mod talk_checkpoints;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
+pub mod worktree_share;
 pub mod mission;
 pub mod template;
 pub mod theme;
@@ -52,11 +61,16 @@ pub mod routines;
 pub mod git_lock;
 pub mod mcp_setup;
 pub mod readiness;
+pub mod request_context;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod claude_code_contract;
+#[cfg(test)]
+mod codex_contract;
 
 use state::AppState;
 use tauri::Manager;
@@ -210,9 +224,23 @@ pub fn run() {
             commands::list_closed_projects,
             commands::reopen_project,
             commands::delete_project,
+            // Rail groups
+            commands::list_groups,
+            commands::create_group,
+            commands::rename_group,
+            commands::set_group_tint,
+            commands::set_group_order,
+            commands::delete_group,
+            commands::set_item_group,
+            commands::set_items_group,
+            commands::set_workspace_prerequisite,
+            commands::clear_workspace_prerequisite,
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,
+            commands::conductor_setup_script,
+            commands::share_with_missions,
+            commands::set_share_with_missions,
             commands::list_workspaces,
             commands::delete_workspace,
             commands::archive_workspace,
@@ -232,7 +260,10 @@ pub fn run() {
             commands::get_git_status,
             commands::list_branches,
             commands::workspaces_git_summary,
+            commands::project_collisions,
+            commands::workspace_diff_size,
             commands::get_git_diff,
+            commands::get_committed_diff,
             // Chat
             commands::send_chat_message,
             commands::truncate_chat_after,
@@ -249,19 +280,35 @@ pub fn run() {
             commands::rename_chat_thread,
             commands::set_thread_pinned,
             commands::delete_chat_thread,
+            commands::list_talk_checkpoints,
+            commands::preview_talk_rewind,
+            commands::rewind_talk_files,
+            commands::undo_talk_rewind,
+            commands::fork_chat_thread,
             commands::list_skills,
             commands::list_subagent_types,
             commands::read_attachment,
             commands::list_mcp_tools,
-            commands::list_mcp_servers,
+            commands::list_mcp_server_status,
+            commands::get_thread_mcp_disabled,
+            commands::set_thread_mcp_server,
             commands::get_mcp_config,
             commands::save_mcp_config,
             commands::test_mcp_server,
+            commands::reconnect_mcp_server,
+            commands::clear_mcp_sign_in,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,
             commands::save_pipeline,
             commands::delete_pipeline,
+            commands::export_crew,
+            commands::save_crew_file,
+            commands::read_crew_file,
+            commands::preview_crew,
+            commands::import_crew,
+            commands::list_repo_crews,
+            commands::read_repo_crew,
             commands::create_run,
             commands::start_run,
             commands::get_run,
@@ -271,6 +318,7 @@ pub fn run() {
             commands::resolve_checkpoint,
             commands::answer_blocker,
             commands::abort_run,
+            commands::cancel_plan_resume,
             commands::stop_stage,
             commands::request_run_pause,
             commands::update_run_stage,
@@ -301,12 +349,19 @@ pub fn run() {
             commands::refresh_pricing,
             commands::reprice_spend,
             commands::get_thread_cost,
+            commands::get_session_usage,
+            commands::get_request_context,
             commands::continue_subagent,
             commands::respond_subagent_cap,
             commands::pending_subagent_caps,
             // Settings
             commands::get_settings,
             commands::save_settings,
+            commands::get_notify_elsewhere,
+            commands::set_notify_elsewhere,
+            commands::notify_elsewhere_test,
+            commands::notify_elsewhere_preview,
+            commands::unreadable_settings_path,
             commands::save_git_credentials,
             // Provider catalog
             commands::save_providers,
@@ -315,6 +370,7 @@ pub fn run() {
             commands::list_terminals,
             commands::create_terminal,
             commands::rename_terminal,
+            commands::reorder_terminals,
             commands::delete_terminal,
             // PTY daemon
             commands::list_pty_sessions,
@@ -327,6 +383,7 @@ pub fn run() {
             // File I/O
             commands::read_file,
             commands::read_file_checked,
+            commands::read_file_lines,
             commands::write_file,
             commands::file_meta,
             // File edits (Review canvas)
@@ -342,6 +399,9 @@ pub fn run() {
             commands::unstage_file,
             commands::unstage_all_changes,
             commands::commit_changes,
+            commands::secret_scan_staged,
+            commands::secret_scan_branch,
+            commands::secret_scan_text,
             commands::get_staged_diff,
             commands::get_last_commit,
             commands::git_log,
@@ -376,7 +436,10 @@ pub fn run() {
             commands::create_tag,
             commands::list_tags,
             commands::find_pr_for_branch,
+            commands::pr_failed_check_logs,
             commands::open_prs_for_project,
+            commands::merged_workspaces,
+            commands::archive_merged_workspaces,
             commands::list_prs,
             commands::list_github_issues,
             commands::github_ship_readiness,
@@ -402,6 +465,11 @@ pub fn run() {
             commands::mcp_connection_status,
             commands::connect_claude_code,
             commands::claude_cli_version,
+            commands::claude_model_floor_note,
+            commands::claude_known_bad_note,
+            commands::codex_trust_note,
+            commands::repo_hooks_notice,
+            commands::model_retirements,
             commands::readiness_check,
             // Role commands
             commands::list_roles,
@@ -421,6 +489,7 @@ pub fn run() {
             commands::preview_routine_schedule,
             // Cross-machine run history (Pro-real Part B / B1)
             commands::get_sync_prefs,
+            commands::get_sync_status,
             commands::set_sync_pref,
             // Updater (channels + launch alert)
             commands::get_update_channel,
@@ -433,6 +502,7 @@ pub fn run() {
             commands::history_sync_pull,
             commands::history_sync_push_all,
             commands::history_run_detail,
+            commands::unpriced_models,
             commands::library_sync_push_all,
             commands::library_sync_pull,
             // Accounts (P1)
@@ -465,10 +535,19 @@ pub fn run() {
             // even while the Usage page is closed.
             {
                 let ingestor = std::sync::Arc::clone(&state.transcripts);
+                let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
                         let i = std::sync::Arc::clone(&ingestor);
-                        let _ = tauri::async_runtime::spawn_blocking(move || i.maybe_ingest()).await;
+                        let done = tauri::async_runtime::spawn_blocking(move || i.maybe_ingest()).await;
+                        // The ledger moved: cost readers (the mission Logbook)
+                        // re-read instead of waiting for their next edge.
+                        if let Ok(Some(s)) = done {
+                            if s.rows_inserted + s.rows_removed > 0 {
+                                use tauri::Emitter;
+                                let _ = handle.emit("octo://spend-ingested", ());
+                            }
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                 });
@@ -492,6 +571,20 @@ pub fn run() {
                     }
                 });
             }
+
+            // Read the login shell's env now (bounded, once per session), so
+            // the first Talk command, CLI stage or MCP server doesn't wait on it.
+            tauri::async_runtime::spawn_blocking(|| {
+                let _ = orchestrator::cli_runner::login_shell_env();
+            });
+
+            // Sandbox build caches nobody used for 30 days.
+            tauri::async_runtime::spawn_blocking(|| {
+                let n = orchestrator::sandbox::prune_build_caches(orchestrator::sandbox::BUILD_CACHE_MAX_AGE);
+                if n > 0 {
+                    tracing::info!(count = n, "pruned unused build caches");
+                }
+            });
 
             // Direct-mode orchestrator: seed builtin pipelines + register engine.
             {
@@ -521,6 +614,8 @@ pub fn run() {
                 // the same guarded launch path as a user's Begin.
                 std::sync::Arc::clone(&orch).spawn_routine_scheduler();
                 app.manage(orch);
+                // Runs still parked from the last session badge the Dock now.
+                fleet_status::refresh_later(app.handle());
             }
 
             // Signed entitlement token (#582): refresh it in the background so
@@ -533,14 +628,22 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing main while Quick Views are open hides it instead of
-            // destroying it, so Reopen / "Continue in the workspace" / a
-            // second launch can still bring it back.
+            // Closing main hides it instead of destroying it (always on macOS,
+            // elsewhere while Quick Views are open), so Reopen / "Continue in
+            // the workspace" / a second launch can still bring it back.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main"
-                    && !window.app_handle().state::<file_open::QuickViews>().is_empty()
+                    && file_open::hide_main_on_close(
+                        cfg!(target_os = "macos"),
+                        !window.app_handle().state::<file_open::QuickViews>().is_empty(),
+                    )
                 {
                     api.prevent_close();
+                    // Hiding a fullscreen window leaves macOS on an empty black
+                    // Space: leave fullscreen first.
+                    if window.is_fullscreen().unwrap_or(false) {
+                        let _ = window.set_fullscreen(false);
+                    }
                     let _ = window.hide();
                 }
                 return;

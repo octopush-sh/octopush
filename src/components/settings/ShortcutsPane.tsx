@@ -1,4 +1,6 @@
 // Settings → Shortcuts — a read-only reference of every keybinding.
+import { MODES, MODE_LABELS, MODE_SHORTCUTS } from "../../lib/modes";
+import { tourId } from "../../lib/tour/ids";
 import { PaneHeader, SectionLabel } from "./shared";
 
 export function ShortcutsPane() {
@@ -10,16 +12,21 @@ export function ShortcutsPane() {
         subtitle="A reference of every keybinding Octopush respects."
       />
 
-      <div className="max-w-[640px]">
+      <div>
         <ShortcutGroup title="Navigation">
           <Shortcut keys="⌘1 … ⌘9" desc="Switch to workspace N" />
-          <Shortcut keys="⌘⇧1" desc="Talk mode" />
-          <Shortcut keys="⌘⇧2" desc="Run mode" />
-          <Shortcut keys="⌘⇧3" desc="Review mode" />
-          <Shortcut keys="⌘⇧D" desc="Direct mode" />
+          {/* In switcher order, from the same table as its tooltips. */}
+          {MODES.map((m, i) => (
+            <Shortcut
+              key={m}
+              keys={MODE_SHORTCUTS[m]}
+              desc={`${MODE_LABELS[m]} mode`}
+              tour={i === 0 ? tourId("settings-shortcuts-modes") : undefined}
+            />
+          ))}
           <Shortcut keys="⌘⇧M" desc="Mission Control" />
           <Shortcut keys="⌘⇧L" desc="Logbook Room" />
-          <Shortcut keys="⌘\\" desc="Toggle companion" />
+          <Shortcut keys={"⌘\\"} desc="Toggle companion" />
         </ShortcutGroup>
 
         <ShortcutGroup title="Actions">
@@ -27,6 +34,13 @@ export function ShortcutsPane() {
           <Shortcut keys="⌘N" desc="New workspace" />
           <Shortcut keys="⌘," desc="Open Settings" />
           <Shortcut keys="⌘⇧T" desc="Open Settings · Usage" />
+        </ShortcutGroup>
+
+        <ShortcutGroup title="Rail">
+          <Shortcut keys="⌘⌥G" desc="Move the focused mission or project to a group" />
+          <Shortcut keys="⇧F10" desc="Open the focused row's menu" />
+          <Shortcut keys="⌘-click · ⇧-click" desc="Select several missions of one project" />
+          <Shortcut keys="Esc" desc="Clear the selection" />
         </ShortcutGroup>
 
         <ShortcutGroup title="Chat">
@@ -49,9 +63,9 @@ function ShortcutGroup({ title, children }: { title: string; children: React.Rea
   );
 }
 
-function Shortcut({ keys, desc }: { keys: string; desc: string }) {
+function Shortcut({ keys, desc, tour }: { keys: string; desc: string; tour?: string }) {
   return (
-    <li className="flex items-baseline justify-between px-4 py-2.5">
+    <li data-tour={tour} className="flex items-baseline justify-between px-4 py-2.5">
       <span className="text-[13px] text-octo-sage">{desc}</span>
       <kbd className="rounded border border-octo-hairline bg-octo-onyx px-2 py-0.5 font-mono text-[10px] text-octo-mute">
         {keys}

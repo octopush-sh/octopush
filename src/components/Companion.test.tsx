@@ -12,7 +12,7 @@ import { Companion } from "./Companion";
 vi.mock("./CompanionContext",   () => ({ CompanionContext:   () => <div data-testid="ctx" />   }));
 vi.mock("./CompanionHistory",   () => ({ CompanionHistory:   () => <div data-testid="hist" />  }));
 vi.mock("./CompanionCrewJournal", () => ({ CompanionCrewJournal: () => null }));
-vi.mock("./CompanionSession", () => ({ CompanionSession: () => <div data-testid="term" />  }));
+vi.mock("./CompanionRun", () => ({ CompanionRun: () => <div data-testid="run" /> }));
 vi.mock("./CompanionFileTree",  () => ({ CompanionFileTree:  () => <div data-testid="tree" />  }));
 vi.mock("./review/AiReviewPanel", () => ({ AiReviewPanel: () => <div data-testid="ai-review" /> }));
 vi.mock("./WorkContextPanel",   () => ({ WorkContextPanel:   () => <div data-testid="backlog" /> }));
@@ -77,6 +77,16 @@ describe("Companion cross-mode visibility of issue tracker block", () => {
     expect(screen.queryByTestId("active")).not.toBeInTheDocument();
     expect(screen.queryByTestId("backlog")).not.toBeInTheDocument();
     expect(screen.queryByTestId("else")).not.toBeInTheDocument();
+  });
+});
+
+describe("Companion in Run", () => {
+  it("shows Run's own content, not Talk's or a session inspector", async () => {
+    render(<Companion mode="run" {...baseProps} />);
+    // FadeSwap mounts the mode's content once the previous one has left.
+    expect(await screen.findByTestId("run")).toBeInTheDocument();
+    expect(screen.queryByTestId("ctx")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("hist")).not.toBeInTheDocument();
   });
 });
 

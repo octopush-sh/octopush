@@ -9,7 +9,8 @@
 use crate::chat_agents::{
     agent_tool_definitions, director_doctrine, director_model_for_auto, is_agent_tool, parse_agent_call,
     run_subagents, unmapped_subagent_tiers, AgentOutcome, AUTO_MODEL,
-    SubagentSpec, SubagentPlan, plan_subagent, run_one_subagent, discover_mcp_tools, model_catalog, mcp_turnstiles,
+    SubagentSpec, SubagentPlan, plan_subagent, run_one_subagent, discover_thread_mcp_tools, model_catalog, mcp_turnstiles,
+    mcp_off_refusal, thread_mcp_off,
 };
 use crate::chat_history::{
     build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
@@ -43,6 +44,31 @@ const RECALL_TOOL_NAME: &str = "recall_tool_output";
 const RECALL_DEFAULT_LIMIT: usize = 40_000;
 /// Hard ceiling on one `recall_tool_output` window.
 const RECALL_MAX_LIMIT: usize = 100_000;
+
+/// Talk's system prompt when the request brings none.
+fn default_talk_system_prompt(workspace_path: &str) -> String {
+    format!(
+        "You are a helpful coding assistant working in the project at {workspace_path}. \
+         You have tools to run commands, read/write files, and list directories. \
+         run_command executes in a persistent shell SHARED with the user — a \
+         `cd` or env export (yours or theirs) carries over to later commands. It \
+         is NON-interactive: don't run REPLs or commands that wait for stdin \
+         (pass input via flags or a heredoc instead). read_file/write_file/\
+         list_files paths are ALWAYS relative to the project root, regardless of \
+         the shell's current directory — pass a path relative to the root. Tool \
+         outputs from earlier turns appear abridged as `[Tool #id: …]`; when you \
+         need an omitted part, call recall_tool_output with that id rather than \
+         re-running the tool. You can delegate independent, self-contained tasks \
+         to sub-agents with the Agent tool — call it several times in ONE response \
+         to run them in parallel; when a skill asks for parallel sub-agents, use \
+         Agent, never emulate them one after another yourself. Your `mcp__` tools \
+         come from MCP servers that Octopush runs and the user manages in Settings › \
+         Integrations (where one can be reconnected), so never point the user to \
+         Claude Code's `/mcp` or `claude mcp` commands for them. Use the tools to \
+         help the user; be concise and take action rather than just explaining \
+         what to do."
+    )
+}
 
 fn recall_tool_definition() -> LlmTool {
     LlmTool {
@@ -186,6 +212,10 @@ pub struct ShellRequest {
     pub thread_id: String,
     pub workspace_path: String,
     pub command: String,
+    /// The secret guard's override (#819): the fingerprint of exactly the
+    /// findings the confirm showed, for this one run of the command.
+    #[serde(default)]
+    pub allow_findings: Option<String>,
 }
 
 /// Monotonic counter for `$`-direct call ids (correlates the resolved card to
@@ -205,13 +235,44 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
     } else if s.trim().is_empty() {
         s = "(exit code 0)".to_string();
     }
+    if exit_code == NOT_FOUND_EXIT {
+        s.push('\n');
+        s.push_str(&not_found_note(output));
+    }
     s
+}
+
+/// The exit status bash gives a command it couldn't find.
+const NOT_FOUND_EXIT: i32 = 127;
+
+/// The line a command's result gains when it exits 127, so the model reads a
+/// PATH miss as one instead of concluding the tool isn't installed. Names the
+/// program from bash's last `<name>: command not found` (or, for a path such
+/// as `./x`, `<name>: No such file or directory`) line in `output`. A path
+/// wasn't looked up on the PATH, so its line doesn't mention the PATH. Pure.
+fn not_found_note(output: &str) -> String {
+    let program = output
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let l = l.trim_end();
+            l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": No such file or directory"))
+        })
+        .and_then(|head| head.rsplit(": ").next())
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !p.contains(char::is_whitespace));
+    match program {
+        Some(p) if p.contains('/') => format!("`{p}` wasn't found."),
+        Some(p) => format!("`{p}` wasn't found (the command ran with your login shell's PATH)."),
+        None => "A program in this command wasn't found (the command ran with your login shell's PATH).".to_string(),
+    }
 }
 
 /// Flag a command the agent wants to run as destructive (returns a short reason
 /// for the approval card). Conservative + high-confidence: a safety net before
 /// the agent does something irreversible, not a sandbox. User-typed `$` commands
-/// are never passed here. Case-insensitive, matches anywhere in the command.
+/// are never passed here (only the secret guard checks them, #819).
+/// Case-insensitive, matches anywhere in the command.
 pub(crate) fn dangerous_command(command: &str) -> Option<&'static str> {
     // Normalize runs of whitespace so spacing tricks (`rm  -rf`) don't slip past.
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -449,6 +510,13 @@ pub struct ApprovalRequestEvent {
     pub call_id: String,
     pub command: String,
     pub reason: String,
+    /// The secret guard asks (#819): the card offers no "don't ask again",
+    /// and a thread's grant never answers it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
+    /// The command also stages, so the scan read uncommitted changes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub covers_uncommitted: bool,
 }
 
 /// The one approval channel for dangerous agent commands in TALK: the parent
@@ -502,6 +570,64 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None).await;
+        self.record(thread_id, decision, false);
+        decision
+    }
+
+    /// Ask about a command the secret guard stopped (#819). Unlike
+    /// [`Self::await_approval`], a thread's "don't ask again" never answers it,
+    /// and an approval grants nothing beyond this one call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn await_secret_approval(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        command: &str,
+        reason: &str,
+        covers_uncommitted: bool,
+    ) -> ApprovalDecision {
+        let decision = self
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted))
+            .await;
+        self.record(thread_id, decision, true)
+    }
+
+    /// Keep a "don't ask again" grant, except from a secret card, whose
+    /// approval reads as a plain one. Returns the decision to act on.
+    pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
+        match decision {
+            ApprovalDecision::ApproveAlways if secret => ApprovalDecision::Approve,
+            ApprovalDecision::ApproveAlways => {
+                self.auto_approve.lock().insert(thread_id.to_string());
+                decision
+            }
+            d => d,
+        }
+    }
+
+    /// Whether the thread's "don't ask again" grant skips a dangerous-command
+    /// prompt (never a secret one).
+    #[cfg(test)]
+    pub(crate) fn auto_approves(&self, thread_id: &str) -> bool {
+        self.auto_approve.lock().contains(thread_id)
+    }
+
+    /// Emit the card and wait for its answer. `secret` is `Some(covers
+    /// uncommitted)` for the secret guard's card.
+    #[allow(clippy::too_many_arguments)]
+    async fn ask(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        command: &str,
+        reason: &str,
+        secret: Option<bool>,
+    ) -> ApprovalDecision {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.approvals
             .lock()
@@ -512,6 +638,8 @@ impl ApprovalBroker {
             call_id: call_id.to_string(),
             command: command.to_string(),
             reason: reason.to_string(),
+            secret: secret.is_some(),
+            covers_uncommitted: secret.unwrap_or(false),
         });
         let decision = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
             Ok(Ok(d)) => d,
@@ -520,15 +648,68 @@ impl ApprovalBroker {
                 ApprovalDecision::Deny
             }
         };
-        if decision == ApprovalDecision::ApproveAlways {
-            self.auto_approve.lock().insert(thread_id.to_string());
-        }
         let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
         });
         decision
+    }
+}
+
+/// The secret card's reason and the denial fed back to the model (#819):
+/// kinds and `file:line` only, never a value. `label` names the sub-agent.
+/// Pure, so the wording is tested.
+pub(crate) fn secret_gate_texts(label: Option<&str>, summary: &str) -> (String, String) {
+    let card = match label {
+        Some(l) => format!("Sub-agent \u{201c}{l}\u{201d}: possible secret \u{b7} {summary}"),
+        None => format!("possible secret \u{b7} {summary}"),
+    };
+    let denial = format!(
+        "Command not run — the secret guard found {summary} in what it would commit or push, \
+         and the user declined. Take it out of the change or ask the user how to proceed; \
+         do not retry the same command."
+    );
+    (card, denial)
+}
+
+/// The secret guard on an agent's `run_command` in Talk (#819): a command
+/// that commits, pushes or opens a pull request is scanned first, and a
+/// finding (or a partial scan) parks it on the secret card. The approval is
+/// bound to the scan's fingerprint: the command runs only if a rescan still
+/// finds exactly what the card showed, else the card asks again. `Some` is
+/// the denial for the model. Guard off, or nothing found: `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn guard_agent_command(
+    broker: &ApprovalBroker,
+    app: &AppHandle,
+    workspace_id: &str,
+    thread_id: &str,
+    call_id: &str,
+    command: &str,
+    workspace_path: &str,
+    label: Option<&str>,
+) -> Option<String> {
+    let plan = crate::secret_scan::shell_plan(command)?;
+    let mut approved: Option<String> = None;
+    loop {
+        let (path, p) = (workspace_path.to_string(), plan.clone());
+        let report = crate::secret_scan::guarded_scan(move || {
+            crate::secret_scan::shell_files(std::path::Path::new(&path), &p)
+        })
+        .await?;
+        if !report.needs_confirmation() || approved.as_deref() == Some(report.fingerprint.as_str()) {
+            return None;
+        }
+        let summary = crate::secret_scan::refusal_summary(&report.findings, report.total, report.partial);
+        let (card, denial) = secret_gate_texts(label, &summary);
+        match broker
+            .await_secret_approval(app, workspace_id, thread_id, call_id, command, &card, plan.covers_uncommitted())
+            .await
+        {
+            ApprovalDecision::Deny => return Some(denial),
+            _ => approved = Some(report.fingerprint),
+        }
     }
 }
 
@@ -906,7 +1087,7 @@ fn tool_definitions() -> serde_json::Value {
 /// target that escapes the workspace (a lexical check can't see through a
 /// symlink). The target is passed as a positional arg (`$1`), never interpolated
 /// into the script. Fail-closed: if the sandbox can't be set up, nothing is
-/// written. The profile guard lives until the child exits.
+/// written.
 fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> (String, bool) {
     use std::io::Write;
     // `$0` is a label; `$1` is the (untrusted) absolute target path.
@@ -918,7 +1099,7 @@ fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> 
         full.to_string_lossy().into_owned(),
     ];
     let prepared =
-        match crate::orchestrator::sandbox::prepare(roots, std::ffi::OsStr::new("bash"), &args) {
+        match crate::orchestrator::sandbox::prepare(roots, None, std::ffi::OsStr::new(crate::talk_shell::TALK_BASH), &args) {
             Ok(p) => p,
             Err(e) => {
                 return (
@@ -1098,10 +1279,17 @@ fn wait_command_bounded(
             if result.is_empty() {
                 result = format!("(exit code {})", status.code().unwrap_or(-1));
             }
+            let note = (status.code() == Some(NOT_FOUND_EXIT)).then(|| not_found_note(&result));
             if result.len() > 50_000 {
                 let cut = truncate_char_safe(&result, 50_000).len();
                 result.truncate(cut);
                 result.push_str("\n... (truncated)");
+            }
+            if let Some(note) = note {
+                if !result.ends_with('\n') {
+                    result.push('\n');
+                }
+                result.push_str(&note);
             }
             (result, status.success())
         }
@@ -1151,17 +1339,28 @@ pub(crate) fn execute_tool_cancellable(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(RUN_COMMAND_TIMEOUT_SECS)
                 .clamp(1, RUN_COMMAND_TIMEOUT_MAX);
-            let _guard;
+            // The PATH CLI stages spawn with (the login shell's, the app's and
+            // the common bin dirs), and no other login-shell variable: an app
+            // opened from the Dock has launchd's minimal PATH, where Homebrew,
+            // nvm and similar tools aren't found.
+            let path = crate::orchestrator::cli_runner::resolved_cli_path();
             let mut command = if let Some(roots) = sandbox_roots {
+                let scope = workspace_path.to_string_lossy();
                 match crate::orchestrator::sandbox::prepare(
                     roots,
-                    std::ffi::OsStr::new("bash"),
+                    Some(&*scope),
+                    std::ffi::OsStr::new(crate::talk_shell::TALK_BASH),
                     &["-c".to_string(), cmd.to_string()],
                 ) {
                     Ok(p) => {
                         let mut c = std::process::Command::new(&p.program);
                         c.args(&p.args);
-                        _guard = Some(p.guard);
+                        // Redirect build-tool caches into the workspace's own
+                        // cache root, not the user's real ~/.cargo etc. (which
+                        // the profile doesn't expose). PATH is set after
+                        // them, so it is the login PATH whatever they carry.
+                        c.envs(p.env);
+                        c.env("PATH", &path);
                         c
                     }
                     Err(e) => {
@@ -1172,22 +1371,10 @@ pub(crate) fn execute_tool_cancellable(
                     }
                 }
             } else {
-                _guard = None;
-                let mut c = std::process::Command::new("bash");
-                c.arg("-c").arg(cmd);
+                let mut c = std::process::Command::new(crate::talk_shell::TALK_BASH);
+                c.arg("-c").arg(cmd).env("PATH", &path);
                 c
             };
-            // Sandboxed: redirect build-tool caches into the confined temp so a
-            // sandboxed `npm install` writes there, not to the user's real
-            // ~/.cargo etc. (which the profile no longer exposes).
-            if sandbox_roots.is_some() {
-                if let Ok(tmp) = std::env::var("TMPDIR") {
-                    let scope = workspace_path.to_string_lossy();
-                    for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
-                        command.env(k, v);
-                    }
-                }
-            }
             command.current_dir(workspace_path);
             wait_command_bounded(command, timeout_secs, cancel)
         }
@@ -1532,7 +1719,7 @@ pub(crate) fn resolve_provider(model: &str) -> AppResult<(Box<dyn LlmProvider>, 
 
     let impl_: Box<dyn LlmProvider> = match provider_cfg.protocol.as_str() {
         "anthropic" => Box::new(AnthropicProvider),
-        "openai-compatible" => Box::new(OpenAICompatibleProvider),
+        "openai-compatible" => Box::new(OpenAICompatibleProvider { provider: provider_cfg.name.clone() }),
         other => return Err(AppError::Other(format!("Unsupported protocol: {other}"))),
     };
 
@@ -1625,6 +1812,16 @@ impl Drop for CancelGuard {
             cancels.remove(&self.key);
         }
     }
+}
+
+/// What a Talk turn hands back to `send_agentic` to finish after it returns:
+/// its cancel registration (dropped last, so the turn counts as running until
+/// the end) and the checkpoint whose end state is still to be recorded.
+#[derive(Default)]
+struct TurnHold {
+    /// Only held, never read: dropping it ends the turn.
+    _cancel: Option<CancelGuard>,
+    after: Option<crate::talk_checkpoints::AfterTurn>,
 }
 
 /// Marks one sub-agent as being continued for the life of the guard, so
@@ -1732,6 +1929,19 @@ impl ChatEngine {
         self.cap_gate.deny_thread(thread_id);
     }
 
+    /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
+    /// A rewind waits for it: it would race the agent's own writes.
+    pub fn is_running(&self, thread_id: &str) -> bool {
+        let prefix = format!("{thread_id}#");
+        self.cancels.lock().keys().any(|k| k == thread_id || k.starts_with(&prefix))
+    }
+
+    /// Whether a turn (or a sub-agent continuation) is running on any of
+    /// `thread_ids`.
+    pub fn any_running(&self, thread_ids: &[String]) -> bool {
+        thread_ids.iter().any(|t| self.is_running(t))
+    }
+
     /// Record one provider response's token usage: the canonical spend ledger
     /// (so the Companion CONTEXT card and Settings · Usage see chat turns)
     /// and the mission logbook. Shared by the loop and the forced close.
@@ -1760,7 +1970,9 @@ impl ChatEngine {
     /// override may differ from the thread's) and under its call id, so the
     /// Companion's conversation cost splits director from crew. An escalated
     /// sub-agent bills every attempt at its own model's price, so each
-    /// attempt is its own ledger row.
+    /// attempt is its own ledger row. The row takes the attempt's own cost,
+    /// priced per request by the agentic loop (Haiku 5.5's long tier); a $0
+    /// attempt is priced (or marked unpriced) by the ledger.
     fn record_subagent_spend(&self, workspace_id: &str, thread_id: &str, call_id: &str, o: &AgentOutcome) {
         let origin = subagent_origin(call_id);
         for a in o.billed_attempts() {
@@ -1777,7 +1989,7 @@ impl ChatEngine {
                 cache_read_tokens: a.cache_read_tokens,
                 cache_creation_tokens: a.cache_creation_tokens,
                 model: a.model.clone(),
-                cost_usd: 0.0,
+                cost_usd: a.cost_usd,
             }, "talk", Some(thread_id), Some(&origin)) {
                 tracing::warn!(error = %e, "failed to record sub-agent token event");
             }
@@ -2066,7 +2278,8 @@ impl ChatEngine {
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         });
 
-        let mcp_tools = discover_mcp_tools(Arc::clone(&self.mcp), &spec.workspace_path).await;
+        let mcp_tools = discover_thread_mcp_tools(Arc::clone(&self.mcp), &self.db, &spec.workspace_path, &run.thread_id).await;
+        let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
         let turnstiles = mcp_turnstiles(&mcp_tools);
         let (known_models, tiers) = model_catalog();
         let outcome = run_one_subagent(
@@ -2145,6 +2358,17 @@ impl ChatEngine {
         app: AppHandle,
         request: ShellRequest,
     ) -> AppResult<crate::talk_shell::ShellResult> {
+        // Secret guard (#819): a command that commits, pushes or opens a pull
+        // request is refused with `SecretsFound` before anything is shown or
+        // run, unless `allow_findings` is the fingerprint the confirm showed.
+        if let Some(plan) = crate::secret_scan::shell_plan(&request.command) {
+            let path = request.workspace_path.clone();
+            crate::secret_scan::guard(request.allow_findings.clone(), move || {
+                crate::secret_scan::shell_files(std::path::Path::new(&path), &plan)
+            })
+            .await?;
+        }
+
         // Show the command as the user's turn straight away.
         self.insert_and_emit_message(
             &app,
@@ -2386,6 +2610,23 @@ impl ChatEngine {
         app: AppHandle,
         request: ChatRequest,
     ) -> AppResult<()> {
+        let mut held = TurnHold::default();
+        let result = self.run_agentic_turn(app, request, &mut held).await;
+        // Talk checkpoint (#958): record how the turn left the tree, on every
+        // exit path, while its cancel registration still marks it running.
+        if let Some(after) = held.after.take() {
+            after.record_off_runtime().await;
+        }
+        drop(held);
+        result
+    }
+
+    async fn run_agentic_turn(
+        &self,
+        app: AppHandle,
+        request: ChatRequest,
+        held: &mut TurnHold,
+    ) -> AppResult<()> {
         // The Auto policy (economy director): the composer sends `auto`; the
         // turn runs on the strong tier's model under the lean-context
         // doctrine, and sub-agents take their tier by role. Resolved once,
@@ -2438,16 +2679,17 @@ impl ChatEngine {
             });
 
         // Register a fresh cancellation flag for this turn, keyed by thread. The
-        // guard removes it from the registry on every exit path (Drop).
+        // guard removes it from the registry on every exit path (Drop), once
+        // `send_agentic` has also recorded the turn's checkpoint.
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancels
             .lock()
             .insert(request.thread_id.clone(), Arc::clone(&cancel));
-        let _cancel_guard = CancelGuard {
+        held._cancel = Some(CancelGuard {
             cancels: Arc::clone(&self.cancels),
             key: request.thread_id.clone(),
             flag: Arc::clone(&cancel),
-        };
+        });
 
         // Persist user message and emit message-added so the frontend learns the
         // DB id. Skipped on regenerate: history already ends with the user turn
@@ -2470,6 +2712,26 @@ impl ChatEngine {
         // same-role turns merge (Anthropic 400 guard), and `error`/`stopped`
         // rows are never replayed.
         let history = self.db.lock().list_chat_messages(&request.thread_id)?;
+
+        // Talk checkpoint (#958): snapshot the tree before this turn can
+        // write, so its files can be rewound later (a regenerate keeps the
+        // first attempt's checkpoint). A read-only mission can't write, so it
+        // takes none. `send_agentic` records how the turn left the tree. The
+        // git work runs on a blocking thread, off the async runtime.
+        let can_write = !matches!(sandbox_roots.as_deref(), Some([]));
+        let turn_id = history.iter().rev().find(|m| m.role == "user").filter(|_| can_write).map(|m| m.id);
+        if let Some(id) = turn_id {
+            let (ws, thread) = (workspace_path.clone(), request.thread_id.clone());
+            let taken = crate::talk_checkpoints::off_runtime(move || {
+                Ok(crate::talk_checkpoints::capture_before(&ws, &thread, id))
+            })
+            .await
+            .unwrap_or(false);
+            if taken {
+                held.after = Some(crate::talk_checkpoints::AfterTurn::new(&workspace_path, &request.thread_id, id));
+            }
+        }
+
         let rows: Vec<HistoryRow<'_>> = history
             .iter()
             .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str() })
@@ -2520,27 +2782,9 @@ impl ChatEngine {
             }
         }
 
-        let mut system_prompt = request.system.unwrap_or_else(|| {
-            format!(
-                "You are a helpful coding assistant working in the project at {}. \
-                 You have tools to run commands, read/write files, and list directories. \
-                 run_command executes in a persistent shell SHARED with the user — a \
-                 `cd` or env export (yours or theirs) carries over to later commands. It \
-                 is NON-interactive: don't run REPLs or commands that wait for stdin \
-                 (pass input via flags or a heredoc instead). read_file/write_file/\
-                 list_files paths are ALWAYS relative to the project root, regardless of \
-                 the shell's current directory — pass a path relative to the root. Tool \
-                 outputs from earlier turns appear abridged as `[Tool #id: …]`; when you \
-                 need an omitted part, call recall_tool_output with that id rather than \
-                 re-running the tool. You can delegate independent, self-contained tasks \
-                 to sub-agents with the Agent tool — call it several times in ONE response \
-                 to run them in parallel; when a skill asks for parallel sub-agents, use \
-                 Agent, never emulate them one after another yourself. Use the tools to \
-                 help the user; be concise and take action rather than just explaining \
-                 what to do.",
-                request.workspace_path
-            )
-        });
+        let mut system_prompt = request
+            .system
+            .unwrap_or_else(|| default_talk_system_prompt(&request.workspace_path));
 
         if let Some(doctrine) = &doctrine {
             system_prompt.push_str(doctrine);
@@ -2622,19 +2866,22 @@ impl ChatEngine {
         // `mcp__server__tool`). Unreachable servers are skipped inside
         // list_tools. A skill's allowed-tools filter above doesn't touch these
         // (MCP tools are opt-in via the server config, not the skill).
-        // Run the (blocking) MCP discovery off the async runtime thread, bounded
-        // by a timeout so a hung server can't freeze the turn.
+        // Discovery runs off the async runtime thread, bounded by a timeout so
+        // a hung server can't freeze the turn (`discover_mcp_tools`). Servers
+        // the user switched off in this conversation (Companion "can use")
+        // are left out and never started for it; the same path as
+        // sub-agents'. What it offers is fixed for the turn.
         {
-            let mcp = Arc::clone(&self.mcp);
-            let wp = workspace_path.clone();
-            let discovered = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                tokio::task::spawn_blocking(move || mcp.list_tools(&wp)),
+            let discovered = discover_thread_mcp_tools(
+                Arc::clone(&self.mcp),
+                &self.db,
+                &request.workspace_path,
+                &request.thread_id,
             )
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
+            .await;
+            // Discovery may have started servers or seen one fail: the
+            // Companion's chips re-read their status.
+            let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
             for t in discovered {
                 tools.push(LlmTool {
                     name: t.namespaced,
@@ -3016,12 +3263,25 @@ impl ChatEngine {
 
                 // ── Approval gate (agent run_command only) ────────────
                 // A command flagged destructive pauses for the user's OK before
-                // it runs. User-typed `$` commands are never gated. A denial
-                // skips execution and tells the model the user declined.
+                // it runs. User-typed `$` commands meet only the secret guard.
+                // A denial skips execution and tells the model the user
+                // declined. The secret guard asks first (#819): a thread's
+                // "don't ask again" covers the destructive check, never it.
                 let mut denied: Option<String> = None;
                 if u.name == "run_command" {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                    if let Some(reason) = dangerous_command(command) {
+                    denied = guard_agent_command(
+                        &self.approvals,
+                        &app,
+                        &request.workspace_id,
+                        &request.thread_id,
+                        &u.id,
+                        command,
+                        &request.workspace_path,
+                        None,
+                    )
+                    .await;
+                    if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         match self
                             .await_approval(
                                 &app,
@@ -3083,6 +3343,15 @@ impl ChatEngine {
                     pair
                 } else if u.name == RECALL_TOOL_NAME {
                     self.recall_tool_output(&request.thread_id, &u.input)
+                } else if let Some(refusal) = crate::mcp::is_mcp_tool(&u.name)
+                    .then(|| mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)))
+                    .flatten()
+                {
+                    // The list as it is now, not at the turn's start: a server
+                    // turned off mid-turn stops here, one turned back on runs.
+                    // (A call to a server not offered this turn can still be
+                    // copied from an earlier turn's history.)
+                    (refusal, false)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
                     // Bounded, and a timeout STOPS the server so the call can
                     // never complete later in the background.
@@ -3626,11 +3895,52 @@ mod continuation_tests {
         assert_eq!(subagent_origin("toolu_01"), "subagent:toolu_01");
         assert_eq!(DIRECTOR_ORIGIN, "director");
     }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_subagents_ledger_rows_take_each_attempts_per_request_cost() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        // A Haiku 5.5 attempt of a 40K and a 140K request, as the agentic
+        // loop prices them: 40K at 0.10 / 0.01 / 0.50, 140K at 0.50 / 0.05 / 2.50.
+        let short = (10_000.0 * 0.10 + 30_000.0 * 0.01 + 1_000.0 * 0.50) / 1e6;
+        let long = (20_000.0 * 0.50 + 120_000.0 * 0.05 + 2_000.0 * 2.50) / 1e6;
+        let haiku = AgentAttempt {
+            model: "claude-haiku-5-5".into(), input_tokens: 30_000, output_tokens: 3_000,
+            cache_read_tokens: 150_000, cache_creation_tokens: 0, cost_usd: short + long,
+        };
+        // Escalated to a second model; each attempt keeps its own figure.
+        let opus = AgentAttempt { model: "opus".into(), input_tokens: 200, output_tokens: 20, cost_usd: 0.20, ..Default::default() };
+        let o = AgentOutcome { attempts: vec![haiku, opus], cost_usd: short + long + 0.20, ..Default::default() };
+        engine.record_subagent_spend("ws-1", "t-1", "call-1", &o);
+        let c = db.lock().thread_cost("t-1", None).unwrap();
+        assert_eq!(c.calls, 2);
+        assert!((c.subagents_usd - (short + long + 0.20)).abs() < 1e-12, "{}", c.subagents_usd);
+
+        // A $0 attempt on a model with no price still lands unpriced.
+        let unknown = AgentOutcome { model: "mystery-model-9".into(), input_tokens: 100, output_tokens: 10, ..Default::default() };
+        engine.record_subagent_spend("ws-1", "t-2", "call-2", &unknown);
+        let c = db.lock().thread_cost("t-2", None).unwrap();
+        assert_eq!((c.unpriced_calls, c.subagents_usd), (1, 0.0));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn talks_prompt_sends_mcp_problems_to_settings_not_the_cli() {
+        let prompt = default_talk_system_prompt("/w");
+        assert!(prompt.starts_with("You are a helpful coding assistant working in the project at /w."));
+        assert!(prompt.contains("the user manages in Settings › Integrations"), "{prompt}");
+        assert!(prompt.contains("never point the user to Claude Code's `/mcp` or `claude mcp` commands"), "{prompt}");
+        // A hint such as "run `which npx` in Terminal" may still reach the user.
+        assert!(!prompt.contains("any CLI command"), "{prompt}");
+    }
 
     #[test]
     fn execute_tool_reports_structural_status() {
@@ -3873,8 +4183,8 @@ mod tests {
         // inside the workspace pointing at a DENIED location (a hostile repo can
         // commit `link -> $HOME`). Lexically `link/…` is under the workspace, so
         // it passes the fast pre-check — the KERNEL-enforced seatbelt write must
-        // still block it. ($HOME root is denied; only ~/.claude/~/.cache are
-        // writable, and a tempdir would be under the allowed $TMPDIR.)
+        // still block it. ($HOME root is denied; only the ~/.claude state dirs
+        // are writable there, and a tempdir would be under the allowed $TMPDIR.)
         let dir = tempfile::tempdir().unwrap();
         let wp = dir.path();
         let roots = vec![wp.to_string_lossy().into_owned()];
@@ -3912,6 +4222,39 @@ mod tests {
         );
         assert!(!ok, "a readonly mission refuses even an in-workspace write: {msg}");
         assert!(!wp.join("in_workspace.txt").exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_secret_card_never_grants_dont_ask_again() {
+        let broker = ApprovalBroker::default();
+        // "Always" on a secret card acts as one approval and grants nothing.
+        assert_eq!(broker.record("t", ApprovalDecision::ApproveAlways, true), ApprovalDecision::Approve);
+        assert!(!broker.auto_approves("t"));
+        assert_eq!(broker.record("t", ApprovalDecision::Deny, true), ApprovalDecision::Deny);
+        // On a destructive-command card it still grants the thread.
+        assert_eq!(broker.record("t", ApprovalDecision::ApproveAlways, false), ApprovalDecision::ApproveAlways);
+        assert!(broker.auto_approves("t"));
+    }
+
+    #[test]
+    fn secret_gate_texts_name_kind_and_place_never_a_value() {
+        let (card, denial) = secret_gate_texts(None, "Anthropic API key in a.ts:3");
+        assert_eq!(card, "possible secret \u{b7} Anthropic API key in a.ts:3");
+        assert!(denial.contains("Anthropic API key in a.ts:3") && denial.contains("do not retry"));
+        let (card, _) = secret_gate_texts(Some("Ship it"), "GitHub token in b.ts:1");
+        assert!(card.starts_with("Sub-agent \u{201c}Ship it\u{201d}: possible secret"));
+    }
+
+    #[test]
+    fn approval_event_marks_a_secret_card_only_when_it_is_one() {
+        let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
+            workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
+            command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted,
+        };
+        let plain = serde_json::to_value(ev(false, false)).unwrap();
+        assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
+        let s = serde_json::to_value(ev(true, true)).unwrap();
+        assert_eq!((s["secret"].as_bool(), s["coversUncommitted"].as_bool()), (Some(true), Some(true)));
     }
 
     #[test]
@@ -3998,5 +4341,131 @@ mod tests {
         let v = tool_input_with_cwd(&input, "/repo/src", "/repo");
         assert_eq!(v.get("cwd").and_then(|c| c.as_str()), Some("src"));
         assert_eq!(v.get("command").and_then(|c| c.as_str()), Some("ls"));
+    }
+}
+
+/// Talk's shells get the login shell's PATH the way CLI stages do, and only
+/// that (#1087).
+#[cfg(test)]
+mod login_path_tests {
+    use super::*;
+    use crate::orchestrator::cli_runner::{resolved_cli_path, with_login_shell_env};
+    use serial_test::serial;
+
+    /// A dir holding `octo-1087-tool`, an executable found only through it,
+    /// and a `bash` that isn't one, which a bare `bash` would resolve to.
+    fn login_bin() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [("octo-1087-tool", "echo found-on-login-path"), ("bash", "echo wrong-bash")] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// Runs the tool only the login PATH has, then prints the PATH, a variable
+    /// only the login shell sets, `CARGO_HOME` (which the login shell sets too)
+    /// and the bash running the command.
+    const PROBE: &str = "octo-1087-tool && printf '%s\\n' \"$PATH\" \"${OCTO_1087_LOGIN_ONLY-unset}\" \"${CARGO_HOME-unset}\" \"$BASH\"";
+
+    /// `run_command` with a stubbed login shell: the output lines, the PATH CLI
+    /// stages get under the same stub, and the login PATH dir.
+    fn run_probe(sandboxed: bool) -> (Vec<String>, String, String) {
+        let bin = login_bin();
+        let ws = tempfile::tempdir().unwrap();
+        let roots = vec![ws.path().to_string_lossy().into_owned()];
+        let bin_path = bin.path().to_string_lossy().into_owned();
+        let login = [
+            ("PATH", bin_path.as_str()),
+            ("OCTO_1087_LOGIN_ONLY", "leaked"),
+            ("CARGO_HOME", "/login-shell/cargo"),
+        ];
+        with_login_shell_env(&login, || {
+            let input = serde_json::json!({ "command": PROBE });
+            let (out, ok) = execute_tool(ws.path(), "run_command", &input, sandboxed.then_some(roots.as_slice()));
+            if sandboxed {
+                let _ = crate::orchestrator::sandbox::remove_workspace_build_caches(&roots[0]);
+            }
+            assert!(ok, "{out}");
+            (out.lines().map(str::to_string).collect(), resolved_cli_path(), bin_path.clone())
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn an_unconfined_command_gets_the_login_path_and_nothing_else() {
+        let (lines, path, bin) = run_probe(false);
+        assert_eq!(lines[0], "found-on-login-path", "{lines:?}");
+        assert_eq!(lines[1], path, "the PATH CLI stages spawn with");
+        assert!(path.starts_with(&bin), "{path}");
+        assert_eq!(lines[2], "unset", "no other login-shell variable");
+        assert_ne!(lines[3], "/login-shell/cargo");
+        assert_eq!(lines[4], "/bin/bash", "the pinned bash, not the one first on the PATH");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "macos")]
+    fn a_sandboxed_command_gets_the_login_path_and_keeps_its_cache_redirect() {
+        let (lines, path, bin) = run_probe(true);
+        assert_eq!(lines[0], "found-on-login-path", "the profile lets it run tools on the login PATH: {lines:?}");
+        assert_eq!(lines[1], path);
+        assert!(path.starts_with(&bin), "{path}");
+        assert_eq!(lines[2], "unset");
+        assert!(lines[3].contains("build-cache") && lines[3].ends_with("/cargo"), "the sandbox's cache wins: {lines:?}");
+        assert_eq!(lines[4], "/bin/bash", "the pinned bash, not the one first on the PATH");
+    }
+
+    #[test]
+    fn a_missing_program_says_which_path_it_ran_with() {
+        let ws = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({ "command": "octo-1087-missing-tool --version" });
+        let (out, ok) = with_login_shell_env(&[], || execute_tool(ws.path(), "run_command", &input, None));
+        assert!(!ok);
+        assert!(out.contains("octo-1087-missing-tool: command not found"), "{out}");
+        assert_eq!(
+            out.lines().last(),
+            Some("`octo-1087-missing-tool` wasn't found (the command ran with your login shell's PATH)."),
+            "{out}"
+        );
+        // A path isn't looked up on the PATH, so the line doesn't name it.
+        let input = serde_json::json!({ "command": "./octo-1087-missing.sh" });
+        let (out, ok) = with_login_shell_env(&[], || execute_tool(ws.path(), "run_command", &input, None));
+        assert!(!ok);
+        assert_eq!(out.lines().last(), Some("`./octo-1087-missing.sh` wasn't found."), "{out}");
+        // Any other failure reads as before.
+        let input = serde_json::json!({ "command": "echo nope >&2; exit 1" });
+        let (out, _) = with_login_shell_env(&[], || execute_tool(ws.path(), "run_command", &input, None));
+        assert!(!out.contains("wasn't found"), "{out}");
+    }
+
+    #[test]
+    fn the_not_found_note_names_the_program_bash_reported() {
+        let named = |p: &str| format!("`{p}` wasn't found (the command ran with your login shell's PATH).");
+        assert_eq!(not_found_note("bash: gh: command not found"), named("gh"));
+        assert_eq!(not_found_note("[stderr] bash: line 1: gh: command not found\n"), named("gh"));
+        assert_eq!(not_found_note("bash: npx: command not found\r\nbash: line 2: node: command not found\r"), named("node"));
+        assert_eq!(not_found_note("./run.sh: line 3: pnpm: command not found"), named("pnpm"));
+        assert_eq!(not_found_note("env: uvx: No such file or directory"), named("uvx"));
+        // A path wasn't looked up on the PATH.
+        assert_eq!(not_found_note("bash: ./missing.sh: No such file or directory"), "`./missing.sh` wasn't found.");
+        assert_eq!(not_found_note("bash: line 1: /opt/x/bin/tool: No such file or directory"), "`/opt/x/bin/tool` wasn't found.");
+        assert_eq!(not_found_note("bash: scripts/run: No such file or directory"), "`scripts/run` wasn't found.");
+        // Nothing to name.
+        let unnamed = "A program in this command wasn't found (the command ran with your login shell's PATH).";
+        assert_eq!(not_found_note(""), unnamed);
+        assert_eq!(not_found_note("bash: ./run.sh: /usr/bin/missing: bad interpreter: No such file or directory"), unnamed);
+    }
+
+    #[test]
+    fn shell_output_on_127_gains_the_note() {
+        assert_eq!(
+            format_command_output("bash: gh: command not found", 127),
+            "bash: gh: command not found\n(exit code 127)\n`gh` wasn't found (the command ran with your login shell's PATH)."
+        );
+        assert_eq!(format_command_output("nope", 1), "nope\n(exit code 1)");
+        assert_eq!(format_command_output("", 0), "(exit code 0)");
     }
 }

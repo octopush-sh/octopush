@@ -28,6 +28,17 @@ describe("decideCheckpointNotification (needs you)", () => {
     expect(decideCheckpointNotification(undefined, run("paused"), "ws")).not.toBeNull();
   });
 
+  it("a Claude plan park that resumes on its own is a calm notice, not 'needs you'", () => {
+    const at = Math.floor(Date.now() / 1000) + 3600;
+    const n = decideCheckpointNotification(
+      "plan_limit",
+      run("paused", { planWait: { window: "five_hour", resetsAt: at - 90, resumeAt: at, resumeCount: 0, otherHold: false } }),
+      "ws",
+    );
+    expect(n?.title).toBe("Paused by your Claude plan");
+    expect(n?.body).toMatch(/· resumes at \d{2}:\d{2}$/);
+  });
+
   it("stays silent when the run row isn't hydrated yet — silent beats wrong", () => {
     expect(decideCheckpointNotification("decision", undefined, null)).toBeNull();
   });
@@ -38,6 +49,11 @@ describe("decideCompletionNotification (finished)", () => {
     const n = decideCompletionNotification("running", run("completed"), "checkout-flow");
     expect(n?.title).toBe("Crew finished");
     expect(n?.body).toContain("$0.42");
+  });
+
+  it("groups thousands in the cost", () => {
+    const n = decideCompletionNotification("running", run("completed", { costUsd: 12843.27 }), "checkout-flow");
+    expect(n?.body).toContain("$12,843.27");
   });
 
   it("aborted is the director's own hand — silence", () => {

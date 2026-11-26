@@ -1,0 +1,7 @@
+{
+  "ok": true,
+  "count": 2,
+  "rejected": [
+    { "id": "00000000-0000-4000-8000-0000000b0001", "kind": "pipeline", "reason": "future_stamp" }
+  ]
+}

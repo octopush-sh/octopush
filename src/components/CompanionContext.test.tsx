@@ -11,6 +11,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 const getThreadCost = vi.fn();
 const logbookSummary = vi.fn();
+const listMcpServerStatus = vi.fn();
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   return {
@@ -19,6 +20,8 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       ...actual.ipc,
       getThreadCost: (...a: unknown[]) => getThreadCost(...a),
       logbookSummary: (...a: unknown[]) => logbookSummary(...a),
+      listMcpServerStatus: (...a: unknown[]) => listMcpServerStatus(...a),
+      getThreadMcpDisabled: () => Promise.resolve([]),
     },
   };
 });
@@ -40,6 +43,7 @@ const cost = (over: Partial<ThreadCost> = {}): ThreadCost => ({
 beforeEach(() => {
   getThreadCost.mockReset().mockResolvedValue(cost());
   logbookSummary.mockReset().mockResolvedValue([]);
+  listMcpServerStatus.mockReset().mockResolvedValue([]);
   useChatStore.setState({ activeThreadByWs: { ws: "t-1" }, messagesByWs: {}, streamingByWs: {}, continuingCalls: {} });
 });
 
@@ -84,6 +88,11 @@ describe("costLines", () => {
     expect(usd(0.5)).toBe("$0.50");
     expect(usd(0)).toBe("$0.00");
   });
+
+  it("groups thousands from a cent up, like the ledger", () => {
+    expect(usd(12843.27)).toBe("$12,843.27");
+    expect(usd(0.01)).toBe("$0.01");
+  });
 });
 
 describe("CompanionContext", () => {
@@ -124,6 +133,7 @@ describe("CompanionContext", () => {
   });
 
   it("shows the capabilities and budget rows only when there is something to show", async () => {
+    listMcpServerStatus.mockResolvedValue([{ name: "docs-server", state: "idle", tools: null, reason: null }]);
     await act(async () => {
       render(
         <CompanionContext
@@ -132,14 +142,14 @@ describe("CompanionContext", () => {
           unstaged={0}
           toolCalls={0}
           workspaceId="ws"
-          mcpServers={["jira"]}
+          worktreePath="/wt"
           budgets={[{ id: "b", scopeType: "global", scopeId: "", period: "daily", limitUsd: 10, createdAt: "" } as never]}
           spend={{ "global::daily": { costUsd: 2.5 } as never }}
         />,
       );
     });
     expect(screen.getByText("can use")).toBeInTheDocument();
-    expect(screen.getByText("jira")).toBeInTheDocument();
+    expect(screen.getByText("docs-server")).toBeInTheDocument();
     expect(screen.getByText("budget · today")).toBeInTheDocument();
     expect(screen.getByText("$2.50 / $10.00")).toBeInTheDocument();
   });

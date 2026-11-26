@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
-import type { SyncKind, SyncPrefs } from "../lib/types";
+import type { SyncKind, SyncPrefs, SyncStatus } from "../lib/types";
 
 /** The signed-in user's cloud-sync opt-ins (Settings › Account › Sync). Both
  *  are **off by default** — including for existing users who never chose — and
@@ -26,7 +26,18 @@ interface SyncPrefsState extends SyncPrefs {
   setPref: (kind: SyncKind, enabled: boolean) => Promise<boolean>;
   /** Read-and-clear the "just turned on" mark for `kind`. */
   consumeJustEnabled: (kind: SyncKind) => boolean;
+  /** The last push attempt per kind (`get_sync_status`), for the line under
+   *  each toggle, and the library items the service refused (#799).
+   *  Unreadable ⇒ nothing recorded (the lines stay hidden). */
+  status: SyncStatus;
+  loadStatus: () => Promise<void>;
 }
+
+const NO_STATUS: SyncStatus = { history: null, library: null, libraryRejected: [] };
+
+/** Bumped by every status load, so an older, slower answer never overwrites
+ *  a newer one. */
+let statusSeq = 0;
 
 const OFF: SyncPrefs = { historySync: false, librarySync: false };
 
@@ -40,6 +51,24 @@ export const useSyncPrefsStore = create<SyncPrefsState>((set, get) => ({
   saving: null,
   error: null,
   justEnabled: {},
+  status: NO_STATUS,
+
+  loadStatus: async () => {
+    const seq = ++statusSeq;
+    let status: SyncStatus;
+    try {
+      const s = await ipc.getSyncStatus();
+      status = {
+        history: s?.history ?? null,
+        library: s?.library ?? null,
+        libraryRejected: Array.isArray(s?.libraryRejected) ? s.libraryRejected : [],
+      };
+    } catch {
+      status = NO_STATUS;
+    }
+    if (seq !== statusSeq) return; // a newer load is in flight — its answer wins
+    set({ status });
+  },
 
   load: async () => {
     if (get().saving) return; // a write is in flight — its answer wins

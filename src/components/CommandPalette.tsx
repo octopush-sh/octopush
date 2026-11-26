@@ -1,5 +1,6 @@
 import { Command } from "cmdk";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { flushSync } from "react-dom";
 import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
@@ -11,6 +12,23 @@ import { useBlameStore } from "../stores/blameStore";
 import { ModalShell } from "./ModalShell";
 import { openWhatsNewForCurrentVersion, previewUnreleasedTips } from "../lib/whatsNewLaunch";
 import { tourId } from "../lib/tour/ids";
+import { useCrewImportStore } from "../stores/crewImportStore";
+import { useRunsStore } from "../stores/runsStore";
+import { MidTruncate } from "./primitives/MidTruncate";
+import {
+  paletteFilter,
+  paletteShowsProject,
+  paletteWorkspaceMeta,
+  paletteWorkspaces,
+  WORKSPACE_VALUE_PREFIX,
+  type PaletteWorkspace,
+} from "../lib/paletteWorkspaces";
+import type { ProjectGroup } from "./WorkspaceRail";
+import { firstRevealedModel, paletteModelValue, paletteModels } from "../lib/paletteModels";
+import { GROUP_VALUE_PREFIX, paletteGroups, type PaletteGroup } from "../lib/paletteGroups";
+import { useGroupsStore } from "../stores/groupsStore";
+import { groupMarkColor } from "./RailMissionGroup";
+import { ChevronDown } from "lucide-react";
 
 interface Props {
   open: boolean;
@@ -19,6 +37,15 @@ interface Props {
   onToggleTokens: () => void;
   /** Opens the PR composer for the active workspace; absent without one. */
   onOpenPullRequest?: () => void;
+  /** The rail's projects and their workspaces — the Workspaces group. */
+  projects?: ProjectGroup[];
+  /** Workspaces something is working in (the rail's marching edge). */
+  runningByWs?: Record<string, boolean>;
+  /** Switches project and workspace like a rail click. */
+  onSelectWorkspace?: (id: string) => void;
+  /** Reveals a rail group (unfolds it, scrolls to it, focuses its header).
+   *  The Groups section shows only when this is wired. */
+  onRevealGroup?: (groupId: string) => void;
 }
 
 export function CommandPalette({
@@ -27,6 +54,10 @@ export function CommandPalette({
   onNewSession,
   onToggleTokens,
   onOpenPullRequest,
+  projects,
+  runningByWs,
+  onSelectWorkspace,
+  onRevealGroup,
 }: Props) {
   const { sessions, activeId, select, kill } = useSessionStore();
   const refresh = useSessionStore((s) => s.refresh);
@@ -38,11 +69,36 @@ export function CommandPalette({
   const editorTabWidth = useEditorPrefs((s) => s.tabWidth);
   const editorLineNumbers = useEditorPrefs((s) => s.lineNumbers);
   const blameOn = useBlameStore((s) => s.enabled);
+  const runsByWs = useRunsStore((s) => s.runsByWs);
+  const statusSince = useRunsStore((s) => s.statusSince);
+  const groups = useGroupsStore((s) => s.groups);
+  const workspaceRows = useMemo(
+    () => (open && onSelectWorkspace ? paletteWorkspaces(projects, runsByWs, statusSince, runningByWs, groups) : []),
+    [open, onSelectWorkspace, projects, runsByWs, statusSince, runningByWs, groups],
+  );
+  const groupRows = useMemo(
+    () => (open && onRevealGroup ? paletteGroups(projects, groups) : []),
+    [open, onRevealGroup, projects, groups],
+  );
 
+  const [search, setSearch] = useState("");
+  const [allModels, setAllModels] = useState(false);
+  // cmdk's selection, controlled so "Show all models" can hand it to the
+  // first revealed model (#897).
+  const [selected, setSelected] = useState("");
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // The palette stays mounted while closed (it renders nothing), so reset on
+  // close: a reopen must never paint the old query or expanded list for a
+  // frame before an open-time reset lands (#897).
   useEffect(() => {
     if (open) {
       ipc.listModels().then(setModels).catch(() => {});
       ipc.listTemplates().then(setTemplates).catch(() => {});
+    } else {
+      setSearch("");
+      setAllModels(false);
+      setSelected("");
     }
   }, [open]);
 
@@ -57,6 +113,36 @@ export function CommandPalette({
   if (!open) return null;
 
   const activeSession = sessions.find((s) => s.id === activeId);
+  const modelRows = paletteModels(models, search, allModels, activeSession?.agent.model);
+
+  // Groups — every rail group, in the rail's order. Choosing one reveals it
+  // in the rail and focuses its header, where the group's own keys (F2,
+  // ⇧F10, ←/→) take over: the palette is navigation only, it renames and
+  // moves nothing itself.
+  const groupsSection = groupRows.length > 0 && onRevealGroup && (
+    <Group key="groups" heading="Groups" tour={tourId("palette-groups")}>
+      {groupRows.map((g) => (
+        <GroupItem key={g.id} row={g} onSelect={() => run(() => onRevealGroup(g.id))} />
+      ))}
+    </Group>
+  );
+
+  // Workspaces — every open project's, needs-you first, then running, then
+  // most recently active. Typing part of a branch or a project name finds
+  // the row. With one project open, the meta lines leave its name out.
+  const showProject = paletteShowsProject(workspaceRows);
+  const workspacesSection = workspaceRows.length > 0 && onSelectWorkspace && (
+    <Group key="workspaces" heading="Workspaces" tour={tourId("palette-workspaces")}>
+      {workspaceRows.map((w) => (
+        <WorkspaceItem
+          key={w.id}
+          row={w}
+          showProject={showProject}
+          onSelect={() => run(() => onSelectWorkspace(w.id))}
+        />
+      ))}
+    </Group>
+  );
 
   return (
     <ModalShell onClose={onClose} align="top" topOffset="pt-[18vh]" ariaLabel="Command palette">
@@ -68,12 +154,27 @@ export function CommandPalette({
             "0 30px 60px -10px rgba(0,0,0,0.6), 0 0 0 6px rgba(212, 165, 116, 0.04)",
         }}
       >
-        <Command loop className="overflow-hidden rounded-xl">
+        <Command
+          loop
+          filter={paletteFilter}
+          value={selected}
+          onValueChange={setSelected}
+          // A held Enter must act once. Every other row closes the palette,
+          // but "Show all models" hands the selection to the first revealed
+          // model, so a key repeat would switch to it (#908). cmdk skips a
+          // keydown whose default is prevented.
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && e.repeat) e.preventDefault();
+          }}
+          className="overflow-hidden rounded-xl"
+        >
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
             <span className="font-mono text-[11px] text-octo-brass">⌘ K</span>
             <Command.Input
               data-tour="palette-input"
               autoFocus
+              value={search}
+              onValueChange={setSearch}
               placeholder="Type a command, or search…"
               className="flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
             />
@@ -87,14 +188,14 @@ export function CommandPalette({
             </button>
           </div>
 
-          <Command.List className="max-h-[380px] overflow-y-auto py-2">
+          <Command.List ref={listRef} className="max-h-[380px] overflow-y-auto py-2">
             <Command.Empty className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
               Nothing matches.
             </Command.Empty>
 
             {/* Sessions */}
             <Group heading="Sessions">
-              <Item glyph="+" label="New session" shortcut="⌘T" onSelect={() => run(onNewSession)} />
+              <Item glyph="+" label="New session" onSelect={() => run(onNewSession)} />
               {sessions.map((s) => (
                 <Item
                   key={s.id}
@@ -117,12 +218,24 @@ export function CommandPalette({
               )}
             </Group>
 
+            {/* At rest the Workspaces, by recency, lead. With a query, Groups
+                come before them: a group's name also finds its missions, and
+                the group itself is the likelier target. The order is the
+                JSX's (cmdk 1.1 keeps sections where they are drawn), and the
+                two are one keyed list, so React moves a section instead of
+                remounting it on the first keystroke. */}
+            {search.trim() === "" ? [workspacesSection, groupsSection] : [groupsSection, workspacesSection]}
+
             {/* Models */}
-            {/* The heading already says "Models", so rows carry the bare name. */}
+            {/* The heading already says "Models", so rows carry the bare name.
+                With no query it is a short preview (#850); typing searches
+                every model. */}
             <Group heading="Models" tour={tourId("palette-models")}>
-              {models.map((m) => (
+              {modelRows.shown.map((m) => (
                 <Item
                   key={m.model.id}
+                  value={paletteModelValue(m)}
+                  keywords={[m.model.displayName, m.provider]}
                   glyph="◇"
                   label={m.model.displayName}
                   detail={`${m.provider} · $${m.model.inputCostPerM}/M in`}
@@ -141,6 +254,34 @@ export function CommandPalette({
                   }
                 />
               ))}
+              {modelRows.hidden > 0 && (
+                <Item
+                  glyph="⋯"
+                  label="Show all models"
+                  detail={`${modelRows.hidden} more`}
+                  tour={tourId("palette-models-more")}
+                  onSelect={() => {
+                    // If this row were still selected when it unmounts, cmdk
+                    // would re-select the palette's first item ("New
+                    // session") (#897). So park the selection on the last
+                    // shown model, reveal, then select the first revealed
+                    // row through cmdk itself. A controlled `value` change
+                    // moves aria-selected but not cmdk's aria-activedescendant
+                    // (cmdk 1.1 recomputes it only when it selects a row), so
+                    // setting the value alone would leave assistive tech on
+                    // this removed row.
+                    const next = firstRevealedModel(models, modelRows.shown);
+                    const park = modelRows.shown[modelRows.shown.length - 1];
+                    if (!next || !park) {
+                      setAllModels(true);
+                      return;
+                    }
+                    flushSync(() => setSelected(paletteModelValue(park)));
+                    flushSync(() => setAllModels(true));
+                    selectRow(listRef.current, paletteModelValue(next));
+                  }}
+                />
+              )}
             </Group>
 
             {/* Templates */}
@@ -168,6 +309,13 @@ export function CommandPalette({
                   onSelect={() => run(onOpenPullRequest)}
                 />
               )}
+              <Item
+                glyph="↓"
+                label="Import a crew…"
+                detail=".octocrew.json"
+                tour={tourId("palette-import-crew")}
+                onSelect={() => run(() => useCrewImportStore.getState().show())}
+              />
               <Item
                 glyph="↺"
                 label="Check for updates"
@@ -341,22 +489,44 @@ function Group({
   );
 }
 
+/** Select a mounted row the way cmdk selects one under the pointer, so cmdk
+ *  updates its own value, aria-selected and aria-activedescendant together
+ *  (#897), then bring the row into view as keyboard navigation would. */
+function selectRow(list: HTMLElement | null, value: string) {
+  const row = Array.from(list?.querySelectorAll<HTMLElement>("[cmdk-item]") ?? []).find(
+    (el) => el.dataset.paletteValue === value,
+  );
+  if (!row) return;
+  row.dispatchEvent(new Event("pointermove", { bubbles: true }));
+  row.scrollIntoView?.({ block: "nearest" });
+}
+
 function Item({
   glyph,
   label,
   detail,
   shortcut,
+  tour,
+  value,
+  keywords,
   onSelect,
 }: {
+  value?: string;
+  keywords?: string[];
   glyph: string;
   label: string;
   detail?: string;
   shortcut?: string;
+  tour?: string;
   onSelect: () => void;
 }) {
   return (
     <Command.Item
+      value={value}
+      keywords={keywords}
       onSelect={onSelect}
+      data-tour={tour}
+      data-palette-value={value}
       className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
       style={
         {
@@ -391,6 +561,98 @@ function Item({
           {shortcut}
         </kbd>
       )}
+    </Command.Item>
+  );
+}
+
+/** A Groups row: the group's own mark (the rail's chevron, in its tint) in
+ *  the glyph box, its name over a mono meta line (`acme-api · 3 missions`
+ *  for a mission group, `2 projects` for a project group). */
+function GroupItem({ row, onSelect }: { row: PaletteGroup; onSelect: () => void }) {
+  const kind = row.scope === "project" ? "Project group" : "Mission group";
+  return (
+    <Command.Item
+      value={`${GROUP_VALUE_PREFIX}${row.id}`}
+      keywords={row.keywords}
+      onSelect={onSelect}
+      data-testid="palette-group"
+      className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-1.5 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
+    >
+      <span
+        aria-hidden
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-octo-hairline"
+        style={{ color: groupMarkColor(row, "var(--color-octo-mute)") }}
+      >
+        <ChevronDown size={12} />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="flex min-w-0" title={`${kind}: ${row.name}`}>
+          <MidTruncate text={row.name} className="min-w-0 flex-1" />
+        </span>
+        <span className="flex min-w-0 font-mono text-[10px] text-octo-mute" title={row.meta}>
+          <MidTruncate text={row.meta} tail={16} className="min-w-0 flex-1" />
+        </span>
+      </span>
+    </Command.Item>
+  );
+}
+
+/** A Workspaces row: the name over a mono meta line, "<project> · <branch>"
+ *  ("<project> · <group> · <branch>" for a mission in a group; the project
+ *  only when the list spans several, #935), both middle-truncated like the
+ *  rail with the full text, project included, in a title. A
+ *  static dot says the crew needs you (brass, the rail's non-beacon dot) or
+ *  that it is working (sage); the palette never pulses. */
+function WorkspaceItem({
+  row,
+  showProject,
+  onSelect,
+}: {
+  row: PaletteWorkspace;
+  showProject: boolean;
+  onSelect: () => void;
+}) {
+  const meta = paletteWorkspaceMeta(row, showProject);
+  const fullMeta = paletteWorkspaceMeta(row, true);
+  const state = row.needsYou ? "Needs you" : row.running ? "Working" : null;
+  return (
+    <Command.Item
+      // cmdk keys selection on `value`: the id keeps two same-named rows
+      // (one `main` per project) distinct; name, branch and project match
+      // through `keywords`. The prefix tells `paletteFilter` to score the
+      // keywords alone, so the UUID never matches a search.
+      value={`${WORKSPACE_VALUE_PREFIX}${row.id}`}
+      keywords={row.keywords}
+      onSelect={onSelect}
+      data-testid="palette-workspace"
+      className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-1.5 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
+    >
+      <span
+        aria-hidden
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-octo-hairline font-serif text-[12px] text-octo-mute group-aria-selected:text-octo-brass"
+      >
+        {row.glyph}
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="flex min-w-0" title={row.name}>
+          <MidTruncate text={row.name} className="min-w-0 flex-1" />
+        </span>
+        <span className="flex min-w-0 font-mono text-[10px] text-octo-mute" title={fullMeta}>
+          <MidTruncate text={meta} tail={16} className="min-w-0 flex-1" />
+        </span>
+      </span>
+      {/* Reserved slot, so a state change never shifts the row. */}
+      <span className="flex w-2 shrink-0 justify-center">
+        {state && (
+          <span
+            role="img"
+            aria-label={state}
+            title={state}
+            data-testid="palette-workspace-state"
+            className={`octo-pop-in h-[5px] w-[5px] rounded-full ${row.needsYou ? "bg-octo-brass" : "bg-octo-sage"}`}
+          />
+        )}
+      </span>
     </Command.Item>
   );
 }

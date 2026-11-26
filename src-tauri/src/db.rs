@@ -50,6 +50,60 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A group's name as stored: trimmed, and never empty.
+fn normalize_group_name(name: &str) -> AppResult<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(group_error("Group name cannot be empty."));
+    }
+    Ok(name.to_string())
+}
+
+/// A group's tint as stored: None for absent or blank, else one of
+/// [`GROUP_TINTS`]. Anything else is refused, so no new hue reaches the rail.
+fn normalize_group_tint(tint: Option<&str>) -> AppResult<Option<String>> {
+    match normalize_optional(tint) {
+        None => Ok(None),
+        Some(t) if GROUP_TINTS.contains(&t.as_str()) => Ok(Some(t)),
+        Some(t) => Err(group_error(format!(
+            "Unknown tint '{t}'. Use one of: {}.",
+            GROUP_TINTS.join(", ")
+        ))),
+    }
+}
+
+/// A refusal from the rail-group layer, worded for the user.
+fn group_error(message: impl Into<String>) -> crate::error::AppError {
+    crate::error::AppError::Other(message.into())
+}
+
+fn unknown_group_item_kind(kind: &str) -> crate::error::AppError {
+    group_error(format!("Unknown item kind '{kind}'. Use 'project' or 'workspace'."))
+}
+
+/// What a mission can wait for on its prerequisite (`workspaces.after_condition`).
+pub const PREREQUISITE_CONDITIONS: [&str; 2] = ["run_finished", "pr_merged"];
+
+/// A refusal from the prerequisite ("Starts after") layer, worded for the user.
+fn prerequisite_error(message: impl Into<String>) -> crate::error::AppError {
+    crate::error::AppError::Other(message.into())
+}
+
+/// Clears every link that points at `workspace_id` (it is being deleted or
+/// archived), so no mission waits on one that is gone.
+const CLEAR_LINKS_TO_WORKSPACE_SQL: &str =
+    "UPDATE workspaces SET after_workspace_id = NULL, after_condition = NULL,
+            branch_from_prerequisite = 0, auto_start = 0
+     WHERE after_workspace_id = ?1";
+
+/// Map an UPDATE's row count to "the group exists".
+fn group_found(changed: usize) -> AppResult<()> {
+    if changed == 0 {
+        return Err(group_error("Group not found."));
+    }
+    Ok(())
+}
+
 /// Parse a stage's `parents` JSON column (a list of upstream positions) into a
 /// vec. A NULL or malformed value reads as "no recorded parents" — the caller
 /// then treats the stage as part of a legacy linear chain.
@@ -429,6 +483,12 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN setup_script TEXT NOT NULL DEFAULT ''",
         )?;
+        // What new missions borrow from the main checkout (#961): a JSON
+        // `worktree_share::ShareSpec`, '' for nothing (opt-in).
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN share_with_missions TEXT NOT NULL DEFAULT ''",
+        )?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -646,6 +706,11 @@ impl Db {
             &self.conn,
             "ALTER TABLE chat_threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         )?;
+        // MCP servers switched off for one conversation (the Companion's "can
+        // use" chips): a JSON array of server names. NULL — every row from
+        // before the column — means none is off, so every configured server
+        // stays available, as it always was.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mcp_disabled TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
@@ -779,15 +844,84 @@ impl Db {
         // D18: the ask_director conversation transcript, so an answered block
         // CONTINUES its conversation instead of re-running from scratch.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_transcript TEXT")?;
+        // #730: the secret guard's hold on an Action stage (JSON `SecretHold`:
+        // findings without values, a fingerprint, and whether the director
+        // approved proceeding past exactly those findings). NULL otherwise.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN secret_hold TEXT")?;
         // #362: the spend the session had already reported when a Resume (or
         // an answered block) set resume_pending — the resumed Claude run
         // reports the conversation's whole total, so its budget cap sits on
         // top. 0 for every pre-existing row.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_prior_cost_usd REAL NOT NULL DEFAULT 0")?;
+        // #712: 1 once an attempt of this stage stopped before its CLI reported
+        // usage (Codex) — its cost is unknown, not $0. Sticky across re-runs:
+        // the unknown spend was burned all the same.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN usage_unreported INTEGER NOT NULL DEFAULT 0")?;
+        // #860: the same flag for the stage's current attempt only (cleared
+        // when an attempt starts), so the ledger labels each attempt's row by
+        // what that attempt did, not by an earlier one.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN attempt_usage_unreported INTEGER NOT NULL DEFAULT 0")?;
+        // #682: the token totals the stage's CLI session had reported by the end
+        // of its last attempt (JSON `{"session": id, "usage": SessionUsage}`,
+        // Codex only) — the baseline a `codex exec resume` subtracts, since a
+        // resumed thread reports its running total. NULL when unknown.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN session_usage TEXT")?;
+        // #791: the model the stage's last attempt actually ran on, when Claude
+        // Code's `system/init` named another than `agent_model` (its settings
+        // blocked the requested one). NULL when they matched or nobody said.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN ran_model TEXT")?;
+        // #893: how many tool calls Claude Code refused in the stage's last
+        // attempt (its result event's `permission_denials`).
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN refused_calls INTEGER NOT NULL DEFAULT 0")?;
+        // #895: the context size of the Claude CLI stage's latest top-level
+        // assistant message (input + cache read + cache write, Talk's
+        // `contextTokens`) and the window of the model that answered it, as
+        // `PersistingSink` last saw them — what the Direct context meter reads,
+        // detached runs included. NULL until the stage's first message, for
+        // Codex/API stages, and (window) when the catalog doesn't list the model.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_tokens INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_window INTEGER")?;
+        // #1025: the context reading a Resume (or an answered block) found on
+        // the stage before its reset forgot it — a resumed Claude run whose
+        // first reply reads far less came back on an empty conversation.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_context_tokens INTEGER")?;
+        // #973: 1 ⇒ the stage's pending `--resume` drops the deferred call
+        // whose tool is gone (`CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL`).
+        // Set by the Drop-the-call action, cleared when the run starts.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN drop_deferred_pending INTEGER NOT NULL DEFAULT 0")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
         )?;
+        // #613 (ONE-SHOT, gated via app_meta): Codex CLI stages took no effort
+        // before #613, so a stored effort on one that already ran is one it never
+        // got. Clear it, so history (RunFlow's pill, the pre-run estimate's
+        // samples) is true to what ran; from here on a Codex stage's effort is
+        // real. Only stages of a terminal run (completed/aborted — what `drive`
+        // never resumes) are cleared: every stage of a draft, running or paused
+        // run (a budget-parked `awaiting_checkpoint` stage, a retryable failed
+        // one) will still run with its effort. A stage is judged on the model it
+        // last ran on (`escalate_model` once escalated, as RunFlow and
+        // `run_stage_once` do); the model test mirrors
+        // `cli_runner::dialect_for_model`. `pipeline_stages` is left alone: those
+        // efforts apply from now on.
+        if self.meta_get("codex_stage_effort_cleared_v1")?.is_none() {
+            self.conn.execute(
+                "UPDATE run_stages SET effort = NULL, escalate_effort = NULL
+                 WHERE id IN (
+                     SELECT id FROM (
+                         SELECT s.id, lower(CASE WHEN s.escalated AND s.escalate_model IS NOT NULL
+                                                 THEN s.escalate_model ELSE s.agent_model END) AS m
+                         FROM run_stages s JOIN runs r ON r.id = s.run_id
+                         WHERE s.substrate = 'cli' AND r.status IN ('completed', 'aborted')
+                     )
+                     WHERE m LIKE 'gpt-%' OR m LIKE 'o1%' OR m LIKE 'o3%' OR m LIKE 'o4%'
+                        OR m LIKE '%codex%'
+                 )",
+                [],
+            )?;
+            self.meta_set("codex_stage_effort_cleared_v1", "done")?;
+        }
 
         // ── Routine pre-fire condition (Routines, `fire_condition` gate) ────
         // An optional shell command evaluated before each fire (exit 0 ⇒ fire,
@@ -839,6 +973,21 @@ impl Db {
         // belongs to. Adding a column at the END is safe — no read SELECTs *, all
         // list their columns explicitly, so existing positional maps are unmoved.
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN mission_id TEXT")?;
+        // Claude plan limit park (#731): the window that stopped the run, when
+        // it resets, when the automatic resume is due (NULL = the director
+        // resumes), and how many automatic resumes ran since the director
+        // last acted or a stage finished. Epoch seconds.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_window TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resets_at INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resume_at INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resume_count INTEGER NOT NULL DEFAULT 0")?;
+        // Consecutive automatic resumes claimed but not applied (#857): on
+        // the row, so the app and a detached worker share one count and a
+        // restart doesn't reset it.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_retry_count INTEGER NOT NULL DEFAULT 0")?;
+        // Plan-limit reports in a row whose reset was already past (#1109):
+        // Claude Code before 2.1.332 can report a limit that already reset.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_stale_count INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mission_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE terminals ADD COLUMN mission_id TEXT")?;
         // One-shot re-parenting: every existing workspace becomes a 'build'
@@ -1083,8 +1232,130 @@ impl Db {
             self.meta_set("spend_events_retired_reconcile_v1", "done")?;
         }
 
+        // #861: every Claude CLI session a Direct stage ran, kept for good
+        // (`run_stages.session_id` is overwritten per attempt and cleared on
+        // completion paths). The transcript ingestor skips these sessions —
+        // their spend is already metered as the stage's `direct` row — and
+        // removes any `run` rows it recorded for them before they were known.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS direct_cli_sessions (
+                session_id TEXT PRIMARY KEY,
+                run_id     TEXT,
+                stage_id   TEXT,
+                created_at TEXT NOT NULL
+            );
+            "#,
+        )?;
+        // Which Claude Code session each Run terminal runs, as that session's
+        // own hooks say (`claude_hooks::remember_sessions`): the hook's
+        // environment names the terminal, its payload the session. One
+        // current session per terminal; a terminal with none has no row. The
+        // Run Companion's Context section reads one terminal's context and
+        // spend through it. `ended_claude_sessions` remembers the sessions
+        // whose `SessionEnd` fired, so a late signal can't relink one and a
+        // finished conversation is never taken for a terminal's rival.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS terminal_claude_session (
+                terminal_id TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL,
+                linked_at   TEXT NOT NULL   -- the last hook signal naming this pair
+            );
+            CREATE INDEX IF NOT EXISTS idx_terminal_claude_session_session
+                ON terminal_claude_session(session_id);
+            CREATE TABLE IF NOT EXISTS ended_claude_sessions (
+                session_id TEXT PRIMARY KEY,
+                ended_at   TEXT NOT NULL
+            );
+            "#,
+        )?;
+        // Pruned on every migrating open (the app's start, and each
+        // `octopush-mcp` server start): 30 days is far past any message that
+        // could still be recent to a live session, or any late signal.
+        self.prune_ended_claude_sessions(&(Utc::now() - chrono::Duration::days(ENDED_SESSION_DAYS)).to_rfc3339())?;
+        // One-time backfill from what the stage rows still remember: the last
+        // attempt's session id, and the session its reported usage belongs to.
+        // The ingestor then purges the duplicate `run` rows those sessions'
+        // transcripts produced (it has to read the files to know their keys).
+        if self.meta_get("direct_cli_sessions_backfill_v1")?.is_none() {
+            self.backfill_direct_cli_sessions()?;
+            self.meta_set("direct_cli_sessions_backfill_v1", "done")?;
+        }
+
+        // Rail groups: a named, optionally tinted, one-level container for the
+        // workspace rail. One table, two scopes. A `project` group holds
+        // projects and belongs to no project; a `workspace` group holds one
+        // project's workspaces and is deleted with that project. Membership is
+        // the nullable `group_id` on the member's own row, so an item is in at
+        // most one group. The columns carry no foreign key: `delete_group`
+        // clears them in its own transaction, and a group that loses every
+        // member stays until it is deleted.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS groups (
+                id          TEXT PRIMARY KEY,
+                scope       TEXT NOT NULL CHECK (scope IN ('project','workspace')),
+                project_id  TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                tint        TEXT,
+                sort_order  INTEGER NOT NULL,
+                created_at  TEXT NOT NULL,
+                CHECK ((scope = 'project' AND project_id IS NULL)
+                    OR (scope = 'workspace' AND project_id IS NOT NULL))
+            );
+            CREATE INDEX IF NOT EXISTS idx_groups_scope ON groups(scope, project_id, sort_order);
+            "#,
+        )?;
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN group_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN group_id TEXT")?;
+
+        // ── Starts after (#960): a mission that waits on another mission of
+        // the same project. `after_workspace_id` names the prerequisite (no
+        // foreign key: deleting or archiving it clears the link in
+        // `delete_workspace` / `archive_workspace`); `after_condition` is one
+        // of `PREREQUISITE_CONDITIONS`. Both are NULL when there is no link.
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN after_workspace_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN after_condition TEXT")?;
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN branch_from_prerequisite INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0",
+        )?;
+
         self.backfill_default_threads()?;
 
+        Ok(())
+    }
+
+    /// Seed `direct_cli_sessions` from `run_stages.session_id` and the session
+    /// named in `run_stages.session_usage` (#861). Idempotent.
+    fn backfill_direct_cli_sessions(&self) -> AppResult<()> {
+        let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, run_id, session_id, session_usage, COALESCE(finished_at, started_at)
+                 FROM run_stages
+                 WHERE session_id IS NOT NULL OR session_usage IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let now = Utc::now().to_rfc3339();
+        for (stage_id, run_id, session_id, usage, at) in rows {
+            let from_usage = usage
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                .and_then(|v| v.get("session").and_then(|s| s.as_str()).map(str::to_string));
+            for sid in [session_id, from_usage].into_iter().flatten().filter(|s| !s.is_empty()) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO direct_cli_sessions (session_id, run_id, stage_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![sid, run_id, stage_id, at.as_deref().unwrap_or(&now)],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1253,7 +1524,7 @@ impl Db {
                 s.icon,
                 s.project_root,
                 agent_json,
-                s.token_budget,
+                s.token_budget.map(|b| b as i64),
                 s.tokens_used as i64,
                 s.tokens_input as i64,
                 s.tokens_output as i64,
@@ -2200,21 +2471,21 @@ impl Db {
 
     pub fn list_projects(
         &self,
-    ) -> AppResult<Vec<(String, String, String, String, Option<String>, bool, Option<String>)>> {
+    ) -> AppResult<Vec<ProjectListRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint FROM projects \
+            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint, group_id FROM projects \
              WHERE closed_at IS NULL \
              ORDER BY pinned DESC, sort_order IS NULL, sort_order ASC, created_at ASC",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?, r.get(7)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn get_project(&self, project_id: &str) -> AppResult<Option<crate::commands::ProjectInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, jira_project_key, pinned, tint FROM projects WHERE id = ?1",
+            "SELECT id, name, path, jira_project_key, pinned, tint, group_id FROM projects WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![project_id], |r| {
@@ -2225,6 +2496,7 @@ impl Db {
                     jira_project_key: r.get(3)?,
                     pinned: r.get::<_, i64>(4)? != 0,
                     tint: r.get(5)?,
+                    group_id: r.get(6)?,
                 })
             })
             .optional()?;
@@ -2280,6 +2552,30 @@ impl Db {
         self.conn.execute(
             "UPDATE projects SET setup_script = ?1 WHERE id = ?2",
             params![script, id],
+        )?;
+        Ok(())
+    }
+
+    /// What the project shares with new missions (nothing when unset, or no
+    /// such project). Read leniently and sanitized.
+    pub fn get_project_share(&self, id: &str) -> AppResult<crate::worktree_share::ShareSpec> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT share_with_missions FROM projects WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(crate::worktree_share::ShareSpec::from_stored(&raw.unwrap_or_default()))
+    }
+
+    pub fn set_project_share(&self, id: &str, spec: &crate::worktree_share::ShareSpec) -> AppResult<()> {
+        let spec = spec.sanitized();
+        let raw = if spec.is_empty() { String::new() } else { serde_json::to_string(&spec).unwrap_or_default() };
+        self.conn.execute(
+            "UPDATE projects SET share_with_missions = ?1 WHERE id = ?2",
+            params![raw, id],
         )?;
         Ok(())
     }
@@ -2341,19 +2637,486 @@ impl Db {
     /// newest first, capped at 10. Same tuple shape as `list_projects`.
     pub fn list_closed_projects(
         &self,
-    ) -> AppResult<Vec<(String, String, String, String, Option<String>, bool, Option<String>)>> {
+    ) -> AppResult<Vec<ProjectListRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint FROM projects \
+            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint, group_id FROM projects \
              WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 10",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?, r.get(7)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn delete_project(&self, id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ─── Rail groups ──────────────────────────────────────────────
+
+    fn row_to_group(r: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
+        Ok(GroupRow {
+            id: r.get(0)?,
+            scope: r.get(1)?,
+            project_id: r.get(2)?,
+            name: r.get(3)?,
+            tint: r.get(4)?,
+            sort_order: r.get(5)?,
+            created_at: r.get(6)?,
+        })
+    }
+
+    /// Every group, both scopes: project groups first, then workspace groups
+    /// project by project, each run in `sort_order`.
+    pub fn list_groups(&self) -> AppResult<Vec<GroupRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, project_id, name, tint, sort_order, created_at FROM groups
+             ORDER BY scope ASC, project_id ASC, sort_order ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_group)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_group(&self, id: &str) -> AppResult<Option<GroupRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, scope, project_id, name, tint, sort_order, created_at FROM groups WHERE id = ?1",
+                params![id],
+                Self::row_to_group,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Check that an item may join a group of `group_scope` owned by
+    /// `group_project`. `kind` is `project` or `workspace`; a group only holds
+    /// items of its own scope, and a workspace group only its project's.
+    fn ensure_item_fits_group(
+        &self,
+        kind: &str,
+        item_id: &str,
+        group_scope: &str,
+        group_project: Option<&str>,
+    ) -> AppResult<()> {
+        match kind {
+            "project" => {
+                self.ensure_group_item_exists(kind, item_id)?;
+                if group_scope != "project" {
+                    return Err(group_error("A project can only join a project group."));
+                }
+            }
+            "workspace" => {
+                let owner = self.ensure_group_item_exists(kind, item_id)?;
+                if group_scope != "workspace" {
+                    return Err(group_error("A workspace can only join a workspace group."));
+                }
+                if owner.as_deref() != group_project {
+                    return Err(group_error("A workspace can only join a group in its own project."));
+                }
+            }
+            other => return Err(unknown_group_item_kind(other)),
+        }
+        Ok(())
+    }
+
+    /// Check that the item exists. Returns a workspace's project id (None for
+    /// a project).
+    fn ensure_group_item_exists(&self, kind: &str, item_id: &str) -> AppResult<Option<String>> {
+        match kind {
+            "project" => {
+                let found: Option<i64> = self
+                    .conn
+                    .query_row("SELECT 1 FROM projects WHERE id = ?1", params![item_id], |r| r.get(0))
+                    .optional()?;
+                found.map(|_| None).ok_or_else(|| group_error("Project not found."))
+            }
+            "workspace" => {
+                let owner: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT project_id FROM workspaces WHERE id = ?1",
+                        params![item_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                owner.map(Some).ok_or_else(|| group_error("Workspace not found."))
+            }
+            other => Err(unknown_group_item_kind(other)),
+        }
+    }
+
+    /// Where a new group goes among its siblings (the groups of the same scope
+    /// and project). With no members it goes last. With members it takes the
+    /// place of its first member in rail order: before the first sibling whose
+    /// own first member comes later. Siblings that are empty keep their place.
+    /// Rail order is `list_projects`' for projects and `created_at` for
+    /// workspaces; closed projects and archived workspaces count too, so the
+    /// answer doesn't depend on what the rail hides.
+    fn new_group_sort_order(
+        &self,
+        scope: &str,
+        project_id: Option<&str>,
+        member_ids: &[String],
+    ) -> AppResult<i64> {
+        let siblings: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, sort_order FROM groups WHERE scope = ?1 AND project_id IS ?2
+                 ORDER BY sort_order ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![scope, project_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let last = siblings.iter().map(|(_, order)| *order + 1).max().unwrap_or(0);
+        if member_ids.is_empty() {
+            return Ok(last);
+        }
+        // (item id, its current group) in rail order.
+        let items: Vec<(String, Option<String>)> = if scope == "project" {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, group_id FROM projects
+                 ORDER BY pinned DESC, sort_order IS NULL, sort_order ASC, created_at ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, group_id FROM workspaces WHERE project_id = ?1
+                 ORDER BY created_at ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map(params![project_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(first_member) = items.iter().position(|(id, _)| member_ids.contains(id)) else {
+            return Ok(last);
+        };
+        // Each sibling's first member that stays with it (the new group's
+        // members are leaving theirs).
+        let mut sibling_first: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (idx, (id, group)) in items.iter().enumerate() {
+            let Some(group) = group else { continue };
+            if !member_ids.contains(id) {
+                sibling_first.entry(group.as_str()).or_insert(idx);
+            }
+        }
+        for (id, order) in &siblings {
+            if sibling_first.get(id.as_str()).is_some_and(|first| *first > first_member) {
+                return Ok(*order);
+            }
+        }
+        Ok(last)
+    }
+
+    /// Create a group and move `member_ids` into it, in one transaction. The
+    /// group is placed by [`Self::new_group_sort_order`]; siblings at or after
+    /// that place shift down by one. A member that was in another group leaves
+    /// it (one membership per item).
+    pub fn create_group(
+        &self,
+        scope: &str,
+        project_id: Option<&str>,
+        name: &str,
+        tint: Option<&str>,
+        member_ids: &[String],
+    ) -> AppResult<GroupRow> {
+        let name = normalize_group_name(name)?;
+        let tint = normalize_group_tint(tint)?;
+        let project_id = normalize_optional(project_id);
+        match scope {
+            "project" => {
+                if project_id.is_some() {
+                    return Err(group_error("A project group cannot belong to a project."));
+                }
+            }
+            "workspace" => {
+                let Some(pid) = project_id.as_deref() else {
+                    return Err(group_error("A workspace group needs the project it belongs to."));
+                };
+                self.ensure_group_item_exists("project", pid)?;
+            }
+            other => {
+                return Err(group_error(format!(
+                    "Unknown group scope '{other}'. Use 'project' or 'workspace'."
+                )))
+            }
+        }
+        // IMMEDIATE: the checks and the placement read before anything is
+        // written, and another process (octopush-mcp, a run worker) may write
+        // in between. Taking the write lock up front waits for it (busy
+        // timeout) instead of failing the upgrade from a stale read.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        for member in member_ids {
+            self.ensure_item_fits_group(scope, member, scope, project_id.as_deref())?;
+        }
+        let sort_order = self.new_group_sort_order(scope, project_id.as_deref(), member_ids)?;
+        tx.execute(
+            "UPDATE groups SET sort_order = sort_order + 1
+             WHERE scope = ?1 AND project_id IS ?2 AND sort_order >= ?3",
+            params![scope, project_id, sort_order],
+        )?;
+        let group = GroupRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope: scope.to_string(),
+            project_id,
+            name,
+            tint,
+            sort_order,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        tx.execute(
+            "INSERT INTO groups (id, scope, project_id, name, tint, sort_order, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![group.id, group.scope, group.project_id, group.name, group.tint, group.sort_order, group.created_at],
+        )?;
+        let assign = if scope == "project" {
+            "UPDATE projects SET group_id = ?1 WHERE id = ?2"
+        } else {
+            "UPDATE workspaces SET group_id = ?1 WHERE id = ?2"
+        };
+        for member in member_ids {
+            tx.execute(assign, params![group.id, member])?;
+        }
+        tx.commit()?;
+        Ok(group)
+    }
+
+    /// Rename a group. The name is trimmed; an empty one is refused.
+    pub fn rename_group(&self, id: &str, name: &str) -> AppResult<()> {
+        let name = normalize_group_name(name)?;
+        let changed = self
+            .conn
+            .execute("UPDATE groups SET name = ?1 WHERE id = ?2", params![name, id])?;
+        group_found(changed)
+    }
+
+    /// Set or clear (None or blank) a group's tint. Only [`GROUP_TINTS`] pass.
+    pub fn set_group_tint(&self, id: &str, tint: Option<&str>) -> AppResult<()> {
+        let tint = normalize_group_tint(tint)?;
+        let changed = self
+            .conn
+            .execute("UPDATE groups SET tint = ?1 WHERE id = ?2", params![tint, id])?;
+        group_found(changed)
+    }
+
+    /// Persist a manual order: each id gets its index in `ids` as `sort_order`,
+    /// like `set_project_order`. Pass the sibling groups of one scope (and
+    /// project) in their new order; ids that match no group are ignored.
+    pub fn set_group_order(&self, ids: &[String]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (idx, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE groups SET sort_order = ?1 WHERE id = ?2",
+                params![idx as i64, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete a group and keep its members: their `group_id` is cleared in the
+    /// same transaction (archived workspaces and closed projects included).
+    pub fn delete_group(&self, id: &str) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE projects SET group_id = NULL WHERE group_id = ?1", params![id])?;
+        tx.execute("UPDATE workspaces SET group_id = NULL WHERE group_id = ?1", params![id])?;
+        tx.execute("DELETE FROM groups WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Move a project or workspace into a group, or out of any group
+    /// (`group_id` None). Refuses a group of the other scope and a workspace
+    /// group of another project. An item is in at most one group, so joining
+    /// one leaves the previous.
+    pub fn set_item_group(&self, kind: &str, item_id: &str, group_id: Option<&str>) -> AppResult<()> {
+        match group_id {
+            Some(gid) => {
+                // Name an unknown kind before an unknown group.
+                if !matches!(kind, "project" | "workspace") {
+                    return Err(unknown_group_item_kind(kind));
+                }
+                let group = self
+                    .get_group(gid)?
+                    .ok_or_else(|| group_error("Group not found."))?;
+                self.ensure_item_fits_group(kind, item_id, &group.scope, group.project_id.as_deref())?;
+            }
+            None => {
+                self.ensure_group_item_exists(kind, item_id)?;
+            }
+        }
+        let sql = if kind == "project" {
+            "UPDATE projects SET group_id = ?1 WHERE id = ?2"
+        } else {
+            "UPDATE workspaces SET group_id = ?1 WHERE id = ?2"
+        };
+        self.conn.execute(sql, params![group_id, item_id])?;
+        Ok(())
+    }
+
+    /// Move several projects or workspaces (one `kind`) into a group, or out of
+    /// any, in one transaction: every item is checked like [`Self::set_item_group`]
+    /// checks one, and a single refusal leaves them all where they were.
+    pub fn set_items_group(&self, kind: &str, item_ids: &[String], group_id: Option<&str>) -> AppResult<()> {
+        if !matches!(kind, "project" | "workspace") {
+            return Err(unknown_group_item_kind(kind));
+        }
+        // IMMEDIATE, like `create_group`: the checks read before the writes.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let group = match group_id {
+            Some(gid) => Some(self.get_group(gid)?.ok_or_else(|| group_error("Group not found."))?),
+            None => None,
+        };
+        for item_id in item_ids {
+            match &group {
+                Some(g) => self.ensure_item_fits_group(kind, item_id, &g.scope, g.project_id.as_deref())?,
+                None => {
+                    self.ensure_group_item_exists(kind, item_id)?;
+                }
+            }
+        }
+        let sql = if kind == "project" {
+            "UPDATE projects SET group_id = ?1 WHERE id = ?2"
+        } else {
+            "UPDATE workspaces SET group_id = ?1 WHERE id = ?2"
+        };
+        for item_id in item_ids {
+            tx.execute(sql, params![group_id, item_id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ─── Prerequisites ("Starts after", #960) ─────────────────────
+
+    /// The mission `workspace_id` waits on, or None when it has no link.
+    pub fn get_workspace_prerequisite(&self, workspace_id: &str) -> AppResult<Option<PrerequisiteRow>> {
+        let row: Option<(Option<String>, Option<String>, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT after_workspace_id, after_condition, branch_from_prerequisite, auto_start
+                 FROM workspaces WHERE id = ?1",
+                params![workspace_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (after, condition, branch_from, auto_start) =
+            row.ok_or_else(|| prerequisite_error("Mission not found."))?;
+        Ok(match (after, condition) {
+            (Some(after_workspace_id), Some(after_condition)) => Some(PrerequisiteRow {
+                workspace_id: workspace_id.to_string(),
+                after_workspace_id,
+                after_condition,
+                branch_from_prerequisite: branch_from != 0,
+                auto_start: auto_start != 0,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Make `workspace_id` wait on `after_workspace_id` until `condition`
+    /// (one of [`PREREQUISITE_CONDITIONS`]), replacing any earlier link.
+    /// Refuses an unknown condition, a missing or archived prerequisite, one
+    /// from another project, and any link that would close a cycle (itself
+    /// included).
+    pub fn set_workspace_prerequisite(
+        &self,
+        workspace_id: &str,
+        after_workspace_id: &str,
+        condition: &str,
+        branch_from_prerequisite: bool,
+        auto_start: bool,
+    ) -> AppResult<PrerequisiteRow> {
+        if !PREREQUISITE_CONDITIONS.contains(&condition) {
+            return Err(prerequisite_error(format!(
+                "Unknown condition '{condition}'. Use one of: {}.",
+                PREREQUISITE_CONDITIONS.join(", ")
+            )));
+        }
+        // IMMEDIATE, like `set_items_group`: the checks read before the write.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let lookup = |id: &str| -> AppResult<Option<(String, String)>> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT project_id, status FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?)
+        };
+        let (project, _) = lookup(workspace_id)?.ok_or_else(|| prerequisite_error("Mission not found."))?;
+        let (after_project, after_status) = lookup(after_workspace_id)?
+            .ok_or_else(|| prerequisite_error("The mission to wait on was not found."))?;
+        if after_status == "archived" {
+            return Err(prerequisite_error("A mission can't wait on an archived mission."));
+        }
+        if after_project != project {
+            return Err(prerequisite_error("A mission can only wait on a mission of its own project."));
+        }
+        // Walk the chain up from the prerequisite: reaching `workspace_id`
+        // means the new link would close a loop. `seen` stops on a loop that
+        // somehow exists already.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(after_workspace_id.to_string());
+        while let Some(id) = cursor {
+            if id == workspace_id {
+                return Err(prerequisite_error("These missions would wait on each other."));
+            }
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            cursor = self
+                .conn
+                .query_row(
+                    "SELECT after_workspace_id FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+        }
+        tx.execute(
+            "UPDATE workspaces SET after_workspace_id = ?2, after_condition = ?3,
+                    branch_from_prerequisite = ?4, auto_start = ?5
+             WHERE id = ?1",
+            params![
+                workspace_id,
+                after_workspace_id,
+                condition,
+                branch_from_prerequisite as i64,
+                auto_start as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(PrerequisiteRow {
+            workspace_id: workspace_id.to_string(),
+            after_workspace_id: after_workspace_id.to_string(),
+            after_condition: condition.to_string(),
+            branch_from_prerequisite,
+            auto_start,
+        })
+    }
+
+    /// Remove `workspace_id`'s prerequisite, if it has one.
+    pub fn clear_workspace_prerequisite(&self, workspace_id: &str) -> AppResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE workspaces SET after_workspace_id = NULL, after_condition = NULL,
+                    branch_from_prerequisite = 0, auto_start = 0
+             WHERE id = ?1",
+            params![workspace_id],
+        )?;
+        if changed == 0 {
+            return Err(prerequisite_error("Mission not found."));
+        }
         Ok(())
     }
 
@@ -2406,7 +3169,7 @@ impl Db {
 
     pub fn list_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE project_id = ?1 AND status != 'archived' ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -2426,6 +3189,7 @@ impl Db {
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
                 from_branch: r.get(14)?,
+                group_id: r.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2433,7 +3197,7 @@ impl Db {
 
     pub fn get_workspace(&self, workspace_id: &str) -> AppResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE id = ?1",
         )?;
         let row = stmt
@@ -2454,6 +3218,7 @@ impl Db {
                     test_command: r.get(12)?,
                     linked_issue_key: r.get(13)?,
                     from_branch: r.get(14)?,
+                    group_id: r.get(15)?,
                 })
             })
             .optional()?;
@@ -2871,7 +3636,7 @@ impl Db {
         branch: &str,
     ) -> AppResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE project_id = ?1 AND branch = ?2
              ORDER BY (status = 'archived') ASC, created_at ASC LIMIT 1",
         )?;
@@ -2893,6 +3658,7 @@ impl Db {
                     test_command: r.get(12)?,
                     linked_issue_key: r.get(13)?,
                     from_branch: r.get(14)?,
+                    group_id: r.get(15)?,
                 })
             })
             .optional()?;
@@ -2976,6 +3742,7 @@ impl Db {
         // missions must be removed explicitly or they linger as active orphans.
         self.conn
             .execute("DELETE FROM missions WHERE workspace_id = ?1", params![id])?;
+        self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -2988,6 +3755,9 @@ impl Db {
             "UPDATE workspaces SET status = 'archived' WHERE id = ?1",
             params![id],
         )?;
+        // Missions waiting on this one stop waiting; restoring it doesn't
+        // bring the links back.
+        self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         // Keep the paired mission in lockstep: archive its active mission(s) so
         // the writer slot frees and it stops surfacing as an active mission.
         self.conn.execute(
@@ -3026,7 +3796,7 @@ impl Db {
     /// Archived workspaces for a project (status='archived'), newest first.
     pub fn list_archived_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE project_id = ?1 AND status = 'archived' ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -3046,6 +3816,7 @@ impl Db {
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
                 from_branch: r.get(14)?,
+                group_id: r.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -3158,6 +3929,100 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// The MCP servers switched off in a conversation, sorted. Empty for a
+    /// thread that never switched one off (NULL), an unreadable value, or a
+    /// thread that no longer exists: the default is every server.
+    pub fn thread_mcp_disabled(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT mcp_disabled FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok()).unwrap_or_default())
+    }
+
+    /// Replace a conversation's switched-off MCP servers. Names are trimmed,
+    /// de-duplicated and sorted; an empty list stores NULL (all on).
+    pub fn set_thread_mcp_disabled(&self, thread_id: &str, servers: &[String]) -> AppResult<()> {
+        let names: std::collections::BTreeSet<&str> =
+            servers.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let value = (!names.is_empty()).then(|| serde_json::to_string(&names).ok()).flatten();
+        self.conn.execute(
+            "UPDATE chat_threads SET mcp_disabled = ?2 WHERE id = ?1",
+            params![thread_id, value],
+        )?;
+        Ok(())
+    }
+
+    /// Turn one MCP server off (or back on) in a conversation, leaving the
+    /// others as stored, and return the new list. Read and written under the
+    /// one connection the caller holds locked, so two toggles never lose
+    /// each other's change.
+    pub fn set_thread_mcp_server_off(&self, thread_id: &str, server: &str, off: bool) -> AppResult<Vec<String>> {
+        let server = server.trim();
+        let mut names = self.thread_mcp_disabled(thread_id)?;
+        names.retain(|n| n != server);
+        if off && !server.is_empty() {
+            names.push(server.to_string());
+        }
+        self.set_thread_mcp_disabled(thread_id, &names)?;
+        self.thread_mcp_disabled(thread_id)
+    }
+
+    /// After MCP servers were renamed in Settings (`renames`: old → new):
+    /// every conversation that had an old name switched off has the new one
+    /// off instead, so a renamed server doesn't come back on there. Not
+    /// where `keeps_old(workspace path, old name)` says the conversation's
+    /// project still defines the old name itself (its `.claude/mcp.json`):
+    /// the entry there still means that server. All rows in one
+    /// transaction; an unreadable value is left as it is. Returns how many
+    /// conversations changed.
+    pub fn rename_thread_mcp_servers(
+        &self,
+        renames: &[(String, String)],
+        keeps_old: impl Fn(&str, &str) -> bool,
+    ) -> AppResult<usize> {
+        if renames.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let rows: Vec<(String, String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT t.id, t.mcp_disabled, COALESCE(NULLIF(w.worktree_path, ''), p.path) FROM chat_threads t \
+                 LEFT JOIN workspaces w ON w.id = t.workspace_id LEFT JOIN projects p ON p.id = w.project_id \
+                 WHERE t.mcp_disabled IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut changed = 0;
+        for (id, raw, path) in rows {
+            let Ok(names) = serde_json::from_str::<Vec<String>>(&raw) else { continue };
+            let mut hit = false;
+            // Each name maps once, so two servers that swap names swap here too.
+            let renamed: std::collections::BTreeSet<String> = names
+                .into_iter()
+                .map(|n| match renames.iter().find(|(old, _)| *old == n) {
+                    Some(_) if path.as_deref().is_some_and(|p| keeps_old(p, &n)) => n,
+                    Some((_, new)) => {
+                        hit = true;
+                        new.clone()
+                    }
+                    None => n,
+                })
+                .collect();
+            if hit {
+                tx.execute(
+                    "UPDATE chat_threads SET mcp_disabled = ?2 WHERE id = ?1",
+                    params![id, serde_json::to_string(&renamed)?],
+                )?;
+                changed += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn rename_chat_thread(&self, thread_id: &str, title: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE chat_threads SET title = ?1 WHERE id = ?2",
@@ -3173,6 +4038,140 @@ impl Db {
         self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
         Ok(())
+    }
+
+    /// The worktree of the workspace a thread belongs to (its checkpoints
+    /// live in that repository).
+    pub fn chat_thread_worktree(&self, thread_id: &str) -> AppResult<Option<String>> {
+        let path = self
+            .conn
+            .query_row(
+                "SELECT w.worktree_path FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1",
+                params![thread_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(path.flatten())
+    }
+
+    /// The workspace a thread belongs to and its worktree, when it has one.
+    pub fn chat_thread_home(&self, thread_id: &str) -> AppResult<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT w.id, w.worktree_path FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every thread of every workspace checked out at the same path as
+    /// `thread_id`'s workspace (itself included): the conversations whose
+    /// turns write to the same files.
+    pub fn chat_threads_sharing_worktree(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t2.id FROM chat_threads t
+               JOIN workspaces w ON w.id = t.workspace_id
+               JOIN workspaces w2 ON w2.id = w.id
+                 OR (w.worktree_path IS NOT NULL AND rtrim(w2.worktree_path, '/') = rtrim(w.worktree_path, '/'))
+               JOIN chat_threads t2 ON t2.workspace_id = w2.id
+             WHERE t.id = ?1",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Whether a Direct run is in progress (`running` or `paused`) in a
+    /// workspace checked out at `worktree_path`.
+    pub fn has_active_run_at(&self, worktree_path: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs r JOIN workspaces w ON w.id = r.workspace_id
+             WHERE r.status IN ('running', 'paused')
+               AND rtrim(w.worktree_path, '/') = rtrim(?1, '/')",
+            params![worktree_path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The threads of every workspace checked out at `worktree_path` (a
+    /// trailing slash ignored), to ask the chat engine whether one runs there.
+    pub fn chat_threads_at_worktree(&self, worktree_path: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+             WHERE rtrim(w.worktree_path, '/') = rtrim(?1, '/')",
+        )?;
+        let rows = stmt.query_map(params![worktree_path], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The ids of a workspace's threads (their checkpoints go when the
+    /// workspace is deleted or archived).
+    pub fn chat_thread_ids(&self, workspace_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM chat_threads WHERE workspace_id = ?1")?;
+        let rows = stmt.query_map(params![workspace_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Fork from a user turn (#958): a new thread in the same workspace holding
+    /// a copy of every message BEFORE `message_id`, which must be a user turn
+    /// of `thread_id`. Returns the new thread, the turn's text (the fork's
+    /// draft) and each copied row's (old id, new id).
+    pub fn fork_chat_thread(
+        &self,
+        thread_id: &str,
+        message_id: i64,
+    ) -> AppResult<(ChatThreadRow, String, Vec<(i64, i64)>)> {
+        let (workspace_id, title): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT workspace_id, title FROM chat_threads WHERE id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| crate::error::AppError::Other("That conversation no longer exists.".into()))?;
+        let draft: String = self
+            .conn
+            .query_row(
+                "SELECT content FROM chat_messages WHERE id = ?1 AND thread_id = ?2 AND role = 'user'",
+                params![message_id, thread_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| crate::error::AppError::Other("Only a message you sent can be forked from.".into()))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_messages WHERE thread_id = ?1 AND id < ?2 ORDER BY id")?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![thread_id, message_id], |r| r.get(0))?
+            .collect::<Result<Vec<i64>, rusqlite::Error>>()?;
+        drop(stmt);
+        // One transaction: a failure part-way leaves no half-copied fork.
+        let tx = self.conn.unchecked_transaction()?;
+        let thread = self.create_chat_thread(&workspace_id, &format!("{title} · fork"))?;
+        // A fork is the same conversation from here: it keeps its MCP scope.
+        tx.execute(
+            "UPDATE chat_threads SET mcp_disabled = (SELECT mcp_disabled FROM chat_threads WHERE id = ?2) WHERE id = ?1",
+            params![thread.id, thread_id],
+        )?;
+        let mut pairs = Vec::with_capacity(ids.len());
+        for old in ids {
+            tx.execute(
+                "INSERT INTO chat_messages (workspace_id, thread_id, role, content, model, input_tokens,
+                    output_tokens, cost_usd, created_at, cache_read_tokens, cache_creation_tokens, context_tokens)
+                 SELECT workspace_id, ?1, role, content, model, input_tokens, output_tokens, cost_usd,
+                    created_at, cache_read_tokens, cache_creation_tokens, context_tokens
+                 FROM chat_messages WHERE id = ?2",
+                params![thread.id, old],
+            )?;
+            pairs.push((old, tx.last_insert_rowid()));
+        }
+        tx.commit()?;
+        Ok((thread, draft, pairs))
     }
 
     /// Delete a message and everything after it in a thread (ids are monotonic
@@ -3230,11 +4229,20 @@ impl Db {
 
     // ─── Claude Code hook signals ──────────────────────────────────
 
-    /// Queue one hook signal for the app's poller (`claude_hooks`).
+    /// Queue one hook signal for the app's poller (`claude_hooks`), stamped now.
     pub fn insert_hook_signal(&self, terminal_id: &str, signal: &str, session_id: Option<&str>) -> AppResult<()> {
+        self.insert_hook_signal_at(terminal_id, signal, session_id, &Utc::now().to_rfc3339())
+    }
+
+    /// [`Self::insert_hook_signal`] stamped `at` (RFC3339 UTC): when the hook
+    /// fired, which the hook process notes as it starts. Rows are queued in
+    /// the order they are WRITTEN, and a hook that waited on the database
+    /// can be written after one that fired later; the stamp keeps the order
+    /// the events happened in.
+    pub fn insert_hook_signal_at(&self, terminal_id: &str, signal: &str, session_id: Option<&str>, at: &str) -> AppResult<()> {
         self.conn.execute(
             "INSERT INTO hook_signals (terminal_id, signal, session_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![terminal_id, signal, session_id, Utc::now().to_rfc3339()],
+            params![terminal_id, signal, session_id, at],
         )?;
         Ok(())
     }
@@ -3321,6 +4329,35 @@ impl Db {
         Ok(val.map(|v| v as u32))
     }
 
+    /// Persist the session line's order: `ids[i]` takes position `i`. Only
+    /// the workspace's own terminals move, so a stale or foreign id is a
+    /// no-op, and a session `ids` leaves out goes after the listed ones,
+    /// keeping its relative order.
+    pub fn set_terminal_order(&self, workspace_id: &str, ids: &[String]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let current: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM terminals WHERE workspace_id = ?1 ORDER BY position ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![workspace_id], |r| r.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut order: Vec<&String> = Vec::with_capacity(current.len());
+        for id in ids.iter().chain(current.iter()) {
+            if current.contains(id) && !order.contains(&id) {
+                order.push(id);
+            }
+        }
+        for (idx, id) in order.iter().enumerate() {
+            tx.execute(
+                "UPDATE terminals SET position = ?1 WHERE id = ?2 AND workspace_id = ?3",
+                params![idx as i64, id, workspace_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn rename_terminal(&self, id: &str, label: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE terminals SET label = ?1 WHERE id = ?2",
@@ -3334,6 +4371,8 @@ impl Db {
             "DELETE FROM terminals WHERE id = ?1",
             params![id],
         )?;
+        // Whatever Claude Code session it ran is no terminal's any more.
+        self.conn.execute("DELETE FROM terminal_claude_session WHERE terminal_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -3868,6 +4907,177 @@ impl Db {
         Ok(out)
     }
 
+    /// Make `session_id` the current Claude Code session of `terminal_id`,
+    /// confirmed at `at` (RFC3339 UTC, when the hook fired): what one of
+    /// that session's hooks just said. `started` is its `SessionStart`,
+    /// which also revives a session that had ended (a resume), but only when
+    /// it fired AFTER that end: `SessionStart` is asynchronous and
+    /// `SessionEnd` is not, so the start of a session that ended at once can
+    /// be written after its end, and must not link the terminal to a dead
+    /// session. Any other signal of an ended session is late and changes
+    /// nothing. `false` when nothing was linked. A session is current in one
+    /// terminal only: it leaves any other terminal, which then has none.
+    pub fn link_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str, started: bool) -> AppResult<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ended_at: Option<String> = tx
+            .query_row("SELECT ended_at FROM ended_claude_sessions WHERE session_id = ?1", params![session_id], |r| r.get(0))
+            .optional()?;
+        if let Some(ended_at) = ended_at {
+            // Both stamps are RFC3339 UTC in one shape, so they compare as text.
+            if !started || at <= ended_at.as_str() {
+                return Ok(false);
+            }
+            tx.execute("DELETE FROM ended_claude_sessions WHERE session_id = ?1", params![session_id])?;
+        }
+        tx.execute(
+            "DELETE FROM terminal_claude_session WHERE session_id = ?1 AND terminal_id != ?2",
+            params![session_id, terminal_id],
+        )?;
+        tx.execute(
+            "INSERT INTO terminal_claude_session (terminal_id, session_id, linked_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(terminal_id) DO UPDATE SET session_id = excluded.session_id, linked_at = excluded.linked_at",
+            params![terminal_id, session_id, at],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The Claude Code session `session_id` ended at `at` (its `SessionEnd`):
+    /// it is remembered as ended, and `terminal_id` has no current session
+    /// if that was the one it ran (an end naming another session leaves the
+    /// terminal's own alone). Also how a print-mode session is set aside,
+    /// from its first moment: it is never a terminal's session, and recorded
+    /// here it is never taken for a rival either. The newest end is kept.
+    pub fn end_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO ended_claude_sessions (session_id, ended_at) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET ended_at = MAX(ended_at, excluded.ended_at)",
+            params![session_id, at],
+        )?;
+        tx.execute(
+            "DELETE FROM terminal_claude_session WHERE terminal_id = ?1 AND session_id = ?2",
+            params![terminal_id, session_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The Claude Code session `terminal_id` runs, and when a hook last said
+    /// so: `(session id, linked_at)`. `None` when it has none.
+    pub fn terminal_claude_session(&self, terminal_id: &str) -> AppResult<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT session_id, linked_at FROM terminal_claude_session WHERE terminal_id = ?1",
+                params![terminal_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Whether `session_id` is the current session of some terminal.
+    pub fn claude_session_is_linked(&self, session_id: &str) -> AppResult<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM terminal_claude_session WHERE session_id = ?1)",
+            params![session_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Drop the ended sessions whose end is older than `cutoff` (RFC3339
+    /// UTC). An ended session only matters while its messages are recent
+    /// enough to be taken for a rival's, or a late signal of its own could
+    /// still arrive; the table would otherwise grow by one row per
+    /// conversation, for good. Returns the rows removed.
+    pub fn prune_ended_claude_sessions(&self, cutoff: &str) -> AppResult<usize> {
+        Ok(self.conn.execute("DELETE FROM ended_claude_sessions WHERE ended_at < ?1", params![cutoff])?)
+    }
+
+    /// Forget every terminal's current session (the hooks setting went off:
+    /// nothing confirms them any more).
+    pub fn clear_terminal_claude_sessions(&self) -> AppResult<()> {
+        self.conn.execute("DELETE FROM terminal_claude_session", [])?;
+        Ok(())
+    }
+
+    /// The workspace a Run terminal belongs to.
+    pub fn terminal_workspace(&self, terminal_id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row("SELECT workspace_id FROM terminals WHERE id = ?1", params![terminal_id], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Whether `terminal_id`'s session (`source_id`, the ledger's
+    /// `cc:<session id>`) has a rival: another Claude Code session metered in
+    /// `workspace_id` after `since` (RFC3339 UTC) that is neither over (its
+    /// `SessionEnd` fired) nor the current session of another terminal. Such
+    /// a session may be the one this terminal runs now, with no hook having
+    /// said so yet: a session whose hooks predate `SessionStart`, or one
+    /// started outside Octopush's terminals.
+    pub fn run_session_has_rival(&self, workspace_id: &str, terminal_id: &str, source_id: &str, since: &str) -> AppResult<bool> {
+        // `substr(source_id, 4)` drops the `cc:` prefix, so both lookups go
+        // through an index on the session id (the ended table's key, and
+        // `idx_terminal_claude_session_session`).
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM spend_events se
+                     WHERE se.surface = 'run' AND se.workspace_id = ?1 AND se.ts_utc > ?4
+                       AND se.source_id LIKE 'cc:%' AND se.source_id != ?3
+                       AND NOT EXISTS (SELECT 1 FROM ended_claude_sessions e
+                                       WHERE e.session_id = substr(se.source_id, 4))
+                       AND NOT EXISTS (SELECT 1 FROM terminal_claude_session t
+                                       WHERE t.session_id = substr(se.source_id, 4) AND t.terminal_id != ?2)
+                 )",
+                params![workspace_id, terminal_id, source_id, since],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// One Claude Code session's RUN rows, folded for the Run Companion's
+    /// Context section: what it spent (unpriced calls aside, as in
+    /// [`Self::thread_cost`]), the share of its prompt tokens the cache
+    /// served, and the model and time of its newest row. `source_id` is the
+    /// ledger's own key for a transcript-metered session (`cc:<session id>`).
+    /// `None` when the ledger holds no such row.
+    pub fn run_session_ledger(&self, source_id: &str) -> AppResult<Option<RunSessionLedger>> {
+        let (calls, unpriced_calls, spent_usd, input, read, create) = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(cost_basis = 'unpriced'), 0),
+                    COALESCE(SUM(CASE WHEN cost_basis = 'unpriced' THEN 0.0 ELSE cost_usd END), 0.0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_creation_tokens), 0)
+             FROM spend_events WHERE surface = 'run' AND source_id = ?1",
+            params![source_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        if calls == 0 {
+            return Ok(None);
+        }
+        let (last_model, last_ts) = self.conn.query_row(
+            "SELECT model, ts_utc FROM spend_events
+             WHERE surface = 'run' AND source_id = ?1
+             ORDER BY ts_utc DESC, id DESC LIMIT 1",
+            params![source_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let (cache_hit_pct, _) = cache_hit_pct(input, read, create);
+        Ok(Some(RunSessionLedger { calls, unpriced_calls, spent_usd, cache_hit_pct, last_model, last_ts }))
+    }
+
     /// Rows the re-pricer looks at: `'unpriced'` rows with tokens, plus —
     /// when `include_legacy` — `'computed'` rows at $0 with tokens (recorded
     /// before the ledger told unknown from free; a one-time pass, gated by
@@ -4091,7 +5301,7 @@ impl Db {
                 substrate: r.get(5)?,
                 checkpoint: r.get::<_, i64>(6)? != 0,
                 loop_target_position: r.get(7)?,
-                loop_max_iterations: r.get(8)?,
+                loop_max_iterations: clamp_loop_iterations(r.get(8)?),
                 loop_mode: r.get(9)?,
                 max_iterations: r.get(10)?,
                 pos_x: r.get(11)?,
@@ -4153,56 +5363,62 @@ impl Db {
     /// Insert the three curated pipelines if they are not already present.
     /// Idempotent: keyed on the builtin name.
     pub fn seed_builtin_pipelines(&self) -> AppResult<()> {
+        // Models come from the builtin lineup's tags, so a fresh install seeds
+        // current models. Crews already seeded are never rewritten (keyed on the
+        // name below): a saved crew's cost doesn't change silently.
+        let fast = crate::provider_router::builtin_anthropic_model_tagged("fast");
+        let balanced = crate::provider_router::builtin_anthropic_model_tagged("balanced");
+        let (fast, balanced) = (fast.as_str(), balanced.as_str());
         // (name, description, [(role, model, substrate, checkpoint, loop_target, loop_max, loop_mode)])
         let defs: &[(&str, &str, &[(&str, &str, &str, bool, Option<i64>, i64, Option<&str>)])] = &[
             (
                 "Feature Factory",
                 "Full build: plan, review, implement, review, test.",
                 &[
-                    ("plan",        "claude-haiku-4-5",   "api", false, None,    0, None),
-                    ("plan_review", "claude-haiku-4-5",   "api", false, None,    0, None),
-                    ("implement",   "claude-sonnet-4-6",  "api", true,  None,    0, None),
-                    ("code_review", "claude-haiku-4-5",   "api", true,  Some(2), 2, Some("gated")),
-                    ("test",        "claude-haiku-4-5",   "api", true,  None,    0, None),
+                    ("plan",        fast,     "api", false, None,    0, None),
+                    ("plan_review", fast,     "api", false, None,    0, None),
+                    ("implement",   balanced, "api", true,  None,    0, None),
+                    ("code_review", fast,     "api", true,  Some(2), 2, Some("gated")),
+                    ("test",        fast,     "api", true,  None,    0, None),
                 ],
             ),
             (
                 "Bugfix relay",
                 "Reproduce, fix, verify. Lean and fast.",
                 &[
-                    ("repro",  "claude-haiku-4-5",  "api", false, None,    0, None),
-                    ("fix",    "claude-sonnet-4-6",  "api", true,  None,    0, None),
-                    ("verify", "claude-haiku-4-5",   "api", true,  Some(1), 2, Some("gated")),
+                    ("repro",  fast,     "api", false, None,    0, None),
+                    ("fix",    balanced, "api", true,  None,    0, None),
+                    ("verify", fast,     "api", true,  Some(1), 2, Some("gated")),
                 ],
             ),
             (
                 "Plan & review",
                 "Thinking only — no code is written.",
                 &[
-                    ("plan",     "claude-sonnet-4-6", "api", false, None, 0, None),
-                    ("critique", "claude-haiku-4-5",  "api", false, None, 0, None),
-                    ("refine",   "claude-sonnet-4-6", "api", true,  None, 0, None),
+                    ("plan",     balanced, "api", false, None, 0, None),
+                    ("critique", fast,     "api", false, None, 0, None),
+                    ("refine",   balanced, "api", true,  None, 0, None),
                 ],
             ),
             (
                 "Ship it",
                 "Issue to pull request: plan, implement, review, test, open the PR.",
                 &[
-                    ("plan",         "claude-haiku-4-5",  "api", false, None,    0, None),
-                    ("implement",    "claude-sonnet-4-6", "api", true,  None,    0, None),
-                    ("code_review",  "claude-haiku-4-5",  "api", true,  Some(1), 2, Some("gated")),
-                    ("test",         "claude-haiku-4-5",  "api", true,  None,    0, None),
-                    ("pull_request", "claude-sonnet-4-6", "cli", true,  None,    0, None),
+                    ("plan",         fast,     "api", false, None,    0, None),
+                    ("implement",    balanced, "api", true,  None,    0, None),
+                    ("code_review",  fast,     "api", true,  Some(1), 2, Some("gated")),
+                    ("test",         fast,     "api", true,  None,    0, None),
+                    ("pull_request", balanced, "cli", true,  None,    0, None),
                 ],
             ),
             (
                 "Claude Code build",
                 "Plan via API, then implement, review, and test with Claude Code (CLI).",
                 &[
-                    ("plan",        "claude-haiku-4-5",  "api", false, None,    0, None),
-                    ("implement",   "claude-sonnet-4-6", "cli", true,  None,    0, None),
-                    ("code_review", "claude-haiku-4-5",  "cli", true,  Some(1), 2, Some("gated")),
-                    ("test",        "claude-haiku-4-5",  "cli", true,  None,    0, None),
+                    ("plan",        fast,     "api", false, None,    0, None),
+                    ("implement",   balanced, "cli", true,  None,    0, None),
+                    ("code_review", fast,     "cli", true,  Some(1), 2, Some("gated")),
+                    ("test",        fast,     "cli", true,  None,    0, None),
                 ],
             ),
         ];
@@ -4274,10 +5490,13 @@ impl Db {
             "From a prompt to a first working slice of a brand-new project.",
             true,
         )?;
+        let fast = crate::provider_router::builtin_anthropic_model_tagged("fast");
+        let balanced = crate::provider_router::builtin_anthropic_model_tagged("balanced");
+        let (fast, balanced) = (fast.as_str(), balanced.as_str());
         // (role, custom_name, model, checkpoint, loop_target, loop_max, loop_mode, instructions)
         let stages: &[(&str, &str, &str, bool, Option<i64>, i64, Option<&str>, &str)] = &[
             (
-                "plan", "Choose the stack", "claude-sonnet-4-6", true, None, 0, None,
+                "plan", "Choose the stack", balanced, true, None, 0, None,
                 "This is a GREENFIELD project — the repository is empty. Read the brief and choose the \
                  SIMPLEST language, framework, and structure that genuinely satisfies it (bias to what \
                  can be verified locally with common toolchains). Propose the directory structure and a \
@@ -4286,26 +5505,26 @@ impl Db {
                  director approves before the build begins.",
             ),
             (
-                "implement", "Scaffold", "claude-sonnet-4-6", false, None, 0, None,
+                "implement", "Scaffold", balanced, false, None, 0, None,
                 "Scaffold ONLY the structure the approved plan chose: directories, dependency manifests, \
                  config, and a sensible .gitignore. Do not implement features yet — create the skeleton \
                  that installs/builds cleanly. Prefer standard, well-known project layouts for the chosen \
                  stack.",
             ),
             (
-                "implement", "First increment", "claude-sonnet-4-6", true, None, 0, None,
+                "implement", "First increment", balanced, true, None, 0, None,
                 "Implement the FIRST working increment from the plan — the smallest slice that actually \
                  runs: a passing test, a server that responds, a CLI that does one thing, or a view that \
                  compiles. Keep it minimal and real. This is a starting point a developer can build on, \
                  not a finished product.",
             ),
             (
-                "code_review", "Review the increment", "claude-haiku-4-5", true, Some(2), 2, Some("gated"),
+                "code_review", "Review the increment", fast, true, Some(2), 2, Some("gated"),
                 "Review the increment for correctness and obvious issues. Keep the bar at 'a competent \
                  first slice', not 'production-ready' — this is a greenfield starting point.",
             ),
             (
-                "test", "Verify honestly", "claude-sonnet-4-6", true, None, 0, None,
+                "test", "Verify honestly", balanced, true, None, 0, None,
                 "Run whatever can be run to verify the increment. Then write a README.md that is HONEST: \
                  how to run it, what you actually verified (e.g. 'tests pass', 'the server responds on \
                  :3000'), and what you could NOT verify in this environment (e.g. 'no iOS simulator \
@@ -4356,6 +5575,7 @@ impl Db {
         // write — but a tight allowlist keeps the agent from even trying.)
         let profile_tools = r#"["read_file","list_files","run_command"]"#;
         let read_tools = r#"["read_file","list_files"]"#;
+        let model = crate::provider_router::builtin_anthropic_model_tagged("balanced");
         // (custom_name, checkpoint, instructions, tools_json)
         let stages: &[(&str, bool, &str, &str)] = &[
             (
@@ -4389,8 +5609,8 @@ impl Db {
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      custom_name, instructions, tools)
-                 VALUES (?1,?2,?3,'critique','claude-sonnet-4-6','api',?4,NULL,0,NULL,25,?5,?6,?7)",
-                params![id, pid, i as i64, *checkpoint as i64, custom_name, instructions, tools],
+                 VALUES (?1,?2,?3,'critique',?8,'api',?4,NULL,0,NULL,25,?5,?6,?7)",
+                params![id, pid, i as i64, *checkpoint as i64, custom_name, instructions, tools, model],
             )?;
         }
         Ok(())
@@ -4569,7 +5789,11 @@ impl Db {
         self.conn
             .query_row(
                 "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                        reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                        reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
                  FROM runs WHERE id = ?1",
                 params![run_id],
                 row_to_run,
@@ -4581,7 +5805,11 @@ impl Db {
     pub fn list_runs(&self, workspace_id: &str) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs WHERE workspace_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], row_to_run)?;
@@ -4594,7 +5822,11 @@ impl Db {
     pub fn list_active_runs(&self) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs WHERE status IN ('running', 'paused') ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_run)?;
@@ -4661,7 +5893,11 @@ impl Db {
     pub fn list_terminal_runs(&self, limit: u32) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs WHERE status IN ('completed', 'aborted') ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_run)?;
@@ -4681,7 +5917,11 @@ impl Db {
         let since = since.with_timezone(&Utc).to_rfc3339();
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs
              WHERE status IN ('completed', 'aborted') AND finished_at IS NOT NULL AND finished_at > ?1
              ORDER BY finished_at DESC LIMIT 50",
@@ -4881,7 +6121,7 @@ impl Db {
                 substrate: r.get(2)?,
                 checkpoint: r.get::<_, i64>(3)? != 0,
                 loop_target_position: r.get(4)?,
-                loop_max_iterations: r.get(5)?,
+                loop_max_iterations: clamp_loop_iterations(r.get(5)?),
                 loop_mode: r.get(6)?,
                 max_iterations: r.get(7)?,
                 pos_x: r.get(8)?,
@@ -4934,7 +6174,18 @@ impl Db {
             Some((local, _)) if local.as_str() >= sp.updated_at.as_str() => return Ok(false),
             _ => {}
         }
-        self.validate_pipeline_stages(&sp.stages)?;
+        // A pipeline saved before the loop cap may arrive with a larger count:
+        // clamp it rather than skip the item forever.
+        let stages: Vec<StageDraft> = sp
+            .stages
+            .iter()
+            .cloned()
+            .map(|mut st| {
+                st.loop_max_iterations = clamp_loop_iterations(st.loop_max_iterations);
+                st
+            })
+            .collect();
+        self.validate_pipeline_stages(&stages)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO pipelines (id, name, description, is_builtin, created_at, updated_at)
@@ -4944,7 +6195,7 @@ impl Db {
             params![sp.id, sp.name, sp.description, sp.updated_at],
         )?;
         tx.execute("DELETE FROM pipeline_stages WHERE pipeline_id = ?1", params![sp.id])?;
-        for (i, st) in sp.stages.iter().enumerate() {
+        for (i, st) in stages.iter().enumerate() {
             let parents_json = serde_json::to_string(&st.parents).ok();
             let tools_json = st.tools.as_ref().and_then(|t| serde_json::to_string(t).ok());
             tx.execute(
@@ -5047,7 +6298,7 @@ impl Db {
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
                     max_iterations, parents, tools, custom_name, instructions,
                     session_id, resume_pending, baseline_commit, effort, blocked_questions,
-                    escalate_model, escalate_effort, escalated, blocked_transcript
+                    escalate_model, escalate_effort, escalated, blocked_transcript, secret_hold
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -5087,6 +6338,9 @@ impl Db {
                 baseline_commit: r.get(28)?,
                 blocked_questions: r.get(30)?,
                 blocked_transcript: r.get(34)?,
+                secret_hold: r
+                    .get::<_, Option<String>>(35)?
+                    .and_then(|j| serde_json::from_str(&j).ok()),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -5106,6 +6360,166 @@ impl Db {
             )?;
         }
         Ok(())
+    }
+
+    // ── Claude plan limit park (#731) ────────────────────────────────────────
+
+    /// Park the run at a Claude plan limit: the window, its reset, and the
+    /// automatic resume (`None` = the director resumes), and how many reports
+    /// in a row came with their reset already past (`stale_count`, #1109).
+    pub fn set_run_plan_wait(
+        &self,
+        run_id: &str,
+        window: &str,
+        resets_at: i64,
+        resume_at: Option<i64>,
+        stale_count: i64,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4, plan_stale_count = ?5
+             WHERE id = ?1",
+            params![run_id, window, resets_at, resume_at, stale_count],
+        )?;
+        Ok(())
+    }
+
+    /// The run is no longer parked by its plan (resumed, resolved, aborted).
+    /// The automatic-resume count is kept: see [`Db::reset_plan_resume_count`].
+    /// So is the stale-report count: the next report must know it came in a row.
+    pub fn clear_run_plan_wait(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_window = NULL, plan_resets_at = NULL, plan_resume_at = NULL WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// The director turned the automatic resume off: the run stays parked by
+    /// its plan and waits for a manual Resume. Returns whether one was due.
+    pub fn cancel_plan_resume(&self, run_id: &str) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET plan_resume_at = NULL WHERE id = ?1 AND plan_resume_at IS NOT NULL",
+            params![run_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Claim the automatic resume of a plan-parked run whose time has come:
+    /// a compare-and-set, so the app's tick and a waiting detached worker can
+    /// race and exactly one of them resumes. Counts the resume, unless the
+    /// park came from a stale report (`plan_stale_count`, #1109): that one
+    /// resume is Claude Code's error, not the plan's wall.
+    ///
+    /// The claim does NOT clear the resume time: it moves it to `retry_at`.
+    /// Applying the Resume ends the park (`clear_run_plan_wait`); until then
+    /// the park stays due again at `retry_at`, so a claimant that fails or
+    /// dies between the claim and the apply can never lose the resume.
+    pub fn claim_plan_resume(&self, run_id: &str, now: i64, retry_at: i64) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET plan_resume_at = ?3,
+                 plan_resume_count = plan_resume_count + (CASE WHEN plan_stale_count > 0 THEN 0 ELSE 1 END)
+             WHERE id = ?1 AND status = 'paused' AND plan_resume_at IS NOT NULL AND plan_resume_at <= ?2",
+            params![run_id, now, retry_at],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Undo a claim whose Resume couldn't be applied: the run is parked by its
+    /// plan again, its automatic resume due at `resume_at` (`None` = it now
+    /// waits for the director), and the claim no longer counts against the cap.
+    ///
+    /// Only the claim's own park is put back: the schedule must still be the
+    /// `claimed_at` the claim set, or the park must be gone entirely (the
+    /// failed apply cleared it). A park whose schedule changed meanwhile (the
+    /// director turned the automatic resume off, which keeps the window but
+    /// clears `plan_resume_at`) is left as the director left it. Returns
+    /// whether the park was put back.
+    pub fn restore_plan_resume(
+        &self,
+        run_id: &str,
+        window: &str,
+        resets_at: i64,
+        resume_at: Option<i64>,
+        claimed_at: i64,
+    ) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4,
+                 plan_resume_count = MAX(plan_resume_count - (CASE WHEN plan_stale_count > 0 THEN 0 ELSE 1 END), 0)
+             WHERE id = ?1 AND status = 'paused'
+               AND (plan_resume_at = ?5 OR (plan_window IS NULL AND plan_resume_at IS NULL))",
+            params![run_id, window, resets_at, resume_at, claimed_at],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// A fresh allowance of automatic resumes (the director acted, or a stage
+    /// finished: the run got past the wall). Failed claims and stale reports
+    /// start over too.
+    pub fn reset_plan_resume_count(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_resume_count = 0, plan_retry_count = 0, plan_stale_count = 0
+             WHERE id = ?1 AND (plan_resume_count <> 0 OR plan_retry_count <> 0 OR plan_stale_count <> 0)",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count one more automatic resume that was claimed but couldn't be
+    /// applied, by any process; returns the consecutive count.
+    pub fn bump_plan_retry_count(&self, run_id: &str) -> AppResult<i64> {
+        self.conn.execute(
+            "UPDATE runs SET plan_retry_count = plan_retry_count + 1 WHERE id = ?1",
+            params![run_id],
+        )?;
+        self.plan_retry_count(run_id)
+    }
+
+    /// Consecutive automatic resumes claimed but not applied.
+    pub fn plan_retry_count(&self, run_id: &str) -> AppResult<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT plan_retry_count FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// An automatic resume applied (or handed to the director): failed
+    /// claims start over.
+    pub fn reset_plan_retry_count(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_retry_count = 0 WHERE id = ?1 AND plan_retry_count <> 0",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Automatic plan resumes since the director last acted or a stage finished.
+    pub fn plan_resume_count(&self, run_id: &str) -> AppResult<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT plan_resume_count FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Plan-limit reports in a row whose reset was already past (#1109),
+    /// since the director last acted or a stage finished.
+    pub fn plan_stale_count(&self, run_id: &str) -> AppResult<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT plan_stale_count FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Paused runs whose automatic plan resume is due at `now`.
+    pub fn list_due_plan_resumes(&self, now: i64) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM runs WHERE status = 'paused' AND plan_resume_at IS NOT NULL
+             AND plan_resume_at <= ?1 ORDER BY plan_resume_at",
+        )?;
+        let rows = stmt.query_map(params![now], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn set_run_cost(&self, run_id: &str, cost_usd: f64, baseline_usd: f64) -> AppResult<()> {
@@ -5605,6 +7019,23 @@ impl Db {
         Ok(())
     }
 
+    /// The name of the Routine whose last fired run is `run_id`
+    /// (`last_run_id`), if any — how "Notify me elsewhere" (#964) tells a
+    /// Routine's crew from one the director started, and what it calls it. A
+    /// Routine never fires again while its run is live (the fire guards), so
+    /// its run is still `last_run_id` when it ends.
+    pub fn routine_name_for_run(&self, run_id: &str) -> AppResult<Option<String>> {
+        let name: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT name FROM routines WHERE last_run_id = ?1 LIMIT 1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(name)
+    }
+
     /// Record the outcome of a fire evaluation (dispatched, or a skip reason)
     /// on EVERY tick — `last_checked_at`/`last_outcome`. Independent of
     /// `stamp_routine_run` (which records the dispatched run itself); this keeps
@@ -5639,6 +7070,16 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Persist (or clear, with `None`) the secret guard's hold on a stage (#730).
+    pub fn set_stage_secret_hold(&self, stage_id: &str, hold: Option<&crate::secret_scan::SecretHold>) -> AppResult<()> {
+        let json = hold.map(serde_json::to_string).transpose()?;
+        self.conn.execute(
+            "UPDATE run_stages SET secret_hold = ?2 WHERE id = ?1",
+            params![stage_id, json],
+        )?;
+        Ok(())
+    }
+
     /// Persist (or clear, with `None`) a parked stage's `ask_director`
     /// questions — the JSON `BlockedAsk` the answer form reads. Set when a stage
     /// blocks; cleared when the director answers (or, defensively, on any reset).
@@ -5670,12 +7111,102 @@ impl Db {
         Ok(())
     }
 
+    /// Mark a run-stage whose CLI stopped before reporting usage (sticky; see
+    /// the `usage_unreported` column), and its current attempt.
+    pub fn set_run_stage_usage_unreported(&self, stage_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET usage_unreported = 1, attempt_usage_unreported = 1 WHERE id = ?1",
+            params![stage_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record the model a stage's attempt actually ran on (`None` = the one
+    /// it asked for). Set before the attempt's completion is recorded, so its
+    /// spend event is attributed to that model (`record_direct_spend`).
+    pub fn set_run_stage_ran_model(&self, stage_id: &str, ran_model: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET ran_model = ?2 WHERE id = ?1",
+            params![stage_id, ran_model],
+        )?;
+        Ok(())
+    }
+
+    /// The run's stages that ran on another model than they asked for:
+    /// stage id → the model that ran.
+    pub fn ran_models(&self, run_id: &str) -> AppResult<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, ran_model FROM run_stages WHERE run_id = ?1 AND ran_model IS NOT NULL")?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Record a Claude CLI stage's latest context reading (#895): the context
+    /// size of its latest top-level assistant message and the window of the
+    /// model that answered it (`None` when the catalog doesn't know it).
+    /// Written by `PersistingSink`, at most once per message.
+    pub fn set_run_stage_context(&self, stage_id: &str, tokens: i64, window: Option<i64>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET context_tokens = ?2, context_window = ?3 WHERE id = ?1",
+            params![stage_id, tokens, window],
+        )?;
+        Ok(())
+    }
+
+    /// The run's stages with a context reading: stage id → (tokens, window).
+    pub fn stage_contexts(&self, run_id: &str) -> AppResult<std::collections::HashMap<String, (i64, Option<i64>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, context_tokens, context_window FROM run_stages
+             WHERE run_id = ?1 AND context_tokens IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![run_id], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)))
+        })?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Record how many tool calls Claude Code refused in a stage's attempt
+    /// (`0` clears an earlier attempt's).
+    pub fn set_run_stage_refused_calls(&self, stage_id: &str, count: u32) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET refused_calls = ?2 WHERE id = ?1",
+            params![stage_id, count],
+        )?;
+        Ok(())
+    }
+
+    /// The run's stages whose last attempt had tool calls refused: stage id →
+    /// how many.
+    pub fn refused_call_counts(&self, run_id: &str) -> AppResult<std::collections::HashMap<String, u32>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, refused_calls FROM run_stages WHERE run_id = ?1 AND refused_calls > 0")?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Ids of the run's stages flagged `usage_unreported`.
+    pub fn usage_unreported_stage_ids(&self, run_id: &str) -> AppResult<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM run_stages WHERE run_id = ?1 AND usage_unreported != 0")?;
+        let rows = stmt.query_map(params![run_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(Into::into)
+    }
+
     pub fn set_run_stage_status(&self, stage_id: &str, status: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        // Stamp started_at the first time it goes running.
+        // Stamp started_at the first time it goes running. A (re)start also
+        // forgets the last attempt's context reading (#895): the new attempt's
+        // first message brings its own, and the last attempt's unreported
+        // usage (#860): the sticky `usage_unreported` keeps it.
         self.conn.execute(
             "UPDATE run_stages SET status = ?2,
-                started_at = COALESCE(started_at, CASE WHEN ?2 = 'running' THEN ?3 ELSE started_at END)
+                started_at = COALESCE(started_at, CASE WHEN ?2 = 'running' THEN ?3 ELSE started_at END),
+                context_tokens = CASE WHEN ?2 = 'running' THEN NULL ELSE context_tokens END,
+                context_window = CASE WHEN ?2 = 'running' THEN NULL ELSE context_window END,
+                attempt_usage_unreported = CASE WHEN ?2 = 'running' THEN 0 ELSE attempt_usage_unreported END
              WHERE id = ?1",
             params![stage_id, status, now],
         )?;
@@ -5744,9 +7275,9 @@ impl Db {
     /// Tokens of the `limit` most recent stages of `role` at `effort` in
     /// completed runs, each summed over every attempt the ledger recorded
     /// (loop-backs and re-runs included — that is what the stage cost).
-    /// Effort reaches the API and Claude Code (`--effort`) but not Codex, so a
-    /// Codex CLI stage counts as no effort — the model test mirrors
-    /// `cli_runner::dialect_for_model`. Read-only; feeds the pre-run estimate.
+    /// Every stage keys by its stored effort: Codex CLI stages that ran before
+    /// they took one had it cleared by a one-time migration (#613), so they
+    /// count as no effort, as they ran. Read-only; feeds the pre-run estimate.
     pub fn stage_token_samples(
         &self,
         role: &str,
@@ -5760,11 +7291,7 @@ impl Db {
              JOIN run_stages s ON s.id = se.source_id
              JOIN runs r ON r.id = s.run_id
              WHERE se.surface = 'direct' AND r.status = 'completed' AND s.role = ?1
-               AND (CASE WHEN s.substrate = 'cli' AND (
-                        lower(s.agent_model) LIKE 'gpt-%' OR lower(s.agent_model) LIKE 'o1%'
-                        OR lower(s.agent_model) LIKE 'o3%' OR lower(s.agent_model) LIKE 'o4%'
-                        OR lower(s.agent_model) LIKE '%codex%'
-                    ) THEN NULL ELSE s.effort END) IS ?2
+               AND s.effort IS ?2
              GROUP BY s.id
              HAVING SUM(se.input_tokens + se.output_tokens + se.cache_read_tokens + se.cache_creation_tokens) > 0
              ORDER BY MAX(se.ts_utc) DESC
@@ -5794,28 +7321,34 @@ impl Db {
         cache_creation_tokens: i64,
         cost_usd: f64,
     ) -> AppResult<()> {
-        let attr: Option<(String, Option<String>, String, Option<String>)> = self
+        let attr: Option<(String, Option<String>, String, Option<String>, bool)> = self
             .conn
             .query_row(
-                "SELECT r.workspace_id, w.project_id, s.agent_model, r.mission_id
+                "SELECT r.workspace_id, w.project_id, COALESCE(s.ran_model, s.agent_model), r.mission_id, s.attempt_usage_unreported != 0
                  FROM run_stages s
                  JOIN runs r ON r.id = s.run_id
                  LEFT JOIN workspaces w ON w.id = r.workspace_id
                  WHERE s.id = ?1",
                 params![stage_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        let Some((workspace_id, project_id, model, mission_id)) = attr else {
+        let Some((workspace_id, project_id, model, mission_id, usage_unreported)) = attr else {
             return Ok(()); // stage vanished — nothing to attribute
         };
         // Logbook: a stage that burned spend is active DIRECT work on the mission.
         let _ = self.record_activity(&workspace_id, "direct", "stage");
-        let cost_basis = crate::token_engine::ledger_cost_basis(
-            &model,
-            cost_usd,
-            input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens,
-        );
+        let tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens;
+        // $0 with tokens on an attempt flagged `usage_unreported` (its
+        // streamed tokens were all on message models with no price, e.g. an
+        // unknown subagent model under a priced stage model): unknown, never
+        // free — even though the stage's own model has a price. An earlier
+        // attempt's flag doesn't count (#860).
+        let cost_basis = if usage_unreported && cost_usd == 0.0 && tokens > 0 {
+            "unpriced"
+        } else {
+            crate::token_engine::ledger_cost_basis(&model, cost_usd, tokens)
+        };
         self.insert_spend_event(&SpendEvent {
             ts_utc: ts_utc.to_string(),
             surface: "direct".into(),
@@ -5891,7 +7424,8 @@ impl Db {
             "UPDATE run_stages
              SET status = 'pending', artifact = NULL, error = NULL,
                  started_at = NULL, finished_at = NULL, diff_snapshot = NULL,
-                 blocked_questions = NULL,
+                 blocked_questions = NULL, secret_hold = NULL, ran_model = NULL, refused_calls = 0,
+                 context_tokens = NULL, context_window = NULL,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],
@@ -6170,7 +7704,58 @@ impl Db {
             "UPDATE run_stages SET session_id = ?2 WHERE id = ?1",
             params![stage_id, session_id],
         )?;
+        if let Some(sid) = session_id {
+            self.record_direct_cli_session(stage_id, sid)?;
+        }
         Ok(())
+    }
+
+    /// Remember for good that `session_id` is a Direct stage's CLI session
+    /// (#861): its spend is the stage's `direct` row, so the transcript
+    /// ingestor must never meter its transcript as RUN spend. Idempotent.
+    pub fn record_direct_cli_session(&self, stage_id: &str, session_id: &str) -> AppResult<()> {
+        if session_id.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO direct_cli_sessions (session_id, run_id, stage_id, created_at)
+             VALUES (?1, (SELECT run_id FROM run_stages WHERE id = ?2), ?2, ?3)",
+            params![session_id, stage_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Every CLI session id a Direct stage has run (see
+    /// [`Self::record_direct_cli_session`]).
+    pub fn direct_cli_session_ids(&self) -> AppResult<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT session_id FROM direct_cli_sessions")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(Into::into)
+    }
+
+    /// Whether any of `ids` is a recorded Direct-stage CLI session (#890).
+    pub fn any_direct_cli_session(&self, ids: &[String]) -> AppResult<bool> {
+        let mut stmt = self.conn.prepare_cached("SELECT 1 FROM direct_cli_sessions WHERE session_id = ?1")?;
+        for id in ids {
+            if stmt.exists(params![id])? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Delete the transcript-ingested RUN rows with these idempotency keys —
+    /// the duplicates a Direct stage's transcript produced (#861). Only
+    /// `surface = 'run'` rows: the stage's own `direct` row is never touched.
+    pub fn delete_run_spend_by_keys(&self, keys: &[String]) -> AppResult<usize> {
+        let mut n = 0usize;
+        for k in keys {
+            n += self.conn.execute(
+                "DELETE FROM spend_events WHERE surface = 'run' AND idempotency_key = ?1",
+                params![k],
+            )?;
+        }
+        Ok(n)
     }
 
     /// Mark that the next run of this stage should `--resume` its session_id.
@@ -6182,6 +7767,28 @@ impl Db {
         Ok(())
     }
 
+    /// Mark that the stage's pending `--resume` drops its deferred call (read
+    /// back by [`Self::get_stage_drop_deferred`]).
+    pub fn set_stage_drop_deferred(&self, stage_id: &str, drop_call: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET drop_deferred_pending = ?2 WHERE id = ?1",
+            params![stage_id, drop_call as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_stage_drop_deferred(&self, stage_id: &str) -> AppResult<bool> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT drop_deferred_pending FROM run_stages WHERE id = ?1",
+                params![stage_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0) != 0)
+    }
+
     /// Record the spend the session had reported when `resume_pending` was
     /// set (read back by [`Self::get_stage_resume_prior_cost`]).
     pub fn set_stage_resume_prior_cost(&self, stage_id: &str, cost_usd: f64) -> AppResult<()> {
@@ -6190,6 +7797,64 @@ impl Db {
             params![stage_id, cost_usd],
         )?;
         Ok(())
+    }
+
+    /// Record what `session_id` had reported by the end of the stage's last
+    /// attempt (`None` usage ⇒ unknown, stored as NULL).
+    pub fn set_stage_session_usage(
+        &self,
+        stage_id: &str,
+        session_id: &str,
+        usage: Option<&crate::orchestrator::types::SessionUsage>,
+    ) -> AppResult<()> {
+        let json = usage.map(|u| serde_json::json!({ "session": session_id, "usage": u }).to_string());
+        self.conn.execute(
+            "UPDATE run_stages SET session_usage = ?2 WHERE id = ?1",
+            params![stage_id, json],
+        )?;
+        Ok(())
+    }
+
+    /// The reported total recorded for `session_id` on this stage; `None` when
+    /// none is recorded or it belongs to another session.
+    pub fn get_stage_session_usage(
+        &self,
+        stage_id: &str,
+        session_id: &str,
+    ) -> AppResult<Option<crate::orchestrator::types::SessionUsage>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT session_usage FROM run_stages WHERE id = ?1", params![stage_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+            .filter(|v| v.get("session").and_then(|s| s.as_str()) == Some(session_id))
+            .and_then(|v| serde_json::from_value(v.get("usage")?.clone()).ok()))
+    }
+
+    /// Keep the stage's current context reading for its resumed run (read
+    /// back by [`Self::get_stage_resume_context`]); called before the reset
+    /// that clears `context_tokens`. NULL when it has none.
+    pub fn keep_stage_resume_context(&self, stage_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET resume_context_tokens = context_tokens WHERE id = ?1",
+            params![stage_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_stage_resume_context(&self, stage_id: &str) -> AppResult<Option<u64>> {
+        let tokens: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT resume_context_tokens FROM run_stages WHERE id = ?1",
+                params![stage_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(tokens.and_then(|t| u64::try_from(t).ok()))
     }
 
     pub fn get_stage_resume_prior_cost(&self, stage_id: &str) -> AppResult<f64> {
@@ -6385,6 +8050,52 @@ pub struct WorkspaceRow {
     /// The resolved base branch this workspace was created from. None for
     /// rows predating the column and for the auto-created default-branch row.
     pub from_branch: Option<String>,
+    /// The workspace-scope rail group this workspace sits in, if any. Kept
+    /// through archive and restore.
+    pub group_id: Option<String>,
+}
+
+/// One `list_projects` / `list_closed_projects` row: id, name, path,
+/// last_opened, jira_project_key, pinned, tint, group_id.
+pub type ProjectListRow =
+    (String, String, String, String, Option<String>, bool, Option<String>, Option<String>);
+
+/// The tints a rail group may carry: the monogram tints of
+/// `src/lib/monogram.ts` (`TINT_NAMES`), in the same order.
+pub const GROUP_TINTS: [&str; 7] =
+    ["brass", "verdigris", "rouge", "indigo", "lavender", "smoke", "bone"];
+
+/// A rail group (`groups`): a named, optionally tinted, one-level container.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRow {
+    pub id: String,
+    /// `project` (holds projects) or `workspace` (holds one project's workspaces).
+    pub scope: String,
+    /// The owning project of a `workspace` group; None for a `project` group.
+    pub project_id: Option<String>,
+    pub name: String,
+    /// One of [`GROUP_TINTS`], or None.
+    pub tint: Option<String>,
+    /// Position among the groups of the same scope (and, for `workspace`
+    /// groups, the same project). Ascending; not necessarily dense.
+    pub sort_order: i64,
+    pub created_at: String,
+}
+
+/// A mission's prerequisite ("Starts after", #960): `workspace_id` waits on
+/// `after_workspace_id`, a mission of the same project.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrerequisiteRow {
+    pub workspace_id: String,
+    pub after_workspace_id: String,
+    /// One of [`PREREQUISITE_CONDITIONS`].
+    pub after_condition: String,
+    /// Branch the waiting mission from the prerequisite's branch, not the base.
+    pub branch_from_prerequisite: bool,
+    /// Start the waiting mission's run on its own once the condition holds.
+    pub auto_start: bool,
 }
 
 /// One queued Claude Code hook signal (`hook_signals`).
@@ -6708,6 +8419,25 @@ pub struct ThreadCost {
     pub unpriced_models: Vec<String>,
 }
 
+/// How long an ended Claude Code session is remembered
+/// (`ended_claude_sessions`), in days.
+pub const ENDED_SESSION_DAYS: i64 = 30;
+
+/// One Claude Code session's RUN rows in the ledger (see
+/// `run_session_ledger`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunSessionLedger {
+    pub calls: i64,
+    /// Rows whose model had no price — left out of `spent_usd`.
+    pub unpriced_calls: i64,
+    pub spent_usd: f64,
+    /// See [`cache_hit_pct`].
+    pub cache_hit_pct: Option<f64>,
+    /// Model and timestamp of the newest row.
+    pub last_model: String,
+    pub last_ts: String,
+}
+
 // ─── Usage report types ────────────────────────────────────────────────
 
 /// One aggregate of the ledger — the whole range, one surface, one model or
@@ -6910,6 +8640,19 @@ fn default_max_iterations() -> i64 {
 /// from blowing up every prompt this stage runs).
 const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 
+/// The most loop-backs a review stage may take. The builder's "Max loop-backs"
+/// stepper uses the same bound (`MAX_LOOP_ITERATIONS` in
+/// `src/components/builder/graph.ts`); keep the two in sync.
+pub const MAX_LOOP_ITERATIONS: i64 = 9;
+
+/// A stored loop count brought under [`MAX_LOOP_ITERATIONS`]. Pipelines saved
+/// before the cap (or synced from such a Mac) may hold a larger count; they are
+/// clamped when read or synced so they keep loading, re-saving and syncing.
+/// New input (builder, MCP, crew import) is still rejected above the cap.
+pub fn clamp_loop_iterations(n: i64) -> i64 {
+    n.min(MAX_LOOP_ITERATIONS)
+}
+
 /// The workspace tools a stage's agent may be granted. Keep in sync with
 /// `tool_definitions()` in chat_engine.rs and the role default_tools seeded in orchestrator/roles.rs.
 /// `grep`/`glob` are implied by read access and `edit_file` by `write_file`
@@ -6944,6 +8687,21 @@ fn draft_ancestors(stages: &[StageDraft], idx: usize) -> std::collections::HashS
 /// Roles are looked up from the DB; an unknown role key is rejected.
 impl Db {
 pub fn validate_pipeline_stages(&self, stages: &[StageDraft]) -> crate::error::AppResult<()> {
+    match self.pipeline_stage_issues(stages, &[])?.into_iter().next() {
+        Some((_, msg)) => Err(crate::error::AppError::Other(msg)),
+        None => Ok(()),
+    }
+}
+
+/// Every stage's first contract violation as (position, message), in stage
+/// order — the rules [`Db::validate_pipeline_stages`] enforces, so a crew
+/// import can show a per-stage error. `extra` roles count as existing (an
+/// import's custom roles, before they are saved).
+pub fn pipeline_stage_issues(
+    &self,
+    stages: &[StageDraft],
+    extra: &[crate::orchestrator::roles::RoleDef],
+) -> crate::error::AppResult<Vec<(usize, String)>> {
     use crate::error::AppError;
     if stages.is_empty() {
         return Err(AppError::Other("a pipeline needs at least one stage".into()));
@@ -6952,98 +8710,116 @@ pub fn validate_pipeline_stages(&self, stages: &[StageDraft]) -> crate::error::A
     // loop-target-is-ancestor rule only applies to authored graphs (a linear
     // draft has no parents, so "earlier position" is the right contract there).
     let authored = stages.iter().any(|s| !s.parents.is_empty());
-    for (i, s) in stages.iter().enumerate() {
-        if self.get_role(&s.role)?.is_none() {
-            return Err(AppError::Other(format!("unknown stage role '{}'", s.role)));
+    let mut issues = Vec::new();
+    for i in 0..stages.len() {
+        if let Some(msg) = self.stage_issue(stages, i, authored, extra)? {
+            issues.push((i, msg));
         }
-        if !matches!(s.substrate.as_str(), "api" | "cli") {
-            return Err(AppError::Other(format!("unknown substrate '{}'", s.substrate)));
-        }
-        if s.agent_model.trim().is_empty() {
-            return Err(AppError::Other(format!("stage {} has no model", i + 1)));
-        }
-        if !(1..=100).contains(&s.max_iterations) {
-            return Err(AppError::Other(format!(
-                "stage {} max turns must be between 1 and 100 (got {})",
-                i + 1,
-                s.max_iterations
-            )));
-        }
-        // Flow-edge parents: each must reference a strictly-earlier stage (the
-        // builder topo-sorts before saving, so a valid DAG always satisfies
-        // this) and must be distinct. This is what keeps the graph acyclic and
-        // makes the ancestry-aware dossier well-defined.
-        {
-            let mut seen = std::collections::HashSet::new();
-            for &p in &s.parents {
-                if p < 0 || p >= i as i64 {
-                    return Err(AppError::Other(format!(
-                        "stage {} has an upstream link to a non-earlier stage — the flow must be acyclic",
-                        i + 1
-                    )));
-                }
-                if !seen.insert(p) {
-                    return Err(AppError::Other(format!(
-                        "stage {} lists the same upstream stage twice",
-                        i + 1
-                    )));
-                }
-            }
-        }
-        // Tool allowlist, when set, must be a non-empty subset of the known
-        // workspace tools — an empty list would leave the agent unable to act.
-        if let Some(tools) = &s.tools {
-            if tools.is_empty() {
-                return Err(AppError::Other(format!(
-                    "stage {} has an empty tool list — give it at least one tool",
+    }
+    Ok(issues)
+}
+
+/// The first rule stage `i` breaks, or `None`.
+fn stage_issue(
+    &self,
+    stages: &[StageDraft],
+    i: usize,
+    authored: bool,
+    extra: &[crate::orchestrator::roles::RoleDef],
+) -> crate::error::AppResult<Option<String>> {
+    let s = &stages[i];
+    let role = match extra.iter().find(|r| r.key == s.role) {
+        Some(r) => Some(r.clone()),
+        None => self.get_role(&s.role)?,
+    };
+    let Some(role) = role else {
+        return Ok(Some(format!("unknown stage role '{}'", s.role)));
+    };
+    if !matches!(s.substrate.as_str(), "api" | "cli") {
+        return Ok(Some(format!("unknown substrate '{}'", s.substrate)));
+    }
+    if s.agent_model.trim().is_empty() {
+        return Ok(Some(format!("stage {} has no model", i + 1)));
+    }
+    if !(1..=100).contains(&s.max_iterations) {
+        return Ok(Some(format!(
+            "stage {} max turns must be between 1 and 100 (got {})",
+            i + 1,
+            s.max_iterations
+        )));
+    }
+    // Flow-edge parents: each must reference a strictly-earlier stage (the
+    // builder topo-sorts before saving, so a valid DAG always satisfies
+    // this) and must be distinct. This is what keeps the graph acyclic and
+    // makes the ancestry-aware dossier well-defined.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for &p in &s.parents {
+            if p < 0 || p >= i as i64 {
+                return Ok(Some(format!(
+                    "stage {} has an upstream link to a non-earlier stage — the flow must be acyclic",
                     i + 1
                 )));
             }
-            for t in tools {
-                if !KNOWN_TOOLS.contains(&t.as_str()) {
-                    return Err(AppError::Other(format!("unknown tool '{t}'")));
-                }
-            }
-        }
-        if let Some(instr) = &s.instructions {
-            if instr.chars().count() > MAX_INSTRUCTIONS_CHARS {
-                return Err(AppError::Other(format!(
-                    "stage {} instructions are too long (max {MAX_INSTRUCTIONS_CHARS} characters)",
-                    i + 1
-                )));
-            }
-        }
-        match s.loop_target_position {
-            Some(target) => {
-                if !self.get_role(&s.role)?.map(|r| r.can_loop).unwrap_or(false) {
-                    return Err(AppError::Other(format!("stage '{}' cannot carry a loop (not a review role)", s.role)));
-                }
-                if target < 0 || target >= i as i64 {
-                    return Err(AppError::Other("loop target must be an earlier stage".into()));
-                }
-                // In an authored graph the loop must return to a stage on the
-                // review's own path; otherwise loop_back can't re-run it (the
-                // dossier and reset both follow ancestry, not raw position).
-                if authored && !draft_ancestors(stages, i).contains(&target) {
-                    return Err(AppError::Other(
-                        "loop target must be an earlier stage on the review's own path".into(),
-                    ));
-                }
-                if s.loop_max_iterations < 1 {
-                    return Err(AppError::Other("loop max iterations must be at least 1".into()));
-                }
-                if !matches!(s.loop_mode.as_deref(), Some("gated") | Some("auto")) {
-                    return Err(AppError::Other("loop mode must be 'gated' or 'auto'".into()));
-                }
-            }
-            None => {
-                if s.loop_max_iterations != 0 || s.loop_mode.is_some() {
-                    return Err(AppError::Other("loop fields set without a loop target".into()));
-                }
+            if !seen.insert(p) {
+                return Ok(Some(format!("stage {} lists the same upstream stage twice", i + 1)));
             }
         }
     }
-    Ok(())
+    // Tool allowlist, when set, must be a non-empty subset of the known
+    // workspace tools — an empty list would leave the agent unable to act.
+    if let Some(tools) = &s.tools {
+        if tools.is_empty() {
+            return Ok(Some(format!(
+                "stage {} has an empty tool list — give it at least one tool",
+                i + 1
+            )));
+        }
+        for t in tools {
+            if !KNOWN_TOOLS.contains(&t.as_str()) {
+                return Ok(Some(format!("unknown tool '{t}'")));
+            }
+        }
+    }
+    if let Some(instr) = &s.instructions {
+        if instr.chars().count() > MAX_INSTRUCTIONS_CHARS {
+            return Ok(Some(format!(
+                "stage {} instructions are too long (max {MAX_INSTRUCTIONS_CHARS} characters)",
+                i + 1
+            )));
+        }
+    }
+    match s.loop_target_position {
+        Some(target) => {
+            if !role.can_loop {
+                return Ok(Some(format!("stage '{}' cannot carry a loop (not a review role)", s.role)));
+            }
+            if target < 0 || target >= i as i64 {
+                return Ok(Some("loop target must be an earlier stage".into()));
+            }
+            // In an authored graph the loop must return to a stage on the
+            // review's own path; otherwise loop_back can't re-run it (the
+            // dossier and reset both follow ancestry, not raw position).
+            if authored && !draft_ancestors(stages, i).contains(&target) {
+                return Ok(Some("loop target must be an earlier stage on the review's own path".into()));
+            }
+            if !(1..=MAX_LOOP_ITERATIONS).contains(&s.loop_max_iterations) {
+                return Ok(Some(format!(
+                    "loop max iterations must be between 1 and {MAX_LOOP_ITERATIONS} (got {})",
+                    s.loop_max_iterations
+                )));
+            }
+            if !matches!(s.loop_mode.as_deref(), Some("gated") | Some("auto")) {
+                return Ok(Some("loop mode must be 'gated' or 'auto'".into()));
+            }
+        }
+        None => {
+            if s.loop_max_iterations != 0 || s.loop_mode.is_some() {
+                return Ok(Some("loop fields set without a loop target".into()));
+            }
+        }
+    }
+    Ok(None)
 }
 } // impl Db (validate_pipeline_stages)
 
@@ -7145,6 +8921,30 @@ pub struct RunRow {
     /// `true` when this run was handed to a detached segment worker — it
     /// survives the app quitting. Set at spawn, permanent for the run.
     pub detached: bool,
+    /// Set while the run is parked by a Claude plan limit (#731).
+    pub plan_wait: Option<PlanWait>,
+}
+
+/// A run parked at a Claude plan limit. Epoch seconds.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanWait {
+    /// The plan window that stopped the stage (`five_hour`, `seven_day`, …).
+    pub window: String,
+    /// When that window resets.
+    pub resets_at: i64,
+    /// When the automatic resume is due; `None` = parked for the director.
+    pub resume_at: Option<i64>,
+    /// Automatic resumes since the director last acted or a stage finished.
+    pub resume_count: i64,
+    /// Another stage of the run also waits for the director: a real halt, a
+    /// gate or a question (anything resolvable that isn't a plan limit). The
+    /// run then needs you, even with an automatic resume scheduled.
+    pub other_hold: bool,
+    /// Reports in a row whose reset was already past when they came (#1109):
+    /// 1 = this park resumes once, uncounted; 2 = it waits for the director
+    /// (`plan_wait::DirectorReason::StaleReport`).
+    pub stale_count: i64,
 }
 
 /// The routines column list, in the order `row_to_routine` reads them.
@@ -7246,6 +9046,22 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         finished_at: r.get(10)?,
         budget_usd: r.get(11)?,
         detached: r.get::<_, i64>(12)? != 0,
+        plan_wait: {
+            let window: Option<String> = r.get(13)?;
+            let resets_at: Option<i64> = r.get(14)?;
+            let resume_at: Option<i64> = r.get(15)?;
+            let resume_count: i64 = r.get(16)?;
+            let other_hold = r.get::<_, i64>(17)? != 0;
+            let stale_count: i64 = r.get(18)?;
+            resets_at.map(|resets_at| PlanWait {
+                window: window.unwrap_or_default(),
+                resets_at,
+                resume_at,
+                resume_count,
+                other_hold,
+                stale_count,
+            })
+        },
     })
 }
 
@@ -7314,6 +9130,10 @@ pub struct RunStageRow {
     /// Never serialized to the frontend (internal continuation state).
     #[serde(skip_serializing)]
     pub blocked_transcript: Option<String>,
+    /// The secret guard's hold on this (Action) stage, if any (#730): what it
+    /// found (file, line, kind — never a value) and whether the director
+    /// approved proceeding. Unparseable ⇒ `None`.
+    pub secret_hold: Option<crate::secret_scan::SecretHold>,
 }
 
 /// Serialize a stored JSON string as its parsed value (or `null`) so a
@@ -7373,7 +9193,7 @@ fn row_to_session(row: &rusqlite::Row) -> AppResult<Session> {
         icon: row.get("icon")?,
         project_root: row.get("project_root")?,
         agent: serde_json::from_str(&agent_json)?,
-        token_budget: row.get("token_budget")?,
+        token_budget: row.get::<_, Option<i64>>("token_budget")?.map(|v| v as u64),
         tokens_used: tokens_used as u64,
         tokens_input: tokens_input as u64,
         tokens_output: tokens_output as u64,

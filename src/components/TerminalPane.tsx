@@ -7,6 +7,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { attachOsc52Clipboard } from "../lib/osc52";
+import { registerTerminalBuffer } from "../lib/terminalBuffers";
+import { joinWrappedRows } from "../lib/talkContext";
 import type {
   PtyAttentionEvent,
   PtyDataEvent,
@@ -65,12 +67,16 @@ interface Props {
   /** Called when spawn-or-attach is rejected (no shell, sandbox denial,
    *  daemon down). The pane shows its own error state with a retry. */
   onSpawnError?: () => void;
+  /** Called once, when the PTY's first output reaches xterm and the
+   *  "Starting shell in …" line gives way to the prompt. */
+  onFirstOutput?: () => void;
   /** Called when the PTY process exits. */
   onExit?: () => void;
   /**
    * Called when this terminal is successfully reattached to a surviving daemon
    * session (i.e. after an Octopush restart).  The parent uses this to mark
-   * the terminal as `restored` in the store so the Companion can show the badge.
+   * the terminal as `restored` in the store, for whatever surface shows the
+   * Restored badge (the Companion no longer does).
    */
   onReattach?: () => void;
   /**
@@ -92,6 +98,7 @@ export function TerminalPane({
   layoutVersion,
   onSpawn,
   onSpawnError,
+  onFirstOutput,
   onExit,
   onReattach,
   onOpenFile,
@@ -144,10 +151,12 @@ export function TerminalPane({
   // Stable ref wrappers so effect cleanup sees up-to-date callbacks.
   const onSpawnRef = useRef(onSpawn);
   const onSpawnErrorRef = useRef(onSpawnError);
+  const onFirstOutputRef = useRef(onFirstOutput);
   const onExitRef = useRef(onExit);
   const onReattachRef = useRef(onReattach);
   onSpawnRef.current = onSpawn;
   onSpawnErrorRef.current = onSpawnError;
+  onFirstOutputRef.current = onFirstOutput;
   onExitRef.current = onExit;
   onReattachRef.current = onReattach;
 
@@ -158,7 +167,7 @@ export function TerminalPane({
       const current = store.waitingByTerminal[terminalId] ?? null;
       const next = nextShownWaiting(current, event);
       if (next !== current) store.setShownWaiting(terminalId, next);
-      // The same answers end the wait the rail marks while it is off screen.
+      // The same answers end the wait the session line marks while it is off screen.
       if (clearsWait(event)) store.clearWait(terminalId);
     },
     [terminalId],
@@ -219,6 +228,18 @@ export function TerminalPane({
     termRef.current = term;
     fitRef.current = fit;
     fontSizeRef.current = ZOOM_DEFAULT;
+    // Talk's `@session` reads what this session shows (lib/terminalBuffers).
+    const unregisterBuffer = registerTerminalBuffer(terminalId, () => {
+      const buf = term.buffer.active;
+      const rows: { text: string; wrapped: boolean }[] = [];
+      for (let i = 0; i < buf.length; i++) {
+        const line = buf.getLine(i);
+        // Untrimmed: a wrap may fall on a space; joinWrappedRows trims each
+        // logical line's end once.
+        rows.push({ text: line?.translateToString(false) ?? "", wrapped: !!line?.isWrapped });
+      }
+      return joinWrappedRows(rows);
+    });
 
     // Follow Octopush theme switches: themeStore.applyThemeToDom fires
     // `octo:theme` after writing the new tokens to :root. xterm can't read
@@ -450,6 +471,8 @@ export function TerminalPane({
       if (hasOutputRef.current) return;
       hasOutputRef.current = true;
       setHasOutput(true);
+      // The store reads the same moment: the session is `starting` until now.
+      onFirstOutputRef.current?.();
     };
 
     listen<PtyDataEvent>("pty://data", (ev) => {
@@ -478,7 +501,7 @@ export function TerminalPane({
       if (waiting) notifyClaudeWaiting(workspaceIdRef.current, waiting, shownRef.current);
       applyShownWaiting({ type: "attention", reason, shown: shownRef.current });
       if (shownRef.current) return;
-      // Carry the terminal id so the Run rail can mark the session that rang
+      // Carry the terminal id so Run's session line can mark the session that rang
       // rather than the whole workspace.
       useAttentionStore
         .getState()
@@ -661,13 +684,14 @@ export function TerminalPane({
       copyEl.removeEventListener("contextmenu", onContextMenu);
       copyEl.removeEventListener("mousedown", onMouseDownCapture, true);
       copyEl.removeEventListener("wheel", onWheel);
+      unregisterBuffer();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
       // Note: we intentionally do NOT kill the PTY here — the daemon owns it
       // and it should survive this TerminalPane unmounting (e.g. workspace
       // switch, Octopush restart).  The user explicitly kills a terminal via
-      // Close action in the session rail's flyout / Companion, which calls
+      // Close session item of its pane caption's menu (or ⌘⌥K), which calls
       // ipc.deleteTerminal.
       ptySessionIdRef.current = null;
     };
@@ -695,7 +719,7 @@ export function TerminalPane({
   }, [shown, takesFocus, syncSize]);
 
   // Focusing the pane is answering its caption's "waiting on …"; leaving the
-  // screen drops it (the rail flags whatever the session asks for next).
+  // screen drops it (the session line flags whatever the session asks for next).
   useEffect(() => {
     if (!shown) applyShownWaiting({ type: "hidden" });
     else if (takesFocus) applyShownWaiting({ type: "focus" });

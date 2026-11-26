@@ -2,11 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { PanelRightClose, PanelRightOpen } from "lucide-react";
 import { type WorkspaceMode } from "../lib/modes";
 import type { Budget, SpendSnapshot, ProjectInfo, Workspace, Issue, GitStatus } from "../lib/types";
+import type { ChangeStats } from "../lib/runChanges";
 import { CompanionContext } from "./CompanionContext";
 import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionCrewJournal } from "./CompanionCrewJournal";
-import { CompanionSession } from "./CompanionSession";
+import { CompanionRun, type CommitsAhead } from "./CompanionRun";
 import { CompanionRuns } from "./CompanionRuns";
 import { LogbookCard } from "./LogbookCard";
 import { WorkContextPanel } from "./WorkContextPanel";
@@ -30,7 +31,6 @@ interface ContextProps {
   toolCalls: number;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
-  mcpServers?: string[];
   onReviewClick?: () => void;
   onSettingsClick?: () => void;
   onOpenLogbook?: () => void;
@@ -58,9 +58,16 @@ interface Props {
   issueTrackerConfigured: boolean;
   onBacklogTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
   /** Review-mode context for the companion cockpit (scope, provenance, sync). */
-  reviewProps?: { gitStatus: GitStatus | null; gitDiff: string; workspacePath: string } | null;
-  /** Jump to a file in the diff from the companion (e.g. a provenance chip). */
+  reviewProps?: { gitStatus: GitStatus | null; workspacePath: string } | null;
+  /** Run-mode context for the Changes section: the workspace's git status,
+   *  the lines each uncommitted file's working diff adds and removes, and
+   *  the commits ahead of the base while the tree is clean. */
+  runProps?: { gitStatus: GitStatus | null; changeStats: ChangeStats; ahead: CommitsAhead | null } | null;
+  /** Jump to a file in the diff from the companion (a provenance chip in
+   *  Review, a changed file in Run). */
   onJumpToFile?: (file: string, line: number | null) => void;
+  /** Switch to Review (Run's "Read the diff"). */
+  onOpenReview?: () => void;
   /** Collapsed state is owned by the parent (App), mirroring the rail. When
    *  collapsed the companion shrinks to a slim strip carrying only the expand
    *  control — the modes live in the band above the canvas, which stays put
@@ -86,7 +93,9 @@ export function Companion({
   issueTrackerConfigured,
   onBacklogTicketContextMenu,
   reviewProps,
+  runProps,
   onJumpToFile,
+  onOpenReview,
   collapsed,
   foldedForPanes = false,
   onToggleCollapsed,
@@ -210,7 +219,12 @@ export function Companion({
                 and everything about the one on screen (context, cost, the
                 mission line, capabilities, budgets). */}
             <CompanionHistory {...historyProps} />
-            <CompanionContext {...contextProps} workspaceId={workspaceId ?? undefined} onOpenLogbook={onOpenLogbook} />
+            <CompanionContext
+              {...contextProps}
+              workspaceId={workspaceId ?? undefined}
+              worktreePath={workspace?.worktreePath ?? undefined}
+              onOpenLogbook={onOpenLogbook}
+            />
             {onMakeProject && (
               <div className="border-t border-octo-hairline px-3 py-3">
                 <button
@@ -226,15 +240,24 @@ export function Companion({
             )}
           </div>
         )}
+        {/* Run: what the terminals can't show — the focused agent's context
+            and cost, what the sessions changed, the mission it serves. */}
         {mode === "run" && workspaceId && (
-          <CompanionSession workspaceId={workspaceId} />
+          <CompanionRun
+            workspaceId={workspaceId}
+            gitStatus={runProps?.gitStatus ?? null}
+            changeStats={runProps?.changeStats}
+            ahead={runProps?.ahead}
+            onJumpToFile={onJumpToFile}
+            onReadDiff={onOpenReview}
+            onOpenLogbook={onOpenLogbook}
+          />
         )}
         {mode === "review" && workspaceId && reviewProps && (
           <CompanionReview
             workspaceId={workspaceId}
             workspacePath={reviewProps.workspacePath}
             gitStatus={reviewProps.gitStatus}
-            gitDiff={reviewProps.gitDiff}
             onJump={onJumpToFile}
           />
         )}

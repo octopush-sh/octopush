@@ -6,6 +6,7 @@
 //! already streams to the stage. Older CLIs never send it, so nothing is
 //! stored and every reader keeps its old behaviour.
 
+use crate::agent_adapter::ClaudeLoginProbe;
 use crate::db::Db;
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
@@ -55,21 +56,68 @@ pub fn record(db: &Db, expires_at: i64, seen_at: &str) -> AppResult<()> {
     db.meta_set(KEY, &serde_json::to_string(&v)?)
 }
 
+/// Forget the stored end: a Claude Code stage ran as an API-key session, so
+/// stages no longer use the sign-in and none will report a new date, or
+/// `claude auth status` said signed out ([`apply_probe`]).
+pub fn clear(db: &Db) -> AppResult<()> {
+    db.meta_delete(KEY)
+}
+
+/// What a Readiness `claude auth status` answer does to the stored end:
+/// signed in with a date records it; signed out clears it (no sign-in, so the
+/// old date no longer applies); unknown leaves it. Returns the `expiresAt`
+/// for a [`LOGIN_EVENT`] when something changed (`None` inside: cleared), so
+/// the launcher and the sign-in notes agree with the row.
+pub fn apply_probe(db: &Db, probe: ClaudeLoginProbe, seen_at: &str) -> AppResult<Option<Option<i64>>> {
+    match probe {
+        ClaudeLoginProbe::SignedIn(expires_at) => {
+            record(db, expires_at, seen_at)?;
+            Ok(Some(Some(expires_at)))
+        }
+        ClaudeLoginProbe::SignedOut if load(db)?.is_some() => {
+            clear(db)?;
+            Ok(Some(None))
+        }
+        ClaudeLoginProbe::SignedOut | ClaudeLoginProbe::Unknown => Ok(None),
+    }
+}
+
 /// The stored end; `None` until a stage reported one (or if unreadable).
 pub fn load(db: &Db) -> AppResult<Option<LoginExpiry>> {
     Ok(db.meta_get(KEY)?.and_then(|v| serde_json::from_str(&v).ok()))
 }
 
+/// What `get_claude_login` returns: the stored end, key or not (see
+/// [`has_anthropic_key`]).
+pub fn shown(db: &Db) -> AppResult<Option<LoginExpiry>> {
+    load(db)
+}
+
 /// An Anthropic key (settings or `ANTHROPIC_API_KEY`) is set; Readiness then
-/// reports "API key" and ignores the stored sign-in end.
+/// reports "API key" unless a sign-in end is stored. The key never hides the
+/// end: Claude Code stages don't get the Settings key (`cli_runner`), so a
+/// stored end means they run on the claude.ai sign-in.
 pub fn has_anthropic_key() -> bool {
+    #[cfg(test)]
+    if let Some(v) = test_key_override::get() {
+        return v;
+    }
     crate::settings::get_anthropic_key().is_some_and(|k| !k.trim().is_empty())
 }
 
-/// The stored end as the app shows it: hidden when an Anthropic key is set,
-/// so the notes agree with Readiness.
-pub fn shown(stored: Option<LoginExpiry>, has_anthropic_key: bool) -> Option<LoginExpiry> {
-    stored.filter(|_| !has_anthropic_key)
+/// Per-thread stand-in for the settings key, so tests never read `~/.octopush`.
+#[cfg(test)]
+pub mod test_key_override {
+    use std::cell::Cell;
+    thread_local! {
+        static KEY_SET: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub fn get() -> Option<bool> {
+        KEY_SET.with(|c| c.get())
+    }
+    pub fn set(v: Option<bool>) {
+        KEY_SET.with(|c| c.set(v));
+    }
 }
 
 #[cfg(test)]
@@ -94,13 +142,20 @@ mod tests {
         record(&db, 100, "2026-11-01T00:00:00Z").unwrap();
         record(&db, 900, "2026-11-02T00:00:00Z").unwrap();
         assert_eq!(load(&db).unwrap(), Some(LoginExpiry { expires_at: 900, seen_at: "2026-11-02T00:00:00Z".into() }));
+        clear(&db).unwrap();
+        assert_eq!(load(&db).unwrap(), None);
+        clear(&db).unwrap();
     }
 
     #[test]
-    fn an_api_key_hides_the_stored_end() {
-        let stored = LoginExpiry { expires_at: 100, seen_at: "2026-11-01T00:00:00Z".into() };
-        assert_eq!(shown(Some(stored.clone()), true), None);
-        assert_eq!(shown(Some(stored.clone()), false), Some(stored));
-        assert_eq!(shown(None, false), None);
+    fn get_claude_login_returns_the_stored_end_when_a_key_is_set() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        record(&db, 900, "2026-11-02T00:00:00Z").unwrap();
+        test_key_override::set(Some(true));
+        assert!(has_anthropic_key());
+        let got = shown(&db).unwrap();
+        test_key_override::set(None);
+        assert_eq!(got, Some(LoginExpiry { expires_at: 900, seen_at: "2026-11-02T00:00:00Z".into() }));
     }
 }

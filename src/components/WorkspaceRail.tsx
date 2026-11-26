@@ -12,30 +12,93 @@ import {
 } from "lucide-react";
 import {
   DndContext,
-  closestCenter,
+  DragOverlay,
   PointerSensor,
   KeyboardSensor,
+  useDraggable,
+  useDroppable,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragOverEvent,
+  type DragStartEvent,
+  type UniqueIdentifier,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   verticalListSortingStrategy,
-  sortableKeyboardCoordinates,
   useSortable,
 } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
 import { resolveMonogram, TINTS } from "../lib/monogram";
+import { ACTIVE_ROW_SELECTOR, useScrollActiveIntoView } from "../hooks/useScrollActiveIntoView";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { MENU_CHROME } from "../lib/menuStyles";
-import type { Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
+import type { Group, TintName, Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
+import { nearestVisibleAncestor } from "../lib/beacon";
+import {
+  createMissionGroup,
+  createProjectGroup,
+  moveMissionToGroup,
+  moveMissionsToGroup,
+  moveProjectToGroup,
+  ungroupMissions,
+  ungroupProjects,
+} from "../lib/groupActions";
+import { prefersReducedMotion } from "../lib/motion";
+import { isMac } from "../lib/platform";
+import { holdMissionRowFocus, holdProjectLineFocus, restoreProjectLineFocus } from "../lib/railFocus";
+import {
+  projectKeyboardCoordinates,
+  railCollisions,
+  railSubjectOf,
+  railTargetOf,
+  useFollowPointer,
+  DRAGGED_BLOCK,
+  type RailTopData,
+} from "../lib/railDnd";
+import { useShallow } from "zustand/react/shallow";
+import { archivableMerge, missionState, runStatesByWs, type MissionState } from "../lib/railState";
+import {
+  filterRailItems,
+  filterRailMissions,
+  layoutMissions,
+  layoutProjects,
+  missionGroupOwners,
+  missionGroupsOf,
+  ownGroupId,
+  projectGroupsOf,
+  resolveRailDrop,
+  resolveTopDropWithCue,
+  sectionByProject,
+  sectionDragId,
+  stepEmptySection,
+  stepInRail,
+  TOP_LOOSE_ID,
+  type RailDragSubject,
+  type RailDropTarget,
+  type RailItem,
+  type RailTopItem,
+  type TopDropCue,
+} from "../lib/railGroups";
 import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore";
+import { useGroupsStore } from "../stores/groupsStore";
 import { useMissionsStore } from "../stores/missionsStore";
+import { useRailGroupUi } from "../stores/railGroupUiStore";
+import { useRailSelection } from "../stores/railSelectionStore";
+import { useRunsStore } from "../stores/runsStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
+import { GroupContextMenu } from "./GroupContextMenu";
+import { MoveToGroupMenu } from "./MoveToGroupMenu";
+import { RailSelectionMenu } from "./RailSelectionMenu";
+import { RailStateFilter } from "./RailStateFilter";
+import { RailMissionGroup, groupMarkColor } from "./RailMissionGroup";
+import { EYEBROW, RailProjectSection } from "./RailProjectSection";
 import { ProjectMark } from "./icons/ProjectMark";
 import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
+import { CollisionMark, useWorkspaceCollisions } from "./CollisionMark";
+import { collisionSegment, worstSeverity } from "../lib/collisions";
 
 /**
  * The workspace rail — "the index".
@@ -52,8 +115,20 @@ import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
  *    the list is never repeated in its header).
  *  - Exactly one brass pulse per rail (the workspace waiting longest); every
  *    other workspace that needs you carries a static brass dot.
- *  - Collapsed, the rail is the Run session rail's geometry (44px, 32px
- *    cells, reserved edge) with a hover flyout for project · name · status.
+ *  - Collapsed, the rail is the slim-rail geometry of Review's collapsed
+ *    navigator (44px, 32px cells, reserved edge) with a hover flyout for
+ *    project · name · status.
+ *  - A mission group is a folder inside a project (`RailMissionGroup`): an
+ *    always-visible chevron and a 1px guide beside its indented members. Its
+ *    tint colours those two marks only; monograms are never recoloured. When
+ *    the beacon's workspace is folded away, the fold that hides it carries
+ *    the pulse (`resolveAttentionCarriers`).
+ *  - A project group is a section of the top level (`RailProjectSection`): a
+ *    hairline and a caps eyebrow above its projects, which are not indented.
+ *    A project's hexagon takes the section's tint only when it has none of
+ *    its own (`projectMarkColor`). A section stands where its first project
+ *    stands (`layoutProjects`), so a pinned project brings its section up
+ *    with it.
  */
 
 /** Hierarchical project/workspace structure for the rail. */
@@ -62,7 +137,24 @@ export interface ProjectGroup {
   name: string;
   tint?: string;
   jiraProjectKey?: string | null;
+  /** The project group (a section of the rail) this project sits in. Null,
+   *  absent or an id that names no loaded group: a loose project. */
+  groupId?: string | null;
+  /** Pinned projects are listed first; the rail needs it to know which
+   *  reorders the list would undo (`stepInRail`). */
+  pinned?: boolean;
   workspaces: Workspace[];
+}
+
+/**
+ * The colour of a project's hexagon: its own tint when the user chose one,
+ * else its section's tint, else mute (so N projects never mean N brass
+ * hexagons). This is the one place a group's tint reaches a member's mark;
+ * a mission's monogram is never recoloured.
+ */
+export function projectMarkColor(projectTint: string | null | undefined, sectionTint: TintName | null): string {
+  const own = projectTint ? TINTS[projectTint as keyof typeof TINTS] : undefined;
+  return own?.accent ?? (sectionTint ? TINTS[sectionTint].accent : "var(--color-octo-mute)");
 }
 
 interface Props {
@@ -70,14 +162,21 @@ interface Props {
   activeWorkspaceId: string | null;
   onSelect: (id: string) => void;
   onCustomize: (id: string) => void;
-  /** Called when the user right-clicks a workspace row / cell. */
-  onContextMenu?: (workspaceId: string, x: number, y: number) => void;
+  /** Called when the user right-clicks a workspace row / cell, or asks for
+   *  its menu from the keyboard (⇧F10 or the context-menu key on a row;
+   *  `fromKeyboard`, so the owner can give the row the focus back). */
+  onContextMenu?: (workspaceId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   /** Called when user clicks to create a workspace for a specific project. */
   onNewWorkspaceForProject?: (projectId: string) => void;
+  /** Called from a mission group's "+": start a new mission that joins the
+   *  group. The "+" is not drawn when this is left out. */
+  onNewWorkspaceInGroup?: (projectId: string, groupId: string) => void;
   /** Called when user clicks to add a new project. */
   onAddProject?: () => void;
-  /** Called when user right-clicks on a project header. */
-  onProjectContextMenu?: (projectId: string, x: number, y: number) => void;
+  /** Called when the user right-clicks a project header, or asks for its
+   *  menu from the keyboard (⇧F10 or the context-menu key on the project
+   *  line; `fromKeyboard`, so the owner can give the line the focus back). */
+  onProjectContextMenu?: (projectId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   /** Soft-closed projects, for the Recently-closed drawer (§4.4). */
   closedProjects?: ProjectInfo[];
   /** Called when the user restores a closed project. */
@@ -98,6 +197,9 @@ interface Props {
    *  collapsed flyout. Computed by the owner from the same list the shortcut
    *  handler indexes, so the hint can never lie. */
   shortcutByWs?: Record<string, string>;
+  /** "Merged · archive?" on a merged, clean, idle mission's row (#963). The
+   *  action is not drawn when this is left out. */
+  onArchiveMerged?: (workspaceId: string) => void;
 }
 
 const COLLAPSE_KEY = "railProjectCollapsed";
@@ -116,6 +218,13 @@ const HIT_WASH =
   "rounded-[2px] bg-[var(--octo-match)] text-[var(--octo-match-ink)] shadow-[inset_0_0_0_1px_var(--octo-match-ring)]";
 
 type Attention = "beacon" | "dot";
+
+/** The rail's empty line under a state filter alone. */
+const STATE_EMPTY: Record<MissionState, string> = {
+  "needs-you": "No mission needs you",
+  working: "No mission is working",
+  idle: "No mission is idle",
+};
 
 /** Per-project collapsed map from localStorage. Absent id ⇒ expanded (§4.6). */
 function loadCollapsedFromStorage(): Record<string, boolean> {
@@ -164,17 +273,82 @@ export function resolveAttention(
   return out;
 }
 
+/** The beacon or dot each FOLDED container carries for the workspaces it
+ *  hides, by project id, by mission-group id and by project-group id. */
+export interface AttentionCarriers {
+  byProject: Record<string, Attention>;
+  byGroup: Record<string, Attention>;
+  bySection: Record<string, Attention>;
+}
+
+/**
+ * The nearest-visible-ancestor step of the single beacon. A workspace's
+ * signal (`attentionByWs`, from `resolveAttention`) is drawn on its own row,
+ * unless a fold hides that row: then the outermost folded container around it
+ * (its project group's header, else its project line, else its mission
+ * group's header) carries it. One container hiding
+ * several signals shows the strongest, so the pulse still lands on exactly one
+ * visible element. `groupOwners` maps each mission group to its project
+ * (`missionGroupOwners`): a workspace is in a group only when the group is
+ * its own project's, the test the layout applies, so a header never carries a
+ * signal for a row that is drawn loose. `sectionOf` gives the project group a
+ * project is laid out in (`sectionByProject`), under the same rule. Pure and
+ * exported, like `resolveAttention`.
+ */
+export function resolveAttentionCarriers(
+  projects: ProjectGroup[] | undefined,
+  attentionByWs: Record<string, Attention>,
+  groupOwners: ReadonlyMap<string, string>,
+  isProjectFolded: (projectId: string) => boolean,
+  isGroupFolded: (groupId: string) => boolean,
+  sectionOf: (projectId: string) => string | null = () => null,
+  isSectionFolded: (groupId: string) => boolean = () => false,
+): AttentionCarriers {
+  const out: AttentionCarriers = { byProject: {}, byGroup: {}, bySection: {} };
+  for (const project of projects || []) {
+    const sectionId = sectionOf(project.id);
+    for (const ws of project?.workspaces || []) {
+      const signal = ws?.id ? attentionByWs[ws.id] : undefined;
+      if (!signal) continue;
+      const groupId = ownGroupId(ws, project.id, groupOwners);
+      const carrier = nearestVisibleAncestor([
+        ...(sectionId ? [{ map: out.bySection, id: sectionId, folded: isSectionFolded(sectionId) }] : []),
+        { map: out.byProject, id: project.id, folded: isProjectFolded(project.id) },
+        ...(groupId ? [{ map: out.byGroup, id: groupId, folded: isGroupFolded(groupId) }] : []),
+      ]);
+      if (!carrier) continue;
+      if (signal === "beacon" || !carrier.map[carrier.id]) carrier.map[carrier.id] = signal;
+    }
+  }
+  return out;
+}
+
 /** The linked ticket, or one detected from the branch under the project's key. */
 function ticketKeyFor(ws: Workspace, project: ProjectGroup): string | null {
   return ws?.linkedIssueKey ?? detectIssueKeyForProject(ws?.branch ?? "", project?.jiraProjectKey ?? null);
 }
 
-/** A project and the rows it shows: all of them at rest or on a project-name
- *  hit, only the hits otherwise; a project with nothing to show leaves the rail. */
+/** A project and what it shows: every item at rest or on a project-name hit,
+ *  only the hits otherwise (a group-name hit keeps the whole group); a project
+ *  with nothing to show leaves the rail. */
 interface VisibleProject {
   project: ProjectGroup;
-  visibleWs: Workspace[];
+  /** Loose missions and mission groups, interleaved in rail order. */
+  items: RailItem[];
 }
+
+/** One block of the rail's top level and what it shows: a loose project, or a
+ *  project group with the projects a filter leaves it (all of them at rest
+ *  and on a group-name hit). */
+type VisibleTop =
+  | { kind: "project"; entry: VisibleProject }
+  | {
+      kind: "section";
+      group: Group;
+      /** Every project of the group, for its aggregates. */
+      members: ProjectGroup[];
+      entries: VisibleProject[];
+    };
 
 export function WorkspaceRail({
   projects,
@@ -183,6 +357,7 @@ export function WorkspaceRail({
   onCustomize,
   onContextMenu,
   onNewWorkspaceForProject,
+  onNewWorkspaceInGroup,
   onAddProject,
   onProjectContextMenu,
   closedProjects,
@@ -193,12 +368,41 @@ export function WorkspaceRail({
   isCollapsed,
   onReorderProjects,
   shortcutByWs,
+  onArchiveMerged,
 }: Props) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
     loadCollapsedFromStorage,
   );
   const [filter, setFilter] = useState("");
   const q = isCollapsed ? "" : filter.trim();
+  // The state filter (#963): Needs you · Working · Idle, or every mission.
+  const [statePick, setStatePick] = useState<MissionState | null>(null);
+  const stateFilter = isCollapsed ? null : statePick;
+  /** A filter of either kind holds: folds are ignored, nothing drags. */
+  const filtering = q !== "" || stateFilter !== null;
+  const runStateByWs = useRunsStore(useShallow((s) => runStatesByWs(s.runsByWs)));
+  const mergedPrByWs = useWorkspaceStore((s) => s.mergedPrByWs);
+  // Every mission's state, on the fleet chip's terms (`missionState`), and
+  // the merged PR of each one the rail offers to archive.
+  const { stateByWs, archivableByWs } = useMemo(() => {
+    const states: Record<string, MissionState> = {};
+    const archivable: Record<string, Pr> = {};
+    for (const project of projects || []) {
+      for (const ws of project?.workspaces || []) {
+        if (!ws?.id) continue;
+        const state = missionState(runStateByWs[ws.id], runningByWs?.[ws.id]);
+        states[ws.id] = state;
+        const merged = archivableMerge(ws.id, state, mergedPrByWs, prByWs, gitSummaryByWs);
+        if (merged) archivable[ws.id] = merged;
+      }
+    }
+    return { stateByWs: states, archivableByWs: archivable };
+  }, [projects, runStateByWs, runningByWs, mergedPrByWs, prByWs, gitSummaryByWs]);
+  const stateCounts = useMemo(() => {
+    const out: Record<MissionState, number> = { "needs-you": 0, working: 0, idle: 0 };
+    for (const state of Object.values(stateByWs)) out[state] += 1;
+    return out;
+  }, [stateByWs]);
   const flagsByWs = useAttentionStore((s) => s.flagsByWs);
   // Memoised: an attention ping or a git refresh replaces one map, and the
   // rail must not recompute every project's shape for it.
@@ -206,19 +410,91 @@ export function WorkspaceRail({
     () => resolveAttention(projects, flagsByWs, activeWorkspaceId, runningByWs),
     [projects, flagsByWs, activeWorkspaceId, runningByWs],
   );
-  const visibleProjects = useMemo<VisibleProject[]>(() => {
-    const out: VisibleProject[] = [];
+  // Mission groups: each project's groups interleaved with its loose missions.
+  const groups = useGroupsStore((s) => s.groups);
+  const collapsedGroups = useRailGroupUi((s) => s.collapsed);
+  const renamingGroupId = useRailGroupUi((s) => s.renamingId);
+  const groupOwners = useMemo(() => missionGroupOwners(groups), [groups]);
+  const itemsByProject = useMemo(() => {
+    const out: Record<string, RailItem[]> = {};
     for (const project of projects || []) {
-      const workspaces = project?.workspaces || [];
-      if (q === "" || matchRange(project?.name ?? "", q)) {
-        out.push({ project, visibleWs: workspaces });
-        continue;
-      }
-      const hits = workspaces.filter((w) => matchRange(w?.name ?? "", q) !== null);
-      if (hits.length > 0) out.push({ project, visibleWs: hits });
+      if (!project?.id) continue;
+      out[project.id] = layoutMissions(
+        (project.workspaces || []).filter((w) => !!w),
+        missionGroupsOf(groups, project.id),
+      );
     }
     return out;
-  }, [projects, q]);
+  }, [projects, groups]);
+  // Project groups: the top level is loose projects and sections of projects.
+  const topItems = useMemo<RailTopItem<ProjectGroup>[]>(
+    () =>
+      layoutProjects(
+        (projects || []).filter((p) => !!p?.id),
+        projectGroupsOf(groups),
+      ),
+    [projects, groups],
+  );
+  const sectionOfProject = useMemo(() => sectionByProject(topItems), [topItems]);
+  // A project line the keyboard holds keeps the focus when a move re-renders
+  // it under another parent (see `lib/railFocus.ts`).
+  // After every render: a move re-renders the row under another parent, and
+  // a menu the rail owns (Move to group…) closes in a render of its own.
+  // Cheap: nothing is read unless a line is held.
+  useLayoutEffect(() => {
+    restoreProjectLineFocus();
+  });
+  const visibleTop = useMemo<VisibleTop[]>(() => {
+    // The state filter (#963) narrows whatever the text filter leaves; a
+    // project it leaves with no mission leaves the rail.
+    const byState = (project: ProjectGroup, items: RailItem[]): VisibleProject | null => {
+      if (stateFilter === null) return { project, items };
+      const kept = filterRailMissions(items, (w) => stateByWs[w.id] === stateFilter);
+      return kept.length > 0 ? { project, items: kept } : null;
+    };
+    const whole = (project: ProjectGroup): VisibleProject | null =>
+      byState(project, itemsByProject[project.id] ?? []);
+    // A project: every item at rest or on its own name's hit, else its hits.
+    const visible = (project: ProjectGroup): VisibleProject | null => {
+      if (q === "" || matchRange(project.name ?? "", q)) return whole(project);
+      const hits = filterRailItems(itemsByProject[project.id] ?? [], (name) => matchRange(name, q) !== null);
+      return hits.length > 0 ? byState(project, hits) : null;
+    };
+    const out: VisibleTop[] = [];
+    for (const item of topItems) {
+      if (item.kind === "project") {
+        const entry = visible(item.project);
+        if (entry) out.push({ kind: "project", entry });
+        continue;
+      }
+      const { group, projects: members } = item;
+      // A group-name hit keeps the whole group, as a project-name hit keeps
+      // the whole project.
+      const entries = (q !== "" && matchRange(group.name, q) ? members.map(whole) : members.map(visible)).filter(
+        (entry): entry is VisibleProject => entry !== null,
+      );
+      // At rest an empty group stays (it is a standing bucket); under a
+      // filter a group with nothing to show leaves like a project does.
+      if (!filtering || entries.length > 0) out.push({ kind: "section", group, members, entries });
+    }
+    return out;
+  }, [topItems, itemsByProject, q, stateFilter, stateByWs, filtering]);
+  // Where the beacon and the dots show when a fold hides their rows. Folds
+  // are ignored while a filter holds everything open; the slim rail has no
+  // project fold and no project-group fold.
+  const carriers = useMemo(
+    () =>
+      resolveAttentionCarriers(
+        projects,
+        attentionByWs,
+        groupOwners,
+        (id) => !isCollapsed && !filtering && !!collapsedProjects[id],
+        (id) => !filtering && !!collapsedGroups[id],
+        (projectId) => sectionOfProject.get(projectId) ?? null,
+        (id) => !isCollapsed && !filtering && !!collapsedGroups[id],
+      ),
+    [projects, attentionByWs, groupOwners, isCollapsed, filtering, collapsedProjects, collapsedGroups, sectionOfProject],
+  );
 
   const toggleProjectCollapsed = useCallback((projectId: string) => {
     setCollapsedProjects((prev) => {
@@ -231,31 +507,451 @@ export function WorkspaceRail({
       return next;
     });
   }, []);
+  // #846: a newly active workspace (a project just opened, a jump key, a
+  // palette pick) is scrolled into view, calmly, and only when off-screen.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const asideRef = useRef<HTMLElement | null>(null);
+  useScrollActiveIntoView(listRef, isCollapsed ? null : activeWorkspaceId, visibleTop);
+
+  // Activating a mission that sits in a folded group (its mission group, its
+  // project's group, or both) unfolds it, then
+  // brings the row into view: the hook above scrolled while the row still had
+  // no height, so the scroll is repeated once the fold has opened (at once,
+  // which is all reduced motion needs, and again after the 280ms transition).
+  // Only the workspace the app restored by itself at launch is not an
+  // activation (`workspaceStore.launchRestoredId`): a group folded on purpose
+  // stays folded across a restart. Every other first sight of an active id
+  // is one, also when the rail mounted with nothing active.
+  const seenActive = useRef<string | null>(null);
+  const keptForLaunch = useRef<string | null>(null);
+  const revealFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeWorkspaceId) return;
+    if (seenActive.current === activeWorkspaceId) return;
+    const all = (projects || []).flatMap((p) => p?.workspaces || []);
+    const ws = all.find((w) => w?.id === activeWorkspaceId);
+    if (!ws) return; // its row has not loaded yet: retry when the projects change
+    seenActive.current = activeWorkspaceId;
+    const restored = useWorkspaceStore.getState().launchRestoredId;
+    if (restored === activeWorkspaceId && keptForLaunch.current !== restored) {
+      // Once per restore: coming back to it later is an activation.
+      keptForLaunch.current = restored;
+      return;
+    }
+    const ui = useRailGroupUi.getState();
+    const folded = [sectionOfProject.get(ws.projectId) ?? null, ownGroupId(ws, ws.projectId, groupOwners)].filter(
+      (id): id is string => id !== null && !!ui.collapsed[id],
+    );
+    if (folded.length === 0) return;
+    revealFor.current = activeWorkspaceId;
+    for (const id of folded) ui.setCollapsed(id, false);
+  }, [activeWorkspaceId, projects, groupOwners, sectionOfProject]);
+  useEffect(() => {
+    if (!revealFor.current || revealFor.current !== activeWorkspaceId) return;
+    revealFor.current = null;
+    const reveal = () =>
+      asideRef.current?.querySelector<HTMLElement>(ACTIVE_ROW_SELECTOR)?.scrollIntoView?.({
+        block: "nearest",
+        inline: "nearest",
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+    reveal();
+    const timer = setTimeout(reveal, 300);
+    return () => clearTimeout(timer);
+  }, [collapsedGroups, activeWorkspaceId]);
+
+  // A group whose name went into edit must be on screen: open its project.
+  // The slim rail has no room for the input, so the name stays as it is.
+  useEffect(() => {
+    if (!renamingGroupId) return;
+    if (isCollapsed) {
+      useRailGroupUi.getState().stopRename();
+      return;
+    }
+    const projectId = groups.find((g) => g.id === renamingGroupId)?.projectId;
+    if (projectId && collapsedProjects[projectId]) toggleProjectCollapsed(projectId);
+  }, [renamingGroupId, isCollapsed, groups, collapsedProjects, toggleProjectCollapsed]);
+
+  // ⌘K's "Go to group": unfold everything around the group (its project
+  // group, the project that holds a mission group, the group itself), let go
+  // of a filter that hides it, then scroll its header into view and give it
+  // the focus. Re-run as the folds open, until the header is focusable.
+  const revealId = useRailGroupUi((s) => s.revealId);
+  useEffect(() => {
+    if (!revealId) return;
+    const ui = useRailGroupUi.getState();
+    const group = groups.find((g) => g.id === revealId);
+    if (!group) {
+      ui.revealDone(revealId);
+      return;
+    }
+    if (isCollapsed) return; // the owner opens the rail first
+    const projectId = group.scope === "workspace" ? group.projectId : null;
+    const sectionId = group.scope === "project" ? null : projectId ? (sectionOfProject.get(projectId) ?? null) : null;
+    if (sectionId && ui.collapsed[sectionId]) ui.setCollapsed(sectionId, false);
+    if (ui.collapsed[group.id]) ui.setCollapsed(group.id, false);
+    if (projectId && collapsedProjects[projectId]) toggleProjectCollapsed(projectId);
+    const shown = visibleTop.some((item) =>
+      item.kind === "section"
+        ? item.group.id === group.id ||
+          item.entries.some((e) => e.items.some((i) => i.kind === "group" && i.group.id === group.id))
+        : item.entry.items.some((i) => i.kind === "group" && i.group.id === group.id),
+    );
+    if (!shown) {
+      if (filter !== "" || statePick !== null) {
+        setFilter("");
+        setStatePick(null);
+      } else ui.revealDone(group.id); // not in the rail at all (its project is closed)
+      return;
+    }
+    const header = Array.from(
+      asideRef.current?.querySelectorAll<HTMLElement>("[data-rail-group-header]") ?? [],
+    ).find((el) => el.dataset.railGroupHeader === group.id);
+    if (!header || header.closest("[inert]")) return; // a fold is still opening
+    ui.revealDone(group.id);
+    const behavior: ScrollBehavior = prefersReducedMotion() ? "auto" : "smooth";
+    // A frame later, so the palette that asked has closed and handed its
+    // focus back first; again once the folds' 280ms transition has run.
+    // Not cancelled on cleanup: `revealDone` above re-renders at once.
+    requestAnimationFrame(() => {
+      if (!header.isConnected) return;
+      header.focus({ preventScroll: true });
+      header.scrollIntoView?.({ block: "nearest", inline: "nearest", behavior });
+    });
+    setTimeout(() => {
+      if (header.isConnected) header.scrollIntoView?.({ block: "nearest", inline: "nearest", behavior });
+    }, 300);
+  }, [revealId, groups, isCollapsed, sectionOfProject, collapsedProjects, collapsedGroups, toggleProjectCollapsed, visibleTop, filter, statePick]);
+
+  // The header menu of a group (a mission group's or a project group's),
+  // owned by the rail.
+  const [groupMenu, setGroupMenu] = useState<{
+    groupId: string;
+    x: number;
+    y: number;
+    fromKeyboard: boolean;
+  } | null>(null);
+  const openGroupMenu = useCallback((groupId: string, x: number, y: number, fromKeyboard = false) => {
+    setGroupMenu({ groupId, x, y, fromKeyboard });
+  }, []);
+  // A menu the keyboard opened gives the focus back to its header when it
+  // closes (as `useAnchoredMenu` does for a button's menu), so Escape does
+  // not drop the keyboard out of the rail. A pointer-opened one does not
+  // move the focus. Rename then takes it for its input; a press elsewhere
+  // still lands where it was aimed, since the browser focuses that after.
+  const closeGroupMenu = () => {
+    const closing = groupMenu;
+    setGroupMenu(null);
+    if (!closing?.fromKeyboard) return;
+    Array.from(asideRef.current?.querySelectorAll<HTMLElement>("[data-rail-group-header]") ?? [])
+      .find((el) => el.dataset.railGroupHeader === closing.groupId)
+      ?.focus({ preventScroll: true });
+  };
+  const menuGroup = groupMenu ? groups.find((g) => g.id === groupMenu.groupId) : undefined;
+
+  // ── Multi-select (⌘-click / ⇧-click on mission rows, one project) ──
+  const selection = useRailSelection((s) => s.selection);
+  // The rows of the selection's project that the rail draws right now: not
+  // archived or deleted away, not inside a folded group, project or project
+  // group. A selection is only ever of these, so its count, its menu and its
+  // actions match what the user sees.
+  const selectionProjectId = selection?.projectId ?? null;
+  const drawnSelectable = useMemo(() => {
+    const out = new Set<string>();
+    if (!selectionProjectId || isCollapsed || filtering || collapsedProjects[selectionProjectId]) return out;
+    const section = sectionOfProject.get(selectionProjectId);
+    if (section && collapsedGroups[section]) return out;
+    for (const item of itemsByProject[selectionProjectId] ?? []) {
+      if (item.kind === "mission") out.add(item.workspace.id);
+      else if (!collapsedGroups[item.group.id]) for (const w of item.members) out.add(w.id);
+    }
+    return out;
+  }, [selectionProjectId, isCollapsed, filtering, collapsedProjects, sectionOfProject, collapsedGroups, itemsByProject]);
+  useEffect(() => {
+    useRailSelection.getState().retain(drawnSelectable);
+  }, [drawnSelectable]);
+  const drawnRef = useRef(drawnSelectable);
+  drawnRef.current = drawnSelectable;
+  const selectedIds = useMemo(
+    () => new Set((selection?.ids ?? []).filter((id) => drawnSelectable.has(id))),
+    [selection, drawnSelectable],
+  );
+  // A filter or the slim rail changes which rows are there to act on: the
+  // selection goes rather than act on rows out of sight.
+  useEffect(() => {
+    useRailSelection.getState().clear();
+  }, [q, stateFilter, isCollapsed]);
+  // Escape lets a selection go, unless something else is listening for it:
+  // only a key pressed in the rail itself, or with the focus nowhere (a menu,
+  // a dialog, an editor or a terminal keeps its Escape).
+  useEffect(() => {
+    if (!selection) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      const t = e.target instanceof Element ? e.target : null;
+      const inRail = !!t && !!asideRef.current?.contains(t) && !t.closest("input, textarea");
+      if (inRail || !t || t === document.body) useRailSelection.getState().clear();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selection]);
+  const pickRow = useCallback(
+    (e: React.MouseEvent<HTMLButtonElement>, projectId: string, ordered: readonly string[], workspaceId: string) => {
+      const sel = useRailSelection.getState();
+      if (isMac() ? e.metaKey : e.ctrlKey) {
+        sel.toggle(projectId, workspaceId);
+        // WebKit does not focus a clicked button: the row takes it, so
+        // Escape and ⌘⌥G reach the rail.
+        e.currentTarget.focus({ preventScroll: true });
+        return true;
+      }
+      if (e.shiftKey) {
+        sel.extend(projectId, ordered, workspaceId, activeWorkspaceId);
+        e.currentTarget.focus({ preventScroll: true });
+        return true;
+      }
+      sel.clear();
+      return false;
+    },
+    [activeWorkspaceId],
+  );
+  // The selection's menu, owned by the rail like the group menus.
+  const [selectionMenu, setSelectionMenu] = useState<{
+    x: number;
+    y: number;
+    focusId: string;
+    fromKeyboard: boolean;
+  } | null>(null);
+  // A selected row's menu is the selection's (two or more); any other row's
+  // menu lets the selection go and is the mission's own.
+  const openRowMenu = useCallback(
+    (workspaceId: string, x: number, y: number, fromKeyboard = false) => {
+      // Decided from the rows still drawn, as the menu itself counts them.
+      const sel = useRailSelection.getState().selection;
+      const live = (sel?.ids ?? []).filter((id) => drawnRef.current.has(id));
+      if (live.length > 1 && live.includes(workspaceId)) {
+        setSelectionMenu({ x, y, focusId: workspaceId, fromKeyboard });
+        return;
+      }
+      useRailSelection.getState().clear();
+      if (fromKeyboard) onContextMenu?.(workspaceId, x, y, true);
+      else onContextMenu?.(workspaceId, x, y);
+    },
+    [onContextMenu],
+  );
+  const closeSelectionMenu = () => {
+    const closing = selectionMenu;
+    setSelectionMenu(null);
+    if (closing?.fromKeyboard) holdMissionRowFocus(closing.focusId);
+  };
+  /** The selected rows, in the rail's order (their project's `created_at`). */
+  const selectedRows = useMemo(() => {
+    if (!selection) return [];
+    const project = (projects || []).find((p) => p?.id === selection.projectId);
+    return (project?.workspaces || []).filter((w) => !!w && selectedIds.has(w.id));
+  }, [selection, selectedIds, projects]);
+  // A selection menu whose selection fell under two rows (one archived, one
+  // folded away) closes: it must never come back by itself later.
+  useEffect(() => {
+    if (selectionMenu && selectedRows.length < 2) setSelectionMenu(null);
+  }, [selectionMenu, selectedRows]);
+
+  // ── "Move to group…" from the keyboard (⌘⌥G on a focused row) ──
+  // Rail-scoped on purpose: ⌘⌥G is go-to-line in the editor and the
+  // scratchpad, whose CodeMirror keymaps only hear a key pressed in them.
+  const [movePicker, setMovePicker] = useState<
+    | { kind: "mission"; projectId: string; ids: string[]; focusId: string; x: number; y: number }
+    | { kind: "project"; projectId: string; x: number; y: number }
+    | null
+  >(null);
+  const closeMovePicker = () => {
+    const closing = movePicker;
+    setMovePicker(null);
+    if (!closing) return;
+    if (closing.kind === "project") holdProjectLineFocus(closing.projectId);
+    else holdMissionRowFocus(closing.focusId);
+  };
+  const onRailKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
+    if (!isMoveToGroupChord(e)) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target || target.closest("input, textarea, [contenteditable]")) return;
+    const row = target.closest<HTMLElement>("[data-rail-ws]");
+    const line = target.closest<HTMLElement>("[data-rail-project-line]");
+    if (row?.dataset.railWs) {
+      const id = row.dataset.railWs;
+      const ws = (projects || []).flatMap((p) => p?.workspaces || []).find((w) => w?.id === id);
+      if (!ws) return;
+      e.preventDefault();
+      const sel = useRailSelection.getState().selection;
+      const live = (sel?.ids ?? []).filter((x) => drawnRef.current.has(x));
+      const ids = live.includes(id) ? live : [id];
+      const r = row.getBoundingClientRect();
+      setMovePicker({ kind: "mission", projectId: ws.projectId, ids, focusId: id, x: r.left + 24, y: r.bottom });
+    } else if (line?.dataset.railProjectLine) {
+      e.preventDefault();
+      const r = line.getBoundingClientRect();
+      setMovePicker({ kind: "project", projectId: line.dataset.railProjectLine, x: r.left + 24, y: r.bottom });
+    }
+  };
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    // Only a project has a keyboard drag, and it must step from project to
+    // project, never onto a mission group's drop target.
+    useSensor(KeyboardSensor, { coordinateGetter: projectKeyboardCoordinates }),
   );
-  const dragEnabled = !isCollapsed && q === "" && !!onReorderProjects;
+  // Projects and project groups drag whenever the list is whole and the owner
+  // persists the order.
+  const dragEnabled = !isCollapsed && !filtering && !!onReorderProjects;
+  // Missions and group headers drag whenever the list is whole (no filter).
+  const groupDragEnabled = !isCollapsed && !filtering;
+  const [dragging, setDragging] = useState<RailDragSubject | null>(null);
+  // How far the list could scroll when the drag began. A project or a group
+  // is dragged by a transform, and a transformed block that travels past the
+  // list's foot lengthens what the list can scroll: dnd-kit's auto-scroll
+  // then keeps scrolling after it, the block keeps its place under the
+  // pointer, and the list runs away from under the drag. The list is held to
+  // the room its own content gave it.
+  const scrollLimit = useRef<number | null>(null);
+  const holdScroll = (list: HTMLDivElement) => {
+    const max = scrollLimit.current;
+    if (max === null) return;
+    if (list.scrollTop > max) list.scrollTop = max;
+    if (list.scrollLeft !== 0) list.scrollLeft = 0;
+  };
+  // What the drop under the pointer would do to the dragged project's group,
+  // shown on the dragged block (`DropCue`) and as the wash of the group it
+  // would join. It comes from the very call the drop makes (see `dropAt`),
+  // made in render from the target the drag is over and the rail as it is
+  // now: a reload in mid-drag re-resolves it, as the drop will.
+  const [pendingDrop, setPendingDrop] = useState<{ activeId: string; overId: string | null } | null>(null);
+  /** A top-level drop of `active` on `over`, resolved once for the cue (while
+   *  over it) and for the drop (when released there). */
+  const dropAt = (active: { id: UniqueIdentifier }, over: { id: UniqueIdentifier } | null) =>
+    resolveTopDropWithCue(topItems, String(active.id), over ? String(over.id) : null);
+  const dropCue = useMemo<TopDropCue | null>(
+    () =>
+      pendingDrop ? resolveTopDropWithCue(topItems, pendingDrop.activeId, pendingDrop.overId).cue : null,
+    [pendingDrop, topItems],
+  );
+  const handleDragOver = (e: DragOverEvent) => {
+    if (railSubjectOf(e.active.data.current)) return;
+    const activeId = String(e.active.id);
+    const overId = e.over ? String(e.over.id) : null;
+    setPendingDrop((prev) => (prev?.activeId === activeId && prev.overId === overId ? prev : { activeId, overId }));
+  };
+  const endDrag = () => {
+    scrollLimit.current = null;
+    setDragging(null);
+    setPendingDrop(null);
+  };
+  const handleDragStart = (e: DragStartEvent) => {
+    const subject = railSubjectOf(e.active.data.current);
+    const list = listRef.current;
+    // A mission and a mission-group header ride in the overlay: they lengthen nothing.
+    scrollLimit.current = !subject && list ? Math.max(0, list.scrollHeight - list.clientHeight) : null;
+    setDragging(subject);
+  };
   const handleDragEnd = (e: DragEndEvent) => {
     const { active, over } = e;
-    if (!over || active.id === over.id) return;
-    const ids = (projects || []).map((p) => p.id);
-    const from = ids.indexOf(String(active.id));
-    const to = ids.indexOf(String(over.id));
-    if (from < 0 || to < 0) return;
-    const next = [...ids];
-    const [moved] = next.splice(from, 1);
-    next.splice(to, 0, moved);
-    onReorderProjects?.(next);
+    endDrag();
+    const subject = railSubjectOf(active.data.current);
+    if (subject) {
+      const target = railTargetOf(over?.data.current);
+      if (!target) return;
+      const action = resolveRailDrop(
+        subject,
+        target,
+        missionGroupsOf(groups, subject.projectId).map((g) => g.id),
+      );
+      if (action?.kind === "move") void moveMissionToGroup(action.workspaceId, action.groupId);
+      if (action?.kind === "reorder") void useGroupsStore.getState().setOrder(action.ids);
+      return;
+    }
+    // The top level: a project or a project group. A project dropped in
+    // another container (a group, or the loose top level) joins it too.
+    const { action } = dropAt(active, over);
+    if (!action) return;
+    if (action.move) {
+      // The order travels with the move: both land in the rail at once.
+      void moveProjectToGroup(action.move.projectId, action.move.groupId, action.order);
+      return;
+    }
+    if (action.order) onReorderProjects?.(action.order);
+  };
+  // "Move up" / "Move down" in a project group's menu: one block at a time,
+  // as the step to take, or null when it would change nothing. A group with
+  // projects steps through the project order; an empty one steps among the
+  // empty groups at the foot, through the groups' own order.
+  const stepSection = (direction: -1 | 1): (() => void) | null => {
+    if (menuGroup?.scope !== "project") return null;
+    const groupIds = stepEmptySection(topItems, menuGroup.id, direction);
+    if (groupIds) return () => void useGroupsStore.getState().setOrder(groupIds);
+    const order = onReorderProjects ? stepInRail(topItems, sectionDragId(menuGroup.id), direction) : null;
+    return order ? () => onReorderProjects?.(order) : null;
+  };
+  const sectionUp = stepSection(-1);
+  const sectionDown = stepSection(1);
+
+  // One project of the expanded rail, loose or in the project group `section`.
+  const renderProject = (
+    entry: VisibleProject,
+    lead: ProjectLead,
+    section: Group | null,
+    sectionFolded = false,
+  ) => {
+    const { project, items } = entry;
+    return (
+      <SortableProjectGroup
+        key={project.id}
+        project={project}
+        items={items}
+        lead={lead}
+        sectionId={section?.id ?? null}
+        sectionTint={section?.tint ?? null}
+        hidden={sectionFolded}
+        dropCue={dropCue}
+        collapsedGroups={collapsedGroups}
+        attention={carriers.byProject[project.id] ?? null}
+        groupAttention={carriers.byGroup}
+        groupDragEnabled={groupDragEnabled}
+        dragging={dragging}
+        onGroupContextMenu={openGroupMenu}
+        onNewWorkspaceInGroup={onNewWorkspaceInGroup}
+        q={q}
+        filtering={filtering}
+        archivableByWs={archivableByWs}
+        onArchiveMerged={onArchiveMerged}
+        folded={!filtering && !!collapsedProjects[project.id]}
+        toggleProjectCollapsed={toggleProjectCollapsed}
+        activeWorkspaceId={activeWorkspaceId}
+        gitSummaryByWs={gitSummaryByWs}
+        prByWs={prByWs}
+        runningByWs={runningByWs}
+        attentionByWs={attentionByWs}
+        flagsByWs={flagsByWs}
+        shortcutByWs={shortcutByWs}
+        onSelect={onSelect}
+        onCustomize={onCustomize}
+        onContextMenu={onContextMenu ? openRowMenu : undefined}
+        onNewWorkspaceForProject={onNewWorkspaceForProject}
+        onProjectContextMenu={onProjectContextMenu}
+        dragEnabled={dragEnabled}
+        selectedIds={selectedIds}
+        onRowPick={pickRow}
+      />
+    );
   };
 
   return (
     <aside
+      ref={asideRef}
       data-tour="rail"
       className={`flex h-full shrink-0 flex-col border-r border-octo-hairline bg-octo-panel pt-2 transition-[width] duration-[220ms] ${EASE} ${
         isCollapsed ? RAIL_WIDTH_COLLAPSED : RAIL_WIDTH_EXPANDED
       }`}
       aria-label="Missions"
+      onKeyDown={onRailKeyDown}
     >
       {isCollapsed ? (
         <CollapsedRail
@@ -272,6 +968,11 @@ export function WorkspaceRail({
           attentionByWs={attentionByWs}
           flagsByWs={flagsByWs}
           shortcutByWs={shortcutByWs}
+          topItems={topItems}
+          itemsByProject={itemsByProject}
+          collapsedGroups={collapsedGroups}
+          groupAttention={carriers.byGroup}
+          onGroupContextMenu={openGroupMenu}
         />
       ) : (
         <>
@@ -281,7 +982,7 @@ export function WorkspaceRail({
             <label
               data-tour="rail-search"
               className="flex h-[26px] min-w-0 flex-1 items-center gap-2 border-b border-transparent text-octo-mute transition-colors duration-[220ms] focus-within:border-octo-brass focus-within:text-octo-brass"
-              title="Find a project or mission"
+              title="Find a project, group or mission"
             >
               <Search size={12} aria-hidden className="shrink-0" />
               <input
@@ -290,12 +991,15 @@ export function WorkspaceRail({
                 onKeyDown={(e) => {
                   if (e.key === "Escape") setFilter("");
                 }}
+                // Short enough to fit beside the filter and "+" at the rail's
+                // default width; the full phrase lives in the title and label.
                 placeholder="Find a project or mission"
                 spellCheck={false}
-                aria-label="Find a project or mission"
-                className="min-w-0 flex-1 bg-transparent text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
+                aria-label="Find a project, group or mission"
+                className="min-w-0 flex-1 text-ellipsis bg-transparent text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
               />
             </label>
+            <RailStateFilter value={statePick} counts={stateCounts} onChange={setStatePick} />
             {onAddProject && (
               <button
                 type="button"
@@ -310,41 +1014,92 @@ export function WorkspaceRail({
             )}
           </div>
 
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+          <div
+            ref={listRef}
+            data-testid="rail-list"
+            className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2"
+            onScroll={(e) => holdScroll(e.currentTarget)}
+          >
+            <DndContext
+              sensors={sensors}
+              collisionDetection={railCollisions}
+              onDragStart={handleDragStart}
+              onDragOver={handleDragOver}
+              onDragEnd={handleDragEnd}
+              onDragCancel={endDrag}
+            >
+              {/* The top level is one sortable list of blocks: loose projects
+                  and project groups (each dragged as a unit). A group's
+                  projects are a sortable list of their own inside it. */}
               <SortableContext
-                items={visibleProjects.map(({ project }) => project.id)}
+                items={visibleTop.map((item) =>
+                  item.kind === "project" ? item.entry.project.id : sectionDragId(item.group.id),
+                )}
                 strategy={verticalListSortingStrategy}
               >
-                {visibleProjects.map(({ project, visibleWs }, projectIndex) => (
-                  <SortableProjectGroup
-                    key={project?.id || `project-${projectIndex}`}
-                    project={project}
-                    visibleWs={visibleWs}
-                    projectIndex={projectIndex}
-                    q={q}
-                    folded={q === "" && !!collapsedProjects[project.id]}
-                    toggleProjectCollapsed={toggleProjectCollapsed}
-                    activeWorkspaceId={activeWorkspaceId}
-                    gitSummaryByWs={gitSummaryByWs}
-                    prByWs={prByWs}
-                    runningByWs={runningByWs}
-                    attentionByWs={attentionByWs}
-                    flagsByWs={flagsByWs}
-                    shortcutByWs={shortcutByWs}
-                    onSelect={onSelect}
-                    onCustomize={onCustomize}
-                    onContextMenu={onContextMenu}
-                    onNewWorkspaceForProject={onNewWorkspaceForProject}
-                    onProjectContextMenu={onProjectContextMenu}
-                    dragEnabled={dragEnabled}
-                  />
-                ))}
+                {visibleTop.map((item, topIndex) => {
+                  if (item.kind === "project") {
+                    const lead =
+                      topIndex === 0 ? "first" : visibleTop[topIndex - 1].kind === "section" ? "after-section" : "next";
+                    return renderProject(item.entry, lead, null);
+                  }
+                  const { group, members, entries } = item;
+                  const sectionFolded = !filtering && !!collapsedGroups[group.id];
+                  return (
+                    <RailProjectSection
+                      key={`section-${group.id}`}
+                      group={group}
+                      projectCount={members.length}
+                      lead={
+                        topIndex === 0
+                          ? "first"
+                          : visibleTop[topIndex - 1].kind === "section"
+                            ? "after-section"
+                            : "after-project"
+                      }
+                      folded={sectionFolded}
+                      canFold={!filtering}
+                      q={q}
+                      holdsActive={members.some((p) => p.workspaces.some((w) => w?.id === activeWorkspaceId))}
+                      attention={sectionFolded ? (carriers.bySection[group.id] ?? null) : null}
+                      dragEnabled={dragEnabled}
+                      accepting={dropCue?.kind === "into" && dropCue.groupId === group.id}
+                      hitClassName={HIT_WASH}
+                      onToggle={() => useRailGroupUi.getState().toggle(group.id)}
+                      onContextMenu={(x, y, fromKeyboard) => openGroupMenu(group.id, x, y, fromKeyboard)}
+                    >
+                      <SortableContext
+                        items={entries.map(({ project }) => project.id)}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {entries.map((entry, index) =>
+                          renderProject(entry, index === 0 ? "section-first" : "next", group, sectionFolded),
+                        )}
+                      </SortableContext>
+                    </RailProjectSection>
+                  );
+                })}
               </SortableContext>
+              {/* The ungrouped area under the last block: a project dragged
+                  out of its group and dropped here leaves it. Drawn only
+                  while there is a group to leave, so a rail without groups
+                  is laid out exactly as it always was. */}
+              {dragEnabled && topItems.some((item) => item.kind === "section") && <TopLooseArea />}
+              {/* The drag ghost of a mission or a group header, drawn outside
+                  the list so the folds' clipping never cuts it. It is mounted
+                  ONLY for those two drags: a mounted <DragOverlay> wraps any
+                  active drag, children or not, and the sortable list then
+                  takes the drag for an overlay-driven one and stops moving
+                  the dragged project with the pointer. */}
+              {dragging && (
+                <DragOverlay dropAnimation={null}>
+                  <RailDragGhost subject={dragging} projects={projects || []} groups={groups} />
+                </DragOverlay>
+              )}
             </DndContext>
-            {q !== "" && visibleProjects.length === 0 && (
+            {filtering && visibleTop.length === 0 && (
               <div className="octo-fade-in px-3.5 py-4 font-serif text-[13px] text-octo-mute">
-                Nothing matches
+                {q === "" && stateFilter ? STATE_EMPTY[stateFilter] : "Nothing matches"}
               </div>
             )}
           </div>
@@ -355,7 +1110,201 @@ export function WorkspaceRail({
           )}
         </>
       )}
+      {groupMenu && menuGroup?.scope === "project" && (
+        <GroupContextMenu
+          x={groupMenu.x}
+          y={groupMenu.y}
+          groupName={menuGroup.name}
+          tint={menuGroup.tint}
+          holds="projects"
+          empty={!(projects || []).some((p) => sectionOfProject.get(p.id) === menuGroup.id)}
+          // The slim rail draws no project-group header to rename in.
+          onRename={() => {
+            if (!isCollapsed) useRailGroupUi.getState().startRename(menuGroup.id);
+          }}
+          onTint={(tint) => void useGroupsStore.getState().setTint(menuGroup.id, tint)}
+          // Offered only where the step shows: an order the pinned-first
+          // rule would undo is no step (`stepInRail` answers null for it).
+          onMoveUp={sectionUp ?? undefined}
+          onMoveDown={sectionDown ?? undefined}
+          onUngroup={() => void ungroupProjects(menuGroup.id)}
+          onDismiss={closeGroupMenu}
+        />
+      )}
+      {groupMenu && menuGroup?.scope === "workspace" && (
+        <GroupContextMenu
+          x={groupMenu.x}
+          y={groupMenu.y}
+          groupName={menuGroup.name}
+          tint={menuGroup.tint}
+          empty={
+            !(projects || [])
+              .find((p) => p.id === menuGroup.projectId)
+              ?.workspaces.some((w) => w?.groupId === menuGroup.id)
+          }
+          // The slim rail has no room for the inline input.
+          onRename={() => {
+            if (!isCollapsed) useRailGroupUi.getState().startRename(menuGroup.id);
+          }}
+          onTint={(tint) => void useGroupsStore.getState().setTint(menuGroup.id, tint)}
+          onNewMission={
+            onNewWorkspaceInGroup && menuGroup.projectId
+              ? () => onNewWorkspaceInGroup(menuGroup.projectId!, menuGroup.id)
+              : undefined
+          }
+          onUngroup={() => void ungroupMissions(menuGroup.id)}
+          onDismiss={closeGroupMenu}
+        />
+      )}
+      {selectionMenu && selection && selectedRows.length > 1 && (() => {
+        const choices = missionGroupsOf(groups, selection.projectId);
+        const own = (w: Workspace) => (choices.some((g) => g.id === w.groupId) ? w.groupId : null);
+        const first = own(selectedRows[0]);
+        const common = selectedRows.every((w) => own(w) === first) ? first : null;
+        const ids = selectedRows.map((w) => w.id);
+        const done = () => useRailSelection.getState().clear();
+        return (
+          <RailSelectionMenu
+            x={selectionMenu.x}
+            y={selectionMenu.y}
+            count={selectedRows.length}
+            groups={choices}
+            commonGroupId={common ?? null}
+            anyGrouped={selectedRows.some((w) => own(w) !== null)}
+            onGroup={() => {
+              done();
+              void createMissionGroup(selection.projectId, ids);
+            }}
+            onMove={(groupId) => {
+              done();
+              void moveMissionsToGroup(ids, groupId);
+            }}
+            onRemoveFromGroup={() => {
+              done();
+              void moveMissionsToGroup(ids, null);
+            }}
+            onClearSelection={done}
+            onDismiss={closeSelectionMenu}
+          />
+        );
+      })()}
+      {movePicker?.kind === "mission" && (() => {
+        const choices = missionGroupsOf(groups, movePicker.projectId);
+        const rows = (projects || [])
+          .find((p) => p?.id === movePicker.projectId)
+          ?.workspaces.filter((w) => !!w && movePicker.ids.includes(w.id)) ?? [];
+        if (rows.length === 0) return null;
+        const own = (w: Workspace) => (choices.some((g) => g.id === w.groupId) ? w.groupId : null);
+        const first = own(rows[0]);
+        const common = rows.every((w) => own(w) === first) ? first : null;
+        const ids = rows.map((w) => w.id);
+        const many = ids.length > 1;
+        const done = () => {
+          if (many) useRailSelection.getState().clear();
+        };
+        return (
+          <MoveToGroupMenu
+            x={movePicker.x}
+            y={movePicker.y}
+            subject={rows.map((w) => w.name || "Mission").join(", ")}
+            count={ids.length}
+            groups={choices}
+            currentGroupId={common ?? null}
+            onMove={(groupId) => {
+              done();
+              void moveMissionsToGroup(ids, groupId);
+            }}
+            onNewGroup={() => {
+              done();
+              void createMissionGroup(movePicker.projectId, ids);
+            }}
+            onRemoveFromGroup={
+              rows.some((w) => own(w) !== null)
+                ? () => {
+                    done();
+                    void moveMissionsToGroup(ids, null);
+                  }
+                : undefined
+            }
+            onDismiss={closeMovePicker}
+          />
+        );
+      })()}
+      {movePicker?.kind === "project" && (() => {
+        const choices = projectGroupsOf(groups);
+        const project = (projects || []).find((p) => p?.id === movePicker.projectId);
+        if (!project) return null;
+        const current = choices.some((g) => g.id === project.groupId) ? (project.groupId ?? null) : null;
+        return (
+          <MoveToGroupMenu
+            x={movePicker.x}
+            y={movePicker.y}
+            subject={project.name}
+            groups={choices}
+            currentGroupId={current}
+            onMove={(groupId) => void moveProjectToGroup(project.id, groupId)}
+            onNewGroup={() => void createProjectGroup(project.id)}
+            onRemoveFromGroup={current ? () => void moveProjectToGroup(project.id, null) : undefined}
+            onDismiss={closeMovePicker}
+          />
+        );
+      })()}
     </aside>
+  );
+}
+
+/** ⌘⌥G on a Mac, Ctrl+Alt+G elsewhere: "Move to group…" on the focused rail
+ *  row. Never Ctrl+Option on a Mac (VoiceOver's modifiers). The physical
+ *  key, since Option rewrites the printed letter on a Mac. */
+export function isMoveToGroupChord(
+  e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "key" | "code">,
+): boolean {
+  const mod = isMac() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  return mod && e.altKey && !e.shiftKey && (e.code === "KeyG" || e.key.toLowerCase() === "g");
+}
+
+/** The rest of the rail under its last block, as a drop target: the ungrouped
+ *  area (`TOP_LOOSE_ID`). It draws nothing. */
+function TopLooseArea() {
+  const { setNodeRef } = useDroppable({
+    id: TOP_LOOSE_ID,
+    data: { type: "top-loose" } satisfies RailTopData,
+  });
+  return <div ref={setNodeRef} aria-hidden data-testid="rail-top-loose" className="min-h-4 flex-1" />;
+}
+
+/** What follows the pointer while a mission or a group header is dragged. */
+function RailDragGhost({
+  subject,
+  projects,
+  groups,
+}: {
+  subject: RailDragSubject;
+  projects: ProjectGroup[];
+  groups: Group[];
+}) {
+  const box =
+    "flex h-7 w-[220px] items-center gap-2 rounded border border-octo-hairline bg-octo-panel-2 px-2 shadow-xl";
+  if (subject.type === "group") {
+    const group = groups.find((g) => g.id === subject.groupId);
+    if (!group) return null;
+    return (
+      <div className={box}>
+        <ChevronDown size={12} aria-hidden style={{ color: groupMarkColor(group, "var(--color-octo-mute)") }} />
+        <span className="truncate font-mono text-[11px] text-octo-ivory">{group.name}</span>
+      </div>
+    );
+  }
+  const ws = projects.flatMap((p) => p?.workspaces || []).find((w) => w?.id === subject.workspaceId);
+  if (!ws) return null;
+  const mono = resolveMonogram(ws);
+  return (
+    <div className={box}>
+      <span className="font-serif text-[12px] leading-none" style={{ color: TINTS[mono.tint]?.accent }}>
+        {mono.glyph}
+      </span>
+      <span className="truncate text-[13px] text-octo-ivory">{ws.name || "Mission"}</span>
+    </div>
   );
 }
 
@@ -365,9 +1314,20 @@ export function WorkspaceRail({
  * The reserved identity edge every row and cell carries, so state never
  * shifts content by a pixel. Brass marks the active row; the marching bar
  * marks work (brass on the active row, sage everywhere else — never a status
- * in brass, never the workspace tint); transparent at rest.
+ * in brass, never the workspace tint); a static sage bar marks a row of the
+ * multi-selection that is neither active nor working; transparent at rest.
  */
-function IdentityEdge({ active, running, inset = 0 }: { active: boolean; running: boolean; inset?: number }) {
+function IdentityEdge({
+  active,
+  running,
+  selected = false,
+  inset = 0,
+}: {
+  active: boolean;
+  running: boolean;
+  selected?: boolean;
+  inset?: number;
+}) {
   if (running) {
     return (
       <span
@@ -389,8 +1349,9 @@ function IdentityEdge({ active, running, inset = 0 }: { active: boolean; running
   return (
     <span
       aria-hidden
+      data-selected-edge={!active && selected ? "" : undefined}
       className={`absolute left-0 w-[2px] transition-colors duration-[180ms] ${
-        active ? "bg-octo-brass" : "bg-transparent"
+        active ? "bg-octo-brass" : selected ? "bg-octo-sage" : "bg-transparent"
       }`}
       style={{ top: inset, bottom: inset }}
     />
@@ -399,12 +1360,52 @@ function IdentityEdge({ active, running, inset = 0 }: { active: boolean; running
 
 // ───────────────────────────── expanded: project group ─────────────────────────────
 
+/** What stands above a project in the expanded rail, which sets the air (and
+ *  the hairline) above its line: nothing (`first`), a project (`next`), its
+ *  own group's eyebrow (`section-first`), or the end of a project group, which
+ *  a loose project closes with a hairline (`after-section`). */
+type ProjectLead = "first" | "next" | "section-first" | "after-section";
+
+const PROJECT_LEAD: Record<ProjectLead, string> = {
+  first: "mt-1",
+  next: "mt-3",
+  "section-first": "mt-0.5",
+  "after-section": "mt-0.5 border-t border-octo-hairline pt-2.5",
+};
+
 interface SortableProjectGroupProps {
   project: ProjectGroup;
-  /** The rows to show — computed once by the rail (see `VisibleProject`). */
-  visibleWs: Workspace[];
-  projectIndex: number;
+  /** What to show — computed once by the rail (see `VisibleProject`). */
+  items: RailItem[];
+  lead: ProjectLead;
+  /** The project group this project is laid out in, or null for a loose one. */
+  sectionId: string | null;
+  /** That group's tint, which the hexagon takes when the project has none. */
+  sectionTint: TintName | null;
+  /** Its project group is folded: the project is out of sight, so nothing
+   *  can be dropped on it (the group's header is the target). */
+  hidden: boolean;
+  /** What dropping the dragged project now would do to its group; shown on
+   *  this project's line only while this is the project being dragged. */
+  dropCue: TopDropCue | null;
+  /** Folded mission groups by id (the stored state; a filter overrides it). */
+  collapsedGroups: Record<string, boolean>;
+  /** Set only while folded: the beacon or dot this line carries for the
+   *  workspaces it hides. */
+  attention: Attention | null;
+  /** The same, per folded mission group. */
+  groupAttention: Record<string, Attention>;
+  /** Missions and group headers can be dragged (the list is whole). */
+  groupDragEnabled: boolean;
+  dragging: RailDragSubject | null;
+  onGroupContextMenu: (groupId: string, x: number, y: number, fromKeyboard?: boolean) => void;
+  onNewWorkspaceInGroup?: (projectId: string, groupId: string) => void;
   q: string;
+  /** A text or state filter holds: folds are ignored. */
+  filtering: boolean;
+  /** The merged PR of each mission whose row offers "Merged · archive?". */
+  archivableByWs: Record<string, Pr>;
+  onArchiveMerged?: (workspaceId: string) => void;
   folded: boolean;
   toggleProjectCollapsed: (projectId: string) => void;
   activeWorkspaceId: string | null;
@@ -416,31 +1417,102 @@ interface SortableProjectGroupProps {
   shortcutByWs?: Record<string, string>;
   onSelect: (id: string) => void;
   onCustomize: (id: string) => void;
-  onContextMenu?: (workspaceId: string, x: number, y: number) => void;
+  onContextMenu?: (workspaceId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   onNewWorkspaceForProject?: (projectId: string) => void;
-  onProjectContextMenu?: (projectId: string, x: number, y: number) => void;
+  onProjectContextMenu?: (projectId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   dragEnabled: boolean;
+  /** The missions of the rail's multi-selection (empty when none). */
+  selectedIds: ReadonlySet<string>;
+  /** A click on a row, before it activates: true when it was a selection
+   *  gesture. `ordered` is this project's rows as drawn, for a ⇧-click run. */
+  onRowPick?: (
+    e: React.MouseEvent<HTMLButtonElement>,
+    projectId: string,
+    ordered: readonly string[],
+    workspaceId: string,
+  ) => boolean;
 }
 
 function SortableProjectGroup(props: SortableProjectGroupProps) {
   const {
-    project, visibleWs, projectIndex, q, folded, toggleProjectCollapsed, activeWorkspaceId,
+    project, items, lead, sectionId, sectionTint, hidden, dropCue,
+    collapsedGroups, attention, groupAttention, groupDragEnabled, dragging,
+    onGroupContextMenu, onNewWorkspaceInGroup,
+    q, filtering, archivableByWs, onArchiveMerged, folded, toggleProjectCollapsed, activeWorkspaceId,
     gitSummaryByWs, prByWs, runningByWs, attentionByWs, flagsByWs, shortcutByWs,
     onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
-    dragEnabled,
+    dragEnabled, selectedIds, onRowPick,
   } = props;
 
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
-    useSortable({ id: project.id, disabled: !dragEnabled });
+    useSortable({
+      id: project.id,
+      data: { type: "project", sectionId } satisfies RailTopData,
+      disabled: { draggable: !dragEnabled, droppable: !dragEnabled || hidden },
+    });
+  // A translation only (dnd-kit would also scale the block to whatever it is
+  // over), and under the pointer even where the list moves nothing: over
+  // another group's header or the ungrouped area.
+  const shown = useFollowPointer(project.id, isDragging, transform);
 
   const workspaces = project?.workspaces || [];
+  // A project with no group has nothing to drag a mission onto: its rows stay
+  // plain, exactly as they were before groups existed.
+  const hasGroups = items.some((item) => item.kind === "group");
+  const missionDrag = groupDragEnabled && hasGroups;
+  // The part of the project that belongs to no group. A mission dropped here
+  // leaves its group; a group under the pointer wins (see `railCollisions`).
+  const loose = useDroppable({
+    id: `loose:${project.id}`,
+    data: { type: "loose", projectId: project.id } satisfies RailDropTarget,
+    disabled: !missionDrag,
+  });
+
+  // The project's rows as the rail draws them (a folded group's members are
+  // out of sight), for the run a ⇧-click selects.
+  const orderedIds = items.flatMap((item) =>
+    item.kind === "mission"
+      ? [item.workspace.id]
+      : !filtering && collapsedGroups[item.group.id]
+        ? []
+        : item.visible.map((w) => w.id),
+  );
+
+  const renderRow = (ws: Workspace, groupId: string | null) => (
+    <WorkspaceRow
+      key={ws?.id || `ws-${project.id}`}
+      workspace={ws}
+      active={ws?.id === activeWorkspaceId}
+      selected={!!ws?.id && selectedIds.has(ws.id)}
+      onPick={onRowPick && ws?.id ? (e) => onRowPick(e, project.id, orderedIds, ws.id) : undefined}
+      q={q}
+      grouped={groupId !== null}
+      drag={
+        missionDrag && ws?.id
+          ? { type: "mission", workspaceId: ws.id, projectId: project.id, groupId }
+          : null
+      }
+      ticketKey={ticketKeyFor(ws, project)}
+      dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
+      ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
+      behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
+      hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
+      mergedPr={archivableByWs[ws?.id ?? ""] ?? null}
+      onArchiveMerged={onArchiveMerged && ws?.id ? () => onArchiveMerged(ws.id) : undefined}
+      running={!!runningByWs?.[ws?.id ?? ""]}
+      attention={attentionByWs[ws?.id ?? ""] ?? null}
+      attentionKind={flagsByWs?.[ws?.id ?? ""]?.kind ?? null}
+      shortcut={shortcutByWs?.[ws?.id ?? ""] ?? null}
+      onSelect={() => ws?.id && onSelect(ws.id)}
+      onCustomize={() => ws?.id && onCustomize(ws.id)}
+      onContextMenu={onContextMenu && ws?.id ? (x, y, kb) => onContextMenu(ws.id, x, y, kb) : undefined}
+    />
+  );
 
   // A live filter forces every project open, so folding is not offered while
   // one is typed: the stored fold state is left exactly as it was.
-  const canFold = q === "";
-  // The project's own tint colours its mark only when the user chose one; an
-  // untinted project stays mute, so N projects never mean N brass hexagons.
-  const projectTint = project.tint ? TINTS[project.tint as keyof typeof TINTS] : undefined;
+  const canFold = !filtering;
+  const lineRef = useRef<HTMLButtonElement | null>(null);
   const hasActive = workspaces.some((w) => w?.id === activeWorkspaceId);
   const dirtyCount = workspaces.filter((w) => gitSummaryByWs?.[w?.id ?? ""]?.dirty).length;
   const openPrCount = workspaces.filter((w) => prByWs?.[w?.id ?? ""]).length;
@@ -449,11 +1521,14 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
   return (
     <div
       ref={setNodeRef}
-      className={`flex flex-col ${projectIndex === 0 ? "mt-1" : "mt-3"}`}
+      data-rail-project={project.id}
+      data-dragging={isDragging || undefined}
+      // Dragged, it is an opaque, lifted surface that occludes the blocks it
+      // passes, its content at full strength.
+      className={`flex flex-col ${PROJECT_LEAD[lead]} ${isDragging ? DRAGGED_BLOCK : ""}`}
       style={{
-        transform: CSS.Transform.toString(transform),
+        transform: shown,
         transition,
-        opacity: isDragging ? 0.6 : undefined,
       }}
     >
       {/* Header — a line of the index: mark, name, then (folded only) the
@@ -466,27 +1541,49 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         }}
       >
         <button
+          ref={lineRef}
           type="button"
+          data-rail-project-line={project.id}
           onClick={() => {
             if (canFold) toggleProjectCollapsed(project.id);
+          }}
+          // The keyboard's way into the project's menu (and so into "Move to
+          // group"): ⇧F10 or the context-menu key, opened at the line.
+          onKeyDown={(e) => {
+            if (!onProjectContextMenu) return;
+            if (e.key !== "ContextMenu" && !(e.key === "F10" && e.shiftKey)) return;
+            e.preventDefault();
+            const r = lineRef.current?.getBoundingClientRect();
+            if (r) onProjectContextMenu(project.id, r.left + 24, r.bottom, true);
           }}
           aria-expanded={canFold ? !folded : undefined}
           title={canFold ? `${verb} ${project.name}` : undefined}
           className="flex h-full min-w-0 flex-1 items-center gap-2 text-left focus-visible:outline-none"
         >
-          <ProjectMark
-            size={12}
-            className="shrink-0"
-            color={projectTint?.accent ?? "var(--color-octo-mute)"}
-          />
+          {/* Folded over the beacon's workspace, the mark carries the pulse
+              (nearest visible ancestor); the wrapper changes no geometry. */}
+          <span
+            className={`flex shrink-0 rounded-full ${
+              attention === "beacon" ? "rail-beacon animate-attention-pulse" : ""
+            }`}
+          >
+            <ProjectMark size={12} color={projectMarkColor(project.tint, sectionTint)} />
+          </span>
+          {/* Middle-truncated (E1): projects in one org share their head, so
+              the tail is what tells them apart. `flex-1 min-w-0` gives the
+              MidTruncate box the definite width it elides into. The button's
+              fold title already carries the name; while a filter disables
+              folding, the name carries its own. */}
           <span
             data-testid="project-header"
-            className={`truncate font-serif text-[13px] leading-none transition-colors duration-[180ms] group-hover/head:text-octo-ivory ${
+            title={canFold ? undefined : project.name}
+            className={`flex min-w-0 flex-1 font-serif text-[13px] leading-none transition-colors duration-[180ms] group-hover/head:text-octo-ivory ${
               hasActive ? "text-octo-ivory" : "text-octo-sage"
             }`}
           >
-            {project.name}
+            <MidTruncate text={project.name} tail={RAIL_NAME_TAIL} />
           </span>
+          {attention && <span className="sr-only"> — needs attention</span>}
         </button>
 
         {/* Aggregates — visible only while folded. Kept mounted so folding
@@ -520,16 +1617,30 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
               {openPrCount}
             </span>
           )}
+          {attention === "dot" && (
+            <span
+              role="img"
+              aria-label="Needs your attention"
+              title="Needs your attention"
+              className="h-[5px] w-[5px] shrink-0 rounded-full bg-octo-brass"
+            />
+          )}
         </span>
 
-        <span className="flex shrink-0 items-center opacity-0 transition-opacity duration-[180ms] group-focus-within/head:opacity-100 group-hover/head:opacity-100">
+        {/* Hover actions — they take no width until hover/focus reveals them,
+            so a long name uses the whole line meanwhile. Clipped while they
+            grow, hence the inset focus rings. */}
+        <span
+          data-testid="project-header-actions"
+          className={`flex max-w-0 shrink-0 items-center overflow-hidden opacity-0 transition-[max-width,opacity] duration-[220ms] ${EASE} group-focus-within/head:max-w-[60px] group-focus-within/head:opacity-100 group-hover/head:max-w-[60px] group-hover/head:opacity-100`}
+        >
           {onNewWorkspaceForProject && (
             <button
               type="button"
               onClick={() => onNewWorkspaceForProject(project.id)}
               title={`New mission in ${project.name}`}
               aria-label={`New mission in ${project.name}`}
-              className={`${ICON_BTN} h-5 w-5`}
+              className={`${ICON_BTN} h-5 w-5 focus-visible:ring-inset`}
             >
               <Plus size={12} aria-hidden />
             </button>
@@ -542,7 +1653,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
               {...listeners}
               aria-label={`Reorder ${project.name}`}
               title="Drag to reorder"
-              className={`${ICON_BTN} h-5 w-5 cursor-grab active:cursor-grabbing`}
+              className={`${ICON_BTN} h-5 w-5 cursor-grab focus-visible:ring-inset active:cursor-grabbing`}
             >
               <GripVertical size={12} aria-hidden />
             </button>
@@ -550,22 +1661,34 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         </span>
         {/* The chevron is decoration for the pointer: the name button already
             is the one keyboard-reachable fold control, so this adds no second
-            tab stop. Hidden while a filter holds every project open. */}
+            tab stop. Hidden while a filter holds every project open. While
+            the project is open it takes no width until hover/focus, like the
+            actions beside it. */}
         {canFold && (
           <span
             aria-hidden
-            onClick={() => toggleProjectCollapsed(project.id)}
-            title={`${verb} ${project.name}`}
-            className={`${ICON_BTN} h-5 w-5 cursor-pointer ${
-              folded ? "opacity-100" : "opacity-0 group-focus-within/head:opacity-100 group-hover/head:opacity-100"
+            data-testid="project-header-chevron"
+            className={`flex shrink-0 overflow-hidden transition-[max-width] duration-[220ms] ${EASE} ${
+              folded ? "max-w-5" : "max-w-0 group-focus-within/head:max-w-5 group-hover/head:max-w-5"
             }`}
           >
-            <ChevronDown
-              size={12}
-              className={`transition-transform duration-[280ms] ${EASE} ${folded ? "-rotate-90" : ""}`}
-            />
+            <span
+              onClick={() => toggleProjectCollapsed(project.id)}
+              title={`${verb} ${project.name}`}
+              className={`${ICON_BTN} h-5 w-5 cursor-pointer ${
+                folded ? "opacity-100" : "opacity-0 group-focus-within/head:opacity-100 group-hover/head:opacity-100"
+              }`}
+            >
+              <ChevronDown
+                size={12}
+                className={`transition-transform duration-[280ms] ${EASE} ${folded ? "-rotate-90" : ""}`}
+              />
+            </span>
           </span>
         )}
+        {/* While this project is dragged and the drop would change its group,
+            its own line says so, where the eye is ("Into …" / "Out of …"). */}
+        {isDragging && dropCue && <DropCue cue={dropCue} />}
       </div>
 
       {/* Rows — the grid-rows 0fr↔1fr collapse idiom. The clip wrapper carries
@@ -581,30 +1704,36 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         }}
       >
         <div className="min-h-0 overflow-hidden">
-          <div className="flex flex-col py-0.5">
-            {visibleWs.map((ws) => (
-              <WorkspaceRow
-                key={ws?.id || `ws-${projectIndex}`}
-                workspace={ws}
-                active={ws?.id === activeWorkspaceId}
-                q={q}
-                ticketKey={ticketKeyFor(ws, project)}
-                dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
-                ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
-                behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
-                hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
-                running={!!runningByWs?.[ws?.id ?? ""]}
-                attention={attentionByWs[ws?.id ?? ""] ?? null}
-                attentionKind={flagsByWs?.[ws?.id ?? ""]?.kind ?? null}
-                shortcut={shortcutByWs?.[ws?.id ?? ""] ?? null}
-                onSelect={() => ws?.id && onSelect(ws.id)}
-                onCustomize={() => ws?.id && onCustomize(ws.id)}
-                onContextMenu={
-                  onContextMenu && ws?.id ? (x, y) => onContextMenu(ws.id, x, y) : undefined
-                }
-              />
-            ))}
-            {visibleWs.length === 0 && (
+          <div ref={loose.setNodeRef} className="flex flex-col py-0.5">
+            {items.map((item) => {
+              if (item.kind === "mission") return renderRow(item.workspace, null);
+              const { group, members, visible } = item;
+              const groupFolded = !filtering && !!collapsedGroups[group.id];
+              return (
+                <RailMissionGroup
+                  key={`group-${group.id}`}
+                  group={group}
+                  memberCount={members.length}
+                  folded={groupFolded}
+                  canFold={canFold}
+                  q={q}
+                  hasOpenPr={members.some((w) => !!prByWs?.[w.id])}
+                  holdsActive={members.some((w) => w.id === activeWorkspaceId)}
+                  attention={groupFolded ? (groupAttention[group.id] ?? null) : null}
+                  dragEnabled={groupDragEnabled}
+                  dragging={dragging}
+                  hitClassName={HIT_WASH}
+                  onToggle={() => useRailGroupUi.getState().toggle(group.id)}
+                  onContextMenu={(x, y, fromKeyboard) => onGroupContextMenu(group.id, x, y, fromKeyboard)}
+                  onNewMission={
+                    onNewWorkspaceInGroup ? () => onNewWorkspaceInGroup(project.id, group.id) : undefined
+                  }
+                >
+                  {visible.map((ws) => renderRow(ws, group.id))}
+                </RailMissionGroup>
+              );
+            })}
+            {items.length === 0 && (
               <div className="flex h-8 items-center pl-[42px] pr-3 text-[12px] text-octo-mute">
                 No missions yet
               </div>
@@ -613,6 +1742,37 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** The text of a drop cue, as the dragged block shows it. */
+export function dropCueText(cue: TopDropCue): string {
+  return `${cue.kind === "into" ? "Into" : "Out of"} ${cue.name}`;
+}
+
+/**
+ * The cue on a dragged project's line: what the drop under the pointer would
+ * do to its group. `Into {group}` in brass (an active state) when it would
+ * join one, `Out of {group}` in mute when it would leave its own. Drawn over
+ * the right end of the line on the block's own ground, so it never changes
+ * the block's size; a long name ends in an ellipsis. It crossfades in when
+ * the drop it describes changes.
+ */
+function DropCue({ cue }: { cue: TopDropCue }) {
+  const text = dropCueText(cue);
+  return (
+    <span
+      data-testid="rail-drop-cue"
+      data-cue={cue.kind}
+      className={`pointer-events-none absolute inset-y-0 right-2 flex max-w-[60%] items-center bg-octo-panel pl-2 ${EYEBROW}`}
+    >
+      <span
+        key={text}
+        className={`octo-fade-in min-w-0 truncate ${cue.kind === "into" ? "text-octo-brass" : "text-octo-mute"}`}
+      >
+        {text}
+      </span>
+    </span>
   );
 }
 
@@ -626,6 +1786,8 @@ export const RAIL_NAME_TAIL = 14;
 /** The width a row's name and meta share at the 280px rail: the row minus its
  *  padding (14 + 12), the 20px monogram and the two 8px gaps. */
 const ROW_TEXT_PX = 218;
+/** How far a mission group's members are indented (the guide stands in it). */
+export const GROUP_INDENT_PX = 14;
 /** 13px system sans, rounded up on purpose: an over-estimate only sheds the
  *  ahead/behind rung a little early (it survives in the name's tooltip); an
  *  under-estimate is still caught by the name's middle truncation. */
@@ -642,6 +1804,8 @@ export interface RowMeta {
   hasOpenPr?: boolean;
   /** The dirty glyph is shown (not on the active row). */
   dirty?: boolean;
+  /** The collision-radar glyph is shown (#732). */
+  collision?: boolean;
   dot?: boolean;
 }
 
@@ -649,13 +1813,14 @@ export interface RowMeta {
  *  rail has a fixed width — what varies is the name, not the band. One rung:
  *  the ahead/behind counts shed before the name loses its tail, and move into
  *  the name's tooltip. Floor: the ticket key, PR, dirty and attention marks. */
-export function shedsGitMeta(name: string, meta: RowMeta): boolean {
+export function shedsGitMeta(name: string, meta: RowMeta, textPx: number = ROW_TEXT_PX): boolean {
   const counts = [meta.ahead, meta.behind].filter((n): n is number => !!n);
   if (counts.length === 0) return false;
   const atoms: number[] = [];
   if (meta.ticketKey) atoms.push(meta.ticketKey.length * META_PX_PER_CHAR);
   if (meta.hasOpenPr) atoms.push(META_ICON_PX);
   if (meta.dirty) atoms.push(META_ICON_PX);
+  if (meta.collision) atoms.push(META_ICON_PX);
   if (meta.dot) atoms.push(5);
   const floor = atoms.reduce((sum, w) => sum + w + META_GAP_PX, 0);
   // Each count: a 10px arrow, a 2px gap and its digits.
@@ -663,7 +1828,7 @@ export function shedsGitMeta(name: string, meta: RowMeta): boolean {
     (sum, n) => sum + 12 + String(n).length * META_PX_PER_CHAR + META_GAP_PX,
     0,
   );
-  return name.length * NAME_PX_PER_CHAR > ROW_TEXT_PX - floor - rung;
+  return name.length * NAME_PX_PER_CHAR > textPx - floor - rung;
 }
 
 function gitCountsLabel(ahead?: number, behind?: number): string {
@@ -679,35 +1844,58 @@ interface WorkspaceRowProps {
   workspace: Workspace;
   active: boolean;
   q: string;
+  /** The row is a member of a mission group: indented beside the guide. */
+  grouped?: boolean;
+  /** What dragging this row carries, or null when rows do not drag (a
+   *  project with no group, a live filter). */
+  drag?: RailDragSubject | null;
   ticketKey?: string | null;
   dirty?: boolean;
   ahead?: number;
   behind?: number;
   hasOpenPr?: boolean;
+  /** Its PR is merged, its worktree clean and it is idle (`archivableMerge`):
+   *  the meta offers "merged · archive?". */
+  mergedPr?: Pr | null;
+  onArchiveMerged?: () => void;
   /** Workspace is actively processing — the identity edge marches. */
   running?: boolean;
   attention: Attention | null;
   attentionKind: string | null;
   shortcut: string | null;
+  /** In the rail's multi-selection (⌘-click / ⇧-click). */
+  selected?: boolean;
   onSelect: () => void;
+  /** A click on the row's monogram or name, before activation: returns true
+   *  when it was a selection gesture (⌘ / Ctrl or ⇧ held), which then does
+   *  not activate the mission. */
+  onPick?: (e: React.MouseEvent<HTMLButtonElement>) => boolean;
   onCustomize: () => void;
-  onContextMenu?: (x: number, y: number) => void;
+  /** `fromKeyboard`: asked for with ⇧F10 or the context-menu key, so the
+   *  menu opens at the row and the row wants the focus back after it. */
+  onContextMenu?: (x: number, y: number, fromKeyboard?: boolean) => void;
 }
 
 function WorkspaceRow({
   workspace,
   active,
   q,
+  grouped = false,
+  drag = null,
   ticketKey,
   dirty,
   ahead,
   behind,
   hasOpenPr,
+  mergedPr = null,
+  onArchiveMerged,
   running,
   attention,
   attentionKind,
   shortcut,
+  selected = false,
   onSelect,
+  onPick,
   onCustomize,
   onContextMenu,
 }: WorkspaceRowProps) {
@@ -723,6 +1911,19 @@ function WorkspaceRow({
   const missionGit = useMissionsStore(
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.gitIsolation ?? null,
   );
+  const collisions = useWorkspaceCollisions(workspace?.id);
+  // An archive of this mission is under way: "merged · archive?" waits.
+  const archiving = useWorkspaceStore((s) => !!s.archivingIds[workspace?.id ?? ""]);
+  // Local files (Claude Code's saved choices among them) are confirmed first.
+  const hasLocalFiles = useWorkspaceStore((s) => (s.localFilesByWs[workspace?.id ?? ""]?.length ?? 0) > 0);
+  // Pointer-only: the row is no extra tab stop. In this rail the keyboard
+  // moves a mission with ⌘⌥G, or with ⇧F10 into its menu ("Move to group");
+  // a slim rail's cell answers neither yet (#918).
+  const draggable = useDraggable({
+    id: `mission:${workspace?.id ?? ""}`,
+    data: drag ?? undefined,
+    disabled: !drag,
+  });
 
   if (!workspace) return null;
 
@@ -758,14 +1959,19 @@ function WorkspaceRow({
       : "";
   const hint = shortcut ? ` (${shortcut})` : "";
   const hit = matchRange(name, q);
-  const shedGit = shedsGitMeta(name, {
-    ticketKey,
-    ahead,
-    behind,
-    hasOpenPr,
-    dirty: dirty && !active,
-    dot: attention === "dot",
-  });
+  const shedGit = shedsGitMeta(
+    name,
+    {
+      ticketKey,
+      ahead,
+      behind,
+      hasOpenPr,
+      dirty: dirty && !active,
+      collision: worstSeverity(collisions) !== null,
+      dot: attention === "dot",
+    },
+    grouped ? ROW_TEXT_PX - GROUP_INDENT_PX : ROW_TEXT_PX,
+  );
   const shedSuffix = shedGit ? ` · ${gitCountsLabel(ahead, behind)}` : "";
 
   const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
@@ -777,23 +1983,55 @@ function WorkspaceRow({
       onCustomize();
     }
   };
+  // The keyboard's way into the mission's menu (and so into "Move to
+  // group"): ⇧F10 or the context-menu key on the monogram or the name,
+  // opened at the row, as on a project line.
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!onContextMenu) return;
+    if (e.key !== "ContextMenu" && !(e.key === "F10" && e.shiftKey)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const r = e.currentTarget.getBoundingClientRect();
+    onContextMenu(r.left + 24, r.bottom, true);
+  };
+  const activate = (e: React.MouseEvent<HTMLButtonElement>) => {
+    if (onPick?.(e)) return;
+    onSelect();
+  };
 
   return (
     <div
-      className={`group/row octo-fade-in relative flex h-8 items-center gap-2 pl-3.5 pr-3 transition-colors duration-[180ms] ${
-        active ? "bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"
+      ref={draggable.setNodeRef}
+      onPointerDown={draggable.listeners?.onPointerDown as React.PointerEventHandler<HTMLDivElement> | undefined}
+      // ⇧-click selects a run of rows: keep the browser from also
+      // selecting the text between the two clicks.
+      onMouseDown={(e) => {
+        if (e.shiftKey) e.preventDefault();
+      }}
+      data-rail-row={grouped ? "member" : "loose"}
+      data-rail-ws={workspace.id}
+      data-selected={selected || undefined}
+      // A member is indented 14px beside its group's guide. The row itself
+      // stays full width, so the state edge below remains at the rail's edge.
+      // Selected (not active), it keeps the hover ground: the selection is
+      // a set of rows to act on, never a second active row.
+      className={`group/row octo-fade-in relative flex h-8 items-center gap-2 pr-3 transition-colors duration-[180ms] ${
+        grouped ? "pl-7" : "pl-3.5"
+      } ${active ? "bg-[var(--brass-ghost)]" : selected ? "bg-octo-panel-2" : "hover:bg-octo-panel-2"} ${
+        draggable.isDragging ? "opacity-40" : ""
       }`}
       onContextMenu={handleContextMenu}
+      onKeyDown={handleKeyDown}
     >
-      <IdentityEdge active={active} running={!!running} />
+      <IdentityEdge active={active} running={!!running} selected={selected} />
 
       {/* Monogram — the one carrier of the workspace tint: a bare serif glyph,
           no border, no fill. The single beacon pulses here. */}
       <button
         type="button"
-        onClick={onSelect}
+        onClick={activate}
         title={posture ?? undefined}
-        aria-label={attention ? `${name} — needs attention` : name}
+        aria-label={`${name}${attention ? " — needs attention" : ""}${selected ? " — selected" : ""}`}
         aria-current={active ? "location" : undefined}
         className={`flex h-5 w-5 shrink-0 items-center justify-center rounded font-serif text-[12px] leading-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
           attention === "beacon" ? "rail-beacon animate-attention-pulse" : ""
@@ -810,10 +2048,11 @@ function WorkspaceRow({
           stays the single name-labelled control. */}
       <button
         type="button"
-        onClick={onSelect}
+        data-rail-mission={workspace.id}
+        onClick={activate}
         title={`${name}${shedSuffix}${stateSuffix}${hint}`}
         className={`flex min-w-0 flex-1 text-left text-[13px] transition-colors duration-[180ms] focus-visible:outline-none ${
-          active ? "text-octo-ivory" : "text-octo-sage group-hover/row:text-octo-ivory"
+          active || selected ? "text-octo-ivory" : "text-octo-sage group-hover/row:text-octo-ivory"
         }`}
       >
         {hit ? (
@@ -823,10 +2062,11 @@ function WorkspaceRow({
         ) : (
           <MidTruncate text={name} tail={RAIL_NAME_TAIL} />
         )}
+        {selected && <span className="sr-only"> — selected</span>}
       </button>
 
       {/* Meta — unboxed, right-aligned, tabular: ticket · ahead/behind · PR ·
-          dirty · attention. Brass appears here only as the attention dot. The
+          dirty · collision (#732) · attention. Brass appears here only as the attention dot. The
           ahead/behind pair is the row's one demotion rung (`shedsGitMeta`). */}
       <div className="octo-tabular flex shrink-0 items-center gap-2 font-mono text-[10px] leading-none text-octo-mute">
         {ticketKey && (
@@ -879,6 +2119,7 @@ function WorkspaceRow({
             <GitCommitHorizontal size={11} aria-hidden />
           </span>
         )}
+        <CollisionMark workspaceId={workspace.id} />
         {attention === "dot" && (
           <span
             role="img"
@@ -886,6 +2127,28 @@ function WorkspaceRow({
             title="Needs your attention"
             className="octo-pop-in h-[5px] w-[5px] rounded-full bg-octo-brass"
           />
+        )}
+        {/* #963: offered, never done by itself. Archiving keeps the branch,
+            and the toast that follows can undo it. */}
+        {mergedPr && onArchiveMerged && (
+          <button
+            type="button"
+            data-tour="rail-merged-archive"
+            disabled={archiving}
+            onClick={(e) => {
+              e.stopPropagation();
+              onArchiveMerged();
+            }}
+            title={`PR #${mergedPr.number} is merged and the worktree is clean. Archive ${name}; the branch is kept.${
+              hasLocalFiles
+                ? " Its local files go too and Undo doesn't bring them back, so they are listed first."
+                : " Undo brings it back whole: it holds no local files and no saved Claude Code choices."
+            }`}
+            aria-label={`Merged — archive ${name}`}
+            className="octo-pop-in rounded px-0.5 text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:pointer-events-none disabled:opacity-50"
+          >
+            merged · archive?
+          </button>
         )}
       </div>
     </div>
@@ -908,6 +2171,16 @@ interface CollapsedRailProps {
   attentionByWs: Record<string, Attention>;
   flagsByWs: Record<string, AttentionFlag>;
   shortcutByWs?: Record<string, string>;
+  /** The top level in rail order: loose projects and project groups. */
+  topItems: RailTopItem<ProjectGroup>[];
+  /** Each project's loose missions and mission groups, in rail order. */
+  itemsByProject: Record<string, RailItem[]>;
+  collapsedGroups: Record<string, boolean>;
+  /** The beacon or dot a folded group's chevron carries. */
+  groupAttention: Record<string, Attention>;
+  /** `fromKeyboard`: asked for with ⇧F10 or the context-menu key on a group's
+   *  chevron, so the chevron gets the focus back when the menu closes. */
+  onGroupContextMenu: (groupId: string, x: number, y: number, fromKeyboard?: boolean) => void;
 }
 
 interface FlyoutAnchor {
@@ -917,11 +2190,25 @@ interface FlyoutAnchor {
 }
 
 /**
- * The slim rail: the Run session rail's geometry (44px, 32px cells, a reserved
- * identity edge), one cluster per project headed by its mark, and a hover /
+ * The slim rail: the geometry of Review's collapsed navigator (44px, 32px
+ * cells, a reserved identity edge), one cluster per project headed by its mark, and a hover /
  * focus flyout that carries what the width cannot — project, name, status and
  * the jump key. Positioned `fixed` against the measured cell, since the
  * scrolling list would clip an absolutely positioned popover.
+ *
+ * A mission group keeps its two marks at this width: a 12px chevron in the
+ * group's tint (its tooltip is the group's name, it folds the group, and ⇧F10
+ * or the context-menu key opens the group's menu beside it) and
+ * the 1px guide beside the members' monograms, with 6px of air above and
+ * below the group.
+ *
+ * A project group is a sub-cluster: its projects' clusters stand together
+ * between two hairlines that span the rail's width (the short hairline still
+ * parts one project from the next, inside a group and outside). There is no
+ * room for its name, so each of its projects' marks is titled
+ * `group · project`, the flyout's eyebrow starts with the group, and the
+ * hexagons take its tint as they do in the expanded rail. It does not fold
+ * at this width, like a project.
  */
 function CollapsedRail({
   projects,
@@ -937,9 +2224,16 @@ function CollapsedRail({
   attentionByWs,
   flagsByWs,
   shortcutByWs,
+  topItems,
+  itemsByProject,
+  collapsedGroups,
+  groupAttention,
+  onGroupContextMenu,
 }: CollapsedRailProps) {
   const [flyout, setFlyout] = useState<FlyoutAnchor | null>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  useScrollActiveIntoView(listRef, activeWorkspaceId, projects);
 
   const cancelClose = useCallback(() => {
     if (closeTimer.current) {
@@ -969,6 +2263,146 @@ function CollapsedRail({
   );
   useEffect(() => () => cancelClose(), [cancelClose]);
 
+  const renderCell = (project: ProjectGroup, section: Group | null, ws: Workspace, group: Group | null) => {
+    if (!ws?.id) return null;
+    return (
+      <CollapsedCell
+        key={ws.id}
+        workspace={ws}
+        // Outermost first: project group · project · mission group.
+        eyebrow={[section?.name, project?.name || "Project", group?.name].filter(Boolean).join(" · ")}
+        active={ws.id === activeWorkspaceId}
+        running={!!runningByWs?.[ws.id]}
+        attention={attentionByWs[ws.id] ?? null}
+        attentionKind={flagsByWs?.[ws.id]?.kind ?? null}
+        ticketKey={ticketKeyFor(ws, project)}
+        git={gitSummaryByWs?.[ws.id]}
+        hasOpenPr={!!prByWs?.[ws.id]}
+        shortcut={shortcutByWs?.[ws.id] ?? null}
+        flyout={flyout?.id === ws.id ? flyout : null}
+        onOpen={openFlyout}
+        onScheduleClose={scheduleClose}
+        onCancelClose={cancelClose}
+        onCloseNow={closeFlyout}
+        onSelect={() => onSelect(ws.id)}
+        onCustomize={() => onCustomize(ws.id)}
+        onContextMenu={onContextMenu ? (x, y) => onContextMenu(ws.id, x, y) : undefined}
+      />
+    );
+  };
+
+  // The top level as runs of clusters: a loose project alone, or a project
+  // group's projects together. An empty group has no cluster to draw.
+  const blocks = topItems
+    .map((item) =>
+      item.kind === "project"
+        ? { section: null as Group | null, projects: [item.project] }
+        : { section: item.group as Group | null, projects: item.projects },
+    )
+    .filter((block) => block.projects.length > 0);
+
+  const renderCluster = (project: ProjectGroup, section: Group | null, parted: boolean) => {
+    const label = [section?.name, project?.name || "Project"].filter(Boolean).join(" · ");
+    return (
+      <div key={project.id} className="flex w-full flex-col items-center">
+        {parted && <div aria-hidden className="my-1 h-px w-5 bg-octo-hairline" />}
+        <span
+          role="img"
+          aria-label={label}
+          title={label}
+          className="flex h-[18px] items-center"
+          onContextMenu={(e) => {
+            e.preventDefault();
+            onProjectContextMenu?.(project.id, e.clientX, e.clientY);
+          }}
+        >
+          <ProjectMark size={12} color={projectMarkColor(project.tint, section?.tint ?? null)} />
+        </span>
+        {(itemsByProject[project.id] ?? []).map((item) => {
+          if (item.kind === "mission") return renderCell(project, section, item.workspace, null);
+          const { group, members } = item;
+          const groupFolded = !!collapsedGroups[group.id];
+          const carried = groupFolded ? (groupAttention[group.id] ?? null) : null;
+          return (
+            <div
+              key={`group-${group.id}`}
+              data-testid={`rail-group-${group.id}`}
+              className="my-1.5 flex w-full flex-col items-center"
+            >
+              <button
+                type="button"
+                // The rail gives a keyboard-opened menu's focus back here.
+                data-rail-group-header={group.id}
+                onClick={() => useRailGroupUi.getState().toggle(group.id)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onGroupContextMenu(group.id, e.clientX, e.clientY);
+                }}
+                // ⇧F10 or the context-menu key: the same menu, opened beside
+                // the chevron where the flyouts open (the rail is 44px wide).
+                onKeyDown={(e) => {
+                  if (e.key !== "ContextMenu" && !(e.key === "F10" && e.shiftKey)) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  onGroupContextMenu(group.id, r.right + 8, r.top, true);
+                }}
+                aria-expanded={!groupFolded}
+                aria-label={carried ? `${group.name} — needs attention` : group.name}
+                title={group.name}
+                className="relative flex h-4 w-full items-center justify-center focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
+              >
+                <span
+                  className={`flex h-4 w-4 items-center justify-center rounded ${
+                    carried === "beacon" ? "rail-beacon animate-attention-pulse" : ""
+                  }`}
+                  style={{ color: groupMarkColor(group, "var(--color-octo-mute)") }}
+                >
+                  <ChevronDown
+                    size={12}
+                    aria-hidden
+                    className={`transition-transform duration-[280ms] ${EASE} ${groupFolded ? "-rotate-90" : ""}`}
+                  />
+                </span>
+                {carried === "dot" && (
+                  <span
+                    aria-hidden
+                    className="octo-pop-in absolute right-[7px] top-[2px] h-[5px] w-[5px] rounded-full bg-octo-brass"
+                  />
+                )}
+              </button>
+              <div
+                aria-hidden={groupFolded}
+                inert={groupFolded}
+                className={`grid w-full overflow-hidden transition-[grid-template-rows,opacity] duration-[280ms] ${EASE}`}
+                style={{
+                  gridTemplateColumns: "minmax(0, 1fr)",
+                  gridTemplateRows: groupFolded ? "0fr" : "1fr",
+                  opacity: groupFolded ? 0 : 1,
+                }}
+              >
+                <div className="min-h-0 overflow-hidden">
+                  <div className="relative flex flex-col">
+                    {members.map((ws) => renderCell(project, section, ws, group))}
+                    {members.length > 0 && (
+                      <span
+                        aria-hidden
+                        data-testid="rail-group-guide"
+                        className="pointer-events-none absolute bottom-1 left-[6px] top-1 w-px opacity-50"
+                        style={{ backgroundColor: groupMarkColor(group, "var(--color-octo-border-strong)") }}
+                      />
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   return (
     <>
       <div className="flex h-9 shrink-0 items-center justify-center">
@@ -985,54 +2419,26 @@ function CollapsedRail({
         )}
       </div>
       <div
+        ref={listRef}
         className="flex min-h-0 w-full flex-1 flex-col items-center overflow-y-auto pb-2"
         // Scrolling moves the cells out from under a measured flyout, so the
         // flyout goes rather than drifting off its anchor.
         onScroll={() => setFlyout(null)}
       >
-        {projects.map((project, projectIndex) => {
-          const projectTint = project?.tint ? TINTS[project.tint as keyof typeof TINTS] : undefined;
+        {blocks.map((block, blockIndex) => {
+          // A project group's start and end are a hairline across the rail;
+          // inside it, and between loose projects, the short one.
+          const wide = blockIndex > 0 && (block.section !== null || blocks[blockIndex - 1].section !== null);
           return (
-            <div key={project?.id || `project-${projectIndex}`} className="flex w-full flex-col items-center">
-              {projectIndex > 0 && <div aria-hidden className="my-1 h-px w-5 bg-octo-hairline" />}
-              <span
-                role="img"
-                aria-label={project?.name || "Project"}
-                title={project?.name || "Project"}
-                className="flex h-[18px] items-center"
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  onProjectContextMenu?.(project.id, e.clientX, e.clientY);
-                }}
-              >
-                <ProjectMark size={12} color={projectTint?.accent ?? "var(--color-octo-mute)"} />
-              </span>
-              {(project?.workspaces || []).map((ws) => {
-                if (!ws?.id) return null;
-                return (
-                  <CollapsedCell
-                    key={ws.id}
-                    workspace={ws}
-                    projectName={project?.name || "Project"}
-                    active={ws.id === activeWorkspaceId}
-                    running={!!runningByWs?.[ws.id]}
-                    attention={attentionByWs[ws.id] ?? null}
-                    attentionKind={flagsByWs?.[ws.id]?.kind ?? null}
-                    ticketKey={ticketKeyFor(ws, project)}
-                    git={gitSummaryByWs?.[ws.id]}
-                    hasOpenPr={!!prByWs?.[ws.id]}
-                    shortcut={shortcutByWs?.[ws.id] ?? null}
-                    flyout={flyout?.id === ws.id ? flyout : null}
-                    onOpen={openFlyout}
-                    onScheduleClose={scheduleClose}
-                    onCancelClose={cancelClose}
-                    onCloseNow={closeFlyout}
-                    onSelect={() => onSelect(ws.id)}
-                    onCustomize={() => onCustomize(ws.id)}
-                    onContextMenu={onContextMenu ? (x, y) => onContextMenu(ws.id, x, y) : undefined}
-                  />
-                );
-              })}
+            <div
+              key={block.section ? `section-${block.section.id}` : block.projects[0].id}
+              data-testid={block.section ? `rail-section-${block.section.id}` : undefined}
+              className="flex w-full flex-col items-center"
+            >
+              {wide && <div aria-hidden data-testid="rail-section-edge" className="my-1 h-px w-full bg-octo-hairline" />}
+              {block.projects.map((project, index) =>
+                renderCluster(project, block.section, index > 0 || (blockIndex > 0 && !wide)),
+              )}
             </div>
           );
         })}
@@ -1043,7 +2449,9 @@ function CollapsedRail({
 
 interface CollapsedCellProps {
   workspace: Workspace;
-  projectName: string;
+  /** The flyout's eyebrow: where the workspace sits, outermost first
+   *  (`project group · project · mission group`, the groups when it has them). */
+  eyebrow: string;
   active: boolean;
   running: boolean;
   attention: Attention | null;
@@ -1064,7 +2472,7 @@ interface CollapsedCellProps {
 
 function CollapsedCell({
   workspace,
-  projectName,
+  eyebrow,
   active,
   running,
   attention,
@@ -1082,6 +2490,7 @@ function CollapsedCell({
   onCustomize,
   onContextMenu,
 }: CollapsedCellProps) {
+  const collisions = useWorkspaceCollisions(workspace?.id);
   let mono: ReturnType<typeof resolveMonogram>;
   let tint: { accent: string; bg: string } | undefined;
   try {
@@ -1100,6 +2509,7 @@ function CollapsedCell({
     git?.behind ? `↓${git.behind}` : null,
     hasOpenPr ? "PR open" : null,
     git?.dirty ? "uncommitted changes" : null,
+    collisionSegment(collisions),
     running ? "working…" : null,
     attention ? `needs your attention${attentionKind ? ` (${attentionKind})` : ""}` : null,
   ].filter(Boolean);
@@ -1171,7 +2581,7 @@ function CollapsedCell({
         >
           <div className="flex items-baseline justify-between gap-2">
             <span className="truncate font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
-              {projectName}
+              {eyebrow}
             </span>
             {shortcut && (
               <span className="shrink-0 font-mono text-[9px] text-octo-mute">{shortcut}</span>

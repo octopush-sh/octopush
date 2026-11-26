@@ -13,6 +13,8 @@ vi.mock("../../lib/ipc", () => ({
     getSettings: (...args: unknown[]) => getSettings(...args),
     saveSettings: (...args: unknown[]) => saveSettings(...args),
     readinessCheck: () => Promise.resolve([]),
+    getNotifyElsewhere: () => Promise.resolve({ enabled: false, url: "" }),
+    notifyElsewherePreview: () => Promise.reject(new Error("not needed here")),
   },
 }));
 
@@ -55,6 +57,21 @@ describe("GeneralPane — default workspace mode", () => {
   });
 });
 
+describe("GeneralPane — Notify me elsewhere (#964)", () => {
+  it("sits with the other attention settings, off", async () => {
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    const row = document.querySelector('[data-tour="settings-notify-elsewhere"]');
+    expect(row).not.toBeNull();
+    // Right after "Notify when a crew needs you", in the Attention section.
+    const crew = screen.getByRole("switch", { name: "Notify when a crew needs you" });
+    const crewRow = crew.closest("label");
+    expect(crewRow?.nextElementSibling).toBe(row);
+    expect(screen.getByTestId("notify-elsewhere-switch")).toHaveAttribute("aria-checked", "false");
+  });
+});
+
 describe("GeneralPane — Claude Code hooks (on by default)", () => {
   const toggle = () => screen.getByTestId("claude-hooks-switch");
 
@@ -64,6 +81,10 @@ describe("GeneralPane — Claude Code hooks (on by default)", () => {
     });
     expect(toggle()).toHaveAttribute("aria-checked", "true");
     expect(screen.getByText(/\.claude\/settings\.local\.json and keeps that file out of git/)).toBeInTheDocument();
+    // The same hooks feed Run's Context section, and the row says so, with
+    // where what they report goes.
+    expect(screen.getByText(/which Claude Code session each terminal runs.*Context section in Run reads/)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing they report leaves this Mac\./)).toBeInTheDocument();
   });
 
   it("reads a saved false as off", async () => {
@@ -87,6 +108,32 @@ describe("GeneralPane — Claude Code hooks (on by default)", () => {
       expect.objectContaining({ editorCommand: "cursor", claudeHooksEnabled: false }),
     );
     expect(toggle()).toHaveAttribute("aria-checked", "false");
+  });
+});
+
+describe("GeneralPane — secret guard (on by default)", () => {
+  const toggle = () => screen.getByTestId("secret-guard-switch");
+
+  it("is on when nothing is saved", async () => {
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    expect(toggle()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText("Guard commits against secrets")).toBeInTheDocument();
+  });
+
+  it("switching off saves an explicit false, without clobbering other settings", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, editorCommand: "cursor" });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ editorCommand: "cursor", secretGuardEnabled: false }),
+    );
   });
 });
 

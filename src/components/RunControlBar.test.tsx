@@ -2,6 +2,9 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { RunControlBar } from "./RunControlBar";
 import type { Run, RunStage } from "../lib/ipc";
+import { useRunsStore } from "../stores/runsStore";
+import { useGateCommentsStore } from "../stores/gateCommentsStore";
+import { gateKey } from "../lib/gateComments";
 
 const run = (status: Run["status"]): Run => ({
   id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status,
@@ -22,7 +25,7 @@ const stage = (over: Partial<RunStage>): RunStage => ({
 
 const handlers = () => ({
   onStart: vi.fn(), onPause: vi.fn(), onStopStage: vi.fn(), onAbort: vi.fn(), onApprove: vi.fn(),
-  onReject: vi.fn(), onResume: vi.fn(), onDiscard: vi.fn(), onSendBack: vi.fn(), onAnswerBlocker: vi.fn(),
+  onReject: vi.fn(), onResume: vi.fn(), onDropCall: vi.fn(), onDiscard: vi.fn(), onSendBack: vi.fn(), onAnswerBlocker: vi.fn(),
   onRunAgain: vi.fn(),
 });
 
@@ -48,6 +51,41 @@ describe("RunControlBar", () => {
     );
     expect(container.firstChild).toBeNull();
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
+  it("checkpoint: Abort asks first — Keep the run cancels, Abort the run ends it (#849)", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />);
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    expect(h.onAbort).not.toHaveBeenCalled();
+    expect(screen.getByText("End this run here?")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep the run" }));
+    expect(h.onAbort).not.toHaveBeenCalled();
+    expect(screen.queryByText("End this run here?")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+    expect(h.onAbort).toHaveBeenCalledTimes(1);
+  });
+
+  it("Abort confirm: Escape keeps the run (#891)", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />);
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    expect(screen.getByText("End this run here?")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByText("End this run here?")).not.toBeInTheDocument();
+    expect(h.onAbort).not.toHaveBeenCalled();
+  });
+
+  it("halted stage: Abort asks first, then ends the run (#891)", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "compile error: missing semicolon" })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/stage halted/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    expect(h.onAbort).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+    expect(h.onAbort).toHaveBeenCalledTimes(1);
   });
 
   it("terminal: offers Run it again", () => {
@@ -128,6 +166,82 @@ describe("RunControlBar", () => {
     expect(h.onReject).toHaveBeenCalledWith("fix it", 50);
   });
 
+  it("hook-deferred tool gone: Re-run is primary, beside Reconnect and resume and Drop the call (#973)", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "The resumed session was waiting to run echo (MCP server srv) · hi, which isn't available anymore. Reconnect it and resume, drop the call and continue, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)",
+      })}
+      loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(screen.getByText(/waiting to run echo \(MCP server srv\) · hi, which isn't available anymore$/)).toBeInTheDocument();
+    const primary = screen.getByRole("button", { name: /^Re-run · 50 turns$/i });
+    expect(primary.className).toContain("octo-stage-pulse");
+    expect(screen.queryByRole("button", { name: /^Resume · /i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Resume$/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Reconnect and resume$/i }));
+    expect(h.onResume).toHaveBeenCalledWith(50);
+    const drop = screen.getByRole("button", { name: /^Drop the call and continue$/i });
+    expect(drop).toHaveAttribute("data-tour", "direct-halt-drop-call");
+    fireEvent.click(drop);
+    expect(h.onDropCall).toHaveBeenCalledWith(50);
+    expect(h.onResume).toHaveBeenCalledTimes(1);
+    fireEvent.click(primary);
+    expect(h.onReject).toHaveBeenCalledWith("", 50);
+  });
+
+  it("hook-deferred tool: a paused call (not a gone tool) offers no drop", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "A hook paused Bash · npm publish --tag beta before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/A hook paused Bash · npm publish --tag beta before it ran$/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Resume$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Drop the call/i })).not.toBeInTheDocument();
+  });
+
+  it("hook-deferred tool gone without a session: nothing to drop or resume", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: null, maxIterations: 25,
+        error: "The resumed session was waiting to run Edit, which isn't available anymore. Reconnect it and resume, drop the call and continue, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.queryByRole("button", { name: /Drop the call/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Reconnect and resume/i })).not.toBeInTheDocument();
+  });
+
+  it("hook-deferred tool: a transient-looking tool name or stderr tail keeps the halt layout", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "A hook paused mcp__cloudflare-dns__create_record before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)\n— stderr —\nrequest timed out",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.queryByText(/awaiting retry/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Re-run · 50 turns$/i })).toBeInTheDocument();
+  });
+
+  it("halt banner with Re-run primary: Re-run with feedback opens the editor and passes turns", async () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "A hook paused Edit before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    fireEvent.click(screen.getByRole("button", { name: /^Re-run with feedback$/i }));
+    expect(h.onReject).not.toHaveBeenCalled();
+    fireEvent.change(await screen.findByRole("textbox"), { target: { value: "skip the hook" } });
+    fireEvent.click(screen.getByRole("button", { name: /Re-run the stage/i }));
+    expect(h.onReject).toHaveBeenCalledWith("skip the hook", 50);
+  });
+
   it("transient halt: offers Resume in amber, not accept/re-run", () => {
     const h = handlers();
     render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "rate limit exceeded" })}
@@ -135,6 +249,26 @@ describe("RunControlBar", () => {
     expect(screen.getByText(/awaiting retry/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Resume the stage/i }));
     expect(h.onResume).toHaveBeenCalled();
+  });
+
+  it("transient halt: the beacon pulses in amber, never brass (#818)", () => {
+    const h = handlers();
+    const { container } = render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "rate limit exceeded" })}
+      loopTargetRole={null} loopState={null} beacon {...h} />);
+    const pulses = container.querySelectorAll(".octo-stage-pulse");
+    expect(pulses).toHaveLength(1);
+    expect(pulses[0]).toHaveTextContent("Resume the stage");
+    expect(pulses[0]).toHaveClass("octo-stage-pulse-warning", "border-octo-warning");
+  });
+
+  it("brass halts and gates keep the brass pulse", () => {
+    const h = handlers();
+    const gate = render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(gate.container.querySelector(".octo-stage-pulse")).not.toHaveClass("octo-stage-pulse-warning");
+    gate.unmount();
+    const halt = render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "compile error: missing semicolon" })}
+      loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(halt.container.querySelector(".octo-stage-pulse")).not.toHaveClass("octo-stage-pulse-warning");
   });
 
   it("escape valve: renders the questions pre-filled with defaults and sends edited answers", () => {
@@ -184,5 +318,179 @@ describe("RunControlBar", () => {
     render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />);
     expect(screen.getByRole("button", { name: /Approve & continue/i })).toBeInTheDocument();
     expect(screen.queryByText(/the crew asked you/i)).not.toBeInTheDocument();
+  });
+  it("secret hold: names what was found and makes approving an explicit override", () => {
+    const h = handlers();
+    const held = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "f", findings: [
+        { file: "tests/fixtures.ts", line: 12, rule: "github-token", kind: "GitHub token", yours: false },
+      ] },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={held} loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(screen.getByText("possible secret")).toBeInTheDocument();
+    expect(screen.getByText(/possible secret · GitHub token in tests\/fixtures\.ts:12/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve & continue/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Proceed regardless" }));
+    expect(h.onApprove).toHaveBeenCalled();
+  });
+  it("secret hold: says when nothing, or not everything, was checked", () => {
+    const h = handlers();
+    const unreadable = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "unreadable", findings: [], total: 0, partial: false, unreadable: true },
+    });
+    const { unmount } = render(<RunControlBar run={run("paused")} blockedStage={unreadable} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/couldn't read the worktree's changes, so nothing was checked/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Proceed regardless" })).toBeInTheDocument();
+    unmount();
+    const partial = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "p", findings: [
+        { file: "a.ts", line: 1, rule: "github-token", kind: "GitHub token", yours: false },
+      ], total: 3, partial: true },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={partial} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/GitHub token in a\.ts:1 and 2 more · scanned the first 16 MB; the rest wasn't checked/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Proceed past them" })).toBeInTheDocument();
+  });
+
+  describe("gate comments (#957)", () => {
+    const gate = stage({ role: "plan", finishedAt: "f1", loopTargetPosition: 0, loopMaxIterations: 3 });
+    const seed = () => {
+      useGateCommentsStore.setState({ byGate: {} });
+      const add = useGateCommentsStore.getState().add;
+      add(gateKey(gate), "Step 3: drop the table", "Keep the data.", 40, 22);
+      add(gateKey(gate), "Use Redis", "We have no Redis.", 5, 9);
+    };
+
+    it("Send back carries the comments as structured feedback and leaves clearing them to the outcome", async () => {
+      seed();
+      const h = handlers();
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole="Implement" loopState={{ iteration: 0, max: 3 }} nextStageLabel="Test" {...h} />);
+      expect(screen.getByText(/2 comments go with your decision/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Send back to Implement/i }));
+      expect(await screen.findByText(/2 comments on the output go with it, in document order/)).toBeInTheDocument();
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "Otherwise good." } });
+      fireEvent.click(screen.getByRole("button", { name: /^Send back$/i }));
+      const fb = h.onSendBack.mock.calls[0][0] as string;
+      expect(fb).toContain('1. On "Use Redis":\n   We have no Redis.');
+      expect(fb.indexOf("Use Redis")).toBeLessThan(fb.indexOf("Step 3: drop the table"));
+      expect(fb.endsWith("Overall note: Otherwise good.")).toBe(true);
+      // Not cleared here: the send-back may still be refused (`runsStore.resolveGate`).
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toHaveLength(2);
+    });
+
+    it("Reject carries them too", async () => {
+      seed();
+      const h = handlers();
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} {...h} />);
+      fireEvent.click(screen.getByRole("button", { name: /^Reject$/i }));
+      await screen.findByRole("textbox");
+      fireEvent.click(screen.getByRole("button", { name: /Re-run the stage/i }));
+      expect(h.onReject.mock.calls[0][0]).toMatch(/^The director commented on 2 passages/);
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toHaveLength(2);
+    });
+
+    it("Approve with comments hands them to the next stage; with none to take them, the bar says so before the click", () => {
+      seed();
+      const h = handlers();
+      const { unmount } = render(
+        <RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} nextStageLabel="Implement" {...h} />,
+      );
+      const approve = screen.getByRole("button", { name: "Approve with comments" });
+      expect(approve).toHaveAttribute("title", "Your comments go to Implement as guidance");
+      fireEvent.click(approve);
+      expect(h.onApprove.mock.calls[0][0]).toHaveLength(2);
+      unmount();
+
+      const h2 = handlers();
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} nextStageLabel={null} {...h2} />);
+      // Visible text, not a tooltip.
+      expect(screen.getByText(/2 comments\. No stage follows to take them: Approve leaves them out, Reject carries them\./)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Approve & continue/ })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Approve without comments" }));
+      // They go with the approve; the store sets them aside once it went through.
+      expect(h2.onApprove.mock.calls[0][0]).toHaveLength(2);
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toHaveLength(2);
+    });
+  });
+
+  it("Approve waits while an approve of this gate is in flight (#957)", () => {
+    const gate = stage({ role: "plan", finishedAt: "f1" });
+    const h = handlers();
+    useGateCommentsStore.setState({ byGate: {} });
+    useRunsStore.setState({ approvingGates: { [`${gate.runId}:${gate.id}`]: true } });
+    try {
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} {...h} />);
+      const approve = screen.getByRole("button", { name: /Approve & continue/ });
+      expect(approve).toBeDisabled();
+      fireEvent.click(approve);
+      expect(h.onApprove).not.toHaveBeenCalled();
+    } finally {
+      useRunsStore.setState({ approvingGates: {} });
+    }
+  });
+
+  describe("Claude plan limit", () => {
+    const planStage = stage({
+      role: "implement", substrate: "cli", checkpoint: false, status: "failed", sessionId: "sess-p",
+      error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)",
+    });
+    const parked = (resumeAt: number | null): Run => ({
+      ...run("paused"),
+      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 600, resumeAt, resumeCount: resumeAt ? 0 : 3, otherHold: false },
+    });
+
+    it("scheduled: says when it resumes, offers Resume now and the opt-out, never the beacon", () => {
+      const cancelPlanResume = vi.fn().mockResolvedValue(undefined);
+      useRunsStore.setState({ cancelPlanResume });
+      const h = handlers();
+      const { container } = render(
+        <RunControlBar run={parked(Math.floor(Date.now() / 1000) + 690)} blockedStage={planStage} loopTargetRole={null} loopState={null} beacon {...h} />,
+      );
+      expect(screen.getByText(/paused by your Claude plan · resumes at \d{2}:\d{2}/)).toBeInTheDocument();
+      expect(container.querySelector(".octo-stage-pulse")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+      expect(h.onResume).toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: /Don.t resume automatically/ }));
+      expect(cancelPlanResume).toHaveBeenCalledWith("r1");
+    });
+
+    it("scheduled: Abort asks first, Keep the run cancels, Abort the run ends it (#891)", () => {
+      const h = handlers();
+      render(
+        <RunControlBar run={parked(Math.floor(Date.now() / 1000) + 690)} blockedStage={planStage} loopTargetRole={null} loopState={null} {...h} />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+      expect(screen.getByText("End this run here?")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Keep the run" }));
+      expect(h.onAbort).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+      fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+      expect(h.onAbort).toHaveBeenCalledTimes(1);
+    });
+
+    it("waiting for the director: Abort asks first too (#891)", () => {
+      const h = handlers();
+      render(<RunControlBar run={parked(null)} blockedStage={planStage} loopTargetRole={null} loopState={null} {...h} />);
+      fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+      expect(h.onAbort).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+      expect(h.onAbort).toHaveBeenCalledTimes(1);
+    });
+
+    it("waiting for the director: Resume the stage is the decision and takes the beacon", () => {
+      const h = handlers();
+      const { container } = render(
+        <RunControlBar run={parked(null)} blockedStage={planStage} loopTargetRole={null} loopState={null} beacon {...h} />,
+      );
+      expect(screen.getByText(/the 5-hour window resets at/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Don.t resume automatically/ })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Resume the stage" }));
+      expect(h.onResume).toHaveBeenCalled();
+      // An amber halt: the pulse follows its ink, never brass (#818).
+      expect(container.querySelector(".octo-stage-pulse")).toHaveClass("octo-stage-pulse-warning");
+    });
   });
 });

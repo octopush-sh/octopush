@@ -94,6 +94,44 @@ export function trimNotes(text, max = NOTES_MAX) {
   return cut.trimEnd() + NOTES_SUFFIX;
 }
 
+/**
+ * `xcrun notarytool history` arguments that check the notarization credentials
+ * in `env` without submitting anything (docs/RELEASING.md "Validating
+ * notarization creds"). Apple ID + app-specific password + team wins, as in
+ * Tauri; otherwise the App Store Connect key. null when neither set is complete.
+ */
+export function notaryPreflightArgs(env) {
+  if (env.APPLE_ID && env.APPLE_PASSWORD && env.APPLE_TEAM_ID) {
+    return ["notarytool", "history", "--apple-id", env.APPLE_ID, "--team-id", env.APPLE_TEAM_ID, "--password", env.APPLE_PASSWORD];
+  }
+  if (env.APPLE_API_ISSUER && env.APPLE_API_KEY && env.APPLE_API_KEY_PATH) {
+    return ["notarytool", "history", "--key", env.APPLE_API_KEY_PATH, "--key-id", env.APPLE_API_KEY, "--issuer", env.APPLE_API_ISSUER];
+  }
+  return null;
+}
+
+/**
+ * What to tell the operator when the notarization preflight fails. Apple
+ * answers HTTP 403 "A required agreement is missing or has expired" once the
+ * Apple Developer Program License Agreement has been updated and not yet
+ * re-accepted; only the team's Account Holder can fix that, and no code or
+ * secret change will.
+ */
+export function notaryPreflightHint(output) {
+  if (/agreement/i.test(output)) {
+    return (
+      "Apple refuses notarization until the team's Account Holder accepts the current " +
+      "Apple Developer Program License Agreement: sign in at https://developer.apple.com/account " +
+      "and accept the pending agreement (App Store Connect → Business may list one too). " +
+      "No code or secret change fixes this; re-run the release afterwards."
+    );
+  }
+  if (/401|unauthori[sz]ed|invalid credentials|password/i.test(output)) {
+    return "The notarization credentials were rejected: check APPLE_ID / APPLE_PASSWORD (app-specific) / APPLE_TEAM_ID, or the APPLE_API_* key.";
+  }
+  return "notarytool could not validate the notarization credentials (output above).";
+}
+
 /** The install / notarization block that closes every GitHub release body. */
 export function installText(notarized) {
   return notarized

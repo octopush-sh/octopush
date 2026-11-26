@@ -82,11 +82,12 @@ describe("ClaudeLoginNote", () => {
     expect(note.getAttribute("data-tone")).toBe("ended");
   });
 
-  it("hides an ended note once an Anthropic key is set, like Readiness", async () => {
+  it("hides the note once the stored end is gone", async () => {
     getClaudeLogin.mockResolvedValue(login(-2));
     render(<ClaudeLoginNote tourId="x" />);
     await screen.findByTestId("claude-login-note");
-    // With a key, `get_claude_login` answers null (`claude_login::shown`).
+    // An Anthropic key no longer hides it (that key never signs Claude Code
+    // in); only a read with no stored end does.
     getClaudeLogin.mockResolvedValue(null);
     await act(async () => useClaudeLoginStore.getState().load());
     expect(screen.queryByTestId("claude-login-note")).toBeNull();

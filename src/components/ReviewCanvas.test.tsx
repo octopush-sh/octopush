@@ -530,3 +530,63 @@ describe("ReviewCanvas — markdown view control", () => {
     expect(useReviewPrefs.getState().mdView).toBe("split");
   });
 });
+
+// ─── Since base (#851) ─────────────────────────────────────────────
+
+describe("ReviewCanvas source toggle", () => {
+  const CLEAN = { ...SAMPLE_GIT_STATUS, changedFiles: [] };
+
+  it("shows no source toggle without commits ahead", () => {
+    renderCanvas();
+    expect(screen.queryByRole("group", { name: "Diff source" })).toBeNull();
+  });
+
+  it("offers Working tree / Since base and reports the pick", () => {
+    const onSourceChange = vi.fn();
+    renderCanvas({ commitsAhead: 3, base: "main", onSourceChange });
+    const working = screen.getByRole("button", { name: "Working tree" });
+    const since = screen.getByRole("button", { name: "Since base · 3 commits" });
+    expect(working).toHaveAttribute("aria-pressed", "true");
+    expect(since).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(since);
+    expect(onSourceChange).toHaveBeenCalledWith("committed");
+  });
+
+  it("puts the commit count on the toolbar's narrow-canvas rung, keeping it in the name (#903)", () => {
+    renderCanvas({ commitsAhead: 3, base: "main" });
+    const count = screen.getByTestId("review-source-count");
+    expect(count.className).toContain("octo-demote-source-count");
+    expect(count.textContent).toBe("\u00a0· 3 commits");
+    expect(screen.getByRole("button", { name: "Since base · 3 commits" })).toContainElement(count);
+  });
+
+  it("makes the committed view read-only: no Accept / Reject, a lock with a tooltip", () => {
+    renderCanvas({ gitStatus: CLEAN, source: "committed", commitsAhead: 2, base: "main", mergeBase: "abc1234" });
+    expect(screen.getByRole("button", { name: "Since base · 2 commits" })).toHaveAttribute("aria-pressed", "true");
+    const lock = screen.getByRole("img", { name: "Read-only" });
+    expect(lock.getAttribute("title")).toMatch(/Read-only: 2 commits since main.*Accept and Reject act on the working tree/);
+    expect(screen.queryByRole("button", { name: "Accept hunk" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject hunk" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept all changes" })).toBeNull();
+    // The diff itself still renders, with Why? and the AI pass.
+    expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review with AI" })).toBeInTheDocument();
+  });
+
+  it("ignores the a / x hunk keys in the committed view", () => {
+    renderCanvas({ gitStatus: CLEAN, source: "committed", commitsAhead: 1, base: "main" });
+    fireEvent.keyDown(window, { key: "a" });
+    fireEvent.keyDown(window, { key: "x" });
+    expect(mockIpc.stageHunk).not.toHaveBeenCalled();
+    expect(mockIpc.revertHunk).not.toHaveBeenCalled();
+  });
+
+  it("a clean working tree with commits ahead points at the commits", () => {
+    const onSourceChange = vi.fn();
+    renderCanvas({ gitStatus: CLEAN, gitDiff: "", commitsAhead: 4, base: "main", onSourceChange });
+    expect(screen.getByText("The working tree is clean.")).toBeInTheDocument();
+    expect(screen.getByText(/committed: 4 commits since main/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Read what was committed" }));
+    expect(onSourceChange).toHaveBeenCalledWith("committed");
+  });
+});

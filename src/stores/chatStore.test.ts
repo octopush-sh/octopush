@@ -56,6 +56,7 @@ function resetStore() {
   useChatStore.setState({
     messagesByWs: {},
     streamingByWs: {},
+    streamSinceByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
     liveToolsByWs: {},
@@ -130,6 +131,59 @@ describe("chatStore — live `$`-direct process lifecycle", () => {
 
     emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "call-1" });
     expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(0);
+  });
+
+  it("marks the secret guard's card, and only it (#819)", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
+    emit("chat://approval-request", {
+      workspaceId: "ws-1", threadId: "t1", callId: "call-s",
+      command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3",
+      secret: true, coversUncommitted: true,
+    });
+    emit("chat://approval-request", {
+      workspaceId: "ws-1", threadId: "t1", callId: "call-d",
+      command: "rm -rf x", reason: "rm -rf",
+    });
+    const [s, d] = useChatStore.getState().getPendingApprovals("ws-1");
+    expect(s).toMatchObject({ secret: true, coversUncommitted: true });
+    expect(d.secret).toBeUndefined();
+    emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "call-s" });
+    emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "call-d" });
+  });
+
+  it("a `$` command the guard refuses asks, and Run regardless re-runs it with the fingerprint (#819)", async () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" }, shellSecretByWs: {} });
+    const refusal = {
+      kind: "SecretsFound", message: "possible secret", total: 1, partial: false, fingerprint: "fp-1",
+      findings: [{ file: "a.ts", line: 3, rule: "github-token", kind: "GitHub token", yours: false }],
+    };
+    const run = vi.fn()
+      .mockRejectedValueOnce(refusal)
+      .mockResolvedValueOnce({ output: "", exitCode: 0, ok: true, cwd: "/r", cwdLabel: "", live: false });
+    Object.assign(ipc, { runShellCommand: run, listShellHistory: vi.fn().mockResolvedValue([]) });
+
+    await useChatStore.getState().runShell("ws-1", "/r", "git commit -m x");
+    const pending = useChatStore.getState().shellSecretByWs["ws-1"];
+    expect(pending?.refusal.fingerprint).toBe("fp-1");
+    expect(pending?.command).toBe("git commit -m x");
+    expect(useChatStore.getState().getError("ws-1")).toBeNull();
+    expect(run.mock.calls[0][0].allowFindings).toBeUndefined();
+
+    await useChatStore.getState().resolveShellSecret("ws-1", true);
+    expect(useChatStore.getState().shellSecretByWs["ws-1"]).toBeNull();
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][0]).toMatchObject({ command: "git commit -m x", allowFindings: "fp-1" });
+  });
+
+  it("leaving a refused `$` command out runs nothing", async () => {
+    useChatStore.setState({
+      shellSecretByWs: { "ws-1": { workspacePath: "/r", command: "git push", refusal: { findings: [], total: 0, partial: true, fingerprint: "f" } } },
+    });
+    const run = vi.fn();
+    Object.assign(ipc, { runShellCommand: run });
+    await useChatStore.getState().resolveShellSecret("ws-1", false);
+    expect(useChatStore.getState().shellSecretByWs["ws-1"]).toBeNull();
+    expect(run).not.toHaveBeenCalled();
   });
 
   it("surfaces approvals workspace-wide (not hidden by a thread switch)", () => {
@@ -455,6 +509,73 @@ describe("chatStore — stop + effort (P3)", () => {
     expect(useChatStore.getState().getAttachments("ws-1")).toHaveLength(0);
   });
 
+  it("send() with attachments: false leaves the staged attachments staged and reports delivery", async () => {
+    useChatStore.getState().addAttachment("ws-1", { mediaType: "image/png", data: "QUJD", name: "a.png" });
+    await expect(
+      useChatStore.getState().send("ws-1", "/tmp", "review notes", undefined, { attachments: false }),
+    ).resolves.toBe(true);
+    const req = (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.attachments).toBeUndefined();
+    expect(useChatStore.getState().getAttachments("ws-1")).toHaveLength(1);
+  });
+
+  it("send() reports dispatch long before the turn ends, once", async () => {
+    let end!: () => void;
+    (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise<void>((r) => { end = r; }));
+    const onDispatched = vi.fn();
+    let ended = false;
+    const turn = useChatStore.getState().send("ws-1", "/tmp", "hi", undefined, { onDispatched }).then((ok) => { ended = true; return ok; });
+    await vi.waitFor(() => expect(onDispatched).toHaveBeenCalledTimes(1));
+    // The turn is running: marked as streaming, the IPC in flight, `send` still pending.
+    expect(useChatStore.getState().streamingByWs["ws-1"]).toBe(true);
+    expect(ipc.sendChatMessage).toHaveBeenCalledTimes(1);
+    expect(ended).toBe(false);
+    end();
+    await expect(turn).resolves.toBe(true);
+    expect(onDispatched).toHaveBeenCalledTimes(1);
+  });
+
+  it("send() never reports dispatch for a pre-flight refusal", async () => {
+    const { ensureThread } = useChatStore.getState();
+    const onDispatched = vi.fn();
+    useChatStore.setState({ ensureThread: async () => "" });
+    try {
+      await expect(useChatStore.getState().send("ws-1", "/tmp", "hi", undefined, { onDispatched })).resolves.toBe(false);
+    } finally {
+      useChatStore.setState({ ensureThread });
+    }
+    expect(onDispatched).not.toHaveBeenCalled();
+  });
+
+  it("send() resolves false when the turn fails to dispatch", async () => {
+    (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce("boom");
+    await expect(useChatStore.getState().send("ws-1", "/tmp", "hi")).resolves.toBe(false);
+  });
+
+  it("send() resolves false at the budget cap", async () => {
+    const { useBudgetsStore, BUDGET_CAP_MSG } = await import("./budgetsStore");
+    const { isOverBudget, consumeOverride } = useBudgetsStore.getState();
+    useBudgetsStore.setState({ isOverBudget: () => true, consumeOverride: () => false });
+    try {
+      await expect(useChatStore.getState().send("ws-1", "/tmp", "hi")).resolves.toBe(false);
+      expect(useChatStore.getState().getError("ws-1")).toBe(BUDGET_CAP_MSG);
+      expect(ipc.sendChatMessage).not.toHaveBeenCalled();
+    } finally {
+      useBudgetsStore.setState({ isOverBudget, consumeOverride });
+    }
+  });
+
+  it("send() resolves false when no thread can be started", async () => {
+    const { ensureThread } = useChatStore.getState();
+    useChatStore.setState({ ensureThread: async () => "" });
+    try {
+      await expect(useChatStore.getState().send("ws-1", "/tmp", "hi")).resolves.toBe(false);
+      expect(useChatStore.getState().getError("ws-1")).toBe("Could not start a conversation.");
+    } finally {
+      useChatStore.setState({ ensureThread });
+    }
+  });
+
   it("send() uses the effort's max-tokens budget", async () => {
     useChatStore.getState().setEffort("deep");
     await useChatStore.getState().send("ws-1", "/tmp", "hi");
@@ -671,6 +792,30 @@ describe("chatStore — message actions (regenerate / edit-and-resend)", () => {
     expect(ipc.sendChatMessage).toHaveBeenCalledWith(
       expect.objectContaining({ userMessage: "edited prompt" }),
     );
+  });
+
+  it("marks where the running turn starts: the highest id on screen, read after a truncate", async () => {
+    // A plain send: every row on screen predates the turn.
+    await useChatStore.getState().runTurn("ws-1", "/tmp", "t1", { userMessage: "next" });
+    expect(useChatStore.getState().streamSinceByWs["ws-1"]).toBe(2);
+    // An edit cuts from the user row first, so the rows it removed don't
+    // count: what's left on screen is the previous turns'.
+    useChatStore.setState({ streamingByWs: { "ws-1": false } });
+    await useChatStore.getState().editAndResend("ws-1", "/tmp", 2, "edited");
+    expect(useChatStore.getState().streamSinceByWs["ws-1"]).toBe(1);
+  });
+
+  it("marks where a `$` command's turn starts too", async () => {
+    let release: (v: unknown) => void = () => {};
+    const run = vi.fn().mockReturnValue(new Promise((r) => { release = r; }));
+    Object.assign(ipc, { runShellCommand: run, listShellHistory: vi.fn().mockResolvedValue([]) });
+    const pending = useChatStore.getState().runShell("ws-1", "/r", "git status");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+    expect(useChatStore.getState().streamSinceByWs["ws-1"]).toBe(2);
+    release({ output: "", exitCode: 0, ok: true, cwd: "/r", cwdLabel: "", live: false });
+    await pending;
   });
 
   it("editAndResend is a no-op for blank content", async () => {

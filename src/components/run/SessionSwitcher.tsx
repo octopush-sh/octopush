@@ -8,6 +8,7 @@ import { ROLE_WORD } from "../../lib/sessionRole";
 import { tourId } from "../../lib/tour/ids";
 import { useAttentionStore, type TerminalWait } from "../../stores/attentionStore";
 import { claudeWaitingCopy, type ClaudeWaitReason } from "../../lib/claudeWaiting";
+import { useCloseSession } from "./useCloseSession";
 
 /** What a session is waiting on, for ordering: `since` is null when the wait
  *  started on screen (a pane caption's mark keeps no start time). */
@@ -31,7 +32,7 @@ export function sessionWait(
 /**
  * Waiting sessions first, oldest wait first — the prompt that has cost the most
  * idle time is the first row, so ⏎ answers it. Waits with no start time (on
- * screen) follow the timed ones; everything else keeps its rail order. Rows
+ * screen) follow the timed ones; everything else keeps its session order. Rows
  * keep their own `index`, so ⌘⌥N numbers don't move with the sort.
  */
 export function orderWaitingFirst<R extends { t: { id: string } }>(
@@ -39,7 +40,7 @@ export function orderWaitingFirst<R extends { t: { id: string } }>(
   waitOf: (id: string) => SessionWait | null,
 ): Array<R & { wait: SessionWait | null }> {
   const rank = (w: SessionWait | null) => (w ? (w.since ?? Number.MAX_SAFE_INTEGER) : Infinity);
-  // Array.prototype.sort is stable, so equal ranks keep the rail order.
+  // Array.prototype.sort is stable, so equal ranks keep the session order.
   return rows
     .map((r) => ({ ...r, wait: waitOf(r.t.id) }))
     .sort((a, b) => {
@@ -63,7 +64,7 @@ interface Props {
 /**
  * ⌘⌥K — the session switcher.
  *
- * The rail answers "which sessions are there" at a glance; this answers "which
+ * The session line answers "which sessions are there" at a glance; this answers "which
  * one do I want" when four icons aren't enough. It is the CommandPalette
  * pattern scoped to terminals: search across label, role and running command,
  * arrow to move, ⏎ to switch, ⌫ to close a session, and a last row that opens
@@ -118,13 +119,22 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
   // closed perfectly well.
   const deleting = useRef(new Set<string>());
   const inputRef = useRef<HTMLInputElement>(null);
+  // ⌫ closes the selected session; one with something running, or waiting on
+  // the user, asks first.
+  const [requestClose, closeConfirm] = useCloseSession(workspaceId, (id) => {
+    deleting.current.add(id);
+    void deleteTerminal(workspaceId, id).finally(() => {
+      deleting.current.delete(id);
+    });
+    setSel(0);
+  });
 
   const waits = useAttentionStore((s) => s.waitsByTerminal);
   const shownWaiting = useAttentionStore((s) => s.waitingByTerminal);
 
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
-    // The number is the session's rail address (⌘⌥N), also when pairing
+    // The number is the session's address on the session line (⌘⌥N), also when pairing
     // leaves some sessions out.
     const rows = terminals.map((t) => ({ t, index: allTerminals.indexOf(t) }));
     const found = q
@@ -181,15 +191,12 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
       const row = matches[selected];
       if (!row || deleting.current.has(row.t.id)) return;
       e.preventDefault();
-      deleting.current.add(row.t.id);
-      void deleteTerminal(workspaceId, row.t.id).finally(() => {
-        deleting.current.delete(row.t.id);
-      });
-      setSel(0);
+      // A busy or waiting session asks first (`useCloseSession`); an idle one goes now.
+      requestClose(row.t);
     }
   };
 
-  return (
+  const palette = (
     <ModalShell
       onClose={onClose}
       align="top"
@@ -337,5 +344,14 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
         </div>
       </div>
     </ModalShell>
+  );
+
+  // The confirm is the palette's sibling, not its child: a key pressed in it
+  // must not bubble into the palette's own handlers.
+  return (
+    <>
+      {palette}
+      {closeConfirm}
+    </>
   );
 }

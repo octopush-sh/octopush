@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { Copy, Lock } from "lucide-react";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
+import { MidTruncate } from "./primitives/MidTruncate";
 import { ipc } from "../lib/ipc";
 import { isUpgradeRequired } from "../lib/upgradeError";
 import { useUpgradeStore } from "../stores/upgradeStore";
 import { useEntitlementStore } from "../stores/entitlementStore";
 import { copyToClipboard } from "../lib/clipboard";
 import { INTENT_ICON } from "../lib/missionIntent";
+import { formatUsd } from "../lib/cost";
 import {
   PERIODS,
   type PeriodKey,
@@ -109,7 +111,7 @@ export function LogbookRoom({ open, onClose, project }: Props) {
         {project && (
           <Segmented
             options={[
-              { key: "project", label: project.name },
+              { key: "project", label: project.name, identifier: true },
               { key: "global", label: "All missions" },
             ]}
             value={scope}
@@ -135,11 +137,11 @@ export function LogbookRoom({ open, onClose, project }: Props) {
                     className="octo-tabular text-octo-verdigris"
                     title="Saved vs an all-premium baseline"
                   >
-                    saved ${totals.savingsUsd.toFixed(2)}
+                    saved {formatUsd(totals.savingsUsd)}
                   </span>
                 )}
-                <span className="octo-tabular text-octo-brass" title="Total spend">
-                  spent ${totals.costUsd.toFixed(2)}
+                <span className="octo-tabular text-octo-ivory" title="Total spend">
+                  spent {formatUsd(totals.costUsd)}
                 </span>
               </span>
               <button
@@ -184,13 +186,29 @@ export function LogbookRoom({ open, onClose, project }: Props) {
   );
 }
 
-/** A small mono segmented control — brass ink marks the active option. */
+/** An option's label box: the 160px button minus its 2 × 8px padding. */
+const OPTION_LABEL_PX = 144;
+/** 10px JetBrains Mono advances 0.6em (6px), plus 0.15em (1.5px) of tracking. */
+const OPTION_PX_PER_CHAR = 7.5;
+/** Characters a middle-truncated option keeps pinned at its end. */
+const OPTION_TAIL = 10;
+
+/** Whether an option's label renders whole in its 160px button. */
+export function optionLabelFits(label: string): boolean {
+  return label.length * OPTION_PX_PER_CHAR <= OPTION_LABEL_PX;
+}
+
+/** A small mono segmented control — a brass-ghost fill with ivory ink marks
+ *  the active option (brass text stays for the eyebrow, never a figure). An
+ *  `identifier` option (the project name) that can't fit is MIDDLE-truncated
+ *  (E1) inside a fixed width — the header is shrink-to-fit, and the
+ *  MidTruncate box needs a definite one — with the full label as its title. */
 function Segmented({
   options,
   value,
   onChange,
 }: {
-  options: { key: string; label: string }[];
+  options: { key: string; label: string; identifier?: boolean }[];
   value: string;
   onChange: (key: string) => void;
 }) {
@@ -198,17 +216,19 @@ function Segmented({
     <div className="flex items-center gap-1">
       {options.map((o) => {
         const active = o.key === value;
+        const mid = !!o.identifier && !optionLabelFits(o.label);
         return (
           <button
             key={o.key}
             type="button"
             onClick={() => onChange(o.key)}
             aria-pressed={active}
-            className={`max-w-[160px] truncate rounded px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
-              active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
-            }`}
+            title={o.identifier ? o.label : undefined}
+            className={`rounded px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              mid ? "flex w-[160px] min-w-0" : "max-w-[160px] truncate"
+            } ${active ? "bg-[var(--brass-ghost)] text-octo-ivory" : "text-octo-mute hover:text-octo-sage"}`}
           >
-            {o.label}
+            {mid ? <MidTruncate text={o.label} tail={OPTION_TAIL} /> : o.label}
           </button>
         );
       })}
@@ -249,11 +269,11 @@ function LogbookTable({ rows }: { rows: LogbookMissionRow[] }) {
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-sage">
                 {fmtHours(r.hoursSecs)}
               </td>
-              <td className="octo-tabular py-2.5 pr-4 text-right text-octo-brass">
-                ${r.costUsd.toFixed(2)}
+              <td className="octo-tabular py-2.5 pr-4 text-right text-octo-sage">
+                {formatUsd(r.costUsd)}
               </td>
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-verdigris">
-                {r.savingsUsd > 0 ? `$${r.savingsUsd.toFixed(2)}` : "—"}
+                {r.savingsUsd > 0 ? formatUsd(r.savingsUsd) : "—"}
               </td>
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-mute">{r.runsCount}</td>
               <td className="octo-tabular py-2.5 text-right text-octo-mute">{r.messagesCount}</td>

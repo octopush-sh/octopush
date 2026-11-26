@@ -6,8 +6,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Check } from "lucide-react";
 import { ipc } from "../../lib/ipc";
+import { tourId } from "../../lib/tour/ids";
 import type { ProjectInfo } from "../../lib/types";
 import { pushToast } from "../Toasts";
+import { MidTruncate } from "../primitives/MidTruncate";
 import { SectionLabel } from "./shared";
 
 // Sentinel shown in the API-token field when a saved token is loaded; if the
@@ -43,7 +45,7 @@ export function IssueTrackingSection({ onConfigSaved }: { onConfigSaved?: () => 
   }, []);
 
   return (
-    <div className="max-w-[820px]">
+    <div>
       <SectionLabel>Issue tracking</SectionLabel>
       <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
         Connect a tracker so Octopush can surface your backlog and the ticket chip, and link each
@@ -270,23 +272,37 @@ function JiraDetail({ onConfigSaved, onConnectedChange }: {
           </div>
         ) : (
           <div className="space-y-2">
-            {projects.map((p) => (
+            {projects.map((p, i) => (
               <div key={p.id} className="flex items-center gap-3">
-                <div className="w-[160px] shrink-0 truncate text-[13px] text-octo-ivory" title={p.name}>{p.name}</div>
-                <input
-                  type="text"
-                  value={mapDrafts[p.id] ?? ""}
-                  onChange={(e) => setMapDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
-                  placeholder="Project key"
-                  className={`${inputClass} flex-1`}
-                />
+                {/* The name takes the width the key input leaves (a definite
+                    `flex-1 min-w-0` box) and is MIDDLE-truncated: sibling projects
+                    share their head (`octopush-enterprise-…`), so the tail is what
+                    tells the rows apart (design-system E1). The wrapper must be a
+                    FLEX box: as a block, the inline-flex MidTruncate box is sized
+                    from its own unbreakable text, spills under the key input and
+                    is hard-cut with no ellipsis (#757). */}
+                <div
+                  className="flex min-w-0 flex-1 text-[13px] text-octo-ivory"
+                  title={p.name}
+                  data-tour={i === 0 ? tourId("settings-integrations-project-link") : undefined}
+                >
+                  <MidTruncate text={p.name} />
+                </div>
+                <div className="w-[200px] min-w-[96px] shrink">
+                  <input
+                    type="text"
+                    value={mapDrafts[p.id] ?? ""}
+                    onChange={(e) => setMapDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                    placeholder="Project key"
+                    className={inputClass}
+                  />
+                </div>
                 <button
                   type="button"
                   onClick={() => void saveMapping(p.id)}
                   disabled={mapSaving[p.id]}
                   aria-label={`Save the link for ${p.name}`}
-                  className="inline-flex min-w-[88px] items-center justify-center gap-1.5 rounded-md px-3 py-2 font-serif text-[12px] text-octo-brass transition-colors disabled:opacity-50"
-                  style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+                  className="inline-flex min-w-[88px] items-center justify-center gap-1.5 rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory disabled:opacity-50"
                 >
                   {mapSaved[p.id] ? <Check size={12} /> : null}
                   {mapSaved[p.id] ? "Saved" : mapSaving[p.id] ? "Saving…" : "Save the link"}

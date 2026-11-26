@@ -28,6 +28,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The bash every Talk command runs in: this shell, and `chat_engine`'s
+/// `run_command` and sandboxed writes. Pinned, so the login PATH can't swap
+/// in another bash (Homebrew's 5.x, a conda or nix wrapper) and the agent's
+/// commands behave as the user's `$` commands do.
+pub(crate) const TALK_BASH: &str = "/bin/bash";
+
 /// Cap on captured output (bytes), mirroring `execute_tool`'s run_command cap
 /// so output can't bloat the DB row / chat render.
 const MAX_OUTPUT_BYTES: usize = 50_000;
@@ -334,19 +340,30 @@ impl TalkShell {
             .iter()
             .any(|t| t.id == id && t.running);
 
+        // The PATH CLI stages spawn with, and no other login-shell variable.
+        let path = crate::orchestrator::cli_runner::resolved_cli_path();
+        // Without the login shell's own PATH (its probe failed or timed out),
+        // `path` is only the app's PATH and the common dirs, which puts
+        // `/usr/bin` ahead of Homebrew: leave `bash -l`'s PATH alone then.
+        let has_login_path = crate::orchestrator::cli_runner::login_env_path().is_some();
         if !reattaching {
-            Self::spawn_bash(client, &id, cwd)?;
+            Self::spawn_bash(client, &id, cwd, &path)?;
         }
         let nonce = gen_nonce();
         let rx = client.attach(&id, 0)?;
 
         match init_and_wait_ready(client, &id, &rx, &nonce) {
-            Ok(ready_cwd) => Ok(Session {
-                id,
-                rx: Some(rx),
-                cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
-                nonce,
-            }),
+            Ok(ready_cwd) => {
+                if has_login_path {
+                    apply_login_path(client, &id, &rx, &nonce, &path);
+                }
+                Ok(Session {
+                    id,
+                    rx: Some(rx),
+                    cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
+                    nonce,
+                })
+            }
             // Reattached but never ready — the surviving shell is busy with a
             // process from before the restart. Do NOT kill it; surface an error.
             Err(_) if reattaching => Err(AppError::Other(
@@ -361,13 +378,38 @@ impl TalkShell {
         }
     }
 
-    fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str) -> AppResult<()> {
-        let mut env = HashMap::new();
-        if let Ok(path) = std::env::var("PATH") {
-            env.insert("PATH".to_string(), path);
-        }
-        client.spawn(id, cwd, &env, Some("/bin/bash"), 40, 120)?;
+    fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str, path: &str) -> AppResult<()> {
+        let env = HashMap::from([("PATH".to_string(), path.to_string())]);
+        client.spawn(id, cwd, &env, Some(TALK_BASH), 40, 120)?;
         Ok(())
+    }
+}
+
+/// The line that gives a Talk shell `path` once (see [`apply_login_path`]):
+/// skipped when `__octo_lp` is already set, `path` single-quoted. Pure.
+fn login_path_line(path: &str) -> String {
+    format!(
+        "[ -n \"${{__octo_lp-}}\" ] || {{ export PATH='{}'; __octo_lp=1; }}\n",
+        path.replace('\'', "'\\''")
+    )
+}
+
+/// Set the shell's PATH to `path` after its profile ran. The spawn env alone
+/// can't: `bash -l` sources `/etc/profile`, whose `path_helper` moves the
+/// system dirs ahead of the PATH the shell was spawned with, so `/usr/bin`
+/// would shadow Homebrew, nvm or pyenv. Written once the prompt is up, as
+/// the commands are (a long line queued while the profile still runs may not
+/// fit the terminal's line buffer), and guarded by a shell variable: a shell
+/// that already ran it keeps any PATH change made in it across a restart,
+/// and one spawned by an older build gets it on its first reattach. Best
+/// effort: a shell that doesn't answer keeps the spawn PATH.
+fn apply_login_path(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str, path: &str) {
+    drain_pending(rx);
+    if client.write(id, login_path_line(path).as_bytes()).is_err() {
+        return;
+    }
+    if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. }) {
+        tracing::warn!(id, "talk shell did not confirm the login PATH");
     }
 }
 
@@ -703,6 +745,15 @@ mod tests {
     const RS: char = '\u{1e}';
     const N: &str = "abc123";
 
+    #[test]
+    fn the_login_path_line_runs_once_and_quotes_the_path() {
+        assert_eq!(
+            login_path_line("/opt/homebrew/bin:/usr/bin"),
+            "[ -n \"${__octo_lp-}\" ] || { export PATH='/opt/homebrew/bin:/usr/bin'; __octo_lp=1; }\n"
+        );
+        assert!(login_path_line("/a b/it's:/bin").contains("export PATH='/a b/it'\\''s:/bin';"));
+    }
+
     /// One command's captured stream: output then the prompt marker.
     fn stream_buf(output: &str, code: i32, cwd: &str) -> String {
         format!("{output}{RS}{RS}OCTO_DONE_{N}:{code}:{cwd}{RS}{RS}\n")
@@ -822,20 +873,7 @@ mod e2e {
     use tempfile::TempDir;
 
     fn find_daemon_bin() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                for cand in [parent.join("octopush-pty-server"), {
-                    let mut p = parent.to_path_buf();
-                    p.pop();
-                    p.join("octopush-pty-server")
-                }] {
-                    if cand.exists() {
-                        return cand;
-                    }
-                }
-            }
-        }
-        panic!("octopush-pty-server not built; run `cargo build --bin octopush-pty-server`");
+        crate::test_support::pty_server_bin()
     }
 
     fn start_daemon(home: &std::path::Path) -> std::process::Child {
@@ -1066,5 +1104,89 @@ mod e2e {
         assert_eq!(r.output, "after-stop");
 
         shell.close("s");
+    }
+
+    /// A dir holding `octo-1087-tool`, an executable found only through it.
+    fn login_bin() -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let tool = dir.path().join("octo-1087-tool");
+        fs::write(&tool, "#!/bin/sh\necho found-on-login-path\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// `$` commands and the agent's commands share the shell, and it gets the
+    /// login PATH exactly as CLI stages do (#1087), after `bash -l`'s profile.
+    #[test]
+    #[serial]
+    fn the_shell_gets_the_login_path_and_keeps_its_own_changes() {
+        use crate::orchestrator::cli_runner::{resolved_cli_path, with_login_shell_env};
+        let d = boot();
+        let bin = login_bin();
+        let bin_path = bin.path().to_string_lossy().into_owned();
+        let quick = Duration::from_secs(5);
+        let login = [("PATH", bin_path.as_str()), ("OCTO_1087_LOGIN_ONLY", "leaked")];
+        with_login_shell_env(&login, || {
+            let path = resolved_cli_path();
+            assert!(path.starts_with(&bin_path), "{path}");
+            {
+                let shell = shell_on(&d.sock);
+                let r = done(shell.run("lp", "/tmp", "printf '%s' \"$PATH\"", quick, true).unwrap());
+                assert_eq!(r.output, path, "a `$` command gets the PATH CLI stages spawn with");
+                let r = cap(shell.run_capture("lp", "/tmp", "octo-1087-tool", quick).unwrap());
+                assert_eq!(r.output, "found-on-login-path", "the agent's run_command finds the login-only tool");
+                let r = done(shell.run("lp", "/tmp", "echo \"${OCTO_1087_LOGIN_ONLY-unset}\"", quick, true).unwrap());
+                assert_eq!(r.output, "unset", "no other login-shell variable");
+                done(shell.run("lp", "/tmp", "export PATH=\"/octo-1087-own:$PATH\"", quick, true).unwrap());
+                // `shell` drops here — simulating an Octopush restart.
+            }
+            let shell = shell_on(&d.sock);
+            let r = done(shell.run("lp", "/tmp", "printf '%s' \"$PATH\"", quick, true).unwrap());
+            assert_eq!(r.output, format!("/octo-1087-own:{path}"), "a reattach keeps the shell's own PATH");
+            shell.close("lp");
+        });
+    }
+
+    /// A conversation's shell started by an older build (the app's own PATH)
+    /// gets the login PATH on its first reattach.
+    #[test]
+    #[serial]
+    fn a_shell_from_an_older_build_gets_the_login_path_on_reattach() {
+        use crate::orchestrator::cli_runner::{resolved_cli_path, with_login_shell_env};
+        let d = boot();
+        let bin = login_bin();
+        let bin_path = bin.path().to_string_lossy().into_owned();
+        let quick = Duration::from_secs(5);
+        let old = DaemonClient::connect_to(d.sock.to_str().unwrap()).unwrap();
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        old.spawn("talk-old", "/tmp", &env, Some("/bin/bash"), 40, 120).unwrap();
+        with_login_shell_env(&[("PATH", bin_path.as_str())], || {
+            let shell = shell_on(&d.sock);
+            let r = cap(shell.run_capture("old", "/tmp", "octo-1087-tool", quick).unwrap());
+            assert_eq!(r.output, "found-on-login-path");
+            let r = done(shell.run("old", "/tmp", "printf '%s' \"$PATH\"", quick, true).unwrap());
+            assert_eq!(r.output, resolved_cli_path());
+            shell.close("old");
+        });
+    }
+
+    /// Without the login shell's PATH (its probe failed or timed out) the
+    /// shell keeps `bash -l`'s PATH: the fallback puts `/usr/bin` ahead of
+    /// Homebrew.
+    #[test]
+    #[serial]
+    fn without_a_login_path_the_shell_keeps_its_profile_path() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        let quick = Duration::from_secs(5);
+        with_login_shell_env(&[("OCTO_1087_LOGIN_ONLY", "leaked")], || {
+            let shell = shell_on(&d.sock);
+            let r = done(shell.run("nolp", "/tmp", "echo \"${__octo_lp-unset}\"", quick, true).unwrap());
+            assert_eq!(r.output, "unset", "the login PATH step didn't run");
+            let r = done(shell.run("nolp", "/tmp", "echo ok", quick, true).unwrap());
+            assert_eq!(r.output, "ok");
+            shell.close("nolp");
+        });
     }
 }

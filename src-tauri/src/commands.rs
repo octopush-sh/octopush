@@ -83,12 +83,7 @@ pub async fn create_session(
         engine.scan_and_record(sid, seq, bytes);
     });
 
-    // Merge guard env into PTY env (isolated HISTFILE, project type, git branch).
-    let mut env = HashMap::new();
-    guard.apply_env(&mut env);
-
-    // Inject the selected model so CLI agents can read it.
-    env.insert("OCTOPUSH_MODEL".into(), session.agent.model.clone());
+    let env = run_terminal_env(&guard, &session.agent.model);
 
     // Spawn PTY
     state.pty.lock().spawn(
@@ -113,6 +108,18 @@ pub async fn create_session(
         .get_session(&id)?
         .ok_or_else(|| AppError::SessionNotFound(id.clone()))?;
     Ok(refreshed)
+}
+
+/// A Run terminal's PTY environment: the context guard's variables (isolated
+/// HISTFILE, project type, git branch) and the selected model, so CLI agents
+/// can read it. Nothing from the crew stage env — a Run terminal is the
+/// user's own session, so Settings › Privacy › "Quiet Claude Code in crews
+/// and Routines" (#703) never reaches it.
+pub(crate) fn run_terminal_env(guard: &ContextGuard, model: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    guard.apply_env(&mut env);
+    env.insert("OCTOPUSH_MODEL".into(), model.to_string());
+    env
 }
 
 #[tauri::command]
@@ -527,6 +534,8 @@ pub struct ProjectInfo {
     pub jira_project_key: Option<String>,
     pub pinned: bool,
     pub tint: Option<String>,
+    /// The project-scope rail group this project sits in, if any.
+    pub group_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -576,7 +585,8 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
         let jira_project_key = existing.as_ref().and_then(|p| p.jira_project_key.clone());
         let pinned = existing.as_ref().map(|p| p.pinned).unwrap_or(false);
         let tint = existing.as_ref().and_then(|p| p.tint.clone());
-        Ok(ProjectInfo { id, name, path: p, jira_project_key, pinned, tint })
+        let group_id = existing.as_ref().and_then(|p| p.group_id.clone());
+        Ok(ProjectInfo { id, name, path: p, jira_project_key, pinned, tint, group_id })
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         let name = std::path::Path::new(&path).file_name()
@@ -584,7 +594,7 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
             .unwrap_or_else(|| path.clone());
         db.insert_project(&id, &name, &path)?;
         ensure_main_workspace(&db, &id, &path, None)?;
-        Ok(ProjectInfo { id, name, path, jira_project_key: None, pinned: false, tint: None })
+        Ok(ProjectInfo { id, name, path, jira_project_key: None, pinned: false, tint: None, group_id: None })
     }
 }
 
@@ -611,19 +621,20 @@ pub async fn ensure_sketchbook(state: State<'_, AppState>) -> AppResult<ProjectI
         let jira_project_key = existing.as_ref().and_then(|p| p.jira_project_key.clone());
         let pinned = existing.as_ref().map(|p| p.pinned).unwrap_or(false);
         let tint = existing.as_ref().and_then(|p| p.tint.clone());
-        Ok(ProjectInfo { id, name: "Sketchbook".into(), path: p, jira_project_key, pinned, tint })
+        let group_id = existing.as_ref().and_then(|p| p.group_id.clone());
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path: p, jira_project_key, pinned, tint, group_id })
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         db.insert_project(&id, "Sketchbook", &path)?;
         ensure_main_workspace(&db, &id, &path, None)?;
-        Ok(ProjectInfo { id, name: "Sketchbook".into(), path, jira_project_key: None, pinned: false, tint: None })
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path, jira_project_key: None, pinned: false, tint: None, group_id: None })
     }
 }
 
 #[tauri::command]
 pub async fn list_recent_projects(state: State<'_, AppState>) -> AppResult<Vec<ProjectInfo>> {
     let rows = state.db.lock().list_projects()?;
-    Ok(rows.into_iter().map(|(id, name, path, _, jira_project_key, pinned, tint)| ProjectInfo { id, name, path, jira_project_key, pinned, tint }).collect())
+    Ok(rows.into_iter().map(|(id, name, path, _, jira_project_key, pinned, tint, group_id)| ProjectInfo { id, name, path, jira_project_key, pinned, tint, group_id }).collect())
 }
 
 #[tauri::command]
@@ -631,13 +642,14 @@ pub async fn list_closed_projects(state: State<'_, AppState>) -> AppResult<Vec<P
     let rows = state.db.lock().list_closed_projects()?;
     Ok(rows
         .into_iter()
-        .map(|(id, name, path, _, jira_project_key, pinned, tint)| ProjectInfo {
+        .map(|(id, name, path, _, jira_project_key, pinned, tint, group_id)| ProjectInfo {
             id,
             name,
             path,
             jira_project_key,
             pinned,
             tint,
+            group_id,
         })
         .collect())
 }
@@ -736,7 +748,7 @@ pub async fn create_project(
             let _ = db.update_mission_exec_isolation(&m.id, "sandbox");
         }
     }
-    Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
+    Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None, group_id: None })
 }
 
 /// The canonical Sketchbook path (expanded, no side effect — does NOT provision
@@ -822,6 +834,9 @@ pub struct CreatedWorkspace {
     pub setup_terminal_id: Option<String>,
     /// Why the setup script couldn't be started. The workspace itself is fine.
     pub setup_error: Option<String>,
+    /// What the fresh worktree borrowed from the main checkout (#961); `None`
+    /// when the project shares nothing or the worktree wasn't fresh.
+    pub shared: Option<crate::worktree_share::ShareOutcome>,
 }
 
 /// Start `script` in a new `setup` Run terminal in `ws`'s worktree. The PTY
@@ -830,7 +845,9 @@ fn start_setup_terminal(
     app: &AppHandle,
     state: &AppState,
     ws: &crate::db::WorkspaceRow,
+    project_root: &str,
     script: &str,
+    shared: Option<String>,
 ) -> AppResult<String> {
     use crate::workspace_setup as setup;
     let cwd = ws
@@ -839,7 +856,12 @@ fn start_setup_terminal(
         .ok_or_else(|| crate::error::AppError::Other("the workspace has no worktree".into()))?;
     let runner = setup::ensure_runner(&setup::runner_dir())?;
     let terminal = insert_terminal(state, ws.id.clone(), setup::TERMINAL_LABEL.to_string())?;
-    let env = std::collections::HashMap::from([(setup::SCRIPT_ENV.to_string(), script.to_string())]);
+    // The script, plus Conductor's variables for every setup script, so scripts
+    // written for Conductor work unchanged (the runner skips any the user exports).
+    let mut env = setup::runner_env(script, project_root, &cwd, &ws.name);
+    if let Some(line) = shared {
+        env.insert(setup::SHARED_ENV.to_string(), line);
+    }
     if let Err(e) = spawn_terminal_session(
         app.clone(),
         state,
@@ -866,6 +888,149 @@ pub async fn set_project_setup_script(
     script: String,
 ) -> AppResult<()> {
     state.db.lock().set_project_setup_script(&project_id, &script)
+}
+
+/// Which repo the wizard may read a Conductor setup script from: the
+/// project's own checkout, looked up by id (never a path the caller sends).
+/// `None` when the project has a saved setup template, or no such project.
+pub(crate) fn conductor_setup_root(db: &crate::db::Db, project_id: &str) -> AppResult<Option<String>> {
+    if !db.get_project_setup_script(project_id)?.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(db.get_project_by_id(project_id)?.map(|(_, _, path)| expand_tilde(&path)))
+}
+
+/// The setup script a Conductor repo declares in `.conductor/settings.toml`
+/// (`workspace_setup::conductor_setup_script`), offered by the new-mission
+/// wizard as a prefill — only while the project has no saved setup template.
+/// The repo is the project's path in the DB. Reading it never runs it.
+#[tauri::command]
+pub async fn conductor_setup_script(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<Option<String>> {
+    let root = {
+        let db = state.db.lock();
+        conductor_setup_root(&db, &project_id)?
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        crate::workspace_setup::conductor_setup_script(std::path::Path::new(&root))
+    })
+    .await
+    .ok()
+    .flatten())
+}
+
+/// The step-3 "Share with new missions" list: what the project shares now
+/// (`saved`) and what its main checkout could share (`available`, see
+/// `worktree_share::candidates`). The repo is the project's path in the DB,
+/// never a path the caller sends.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareOptions {
+    pub saved: crate::worktree_share::ShareSpec,
+    pub available: crate::worktree_share::ShareSpec,
+}
+
+#[tauri::command]
+pub async fn share_with_missions(state: State<'_, AppState>, project_id: String) -> AppResult<ShareOptions> {
+    let (saved, root) = {
+        let db = state.db.lock();
+        let saved = db.get_project_share(&project_id)?;
+        let root = db.get_project_by_id(&project_id)?.map(|(_, _, path)| expand_tilde(&path));
+        (saved, root)
+    };
+    let available = match root {
+        Some(root) => tauri::async_runtime::spawn_blocking(move || {
+            crate::worktree_share::candidates(std::path::Path::new(&root))
+        })
+        .await
+        .unwrap_or_default(),
+        None => crate::worktree_share::ShareSpec::default(),
+    };
+    Ok(ShareOptions { saved, available })
+}
+
+/// Remember what the project shares with new missions (sanitized: only the
+/// allowed link and copy names are kept).
+#[tauri::command]
+pub async fn set_share_with_missions(
+    state: State<'_, AppState>,
+    project_id: String,
+    spec: crate::worktree_share::ShareSpec,
+) -> AppResult<()> {
+    state.db.lock().set_project_share(&project_id, &spec)
+}
+
+/// Apply the project's "Share with new missions" list to a freshly created
+/// worktree — never a reused, restored or adopted one, nor the main checkout.
+/// A sandboxed mission gets neither links nor env copies (`worktree_share`).
+/// Only `create_workspace` (the app's own new-mission path) calls this: a
+/// Routine's fresh worktree and an `octopush-mcp` workspace do not share.
+pub(crate) fn share_into_fresh_worktree(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    outcome: crate::workspace::CreateOutcome,
+    project_id: &str,
+    project_root: &str,
+    ws: &crate::db::WorkspaceRow,
+    exec_isolation: &str,
+) -> Option<crate::worktree_share::ShareOutcome> {
+    if outcome != crate::workspace::CreateOutcome::Created {
+        return None;
+    }
+    let wt = ws.worktree_path.as_deref()?;
+    let spec = db.lock().get_project_share(project_id).ok()?;
+    if spec.is_empty()
+        || crate::worktree_share::same_dir(std::path::Path::new(wt), std::path::Path::new(project_root))
+    {
+        return None;
+    }
+    Some(crate::worktree_share::apply(
+        std::path::Path::new(project_root),
+        std::path::Path::new(wt),
+        &spec,
+        exec_isolation == "sandbox",
+    ))
+}
+
+/// When a mission's Execution becomes `sandbox`, take back what "Share with
+/// new missions" gave its worktree (`worktree_share::unshare`): the links,
+/// which the sandbox would refuse reads and writes through, and each copied
+/// env file that is still identical to the main checkout's (a sandboxed
+/// stage could read it). Only what Octopush recorded making is touched.
+pub(crate) fn unshare_for_sandbox(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: Option<&str>,
+) -> crate::worktree_share::Unshared {
+    let Some(ws_id) = workspace_id else { return Default::default() };
+    let found = {
+        let db = db.lock();
+        let ws = db.get_workspace(ws_id).ok().flatten();
+        let root = ws
+            .as_ref()
+            .and_then(|w| db.get_project(&w.project_id).ok().flatten())
+            .map(|p| expand_tilde(&p.path));
+        ws.and_then(|w| w.worktree_path).zip(root)
+    };
+    let Some((wt, root)) = found else { return Default::default() };
+    crate::worktree_share::unshare(std::path::Path::new(&root), std::path::Path::new(&wt))
+}
+
+/// One sentence per entry `unshare_for_sandbox` handled, in the wording of
+/// `ShareOutcome::skipped`.
+pub(crate) fn unshared_sentences(done: &crate::worktree_share::Unshared) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.extend(done.unlinked.iter().map(|n| format!("{n}: link removed in a sandboxed mission")));
+    out.extend(done.uncopied.iter().map(|n| format!("{n}: copy removed in a sandboxed mission")));
+    out.extend(
+        done.kept
+            .iter()
+            .map(|n| format!("{n}: kept, it was changed in this mission; its agents can read it")),
+    );
+    out
 }
 
 #[tauri::command]
@@ -926,11 +1091,25 @@ pub async fn create_workspace(
         }
     }
     install_claude_hooks_later(state.inner(), ws.clone());
+    // Links and copies land before the setup script, which can use them.
+    let mut shared = share_into_fresh_worktree(&state.db, outcome, &project_id, &project_path_expanded, &ws, exec_isolation);
+    // A reused worktree reopened as a sandboxed mission gives back what an
+    // earlier, unsandboxed mission was given.
+    if exec_isolation == "sandbox" && outcome != crate::workspace::CreateOutcome::Created {
+        let done = unshare_for_sandbox(&state.db, Some(&ws.id));
+        if !done.is_empty() {
+            shared = Some(crate::worktree_share::ShareOutcome {
+                skipped: unshared_sentences(&done),
+                ..Default::default()
+            });
+        }
+    }
+    let shared_line = shared.as_ref().and_then(|s| s.summary());
     // The setup script never blocks the workspace: a start failure is reported
     // alongside it, and a failing script shows in its terminal.
     let (setup_terminal_id, setup_error) =
         if crate::workspace_setup::should_run(outcome, &setup_script) {
-            match start_setup_terminal(&app, state.inner(), &ws, &setup_script) {
+            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script, shared_line) {
                 Ok(id) => (Some(id), None),
                 Err(e) => {
                     tracing::warn!(workspace = %ws.id, error = %e, "setup script could not be started");
@@ -940,7 +1119,7 @@ pub async fn create_workspace(
         } else {
             (None, None)
         };
-    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error })
+    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error, shared })
 }
 
 // ─── Mission commands ─────────────────────────────────────────────
@@ -986,6 +1165,20 @@ pub async fn create_mission(
     )
 }
 
+/// `update_mission`'s response: the mission, plus what was taken back from
+/// its worktree when its Execution became `sandbox` (`unshare_for_sandbox`):
+/// the links removed, the env copies removed, and the env copies kept
+/// because they changed in the mission.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatedMission {
+    #[serde(flatten)]
+    pub mission: crate::db::MissionRow,
+    pub unlinked: Vec<String>,
+    pub uncopied: Vec<String>,
+    pub kept_copies: Vec<String>,
+}
+
 #[tauri::command]
 pub async fn update_mission(
     state: State<'_, AppState>,
@@ -994,7 +1187,7 @@ pub async fn update_mission(
     status: Option<String>,
     linked_issue_key: Option<String>,
     exec_isolation: Option<String>,
-) -> AppResult<crate::db::MissionRow> {
+) -> AppResult<UpdatedMission> {
     if let Some(s) = status.as_deref() {
         crate::mission::validate_status(s)?;
     }
@@ -1028,7 +1221,12 @@ pub async fn update_mission(
             archive_workspace_internal(&state, ws_id)?;
         }
     }
-    Ok(updated)
+    let done = if exec_isolation.as_deref() == Some("sandbox") {
+        unshare_for_sandbox(&state.db, updated.workspace_id.as_deref())
+    } else {
+        Default::default()
+    };
+    Ok(UpdatedMission { mission: updated, unlinked: done.unlinked, uncopied: done.uncopied, kept_copies: done.kept })
 }
 
 /// Archive a workspace's worktree (on disk, if Octopush owns it) + DB row,
@@ -1040,6 +1238,19 @@ fn archive_workspace_internal(state: &AppState, workspace_id: &str) -> AppResult
     let Some(ws) = ws else { return Ok(()) };
     let project_path = { state.db.lock().get_project(&ws.project_id)?.map(|p| p.path) };
     let Some(project_path) = project_path else { return Ok(()) };
+    // Its conversations' Talk checkpoints go first (#958), while the worktree
+    // is still there to run git in. Best-effort; a few ref deletions.
+    let threads = state.db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
+    if !threads.is_empty() {
+        let root = expand_tilde(&project_path);
+        let dir = ws
+            .worktree_path
+            .as_deref()
+            .map(std::path::Path::new)
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| std::path::Path::new(&root));
+        crate::talk_checkpoints::prune_threads(dir, &threads);
+    }
     if owns_worktree_on_disk(&state.db, workspace_id, &project_path, ws.worktree_path.as_deref()) {
         crate::claude_hooks::remove_for_workspace(&state.db, workspace_id, ws.worktree_path.as_deref());
         if let Some(wt) = &ws.worktree_path {
@@ -1197,10 +1408,119 @@ pub async fn workspaces_git_summary(
     Ok(out)
 }
 
+/// Collision radar (#732): which live workspaces of a project change the same
+/// files, and whether an in-memory merge confirms a conflict. Read-only: it
+/// never writes objects, refs, the index or locks. Throttled: a report younger
+/// than `collisions::REPORT_TTL` is reused (unless `force`, or a HEAD moved),
+/// and committed diffs and merge confirmations are cached by commit id.
+#[tauri::command]
+pub async fn project_collisions(
+    state: State<'_, AppState>,
+    project_id: String,
+    force: Option<bool>,
+) -> AppResult<crate::collisions::ProjectCollisions> {
+    let (rows, project_path) = {
+        let db = state.db.lock();
+        let rows = db.list_workspaces(&project_id)?;
+        let path = db.get_project(&project_id)?.map(|p| p.path);
+        (rows, path)
+    };
+    let inputs = crate::collisions::scan_inputs(rows, project_path.as_deref());
+    let cache = std::sync::Arc::clone(&state.collisions);
+    tauri::async_runtime::spawn_blocking(move || {
+        cache.lock().scan_throttled(
+            &project_id,
+            &inputs,
+            std::time::Instant::now(),
+            crate::collisions::REPORT_TTL,
+            force.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("collision scan: {e}")))
+}
+
+/// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
+/// for Mission Control's settled and needs-you cards. `None` when the
+/// workspace or its worktree is gone, it isn't a git repo, or the diff timed
+/// out — the card then shows nothing rather than a made-up zero.
+#[tauri::command]
+pub async fn workspace_diff_size(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<crate::git_ops::DiffSize>> {
+    let (row, project_path) = {
+        let db = state.db.lock();
+        let Some(row) = db.get_workspace(&workspace_id)? else { return Ok(None) };
+        let project_path = db.get_project(&row.project_id)?.map(|p| p.path);
+        (row, project_path)
+    };
+    let Some(wt) = row.worktree_path else { return Ok(None) };
+    let path = expand_tilde(&wt);
+    if !crate::git_ops::is_git_repo(std::path::Path::new(&path)) {
+        return Ok(None);
+    }
+    let from_branch = row.from_branch;
+    Ok(run_with_timeout(std::time::Duration::from_secs(5), move || {
+        // The same base the collision radar uses: the workspace's own base
+        // branch, else the project's default branch.
+        let default_base = project_path
+            .as_deref()
+            .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
+        let base = crate::collisions::workspace_base(from_branch, default_base.as_deref());
+        crate::git_ops::diff_size(std::path::Path::new(&path), base.as_deref()).ok()
+    })
+    .await
+    .flatten())
+}
+
+/// What a workspace committed since its base ([`crate::git_ops::CommittedDiff`]),
+/// for Review's "Since base" view (#851). The base is the one the collision
+/// radar and Mission Control's diff size use: the workspace's own base
+/// branch, else the project's default branch. `None` when the workspace or
+/// its worktree is gone, it isn't a git repo, or the diff timed out — Review
+/// then offers the working tree only.
+#[tauri::command]
+pub async fn get_committed_diff(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    ignore_whitespace: Option<bool>,
+) -> AppResult<Option<crate::git_ops::CommittedDiff>> {
+    let (row, project_path) = {
+        let db = state.db.lock();
+        let Some(row) = db.get_workspace(&workspace_id)? else { return Ok(None) };
+        let project_path = db.get_project(&row.project_id)?.map(|p| p.path);
+        (row, project_path)
+    };
+    let path = expand_tilde(row.worktree_path.as_deref().or(project_path.as_deref()).unwrap_or(""));
+    if path.is_empty() || !crate::git_ops::is_git_repo(std::path::Path::new(&path)) {
+        return Ok(None);
+    }
+    let from_branch = row.from_branch;
+    let ignore_ws = ignore_whitespace.unwrap_or(false);
+    Ok(run_with_timeout(std::time::Duration::from_secs(5), move || {
+        let default_base = project_path
+            .as_deref()
+            .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
+        let base = crate::collisions::workspace_base(from_branch, default_base.as_deref());
+        crate::git_ops::committed_diff(std::path::Path::new(&path), base.as_deref(), ignore_ws).ok()
+    })
+    .await
+    .flatten())
+}
+
+/// The working diff (index → working tree, untracked files included). Built
+/// on a blocking thread: reading every changed file is not work for the
+/// async runtime, and Run's Companion asks for it on the 3 s git poll.
 #[tauri::command]
 pub async fn get_git_diff(path: String, ignore_whitespace: Option<bool>) -> AppResult<String> {
     let path = expand_tilde(&path);
-    crate::git_ops::get_diff_text(std::path::Path::new(&path), ignore_whitespace.unwrap_or(false))
+    let ignore_whitespace = ignore_whitespace.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::git_ops::get_diff_text(std::path::Path::new(&path), ignore_whitespace)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("git diff: {e}")))?
 }
 
 // ─── Delete workspace ────────────────────────────────────────────
@@ -1244,6 +1564,7 @@ fn install_claude_hooks_later(state: &AppState, ws: crate::db::WorkspaceRow) {
 
 #[tauri::command]
 pub async fn delete_workspace(
+    app: AppHandle,
     state: State<'_, AppState>,
     workspace_id: String,
     project_path: String,
@@ -1254,6 +1575,8 @@ pub async fn delete_workspace(
     let is_main = worktree_path
         .as_deref()
         .is_some_and(|wt| is_project_root(&project_path, wt));
+
+    prune_talk_checkpoints_of(&state.db, &workspace_id, &project_path, worktree_path.as_deref()).await;
 
     // Remove the worktree directory only when Octopush created it (`managed`) and
     // it isn't the project root. An adopted checkout (made by the user/another
@@ -1288,8 +1611,28 @@ pub async fn delete_workspace(
         let _ = crate::git_ops::delete_branch(std::path::Path::new(&project_path), &branch);
     }
 
-    // Remove from DB
+    // Remove from DB. The row's runs cascade-delete without a run:// event, so
+    // a paused one would keep the Dock badge counting it: refresh it now.
+    let db_path = state.db.lock().conn_ref_path(&workspace_id).ok().flatten();
     state.db.lock().delete_workspace(&workspace_id)?;
+    crate::fleet_status::refresh_later(&app);
+
+    // Its sandbox build caches go with it, unless another workspace still
+    // sits at the same path (they key the cache by path, a trailing `/`
+    // ignored). Off the IPC thread: a cargo or npm cache can be large.
+    if let Some(path) = db_path {
+        let trimmed = path.trim_end_matches('/').to_string();
+        let shared = [trimmed.clone(), format!("{trimmed}/")]
+            .iter()
+            .any(|p| state.db.lock().workspace_by_path(p).ok().flatten().is_some());
+        if !shared {
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = crate::orchestrator::sandbox::remove_workspace_build_caches(&path) {
+                    tracing::warn!(error = %e, "could not remove the workspace's build caches");
+                }
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1307,16 +1650,44 @@ pub async fn archive_workspace(
     // IPC/API symmetry but isn't needed here.
     let _ = &branch;
     let project_path = expand_tilde(&project_path);
+    let running = |t: &[String]| state.chat.any_running(t);
+    archive_workspace_at(&state.db, running, &workspace_id, &project_path, worktree_path.as_deref(), None)
+        .await
+        .map(|_| ())
+}
 
+/// The archive itself, shared with `archive_merged_workspaces`, which passes
+/// `named` (the local files the user was shown): right before the worktree
+/// is deleted it is checked once more (`worktree_busy` with `running`, which
+/// asks the chat engine about thread ids, then `changed_since_named`), and a
+/// mission that fails is left in place, untouched, with the reason as
+/// `Ok(Some(..))`. The Talk checkpoints go last: they are refs in the shared
+/// git dir, pruned from the project root once the worktree is gone.
+pub(crate) async fn archive_workspace_at(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    running: impl Fn(&[String]) -> bool,
+    workspace_id: &str,
+    project_path: &str,
+    worktree_path: Option<&str>,
+    named: Option<&[String]>,
+) -> AppResult<Option<&'static str>> {
     // Only remove on disk what Octopush created. An adopted checkout and the
     // main workspace (project root) keep their directory — archiving just flips
     // the DB row. (Archive always keeps the branch.)
-    if owns_worktree_on_disk(&state.db, &workspace_id, &project_path, worktree_path.as_deref()) {
-        crate::claude_hooks::remove_for_workspace(&state.db, &workspace_id, worktree_path.as_deref());
-        if let Some(wt) = &worktree_path {
+    if owns_worktree_on_disk(db, workspace_id, project_path, worktree_path) {
+        if let (Some(named), Some(wt)) = (named, worktree_path) {
+            if worktree_busy(&db.lock(), &running, wt) {
+                return Ok(Some("busy"));
+            }
+            if let Some(reason) = changed_since_named(Path::new(wt), Some(named)) {
+                return Ok(Some(reason));
+            }
+        }
+        crate::claude_hooks::remove_for_workspace(db, workspace_id, worktree_path);
+        if let Some(wt) = worktree_path {
             // Prune the worktree's registry slot (by path), then remove its dir.
             let _ = crate::git_ops::delete_worktree(
-                std::path::Path::new(&project_path),
+                std::path::Path::new(project_path),
                 std::path::Path::new(wt),
             );
             let wt_path = std::path::Path::new(wt);
@@ -1325,9 +1696,10 @@ pub async fn archive_workspace(
             }
         }
     }
+    prune_talk_checkpoints_of(db, workspace_id, project_path, worktree_path).await;
     // Mark archived in DB (row survives, hidden from the rail)
-    state.db.lock().archive_workspace(&workspace_id)?;
-    Ok(())
+    db.lock().archive_workspace(workspace_id)?;
+    Ok(None)
 }
 
 #[tauri::command]
@@ -1565,7 +1937,216 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
     // Tear down the thread's TALK shell (kills the daemon PTY + releases the
     // session entry) so deleting conversations doesn't leak bash processes.
     state.chat.talk_shell.close(&thread_id);
+    // Its checkpoints go with it (#958).
+    let worktree = state.db.lock().chat_thread_worktree(&thread_id).ok().flatten();
+    if let Some(path) = worktree {
+        let id = thread_id.clone();
+        crate::talk_checkpoints::off_runtime(move || {
+            crate::talk_checkpoints::prune_thread(std::path::Path::new(&path), &id);
+            Ok(())
+        })
+        .await?;
+    }
     state.db.lock().delete_chat_thread(&thread_id)
+}
+
+// ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+// Every one runs git on a blocking thread (`talk_checkpoints::off_runtime`).
+
+/// Where a thread's files live: its workspace and that workspace's
+/// worktree, read from the database. The webview never names the folder a
+/// rewind writes to.
+fn talk_thread_home(state: &AppState, thread_id: &str) -> AppResult<(String, std::path::PathBuf)> {
+    match state.db.lock().chat_thread_home(thread_id)? {
+        Some((workspace_id, Some(path))) => Ok((workspace_id, std::path::PathBuf::from(path))),
+        Some(_) => Err(AppError::Other("This conversation's workspace has no folder on disk.".into())),
+        None => Err(AppError::Other("That conversation no longer exists.".into())),
+    }
+}
+
+/// A rewind (or its undo) rewrites files in a worktree, so nothing else may
+/// be writing there: no Talk turn on any conversation of a workspace checked
+/// out at that path, and no Direct run in progress in one.
+fn ensure_worktree_is_idle(state: &AppState, thread_id: &str, worktree: &std::path::Path) -> AppResult<()> {
+    let (threads, run) = {
+        let db = state.db.lock();
+        (
+            db.chat_threads_sharing_worktree(thread_id)?,
+            db.has_active_run_at(&worktree.to_string_lossy())?,
+        )
+    };
+    if state.chat.is_running(thread_id) {
+        return Err(AppError::Other("Stop the running turn before rewinding its files.".into()));
+    }
+    if state.chat.any_running(&threads) {
+        return Err(AppError::Other(
+            "Another conversation is running a turn in this workspace. Wait for it or stop it before rewinding files.".into(),
+        ));
+    }
+    if run {
+        return Err(AppError::Other(
+            "A Direct run is in progress in this workspace. Wait for it or stop it before rewinding files.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The user turns of a thread whose files can be rewound, the turns that
+/// ran without a checkpoint (and why), and whether a rewind can be undone.
+#[tauri::command]
+pub async fn list_talk_checkpoints(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<crate::talk_checkpoints::Checkpoints> {
+    let Ok((_, path)) = talk_thread_home(&state, &thread_id) else {
+        return Ok(crate::talk_checkpoints::Checkpoints::default());
+    };
+    crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::checkpoints(&path, &thread_id)).await
+}
+
+/// What rewinding to a turn would change — shown before anything is written.
+#[tauri::command]
+pub async fn preview_talk_rewind(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<crate::talk_checkpoints::RewindPreview> {
+    let (_, path) = talk_thread_home(&state, &thread_id)?;
+    crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::preview(&path, &thread_id, message_id))
+        .await
+}
+
+/// The quiet note a rewind leaves in the conversation, naming the turn.
+pub(crate) fn rewind_note(turn: Option<&str>, files: usize) -> String {
+    let first = turn.and_then(|t| t.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim();
+    let short: String = first.chars().take(40).collect();
+    let short = if first.chars().count() > 40 { format!("{short}…") } else { short };
+    let plural = if files == 1 { "file" } else { "files" };
+    if short.is_empty() {
+        format!("Files rewound to before a turn · {files} {plural}")
+    } else {
+        format!("Files rewound to before “{short}” · {files} {plural}")
+    }
+}
+
+/// What a note adds when a rewind or an undo left paths alone or stopped
+/// part-way.
+pub(crate) fn rewind_note_tail(outcome: &crate::talk_checkpoints::RewindOutcome) -> String {
+    let mut tail = String::new();
+    let left = outcome.untouched.len();
+    if left > 0 {
+        tail.push_str(&format!(" · {left} left untouched"));
+    }
+    if outcome.error.is_some() {
+        tail.push_str(" · stopped part-way");
+    }
+    tail
+}
+
+/// Rewind the worktree to the checkpoint of a user turn. `expected` is the
+/// preview the user confirmed; a tree that moved on since is refused, and
+/// so is a worktree something else is writing to.
+#[tauri::command]
+pub async fn rewind_talk_files(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+    expected: String,
+) -> AppResult<crate::talk_checkpoints::RewindOutcome> {
+    let (workspace_id, path) = talk_thread_home(&state, &thread_id)?;
+    ensure_worktree_is_idle(&state, &thread_id, &path)?;
+    let id = thread_id.clone();
+    let outcome = crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::rewind(&path, &id, message_id, &expected)
+    })
+    .await?;
+    let db = state.db.lock();
+    let turn = db.get_chat_message(message_id).ok().flatten().map(|m| m.content);
+    let note = format!("{}{}", rewind_note(turn.as_deref(), outcome.changed), rewind_note_tail(&outcome));
+    db.insert_chat_message(&workspace_id, &thread_id, "stopped", &note, None, None, None, None)?;
+    Ok(outcome)
+}
+
+/// Put back the files the thread's last rewind replaced — refused while
+/// something else writes to the worktree, or once the files moved on since
+/// the rewind.
+#[tauri::command]
+pub async fn undo_talk_rewind(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<crate::talk_checkpoints::RewindOutcome> {
+    let (workspace_id, path) = talk_thread_home(&state, &thread_id)?;
+    ensure_worktree_is_idle(&state, &thread_id, &path)?;
+    let id = thread_id.clone();
+    let outcome = crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::undo(&path, &id)).await?;
+    let note = if outcome.error.is_some() {
+        format!("Undo of the rewind{}", rewind_note_tail(&outcome))
+    } else {
+        format!("Rewind undone{}", rewind_note_tail(&outcome))
+    };
+    state
+        .db
+        .lock()
+        .insert_chat_message(&workspace_id, &thread_id, "stopped", &note, None, None, None, None)?;
+    Ok(outcome)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkedThread {
+    pub thread: crate::db::ChatThreadRow,
+    /// The forked turn's text, for the new thread's composer.
+    pub draft: String,
+}
+
+/// Fork a conversation from a user turn: a new thread with the history
+/// before it (and those turns' checkpoints); the turn itself becomes the
+/// new thread's draft. The original thread is left as it is.
+#[tauri::command]
+pub async fn fork_chat_thread(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<ForkedThread> {
+    let home = talk_thread_home(&state, &thread_id).ok();
+    let (thread, draft, pairs) = state.db.lock().fork_chat_thread(&thread_id, message_id)?;
+    if let Some((_, path)) = home {
+        let to = thread.id.clone();
+        crate::talk_checkpoints::off_runtime(move || {
+            crate::talk_checkpoints::copy_to_fork(&path, &thread_id, &to, &pairs);
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(ForkedThread { thread, draft })
+}
+
+/// Drop the Talk checkpoints of every conversation of a workspace that is
+/// being deleted or archived (#958). The refs live in the repository's
+/// shared git directory, so they would otherwise outlive the worktree.
+/// Best-effort, and run before the worktree is removed.
+async fn prune_talk_checkpoints_of(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: &str,
+    project_path: &str,
+    worktree: Option<&str>,
+) {
+    let threads = db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
+    if threads.is_empty() {
+        return;
+    }
+    let dirs: Vec<std::path::PathBuf> =
+        worktree.into_iter().chain(std::iter::once(project_path)).map(std::path::PathBuf::from).collect();
+    let pruned = crate::talk_checkpoints::off_runtime(move || {
+        if let Some(dir) = dirs.iter().find(|d| d.is_dir()) {
+            crate::talk_checkpoints::prune_threads(dir, &threads);
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(e) = pruned {
+        tracing::warn!(error = %e, "could not prune the workspace's talk checkpoints");
+    }
 }
 
 /// List the skills available to a worktree (project ∪ user SKILL.md files).
@@ -1655,16 +2236,34 @@ pub async fn list_mcp_tools(
         .list_tools(std::path::Path::new(&workspace_path)))
 }
 
-/// List the names of MCP servers configured for a worktree (project ∪ user),
-/// whether or not they're currently reachable.
+/// Every MCP server configured for a worktree with what Talk's registry knows
+/// about it (connected · N tools, not started yet, failed and why), for the
+/// Companion's "can use" chips. Spawns nothing.
 #[tauri::command]
-pub async fn list_mcp_servers(workspace_path: String) -> AppResult<Vec<String>> {
-    let mut names: Vec<String> =
-        crate::mcp::load_server_configs(std::path::Path::new(&workspace_path))
-            .into_keys()
-            .collect();
-    names.sort();
-    Ok(names)
+pub async fn list_mcp_server_status(
+    state: State<'_, AppState>,
+    workspace_path: String,
+) -> AppResult<Vec<crate::mcp::scope::McpServerStatus>> {
+    Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
+}
+
+/// The MCP servers switched off in one Talk conversation (none by default).
+#[tauri::command]
+pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<String>> {
+    state.db.lock().thread_mcp_disabled(&thread_id)
+}
+
+/// Turn one MCP server off (or back on) in one Talk conversation and return
+/// the conversation's new off list. Its next call to that server is refused
+/// (or runs), and the next turn and fan-out leave it out (or offer it).
+#[tauri::command]
+pub async fn set_thread_mcp_server(
+    state: State<'_, AppState>,
+    thread_id: String,
+    server: String,
+    off: bool,
+) -> AppResult<Vec<String>> {
+    state.db.lock().set_thread_mcp_server_off(&thread_id, &server, off)
 }
 
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
@@ -1674,12 +2273,52 @@ pub async fn get_mcp_config(
     Ok(crate::mcp::load_user_config())
 }
 
-/// Replace the user-level MCP server config.
+/// Replace the user-level MCP server config, then stop Talk's cached
+/// connection to every server whose entry changed or was removed, so the next
+/// call spawns it from the saved config (a call in flight on the old process
+/// fails), and tell the Companion. A remote entry's bridge is rebuilt from
+/// its choices first, and secret values move to the login Keychain
+/// (`mcp::save_user_servers`). `secrets` holds the values Settings' secret
+/// fields were given (server → env name → value; never written to
+/// `mcp.json`; an empty value keeps the saved one), `renamed` maps a new
+/// server name to the old one so its Keychain items move with it, and
+/// conversations that had the old name switched off get the new one. Returns
+/// the entries as saved, without any secret value.
 #[tauri::command]
 pub async fn save_mcp_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
     servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
-) -> AppResult<()> {
-    crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)
+    secrets: Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+    renamed: Option<std::collections::HashMap<String, String>>,
+) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
+    let registry = Arc::clone(&state.chat.mcp);
+    let db = Arc::clone(&state.db);
+    // `npx` lookup, Keychain and file I/O, kill + reap: off the runtime thread.
+    let saved = tokio::task::spawn_blocking(
+        move || -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
+            let store = crate::mcp::secrets::keychain();
+            let renamed = renamed.unwrap_or_default();
+            let (old, saved, touched) =
+                crate::mcp::save_user_servers(servers, secrets.unwrap_or_default(), &renamed, &*store)
+                    .map_err(crate::error::AppError::Other)?;
+            // The file is written: from here on nothing fails the save.
+            let renames = crate::mcp::real_renames(&old, &saved, &renamed);
+            let keeps_old = |worktree: &str, name: &str| {
+                crate::mcp::project_config(std::path::Path::new(worktree)).contains_key(name)
+            };
+            if let Err(e) = db.lock().rename_thread_mcp_servers(&renames, keeps_old) {
+                tracing::warn!(error = %e, "couldn't carry an MCP server rename over to conversations' off lists");
+            }
+            // A new secret value leaves the entry as it reads: restart it too.
+            registry.apply_save(&old, &saved, &touched);
+            Ok(saved)
+        },
+    )
+    .await
+    .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
+    let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ()); // Companion "can use" reloads
+    Ok(saved)
 }
 
 /// Smoke-test a single server config: spawn it, run the handshake, and return
@@ -1689,16 +2328,79 @@ pub async fn test_mcp_server(
     name: String,
     config: crate::mcp::McpServerConfig,
 ) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
-    let fut = tokio::task::spawn_blocking(move || crate::mcp::McpRegistry::test_connect(&name, &config));
+    smoke_test_mcp_server(name, config).await
+}
+
+/// Settings' "Clear sign-in" for a Browser (OAuth) remote server: delete
+/// mcp-remote's saved sign-in for its URL (`mcp::remote::clear_sign_in`),
+/// then stop Talk's connection to it, which holds its tokens in memory.
+/// Returns how many files went.
+#[tauri::command]
+pub async fn clear_mcp_sign_in(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    config: crate::mcp::McpServerConfig,
+) -> AppResult<usize> {
+    let registry = Arc::clone(&state.chat.mcp);
+    let removed = tokio::task::spawn_blocking(move || -> AppResult<usize> {
+        let removed = crate::mcp::remote::clear_sign_in(&config).map_err(crate::error::AppError::Other)?;
+        registry.reset_server(&name);
+        Ok(removed)
+    })
+    .await
+    .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
+    let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ()); // Companion "can use" reloads
+    Ok(removed)
+}
+
+/// Settings' Reconnect: stop Talk's cached connection to the server (a call
+/// in flight on it fails, and a remembered start failure is forgotten), then
+/// run the same smoke test as Test. Talk's next call spawns it afresh.
+#[tauri::command]
+pub async fn reconnect_mcp_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    name: String,
+    config: crate::mcp::McpServerConfig,
+) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    let registry = Arc::clone(&state.chat.mcp);
+    let server = name.clone();
+    tokio::task::spawn_blocking(move || registry.reset_server(&server))
+        .await
+        .map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+    let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ()); // Companion "can use" reloads
+    smoke_test_mcp_server(name, config).await
+}
+
+async fn smoke_test_mcp_server(
+    name: String,
+    config: crate::mcp::McpServerConfig,
+) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    // The server's own env values are redacted wherever its output echoes them.
+    let known = crate::mcp::known_secrets(&config);
+    let fut = tokio::task::spawn_blocking(move || {
+        // A remote entry runs the bridge its choices describe.
+        let mut config = config;
+        if config.remote.is_some() {
+            crate::mcp::remote::apply_bridge(&mut config, &crate::mcp::remote::resolve_npx());
+        }
+        // Which Keychain items it may read is the saved entry's say, never
+        // the caller's.
+        config.secret_env = crate::mcp::load_user_config().get(&name).map(|c| c.secret_env.clone()).unwrap_or_default();
+        crate::mcp::McpRegistry::test_connect(&name, &config)
+    });
+    let failed =
+        |reason: &str| crate::error::AppError::McpFailure(crate::mcp::classify_failure_with(reason, &known));
     // 120s: OAuth bridge tools (e.g. mcp-remote) may need to open a browser
     // and wait for the user to authenticate. 15s was too short for that flow.
     match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
         Ok(join) => join
             .map_err(|e| crate::error::AppError::Other(e.to_string()))?
-            .map_err(crate::error::AppError::Other),
-        Err(_) => Err(crate::error::AppError::Other(
+            .map_err(|reason| failed(&reason)),
+        Err(_) => Err(failed(
             "Connection timed out after 120s. If this server requires OAuth, complete \
-             the authentication in the browser that opened, then test again.".into(),
+             the authentication in the browser that opened, then test again.",
         )),
     }
 }
@@ -1794,6 +2496,87 @@ pub async fn delete_pipeline(
     Ok(())
 }
 
+// ─── Portable crews (`crew.rs`) ───────────────────────────────────
+
+/// A saved pipeline as `.octocrew.json` text (Copy crew as JSON).
+#[tauri::command]
+pub async fn export_crew(state: State<'_, AppState>, pipeline_id: String) -> AppResult<String> {
+    let crew = crate::crew::export(&state.db.lock(), &pipeline_id)?;
+    crate::crew::to_json(&crew)
+}
+
+/// Export crew…: a native save dialog, then the file. `None` when cancelled.
+/// The dialog opens from Rust, so the webview needs no file-write permission.
+#[tauri::command]
+pub async fn save_crew_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pipeline_id: String,
+) -> AppResult<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let crew = crate::crew::export(&state.db.lock(), &pipeline_id)?;
+    let text = crate::crew::to_json(&crew)?;
+    let file_name = crate::crew::file_name(&crew.pipeline.name);
+    let picked = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(file_name)
+            .add_filter("Octopush crew", &["json"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("save dialog failed: {e}")))?;
+    let Some(picked) = picked else { return Ok(None) };
+    let path = picked
+        .into_path()
+        .map_err(|e| AppError::Other(format!("can't save there: {e}")))?;
+    std::fs::write(&path, text)?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// The text of a crew file the user picked to import (size-bounded, never
+/// blocking; the user's own pick may be a symlink).
+#[tauri::command]
+pub async fn read_crew_file(path: String) -> AppResult<String> {
+    crate::crew::read_file(std::path::Path::new(&path), true)
+}
+
+/// The text of one repo crew (`.octopush/crews/<file>`), read on Fork without
+/// following symlinks.
+#[tauri::command]
+pub async fn read_repo_crew(workspace_path: String, file: String) -> AppResult<String> {
+    crate::crew::read_repo_crew(std::path::Path::new(&workspace_path), &file)
+}
+
+/// The import review sheet's content. Writes nothing.
+#[tauri::command]
+pub async fn preview_crew(
+    state: State<'_, AppState>,
+    text: String,
+    model_swaps: Option<Vec<(String, String)>>,
+) -> AppResult<crate::crew::CrewPreview> {
+    let crew = crate::crew::parse(&text)?;
+    crate::crew::preview(&state.db.lock(), &crew, &model_swaps.unwrap_or_default())
+}
+
+/// Save a reviewed crew as a new custom pipeline. Never starts a run.
+#[tauri::command]
+pub async fn import_crew(
+    state: State<'_, AppState>,
+    text: String,
+    model_swaps: Option<Vec<(String, String)>>,
+) -> AppResult<String> {
+    let crew = crate::crew::parse(&text)?;
+    crate::crew::import(&state.db.lock(), &crew, &model_swaps.unwrap_or_default())
+}
+
+/// Crews committed in the workspace under `.octopush/crews/`: names and
+/// counts only (the text is read on Fork by `read_repo_crew`).
+#[tauri::command]
+pub async fn list_repo_crews(workspace_path: String) -> AppResult<Vec<crate::crew::RepoCrew>> {
+    Ok(crate::crew::scan_repo(std::path::Path::new(&workspace_path)))
+}
+
 #[tauri::command]
 pub async fn create_run(
     state: State<'_, AppState>,
@@ -1832,22 +2615,44 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let (run, stages) = {
+    let (run, stages, unreported, ran, refused, contexts) = {
         let db = state.db.lock();
-        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?)
+        (
+            db.get_run(&run_id)?,
+            db.list_run_stages(&run_id)?,
+            db.usage_unreported_stage_ids(&run_id)?,
+            db.ran_models(&run_id)?,
+            db.refused_call_counts(&run_id)?,
+            db.stage_contexts(&run_id)?,
+        )
     };
-    // Flag stages whose model has no price (resolved after the DB lock): the
-    // ledger shows them as unpriced and says the budget cannot see them.
+    // Flag stages whose model has no price (resolved after the DB lock), and
+    // stages whose CLI stopped before reporting usage: the ledger shows them
+    // as unpriced / usage not reported and says the budget cannot see them.
     let router = crate::token_engine::catalog();
     let mut priced: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut stages_json = serde_json::to_value(&stages)?;
     if let Some(arr) = stages_json.as_array_mut() {
         for (v, s) in arr.iter_mut().zip(stages.iter()) {
+            // A stage that ran on another model is priced as what ran.
+            let model = ran.get(&s.id).unwrap_or(&s.agent_model);
             let ok = *priced
-                .entry(s.agent_model.clone())
-                .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), &s.agent_model).is_some());
+                .entry(model.clone())
+                .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), model).is_some());
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("unpricedModel".into(), serde_json::Value::Bool(!ok));
+                obj.insert("usageUnreported".into(), serde_json::Value::Bool(unreported.contains(&s.id)));
+                obj.insert(
+                    "ranModel".into(),
+                    ran.get(&s.id).map_or(serde_json::Value::Null, |m| serde_json::Value::String(m.clone())),
+                );
+                obj.insert("refusedCalls".into(), serde_json::Value::from(refused.get(&s.id).copied().unwrap_or(0)));
+                // A Claude CLI stage's latest context reading (#895); null
+                // before its first message, for Codex/API stages, and (window)
+                // for a model the catalog doesn't list.
+                let ctx = contexts.get(&s.id);
+                obj.insert("contextTokens".into(), ctx.map_or(serde_json::Value::Null, |c| c.0.into()));
+                obj.insert("contextWindow".into(), ctx.and_then(|c| c.1).map_or(serde_json::Value::Null, Into::into));
             }
         }
     }
@@ -2081,6 +2886,51 @@ pub async fn get_sync_prefs() -> AppResult<crate::settings::SyncPrefs> {
     crate::settings::current_sync_prefs()
 }
 
+/// The last push attempt per sync kind (time, outcome, count, HTTP status) for
+/// the status line under each Settings › Account › Sync toggle. A kind whose
+/// opt-in doesn't apply to the signed-in user answers `None`. With library sync
+/// on, it also lists the library items still unsent because the sync service
+/// refused them (#799), each with its local name; an item no longer in the
+/// local library is left out. Local read only.
+#[tauri::command]
+pub async fn get_sync_status(state: State<'_, AppState>) -> AppResult<crate::sync::SyncStatus> {
+    let prefs = crate::settings::current_sync_prefs()?;
+    let mut status = crate::sync::status::snapshot();
+    if !prefs.history_sync {
+        status.history = None;
+    }
+    if !prefs.library_sync {
+        status.library = None;
+        status.library_rejected.clear();
+    }
+    if !status.library_rejected.is_empty() {
+        name_library_rejections(&state.db.lock(), &mut status.library_rejected);
+    }
+    Ok(status)
+}
+
+/// Give each unsent library item its local display name (a pipeline's name, a
+/// role's label), and drop the ones no longer in the local library.
+pub(crate) fn name_library_rejections(
+    db: &crate::db::Db,
+    rejected: &mut Vec<crate::sync::LibraryRejection>,
+) {
+    let pipelines = db.list_pipelines().unwrap_or_default();
+    rejected.retain_mut(|r| {
+        r.name = match r.kind.as_str() {
+            "pipeline" => pipelines.iter().find(|p| p.id == r.id && !p.is_builtin).map(|p| p.name.clone()),
+            "role" => db
+                .get_role(&r.id)
+                .ok()
+                .flatten()
+                .filter(|role| !role.is_builtin)
+                .map(|role| role.label),
+            _ => None,
+        };
+        r.name.is_some()
+    });
+}
+
 /// Turn one cloud sync (`kind`: `"history"` | `"library"`) on or off and return
 /// the new pair. The opt-in is bound to the signed-in Clerk user. Turning ON
 /// requires the matching Pro feature (the UI disables
@@ -2122,6 +2972,8 @@ pub async fn history_list(state: State<'_, AppState>) -> AppResult<Vec<crate::sy
 /// mirror, and return it. Pro-gated (`history.sync`). Best-effort refresh: on a
 /// network/transient error it falls back to the current local mirror rather than
 /// failing (so opening History offline still shows the last-known data).
+/// `pull_runs` answers only once it has every page, so the mirror is never
+/// replaced with a partial set: a failed page lands in the fallback (#799).
 #[tauri::command]
 pub async fn history_sync_pull(
     state: State<'_, AppState>,
@@ -2208,6 +3060,27 @@ pub async fn history_run_detail(
     crate::sync::pull_run_detail(crate::chat_engine::shared_http_client(), &run_id).await
 }
 
+/// The models among `models` this Mac can't price (`prices_in` is `None`),
+/// deduplicated, in first-seen order. The History sheet asks this for synced
+/// stages so an unknown or gateway model reads "unpriced", never "$0.00".
+#[tauri::command]
+pub async fn unpriced_models(models: Vec<String>) -> AppResult<Vec<String>> {
+    Ok(unpriced_models_in(crate::token_engine::catalog().as_deref(), &models))
+}
+
+pub(crate) fn unpriced_models_in(
+    router: Option<&crate::provider_router::ProviderRouter>,
+    models: &[String],
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    models
+        .iter()
+        .filter(|m| seen.insert(m.as_str()))
+        .filter(|m| crate::token_engine::prices_in(router, m).is_none())
+        .cloned()
+        .collect()
+}
+
 /// Push the WHOLE custom library (pipelines + roles) to the cloud — the launch
 /// heal for edits made offline or whose fire-and-forget push failed. The server
 /// does per-item LWW, so re-pushing is idempotent and never regresses a newer
@@ -2250,8 +3123,38 @@ pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
 #[tauri::command]
 pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
     require_sync(crate::sync::SyncKind::Library)?;
-    let items = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
+    let pull = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
+    let outcome = apply_pulled_library(&state.db, &pull.items);
+    // Only once the items are applied: the next pull asks for what changed
+    // after this one (#823). An item skipped for a parse or DB error makes the
+    // next pull a full one instead, so it comes back once it can be applied.
+    crate::sync::commit_library_pull(&pull, outcome.skipped);
+    Ok(outcome.applied)
+}
+
+/// What [`apply_pulled_library`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LibraryApply {
+    /// Items written to the local library.
+    pub applied: usize,
+    /// Items not applied because their data couldn't be read or the local
+    /// write failed. Not counted: LWW losses (the local edit is newer), an
+    /// envelope/data id mismatch, a builtin id, a role kept because it is in
+    /// use — none of those would change on a later pull.
+    pub skipped: usize,
+}
+
+/// Merge pulled library items into the local DB by per-item LWW (the body of
+/// [`library_sync_pull`]). Only the items given are touched: after an
+/// incremental pull, an item that isn't among them is unchanged, never
+/// deleted — only a tombstone deletes. Returns how many were applied and how
+/// many were skipped for a parse or DB error.
+pub(crate) fn apply_pulled_library(
+    store: &parking_lot::Mutex<crate::db::Db>,
+    items: &[crate::sync::SyncLibraryItem],
+) -> LibraryApply {
     let mut applied = 0usize;
+    let mut skipped = 0usize;
 
     // Apply order matters (and each step takes its own SHORT lock — this is a
     // launch-time merge, but the mutex is shared with every live surface):
@@ -2260,55 +3163,69 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
     //   3. role TOMBSTONES LAST — so a role referenced by a pipeline pulled in
     //      this very merge counts as in-use and survives its own tombstone.
     for item in items.iter().filter(|i| i.kind == "role" && !i.deleted) {
-        let Some(data) = &item.data else { continue };
+        let Some(data) = &item.data else {
+            skipped += 1; // an edit with no data: unreadable
+            continue;
+        };
         let Ok(mut role) =
             serde_json::from_value::<crate::orchestrator::roles::RoleDef>(data.clone())
         else {
-            continue; // unparseable → skip, never fatal
+            skipped += 1; // unparseable → skip, never fatal
+            continue;
         };
         if role.key != item.item_id {
             continue; // envelope/data identity mismatch — refuse quietly
         }
         role.is_builtin = false; // the wire never carries builtin authority
-        if state
-            .db
-            .lock()
-            .upsert_role_from_sync(&role, &item.updated_at)
-            .unwrap_or(false)
-        {
-            applied += 1;
+        match store.lock().upsert_role_from_sync(&role, &item.updated_at) {
+            Ok(true) => applied += 1,
+            Ok(false) => {}
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(role = %role.key, "library pull: role skipped: {e}");
+            }
         }
     }
 
     for item in items.iter().filter(|i| i.kind == "pipeline") {
         if item.deleted {
-            let db = state.db.lock();
+            let db = store.lock();
             match db.pipeline_sync_state(&item.item_id) {
                 Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
                     if db.delete_pipeline(&item.item_id).is_ok() {
                         applied += 1;
+                    } else {
+                        skipped += 1;
                     }
                 }
+                Err(_) => skipped += 1,
                 _ => {}
             }
             continue;
         }
-        let Some(data) = &item.data else { continue };
+        let Some(data) = &item.data else {
+            skipped += 1;
+            continue;
+        };
         let Ok(sp) = serde_json::from_value::<crate::sync::SyncPipeline>(data.clone()) else {
+            skipped += 1;
             continue;
         };
         if sp.id != item.item_id {
             continue; // envelope/data mismatch — refuse quietly
         }
-        match state.db.lock().upsert_pipeline_from_sync(&sp) {
+        match store.lock().upsert_pipeline_from_sync(&sp) {
             Ok(true) => applied += 1,
             Ok(false) => {}
-            Err(e) => tracing::warn!(pipeline = %sp.id, "library pull: pipeline skipped: {e}"),
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(pipeline = %sp.id, "library pull: pipeline skipped: {e}");
+            }
         }
     }
 
     for item in items.iter().filter(|i| i.kind == "role" && i.deleted) {
-        let db = state.db.lock();
+        let db = store.lock();
         match db.role_sync_state(&item.item_id) {
             Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
                 if db.role_in_use(&item.item_id).unwrap_or(true) {
@@ -2320,12 +3237,15 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
                 }
                 if db.delete_role(&item.item_id).is_ok() {
                     applied += 1;
+                } else {
+                    skipped += 1;
                 }
             }
+            Err(_) => skipped += 1,
             _ => {}
         }
     }
-    Ok(applied)
+    LibraryApply { applied, skipped }
 }
 
 // ─── Accounts (P1) ─────────────────────────────────────────────
@@ -2435,6 +3355,7 @@ pub async fn resolve_checkpoint(
     feedback: Option<String>,
     model_override: Option<String>,
     max_turns_override: Option<i64>,
+    stage_id: Option<String>,
 ) -> AppResult<()> {
     let action = match action.as_str() {
         "approve" => CheckpointAction::Approve,
@@ -2442,24 +3363,39 @@ pub async fn resolve_checkpoint(
         "abort" => CheckpointAction::Abort,
         "reject" => CheckpointAction::Reject { feedback, model_override, max_turns_override },
         "resume" => CheckpointAction::Resume { max_turns_override },
+        "drop_call" => CheckpointAction::DropDeferredCall { max_turns_override },
         "send_back" => CheckpointAction::SendBack { feedback },
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
-    dispatch_checkpoint(&orch, run_id, None, action)
+    // `stage_id` names the stage the director decided on (the Direct canvas
+    // passes the one its decision bar shows), so a run holding several
+    // stages never resolves a different one. A named stage that was already
+    // decided is refused ("This stage was already decided — refresh…"), never
+    // redirected to another; `None` = the single-parked rule.
+    dispatch_checkpoint(&orch, run_id, stage_id, action)
 }
 
 /// Resolve a checkpoint decision and resume the drive, choosing the detached
 /// (Pro) or in-process path. Shared by `resolve_checkpoint` and
 /// `answer_blocker` so the escape valve reuses the exact resume substrate.
 /// `stage_id` scopes which parked/failed stage the action targets — the escape
-/// valve passes its validated id; the plain checkpoint path passes `None`.
+/// valve passes its validated id, the checkpoint path the stage its caller
+/// named (or `None`).
 fn dispatch_checkpoint(
     orch: &Arc<Orchestrator>,
     run_id: String,
     stage_id: Option<String>,
     action: CheckpointAction,
 ) -> AppResult<()> {
+    // A decision on a stage that was decided elsewhere meanwhile is refused
+    // here, synchronously, so the caller sees it (and refreshes) on both paths.
+    // A decision on a run that has ended (aborted from another surface, say)
+    // is refused the same way, before anything changes.
+    orch.check_run_open(&run_id, &action)?;
+    orch.check_named_stage(&run_id, stage_id.as_deref(), &action)?;
+    // The director acted: a fresh allowance of automatic plan resumes.
+    orch.db().lock().reset_plan_resume_count(&run_id)?;
     // Pro (`runs.detached`): apply the decision's mutations here — they're
     // synchronous and cheap — then hand the re-drive to a detached worker.
     // Guard rejections ("run is already executing") surface immediately
@@ -2514,6 +3450,14 @@ pub async fn answer_blocker(
     // Thread the validated `stage_id` through so the resolution acts on exactly
     // the stage we just checked, not merely "the parked stage".
     dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers, source })
+}
+
+/// Turn off the automatic resume of a run parked by a Claude plan limit: it
+/// stays parked and waits for a manual Resume (#731). "Resume now" is the
+/// ordinary `resolve_checkpoint("resume")`.
+#[tauri::command]
+pub async fn cancel_plan_resume(orch: State<'_, Arc<Orchestrator>>, run_id: String) -> AppResult<()> {
+    orch.cancel_plan_resume(&run_id)
 }
 
 #[tauri::command]
@@ -2695,14 +3639,17 @@ pub async fn estimate_run_cost(
             let (tok_in, tok_out) = db
                 .get_role(&s.role)?
                 .map(|r| (r.token_est_in.max(0) as u64, r.token_est_out.max(0) as u64))
-                .unwrap_or((4_000, 1_000));
+                .unwrap_or((
+                    crate::crew::DEFAULT_TOKEN_EST_IN as u64,
+                    crate::crew::DEFAULT_TOKEN_EST_OUT as u64,
+                ));
             let model = overrides
                 .iter()
                 .find(|(pos, _)| *pos == s.position)
                 .map(|(_, m)| m.clone())
                 .unwrap_or_else(|| s.agent_model.clone());
             // Effort keys the history only where it reaches the agent (API, or
-            // Claude Code's `--effort`); a Codex stage keys as none.
+            // a CLI stage: Claude Code's `--effort`, Codex's `-c` override).
             let effort = s
                 .effort
                 .filter(|_| crate::orchestrator::cli_runner::effort_applies(&s.substrate, &model))
@@ -3102,6 +4049,16 @@ pub async fn rename_terminal(
     state.db.lock().rename_terminal(&id, &label)
 }
 
+/// Persist the order of a workspace's sessions (the session line's drag).
+#[tauri::command]
+pub async fn reorder_terminals(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    ids: Vec<String>,
+) -> AppResult<()> {
+    state.db.lock().set_terminal_order(&workspace_id, &ids)
+}
+
 #[tauri::command]
 pub async fn delete_terminal(
     state: State<'_, AppState>,
@@ -3184,14 +4141,22 @@ pub fn url_with_user(url: &str, username: &str) -> Option<String> {
 /// holds for the host (a valid token for the wrong account is never rejected
 /// by the server, so the askpass would otherwise never be consulted). The
 /// success path then stores the credentials itself — see
-/// `credential_approve_payload`.
-pub fn build_clone_command(url: &str, target: &str, with_typed_credentials: bool) -> String {
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+/// `credential_approve_payload`. The URL and target path travel in the
+/// returned environment, never in the command (see `login_shell_output`).
+pub fn build_clone_command(
+    url: &str,
+    target: &str,
+    with_typed_credentials: bool,
+) -> (String, Vec<(&'static str, String)>) {
     let helper = if with_typed_credentials { " -c credential.helper=" } else { "" };
-    format!(
-        "env LC_ALL=C git{helper} clone --progress -- {} {}",
-        quote(url),
-        quote(target)
+    (
+        format!(
+            "env LC_ALL=C git{helper} clone --progress -- \"$OCTOPUSH_CLONE_URL\" \"$OCTOPUSH_CLONE_TARGET\""
+        ),
+        vec![
+            ("OCTOPUSH_CLONE_URL", url.to_string()),
+            ("OCTOPUSH_CLONE_TARGET", target.to_string()),
+        ],
     )
 }
 
@@ -3368,13 +4333,15 @@ async fn clone_via_shell(
         }
         _ => url.to_string(),
     };
-    let git_cmd = build_clone_command(&clone_url, &target.to_string_lossy(), credentials.is_some());
+    let (git_cmd, clone_env) =
+        build_clone_command(&clone_url, &target.to_string_lossy(), credentials.is_some());
 
     // Build environment overrides.
     let mut env_overrides: Vec<(String, String)> = vec![
         // Prevent git from blocking on tty prompts.
         ("GIT_TERMINAL_PROMPT".into(), "0".into()),
     ];
+    env_overrides.extend(clone_env.into_iter().map(|(k, v)| (k.to_string(), v)));
 
     // Askpass script path — only created when credentials are provided.
     // We hold an `Option<tempfile::TempPath>` so the file lives until after
@@ -3589,6 +4556,7 @@ pub async fn clone_project(
         jira_project_key: None,
         pinned: false,
         tint: None,
+        group_id: None,
     })
 }
 
@@ -3620,6 +4588,124 @@ pub async fn set_project_order(state: State<'_, AppState>, ids: Vec<String>) -> 
     state.db.lock().set_project_order(&ids)
 }
 
+// ─── Rail groups ──────────────────────────────────────────────────
+//
+// A group is a named, optionally tinted, one-level container in the rail:
+// `project` scope holds projects, `workspace` scope holds one project's
+// workspaces. Membership is `group_id` on the project / workspace row, which
+// `list_recent_projects` and `list_workspaces` already return.
+
+/// Every group, both scopes.
+#[tauri::command]
+pub async fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<crate::db::GroupRow>> {
+    state.db.lock().list_groups()
+}
+
+/// Create a group and move `member_ids` into it. It takes the place of its
+/// first member (in rail order), or goes last when it has none.
+#[tauri::command]
+pub async fn create_group(
+    state: State<'_, AppState>,
+    scope: String,
+    project_id: Option<String>,
+    name: String,
+    tint: Option<String>,
+    member_ids: Option<Vec<String>>,
+) -> AppResult<crate::db::GroupRow> {
+    state.db.lock().create_group(
+        &scope,
+        project_id.as_deref(),
+        &name,
+        tint.as_deref(),
+        &member_ids.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+pub async fn rename_group(state: State<'_, AppState>, group_id: String, name: String) -> AppResult<()> {
+    state.db.lock().rename_group(&group_id, &name)
+}
+
+/// Set a group's tint (one of the monogram tints), or clear it with `null`.
+#[tauri::command]
+pub async fn set_group_tint(
+    state: State<'_, AppState>,
+    group_id: String,
+    tint: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().set_group_tint(&group_id, tint.as_deref())
+}
+
+/// Persist the order of sibling groups, like `set_project_order`.
+#[tauri::command]
+pub async fn set_group_order(state: State<'_, AppState>, ids: Vec<String>) -> AppResult<()> {
+    state.db.lock().set_group_order(&ids)
+}
+
+/// Delete a group. Its members stay, ungrouped.
+#[tauri::command]
+pub async fn delete_group(state: State<'_, AppState>, group_id: String) -> AppResult<()> {
+    state.db.lock().delete_group(&group_id)
+}
+
+/// Move a project or workspace (`kind`) into a group, or out of any group
+/// (`group_id` null).
+#[tauri::command]
+pub async fn set_item_group(
+    state: State<'_, AppState>,
+    kind: String,
+    item_id: String,
+    group_id: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().set_item_group(&kind, &item_id, group_id.as_deref())
+}
+
+/// Move several items of one `kind` into a group, or out of any group
+/// (`group_id` null), all or none.
+#[tauri::command]
+pub async fn set_items_group(
+    state: State<'_, AppState>,
+    kind: String,
+    item_ids: Vec<String>,
+    group_id: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().set_items_group(&kind, &item_ids, group_id.as_deref())
+}
+
+// ─── Prerequisites ("Starts after", #960) ─────────────────────────
+//
+// A mission (workspace) can wait on another mission of its project until
+// that one's run finishes (`run_finished`) or its PR merges (`pr_merged`).
+
+/// Make `workspace_id` wait on `after_workspace_id`. Refuses cycles, links
+/// across projects and archived prerequisites.
+#[tauri::command]
+pub async fn set_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    after_workspace_id: String,
+    condition: String,
+    branch_from_prerequisite: bool,
+    auto_start: Option<bool>,
+) -> AppResult<crate::db::PrerequisiteRow> {
+    state.db.lock().set_workspace_prerequisite(
+        &workspace_id,
+        &after_workspace_id,
+        &condition,
+        branch_from_prerequisite,
+        auto_start.unwrap_or(false),
+    )
+}
+
+/// Stop `workspace_id` waiting on another mission.
+#[tauri::command]
+pub async fn clear_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<()> {
+    state.db.lock().clear_workspace_prerequisite(&workspace_id)
+}
+
 #[tauri::command]
 pub async fn close_project(
     state: State<'_, AppState>,
@@ -3632,6 +4718,7 @@ pub async fn close_project(
 
 #[tauri::command]
 pub async fn delete_project(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
 ) -> AppResult<()> {
@@ -3651,6 +4738,7 @@ pub async fn delete_project(
     for workspace in workspaces {
         // Call the existing delete_workspace logic to properly clean up worktrees
         let _ = delete_workspace(
+            app.clone(),
             state.clone(),
             workspace.id,
             path.clone(),
@@ -3668,8 +4756,10 @@ pub async fn delete_project(
         })?;
     }
 
-    // Remove from database
+    // Remove from database. Workspaces not listed above (archived ones) and
+    // their runs cascade with the project, so refresh the Dock badge too.
     state.db.lock().delete_project(&project_id)?;
+    crate::fleet_status::refresh_later(&app);
     Ok(())
 }
 
@@ -3751,11 +4841,12 @@ pub async fn get_claude_plan(state: State<'_, AppState>) -> AppResult<Vec<crate:
 
 /// When the claude.ai sign-in ends, as CLI stages last reported it
 /// (`claude_login`); `None` until a stage on Claude Code 2.1.318+ said, and
-/// `None` while an Anthropic key is set (Readiness then says "API key").
+/// again once a stage ran as an API-key session or Readiness's Check again
+/// found Claude Code signed out. An Anthropic key doesn't
+/// hide it: the Settings key never signs Claude Code in.
 #[tauri::command]
 pub async fn get_claude_login(state: State<'_, AppState>) -> AppResult<Option<crate::claude_login::LoginExpiry>> {
-    let stored = crate::claude_login::load(&state.db.lock())?;
-    Ok(crate::claude_login::shown(stored, crate::claude_login::has_anthropic_key()))
+    crate::claude_login::shown(&state.db.lock())
 }
 
 // ─── Pricing refresh from LiteLLM ────────────────────────────────
@@ -3879,9 +4970,7 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
     *state.router.lock() = updated_router;
 
     // Persist the refresh timestamp to settings.
-    let mut settings = crate::settings::load_settings().unwrap_or_default();
-    settings.last_pricing_refresh = Some(fetched_at.clone());
-    let _ = crate::settings::save_settings(&settings);
+    let _ = crate::settings::update_settings(|s| s.last_pricing_refresh = Some(fetched_at.clone()));
 
     // A model that had no price when its spend was recorded left $0 rows in
     // the ledger; now that it may have one, price them.
@@ -3899,21 +4988,47 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
 const LEDGER_UNPRICED_CLASSIFIED: &str = "ledger_unpriced_classify_v1";
 /// `app_meta` flag: rows billed at a known-wrong builtin price were fixed.
 const LEDGER_STALE_PRICES_FIXED: &str = "ledger_stale_price_fix_2026_10_v1";
+/// `app_meta` flag: rows billed with GPT-4o / GPT-4o mini cached input at the
+/// full input price were fixed. Separate from [`LEDGER_STALE_PRICES_FIXED`]
+/// because installs upgraded from v0.4.89+ already carry that flag.
+const LEDGER_STALE_PRICES_FIXED_GPT4O: &str = "ledger_stale_price_fix_2026_11_gpt4o_v1";
+/// The models the GPT-4o cached-input correction covers.
+const GPT4O_STALE_IDS: &[&str] = &["gpt-4o", "gpt-4o-mini"];
+/// Held for a whole [`reprice_ledger`] call. Startup, Refresh pricing and
+/// Price them now can overlap; without it two calls could both see a
+/// one-time flag unset and run its pass twice (the October pass would then
+/// scale DIRECT stages twice). A dedicated lock rather than claiming the
+/// flag first, so a pass that fails is retried on the next call.
+static REPRICE_LEDGER_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 /// Price every unpriced ledger row with the catalog as it stands now (rows
 /// whose model is still unpriced stay at $0, marked `'unpriced'`; an
 /// explicit $0 marks them `'computed'`). Runs once at startup, after a
-/// pricing refresh, and on demand. Prices are resolved WITHOUT the DB lock
+/// pricing refresh, and on demand — one call at a time
+/// ([`REPRICE_LEDGER_LOCK`]). Prices are resolved WITHOUT the DB lock
 /// (one cached catalog load), each write batch is one transaction, and the
 /// two one-time passes — classifying legacy $0 rows and correcting spend
 /// billed at a known-wrong builtin price — are gated by `app_meta` flags so
 /// a launch does not rescan the whole ledger. Returns rows that got a price.
 pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> AppResult<usize> {
+    // Taken before any DB lock, never while holding one.
+    let _pass = REPRICE_LEDGER_LOCK.lock();
     let router = crate::token_engine::catalog();
     let price = |m: &str| crate::token_engine::prices_in(router.as_deref(), m);
 
     if db.lock().meta_get(LEDGER_STALE_PRICES_FIXED)?.is_none() {
-        fix_stale_prices(db, &price)?;
+        // Fresh pass over every stale id: covers the GPT-4o fix too.
+        let mut ids: Vec<&str> = crate::provider_router::STALE_BUILTIN_PRICES.iter().map(|(id, _)| *id).collect();
+        ids.dedup();
+        fix_stale_prices(db, &price, &ids, true)?;
+        let d = db.lock();
+        d.meta_set(LEDGER_STALE_PRICES_FIXED, "done")?;
+        d.meta_set(LEDGER_STALE_PRICES_FIXED_GPT4O, "done")?;
+    } else if db.lock().meta_get(LEDGER_STALE_PRICES_FIXED_GPT4O)?.is_none() {
+        // Upgraded past the October pass: correct the GPT-4o rows only. Its
+        // change is not a uniform rescale, so DIRECT stages are never scaled.
+        fix_stale_prices(db, &price, GPT4O_STALE_IDS, false)?;
+        db.lock().meta_set(LEDGER_STALE_PRICES_FIXED_GPT4O, "done")?;
     }
 
     let classify_legacy = db.lock().meta_get(LEDGER_UNPRICED_CLASSIFIED)?.is_none();
@@ -3927,20 +5042,26 @@ pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> App
     Ok(n)
 }
 
-/// One-time: re-price `'computed'` ledger rows and DIRECT run figures of
-/// models an earlier release priced wrong (Opus 4.6 at $15/$75, Sonnet 5 at
-/// $3/$15 — `provider_router::STALE_BUILTIN_PRICES`) at today's price.
-/// Ledger rows are recomputed from their tokens; run stages (no cache split
-/// persisted) are scaled by the uniform correction factor, which is only
-/// applied when today's price is a uniform rescale of the stale one.
+/// One-time: re-price `'computed'` ledger rows of `ids` — models an earlier
+/// release priced wrong (Opus 4.6 at $15/$75, Sonnet 5 at $3/$15, GPT-4o and
+/// GPT-4o mini with cached input at $0 — `provider_router::STALE_BUILTIN_PRICES`)
+/// — at today's price, and with `scale_direct` their DIRECT run figures too.
+/// Ledger rows are recomputed from their tokens (idempotent: a re-run lands
+/// on the same cost); run stages (no cache split persisted) are scaled by the
+/// uniform correction factor, which is only applied when today's price is a
+/// uniform rescale of the stale one (so the GPT-4o entries, whose input and
+/// output prices didn't change, correct ledger rows only). The caller gates
+/// each pass with its `app_meta` flag: `ledger_stale_price_fix_2026_10_v1`
+/// runs every id; installs that already had it get a GPT-4o-only pass under
+/// `ledger_stale_price_fix_2026_11_gpt4o_v1`, with no stage scaling.
 fn fix_stale_prices(
     db: &Arc<parking_lot::Mutex<crate::db::Db>>,
     price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
+    ids: &[&str],
+    scale_direct: bool,
 ) -> AppResult<()> {
-    let mut ids: Vec<&str> = crate::provider_router::STALE_BUILTIN_PRICES.iter().map(|(id, _)| *id).collect();
-    ids.dedup();
     let mut ratios: Vec<(String, f64)> = Vec::new();
-    for id in &ids {
+    for id in ids.iter().filter(|_| scale_direct) {
         // The first listed tuple is the full stale default.
         let Some((_, stale)) = crate::provider_router::STALE_BUILTIN_PRICES.iter().find(|(i, _)| i == id) else { continue };
         let Some(now) = price(id) else { continue };
@@ -3962,7 +5083,6 @@ fn fix_stale_prices(
     let d = db.lock();
     let repriced = d.apply_reprice(&plan)?;
     let stages = d.fix_stale_direct_prices(&ratios)?;
-    d.meta_set(LEDGER_STALE_PRICES_FIXED, "done")?;
     if repriced + stages > 0 {
         tracing::info!(rows = repriced, stages, "corrected spend billed at a stale builtin price");
     }
@@ -3990,6 +5110,69 @@ pub async fn get_thread_cost(
         .and_then(|s| s.model_tiers.get("strong").cloned())
         .and_then(|m| crate::token_engine::prices_for(&m));
     state.db.lock().thread_cost(&thread_id, strong.as_ref())
+}
+
+/// What the Claude Code session in one Run terminal has used: its last
+/// prompt against the model's context window, its spend and cache share from
+/// the ledger, and its model. For the Run Companion's Context section.
+/// `None` for a terminal with no current Claude Code session (a shell, a dev
+/// server, another agent CLI, a session that ended, hooks off), one the
+/// ledger holds no row for yet, and while another session may have taken its
+/// place (`transcripts::session_usage`). Read-only; the transcript is read on
+/// a blocking thread.
+#[tauri::command]
+pub async fn get_session_usage(
+    state: State<'_, AppState>,
+    terminal_id: String,
+) -> AppResult<Option<crate::transcripts::SessionUsage>> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        if !crate::claude_hooks::sessions_known() {
+            return Ok(None);
+        }
+        crate::transcripts::terminal_usage(&db, &crate::transcripts::projects_root(), &terminal_id)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("session usage: {e}")))?
+}
+
+/// What every request of one project carries (#959): the fixed context
+/// measured from its recent transcripts (its root and its workspaces'
+/// worktrees; Direct stages' CLI sessions left out), priced at its usual
+/// model and cache rate, and the CLAUDE.md chain, skills and agents that
+/// make it up as estimates (`request_context`). Read-only: no file is
+/// edited, no MCP server contacted, nothing leaves the Mac.
+#[tauri::command]
+pub async fn get_request_context(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<crate::request_context::RequestContext> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, cwds, direct) = {
+            let db = db.lock();
+            let Some(project) = db.get_project(&project_id)? else {
+                return Err(AppError::Other(format!("project not found: {project_id}")));
+            };
+            let mut cwds = vec![project.path.clone()];
+            for (_, pid, worktree) in db.list_workspace_paths()? {
+                if pid == project_id && !cwds.contains(&worktree) {
+                    cwds.push(worktree);
+                }
+            }
+            (project.path, cwds, db.direct_cli_session_ids()?)
+        };
+        let home = dirs::home_dir();
+        Ok(crate::request_context::request_context(
+            &crate::transcripts::projects_root(),
+            home.as_deref(),
+            std::path::Path::new(&path),
+            &cwds,
+            &direct,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("request context: {e}")))?
 }
 
 /// Answer a turn-limit card: the extra turns to give the paused writing
@@ -4039,6 +5222,14 @@ pub async fn get_settings() -> AppResult<crate::settings::AppSettings> {
     crate::settings::load_settings()
 }
 
+/// The path of `settings.json` when it exists but can't be parsed (the app
+/// then shows defaults and refuses every save), else `None`. Path only —
+/// never the file's contents.
+#[tauri::command]
+pub async fn unreadable_settings_path() -> AppResult<Option<String>> {
+    Ok(crate::settings::unreadable_settings_path())
+}
+
 #[tauri::command]
 pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
     // The sync opt-ins are owned by `set_sync_pref`; a stale read-modify-write
@@ -4052,6 +5243,34 @@ pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings
         sync_claude_hooks_later(&state.db);
     }
     Ok(())
+}
+
+/// "Notify me elsewhere" (#964): the saved switch and webhook URL (off, with
+/// no URL, by default).
+#[tauri::command]
+pub async fn get_notify_elsewhere() -> AppResult<crate::notify_elsewhere::NotifySettings> {
+    Ok(crate::notify_elsewhere::current())
+}
+
+/// Save "Notify me elsewhere" — the only writer of its two settings. The URL
+/// is validated first (https, or http to this Mac only); turning on needs one.
+#[tauri::command]
+pub async fn set_notify_elsewhere(enabled: bool, url: String) -> AppResult<crate::notify_elsewhere::NotifySettings> {
+    crate::notify_elsewhere::save(enabled, &url)
+}
+
+/// "Send a test": the test message to `url` (the field's value, saved or
+/// not), once, without retrying. The error names the cause, never the URL.
+#[tauri::command]
+pub async fn notify_elsewhere_test(url: String) -> AppResult<()> {
+    crate::notify_elsewhere::send_test(&url).await.map_err(AppError::Other)
+}
+
+/// The read-only preview in Settings: the body's fields for a checkpoint gate
+/// and every `event` value.
+#[tauri::command]
+pub async fn notify_elsewhere_preview() -> AppResult<crate::notify_elsewhere::Preview> {
+    Ok(crate::notify_elsewhere::preview())
 }
 
 /// Install or strip the Claude Code hooks in every active managed worktree
@@ -4465,6 +5684,102 @@ pub async fn read_file_checked(path: String, max_bytes: Option<u64>) -> AppResul
     read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES))
 }
 
+/// Lines `start..=end` of a file, for Talk's `@path#L10-40` (#1046).
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LineRangeResult {
+    /// `start`/`end` are the lines kept (clamped to the file; `start > end`
+    /// when the file ends before `start`). `total` is the file's line count
+    /// when the read reached its end, `None` when it stopped at `end`.
+    /// `cut`: the range was longer than `max_bytes`.
+    Text { content: String, start: u32, end: u32, total: Option<u32>, cut: bool },
+    Binary,
+    UnsupportedEncoding,
+}
+
+/// Sync core of `read_file_lines`: streams the file and stops after line
+/// `end`, so a range of a large file never reads (or holds) the whole file.
+/// Keeps at most `max_bytes` of the range; lines are counted as `split('\n')`
+/// counts them.
+pub(crate) fn read_file_lines_inner(path: &str, start: u32, end: u32, max_bytes: usize) -> AppResult<LineRangeResult> {
+    use std::io::BufRead;
+    let io = |e: std::io::Error| AppError::Other(format!("read_file_lines({path}): {e}"));
+    let start = start.max(1);
+    let end = end.max(start);
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+    if reader.fill_buf().map_err(io)?.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+        return Ok(LineRangeResult::Binary);
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut cut = false;
+    let mut line: u32 = 1;
+    let mut done = false;
+    while !done {
+        let chunk = reader.fill_buf().map_err(io)?;
+        if chunk.is_empty() {
+            break;
+        }
+        let mut used = chunk.len();
+        let mut i = 0;
+        while i < chunk.len() {
+            let nl = chunk[i..].iter().position(|&b| b == b'\n').map(|p| i + p);
+            let seg_end = nl.unwrap_or(chunk.len());
+            if line >= start {
+                let room = max_bytes.saturating_sub(out.len());
+                let take = (seg_end - i).min(room);
+                out.extend_from_slice(&chunk[i..i + take]);
+                cut |= take < seg_end - i;
+            }
+            let Some(nl) = nl else { break };
+            if line >= end {
+                used = nl + 1;
+                done = true;
+                break;
+            }
+            if line >= start {
+                if out.len() < max_bytes {
+                    out.push(b'\n');
+                } else {
+                    cut = true;
+                }
+            }
+            line += 1;
+            i = nl + 1;
+        }
+        reader.consume(used);
+    }
+    // Stopped at `end` with nothing after it: the file has exactly `end` lines
+    // plus the empty one after its final newline.
+    let total = if !done {
+        Some(line)
+    } else if reader.fill_buf().map_err(io)?.is_empty() {
+        Some(line + 1)
+    } else {
+        None
+    };
+    let content = match String::from_utf8(out) {
+        Ok(s) => s,
+        // A cut that split a character: keep what precedes it.
+        Err(e) if cut && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+        Err(_) => return Ok(LineRangeResult::UnsupportedEncoding),
+    };
+    let last = total.map_or(end, |t| end.min(t));
+    Ok(LineRangeResult::Text { content, start, end: last, total, cut })
+}
+
+#[tauri::command]
+pub async fn read_file_lines(path: String, start: u32, end: u32, max_bytes: usize) -> AppResult<LineRangeResult> {
+    let path = expand_tilde(&path);
+    tokio::task::spawn_blocking(move || read_file_lines_inner(&path, start, end, max_bytes))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file_lines: {e}")))?
+}
+
 /// Kept for any non-editor callers that want a plain string read.
 #[tauri::command]
 pub async fn read_file(path: String) -> AppResult<String> {
@@ -4822,46 +6137,134 @@ pub async fn abort_operation(workspace_path: String) -> AppResult<String> {
     Ok(combined)
 }
 
+/// The secret guard's view of the staged diff — what Commit would check — for
+/// the Review Companion's verdict (#835). `None` when the guard is off.
+/// Read-only: it never blocks anything, and Commit rescans on its own.
+#[tauri::command]
+pub async fn secret_scan_staged(workspace_path: String) -> AppResult<Option<crate::secret_scan::ScanPreview>> {
+    let p = expand_tilde(&workspace_path);
+    crate::secret_scan::preview(move || crate::secret_scan::staged_files(std::path::Path::new(&p))).await
+}
+
+/// The secret guard's rules over the context blocks a Talk message is about
+/// to attach (#1046). `None` when the guard is off. The composer asks before
+/// it sends; nothing leaves the Mac to scan them.
+#[tauri::command]
+pub async fn secret_scan_text(blocks: Vec<crate::secret_scan::TextBlock>) -> AppResult<Option<crate::secret_scan::ScanPreview>> {
+    crate::secret_scan::preview(move || Ok(crate::secret_scan::text_files(blocks))).await
+}
+
+/// "Scan this branch's commits" in Review (#820): the secret guard's rules
+/// over every commit since the merge base with `base`, on demand only, with
+/// the guard's switch on or off. Read-only: it changes and blocks nothing.
+#[tauri::command]
+pub async fn secret_scan_branch(workspace_path: String, base: String) -> AppResult<crate::secret_scan::ScanPreview> {
+    let p = expand_tilde(&workspace_path);
+    crate::secret_scan::scan_now(move || crate::secret_scan::branch_files(std::path::Path::new(&p), &base)).await
+}
+
 /// Commit the staged changes with `message`. Uses the user's login shell so
 /// `user.name`/`user.email` from gitconfig and any commit signing setup
 /// behave as if the user ran `git commit` in their own terminal.
+///
+/// The secret guard (#730) rescans the staged diff first and refuses with
+/// `AppError::SecretsFound` on a finding (or a partial scan), unless
+/// `allow_findings` is the fingerprint of exactly the findings the dialog
+/// showed — the user's "commit regardless" for this one commit.
 #[tauri::command]
-pub async fn commit_changes(workspace_path: String, message: String) -> AppResult<String> {
+pub async fn commit_changes(
+    workspace_path: String,
+    message: String,
+    allow_findings: Option<String>,
+) -> AppResult<String> {
     if message.trim().is_empty() {
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
     let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::staged_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let msg_escaped = message.replace('\'', "'\\''");
-    let cmd = format!("git commit -m '{}'", msg_escaped);
+    commit_in_login_shell(&shell, &workspace_path, &message, false)
+}
 
-    let output = std::process::Command::new(&shell)
-        .arg("-l").arg("-c").arg(&cmd)
-        .current_dir(&workspace_path)
+/// Environment variable naming the file `git commit -F` reads the message from.
+pub const COMMIT_MSG_FILE_ENV: &str = "OCTOPUSH_COMMIT_MSG_FILE";
+
+/// The login-shell command that commits (or amends) with the message in the
+/// file named by `COMMIT_MSG_FILE_ENV`. Constant, so no message text is ever
+/// spliced into it — see `login_shell_output`.
+pub fn git_commit_command(amend: bool) -> &'static str {
+    if amend {
+        "git commit --amend -F \"$OCTOPUSH_COMMIT_MSG_FILE\""
+    } else {
+        "git commit -F \"$OCTOPUSH_COMMIT_MSG_FILE\""
+    }
+}
+
+/// Run `cmd` in `shell` as a login shell in `cwd`, with `env` added. User
+/// values never go into `cmd`: they travel in `env` and `cmd` names them as
+/// `"$VAR"`, which sh, bash, zsh and fish all expand as one untouched
+/// argument. Single-quoting with `'\''` is not safe under fish, where `\'`
+/// inside single quotes is an escape (so `a\'; touch x` would run `touch x`);
+/// it is kept only for refs and SHAs, which git forbids backslashes in
+/// (`git_ops::quote_git_ref`).
+pub(crate) fn login_shell_output(
+    shell: &str,
+    cwd: &str,
+    cmd: &str,
+    env: &[(&str, String)],
+) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(shell)
+        .arg("-l").arg("-c").arg(cmd)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+        .current_dir(cwd)
         .output()
-        .map_err(|e| AppError::Other(format!("failed to spawn git commit: {e}")))?;
+}
+
+/// `git commit` (or `--amend`) with `message` in `shell`, the shared core of
+/// `commit_changes` and `amend_commit`. The message goes to a temp file passed
+/// with `-F` through the environment, deleted once git is done; `-F` keeps the
+/// same whitespace cleanup as `-m`. Returns the new HEAD's short SHA.
+pub(crate) fn commit_in_login_shell(
+    shell: &str,
+    workspace_path: &str,
+    message: &str,
+    amend: bool,
+) -> AppResult<String> {
+    let what = if amend { "git commit --amend" } else { "git commit" };
+    let mut msg_file = tempfile::Builder::new()
+        .prefix("octopush-commit-msg-")
+        .tempfile()
+        .map_err(|e| AppError::Other(format!("couldn't write the commit message: {e}")))?;
+    std::io::Write::write_all(&mut msg_file, message.as_bytes())
+        .map_err(|e| AppError::Other(format!("couldn't write the commit message: {e}")))?;
+    let env = [(COMMIT_MSG_FILE_ENV, msg_file.path().to_string_lossy().into_owned())];
+
+    let output = login_shell_output(shell, workspace_path, git_commit_command(amend), &env)
+        .map_err(|e| AppError::Other(format!("failed to spawn {what}: {e}")))?;
+    drop(msg_file);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.trim().is_empty() {
-            stderr.to_string()
-        } else {
-            stdout.to_string()
-        };
-        return Err(AppError::Other(format!("git commit failed: {}", detail.trim())));
+        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+        return Err(AppError::Other(format!("{what} failed: {}", detail.trim())));
     }
 
     // Return the new HEAD short SHA so the frontend can show a confirmation.
     let head = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&workspace_path)
+        .current_dir(workspace_path)
         .output()
         .map_err(|e| AppError::Other(format!("failed to read HEAD: {e}")))?;
-    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    Ok(sha)
+    Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
 
 /// A branch and its open PR, for the rail's per-workspace PR indicator.
@@ -4960,9 +6363,9 @@ pub async fn github_ship_readiness(path: String) -> AppResult<crate::github::Shi
     let github_remote = (|| -> Option<bool> {
         let repo = git2::Repository::discover(&path).ok()?;
         let names = repo.remotes().ok()?;
-        for name in names.iter().flatten() {
+        for name in names.iter().filter_map(|n| n.ok().flatten()) {
             if let Ok(remote) = repo.find_remote(name) {
-                if let Some(url) = remote.url() {
+                if let Ok(url) = remote.url() {
                     if let Some(parsed) = crate::git_url::parse_git_url(url) {
                         if is_github_host(&parsed.host) {
                             return Some(true);
@@ -5019,10 +6422,19 @@ pub async fn create_pull_request(
     title: String,
     body: String,
     draft: bool,
+    allow_findings: Option<String>,
 ) -> AppResult<crate::github::Pr> {
     let path = expand_tilde(&workspace_path);
     if title.trim().is_empty() {
         return Err(AppError::Other("A pull request needs a title.".into()));
+    }
+    // Secret guard (#730): the commits this PR would contain.
+    {
+        let (p, b) = (path.clone(), base.clone());
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::pr_files(std::path::Path::new(&p), &b)
+        })
+        .await?;
     }
     // The base repo and head owner come from the remotes, so a fork, a base
     // picked as `upstream/main` and `gh repo set-default` all open the PR the
@@ -5111,7 +6523,7 @@ pub async fn ensure_pr_branch(
 
     let _guard = crate::git_lock::git_lock(&path).await;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = crate::github::pr_fetch_command(number, &head_ref_name);
+    let cmd = crate::github::pr_fetch_command(number, &head_ref_name)?;
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
         .current_dir(&path)
@@ -5131,13 +6543,16 @@ pub async fn ensure_pr_branch(
 /// `None` if gh isn't installed, isn't authed, or there's no matching PR.
 /// Runs in the user's login shell so PATH and keychain credentials behave
 /// like in a terminal.
-async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github::Pr> {
+async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str) -> Option<crate::github::Pr> {
+    if !crate::git_ops::is_git_ref_arg(branch) {
+        return None;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
     let cmd = format!(
-        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt --limit 1",
-        branch.replace('\'', "'\\''"),
+        "gh pr list --state all --head {} --json number,title,url,state,isDraft,mergedAt,headRefOid,statusCheckRollup --limit 1",
+        crate::git_ops::quote_git_ref(branch),
     );
 
     let output = tokio::process::Command::new(&shell)
@@ -5167,7 +6582,53 @@ async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github:
     if let Some(merged_at) = pr.get("mergedAt").cloned() {
         pr["merged_at"] = merged_at;
     }
-    Some(crate::github::pr_from_json(&pr))
+    let mut out = crate::github::pr_from_json(&pr);
+    if pr_wants_checks(&out) {
+        let rollup = &pr["statusCheckRollup"];
+        out.checks = crate::github::checks_from_gh_rollup(rollup);
+        // A full rollup may hide checks past gh's cap: re-read every check
+        // run on the head commit, keeping the rollup's answer if that fails.
+        if crate::github::gh_rollup_may_be_capped(rollup) {
+            if let Some(runs) = gh_check_runs(&shell, workspace_path, owner, repo, pr["headRefOid"].as_str()).await {
+                if let Some(checks) = crate::github::checks_from_gh_rollup_and_runs(rollup, &runs) {
+                    out.checks = Some(checks);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Every check run on `sha` through `gh api --paginate`. `None` without a
+/// sha, when gh fails or when the first page can't be read.
+async fn gh_check_runs(
+    shell: &str,
+    workspace_path: &str,
+    owner: &str,
+    repo: &str,
+    sha: Option<&str>,
+) -> Option<Vec<serde_json::Value>> {
+    let (cmd, path) = crate::github::gh_check_runs_command(owner, repo, sha?)?;
+    let output = tokio::process::Command::new(shell)
+        .arg("-l").arg("-c").arg(cmd)
+        .env(crate::github::GH_API_PATH_ENV, path)
+        .current_dir(workspace_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
+            "find_pr_for_branch: gh api check-runs failed, keeping the rollup",
+        );
+        return None;
+    }
+    crate::github::check_runs_from_gh_pages(&output.stdout)
+}
+
+/// Only a live PR's checks are worth a glyph; a merged or closed one is done.
+fn pr_wants_checks(pr: &crate::github::Pr) -> bool {
+    matches!(pr.state, crate::github::PrState::Open | crate::github::PrState::Draft)
 }
 
 /// Look up the most recent pull request for the current branch on GitHub
@@ -5213,8 +6674,8 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
             }
         };
         let url = match remote.url() {
-            Some(u) => u.to_string(),
-            None => {
+            Ok(u) => u.to_string(),
+            Err(_) => {
                 tracing::info!("find_pr_for_branch: remote `origin` has no url");
                 return Ok(None);
             }
@@ -5237,7 +6698,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
     //    have an authed `gh`, no extra setup required. Runs in their login
     //    shell so PATH and macOS keychain credential storage work as if
     //    they invoked `gh` from a terminal.
-    if let Some(pr) = try_gh_cli(&workspace_path, &branch).await {
+    if let Some(pr) = try_gh_cli(&workspace_path, &branch, &owner, &repo_name).await {
         tracing::info!(number = pr.number, "find_pr_for_branch: resolved via gh cli");
         return Ok(Some(pr));
     }
@@ -5276,7 +6737,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         .map_err(|e| AppError::Other(format!("http client: {e}")))?;
 
     let mut req = client.get(&api).header("Accept", "application/vnd.github+json");
-    if let Some(tok) = token {
+    if let Some(tok) = &token {
         req = req.header("Authorization", format!("Bearer {}", tok));
     }
 
@@ -5313,7 +6774,92 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         return Ok(None);
     };
 
-    Ok(Some(crate::github::pr_from_json(&pr)))
+    let mut out = crate::github::pr_from_json(&pr);
+    // Checks cost a second request, so only with a token: unauthenticated,
+    // the 60/hour limit is already spent by the 60s poll above.
+    if let (true, Some(tok), Some(sha)) = (pr_wants_checks(&out), &token, pr["head"]["sha"].as_str()) {
+        out.checks = rest_check_runs(&client, tok, &owner, &repo_name, sha).await;
+    }
+    Ok(Some(out))
+}
+
+/// The check runs on `sha` through REST, every page up to
+/// `CHECK_RUNS_MAX_PAGES`, rolled up. `None` when the first page can't be
+/// read — the chip then just shows no checks glyph; a later page that fails
+/// keeps the runs read so far.
+async fn rest_check_runs(
+    client: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Option<crate::github::PrChecks> {
+    let mut runs: Vec<serde_json::Value> = Vec::new();
+    for page in 1..=crate::github::CHECK_RUNS_MAX_PAGES {
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={}&page={page}",
+            crate::github::CHECK_RUNS_PER_PAGE,
+        );
+        let resp = match client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::info!(status = %r.status(), page, "find_pr_for_branch: check-runs not readable");
+                if page == 1 { return None; }
+                break;
+            }
+            Err(_) if page == 1 => return None,
+            Err(_) => break,
+        };
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            if page == 1 { return None; }
+            break;
+        };
+        let Some(page_runs) = body["check_runs"].as_array() else {
+            if page == 1 { return None; }
+            break;
+        };
+        let page_len = page_runs.len();
+        runs.extend(page_runs.iter().cloned());
+        if !crate::github::more_check_run_pages(body["total_count"].as_u64(), runs.len(), page_len) {
+            break;
+        }
+    }
+    crate::github::checks_from_rest_check_runs(&serde_json::json!({ "check_runs": runs }))
+}
+
+/// The tail of the failed steps' logs of these GitHub Actions runs
+/// (`gh run view <id> --log-failed`), joined and capped at
+/// `FAILED_LOG_MAX_CHARS`, for the "Fix failing checks…" brief. Empty — never
+/// an error — without `gh` or when a log can't be read.
+#[tauri::command]
+pub async fn pr_failed_check_logs(workspace_path: String, run_ids: Vec<u64>) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let mut logs: Vec<(u64, String)> = Vec::new();
+    // At most three runs: the budget split further would leave each too little.
+    for id in run_ids.into_iter().take(3) {
+        // `id` is a number, so it is safe in the command line.
+        let run = tokio::process::Command::new(&shell)
+            .arg("-l")
+            .arg("-c")
+            .arg(format!("gh run view {id} --log-failed"))
+            .current_dir(&workspace_path)
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(30), run).await {
+            Ok(Ok(out)) if out.status.success() => {
+                logs.push((id, String::from_utf8_lossy(&out.stdout).into_owned()));
+            }
+            _ => tracing::info!(run_id = id, "pr_failed_check_logs: log not readable"),
+        }
+    }
+    Ok(crate::github::join_failed_logs(&logs, crate::github::FAILED_LOG_MAX_CHARS))
 }
 
 /// Batch: all OPEN pull requests for the project's GitHub repo, keyed by head
@@ -5347,14 +6893,277 @@ pub async fn open_prs_for_project(project_path: String) -> AppResult<Vec<BranchP
     Ok(parse_open_pr_list(&values))
 }
 
-/// Push the current branch to its tracked upstream (creating it on the remote
-/// if needed via `--set-upstream`). Uses the login shell so SSH agents, the
+/// A mission whose pull request was merged at its worktree's HEAD, with no
+/// changes left in the worktree: the rail offers to archive it (#963).
+/// `local_files` are its `git_ops::local_ignored_files`, which archiving
+/// deletes and Undo can't bring back.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedWorkspace {
+    pub workspace_id: String,
+    pub pr: crate::github::Pr,
+    pub local_files: Vec<String>,
+}
+
+/// Branch → (merged PR's head commit, PR), from `parse_merged_heads`.
+pub(crate) type MergedHeads = HashMap<String, (String, crate::github::Pr)>;
+
+/// Parse `gh pr list --state merged --json …,headRefName,headRefOid` output
+/// into branch → (head commit, PR). Pure. The first entry of a branch wins:
+/// gh lists the most recent first. Entries without a branch or a head commit
+/// are skipped.
+pub(crate) fn parse_merged_heads(values: &[serde_json::Value]) -> MergedHeads {
+    let mut out = HashMap::new();
+    for v in values {
+        let Some(oid) = v.get("headRefOid").and_then(|x| x.as_str()) else { continue };
+        if oid.is_empty() {
+            continue;
+        }
+        let Some(BranchPr { branch, pr }) = parse_open_pr_list(std::slice::from_ref(v)).pop() else {
+            continue;
+        };
+        out.entry(branch).or_insert((oid.to_string(), pr));
+    }
+    out
+}
+
+/// The repo's most recent merged PRs (`parse_merged_heads`), read with `gh`
+/// in the login shell: 300 of them (three API pages), so a busy repo keeps
+/// its offers for a while; an older merge is just not offered. None when gh
+/// is missing, unauthed or fails, or the repo isn't on GitHub.
+async fn merged_heads_in(project_path: &str) -> Option<MergedHeads> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = "gh pr list --state merged --json number,title,url,state,isDraft,headRefName,headRefOid --limit 300";
+    let output = tokio::process::Command::new(&shell)
+        .arg("-l")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(project_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
+    Some(parse_merged_heads(&values))
+}
+
+/// Whether a worktree is merged and clean: the merged PR's head commit is
+/// exactly the worktree's HEAD (no commits came after the merge, and a reused
+/// branch name never matches) and nothing is changed or untracked. Pure.
+pub(crate) fn is_merged_and_clean(head: Option<&str>, merged_head: &str, dirty: bool) -> bool {
+    !dirty && head == Some(merged_head)
+}
+
+/// Why a merged mission checked out at `worktree` can't be archived now, or
+/// None. Checked for the rail's offer and again by `archive_merged_workspaces`
+/// at the moment it acts: "busy" while a Talk turn or a Direct run is active
+/// there; "moved" unless HEAD is exactly `merged_head`, the merged PR's head
+/// commit (None: the branch has no merged PR); then `changed_since_named`.
+/// `named` None (the offer) lists local files rather than skipping for them.
+pub(crate) fn merged_archive_skip(
+    worktree: &Path,
+    merged_head: Option<&str>,
+    busy: bool,
+    named: Option<&[String]>,
+) -> Option<&'static str> {
+    if busy {
+        return Some("busy");
+    }
+    let head = crate::git_ops::head_sha(worktree);
+    if !merged_head.is_some_and(|oid| is_merged_and_clean(head.as_deref(), oid, false)) {
+        return Some("moved");
+    }
+    changed_since_named(worktree, named)
+}
+
+/// "changed" with changes or untracked files (an unreadable status counts);
+/// "local-files" when, with `named` given, the worktree holds a
+/// `local_ignored_files` path the user wasn't shown (an unreadable list
+/// counts). Run again just before the worktree is deleted.
+pub(crate) fn changed_since_named(worktree: &Path, named: Option<&[String]>) -> Option<&'static str> {
+    if crate::git_ops::is_dirty(worktree).unwrap_or(true) {
+        return Some("changed");
+    }
+    let named = named?;
+    match crate::git_ops::local_ignored_files(worktree) {
+        Ok(files) if files.iter().all(|f| named.contains(f)) => None,
+        _ => Some("local-files"),
+    }
+}
+
+/// Whether a Talk turn (`running` asks the chat engine about thread ids) or a
+/// Direct run is active in a workspace checked out at `worktree`. A failed
+/// read counts as busy.
+pub(crate) fn worktree_busy(db: &crate::db::Db, running: impl Fn(&[String]) -> bool, worktree: &str) -> bool {
+    let Ok(threads) = db.chat_threads_at_worktree(worktree) else { return true };
+    db.has_active_run_at(worktree).unwrap_or(true) || running(&threads)
+}
+
+/// Batch: the project's missions that are merged and clean
+/// (`merged_archive_skip`, local files allowed and listed), for the rail's
+/// "Merged · archive?" and the project menu's "Archive merged missions…".
+/// The project root (its main workspace) is never listed. Errs when the
+/// merged PRs can't be read (gh missing/unauthed, not a GitHub repo), so the
+/// app can try again later.
+#[tauri::command]
+pub async fn merged_workspaces(
+    state: State<'_, AppState>,
+    project_id: String,
+    project_path: String,
+) -> AppResult<Vec<MergedWorkspace>> {
+    let project_path = expand_tilde(&project_path);
+    let Some(mut merged) = merged_heads_in(&project_path).await else {
+        return Err(AppError::Other("merged pull requests unreadable".into()));
+    };
+    if merged.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = state.db.lock().list_workspaces(&project_id)?;
+    let root = Path::new(&project_path);
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(wt) = row.worktree_path else { continue };
+        let path = Path::new(&wt);
+        if path == root || !crate::git_ops::is_git_repo(path) {
+            continue;
+        }
+        let head = merged.get(&row.branch).map(|(oid, _)| oid.as_str());
+        if head.is_none() || merged_archive_skip(path, head, false, None).is_some() {
+            continue;
+        }
+        let local_files = crate::git_ops::local_ignored_files(path).unwrap_or_default();
+        if let Some((_, pr)) = merged.remove(&row.branch) {
+            out.push(MergedWorkspace { workspace_id: row.id, pr, local_files });
+        }
+    }
+    Ok(out)
+}
+
+/// A mission `archive_merged_workspaces` left in place, and why: a
+/// `merged_archive_skip` reason, "unverified" (the merged PRs couldn't be
+/// read), "gone" (no longer an active mission of the project) or "failed"
+/// (the archive itself failed).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSkip {
+    pub workspace_id: String,
+    pub reason: String,
+}
+
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedArchive {
+    pub archived: Vec<String>,
+    pub skipped: Vec<ArchiveSkip>,
+}
+
+/// The worktree of a mission `archive_merged_workspaces` may archive now, or
+/// the reason it may not (see `ArchiveSkip`).
+fn merged_archive_check(
+    state: &AppState,
+    project_id: &str,
+    root: &Path,
+    workspace_id: &str,
+    merged: Option<&MergedHeads>,
+    named: &[String],
+) -> Result<String, &'static str> {
+    let merged = merged.ok_or("unverified")?;
+    let row = state.db.lock().get_workspace(workspace_id).ok().flatten().ok_or("gone")?;
+    if row.project_id != project_id || row.status == "archived" {
+        return Err("gone");
+    }
+    let wt = row.worktree_path.ok_or("gone")?;
+    let path = Path::new(&wt);
+    if path == root || !crate::git_ops::is_git_repo(path) {
+        return Err("gone");
+    }
+    let busy = worktree_busy(&state.db.lock(), |t| state.chat.any_running(t), &wt);
+    let head = merged.get(&row.branch).map(|(oid, _)| oid.as_str());
+    match merged_archive_skip(path, head, busy, Some(named)) {
+        Some(reason) => Err(reason),
+        None => Ok(wt),
+    }
+}
+
+/// "merged · archive?" and "Archive merged missions…" (#963): archive each of
+/// `workspace_ids` only if it still passes at this moment, against a fresh
+/// read of the merged PRs (`merged_archive_check`). `local_files_ok` holds,
+/// per mission, the local files the confirm named: one that holds any other
+/// is skipped. Dirt and local files are checked once more just before the
+/// worktree is deleted. Branches are kept.
+#[tauri::command]
+pub async fn archive_merged_workspaces(
+    state: State<'_, AppState>,
+    project_id: String,
+    project_path: String,
+    workspace_ids: Vec<String>,
+    local_files_ok: HashMap<String, Vec<String>>,
+) -> AppResult<MergedArchive> {
+    let project_path = expand_tilde(&project_path);
+    let merged = merged_heads_in(&project_path).await;
+    let mut out = MergedArchive::default();
+    for id in workspace_ids {
+        let named = local_files_ok.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let checked = merged_archive_check(&state, &project_id, Path::new(&project_path), &id, merged.as_ref(), named);
+        let reason = match checked {
+            Ok(wt) => {
+                let running = |t: &[String]| state.chat.any_running(t);
+                let archived = archive_workspace_at(&state.db, running, &id, &project_path, Some(&wt), Some(named)).await;
+                match archived {
+                    Ok(None) => {
+                        out.archived.push(id);
+                        continue;
+                    }
+                    Ok(Some(reason)) => reason,
+                    Err(_) => "failed",
+                }
+            }
+            Err(reason) => reason,
+        };
+        out.skipped.push(ArchiveSkip { workspace_id: id, reason: reason.into() });
+    }
+    Ok(out)
+}
+
+/// The login-shell command `push_branch` runs for `branch`. The branch is
+/// single-quoted with `git_ops::quote_git_ref`, so it must pass
+/// `git_ops::is_git_ref_arg` first (a branch git lets exist, like `-x`, is
+/// refused before a shell runs, without echoing the name).
+pub fn push_command(branch: &str) -> AppResult<String> {
+    if !crate::git_ops::is_git_ref_arg(branch) {
+        return Err(AppError::Other(
+            "cannot push: the current branch isn't a valid branch name.".into(),
+        ));
+    }
+    Ok(format!(
+        "git push --set-upstream {} {} 2>&1",
+        crate::secret_scan::PUSH_REMOTE,
+        crate::git_ops::quote_git_ref(branch)
+    ))
+}
+
+/// Push the current branch to `origin` (creating it on the remote if needed,
+/// and tracking it, via `--set-upstream`). Uses the login shell so SSH agents, the
 /// macOS credential helper, and `~/.gitconfig` work like they do in the
 /// user's terminal. Returns the trimmed final stderr line, which usually
 /// includes either the new remote refs or the error reason.
+///
+/// The secret guard (#730) rescans the commits the push would send — those
+/// not yet on `origin/<branch>`, the ref this push updates (#859) — and
+/// refuses with `AppError::SecretsFound` unless `allow_findings` matches the
+/// fresh scan's fingerprint.
 #[tauri::command]
-pub async fn push_branch(workspace_path: String) -> AppResult<String> {
+pub async fn push_branch(workspace_path: String, allow_findings: Option<String>) -> AppResult<String> {
     let workspace_path = expand_tilde(&workspace_path);
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::push_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
 
     // Read current branch shorthand to pass as upstream target.
     let branch_out = std::process::Command::new("git")
@@ -5370,10 +7179,7 @@ pub async fn push_branch(workspace_path: String) -> AppResult<String> {
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = format!(
-        "git push --set-upstream origin '{}' 2>&1",
-        branch.replace('\'', "'\\''")
-    );
+    let cmd = push_command(&branch)?;
 
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
@@ -5960,7 +7766,10 @@ pub async fn get_perf_stats(perf: tauri::State<'_, crate::perf::PerfState>) -> R
     // Hold the System lock only across the refresh+sample, not the FFI loop below.
     let samples = {
         let mut sys = perf.0.lock();
-        crate::perf::sample_system(&mut sys)
+        let Some(sys) = sys.as_mut() else {
+            return Err("process sampling is unavailable on this system".into());
+        };
+        crate::perf::sample_system(sys)
     };
     let app_pid = std::process::id();
     let daemon_pid = crate::perf::daemon_pid();
@@ -6187,32 +7996,26 @@ pub async fn blame_file(path: String, file: String) -> AppResult<Vec<crate::git_
 }
 
 #[tauri::command]
-pub async fn amend_commit(workspace_path: String, message: String) -> AppResult<String> {
+pub async fn amend_commit(
+    workspace_path: String,
+    message: String,
+    allow_findings: Option<String>,
+) -> AppResult<String> {
     if message.trim().is_empty() {
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
     let _guard = crate::git_lock::git_lock(&workspace_path).await;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let msg_escaped = message.replace('\'', "'\\''");
-    let cmd = format!("git commit --amend -m '{}'", msg_escaped);
-    let output = std::process::Command::new(&shell)
-        .arg("-l").arg("-c").arg(&cmd)
-        .current_dir(&workspace_path)
-        .output()
-        .map_err(|e| AppError::Other(format!("failed to spawn git commit --amend: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
-        return Err(AppError::Other(format!("git commit --amend failed: {}", detail.trim())));
+    // Same secret guard as `commit_changes`: the amend records the staged diff.
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::staged_files(std::path::Path::new(&p))
+        })
+        .await?;
     }
-    let head = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&workspace_path)
-        .output()
-        .map_err(|e| AppError::Other(format!("failed to read HEAD: {e}")))?;
-    Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    commit_in_login_shell(&shell, &workspace_path, &message, true)
 }
 
 /// Sync core of `discard_file` (testable). Tracked → restore to HEAD; untracked → delete.
@@ -6440,15 +8243,100 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
         .map_err(|e| AppError::Other(format!("version task failed: {e}")))
 }
 
-/// Settings › General readiness card: local checks (claude, auth mode, git,
-/// gh, Ollama), each bounded at 3 s, re-probed on every call.
+/// Direct launcher: the one crew model (Claude Code CLI stages and their
+/// escalation models) the installed CLI is too old to launch. Reads the cached
+/// version without waiting or probing, like stage escalation; `None` when
+/// none needs a newer CLI or the version is unknown.
 #[tauri::command]
-pub async fn readiness_check(state: State<'_, AppState>) -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
-    // The stored sign-in end, read before the blocking probes (no network).
-    let login = crate::claude_login::load(&state.db.lock()).ok().flatten().map(|l| l.expires_at);
-    tokio::task::spawn_blocking(move || crate::readiness::run_all(login))
+pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::agent_adapter::ClaudeModelFloorNote>> {
+    Ok(crate::agent_adapter::claude_cli_version_cached()
+        .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
+}
+
+/// Direct launcher: the line naming a Claude Code release to skip
+/// (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) when one of `models` (Claude
+/// Code CLI stages and their escalation models) is a gateway model
+/// (`cli_runner::is_gateway_model`). Reads the cached version without
+/// probing; `None` otherwise or when the version is unknown.
+#[tauri::command]
+pub fn claude_known_bad_note(models: Vec<String>) -> AppResult<Option<String>> {
+    Ok(crate::agent_adapter::claude_cli_version_cached().and_then(|cli| {
+        crate::agent_adapter::known_bad_launch_note(
+            &models,
+            cli.version.as_deref(),
+            crate::agent_adapter::CLAUDE_KNOWN_BAD_RELEASES,
+            crate::orchestrator::cli_runner::is_gateway_model,
+        )
+    }))
+}
+
+/// Direct launcher: the line saying Codex will skip this repo's `.codex/`
+/// settings and MCP servers because the project isn't trusted in Codex, and
+/// how to trust it. Reads Codex's config only; `None` when the repo has no
+/// `.codex/` dir, the project is trusted, or the config is missing or unreadable.
+#[tauri::command]
+pub async fn codex_trust_note(workspace_path: String) -> AppResult<Option<CodexTrustNote>> {
+    tokio::task::spawn_blocking(move || {
+        crate::codex_trust::untrusted_note(std::path::Path::new(&workspace_path)).map(|note| CodexTrustNote {
+            line: note.line.to_string(),
+            how: note.how.to_string(),
+        })
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("codex trust task failed: {e}")))
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTrustNote {
+    pub line: String,
+    pub how: String,
+}
+
+/// Direct launcher: the hooks, status line and MCP servers this worktree's
+/// committed `.claude/settings.json` and `.mcp.json` run in a Claude Code
+/// stage. Read-only; `None` when they run nothing or are missing or malformed.
+#[tauri::command]
+pub async fn repo_hooks_notice(workspace_path: String) -> AppResult<Option<crate::repo_hooks::RepoHooks>> {
+    tokio::task::spawn_blocking(move || crate::repo_hooks::read(std::path::Path::new(&workspace_path)))
         .await
-        .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))
+        .map_err(|e| AppError::Other(format!("repo hooks task failed: {e}")))
+}
+
+/// Direct launcher, Readiness and Routines: the models among `models` with a
+/// published retirement date (`token_engine::MODEL_RETIREMENTS`), each once.
+/// The caller decides from the date whether to say anything.
+#[tauri::command]
+pub fn model_retirements(models: Vec<String>) -> AppResult<Vec<crate::token_engine::ModelRetirement>> {
+    Ok(crate::token_engine::model_retirements(&models))
+}
+
+/// Settings › General readiness card: local checks (claude, auth mode, codex,
+/// git, gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
+/// (an explicit Check again) also runs `claude auth status` (and
+/// `codex login status` when the Codex row shows); the sign-in end
+/// it reports is stored like a stage's, so the launcher and notes agree.
+#[tauri::command]
+pub async fn readiness_check(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ask_claude: Option<bool>,
+) -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
+    // The stored sign-in end, read before the blocking probes.
+    let login = crate::claude_login::load(&state.db.lock()).ok().flatten().map(|l| l.expires_at);
+    // The Codex CLI row only when a saved crew or Routine runs a Codex stage.
+    let want_codex = crate::readiness::wants_codex(&state.db.lock());
+    let ask_claude = ask_claude.unwrap_or(false);
+    let (checks, probed) = tokio::task::spawn_blocking(move || crate::readiness::run_all(login, ask_claude, want_codex))
+        .await
+        .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))?;
+    // Signed in with a date: stored. Signed out: the stored end is cleared,
+    // so the notes hide too. Unknown: left as it was.
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Ok(Some(expires_at)) = crate::claude_login::apply_probe(&state.db.lock(), probed, &now) {
+        let _ = app.emit(crate::claude_login::LOGIN_EVENT, serde_json::json!({ "expiresAt": expires_at }));
+    }
+    Ok(checks)
 }
 
 /// One-click: register the bundled `octopush-mcp` server with Claude Code at

@@ -19,7 +19,7 @@ interface Props {
 
 /** The escalation-policy label for a stage running `model`: the escalate model
  *  (short), or the escalate effort when only that is set and effort reaches the
- *  agent (API or Claude Code, not Codex). null = no policy. */
+ *  agent (the API, or a Claude Code or Codex CLI stage). null = no policy. */
 function escalationLabel(s: PipelineStage, model: string): string | null {
   if (s.escalateModel) return shortModel(s.escalateModel);
   if (s.escalateEffort && effortApplies(s.substrate, model)) return s.escalateEffort;

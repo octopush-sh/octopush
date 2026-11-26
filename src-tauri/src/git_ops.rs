@@ -24,6 +24,10 @@ pub struct GitStatus {
     /// The in-progress multi-step operation, if any: "merge" or "rebase".
     /// None when the repo is in its normal state.
     pub operation: Option<String>,
+    /// The commit HEAD points at, as a hex oid. None on an unborn branch.
+    /// A commit, reset, merge or cherry-pick moves it even when the branch
+    /// has no upstream and the tree ends up clean again.
+    pub head: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -160,7 +164,7 @@ pub fn open_repo(path: &Path) -> AppResult<Repository> {
 }
 
 pub fn current_branch(repo: &Repository) -> Option<String> {
-    repo.head().ok()?.shorthand().map(String::from)
+    repo.head().ok()?.shorthand().ok().map(String::from)
 }
 
 pub fn is_git_repo(path: &Path) -> bool {
@@ -171,7 +175,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 pub fn default_branch(path: &Path) -> AppResult<Option<String>> {
     let repo = open_repo(path)?;
     let result = match repo.head() {
-        Ok(head) => head.shorthand().map(String::from),
+        Ok(head) => head.shorthand().ok().map(String::from),
         Err(_) => None, // Empty repo — no HEAD
     };
     Ok(result)
@@ -184,7 +188,7 @@ pub fn default_branch(path: &Path) -> AppResult<Option<String>> {
 pub fn repo_default_branch(path: &Path) -> Option<String> {
     let repo = open_repo(path).ok()?;
     if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD") {
-        if let Some(name) = r.symbolic_target().and_then(|t| t.strip_prefix("refs/remotes/origin/")) {
+        if let Some(name) = r.symbolic_target().ok().flatten().and_then(|t| t.strip_prefix("refs/remotes/origin/")) {
             return Some(name.to_string());
         }
     }
@@ -369,14 +373,15 @@ pub fn status_files(path: &Path) -> AppResult<GitStatus> {
     let conflicted = changed_files.iter().filter(|f| f.conflicted).count();
     let has_upstream = repo
         .head().ok()
-        .and_then(|h| h.shorthand().map(|s| s.to_string()))
+        .and_then(|h| h.shorthand().ok().map(|s| s.to_string()))
         .and_then(|name| repo.find_branch(&name, git2::BranchType::Local).ok())
         .map(|b| b.upstream().is_ok())
         .unwrap_or(false);
     let operation = state_to_operation(repo.state()).map(String::from);
+    let head = repo.head().ok().and_then(|h| h.target()).map(|oid| oid.to_string());
     Ok(GitStatus {
         branch, changed_files, ahead: 0, behind: 0, has_upstream, conflicted,
-        ahead_behind_known: false, operation,
+        ahead_behind_known: false, operation, head,
     })
 }
 
@@ -422,12 +427,107 @@ pub fn is_dirty(path: &Path) -> AppResult<bool> {
     Ok(!statuses.is_empty())
 }
 
+/// Folders the project's own tooling rebuilds (dependencies, build output,
+/// caches): an ignored path inside one is not the user's work.
+const REBUILDABLE_DIRS: &[&str] = &[
+    "node_modules", ".venv", "venv", "dist", "build", "target", ".next", ".cache", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".turbo", ".parcel-cache", ".gradle",
+];
+
+/// Whether an ignored path (libgit2 lists an ignored folder once, as `dir/`)
+/// is rebuildable: inside or named like a `REBUILDABLE_DIRS` folder, or
+/// Finder's `.DS_Store`. Pure.
+pub fn is_rebuildable_ignored(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path.rsplit('/').next() == Some(".DS_Store") || path.split('/').any(|part| REBUILDABLE_DIRS.contains(&part))
+}
+
+/// Whether `rel` is the Claude Code settings file Octopush writes into its
+/// worktrees (`claude_hooks::EXCLUDE_LINE`) and it holds nothing but
+/// Octopush's own hooks, which restore writes again. Anything more in it
+/// (Claude Code's "don't ask again" choices, say) makes it a local file, and
+/// so does a file that can't be read or parsed.
+pub fn is_hooks_only_settings(root: &Path, rel: &str) -> bool {
+    if rel != crate::claude_hooks::EXCLUDE_LINE.trim_start_matches('/') {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(rel)) else { return false };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    crate::agent_adapter::strip_claude_hooks(value).as_object().is_some_and(|o| o.is_empty())
+}
+
+/// The git-ignored paths in the worktree at `path` that archiving would
+/// delete for good (a local env file, a local database): everything ignored
+/// but `is_rebuildable_ignored` and `is_hooks_only_settings`. An ignored
+/// folder counts once, as `dir/`, and only while it holds such a file
+/// (`folder_holds_local_files`). Untracked folders are examined too: one
+/// holding only ignored files (say `db/dev.sqlite` under `*.sqlite`) is
+/// listed as `db/`, where skipping untracked folders would miss it. So a
+/// `.claude/` folder holding nothing but Octopush's hooks is not listed, nor
+/// is an empty folder (libgit2 reports both as ignored).
+pub fn local_ignored_files(path: &Path) -> AppResult<Vec<String>> {
+    let repo = open_repo(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(true)
+        .recurse_ignored_dirs(false);
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .map_err(|e| AppError::Other(format!("git status: {e}")))?;
+    Ok(statuses
+        .iter()
+        .filter(|e| e.status().is_ignored())
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .filter(|p| !is_rebuildable_ignored(p) && !is_hooks_only_settings(path, p))
+        .filter(|p| !p.ends_with('/') || folder_holds_local_files(path, p))
+        .collect())
+}
+
+/// Entries `folder_holds_local_files` looks at before it gives up and says
+/// the folder holds local files.
+pub const LOCAL_FILES_WALK_CAP: usize = 2_000;
+
+/// Whether the folder `rel` of the worktree at `root` holds a file, at any
+/// depth, that is neither `is_rebuildable_ignored` nor
+/// `is_hooks_only_settings`. Stops at the first one. Dependency and build
+/// folders inside are skipped whole, not walked; a folder it can't read, or
+/// with more than `LOCAL_FILES_WALK_CAP` other entries, counts as holding
+/// one. Symlinks are not followed (they count as files).
+fn folder_holds_local_files(root: &Path, rel: &str) -> bool {
+    let mut stack = vec![root.join(rel)];
+    let mut budget = LOCAL_FILES_WALK_CAP;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { return true };
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
+            let Ok(kind) = entry.file_type() else { return true };
+            let path = entry.path();
+            let inside = path.strip_prefix(root).ok().and_then(|p| p.to_str()).unwrap_or_default().to_string();
+            if is_rebuildable_ignored(&inside) {
+                continue;
+            }
+            if !kind.is_dir() && !is_hooks_only_settings(root, &inside) {
+                return true;
+            }
+            if budget == 0 {
+                return true;
+            }
+            budget -= 1;
+            if kind.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    false
+}
+
 /// Return (ahead, behind) commits relative to the configured upstream of
 /// HEAD. Returns None if no upstream is configured (e.g. a branch that has
 /// never been pushed) or the comparison cannot be computed.
 fn upstream_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     let head = repo.head().ok()?;
-    let branch_name = head.shorthand()?;
+    let branch_name = head.shorthand().ok()?;
     let branch = repo
         .find_branch(branch_name, git2::BranchType::Local)
         .ok()?;
@@ -486,7 +586,7 @@ fn is_live_worktree_at(repo: &Repository, path: &Path) -> bool {
         return true; // the main worktree (never listed by worktrees())
     }
     let Ok(names) = repo.worktrees() else { return false };
-    names.iter().flatten().any(|name| {
+    names.iter().filter_map(|n| n.ok().flatten()).any(|name| {
         repo.find_worktree(name)
             .ok()
             .is_some_and(|wt| wt.validate().is_ok() && canonical(wt.path()) == target)
@@ -502,15 +602,15 @@ pub fn live_worktree_on_branch(repo: &Repository, branch: &str) -> Option<PathBu
     let on_branch = |dir: &Path| -> bool {
         let Ok(sub) = Repository::open(dir) else { return false };
         let Ok(head) = sub.head() else { return false };
-        head.is_branch() && head.shorthand() == Some(branch)
+        head.is_branch() && head.shorthand().ok() == Some(branch)
     };
     if let Some(wd) = repo.workdir() {
-        if repo.head().ok().is_some_and(|h| h.is_branch() && h.shorthand() == Some(branch)) {
+        if repo.head().ok().is_some_and(|h| h.is_branch() && h.shorthand().ok() == Some(branch)) {
             return Some(canonical(wd));
         }
     }
     let names = repo.worktrees().ok()?;
-    for name in names.iter().flatten() {
+    for name in names.iter().filter_map(|n| n.ok().flatten()) {
         if let Ok(wt) = repo.find_worktree(name) {
             if wt.validate().is_ok() && on_branch(wt.path()) {
                 return Some(canonical(wt.path()));
@@ -622,7 +722,7 @@ pub fn delete_worktree(repo_path: &Path, worktree_path: &Path) -> AppResult<()> 
     let repo = open_repo(repo_path)?;
     let target = canonical(worktree_path);
     let Ok(names) = repo.worktrees() else { return Ok(()) };
-    for name in names.iter().flatten() {
+    for name in names.iter().filter_map(|n| n.ok().flatten()) {
         if let Ok(wt) = repo.find_worktree(name) {
             if canonical(wt.path()) == target {
                 let mut opts = git2::WorktreePruneOptions::new();
@@ -766,7 +866,7 @@ pub struct PrTarget {
 pub fn pr_target(repo: &Repository, base: &str, head: &str) -> PrTarget {
     let remotes: Vec<String> = repo
         .remotes()
-        .map(|r| r.iter().flatten().map(String::from).collect())
+        .map(|r| r.iter().filter_map(|n| n.ok().flatten()).map(String::from).collect())
         .unwrap_or_default();
     let config = repo.config().ok();
     let get = |key: String| config.as_ref().and_then(|c| c.get_string(&key).ok());
@@ -802,7 +902,7 @@ pub fn pr_target(repo: &Repository, base: &str, head: &str) -> PrTarget {
 /// A remote's parsed URL (host, owner, repo), for `gh --repo` and `owner:branch`.
 pub fn remote_slug(repo: &Repository, remote: &str) -> Option<crate::git_url::ParsedGitUrl> {
     let r = repo.find_remote(remote).ok()?;
-    crate::git_url::parse_git_url(r.url()?)
+    crate::git_url::parse_git_url(r.url().ok()?)
 }
 
 /// What a pull request from HEAD onto `base` contains: the diff from their
@@ -842,9 +942,242 @@ pub fn branch_pr_context(path: &Path, base: &str) -> AppResult<(String, Vec<Stri
         .filter_map(|o| o.ok())
         .take(50)
         .filter_map(|oid| repo.find_commit(oid).ok())
-        .map(|c| c.summary().unwrap_or("").to_string())
+        .map(|c| c.summary().ok().flatten().unwrap_or("").to_string())
         .collect();
     Ok((text, subjects))
+}
+
+/// How much code a workspace holds for review: files changed and lines
+/// added/removed from the merge base with `base` to the working tree —
+/// committed work, staged and unstaged edits and untracked files together
+/// (what a reviewer of the crew's branch reads). Renames are detected, so a
+/// moved file counts its edits, not a whole delete plus add. `base` is `None`
+/// when the workspace has no base branch or it no longer resolves: the size
+/// is then the uncommitted changes against HEAD, and says so.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSize {
+    pub files: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub base: Option<String>,
+    /// Untracked entries counted as files but not line-counted: a directory
+    /// past [`crate::collisions::MAX_UNTRACKED_DIR_FILES`] files (one entry),
+    /// a file past the [`MAX_UNTRACKED_LINE_FILES`] / [`MAX_UNTRACKED_LINE_BYTES`]
+    /// budget, or one too large to read whole. `0` when every line counted.
+    pub untracked_skipped: usize,
+}
+
+/// At most this many untracked files are read to count their lines.
+pub const MAX_UNTRACKED_LINE_FILES: usize = 200;
+/// At most this many bytes of untracked files are read in total.
+pub const MAX_UNTRACKED_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Lines in an untracked file as `git diff --stat` counts them: a last line
+/// without a newline still counts, a binary file (a NUL byte) counts none.
+fn text_lines(bytes: &[u8]) -> usize {
+    if bytes.is_empty() || bytes[..bytes.len().min(8000)].contains(&0) {
+        return 0;
+    }
+    let nl = bytes.iter().filter(|&&b| b == b'\n').count();
+    nl + usize::from(bytes.last() != Some(&b'\n'))
+}
+
+/// [`DiffSize`] for the worktree at `path`. The merge base resolves like the
+/// collision radar's ([`crate::collisions::resolve_merge_base`]: the newest of
+/// the merge bases with `origin/<base>` and `<base>`). Tracked changes are one
+/// tree → index + working tree diff with rename detection; untracked files are
+/// listed (an untracked directory with more than
+/// [`crate::collisions::MAX_UNTRACKED_DIR_FILES`] files is one entry) and
+/// their lines counted within a file-count and byte budget, so a stray
+/// `node_modules/` never makes the measure read gigabytes.
+pub fn diff_size(path: &Path, base: Option<&str>) -> AppResult<DiffSize> {
+    use crate::collisions::{find_renames, resolve_merge_base, MAX_UNTRACKED_DIR_FILES};
+    let repo = open_repo(path)?;
+    let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let merge_base = match (head.as_ref(), base.map(str::trim).filter(|b| !b.is_empty())) {
+        (Some(h), Some(b)) => resolve_merge_base(&repo, h.id(), b)
+            .and_then(|mb| repo.find_commit(mb).ok()?.tree().ok())
+            .map(|t| (b.to_string(), t)),
+        _ => None,
+    };
+    let (resolved, tree) = match merge_base {
+        Some((b, t)) => (Some(b), Some(t)),
+        None => (None, head.as_ref().and_then(|c| c.tree().ok())),
+    };
+    let err = |what: &str, e: git2::Error| AppError::Other(format!("{what}: {e}"));
+
+    // Tracked: merge base → index + working tree, renames paired.
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(false);
+    let mut diff = repo
+        .diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))
+        .map_err(|e| err("diff", e))?;
+    find_renames(&mut diff, false);
+    let stats = diff.stats().map_err(|e| err("diff stats", e))?;
+    let mut size = DiffSize {
+        files: stats.files_changed(),
+        added: stats.insertions(),
+        removed: stats.deletions(),
+        base: resolved,
+        untracked_skipped: 0,
+    };
+
+    // Untracked: the directories as `git status` shows them (`dir/`), then
+    // every file, each large directory folded into one entry.
+    let untracked = |recurse: bool| -> Vec<String> {
+        let mut o = git2::DiffOptions::new();
+        o.include_untracked(true).recurse_untracked_dirs(recurse);
+        let Ok(d) = repo.diff_index_to_workdir(None, Some(&mut o)) else { return Vec::new() };
+        d.deltas()
+            .filter(|x| x.status() == git2::Delta::Untracked)
+            .filter_map(|x| x.new_file().path().and_then(|p| p.to_str()).map(str::to_string))
+            .collect()
+    };
+    let dirs: Vec<String> = untracked(false).into_iter().filter(|p| p.ends_with('/')).collect();
+    let files = untracked(true);
+    let mut per_dir: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &files {
+        if let Some(d) = dirs.iter().find(|d| f.starts_with(d.as_str())) {
+            *per_dir.entry(d.as_str()).or_default() += 1;
+        }
+    }
+    let workdir = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf());
+    let (mut read_files, mut read_bytes) = (0usize, 0u64);
+    let big_dirs = per_dir.values().filter(|&&n| n > MAX_UNTRACKED_DIR_FILES).count();
+    size.files += big_dirs;
+    size.untracked_skipped += big_dirs;
+    for f in &files {
+        let big_dir = dirs
+            .iter()
+            .find(|d| f.starts_with(d.as_str()))
+            .is_some_and(|d| per_dir.get(d.as_str()).copied().unwrap_or(0) > MAX_UNTRACKED_DIR_FILES);
+        if big_dir {
+            continue;
+        }
+        size.files += 1;
+        let full = workdir.join(f);
+        let len = std::fs::symlink_metadata(&full).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0);
+        if read_files >= MAX_UNTRACKED_LINE_FILES || read_bytes + len > MAX_UNTRACKED_LINE_BYTES {
+            size.untracked_skipped += 1;
+            continue;
+        }
+        read_files += 1;
+        read_bytes += len;
+        if len > 0 {
+            match std::fs::read(&full) {
+                Ok(bytes) => size.added += text_lines(&bytes),
+                Err(_) => size.untracked_skipped += 1,
+            }
+        }
+    }
+    Ok(size)
+}
+
+/// At most this many commits are counted for [`CommittedDiff::commits`]; a
+/// branch further ahead reports this number (the diff itself is unaffected).
+pub const MAX_COMMITTED_COUNT: usize = 10_000;
+
+/// What a workspace committed on top of its base: the merge base → HEAD tree
+/// diff Review shows as "Since base" (#851). Working-tree and untracked
+/// changes are never part of it — they are Review's working-tree view.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommittedDiff {
+    /// The base branch the merge base was resolved against.
+    pub base: Option<String>,
+    /// Short SHA of the merge base, when one resolved.
+    pub merge_base: Option<String>,
+    /// Short SHA of HEAD, when there is one: an amend or a rewrite that keeps
+    /// the commit count and merge base still moves it (#820).
+    pub head: Option<String>,
+    /// Commits on HEAD since the merge base (capped at [`MAX_COMMITTED_COUNT`]).
+    pub commits: usize,
+    /// The unified diff, merge base tree → HEAD tree, renames paired. Empty
+    /// when there are no commits ahead.
+    pub diff: String,
+}
+
+type CommittedKey = (std::path::PathBuf, git2::Oid, git2::Oid, bool, String);
+
+/// The last committed diff per worktree, keyed by (HEAD, merge base,
+/// whitespace mode, base name): Review polls every 3 s, and committed history
+/// only moves when HEAD or the base does, so a poll that finds both still
+/// costs no patch. The base name is in the key because the answer carries it:
+/// a workspace re-based onto another branch at the same merge base must not
+/// keep the old `base` label (#903).
+fn committed_cache() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (CommittedKey, CommittedDiff)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (CommittedKey, CommittedDiff)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// [`CommittedDiff`] for the worktree at `path` against `base`, with the merge
+/// base resolved exactly like the collision radar's and Mission Control's
+/// diff size ([`crate::collisions::resolve_merge_base`]). No base, no HEAD, a
+/// base that doesn't resolve, or HEAD at the merge base: zero commits and an
+/// empty diff.
+pub fn committed_diff(path: &Path, base: Option<&str>, ignore_whitespace: bool) -> AppResult<CommittedDiff> {
+    use crate::collisions::{find_renames, resolve_merge_base};
+    let repo = open_repo(path)?;
+    let base = base.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
+    let short = |o: git2::Oid| o.to_string()[..7].to_string();
+    let empty = |base: Option<String>, mb: Option<git2::Oid>, head: Option<git2::Oid>| CommittedDiff {
+        base,
+        merge_base: mb.map(short),
+        head: head.map(short),
+        commits: 0,
+        diff: String::new(),
+    };
+    let Some(head) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) else {
+        return Ok(empty(base, None, None));
+    };
+    let Some(b) = base.as_deref() else { return Ok(empty(None, None, Some(head.id()))) };
+    let Some(mb) = resolve_merge_base(&repo, head.id(), b) else {
+        return Ok(empty(base, None, Some(head.id())));
+    };
+    if mb == head.id() {
+        return Ok(empty(base, Some(mb), Some(head.id())));
+    }
+    let key: CommittedKey = (path.to_path_buf(), head.id(), mb, ignore_whitespace, b.to_string());
+    if let Ok(cache) = committed_cache().lock() {
+        if let Some((k, v)) = cache.get(path) {
+            if *k == key {
+                return Ok(v.clone());
+            }
+        }
+    }
+    let err = |what: &str, e: git2::Error| AppError::Other(format!("{what}: {e}"));
+
+    let mut walk = repo.revwalk().map_err(|e| err("revwalk", e))?;
+    walk.push(head.id()).map_err(|e| err("revwalk", e))?;
+    walk.hide(mb).map_err(|e| err("revwalk", e))?;
+    let commits = walk.take(MAX_COMMITTED_COUNT).filter(|c| c.is_ok()).count();
+
+    let old_tree = repo.find_commit(mb).and_then(|c| c.tree()).map_err(|e| err("merge base tree", e))?;
+    let new_tree = head.tree().map_err(|e| err("head tree", e))?;
+    let mut opts = git2::DiffOptions::new();
+    if ignore_whitespace {
+        opts.ignore_whitespace(true);
+    }
+    let mut diff = repo
+        .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut opts))
+        .map_err(|e| err("committed diff", e))?;
+    find_renames(&mut diff, false);
+    let out = CommittedDiff {
+        base,
+        merge_base: Some(short(mb)),
+        head: Some(short(head.id())),
+        commits,
+        diff: diff_to_text(&diff)?,
+    };
+    if let Ok(mut cache) = committed_cache().lock() {
+        // One entry per worktree; a stale worktree's entry is bounded by the
+        // number of workspaces ever reviewed in this session.
+        cache.insert(path.to_path_buf(), (key, out.clone()));
+    }
+    Ok(out)
 }
 
 /// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.
@@ -901,7 +1234,7 @@ fn commit_info(commit: &git2::Commit) -> CommitInfo {
     CommitInfo {
         sha_short: sha[..7].to_string(),
         sha,
-        summary: commit.summary().unwrap_or("").to_string(),
+        summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
         author_name: commit.author().name().unwrap_or("").to_string(),
         timestamp_ms: commit.time().seconds() * 1000,
     }
@@ -982,13 +1315,15 @@ pub fn blame_file(path: &Path, file: &str) -> AppResult<Vec<BlameLine>> {
             .or_insert_with(|| {
                 repo.find_commit(oid)
                     .ok()
-                    .and_then(|c| c.summary().map(String::from))
+                    .and_then(|c| c.summary().ok().flatten().map(String::from))
                     .unwrap_or_default()
             })
             .clone();
+        // git2 0.21 returns None when libgit2 has no signature for the hunk
+        // (it used to hand back a dangling pointer). Blank author, epoch time.
         let sig = hunk.final_signature();
-        let author_name = sig.name().unwrap_or("").to_string();
-        let timestamp_ms = sig.when().seconds() * 1000;
+        let author_name = sig.as_ref().and_then(|s| s.name().ok()).unwrap_or("").to_string();
+        let timestamp_ms = sig.as_ref().map_or(0, |s| s.when().seconds() * 1000);
         let sha = oid.to_string();
         let sha_short = sha[..7].to_string();
         let start = hunk.final_start_line();
@@ -1028,12 +1363,39 @@ pub fn friendly_switch_error(name: &str, combined: &str) -> String {
     }
 }
 
+/// `s` single-quoted for a login-shell command line, `'` written as `'\''`.
+/// Only for refs and SHAs: git forbids a backslash in a ref name
+/// (`git check-ref-format`) and a SHA is hex, and without one this quoting is
+/// safe in sh, bash, zsh and fish alike. Anything else — messages, URLs,
+/// paths — must travel through the environment (`commands::login_shell_output`):
+/// fish treats `\'` inside single quotes as an escape, so a backslash would
+/// end the quoted string early.
+pub fn quote_git_ref(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Is `s` a hex commit id (4–64 digits, abbreviated or full)?
+pub fn is_hex_sha(s: &str) -> bool {
+    (4..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// May `s` go through `quote_git_ref`? A hex commit id, or a name git
+/// accepts as a branch (`feat/it's`, or a remote-tracking `origin/x`) that
+/// doesn't start with `-`, so it can't be read as an option. git's ref-name
+/// rules forbid backslashes, whitespace and control bytes.
+pub fn is_git_ref_arg(s: &str) -> bool {
+    is_hex_sha(s) || (s == s.trim() && !s.starts_with('-') && is_valid_branch_name(s))
+}
+
 /// `git switch <name>` via the user's login shell (gitconfig, hooks and
 /// filters behave like the user's terminal). Returns the trimmed combined
 /// output; failures come back as friendly errors via `friendly_switch_error`.
 pub fn switch_branch(path: &Path, name: &str) -> AppResult<String> {
+    if !is_git_ref_arg(name) {
+        return Err(AppError::Other(format!("'{name}' isn't a valid branch name.")));
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = format!("git switch '{}' 2>&1", name.replace('\'', "'\\''"));
+    let cmd = format!("git switch {} 2>&1", quote_git_ref(name));
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
         .current_dir(path)
@@ -1194,11 +1556,11 @@ pub fn clean_untracked(path: &Path) -> AppResult<Vec<String>> {
 /// `classify_pull` is reused: cherry-pick output never matches its diverged
 /// patterns, so the kinds collapse to Ok / Conflict / Error.
 pub fn cherry_pick(path: &Path, sha: &str) -> AppResult<PullOutcome> {
+    if !is_hex_sha(sha) {
+        return Err(AppError::Other(format!("'{sha}' isn't a commit id.")));
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = format!(
-        "git -c core.editor=true cherry-pick '{}' 2>&1",
-        sha.replace('\'', "'\\''")
-    );
+    let cmd = format!("git -c core.editor=true cherry-pick {} 2>&1", quote_git_ref(sha));
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
         .current_dir(path)
@@ -1241,7 +1603,7 @@ pub fn list_tags(path: &Path) -> AppResult<Vec<String>> {
         .tag_names(None)
         .map_err(|e| AppError::Other(format!("list tags: {e}")))?
         .iter()
-        .filter_map(|t| t.map(String::from))
+        .filter_map(|t| t.ok().flatten().map(String::from))
         .collect())
 }
 
@@ -1525,6 +1887,35 @@ mod tests {
         init_repo(dir.path()).unwrap();
         commit_file(dir.path(), "a.txt", "one\n", "first");
         assert!(switch_branch(dir.path(), "no-such-branch").is_err());
+    }
+
+    #[test]
+    fn git_ref_args_accept_refs_and_shas_only() {
+        let full_sha = "f".repeat(40);
+        for ok in ["main", "feat/it's", "origin/x", "JIRA-123", "abc1234", full_sha.as_str()] {
+            assert!(is_git_ref_arg(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "", "a\\b", "-x", "--force", "a..b", "a b", " main", "main\n", "'; touch x",
+            "a\\'; touch x", "x\0y", "a~1", "a:b",
+        ] {
+            assert!(!is_git_ref_arg(bad), "{bad:?} should be rejected");
+        }
+        assert!(is_hex_sha("abcd") && is_hex_sha(&"0".repeat(64)));
+        assert!(!is_hex_sha("abc") && !is_hex_sha(&"0".repeat(65)) && !is_hex_sha("abcg"));
+    }
+
+    #[test]
+    fn switch_branch_and_cherry_pick_refuse_a_hostile_arg_before_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let err = switch_branch(dir.path(), "a\\'; touch PWNED; echo '").unwrap_err();
+        assert!(err.to_string().contains("isn't a valid branch name"), "{err}");
+        // `PullOutcome` isn't `Debug`, so no `unwrap_err` here.
+        let err = cherry_pick(dir.path(), "main; touch PWNED").err().expect("cherry_pick should refuse");
+        assert!(err.to_string().contains("isn't a commit id"), "{err}");
+        assert!(!dir.path().join("PWNED").exists());
     }
 
     #[test]
@@ -1965,7 +2356,7 @@ mod tests {
         assert!(!dir.path().join(".git/worktrees/feat/foo").exists());
         // And the worktree is really on the slashed branch.
         let sub = Repository::open(&wt).unwrap();
-        assert_eq!(sub.head().unwrap().shorthand(), Some("feat/foo"));
+        assert_eq!(sub.head().unwrap().shorthand().ok(), Some("feat/foo"));
     }
 
     #[test]
@@ -2046,7 +2437,7 @@ mod tests {
             .worktrees()
             .unwrap()
             .iter()
-            .flatten()
+            .filter_map(|n| n.ok().flatten())
             .map(String::from)
             .collect();
         assert_eq!(

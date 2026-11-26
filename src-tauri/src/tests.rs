@@ -206,6 +206,21 @@ mod db_tests {
     }
 
     #[test]
+    fn unpriced_models_lists_only_unknown_models_once() {
+        // No catalog: the builtin table decides. Known models are dropped,
+        // unknown ones kept once each, in first-seen order.
+        let models: Vec<String> = ["claude-opus-5-5", "gw/mystery-1", "gpt-4o", "gw/mystery-1", "other-unknown-xyz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            crate::commands::unpriced_models_in(None, &models),
+            vec!["gw/mystery-1".to_string(), "other-unknown-xyz".to_string()]
+        );
+        assert!(crate::commands::unpriced_models_in(None, &[]).is_empty());
+    }
+
+    #[test]
     #[serial_test::serial(pricing_catalog)]
     fn cost_for_prices_current_and_dated_models() {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
@@ -407,6 +422,33 @@ mod workspace_tests {
         assert_eq!(active.len(), 2, "running + paused only");
         assert!(ids.contains(&a.as_str()) && ids.contains(&b.as_str()));
         assert!(!ids.contains(&c.as_str()), "completed is excluded");
+    }
+
+    #[test]
+    fn deleting_a_workspace_drops_its_paused_run_from_the_dock_badge() {
+        // The workspace's runs cascade-delete with no run:// event, which is
+        // why `delete_workspace` / `delete_project` refresh the badge: the
+        // recount after the delete must clear it.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        setup_workspace(&db, "p2", "ws2");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let a = db.create_run("ws1", &pipeline_id, "task a", None, None, &[]).unwrap();
+        let b = db.create_run("ws2", &pipeline_id, "task b", None, None, &[]).unwrap();
+        db.set_run_status(&a, "paused", false).unwrap();
+        db.set_run_status(&b, "paused", false).unwrap();
+        let badge = |db: &Db| {
+            let runs = db.list_active_runs().unwrap();
+            crate::fleet_status::derive(runs.iter().map(|r| (r.status.as_str(), crate::fleet_status::plan_waiting(r)))).badge()
+        };
+        assert_eq!(badge(&db), Some(2));
+
+        db.delete_workspace("ws1").unwrap();
+        assert_eq!(badge(&db), Some(1));
+
+        db.delete_project("p2").unwrap();
+        assert_eq!(badge(&db), None, "a project delete cascades its runs too");
     }
 
     #[test]
@@ -677,7 +719,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
             tools: None, custom_name: None, instructions: None, session_id: None,
-            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
+            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None, secret_hold: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         let huge = format!(
@@ -708,7 +750,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
+            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None, secret_hold: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
@@ -1391,6 +1433,40 @@ mod terminal_tests {
         let max = db.max_terminal_position("ws-t5").unwrap();
         assert_eq!(max, Some(5));
     }
+
+    #[test]
+    fn set_terminal_order_renumbers_the_workspace_sessions() {
+        let db = test_db();
+        setup_workspace(&db, "proj-t6", "ws-t6");
+        setup_workspace(&db, "proj-t7", "ws-t7");
+
+        let ts = chrono::Utc::now().timestamp();
+        db.create_terminal("term-o1", "ws-t6", "A", 0, ts).unwrap();
+        db.create_terminal("term-o2", "ws-t6", "B", 1, ts).unwrap();
+        db.create_terminal("term-o3", "ws-t6", "C", 2, ts).unwrap();
+        db.create_terminal("term-other", "ws-t7", "X", 0, ts).unwrap();
+
+        let ids = |ws: &str| -> Vec<String> {
+            db.list_terminals(ws).unwrap().into_iter().map(|t| t.id).collect()
+        };
+
+        db.set_terminal_order("ws-t6", &["term-o3".into(), "term-o1".into(), "term-o2".into()])
+            .unwrap();
+        assert_eq!(ids("ws-t6"), vec!["term-o3", "term-o1", "term-o2"]);
+        let positions: Vec<u32> = db.list_terminals("ws-t6").unwrap().iter().map(|t| t.position).collect();
+        assert_eq!(positions, vec![0, 1, 2]);
+
+        // Another workspace's id, an unknown id and a duplicate move nothing;
+        // a session left out goes last.
+        db.set_terminal_order(
+            "ws-t6",
+            &["term-other".into(), "term-o2".into(), "nope".into(), "term-o2".into(), "term-o3".into()],
+        )
+        .unwrap();
+        assert_eq!(ids("ws-t6"), vec!["term-o2", "term-o3", "term-o1"]);
+        assert_eq!(ids("ws-t7"), vec!["term-other"]);
+        assert_eq!(db.list_terminals("ws-t7").unwrap()[0].position, 0);
+    }
 }
 
 /// Tests for Feature 5 v2 — cache token tracking and LiteLLM pricing parse.
@@ -1504,17 +1580,30 @@ mod budgets_v2_tests {
         }
     }
 
-    /// Non-Anthropic models have zero cache pricing (no caching support).
+    /// Every builtin model's cache columns match `token_engine::builtin_prices`
+    /// (Anthropic, and OpenAI's cached input since #611). Providers without
+    /// prompt-cache pricing there (DeepSeek, Ollama) keep both at zero.
     #[test]
-    fn non_anthropic_models_have_zero_cache_pricing() {
+    fn builtin_cache_pricing_matches_builtin_prices() {
         let providers = builtin_providers();
         for (name, p) in &providers {
-            if name == "anthropic" { continue; }
+            let cached = matches!(name.as_str(), "anthropic" | "openai");
             for m in &p.models {
-                assert_eq!(
-                    m.cache_read_cost_per_m, 0.0,
-                    "provider {name} model {} should have cache_read_cost_per_m == 0",
-                    m.id
+                let cols = (m.cache_read_cost_per_m, m.cache_creation_cost_per_m);
+                if !cached {
+                    assert_eq!(cols, (0.0, 0.0), "provider {name} model {} should have no cache pricing", m.id);
+                    continue;
+                }
+                let want = crate::token_engine::builtin_prices(&m.id)
+                    .unwrap_or_else(|| panic!("provider {name} model {} has no builtin_prices entry", m.id));
+                // Some columns are written as `3.0 * 0.10`: equal to the cent, not bit for bit.
+                let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
+                assert!(
+                    same(cols.0, want.cache_read_per_m) && same(cols.1, want.cache_creation_per_m),
+                    "provider {name} model {}: cache (read, creation) per M {cols:?} should match builtin_prices ({}, {})",
+                    m.id,
+                    want.cache_read_per_m,
+                    want.cache_creation_per_m
                 );
             }
         }
@@ -1992,26 +2081,7 @@ mod pty_manager_reattach_tests {
     use tempfile::TempDir;
 
     fn find_daemon_bin() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let c = parent.join("octopush-pty-server");
-                if c.exists() { return c; }
-                if let Some(gp) = parent.parent() {
-                    let c = gp.join("octopush-pty-server");
-                    if c.exists() { return c; }
-                }
-            }
-        }
-        for rel in &[
-            "target/debug/octopush-pty-server",
-            "../target/debug/octopush-pty-server",
-        ] {
-            if let Ok(cwd) = std::env::current_dir() {
-                let c = cwd.join(rel);
-                if c.exists() { return c; }
-            }
-        }
-        panic!("octopush-pty-server binary not found — run `cargo build --bin octopush-pty-server` first");
+        crate::test_support::pty_server_bin()
     }
 
     fn start_daemon(home: &std::path::Path) -> std::process::Child {
@@ -2486,6 +2556,7 @@ mod provider_catalog_tests {
             input_cost_per_m: 1.0, output_cost_per_m: 2.0,
             cache_read_cost_per_m: 0.0, cache_creation_cost_per_m: 0.0,
             max_context: 200_000, supports_vision: false, supports_tools: true, tags: vec![],
+            superseded_by: None,
         }
     }
 
@@ -2545,6 +2616,231 @@ mod editor_detection_tests {
         #[cfg(unix)]
         assert!(binary_on_path("sh"));
         assert!(!binary_on_path("definitely-not-a-real-binary-xyz"));
+    }
+}
+
+#[cfg(test)]
+mod pr_checks_tests {
+    use crate::github::{
+        actions_run_id, check_runs_from_gh_pages, checks_from_gh_rollup, checks_from_gh_rollup_and_runs,
+        checks_from_rest_check_runs, gh_check_runs_command, gh_rollup_may_be_capped, join_failed_logs,
+        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE, GH_API_PATH_ENV,
+        GH_ROLLUP_CAP,
+    };
+
+    #[test]
+    fn gh_rollup_is_re_read_only_when_it_comes_back_full() {
+        let ok = serde_json::json!({ "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" });
+        let rollup = |n: usize| serde_json::Value::Array(vec![ok.clone(); n]);
+        assert!(!gh_rollup_may_be_capped(&rollup(0)));
+        assert!(!gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP - 1)));
+        assert!(gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP)));
+        assert!(gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP + 5)));
+        assert!(!gh_rollup_may_be_capped(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn gh_check_runs_command_needs_a_hex_sha_and_passes_the_path_in_the_env() {
+        assert_eq!(GH_API_PATH_ENV, "OCTOPUSH_GH_API_PATH");
+        assert_eq!(
+            gh_check_runs_command("o", "r", "abc123"),
+            Some((
+                "gh api --paginate \"$OCTOPUSH_GH_API_PATH\"",
+                "repos/o/r/commits/abc123/check-runs?per_page=100".to_string(),
+            )),
+        );
+        assert!(gh_check_runs_command("o", "r", "").is_none());
+        assert!(gh_check_runs_command("o", "r", "abc; rm -rf ~").is_none());
+        // Owner and repo stay out of the command line, whatever they hold.
+        let (cmd, path) = gh_check_runs_command("o\\'x", "r", "ab").unwrap();
+        assert_eq!(cmd, "gh api --paginate \"$OCTOPUSH_GH_API_PATH\"");
+        assert_eq!(path, "repos/o\\'x/r/commits/ab/check-runs?per_page=100");
+    }
+
+    #[test]
+    fn gh_check_runs_path_reaches_the_command_verbatim_under_every_shell() {
+        use super::login_shell_fixture::available_shells;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_string_lossy().to_string();
+        let (cmd, path) = gh_check_runs_command("o\\'; touch PWNED; echo '", "r", "ab").unwrap();
+        // `printf %s` stands in for `gh api --paginate`, which isn't installed in CI.
+        let cmd = cmd.replace("gh api --paginate", "printf %s");
+        for shell in available_shells() {
+            let out = crate::commands::login_shell_output(&shell, &ws, &cmd, &[(GH_API_PATH_ENV, path.clone())])
+                .unwrap_or_else(|e| panic!("{shell}: {e}"));
+            assert!(out.status.success(), "{shell}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), path, "{shell}");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the path");
+        }
+    }
+
+    #[test]
+    fn gh_pages_concatenate_check_runs_and_keep_what_was_read() {
+        let raw = br#"{"total_count":3,"check_runs":[{"name":"a"},{"name":"b"}]}
+{"total_count":3,"check_runs":[{"name":"c"}]}"#;
+        let runs = check_runs_from_gh_pages(raw).unwrap();
+        let names: Vec<&str> = runs.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        // Pages printed back to back, without a newline.
+        let tight = br#"{"check_runs":[{"name":"a"}]}{"check_runs":[{"name":"b"}]}"#;
+        assert_eq!(check_runs_from_gh_pages(tight).unwrap().len(), 2);
+        // A broken later page keeps the first.
+        let broken = br#"{"check_runs":[{"name":"a"}]}{"check_runs":"#;
+        assert_eq!(check_runs_from_gh_pages(broken).unwrap().len(), 1);
+        assert!(check_runs_from_gh_pages(b"").is_none());
+        assert!(check_runs_from_gh_pages(br#"{"message":"Not Found"}"#).is_none());
+    }
+
+    #[test]
+    fn capped_rollup_with_every_run_shows_a_failure_past_the_cap() {
+        let ok = serde_json::json!({ "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" });
+        let mut items = vec![ok; GH_ROLLUP_CAP - 1];
+        items.push(serde_json::json!({ "__typename": "StatusContext", "context": "ci/ext", "state": "SUCCESS" }));
+        let rollup = serde_json::Value::Array(items);
+        assert_eq!(checks_from_gh_rollup(&rollup).unwrap().state, ChecksState::Passing);
+
+        let mut runs = vec![serde_json::json!({ "name": "a", "status": "completed", "conclusion": "success" }); 120];
+        runs.push(serde_json::json!({ "name": "late", "status": "completed", "conclusion": "failure",
+            "details_url": "https://github.com/o/r/actions/runs/5/job/1" }));
+        let checks = checks_from_gh_rollup_and_runs(&rollup, &runs).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(checks.failing, vec![FailingCheck { name: "late".into(), run_id: Some(5) }]);
+
+        // Commit statuses still come from the rollup.
+        let failing_status = serde_json::json!([
+            { "__typename": "StatusContext", "context": "ci/ext", "state": "FAILURE" }
+        ]);
+        let checks = checks_from_gh_rollup_and_runs(&failing_status, &runs[..1]).unwrap();
+        assert_eq!(checks.failing, vec![FailingCheck { name: "ci/ext".into(), run_id: None }]);
+    }
+
+    #[test]
+    fn check_runs_read_another_page_only_after_a_full_one_below_the_total() {
+        let full = CHECK_RUNS_PER_PAGE;
+        // 250 runs: pages of 100, 100, 50.
+        assert!(more_check_run_pages(Some(250), 100, full));
+        assert!(more_check_run_pages(Some(250), 200, full));
+        assert!(!more_check_run_pages(Some(250), 250, 50));
+        // Exactly 100: the total says there is nothing more.
+        assert!(!more_check_run_pages(Some(100), 100, full));
+        // No total: a full page is the only hint, a short one ends it.
+        assert!(more_check_run_pages(None, 100, full));
+        assert!(!more_check_run_pages(None, 130, 30));
+        assert!(!more_check_run_pages(Some(500), 0, 0));
+    }
+
+    #[test]
+    fn gh_rollup_failing_names_each_failed_check_once_with_its_run() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "detailsUrl": "https://github.com/o/r/actions/runs/11/job/1" },
+            { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE",
+              "detailsUrl": "https://github.com/o/r/actions/runs/12/job/2" },
+            { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE",
+              "detailsUrl": "https://github.com/o/r/actions/runs/12/job/3" },
+            { "__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": "" },
+            { "__typename": "StatusContext", "context": "ci/circle", "state": "ERROR",
+              "targetUrl": "https://circleci.com/x" }
+        ]);
+        let checks = checks_from_gh_rollup(&raw).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(
+            checks.failing,
+            vec![
+                FailingCheck { name: "test".into(), run_id: Some(12) },
+                FailingCheck { name: "ci/circle".into(), run_id: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn gh_rollup_pending_when_something_still_runs() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "__typename": "CheckRun", "name": "test", "status": "QUEUED", "conclusion": "" },
+        ]);
+        assert_eq!(checks_from_gh_rollup(&raw).unwrap().state, ChecksState::Pending);
+        let status = serde_json::json!([{ "__typename": "StatusContext", "context": "deploy", "state": "PENDING" }]);
+        assert_eq!(checks_from_gh_rollup(&status).unwrap().state, ChecksState::Pending);
+    }
+
+    #[test]
+    fn gh_rollup_passing_counts_skipped_neutral_and_cancelled_as_ok() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "__typename": "CheckRun", "name": "b", "status": "COMPLETED", "conclusion": "SKIPPED" },
+            { "__typename": "CheckRun", "name": "c", "status": "COMPLETED", "conclusion": "NEUTRAL" },
+            { "__typename": "CheckRun", "name": "d", "status": "COMPLETED", "conclusion": "CANCELLED" },
+            { "__typename": "StatusContext", "context": "e", "state": "SUCCESS" }
+        ]);
+        let checks = checks_from_gh_rollup(&raw).unwrap();
+        assert_eq!(checks.state, ChecksState::Passing);
+        assert!(checks.failing.is_empty());
+    }
+
+    #[test]
+    fn gh_rollup_none_without_checks() {
+        assert!(checks_from_gh_rollup(&serde_json::json!([])).is_none());
+        assert!(checks_from_gh_rollup(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn rest_check_runs_shape_rolls_up_the_same_way() {
+        let body = serde_json::json!({
+            "total_count": 3,
+            "check_runs": [
+                { "name": "build", "status": "completed", "conclusion": "success" },
+                { "name": "test", "status": "completed", "conclusion": "timed_out",
+                  "details_url": "https://github.com/o/r/actions/runs/77/job/9" },
+                { "name": "lint", "status": "in_progress", "conclusion": null }
+            ]
+        });
+        let checks = checks_from_rest_check_runs(&body).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(checks.failing, vec![FailingCheck { name: "test".into(), run_id: Some(77) }]);
+
+        let pending = serde_json::json!({ "check_runs": [
+            { "name": "build", "status": "queued", "conclusion": null }
+        ]});
+        assert_eq!(checks_from_rest_check_runs(&pending).unwrap().state, ChecksState::Pending);
+        assert!(checks_from_rest_check_runs(&serde_json::json!({ "check_runs": [] })).is_none());
+        assert!(checks_from_rest_check_runs(&serde_json::json!({ "message": "Not Found" })).is_none());
+    }
+
+    #[test]
+    fn actions_run_id_reads_the_run_out_of_the_url() {
+        assert_eq!(actions_run_id("https://github.com/o/r/actions/runs/123/job/456"), Some(123));
+        assert_eq!(actions_run_id("https://github.com/o/r/actions/runs/9"), Some(9));
+        assert_eq!(actions_run_id("https://circleci.com/gh/o/r/1"), None);
+    }
+
+    #[test]
+    fn pr_checks_serialize_camel_case_and_absent_when_none() {
+        let raw = serde_json::json!({ "number": 1, "url": "u", "title": "t", "state": "open" });
+        let mut pr = crate::github::pr_from_json(&raw);
+        assert!(serde_json::to_value(&pr).unwrap().get("checks").is_none());
+        pr.checks = Some(crate::github::PrChecks {
+            state: ChecksState::Failing,
+            failing: vec![FailingCheck { name: "test".into(), run_id: Some(5) }],
+        });
+        let v = serde_json::to_value(&pr).unwrap();
+        assert_eq!(v["checks"]["state"], "failing");
+        assert_eq!(v["checks"]["failing"][0]["runId"], 5);
+    }
+
+    #[test]
+    fn failed_logs_keep_each_tail_within_the_budget() {
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("ab", 3), "ab");
+        assert_eq!(tail_chars("ñandú", 2), "dú");
+
+        let long = format!("{}FAILED here", "x".repeat(20_000));
+        let out = join_failed_logs(&[(1, long), (2, "  \n".into()), (3, "boom".into())], 8_000);
+        assert!(out.chars().count() <= 8_000);
+        assert!(out.contains("FAILED here"));
+        assert!(out.contains("run 3\nboom"));
+        assert!(!out.contains("run 2"));
+        assert_eq!(join_failed_logs(&[], 8_000), "");
     }
 }
 
@@ -2617,6 +2913,32 @@ mod pr_state_tests {
         assert_eq!(out[0].branch, "feat/a");
         assert_eq!(out[0].pr.number, 7);
         assert_eq!(out[1].branch, "feat/b");
+    }
+
+    #[test]
+    fn parse_merged_heads_keeps_the_latest_merge_per_branch() {
+        use crate::commands::parse_merged_heads;
+        let json = serde_json::json!([
+            { "number": 12, "title": "Again", "url": "https://x/12", "state": "MERGED", "isDraft": false, "headRefName": "fix/a", "headRefOid": "bbb" },
+            { "number": 4, "title": "First", "url": "https://x/4", "state": "MERGED", "isDraft": false, "headRefName": "fix/a", "headRefOid": "aaa" },
+            { "number": 5, "title": "No oid", "url": "https://x/5", "state": "MERGED", "isDraft": false, "headRefName": "fix/b" },
+            { "number": 6, "title": "No branch", "url": "https://x/6", "state": "MERGED", "isDraft": false, "headRefOid": "ccc" }
+        ]);
+        let out = parse_merged_heads(json.as_array().unwrap());
+        assert_eq!(out.len(), 1);
+        let (oid, pr) = &out["fix/a"];
+        assert_eq!(oid, "bbb");
+        assert_eq!(pr.number, 12);
+        assert_eq!(pr.state, crate::github::PrState::Merged);
+    }
+
+    #[test]
+    fn merged_and_clean_needs_the_merged_head_and_no_changes() {
+        use crate::commands::is_merged_and_clean;
+        assert!(is_merged_and_clean(Some("abc"), "abc", false));
+        assert!(!is_merged_and_clean(Some("abc"), "abc", true));
+        assert!(!is_merged_and_clean(Some("def"), "abc", false));
+        assert!(!is_merged_and_clean(None, "abc", false));
     }
 
     #[test]
@@ -2983,6 +3305,7 @@ mod runner_helpers_tests {
             refs_worktree: false,
             worktree_diff: None,
             history: None,
+            concurrent_work: None,
         }
     }
 
@@ -3123,6 +3446,7 @@ mod runner_helpers_tests {
             refs_worktree: false,
             worktree_diff: None,
             history: None,
+            concurrent_work: None,
         };
         let s = user_input_for("implement", "Add a dark-mode toggle", &input, None);
         assert!(s.contains("The plan to follow (from the plan stage):"), "{s}");
@@ -3144,6 +3468,24 @@ mod runner_helpers_tests {
         input.refs_worktree = true;
         let some = user_input_for("code_review", "T", &input, None);
         assert!(some.contains("The current code changes are present in the workspace"));
+    }
+
+    #[test]
+    fn dossier_carries_the_concurrent_work_note_only_when_set() {
+        let mut input = plan_input("plan text");
+        let none = user_input_for("implement", "T", &input, None);
+        assert!(!none.contains("concurrently changing"), "{none}");
+        input.concurrent_work = Some(
+            "Note: workspace `refund-webhooks` is concurrently changing src/billing/limits.ts. Avoid unrelated edits there."
+                .into(),
+        );
+        let some = user_input_for("implement", "T", &input, None);
+        assert!(
+            some.contains("Note: workspace `refund-webhooks` is concurrently changing src/billing/limits.ts."),
+            "{some}"
+        );
+        // Context, after the plan it complements.
+        assert!(some.find("The plan to follow").unwrap() < some.find("concurrently changing").unwrap());
     }
 
     #[test]
@@ -3274,6 +3616,7 @@ mod runner_helpers_tests {
             refs_worktree: false,
             worktree_diff: None,
             history: None,
+            concurrent_work: None,
         };
         let s = user_input_for("code_review", "T", &input, None);
         assert!(!s.contains("Context (from"));
@@ -3797,19 +4140,115 @@ mod run_crud_tests {
         mk("completed", None, "api", 2_000);
         mk("aborted", None, "api", 50_000); // not a completed run
         mk("completed", Some("high"), "api", 8_000); // another effort
-        mk_on("completed", Some("high"), "cli", "gpt-5-codex", 3_000); // Codex ignores effort
+        mk_on("completed", Some("high"), "cli", "gpt-5.5", 3_000); // Codex takes -c model_reasoning_effort
         mk("completed", Some("high"), "cli", 4_000); // Claude Code takes --effort
 
         let mut none: Vec<u64> = db.stage_token_samples("implement", None, 20).unwrap().iter().map(|s| s.input).collect();
         none.sort();
-        assert_eq!(none, vec![1_000, 2_000, 3_000]);
+        assert_eq!(none, vec![1_000, 2_000]);
         let mut high = db.stage_token_samples("implement", Some("high"), 20).unwrap();
         high.sort_by_key(|s| s.input);
-        assert_eq!(high.iter().map(|s| s.input).collect::<Vec<_>>(), vec![4_000, 8_000]);
-        assert_eq!((high[1].input, high[1].output, high[1].cache_read, high[1].cache_creation), (8_000, 800, 7, 3));
+        assert_eq!(high.iter().map(|s| s.input).collect::<Vec<_>>(), vec![3_000, 4_000, 8_000]);
+        assert_eq!((high[2].input, high[2].output, high[2].cache_read, high[2].cache_creation), (8_000, 800, 7, 3));
         assert_eq!(db.stage_token_samples("plan", None, 20).unwrap().len(), 5);
         assert_eq!(db.stage_token_samples("implement", None, 2).unwrap().len(), 2, "limit caps the samples");
         assert!(db.stage_token_samples("test", None, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_clears_the_effort_codex_stages_never_got_once() {
+        // #613: Codex CLI stages took no effort before, so a stored effort on
+        // one that already ran is false history. The upgrade clears it ONCE,
+        // only in terminal runs and judged on the model the stage last ran on —
+        // stages of a draft or paused run keep theirs (they will run with it),
+        // Claude Code and API stages are untouched, and Codex stages run after
+        // the upgrade keep their (now real) effort. Drives the real migration
+        // by re-opening the same database file (app update).
+        #[allow(clippy::too_many_arguments)]
+        fn mk_as(db: &Db, ws: &str, pid: &str, model: &str, substrate: &str, escalated_to: Option<&str>, run_status: &str, stage_status: &str, tokens: i64) -> String {
+            let run = db.create_run(ws, pid, "t", None, None, &[]).unwrap();
+            let st = db.list_run_stages(&run).unwrap();
+            db.conn_ref()
+                .execute(
+                    "UPDATE run_stages SET effort = 'high', escalate_effort = 'max', substrate = ?2, agent_model = ?3,
+                         escalate_model = ?4, escalated = ?5
+                     WHERE id = ?1",
+                    rusqlite::params![st[0].id, substrate, model, escalated_to, escalated_to.is_some()],
+                )
+                .unwrap();
+            if stage_status == "done" {
+                db.complete_run_stage(&st[0].id, "done", tokens, tokens / 10, 0, 0, 0.1, None).unwrap();
+            } else {
+                db.conn_ref()
+                    .execute("UPDATE run_stages SET status = ?2 WHERE id = ?1", rusqlite::params![st[0].id, stage_status])
+                    .unwrap();
+            }
+            if run_status != "draft" {
+                db.set_run_status(&run, run_status, matches!(run_status, "completed" | "aborted")).unwrap();
+            }
+            st[0].id.clone()
+        }
+        fn mk(db: &Db, ws: &str, pid: &str, model: &str, substrate: &str, done: bool, tokens: i64) -> String {
+            if done {
+                mk_as(db, ws, pid, model, substrate, None, "completed", "done", tokens)
+            } else {
+                mk_as(db, ws, pid, model, substrate, None, "draft", "pending", tokens)
+            }
+        }
+        let effort_of = |db: &Db, id: &str| -> (Option<String>, Option<String>) {
+            db.conn_ref()
+                .query_row("SELECT effort, escalate_effort FROM run_stages WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+        };
+        let high = || (Some("high".to_string()), Some("max".to_string()));
+        let inputs = |db: &Db, effort: Option<&str>| -> Vec<u64> {
+            let mut v: Vec<u64> = db.stage_token_samples("implement", effort, 20).unwrap().iter().map(|s| s.input).collect();
+            v.sort();
+            v
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let old_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", true, 1_000);
+        let old_o3 = mk(&db, &ws, &pid, "O3-mini", "cli", true, 2_000);
+        let claude_cli = mk(&db, &ws, &pid, "claude-sonnet-5-5", "cli", true, 4_000);
+        let codex_api = mk(&db, &ws, &pid, "gpt-5", "api", true, 8_000);
+        let pending_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", false, 0);
+        let parked_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "paused", "awaiting_checkpoint", 0);
+        let failed_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "paused", "failed", 0);
+        let claude_to_codex = mk_as(&db, &ws, &pid, "claude-sonnet-5-5", "cli", Some("gpt-5-codex"), "completed", "done", 16_000);
+        let codex_to_claude = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", Some("claude-opus-5-5"), "completed", "done", 32_000);
+        let aborted_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "aborted", "failed", 0);
+        // A pre-upgrade install: no marker yet.
+        db.conn_ref().execute("DELETE FROM app_meta WHERE key = 'codex_stage_effort_cleared_v1'", []).unwrap();
+        drop(db);
+
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(effort_of(&db, &old_codex), (None, None));
+        assert_eq!(effort_of(&db, &old_o3), (None, None));
+        assert_eq!(effort_of(&db, &claude_cli), high(), "Claude Code took --effort");
+        assert_eq!(effort_of(&db, &codex_api), high(), "the API took the effort");
+        assert_eq!(effort_of(&db, &pending_codex), high(), "a pending stage runs with it");
+        assert_eq!(effort_of(&db, &parked_codex), high(), "a budget-parked stage of a paused run runs with it");
+        assert_eq!(effort_of(&db, &failed_codex), high(), "a failed stage of a paused run can be retried with it");
+        assert_eq!(effort_of(&db, &claude_to_codex), (None, None), "it last ran on Codex");
+        assert_eq!(effort_of(&db, &codex_to_claude), high(), "it last ran on Claude Code, which took --effort");
+        assert_eq!(effort_of(&db, &aborted_codex), (None, None), "an aborted run is never resumed");
+        assert_eq!(inputs(&db, None), vec![1_000, 2_000, 16_000], "old Codex rows count as no effort");
+        assert_eq!(inputs(&db, Some("high")), vec![4_000, 8_000, 32_000]);
+
+        // A Codex stage run after the upgrade keeps its effort across launches.
+        let new_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", true, 3_000);
+        drop(db);
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(effort_of(&db, &new_codex), high(), "one-shot: never re-cleared");
+        assert_eq!(inputs(&db, Some("high")), vec![3_000, 4_000, 8_000, 32_000]);
+        assert_eq!(inputs(&db, None), vec![1_000, 2_000, 16_000]);
     }
 
     #[test]
@@ -3833,6 +4272,59 @@ mod run_crud_tests {
         assert!((r.cost_usd - 0.12).abs() < 1e-9, "{}", r.cost_usd);
         // The reference was the stale model too: its baseline scales.
         assert!((r.baseline_usd - 0.20).abs() < 1e-9, "{}", r.baseline_usd);
+    }
+
+    #[test]
+    fn a_zero_dollar_stage_flagged_usage_unreported_is_unpriced_in_the_ledger() {
+        // A stopped stage on a priced model whose streamed tokens were all on
+        // an unpriced subagent model records those tokens at $0: the ledger
+        // row reads "unpriced", never a free "computed" row.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let st = db.list_run_stages(&run).unwrap();
+        let basis = |stage: &str| -> String {
+            db.conn_ref()
+                .query_row("SELECT cost_basis FROM spend_events WHERE source_id = ?1", [stage], |r| r.get(0))
+                .unwrap()
+        };
+        db.set_run_stage_usage_unreported(&st[0].id).unwrap();
+        db.complete_run_stage(&st[0].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[0].id), "unpriced");
+        // Unflagged, the same $0 on a priced model stays "computed".
+        db.complete_run_stage(&st[1].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[1].id), "computed");
+    }
+
+    #[test]
+    fn a_rerun_after_an_unreported_attempt_is_labelled_by_its_own_usage() {
+        // #860: the sticky flag from an earlier attempt must not label a later
+        // attempt's $0-with-tokens row "unpriced".
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        let bases = || -> Vec<String> {
+            let conn = db.conn_ref();
+            let mut stmt = conn
+                .prepare("SELECT cost_basis FROM spend_events WHERE source_id = ?1 ORDER BY ts_utc")
+                .unwrap();
+            stmt.query_map([&stage], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        db.set_run_stage_status(&stage, "running").unwrap();
+        db.set_run_stage_usage_unreported(&stage).unwrap();
+        db.complete_run_stage(&stage, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The re-run reports its usage: its row is labelled by its own model.
+        db.set_run_stage_status(&stage, "running").unwrap();
+        db.complete_run_stage(&stage, "done", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(bases(), vec!["unpriced".to_string(), "computed".to_string()]);
+        assert!(db.usage_unreported_stage_ids(&run).unwrap().contains(&stage), "the stage stays flagged");
     }
 
     #[test]
@@ -3883,6 +4375,120 @@ mod run_crud_tests {
         assert_eq!(ws_tokens, 1500);
         let (global_cost, _) = db.period_spend("global", "", "daily").unwrap();
         assert!((global_cost - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stage_that_ran_on_another_model_is_attributed_to_it() {
+        // #791: Claude Code's settings ran the stage on Sonnet, not the Opus
+        // it asked for — the ledger row (Usage, savings) names what ran.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+
+        db.set_run_stage_ran_model(&stage, Some("claude-sonnet-5-5")).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.12, None).unwrap();
+        let rep = db.token_report(None).unwrap();
+        assert!(rep.cost_by_model.iter().any(|m| m.label == "claude-sonnet-5-5"), "{:?}", rep.cost_by_model);
+        assert!(!rep.cost_by_model.iter().any(|m| m.label == "claude-opus-5-5"));
+        assert_eq!(db.ran_models(&run).unwrap().get(&stage).map(String::as_str), Some("claude-sonnet-5-5"));
+        // The stage still asked for Opus.
+        assert_eq!(db.list_run_stages(&run).unwrap()[0].agent_model, "claude-opus-5-5");
+
+        // A re-run clears it; an attempt on the model it asked for records none.
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+        db.set_run_stage_ran_model(&stage, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stage_keeps_how_many_tool_calls_were_refused_until_it_reruns() {
+        // #893: the stage reads "N tool calls refused" from this count.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.refused_call_counts(&run).unwrap().is_empty());
+
+        db.set_run_stage_refused_calls(&stage, 3).unwrap();
+        assert_eq!(db.refused_call_counts(&run).unwrap().get(&stage), Some(&3));
+        // A later attempt with nothing refused clears it; so does a re-run.
+        db.set_run_stage_refused_calls(&stage, 0).unwrap();
+        assert!(db.refused_call_counts(&run).unwrap().is_empty());
+        db.set_run_stage_refused_calls(&stage, 2).unwrap();
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.refused_call_counts(&run).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stage_keeps_its_last_context_reading_until_it_restarts() {
+        // #895: the Direct context meter reads these two columns.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.stage_contexts(&run).unwrap().is_empty());
+        db.set_run_stage_status(&stage, "running").unwrap();
+        db.set_run_stage_context(&stage, 142_000, Some(200_000)).unwrap();
+        db.set_run_stage_context(&stage, 150_000, None).unwrap();
+        assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(150_000, None)), "the latest reading wins");
+        // Finishing keeps the final value (the focus pane shows it)…
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.12, None).unwrap();
+        db.set_run_stage_status(&stage, "awaiting_checkpoint").unwrap();
+        assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(150_000, None)));
+        // …a restart forgets it, and so does a re-run's reset.
+        db.set_run_stage_status(&stage, "running").unwrap();
+        assert!(db.stage_contexts(&run).unwrap().is_empty());
+        db.set_run_stage_context(&stage, 9_000, Some(1_000_000)).unwrap();
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.stage_contexts(&run).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_adds_the_stage_context_columns_to_an_older_database() {
+        // #895: a database from before the context meter has neither column;
+        // opening it adds both, nullable, and its stages read as unknown.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (run, stage) = {
+            let db = Db::open(tmp.path()).unwrap();
+            let ws = seed_workspace(&db);
+            let pid = db.insert_pipeline("P", "d", false).unwrap();
+            db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+                .unwrap();
+            let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+            let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+            db.conn_ref()
+                .execute_batch(
+                    "ALTER TABLE run_stages DROP COLUMN context_tokens;
+                     ALTER TABLE run_stages DROP COLUMN context_window;",
+                )
+                .unwrap();
+            (run, stage)
+        };
+        let db = Db::open(tmp.path()).unwrap();
+        let cols: Vec<(String, i64)> = {
+            let mut stmt = db.conn_ref().prepare("PRAGMA table_info(run_stages)").unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?))).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        for col in ["context_tokens", "context_window"] {
+            let notnull = cols.iter().find(|(n, _)| n == col).unwrap_or_else(|| panic!("{col} missing")).1;
+            assert_eq!(notnull, 0, "{col} must be nullable");
+        }
+        assert!(db.stage_contexts(&run).unwrap().is_empty(), "an older stage has no reading");
+        db.set_run_stage_context(&stage, 42_000, Some(200_000)).unwrap();
+        assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(42_000, Some(200_000))));
     }
 
     #[test]
@@ -4292,6 +4898,7 @@ mod orchestrator_tests {
             let first = !self.asked.swap(true, std::sync::atomic::Ordering::Relaxed);
             if first {
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -4309,6 +4916,7 @@ mod orchestrator_tests {
                 });
             }
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Plan,
                     text: format!("resolved <<{}>>", stage.feedback.as_deref().unwrap_or("(no feedback)")),
@@ -4334,6 +4942,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -4371,6 +4980,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Diff,
                     text: format!("did {}", stage.role),
@@ -4408,6 +5018,7 @@ mod orchestrator_tests {
         ) -> crate::error::AppResult<StageOutcome> {
             self.seen.lock().push((stage.agent_model.clone(), stage.effort));
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Diff, text: "x".into(), payload: None, refs_worktree: false },
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -4440,6 +5051,7 @@ mod orchestrator_tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: String::new(),
@@ -4706,14 +5318,43 @@ mod orchestrator_tests {
     }
 
     #[test]
-    fn try_escalate_refuses_effort_only_policy_on_codex_cli() {
-        // Codex ignores effort — an effort-only policy there must NOT burn a
-        // pointless same-tier retry (the retry would run identically).
-        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
+    fn try_escalate_accepts_effort_only_policy_on_codex_cli() {
+        // Codex takes `-c model_reasoning_effort`, so low → high is a real tier change.
+        let (db, run) = esc_run_on("cli", "gpt-5.5", Some("low"), None, Some("high"));
         let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
         let orch = orch_for(&db);
-        assert!(!orch.try_escalate(&run, &stage).unwrap(), "Codex ignores effort — no tier change, no retry");
-        assert!(!db.lock().list_run_stages(&run).unwrap()[0].escalated);
+        assert!(orch.try_escalate(&run, &stage).unwrap(), "a Codex CLI effort-only policy escalates");
+        assert!(db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn codex_escalation_judges_the_level_codex_actually_gets() {
+        // gpt-5.5 lists no `max`, so Codex gets it clamped to `xhigh`:
+        // xhigh → max runs identically.
+        let (db, run) = esc_run_on("cli", "gpt-5.5", Some("xhigh"), None, Some("max"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!crate::orchestrator::escalation_changes_tier_on(&stage, false));
+        // gpt-5.6-sol lists `max` (it is not just gpt-6*).
+        for model in ["gpt-6.1-terra", "gpt-5.6-sol"] {
+            let (db, run) = esc_run_on("cli", model, Some("xhigh"), None, Some("max"));
+            let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+            assert!(crate::orchestrator::escalation_changes_tier_on(&stage, false), "{model} lists max");
+        }
+        // A model missing from Codex's catalog gets no override at any level,
+        // so an effort-only escalation would re-run identically.
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!crate::orchestrator::escalation_changes_tier_on(&stage, false), "unknown model: no effort passes");
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "no identical retry");
+        // Escalating onto a model whose levels are known does pass the effort.
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), Some("gpt-5.5"), Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, false));
+        // An old Claude Code CLI doesn't stop Codex's effort.
+        let (db, run) = esc_run_on("cli", "gpt-5.5", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, true));
     }
 
     #[test]
@@ -4958,6 +5599,154 @@ mod orchestrator_tests {
         assert!(artifact.refs_worktree);
     }
 
+    /// A Codex stage that stalled before any `turn.completed`, through the
+    /// real stopped-stage path: `map` is the usage it streamed (none).
+    struct CodexStalledRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for CodexStalledRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            use crate::orchestrator::cli_runner::{stopped_stage, CliDialect};
+            Ok(stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &Default::default(), true))
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_stage_stopped_before_reporting_usage_is_flagged_and_journaled_once() {
+        use crate::orchestrator::cli_runner::USAGE_UNREPORTED;
+        let (db, run) = esc_run(None, None, None);
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(CodexStalledRunner));
+        assert_eq!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stage.status, "failed");
+        assert_eq!((stage.input_tokens, stage.output_tokens, stage.cost_usd), (0, 0, 0.0));
+        let flagged = db.lock().usage_unreported_stage_ids(&run).unwrap();
+        assert!(flagged.contains(&stage.id), "the stage reads usage not reported, not $0.00");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert_eq!(log.iter().filter(|e| e.contains(USAGE_UNREPORTED)).count(), 1, "{log:?}");
+        assert!(
+            log.iter().any(|e| e.contains("Stage halted — codex timed out — no output for 5 minutes\"")),
+            "the halt line keeps the cause alone: {log:?}"
+        );
+
+        // Sticky: a re-run does not erase the unknown spend of the stopped attempt.
+        db.lock().reset_run_stage(&stage.id, None, None).unwrap();
+        assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().contains(&stage.id));
+    }
+
+    #[tokio::test]
+    async fn stages_that_reported_usage_are_never_flagged_unreported() {
+        let (db, run) = esc_run(None, None, None);
+        let calls = Arc::new(Mutex::new(0));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(SessionNotSavedRunner { calls: Arc::clone(&calls) }));
+        orch.run_to_pause(&run).await.unwrap();
+        assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().is_empty());
+    }
+
+    /// A stage that finished with part of its spend unknown: `journaled` says
+    /// whether the runner already wrote why (a usage drift notice).
+    struct UnreportedDoneRunner {
+        journaled: bool,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for UnreportedDoneRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let mut out = crate::orchestrator::cli_runner::parse_cli_result(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Implemented the feature.",
+                    "session_id":"sess-ok","total_cost_usd":0.2,"usage":{"input_tokens":30,"output_tokens":9}}"#,
+                true,
+                ArtifactKind::Diff,
+                "",
+            )?;
+            out.cli.usage_unreported = true;
+            out.cli.usage_unreported_journaled = self.journaled;
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_stage_with_unknown_spend_is_journaled_once_and_a_drift_not_twice() {
+        use crate::orchestrator::cli_runner::USAGE_UNREPORTED;
+        for (journaled, generic_lines) in [(false, 1), (true, 0)] {
+            let (db, run) = esc_run(None, None, None);
+            let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(UnreportedDoneRunner { journaled }));
+            orch.run_to_pause(&run).await.unwrap();
+            let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+            assert_eq!(stage.status, "done");
+            assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().contains(&stage.id), "flagged either way");
+            let log = db.lock().list_stage_log(&stage.id).unwrap();
+            assert_eq!(log.iter().filter(|e| e.contains(USAGE_UNREPORTED)).count(), generic_lines, "{log:?}");
+        }
+    }
+
+    /// A Claude stage that ended on a hook-deferred tool call (Claude Code ≥
+    /// 2.1.319), parsed by the real parser: `line` at exit `exit_success`.
+    struct DeferredRunner {
+        line: &'static str,
+        exit_success: bool,
+        calls: Arc<Mutex<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for DeferredRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            *self.calls.lock() += 1;
+            crate::orchestrator::cli_runner::parse_cli_result(self.line, self.exit_success, ArtifactKind::Diff, "")
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_deferred_stages_halt_with_their_session_and_never_escalate() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_tool_deferred};
+        let cases: [(&'static str, bool, fn(&str) -> bool); 2] = [
+            (
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"sess-def",
+                    "total_cost_usd":0.03,"terminal_reason":"tool_deferred","deferred_tool_use":{"name":"Edit"}}"#,
+                true,
+                is_tool_deferred,
+            ),
+            (
+                r#"{"type":"result","subtype":"success","is_error":true,"result":"Edit isn't available.","session_id":"sess-def",
+                    "total_cost_usd":0.03,"terminal_reason":"tool_deferred_unavailable","deferred_tool_use":{"name":"Edit"}}"#,
+                false,
+                is_deferred_tool_unavailable,
+            ),
+        ];
+        for (line, exit_success, is_kind) in cases {
+            let (db, run) = esc_run(None, Some("strong-m"), None);
+            let calls = Arc::new(Mutex::new(0));
+            let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+            let orch = Orchestrator::new_with_runner(
+                Arc::clone(&db), sink, Box::new(DeferredRunner { line, exit_success, calls: Arc::clone(&calls) }));
+            let status = orch.run_to_pause(&run).await.unwrap();
+            assert_eq!(status, RunStatus::Paused, "{line}");
+            assert_eq!(*calls.lock(), 1, "a stronger model meets the same hook — no escalation");
+            let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+            assert_eq!(stage.status, "failed", "a deferred tool call is not a done stage");
+            assert!(!stage.escalated);
+            assert!(stage.error.as_deref().is_some_and(is_kind), "{:?}", stage.error);
+            assert_eq!(stage.session_id.as_deref(), Some("sess-def"), "Resume stays available");
+            assert!((stage.cost_usd - 0.03).abs() < 1e-9, "the spend stays on the meter");
+        }
+    }
+
     #[tokio::test]
     async fn a_blocked_stage_never_escalates_even_with_a_policy() {
         let (db, run) = esc_run(None, Some("strong-m"), None);
@@ -5186,6 +5975,7 @@ mod orchestrator_tests {
                     ask_tool_use_id: "ask-1".into(),
                 };
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5204,6 +5994,7 @@ mod orchestrator_tests {
             }
             *self.seen_transcript.lock() = stage.blocked_transcript.clone();
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "resolved".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5358,6 +6149,7 @@ mod orchestrator_tests {
                     ask_tool_use_id: String::new(),
                 };
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5371,6 +6163,7 @@ mod orchestrator_tests {
             *self.seen_transcript.lock() = Some(stage.blocked_transcript.clone());
             *self.seen_max_iterations.lock() = Some(stage.max_iterations);
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5470,6 +6263,7 @@ mod orchestrator_tests {
             let first = !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed);
             if first {
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5483,6 +6277,7 @@ mod orchestrator_tests {
             }
             *self.seen_resume.lock() = Some((stage.resume_session.clone(), stage.max_iterations));
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5521,6 +6316,127 @@ mod orchestrator_tests {
         let (resume_session, max_iterations) = seen.lock().clone().expect("second run happened");
         assert_eq!(resume_session.as_deref(), Some("sess-cli-1"), "re-run --resumes the same session");
         assert_eq!(max_iterations, 100, "+turns override reached the re-run");
+    }
+
+    /// Records `(resume session, quiet setting, the quiet variable as the CLI
+    /// spawn would set it)` per attempt; fails the first attempt with a
+    /// session so the director can `--resume` it.
+    struct QuietRecordingRunner {
+        failed: std::sync::atomic::AtomicBool,
+        seen: Arc<Mutex<Vec<(Option<String>, bool, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for QuietRecordingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            use crate::orchestrator::cli_runner::{apply_stage_env, dialect_for_model, QUIET_TRAFFIC_ENV};
+            let mut command = tokio::process::Command::new("claude");
+            apply_stage_env(&mut command, dialect_for_model(&stage.agent_model), &stage.agent_model, stage.effort, ctx.quiet_claude_code, None);
+            let var = command
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == QUIET_TRAFFIC_ENV)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+            self.seen.lock().push((stage.resume_session.clone(), ctx.quiet_claude_code, var));
+            let first = !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Plan, text: "done".into(), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: if first { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: first.then(|| crate::orchestrator::runner::unfinished_stage_error(true, 25)),
+                verdict: None,
+                session_id: Some("sess-quiet".into()),
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// #703: the quiet setting is read from `settings.json` when each stage
+    /// starts — a fresh attempt and its `--resume` both get what the file says
+    /// at that moment, and the detached worker, a separate process driving the
+    /// same `Orchestrator` over the same file, gets it the same way.
+    #[tokio::test]
+    async fn quiet_claude_code_reaches_fresh_and_resumed_stages_from_settings() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        test_settings_path::set(Some(settings.clone()));
+        std::fs::write(&settings, r#"{"quietClaudeCode":false}"#).unwrap();
+
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(QuietRecordingRunner { failed: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+
+        // The user turns the toggle on before resuming: the resumed stage sees it.
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await
+            .unwrap();
+        test_settings_path::set(None);
+        assert_eq!(status, RunStatus::Completed);
+
+        let seen = seen.lock().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (None, false, None),
+                (Some("sess-quiet".into()), true, Some("1".into())),
+            ],
+            "fresh (off) then --resume (on)",
+        );
+    }
+
+    /// #703: a detached segment — `drive_segment`, the entry point
+    /// `octopush-run-worker` calls in its own process — reads the quiet
+    /// setting from `settings.json` per stage, like the in-process drive.
+    #[tokio::test]
+    async fn quiet_claude_code_reaches_a_detached_segment_from_settings() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        test_settings_path::set(Some(settings.clone()));
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(QuietRecordingRunner { failed: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        orch.drive_segment(&run_id, false).await.unwrap();
+        // The user turns it off; the next detached segment (the resume) is loud again.
+        std::fs::write(&settings, "{}").unwrap();
+        let resumed = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await;
+        test_settings_path::set(None);
+        resumed.unwrap();
+
+        let seen = seen.lock().clone();
+        assert_eq!(seen.first(), Some(&(None, true, Some("1".into()))), "detached segment, on: {seen:?}");
+        assert_eq!(seen.get(1), Some(&(Some("sess-quiet".into()), false, None)), "resumed segment, off: {seen:?}");
     }
 
     #[test]
@@ -5657,7 +6573,7 @@ mod orchestrator_tests {
     async fn resolve_checkpoint_scoped_targets_the_passed_stage_id() {
         // Two stages parked at a gate at once (constructed by hand). `.find`
         // alone resolves the FIRST; the caller's validated `stage_id` must
-        // select the intended one, and a stale/absent id falls back to `.find`.
+        // select the intended one, and a stale id is refused (no fallback).
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
@@ -5682,10 +6598,68 @@ mod orchestrator_tests {
         assert_eq!(stages[1].status, "done", "the passed stage_id was the one resolved");
         assert_eq!(stages[0].status, "awaiting_checkpoint", "the unselected stage is untouched");
 
-        // A stale/absent id falls back to `.find` (the remaining parked stage 0).
-        orch.resolve_checkpoint_apply_only(&run_id, Some("nonexistent"), CheckpointAction::Approve).unwrap();
+        // A stale id (stage 1 was just decided) or an unknown one is refused,
+        // never redirected to the remaining parked stage 0.
+        for stale in [ids[1].as_str(), "nonexistent"] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(stale), CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
         let stages = db.lock().list_run_stages(&run_id).unwrap();
-        assert_eq!(stages[0].status, "done", "a stale id falls back to the single parked stage");
+        assert_eq!(stages[0].status, "awaiting_checkpoint", "the other gate stays waiting");
+        // No id keeps the single-parked rule.
+        orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done", "no id resolves the single parked stage");
+    }
+
+    /// An abort leaves the parked stage at `awaiting_checkpoint`. A late
+    /// decision on that run (a Send-back from Review's comment tray, a stale
+    /// Approve) is refused and changes nothing; only Abort still passes.
+    #[tokio::test]
+    async fn a_decision_on_a_finished_run_is_refused_and_changes_nothing() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "review", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let art = serde_json::to_string(&StageArtifact {
+            kind: ArtifactKind::Note, text: "findings".into(), payload: None, refs_worktree: false,
+        }).unwrap();
+        db.lock().set_run_stage_status(&id, "running").unwrap();
+        db.lock().complete_run_stage(&id, "awaiting_checkpoint", 0, 0, 0, 0, 0.0, Some(&art)).unwrap();
+        db.lock().set_run_status(&run_id, "paused", false).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        // A run that is still waiting accepts decisions.
+        assert!(orch.check_run_open(&run_id, &CheckpointAction::Approve).is_ok());
+
+        for ended in ["aborted", "completed", "failed"] {
+            db.lock().set_run_status(&run_id, ended, true).unwrap();
+            let actions = || [
+                CheckpointAction::Approve,
+                CheckpointAction::SendBack { feedback: Some("change this".into()) },
+                CheckpointAction::Reject { feedback: None, model_override: None, max_turns_override: None },
+                CheckpointAction::Resume { max_turns_override: None },
+            ];
+            for action in actions() {
+                let err = orch.check_run_open(&run_id, &action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            for action in actions() {
+                let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&id), action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            let err = orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            let stage = db.lock().list_run_stages(&run_id).unwrap().remove(0);
+            assert_eq!(stage.status, "awaiting_checkpoint", "the parked stage is untouched");
+            assert_eq!(stage.artifact.as_deref(), Some(art.as_str()), "its hand-off is kept");
+            assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, ended, "the run stays {ended}");
+            // Abort tears the run down whatever its state.
+            assert!(orch.check_run_open(&run_id, &CheckpointAction::Abort).is_ok());
+        }
+        assert_eq!(orch.resolve_checkpoint_apply_only(&run_id, Some(&id), CheckpointAction::Abort).unwrap(), None);
     }
 
     #[test]
@@ -5808,6 +6782,7 @@ mod orchestrator_tests {
             let kind = stage.artifact_kind.clone();
             let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind,
                     text: format!("{} output", stage.role),
@@ -5864,6 +6839,101 @@ mod orchestrator_tests {
         assert_eq!(kinds, vec![ArtifactKind::Plan, ArtifactKind::Review]);
         assert!(input.sections[0].text.contains("plan output"));
         assert!(input.sections[1].text.contains("plan_review output"));
+    }
+
+    /// Collision radar, phase 2 (#732): a code-writing stage hears which other
+    /// live workspaces change its files; a planning stage, a workspace whose
+    /// only overlap is a lockfile, and an archived peer add nothing.
+    #[tokio::test]
+    async fn implement_hears_about_overlapping_workspaces_only() {
+        use std::process::Command;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t.dev"]);
+        git(&root, &["config", "user.name", "T"]);
+        std::fs::write(root.join("src/limits.ts"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("README.md"), "readme\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "base"]);
+        let names = ["auth-flow", "refund-webhooks", "docs-pass", "old-lane"];
+        for n in names {
+            let p = dir.path().join(n);
+            git(&root, &["worktree", "add", "-q", "-b", n, p.to_str().unwrap(), "main"]);
+            git(&p, &["config", "user.email", "t@t.dev"]);
+            git(&p, &["config", "user.name", "T"]);
+        }
+        let wt = |n: &str| dir.path().join(n);
+        // auth-flow (the runs' workspace): uncommitted edits, as crews leave them.
+        std::fs::write(wt("auth-flow").join("src/limits.ts"), "ONE\ntwo\n").unwrap();
+        std::fs::write(wt("auth-flow").join("package-lock.json"), "{\"a\":1}\n").unwrap();
+        // refund-webhooks: committed work on the same file.
+        std::fs::write(wt("refund-webhooks").join("src/limits.ts"), "one\nTWO\n").unwrap();
+        git(&wt("refund-webhooks"), &["commit", "-qam", "limits"]);
+        // docs-pass: only the lockfile in common.
+        std::fs::write(wt("docs-pass").join("README.md"), "docs\n").unwrap();
+        std::fs::write(wt("docs-pass").join("package-lock.json"), "{\"d\":1}\n").unwrap();
+        // old-lane: the same file, but archived.
+        std::fs::write(wt("old-lane").join("src/limits.ts"), "old\n").unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P',?1,?2,?2)",
+            rusqlite::params![root.to_str().unwrap(), now]).unwrap();
+        for n in names {
+            db.conn_ref().execute(
+                "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,from_branch,created_at,last_active)
+                 VALUES (?1,'p1',?2,?2,?3,'main',?4,?4)",
+                rusqlite::params![format!("ws-{n}"), n, wt(n).to_str().unwrap(), now]).unwrap();
+        }
+        db.conn_ref().execute("UPDATE workspaces SET status = 'archived' WHERE id = 'ws-old-lane'", []).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+
+        let drive = |ws: &'static str| {
+            let db = Arc::clone(&db);
+            let pid = pid.clone();
+            async move {
+                let run_id = db.lock().create_run(ws, &pid, "task", None, None, &[]).unwrap();
+                let seen = Arc::new(Mutex::new(vec![]));
+                let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+                let orch = Orchestrator::new_with_runner(
+                    Arc::clone(&db),
+                    sink,
+                    Box::new(RecordingRunner { seen: Arc::clone(&seen) }),
+                );
+                assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+                let mut out = Vec::new();
+                std::mem::swap(&mut out, &mut *seen.lock());
+                out
+            }
+        };
+
+        let seen = drive("ws-auth-flow").await;
+        assert_eq!(seen[0].0, "plan");
+        assert_eq!(seen[0].1.concurrent_work, None, "planning stages hear nothing");
+        assert_eq!(seen[1].0, "implement");
+        let note = seen[1].1.concurrent_work.clone().expect("implement hears about refund-webhooks");
+        assert_eq!(
+            note,
+            "Note: workspace `refund-webhooks` is concurrently changing src/limits.ts. Avoid unrelated edits there."
+        );
+
+        // docs-pass shares only the lockfile with auth-flow: nothing to say.
+        let seen = drive("ws-docs-pass").await;
+        assert_eq!(seen[1].0, "implement");
+        assert_eq!(seen[1].1.concurrent_work, None);
     }
 
     /// Two producers of the same kind: BOTH survive into the dossier — the
@@ -6027,6 +7097,116 @@ mod orchestrator_tests {
         assert_eq!(outcome, SegmentSpawn::AlreadyRunning);
         // The original lease is untouched — no clobber, no clear.
         assert!(db.lock().beat_worker_lease(&run_id, "w1").unwrap(), "w1 still owns the lease");
+    }
+
+    /// Records every (event, payload) pair a sink is handed.
+    #[derive(Default)]
+    struct PayloadSink {
+        events: Mutex<Vec<(String, Value)>>,
+    }
+    impl EventSink for PayloadSink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.events.lock().push((event.to_string(), payload));
+        }
+    }
+    impl PayloadSink {
+        fn take(&self, event: &str) -> Vec<Value> {
+            let mut all = self.events.lock();
+            let out = all.iter().filter(|(e, _)| e == event).map(|(_, p)| p.clone()).collect();
+            all.clear();
+            out
+        }
+    }
+
+    /// #895: a Claude stage's context reading goes through `PersistingSink`
+    /// onto its stage row (never the journal) and on to the app; for a
+    /// detached run, whose worker has a null live sink, the app's bridge
+    /// re-emits each change it reads back from the row — and a restart's
+    /// cleared reading too.
+    #[tokio::test]
+    async fn a_stage_context_reading_is_kept_on_its_row_and_relayed_for_a_detached_run() {
+        use crate::orchestrator::live::{LiveEmitter, RUN_CONTEXT_EVENT};
+        use crate::orchestrator::persist::PersistingSink;
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PCTX", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+        db.lock().set_run_status(&run_id, "running", false).unwrap();
+        assert!(db.lock().stage_contexts(&run_id).unwrap().is_empty(), "no reading before the first message");
+
+        // In process: the row keeps it, the app hears it, the journal doesn't.
+        let app = Arc::new(PayloadSink::default());
+        let in_process = PersistingSink::new(app.clone(), Arc::clone(&db));
+        LiveEmitter::new(&in_process, &run_id, &stage_id).context(142_000, Some(200_000));
+        assert_eq!(db.lock().stage_contexts(&run_id).unwrap().get(&stage_id), Some(&(142_000, Some(200_000))));
+        assert!(db.lock().list_stage_log(&stage_id).unwrap().is_empty(), "a reading is not a journal entry");
+        let fwd = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0]["stageId"], stage_id.as_str());
+        assert_eq!(fwd[0]["contextTokens"], 142_000);
+        assert_eq!(fwd[0]["contextWindow"], 200_000);
+
+        // Detached: a live worker owns the run; its sink reaches nobody.
+        assert!(db.lock().reserve_worker_lease(&run_id, "w1").unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "w1", std::process::id() as i64).unwrap());
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            app.clone(),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        );
+        orch.prime_detached_watch(&run_id);
+        orch.bridge_tick().unwrap();
+        assert!(app.take(RUN_CONTEXT_EVENT).is_empty(), "the primed reading is already the app's (get_run)");
+
+        let worker = PersistingSink::new(Arc::new(PayloadSink::default()), Arc::clone(&db));
+        LiveEmitter::new(&worker, &run_id, &stage_id).context(190_000, Some(200_000));
+        orch.bridge_tick().unwrap();
+        let relayed = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(relayed.len(), 1, "{relayed:?}");
+        assert_eq!(relayed[0]["runId"], run_id.as_str());
+        assert_eq!(relayed[0]["stageId"], stage_id.as_str());
+        assert_eq!(relayed[0]["contextTokens"], 190_000);
+        assert_eq!(relayed[0]["contextWindow"], 200_000);
+        // Unchanged: nothing more. An unknown window relays as null.
+        orch.bridge_tick().unwrap();
+        assert!(app.take(RUN_CONTEXT_EVENT).is_empty());
+        LiveEmitter::new(&worker, &run_id, &stage_id).context(12_000, None);
+        orch.bridge_tick().unwrap();
+        let relayed = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(relayed.len(), 1);
+        assert_eq!(relayed[0]["contextTokens"], 12_000);
+        assert!(relayed[0]["contextWindow"].is_null());
+        // The stage restarts: its reading is gone, and the app is told.
+        db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+        orch.bridge_tick().unwrap();
+        let relayed = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(relayed.len(), 1);
+        assert!(relayed[0]["contextTokens"].is_null(), "{relayed:?}");
+    }
+
+    /// #895: a stage (re)start forgets the last attempt's reading on the row
+    /// AND tells the app so (a cleared `run://context`), so an in-process
+    /// run's newest reading is never the previous attempt's.
+    #[tokio::test]
+    async fn a_stage_start_clears_its_context_reading_and_tells_the_app() {
+        use crate::orchestrator::live::RUN_CONTEXT_EVENT;
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PCTX2", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().set_run_stage_context(&stage_id, 150_000, Some(200_000)).unwrap();
+        let app = Arc::new(PayloadSink::default());
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(app.clone(), Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(CostRunner { cost: 0.0 }));
+        orch.run_to_pause(&run_id).await.unwrap();
+        assert!(db.lock().stage_contexts(&run_id).unwrap().is_empty());
+        let cleared = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert_eq!(cleared[0]["stageId"], stage_id.as_str());
+        assert!(cleared[0]["contextTokens"].is_null());
     }
 
     /// H4 guard: `rerun_from_stage` must refuse while a detached worker holds
@@ -6548,6 +7728,73 @@ mod orchestrator_tests {
         assert_eq!(classify_setup_exit(Some(0), "warnings"), Ok(()));
     }
 
+    /// A Routine's headless setup gets Conductor's variables passed to it.
+    #[tokio::test]
+    async fn routine_setup_script_sees_conductor_variables() {
+        use crate::routines::run_setup_with_env;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        let script = r#"test "$CONDUCTOR_ROOT_PATH:$CONDUCTOR_WORKSPACE_PATH:$CONDUCTOR_WORKSPACE_NAME" = "/repo:/wt/a:a""#;
+        assert_eq!(run_setup_with_env(script, dir.path(), Duration::from_secs(5), "/usr/bin:/bin", &env).await, Ok(()));
+    }
+
+    /// #703: with "Quiet Claude Code in crews and Routines" on, a Routine's own
+    /// commands — its fire condition and the fresh worktree's setup script —
+    /// run with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, so a `claude`
+    /// they start is quiet like the Routine's crew stages. Off sets nothing.
+    #[tokio::test]
+    async fn routine_commands_get_the_quiet_variable_only_when_on() {
+        use crate::routines::{evaluate_condition_with_env, routine_quiet_env, run_setup_with_env, ConditionEval};
+        use std::time::Duration;
+        assert_eq!(
+            routine_quiet_env(true),
+            vec![("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string())],
+        );
+        assert!(routine_quiet_env(false).is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/usr/bin:/bin";
+        let t = Duration::from_secs(5);
+        let is_quiet = r#"test "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-unset}" = 1"#;
+        let not_set = r#"test "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-unset}" = unset"#;
+        // Fire condition.
+        assert_eq!(evaluate_condition_with_env(is_quiet, dir.path(), t, path, &routine_quiet_env(true)).await, ConditionEval::Met);
+        // Off adds nothing (checked only when the test runner doesn't export it).
+        let inherited = std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_some();
+        if !inherited {
+            assert_eq!(evaluate_condition_with_env(is_quiet, dir.path(), t, path, &routine_quiet_env(false)).await, ConditionEval::NotMet);
+        }
+        // Setup script, beside Conductor's variables.
+        let mut env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        env.extend(routine_quiet_env(true));
+        let both = format!(r#"{is_quiet} && test "$CONDUCTOR_WORKSPACE_NAME" = a"#);
+        assert_eq!(run_setup_with_env(&both, dir.path(), t, path, &env).await, Ok(()));
+        let mut env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        env.extend(routine_quiet_env(false));
+        if !inherited {
+            assert_eq!(run_setup_with_env(not_set, dir.path(), t, path, &env).await, Ok(()));
+        }
+    }
+
+    /// #703: Run terminals are the user's own sessions — the quiet setting
+    /// never reaches their PTY env, even with it on.
+    #[test]
+    fn run_terminal_env_is_untouched_by_quiet_claude_code() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+        test_settings_path::set(Some(settings));
+        assert!(crate::settings::quiet_claude_code(), "the toggle is on");
+        let guard = crate::context_guard::ContextGuard::auto_configure("s1", dir.path());
+        let env = crate::commands::run_terminal_env(&guard, "claude-sonnet-5");
+        test_settings_path::set(None);
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), "{env:?}");
+        assert!(!env.keys().any(|k| k.starts_with("CLAUDE_CODE_")), "no stage pins in a Run terminal: {env:?}");
+        assert_eq!(env.get("OCTOPUSH_MODEL").map(String::as_str), Some("claude-sonnet-5"));
+    }
+
     /// A failed setup only discards a worktree the fire just created — never an
     /// adopted, reused or restored checkout.
     #[test]
@@ -6589,6 +7836,20 @@ mod orchestrator_tests {
         assert!(!marker.exists(), "the backgrounded child must die with the group");
     }
 
+    /// The Conductor prefill reads only the project's own checkout, by id, and
+    /// only while the project has no setup template.
+    #[test]
+    fn conductor_setup_root_comes_from_the_project_row() {
+        use crate::commands::conductor_setup_root;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-cond", "P", "/tmp/octo-cond-p").unwrap();
+        assert_eq!(conductor_setup_root(&db, "p-cond").unwrap().as_deref(), Some("/tmp/octo-cond-p"));
+        assert_eq!(conductor_setup_root(&db, "missing").unwrap(), None);
+        db.set_project_setup_script("p-cond", "npm ci").unwrap();
+        assert_eq!(conductor_setup_root(&db, "p-cond").unwrap(), None);
+    }
+
     /// The project's setup-script template round-trips through the DB (the
     /// wizard writes it; a fresh routine reads it).
     #[test]
@@ -6600,6 +7861,211 @@ mod orchestrator_tests {
         db.set_project_setup_script("p-setup", "npm install").unwrap();
         assert_eq!(db.get_project_setup_script("p-setup").unwrap(), "npm install");
         assert_eq!(db.get_project_setup_script("missing").unwrap(), "");
+    }
+
+    /// "Share with new missions" is opt-in, round-trips through the DB, and
+    /// keeps only the allowed names whatever the caller sends.
+    #[test]
+    fn project_share_round_trips_sanitized() {
+        use crate::worktree_share::ShareSpec;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-share", "P", "/tmp/octo-share-p").unwrap();
+        assert!(db.get_project_share("p-share").unwrap().is_empty());
+        let sent = ShareSpec {
+            link: vec!["node_modules".into(), "target".into()],
+            copy: vec![".env".into(), "../id_rsa".into()],
+        };
+        db.set_project_share("p-share", &sent).unwrap();
+        assert_eq!(
+            db.get_project_share("p-share").unwrap(),
+            ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] }
+        );
+        db.set_project_share("p-share", &ShareSpec::default()).unwrap();
+        assert!(db.get_project_share("p-share").unwrap().is_empty());
+        assert!(db.get_project_share("missing").unwrap().is_empty());
+    }
+
+    /// Only a freshly created worktree borrows from the main checkout; the
+    /// main checkout itself and a reused workspace are never touched.
+    #[cfg(unix)]
+    #[test]
+    fn sharing_applies_only_to_a_fresh_worktree() {
+        use crate::commands::share_into_fresh_worktree;
+        use crate::workspace::CreateOutcome;
+        use crate::worktree_share::ShareSpec;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let wt = root.parent().unwrap().join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "m", wt.to_str().unwrap()]);
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(db_file.path()).unwrap());
+        let root_s = root.to_string_lossy().into_owned();
+        db.lock().insert_project("p", "P", &root_s).unwrap();
+        db.lock()
+            .set_project_share("p", &ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] })
+            .unwrap();
+        let row = |path: &std::path::Path| crate::db::WorkspaceRow {
+            id: "w".into(),
+            project_id: "p".into(),
+            name: "m".into(),
+            task: String::new(),
+            branch: "m".into(),
+            worktree_path: Some(path.to_string_lossy().into_owned()),
+            setup_script: String::new(),
+            status: "active".into(),
+            created_at: String::new(),
+            last_active: String::new(),
+            glyph: None,
+            tint: None,
+            test_command: None,
+            linked_issue_key: None,
+            from_branch: None,
+            group_id: None,
+        };
+        for outcome in [CreateOutcome::Existed, CreateOutcome::Restored, CreateOutcome::Adopted] {
+            assert!(share_into_fresh_worktree(&db, outcome, "p", &root_s, &row(&wt), "none").is_none());
+        }
+        assert!(share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &row(&root), "none").is_none());
+        assert!(!wt.join(".env").exists());
+        let out = share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &row(&wt), "none").unwrap();
+        assert_eq!(out.summary().as_deref(), Some("linked node_modules · copied .env"));
+    }
+
+    /// A mission created with Execution = none and switched to sandbox later
+    /// gives back what it was given: its links (the sandbox would refuse
+    /// reads and writes through them) and its untouched env copy (a
+    /// sandboxed stage could read it).
+    #[cfg(unix)]
+    #[test]
+    fn switching_a_mission_to_sandbox_takes_back_what_was_shared() {
+        use crate::commands::{share_into_fresh_worktree, unshare_for_sandbox, unshared_sentences};
+        use crate::workspace::CreateOutcome;
+        use crate::worktree_share::ShareSpec;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let wt = root.parent().unwrap().join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "m", wt.to_str().unwrap()]);
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(db_file.path()).unwrap());
+        let root_s = root.to_string_lossy().into_owned();
+        let wt_s = wt.to_string_lossy().into_owned();
+        db.lock().insert_project("p", "P", &root_s).unwrap();
+        db.lock().insert_workspace("w", "p", "m", "", "m", Some(wt_s.as_str()), "", None).unwrap();
+        db.lock()
+            .set_project_share("p", &ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] })
+            .unwrap();
+        let ws = db.lock().get_workspace("w").unwrap().unwrap();
+        let out = share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &ws, "none").unwrap();
+        assert_eq!(out.linked, vec!["node_modules".to_string()]);
+
+        // Later, Execution becomes sandbox (the launcher's one-click).
+        let done = unshare_for_sandbox(&db, Some("w"));
+        assert_eq!(done.unlinked, vec!["node_modules".to_string()]);
+        assert_eq!(done.uncopied, vec![".env".to_string()]);
+        assert!(done.kept.is_empty());
+        assert_eq!(
+            unshared_sentences(&done),
+            vec![
+                "node_modules: link removed in a sandboxed mission".to_string(),
+                ".env: copy removed in a sandboxed mission".to_string(),
+            ]
+        );
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(root.join("node_modules").is_dir(), "the main checkout keeps its folder");
+        assert!(!wt.join(".env").exists(), "the untouched copy leaves the sandboxed worktree");
+        assert_eq!(std::fs::read_to_string(root.join(".env")).unwrap(), "A=1\n", "the main checkout keeps its file");
+        // Nothing left to take back, and a mission with no workspace has none.
+        assert!(unshare_for_sandbox(&db, Some("w")).is_empty());
+        assert!(unshare_for_sandbox(&db, None).is_empty());
+    }
+
+    /// A sandboxed mission's fresh worktree gets neither links nor env copies.
+    #[cfg(unix)]
+    #[test]
+    fn a_sandboxed_mission_shares_nothing_into_its_worktree() {
+        use crate::commands::share_into_fresh_worktree;
+        use crate::workspace::CreateOutcome;
+        use crate::worktree_share::ShareSpec;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let wt = root.parent().unwrap().join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "m", wt.to_str().unwrap()]);
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(db_file.path()).unwrap());
+        let root_s = root.to_string_lossy().into_owned();
+        let wt_s = wt.to_string_lossy().into_owned();
+        db.lock().insert_project("p", "P", &root_s).unwrap();
+        db.lock().insert_workspace("w", "p", "m", "", "m", Some(wt_s.as_str()), "", None).unwrap();
+        db.lock()
+            .set_project_share("p", &ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] })
+            .unwrap();
+        let ws = db.lock().get_workspace("w").unwrap().unwrap();
+        let out = share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &ws, "sandbox").unwrap();
+        assert_eq!(out.summary(), None);
+        assert_eq!(
+            out.skipped,
+            vec![
+                "node_modules: not linked in a sandboxed mission".to_string(),
+                ".env: not copied into a sandboxed mission".to_string(),
+            ]
+        );
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(!wt.join(".env").exists());
     }
 
     /// The condition runs with the PATH it's given (the login-shell PATH in
@@ -6682,6 +8148,104 @@ mod orchestrator_tests {
         // must have prevented it.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!marker.exists(), "the backgrounded child must be killed with the group");
+    }
+
+    /// #731: a crew on Claude Code whose plan is at its wall skips the window
+    /// honestly — no worktree, no setup, no run, no tokens — and says until when.
+    #[tokio::test]
+    async fn routine_skips_while_the_claude_plan_is_rejected() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::{FireOutcome, SkipReason};
+        let (db, ws) = db_with_workspace();
+        let cli = db.lock().insert_pipeline("RCli", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&cli, 0, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let resets = chrono::Utc::now().timestamp() + 3_600;
+        let wall = PlanWindow {
+            kind: "five_hour".into(), utilization: None, resets_at: Some(resets),
+            status: Some("rejected".into()), overage_status: Some("rejected".into()), using_overage: false,
+        };
+        crate::claude_plan::record(&db.lock(), &[wall], &chrono::Utc::now().to_rfc3339()).unwrap();
+        let past = "2000-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-plan", &routine_input(&cli, "interval", "3600"), Some(past), true).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink.clone(),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = Arc::clone(&orch).run_routine_now("r-plan").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped(SkipReason::PlanLimit { resets_at: resets }));
+        assert_eq!(SkipReason::PlanLimit { resets_at: resets }.token(), "plan_limit");
+        assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "no run while the plan is rejected");
+        assert!(
+            !sink.events.lock().iter().any(|e| e == crate::routines::ROUTINE_PHASE_EVENT),
+            "skipped before any condition, workspace or setup phase",
+        );
+        let r = db.lock().get_routine("r-plan").unwrap().unwrap();
+        assert!(r.last_outcome.as_deref().unwrap_or_default().starts_with("plan limit · resets "), "{:?}", r.last_outcome);
+
+        // An API-only crew isn't stopped by a Claude plan.
+        let api = db.lock().insert_pipeline("RApi", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&api, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_routine("r-api", &routine_input(&api, "interval", "3600"), Some(past), true).unwrap();
+        let outcome = orch.run_routine_now("r-api").await.unwrap();
+        assert!(!matches!(outcome, FireOutcome::Skipped(SkipReason::PlanLimit { .. })), "{outcome:?}");
+    }
+
+    #[test]
+    fn plan_wall_needs_a_claude_code_stage_and_a_future_uncovered_rejection() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::plan_wall;
+        let now = 1_793_540_000;
+        let w = |status: &str, resets: i64, overage: bool| PlanWindow {
+            kind: "five_hour".into(), utilization: None, resets_at: Some(resets),
+            status: Some(status.into()), overage_status: None, using_overage: overage,
+        };
+        let claude = vec![("cli".to_string(), "claude-sonnet-5".to_string())];
+        assert_eq!(plan_wall(&claude, &[w("rejected", now + 60, false)], now), Some(now + 60));
+        assert_eq!(plan_wall(&claude, &[w("rejected", now - 60, false)], now), None, "already reset");
+        assert_eq!(plan_wall(&claude, &[w("rejected", now + 60, true)], now), None, "extra usage covers it");
+        assert_eq!(plan_wall(&claude, &[w("allowed_warning", now + 60, false)], now), None);
+        let latest = [w("rejected", now + 60, false), w("rejected", now + 600, false)];
+        assert_eq!(plan_wall(&claude, &latest, now), Some(now + 600), "waits for the last wall");
+        let codex = vec![("cli".to_string(), "gpt-5.5-codex".to_string())];
+        assert_eq!(plan_wall(&codex, &[w("rejected", now + 60, false)], now), None, "Codex isn't on a Claude plan");
+        let api = vec![("api".to_string(), "claude-sonnet-5".to_string())];
+        assert_eq!(plan_wall(&api, &[w("rejected", now + 60, false)], now), None, "API stages aren't on the plan");
+    }
+
+    #[test]
+    fn plan_wall_is_model_aware_and_ignores_a_stale_snapshot() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::{fresh_plan_windows, plan_wall, PLAN_WALL_MAX_AGE_SECS};
+        let now = 1_793_540_000;
+        let w = |kind: &str| PlanWindow {
+            kind: kind.into(), utilization: None, resets_at: Some(now + 3_600),
+            status: Some("rejected".into()), overage_status: None, using_overage: false,
+        };
+        let crew = |model: &str| vec![("cli".to_string(), model.to_string())];
+        // A rejected Opus week doesn't skip a Sonnet crew…
+        assert_eq!(plan_wall(&crew("claude-sonnet-5"), &[w("seven_day_opus")], now), None);
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("seven_day_opus")], now), None);
+        // …but does skip an Opus one (and `opusplan`, which plans on Opus).
+        assert_eq!(plan_wall(&crew("claude-opus-5-5"), &[w("seven_day_opus")], now), Some(now + 3_600));
+        assert_eq!(plan_wall(&crew("opusplan"), &[w("seven_day_opus")], now), Some(now + 3_600));
+        // A mixed crew meets it through its Opus stage.
+        let mixed = vec![("cli".to_string(), "sonnet".to_string()), ("cli".to_string(), "opus".to_string())];
+        assert_eq!(plan_wall(&mixed, &[w("seven_day_opus")], now), Some(now + 3_600));
+        // The shared windows apply to every model.
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("seven_day")], now), Some(now + 3_600));
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("five_hour")], now), Some(now + 3_600));
+
+        let at = |secs_ago: i64| chrono::DateTime::from_timestamp(now - secs_ago, 0).unwrap().to_rfc3339();
+        let snaps = vec![
+            crate::claude_plan::PlanSnapshot { window: w("five_hour"), seen_at: at(60) },
+            crate::claude_plan::PlanSnapshot { window: w("seven_day"), seen_at: at(PLAN_WALL_MAX_AGE_SECS + 1) },
+            crate::claude_plan::PlanSnapshot { window: w("seven_day_opus"), seen_at: "not a time".into() },
+        ];
+        let fresh = fresh_plan_windows(&snaps, now);
+        assert_eq!(fresh.iter().map(|w| w.kind.as_str()).collect::<Vec<_>>(), ["five_hour"], "stale and unreadable dropped");
     }
 
     /// A condition that exits 1 skips the window with NO run created (zero
@@ -7144,6 +8708,7 @@ mod orchestrator_tests {
             }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.01,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -7335,6 +8900,7 @@ mod orchestrator_tests {
         ) -> crate::error::AppResult<StageOutcome> {
             self.seen.lock().push((stage.position, input.clone()));
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -7597,27 +9163,26 @@ mod orchestrator_tests {
     }
 
     /// The target's feedback column receives the composed findings+note before
-    /// the re-run starts (checked mid-flight via the archive-free path: a fresh
-    /// loop with no auto-drive). Uses loop_back's persisted effect directly.
+    /// the re-run starts. Checked through the apply-only path, which makes the
+    /// loop-back's changes and leaves the re-drive to its caller, so the
+    /// pending target still holds its feedback. (A send-back on an aborted run,
+    /// which this test once used to skip the re-drive, is refused.)
     #[tokio::test]
     async fn send_back_target_feedback_column_gets_composed_findings() {
         let (orch, run_id, db) = looped_run(1);
         orch.run_to_pause(&run_id).await.unwrap();
-        // Stop the re-drive from consuming the feedback: abort the run after
-        // the loop-back by checking the column straight after resolve starts is
-        // racy — instead mark the run aborted so resolve_checkpoint's re-drive
-        // is a no-op and the pending target keeps its feedback.
-        db.lock().set_run_status(&run_id, "aborted", true).unwrap();
-        orch.resolve_checkpoint(
+        let redrive = orch.resolve_checkpoint_apply_only(
             &run_id,
+            None,
             CheckpointAction::SendBack { feedback: Some("polish".into()) },
-        ).await.unwrap();
+        ).unwrap();
+        assert!(redrive.is_some(), "the run wants driving again");
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(
             stages[0].feedback.as_deref(),
             Some("did code_review\n\nDirector's note: polish"),
         );
-        assert_eq!(stages[0].status, "pending"); // reset, not re-run (aborted)
+        assert_eq!(stages[0].status, "pending"); // reset, not yet re-run
     }
 
     /// A runner whose review-role output carries a verdict; everything else Done.
@@ -7629,6 +9194,7 @@ mod orchestrator_tests {
             let is_review = matches!(stage.role.as_str(), "code_review" | "verify");
             let text = if is_review && !self.verdict.is_empty() { format!("findings\nVERDICT: {}", self.verdict) } else { "did it".into() };
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Note, text: text.clone(), payload: None, refs_worktree: false },
                 input_tokens: 10, output_tokens: 2, cost_usd: 0.01,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -7706,6 +9272,177 @@ mod orchestrator_tests {
         // One normal loop + one escalated loop, then the gate.
         assert_eq!(stages[1].loop_iterations, 2);
         assert_eq!(stages[1].status, "awaiting_checkpoint");
+    }
+
+    /// #682: a Codex CLI writer looped back by a review sees, per run, the
+    /// session it is asked to resume, the baseline and the feedback. Its
+    /// first run reports a session and (when `report_total`) its total.
+    struct CodexLoopRunner {
+        report_total: bool,
+        reviews: std::sync::atomic::AtomicUsize,
+        seen: Arc<Mutex<Vec<(Option<String>, Option<crate::orchestrator::types::SessionUsage>, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for CodexLoopRunner {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext)
+            -> crate::error::AppResult<StageOutcome> {
+            let total = crate::orchestrator::types::SessionUsage { input_tokens: 900, output_tokens: 90, cache_read_tokens: 0, cache_creation_tokens: 0 };
+            let review = stage.role == "code_review";
+            let text = if review {
+                let n = self.reviews.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 { "fix the parser\nVERDICT: CHANGES_REQUESTED".to_string() } else { "ok\nVERDICT: PASS".to_string() }
+            } else {
+                self.seen.lock().push((stage.resume_session.clone(), stage.resume_baseline, stage.feedback.clone()));
+                "did it".to_string()
+            };
+            let mut cli: crate::orchestrator::types::CliOutcomeMeta = Default::default();
+            if !review && self.report_total {
+                cli.session_usage = Some(total);
+            }
+            Ok(StageOutcome {
+                cli,
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: text.clone(), payload: None, refs_worktree: false },
+                input_tokens: 10, output_tokens: 2, cost_usd: 0.01,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: crate::orchestrator::runner::parse_verdict(&text),
+                session_id: if review { None } else { Some("thr-1".into()) },
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    fn codex_loop_run(report_total: bool) -> (Orchestrator, String, Arc<Mutex<Db>>, Arc<Mutex<Vec<(Option<String>, Option<crate::orchestrator::types::SessionUsage>, Option<String>)>>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("CodexLoop", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "gpt-5.5", "cli", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, Some(0), 2, Some("auto"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(CodexLoopRunner { report_total, reviews: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        (orch, run_id, db, seen)
+    }
+
+    #[tokio::test]
+    async fn codex_writer_resumes_its_session_on_a_review_loop_back() {
+        let (orch, run_id, _db, seen) = codex_loop_run(true);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 2, "implement ran twice");
+        assert_eq!(seen[0].0, None, "first run is fresh");
+        assert_eq!(seen[1].0.as_deref(), Some("thr-1"), "the loop-back resumes the session");
+        assert_eq!(seen[1].1.map(|u| u.input_tokens), Some(900), "with the session's reported total as baseline");
+        assert!(seen[1].2.as_deref().unwrap_or_default().contains("fix the parser"), "the findings ride along");
+    }
+
+    #[tokio::test]
+    async fn codex_writer_without_a_reported_total_reruns_fresh_on_a_loop_back() {
+        let (orch, run_id, _db, seen) = codex_loop_run(false);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].0, None, "no baseline: its cost couldn't be counted, so no resume");
+        assert!(seen[1].2.as_deref().unwrap_or_default().contains("fix the parser"));
+    }
+
+    /// Review fix on #682: a 3-stage window run on [`CodexWindowRunner`]
+    /// records, per writer run, its role and the session it was asked to
+    /// resume. Every writer reports `thr-<role>` and its total.
+    struct CodexWindowRunner {
+        reviews: std::sync::atomic::AtomicUsize,
+        seen: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for CodexWindowRunner {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext)
+            -> crate::error::AppResult<StageOutcome> {
+            let review = stage.role == "code_review";
+            let text = if review {
+                let n = self.reviews.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 { "fix the parser\nVERDICT: CHANGES_REQUESTED".to_string() } else { "ok\nVERDICT: PASS".to_string() }
+            } else {
+                self.seen.lock().push((stage.role.clone(), stage.resume_session.clone()));
+                "did it".to_string()
+            };
+            let mut cli: crate::orchestrator::types::CliOutcomeMeta = Default::default();
+            if !review {
+                cli.session_usage = Some(crate::orchestrator::types::SessionUsage { input_tokens: 900, output_tokens: 90, cache_read_tokens: 0, cache_creation_tokens: 0 });
+            }
+            Ok(StageOutcome {
+                cli,
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: text.clone(), payload: None, refs_worktree: false },
+                input_tokens: 10, output_tokens: 2, cost_usd: 0.01,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: crate::orchestrator::runner::parse_verdict(&text),
+                session_id: if review { None } else { Some(format!("thr-{}", stage.role)) },
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// Plan(`plan_model`/`plan_substrate`) → Implement(Codex CLI) → Review
+    /// (auto loop → Plan), run to completion; returns each writer run.
+    async fn codex_window_run(plan_model: &str, plan_substrate: &str) -> Vec<(String, Option<String>)> {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("CodexWindow", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", plan_model, plan_substrate, false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "gpt-5.5", "cli", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "code_review", "m", "api", false, Some(0), 2, Some("auto"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(CodexWindowRunner { reviews: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let out = seen.lock().clone();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_codex_writer_between_the_loop_target_and_the_review_reruns_fresh() {
+        // The target (Plan) is an API stage; Implement is a Codex writer with
+        // a resumable session in the window. Its input (the new plan)
+        // changed, so it must run fresh with the refreshed dossier.
+        let seen = codex_window_run("m", "api").await;
+        let implement: Vec<_> = seen.iter().filter(|(r, _)| r == "implement").collect();
+        assert_eq!(implement.len(), 2, "implement re-ran in the window: {seen:?}");
+        assert_eq!(implement[1].1, None, "not the loop target: no resume");
+    }
+
+    #[tokio::test]
+    async fn a_codex_writer_loop_target_resumes_and_the_rest_of_the_window_runs_fresh() {
+        let seen = codex_window_run("gpt-5.5", "cli").await;
+        let plan: Vec<_> = seen.iter().filter(|(r, _)| r == "plan").collect();
+        let implement: Vec<_> = seen.iter().filter(|(r, _)| r == "implement").collect();
+        assert_eq!(plan.len(), 2, "{seen:?}");
+        assert_eq!(plan[1].1.as_deref(), Some("thr-plan"), "the Codex loop target resumes its session");
+        assert_eq!(implement.len(), 2, "{seen:?}");
+        assert_eq!(implement[1].1, None, "a Codex writer after the target runs fresh");
+    }
+
+    #[test]
+    fn stage_session_usage_round_trips_per_session() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "gpt-5.5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sid = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let u = crate::orchestrator::types::SessionUsage { input_tokens: 5, output_tokens: 6, cache_read_tokens: 7, cache_creation_tokens: 8 };
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "a").unwrap(), None);
+        db.lock().set_stage_session_usage(&sid, "a", Some(&u)).unwrap();
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "a").unwrap(), Some(u));
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "b").unwrap(), None, "another session's total is no baseline");
+        db.lock().set_stage_session_usage(&sid, "a", None).unwrap();
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "a").unwrap(), None);
     }
 
     #[tokio::test]
@@ -7793,6 +9530,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -7943,6 +9681,7 @@ mod orchestrator_tests {
                 }
             }
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -8423,6 +10162,7 @@ mod orchestrator_tests {
             let (status, error, blocked) =
                 if first_run { (self.first)() } else { (StageStatus::Done, None, None) };
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -8499,6 +10239,72 @@ mod orchestrator_tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_gone_deferred_call_resumes_that_session_once_with_the_drop() {
+        // #973: on a resume whose deferred tool is gone, the director drops
+        // the call — the next run `--resume`s the session with the drop set.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, db) = budgeted_cli_run(FirstRunThenDoneRunner {
+            first: || {
+                (
+                    StageStatus::Failed,
+                    Some(format!(
+                        "The resumed session was waiting to run Edit, which isn't available anymore.\n(terminal_reason: {})",
+                        crate::orchestrator::cli_runner::DEFERRED_TOOL_UNAVAILABLE
+                    )),
+                    None,
+                )
+            },
+            first_cost: 0.01,
+            seen: Arc::clone(&seen),
+        });
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        orch.resolve_checkpoint(&run_id, CheckpointAction::DropDeferredCall { max_turns_override: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2, "the stage ran again after the drop");
+        assert!(!seen[0].drop_deferred_call);
+        assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
+        assert!(seen[1].drop_deferred_call, "the resumed run drops the call");
+        assert!(!db.lock().get_stage_drop_deferred(&stage.id).unwrap(), "only that run drops it");
+    }
+
+    #[tokio::test]
+    async fn a_drop_is_refused_on_a_stage_not_waiting_on_a_gone_tool() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, db) = budgeted_cli_run(FirstRunThenDoneRunner {
+            first: || {
+                (
+                    StageStatus::Failed,
+                    Some(format!(
+                        "A hook paused Edit before it ran.\n(terminal_reason: {})",
+                        crate::orchestrator::cli_runner::TOOL_DEFERRED
+                    )),
+                    None,
+                )
+            },
+            first_cost: 0.01,
+            seen: Arc::clone(&seen),
+        });
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let err = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::DropDeferredCall { max_turns_override: None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("can be dropped"), "{err}");
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed", "nothing changed");
+        assert!(!db.lock().get_stage_drop_deferred(&stage.id).unwrap());
+        // A plain Resume of it still continues the session, without a drop.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
+        assert!(!seen[1].drop_deferred_call);
+    }
+
+    #[tokio::test]
     async fn answering_a_blocked_cli_stage_carries_its_spend_not_an_older_attempts() {
         // A blocked stage has no artifact or error, so answering it archives
         // nothing: the prior spend must come from the row, never from an
@@ -8539,12 +10345,782 @@ mod orchestrator_tests {
         assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
         assert_eq!(seen[1].resume_prior_cost_usd, 0.03);
     }
+
+    /// Records every run's spec and input. The stage at position 1 ends its
+    /// first run the way `first` says (session `sess-b`); every other run
+    /// succeeds.
+    struct SecondStageOnceRunner {
+        first: fn() -> (StageStatus, Option<String>, Option<BlockedAsk>),
+        seen: Arc<Mutex<Vec<(StageSpec, StageInput)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for SecondStageOnceRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first_run = stage.position == 1 && !self.seen.lock().iter().any(|(s, _)| s.position == 1);
+            self.seen.lock().push((stage.clone(), input.clone()));
+            let (status, error, blocked) =
+                if first_run { (self.first)() } else { (StageStatus::Done, None, None) };
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.01,
+                status,
+                tool_calls: vec![],
+                error,
+                verdict: None,
+                session_id: Some("sess-b".into()),
+                blocked,
+                blocked_transcript: None,
+            })
+        }
+    }
+
+    /// Plan (API) → implement (Claude CLI), driven by `runner` until the
+    /// implement stage stops, which then had a 120k context reading.
+    async fn plan_then_cli_implement(runner: SecondStageOnceRunner) -> (Orchestrator, String, Arc<Mutex<Db>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Plan then build", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(sink, Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(runner));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let implement = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        db.lock().set_run_stage_context(&implement.id, 120_000, Some(200_000)).unwrap();
+        (orch, run_id, db)
+    }
+
+    #[tokio::test]
+    async fn a_resumed_claude_stage_gets_its_full_input_and_last_context() {
+        // #1025: if `--resume` comes back on an empty conversation the runner
+        // reruns fresh, which needs the dossier; the context reading the
+        // Resume found is what the resumed reply must come back near.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, _db) = plan_then_cli_implement(SecondStageOnceRunner {
+            first: || (StageStatus::Failed, Some("claude stopped early (error_max_turns)".into()), None),
+            seen: Arc::clone(&seen),
+        })
+        .await;
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 3, "plan, implement, the resumed implement");
+        assert_eq!(seen[0].0.resume_context_tokens, None, "a fresh run carries no context to come back near");
+        let (spec, input) = &seen[2];
+        assert_eq!(spec.resume_session.as_deref(), Some("sess-b"));
+        assert_eq!(spec.resume_context_tokens, Some(120_000));
+        assert!(input.sections.iter().any(|s| s.text == "did plan"), "the dossier rides along: {:?}", input.sections);
+    }
+
+    #[tokio::test]
+    async fn an_answered_claude_stage_keeps_the_answers_for_a_fresh_rerun() {
+        // #1025: the fresh fallback after an empty resume is prompted with the
+        // full input AND the director's answers.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, _db) = plan_then_cli_implement(SecondStageOnceRunner {
+            first: || {
+                (
+                    StageStatus::Done,
+                    None,
+                    Some(BlockedAsk {
+                        summary: "which db?".into(),
+                        questions: vec![BlockedQuestion {
+                            question: "SQLite or Postgres?".into(),
+                            why_blocked: "both fit".into(),
+                            recommended_default: "SQLite".into(),
+                        }],
+                    }),
+                )
+            },
+            seen: Arc::clone(&seen),
+        })
+        .await;
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()], source: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 3, "plan, implement, the answered implement");
+        let (spec, input) = &seen[2];
+        assert_eq!(spec.resume_session.as_deref(), Some("sess-b"));
+        assert_eq!(spec.resume_context_tokens, Some(120_000));
+        let fresh = crate::orchestrator::runner::user_input_for(&spec.role, "t", input, spec.feedback.as_deref());
+        assert!(fresh.contains("did plan"), "{fresh}");
+        assert!(fresh.contains("SQLite"), "{fresh}");
+    }
+
+    fn claude_init(session: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "system", "subtype": "init", "session_id": session })
+    }
+
+    fn claude_reply(tokens: u64, parent: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": parent,
+            "message": { "id": "msg_1", "model": "claude-sonnet-5-5", "usage": {
+                "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": tokens - 10, "cache_creation_input_tokens": 0
+            } }
+        })
+    }
+
+    #[test]
+    fn an_empty_resume_is_named_by_its_session_or_its_first_reply() {
+        use crate::orchestrator::cli_runner::{EmptyResume, ResumeWatch};
+        let observe = |prior: Option<u64>, events: &[serde_json::Value]| {
+            let mut w = ResumeWatch::new("sess-a", prior);
+            events.iter().filter_map(|e| w.observe(e)).collect::<Vec<_>>()
+        };
+        // Another session in `system/init`: decided there, never again.
+        assert_eq!(
+            observe(Some(120_000), &[claude_init("sess-new"), claude_reply(3_000, None)]),
+            vec![EmptyResume::OtherSession { requested: "sess-a".into(), got: "sess-new".into() }]
+        );
+        // No reading recorded: under 8K tokens is empty, at or above it is not.
+        assert_eq!(
+            observe(None, &[claude_init("sess-a"), claude_reply(3_000, None)]),
+            vec![EmptyResume::SmallContext { tokens: 3_000, floor: 8_000 }]
+        );
+        assert!(observe(None, &[claude_init("sess-a"), claude_reply(8_000, None)]).is_empty());
+        // A recorded reading: 15% of it is the floor.
+        assert!(observe(Some(120_000), &[claude_init("sess-a"), claude_reply(130_000, None)]).is_empty());
+        assert_eq!(ResumeWatch::floor(Some(120_000)), 18_000);
+        assert_eq!(ResumeWatch::floor(Some(0)), 8_000, "a zero reading counts as none");
+        // Only the FIRST top-level reply decides: a sub-agent's small context
+        // is its own, and a later small reply (after a compaction) is fine.
+        assert!(observe(
+            Some(120_000),
+            &[claude_init("sess-a"), claude_reply(2_000, Some("toolu_1")), claude_reply(125_000, None), claude_reply(4_000, None)]
+        )
+        .is_empty());
+        // An init with no session id doesn't decide.
+        assert_eq!(
+            observe(Some(120_000), &[serde_json::json!({ "type": "system", "subtype": "init" }), claude_reply(4_000, None)]),
+            vec![EmptyResume::SmallContext { tokens: 4_000, floor: 18_000 }]
+        );
+    }
+
+    #[test]
+    fn an_empty_resume_notice_names_the_update_only_on_a_known_old_cli() {
+        use crate::orchestrator::cli_runner::{empty_resume_notice, EmptyResume};
+        let why = EmptyResume::SmallContext { tokens: 4_200, floor: 21_300 };
+        // A plain Resume carries no feedback, so the line promises only the input.
+        assert_eq!(
+            empty_resume_notice(&why, None, false),
+            "resume came back empty: Claude Code opened a new conversation (its first reply read 4k tokens of context, \
+             under the 21k a continuation reads). The stage runs fresh, with its full input."
+        );
+        // An answered block reruns with the director's answers.
+        assert_eq!(
+            empty_resume_notice(&why, None, true),
+            "resume came back empty: Claude Code opened a new conversation (its first reply read 4k tokens of context, \
+             under the 21k a continuation reads). The stage runs fresh, with its full input and your answers."
+        );
+        let old = empty_resume_notice(&why, Some("2.1.329"), true);
+        assert!(
+            old.ends_with("your answers. Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."),
+            "{old}"
+        );
+        for has_feedback in [false, true] {
+            assert_eq!(
+                empty_resume_notice(&why, Some("2.1.330"), has_feedback),
+                empty_resume_notice(&why, None, has_feedback)
+            );
+            assert_eq!(
+                empty_resume_notice(&why, Some("not a version"), has_feedback),
+                empty_resume_notice(&why, None, has_feedback)
+            );
+        }
+        let other = EmptyResume::OtherSession { requested: "aaaaaaaa-0001".into(), got: "bbbbbbbb-0002".into() };
+        assert!(empty_resume_notice(&other, None, false).contains("(it started session bbbbbbbb instead of aaaaaaaa)"));
+    }
+
+    #[test]
+    fn an_empty_resume_and_its_fresh_rerun_keep_both_spends() {
+        // The stopped attempt's spend is real; the fresh run's result stands.
+        use crate::orchestrator::cli_runner::{merge_resume_fallback, stopped_stage, CliDialect, EMPTY_RESUME_STOP};
+        let stopped = stopped_stage(CliDialect::Claude, EMPTY_RESUME_STOP, "claude-sonnet-5-5", &Default::default(), false);
+        assert_eq!(stopped.status, StageStatus::Failed);
+        assert_eq!(stopped.error.as_deref(), Some(EMPTY_RESUME_STOP));
+        let mut resumed = stopped;
+        resumed.input_tokens = 14_000;
+        resumed.cost_usd = 0.05;
+        let mut fresh = resumed.clone();
+        fresh.status = StageStatus::Done;
+        fresh.error = None;
+        fresh.input_tokens = 30_000;
+        fresh.cost_usd = 0.20;
+        let merged = merge_resume_fallback(resumed, fresh);
+        assert_eq!(merged.status, StageStatus::Done);
+        assert_eq!(merged.input_tokens, 44_000);
+        assert!((merged.cost_usd - 0.25).abs() < 1e-9);
+        assert!(!merged.cli.usage_unreported, "a Claude stop prices what it streamed");
+    }
+    /// A Claude CLI stage that reports its `claude -p` session id.
+    struct SessionRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for SessionRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 1_000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.25,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+                verdict: None,
+                session_id: Some("sess-direct-861".into()),
+                blocked: None,
+                blocked_transcript: None,
+            })
+        }
+    }
+
+    /// One assistant line of a Claude Code transcript, stamped now.
+    fn cc_line(session: &str, req: &str, cwd: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "requestId": req,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "cwd": cwd,
+            "sessionId": session,
+            "message": {
+                "id": format!("msg_{req}"),
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "usage": { "input_tokens": 500, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 100 }
+            }
+        })
+        .to_string()
+    }
+
+    /// #861: a Direct CLI stage's own transcript (and its sub-agent files)
+    /// lands in the worktree's Claude Code project directory, which the
+    /// transcript ingestor reads — it must not meter that spend a second time.
+    #[tokio::test]
+    async fn direct_cli_stage_transcript_is_not_double_counted_in_mission_spend() {
+        let (db, ws) = db_with_workspace();
+        let cwd = "/tmp/octo-861/worktree";
+        db.lock().conn_ref().execute("UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2", rusqlite::params![cwd, ws]).unwrap();
+        let wsrow = db.lock().get_workspace(&ws).unwrap().unwrap();
+        let mission = crate::mission::ensure_for_workspace(&db.lock(), &wsrow, "build", "worktree").unwrap();
+        let pid = db.lock().insert_pipeline("One", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "cli", false, None, 0, None, 25).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(SessionRunner));
+        orch.run_to_pause(&run).await.unwrap();
+        let cost = db.lock().get_run(&run).unwrap().unwrap().cost_usd;
+        assert!((cost - 0.25).abs() < 1e-9, "run card: {cost}");
+
+        // The stage's session transcript and a sub-agent's, as Claude Code writes them.
+        let root = tempfile::tempdir().unwrap();
+        let pdir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct-861/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct-861.jsonl"), format!("{}\n{}\n", cc_line("sess-direct-861", "req_a", cwd), cc_line("sess-direct-861", "req_b", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct-861/subagents/agent-1.jsonl"), format!("{}\n", cc_line("sess-direct-861", "req_sub", cwd))).unwrap();
+        let ing = crate::transcripts::TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        let s = ing.ingest().unwrap();
+        assert_eq!(s.rows_inserted, 0, "the stage's session is already its direct row");
+
+        let (spend, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!((spend - cost).abs() < 1e-9, "mission spend {spend} equals the run's cost {cost}");
+    }
+
+    /// #863: an ingest pass that ran while the stage did (before it reported
+    /// its session id) metered part of the session as RUN rows. The drive
+    /// drops them the moment the stage reports the session, so right after
+    /// the stage completes — with no ingest pass in between — the mission's
+    /// spend is the run's cost, and the budget gates never see it twice.
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn direct_cli_stage_mid_run_transcript_rows_are_dropped_when_the_stage_reports_its_session() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let (db, ws) = db_with_workspace();
+        let cwd = "/tmp/octo-863/worktree";
+        db.lock().conn_ref().execute("UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2", rusqlite::params![cwd, ws]).unwrap();
+        let wsrow = db.lock().get_workspace(&ws).unwrap().unwrap();
+        let mission = crate::mission::ensure_for_workspace(&db.lock(), &wsrow, "build", "worktree").unwrap();
+        let pid = db.lock().insert_pipeline("One", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "cli", false, None, 0, None, 25).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        // Mid-run: the stage's transcript (and a sub-agent's) is on disk and
+        // a pass meters it — the session id isn't known yet.
+        let root = tempfile::tempdir().unwrap();
+        let pdir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct-861/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct-861.jsonl"), format!("{}\n{}\n", cc_line("sess-direct-861", "req_a", cwd), cc_line("sess-direct-861", "req_b", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct-861/subagents/agent-1.jsonl"), format!("{}\n", cc_line("sess-direct-861", "req_sub", cwd))).unwrap();
+        let ing = crate::transcripts::TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 3);
+        let (mid, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!(mid > 0.0, "the mid-run pass metered the session: {mid}");
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(SessionRunner))
+            .with_transcripts_root(root.path().to_path_buf());
+        orch.run_to_pause(&run).await.unwrap();
+        let cost = db.lock().get_run(&run).unwrap().unwrap().cost_usd;
+        assert!((cost - 0.25).abs() < 1e-9, "run card: {cost}");
+
+        // No ingest pass since the stage completed.
+        let (spend, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!((spend - cost).abs() < 1e-9, "mission spend {spend} equals the run's cost {cost}");
+        let run_rows: i64 = db.lock().conn_ref()
+            .query_row("SELECT COUNT(*) FROM spend_events WHERE surface = 'run'", [], |r| r.get(0)).unwrap();
+        assert_eq!(run_rows, 0, "the session's RUN rows are gone");
+        // The next pass finds nothing left to do.
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
+
+    /// #890: the drop removes only the stage's own session. A non-Direct RUN
+    /// session in the same project directory (the user's own `claude` in the
+    /// worktree) keeps its rows.
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn direct_session_drop_keeps_a_non_direct_run_session_in_the_same_project_dir() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let (db, ws) = db_with_workspace();
+        let cwd = "/tmp/octo-890/worktree";
+        db.lock().conn_ref().execute("UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2", rusqlite::params![cwd, ws]).unwrap();
+        let wsrow = db.lock().get_workspace(&ws).unwrap().unwrap();
+        let mission = crate::mission::ensure_for_workspace(&db.lock(), &wsrow, "build", "worktree").unwrap();
+        let pid = db.lock().insert_pipeline("One", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "cli", false, None, 0, None, 25).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let pdir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("sess-direct-861.jsonl"), format!("{}\n", cc_line("sess-direct-861", "req_a", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-mine.jsonl"), format!("{}\n{}\n", cc_line("sess-mine", "req_m1", cwd), cc_line("sess-mine", "req_m2", cwd))).unwrap();
+        let ing = crate::transcripts::TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 3);
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(SessionRunner))
+            .with_transcripts_root(root.path().to_path_buf());
+        orch.run_to_pause(&run).await.unwrap();
+
+        let mut keys: Vec<String> = db.lock().conn_ref()
+            .prepare("SELECT idempotency_key FROM spend_events WHERE surface = 'run'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cc:req_m1".to_string(), "cc:req_m2".to_string()], "the user's session keeps its rows");
+        let cost = db.lock().get_run(&run).unwrap().unwrap().cost_usd;
+        let (spend, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!(spend > cost + 1e-9, "mission spend {spend} still counts the user's session beside the run's {cost}");
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
+
+    /// "Notify me elsewhere" (#964) at the orchestrator's attention points:
+    /// each event, the names-only body, the quiet cases, and the detached
+    /// worker path (sent by the worker, relayed by the bridge, never twice).
+    mod notify_elsewhere {
+        use super::*;
+
+        type Got = Arc<parking_lot::Mutex<Vec<crate::notify_elsewhere::test_receiver::Seen>>>;
+
+        /// A webhook receiver on this Mac that answers 200.
+        async fn receiver() -> (String, Got) {
+            crate::notify_elsewhere::test_receiver::serve(crate::notify_elsewhere::test_receiver::Answer::Status(200)).await
+        }
+
+        fn bodies(got: &Got) -> Vec<Value> {
+            crate::notify_elsewhere::test_receiver::bodies(got)
+        }
+
+        /// Settings in a temp file, with the webhook on. Keep the dir alive.
+        fn turn_on(url: &str) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            crate::settings::test_settings_path::set(Some(dir.path().join("settings.json")));
+            crate::notify_elsewhere::save(true, url).unwrap();
+            dir
+        }
+
+        fn reset() {
+            crate::settings::test_settings_path::set(None);
+        }
+
+        /// Every dispatched send has finished.
+        async fn settle() {
+            crate::notify_elsewhere::flush(crate::notify_elsewhere::FLUSH_MAX).await;
+        }
+
+        fn sent(got: &Got) -> Vec<String> {
+            bodies(got).iter().map(|b| b["event"].as_str().unwrap_or_default().to_string()).collect()
+        }
+
+        /// One-stage crew on the test workspace, whose mission is "Add dark
+        /// mode". The run's task stands in for a prompt that must never leave.
+        fn crew(db: &Arc<Mutex<Db>>, ws: &str, checkpoint: bool) -> (String, String) {
+            db.lock()
+                .insert_mission("m1", Some(ws), "p1", "build", "Add dark mode", "active", None, "worktree", "none", "{}")
+                .unwrap();
+            bare_crew(db, ws, checkpoint)
+        }
+
+        /// The same crew on a workspace with no mission (a fresh-mode
+        /// Routine's workspace has none).
+        fn bare_crew(db: &Arc<Mutex<Db>>, ws: &str, checkpoint: bool) -> (String, String) {
+            let pid = db.lock().insert_pipeline("NE", "d", false).unwrap();
+            db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", checkpoint, None, 0, None, 25).unwrap();
+            let run_id = db.lock().create_run(ws, &pid, "PROMPT-TEXT-NEVER-SENT", None, None, &[]).unwrap();
+            (pid, run_id)
+        }
+
+        /// Make `run_id` the run the Routine "Nightly ship" fired.
+        fn fired_by_routine(db: &Arc<Mutex<Db>>, pid: &str, run_id: &str) {
+            db.lock().insert_routine("r-ne", &routine_input(pid, "interval", "3600"), None, true).unwrap();
+            db.lock().stamp_routine_run("r-ne", run_id, &chrono::Utc::now().to_rfc3339()).unwrap();
+            assert_eq!(db.lock().routine_name_for_run(run_id).unwrap().as_deref(), Some("Nightly ship"));
+        }
+
+        /// A runner whose stage stops on a Claude plan limit, with no
+        /// automatic resume scheduled: the run waits for the director.
+        struct PlanLimitedRunner;
+        #[async_trait::async_trait]
+        impl AgentRunner for PlanLimitedRunner {
+            async fn run(
+                &self,
+                _stage: &StageSpec,
+                _input: &StageInput,
+                _ctx: &StageContext,
+            ) -> crate::error::AppResult<StageOutcome> {
+                Err(crate::error::AppError::Other(format!(
+                    "Claude plan limit reached {}",
+                    crate::orchestrator::cli_runner::PLAN_LIMIT_MARKER
+                )))
+            }
+        }
+
+        fn sink() -> Arc<CollectingSink> {
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) })
+        }
+
+        #[tokio::test]
+        async fn a_gate_sends_the_label_and_the_two_names_only() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            let bodies = bodies(&got);
+            assert_eq!(bodies.len(), 1, "{bodies:?}");
+            let text = "Octopush · Checkpoint gate waiting · Add dark mode · P";
+            assert_eq!(
+                bodies[0],
+                serde_json::json!({
+                    "text": text, "content": text, "mission": "Add dark mode", "project": "P",
+                    "event": "checkpoint_gate",
+                })
+            );
+            let raw = bodies[0].to_string();
+            for never in ["PROMPT-TEXT", "did plan", "/tmp", "main", "w1", run_id.as_str()] {
+                assert!(!raw.contains(never), "{never} left the Mac: {raw}");
+            }
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_question_sends_a_fixed_label_never_the_question() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(
+                Arc::clone(&db),
+                sink(),
+                Box::new(BlockOnceRunner { asked: Default::default() }),
+            );
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["director_question"]);
+            let raw = bodies(&got)[0].to_string();
+            for never in ["datastore", "Postgres", "SQLite", "schema"] {
+                assert!(!raw.contains(never), "{never} left the Mac: {raw}");
+            }
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_failed_stage_sends_run_failed_and_never_the_error() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(FailingRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["run_failed"]);
+            assert!(!bodies(&got)[0].to_string().contains("boom"));
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_routine_sends_when_it_finishes_or_fails() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = crew(&db, &ws, false);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+            settle().await;
+            assert_eq!(sent(&got), ["routine_finished"]);
+            // A Routine's events carry its name, not the workspace's mission.
+            assert_eq!(bodies(&got)[0]["text"], "Octopush · Routine finished · Nightly ship · P");
+            assert_eq!(bodies(&got)[0]["mission"], "Nightly ship");
+
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = crew(&db, &ws, false);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(FailingRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["routine_finished", "routine_failed"]);
+
+            // A fresh-mode Routine's workspace has no mission: the name still
+            // arrives.
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = bare_crew(&db, &ws, true);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["routine_finished", "routine_failed", "checkpoint_gate"]);
+            assert_eq!(bodies(&got)[2]["mission"], "Nightly ship");
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_plan_limit_that_waits_for_the_director_is_no_failure() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            // A crew the director started.
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(PlanLimitedRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["plan_limit"]);
+            assert_eq!(bodies(&got)[0]["text"], "Octopush · Claude plan limit, waiting for you · Add dark mode · P");
+
+            // A Routine's: a wait too, never "Routine failed" (it can still
+            // finish once the director resumes it).
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = crew(&db, &ws, false);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(PlanLimitedRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["plan_limit", "plan_limit"]);
+            reset();
+        }
+
+        #[tokio::test]
+        async fn quiet_cases_send_nothing() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            // A crew the director started finishing is not a decision.
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+            // Nor is the director's own pause.
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            orch.request_pause(&run_id);
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            let quiet = sent(&got);
+            assert!(quiet.is_empty(), "{quiet:?}");
+
+            // Off (and off is the default): a gate sends nothing.
+            crate::notify_elsewhere::save(false, &url).unwrap();
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert!(sent(&got).is_empty());
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_failed_send_is_one_journal_notice_and_the_run_carries_on() {
+            // Nothing listens on this port: connecting fails, once and on retry.
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let _dir = turn_on(&format!("http://127.0.0.1:{port}/hook"));
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            let persisted = Arc::new(crate::orchestrator::persist::PersistingSink::new(sink(), Arc::clone(&db)));
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), persisted, Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            let stage = db.lock().list_run_stages(&run_id).unwrap().remove(0);
+            assert_eq!(stage.status, "awaiting_checkpoint", "the park is untouched");
+            assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+            let notices: Vec<String> = db
+                .lock()
+                .list_stage_log(&stage.id)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.contains("Notify me elsewhere"))
+                .collect();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(notices[0].contains("couldn't connect to the webhook"), "{}", notices[0]);
+            assert!(!notices[0].contains("127.0.0.1"), "the URL is never written: {}", notices[0]);
+            reset();
+        }
+
+        #[tokio::test]
+        async fn the_detached_worker_sends_and_the_bridge_only_relays() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            // The app hands the segment to a worker and watches it.
+            assert!(db.lock().reserve_worker_lease(&run_id, "n1").unwrap());
+            assert!(db.lock().confirm_worker_lease(&run_id, "n1", std::process::id() as i64).unwrap());
+            let app_sink = sink();
+            let app = Orchestrator::new_with_runner(Arc::clone(&db), app_sink.clone(), Box::new(MockRunner));
+            app.prime_detached_watch(&run_id);
+
+            // The worker drives with its own headless orchestrator and a sink
+            // that reaches nobody, parks at the gate, sends, and waits for the
+            // send before it exits (as `octopush-run-worker` does).
+            let worker = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner)).into_headless();
+            assert_eq!(worker.drive_segment(&run_id, false).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["checkpoint_gate"]);
+            db.lock().clear_worker_lease(&run_id, "n1").unwrap();
+
+            // The app's bridge sees the segment end and relays the park to
+            // the window, without sending it a second time.
+            app.bridge_tick().unwrap();
+            assert!(app_sink.events.lock().iter().any(|e| e == "run://checkpoint"));
+            settle().await;
+            assert_eq!(sent(&got), ["checkpoint_gate"]);
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_worker_that_died_is_sent_by_the_app_that_repairs_it() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+            db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+            db.lock().set_run_status(&run_id, "running", false).unwrap();
+            // A lease whose worker is gone: no pid, heartbeat long stale.
+            assert!(db.lock().reserve_worker_lease(&run_id, "n-dead").unwrap());
+            let stale = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+            db.lock()
+                .conn_ref()
+                .execute("UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2", rusqlite::params![stale, run_id])
+                .unwrap();
+            let app = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            app.bridge_tick().unwrap();
+            assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[0].status, "failed");
+            settle().await;
+            assert_eq!(sent(&got), ["run_failed"]);
+            reset();
+        }
+    }
 }
 
 #[cfg(test)]
 mod cli_runner_tests {
     use crate::orchestrator::cli_runner::parse_cli_result;
     use crate::orchestrator::types::{ArtifactKind, StageStatus};
+
+    #[test]
+    fn auto_memory_is_turned_off_only_for_sandboxed_claude_stages() {
+        use crate::orchestrator::cli_runner::{sandboxed_stage_env, CliDialect};
+        use crate::orchestrator::sandbox::claude_stage_env;
+        let prepared = vec![("TMPDIR".to_string(), "/stage/tmp".to_string())];
+        let claude = sandboxed_stage_env(CliDialect::Claude, prepared.clone());
+        assert_eq!(claude[0], prepared[0], "the prepared env comes first");
+        for var in claude_stage_env() {
+            assert!(claude.contains(&var), "{var:?} is set for a sandboxed Claude stage");
+        }
+        let codex = sandboxed_stage_env(CliDialect::Codex, prepared.clone());
+        assert_eq!(codex, prepared, "a Codex stage gets the prepared env only");
+        assert!(!codex.iter().any(|(k, _)| k == "CLAUDE_CODE_DISABLE_AUTO_MEMORY"));
+        // An unsandboxed stage gets no env from the sandbox at all: only the
+        // sandbox arm of the spawn calls `sandboxed_stage_env`.
+        let src = include_str!("orchestrator/cli_runner.rs");
+        let calls: Vec<_> = src.match_indices("sandboxed_stage_env(dialect, ").collect();
+        assert_eq!(calls.len(), 1, "one call site");
+        let arm = src[..calls[0].0].rfind("\"sandbox\" => {").expect("inside the sandbox arm");
+        assert!(!src[arm..calls[0].0].contains("\"none\" =>"), "not in the unsandboxed arm");
+    }
+
+    #[test]
+    fn a_gateway_max_tokens_failure_on_2_1_329_names_the_release() {
+        use crate::orchestrator::cli_runner::{is_gateway_model, with_known_bad_release};
+        assert!(is_gateway_model("claude-sonnet-latest") && is_gateway_model("litellm/kimi-k3"));
+        for m in ["claude-sonnet-5-5", "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "sonnet", "opusplan", "default"] {
+            assert!(!is_gateway_model(m), "{m}");
+        }
+        let line = r#"{"type":"result","subtype":"success","is_error":true,
+            "result":"API Error: 400 max_tokens: 64000 > 32768, which is the maximum allowed","total_cost_usd":0.01}"#;
+        let failed = || parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(failed().status, StageStatus::Failed);
+        let named = with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.329"));
+        let error = named.error.unwrap();
+        assert!(
+            error.starts_with(
+                "Skip Claude Code 2.1.329 on a gateway model: it drops the retry gateway models need when a max_tokens \
+                 error names a lower limit; 2.1.330 restores it. Update Claude Code, then resume or re-run.\n"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("API Error: 400 max_tokens: 64000 > 32768"), "the CLI's own error stays: {error}");
+        let unchanged = failed().error;
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.330")).error, unchanged);
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-5-5", Some("2.1.329")).error, unchanged, "built-in model");
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", None).error, unchanged, "version unknown");
+        let done = parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(with_known_bad_release(done, "claude-sonnet-latest", Some("2.1.329")).error, None);
+    }
 
     const SUCCESS: &str = r#"{
         "type":"result","subtype":"success","is_error":false,
@@ -8566,6 +11142,91 @@ mod cli_runner_tests {
         "usage":{"input_tokens":10,"output_tokens":4,
                  "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
     }"#;
+
+    #[test]
+    fn refused_setting_reads_the_validation_line_and_nothing_else() {
+        use crate::orchestrator::cli_runner::{refused_setting, SANDBOX_REQUIRED_UNAVAILABLE};
+        let stderr = "\nError: sandbox required but unavailable: the settings passed with --settings \
+            failed validation, so none of them apply (sandbox.enabled: Expected boolean, but received string). Fix them\n  \
+            Refusing to start without a working sandbox.\n";
+        let line = refused_setting(None, stderr, None).expect("named");
+        assert!(line.starts_with("sandbox required but unavailable:"), "the `Error:` prefix goes: {line}");
+        assert!(line.contains("(sandbox.enabled: Expected boolean, but received string)"), "{line}");
+        // `errors` wins over stderr; non-string entries are skipped.
+        let errors = serde_json::json!([{"code": 1}, "Sandbox required but unavailable: settings failed validation (a.b: bad)"]);
+        assert_eq!(
+            refused_setting(Some(&errors), stderr, None).as_deref(),
+            Some("Sandbox required but unavailable: settings failed validation (a.b: bad)")
+        );
+        // "failed validation" alone is not the signal.
+        let unrelated = "[Bootstrap] Gateway /v1/models failed validation: unexpected shape";
+        assert_eq!(refused_setting(None, unrelated, None), None);
+        let other = serde_json::json!(["Settings failed validation (a.b: bad)"]);
+        assert_eq!(refused_setting(Some(&other), unrelated, None), None);
+        // The machine-readable reason is: the first `errors` string stands in.
+        assert_eq!(
+            refused_setting(Some(&other), unrelated, Some(SANDBOX_REQUIRED_UNAVAILABLE)).as_deref(),
+            Some("Settings failed validation (a.b: bad)")
+        );
+        assert!(refused_setting(None, "", Some(SANDBOX_REQUIRED_UNAVAILABLE)).is_some());
+        assert_eq!(refused_setting(None, "", Some("something_else")), None);
+        // Any other failure stays generic.
+        assert_eq!(refused_setting(None, "Error: API error 529 overloaded", None), None);
+        assert_eq!(refused_setting(Some(&serde_json::json!("failed validation")), "", None), None, "not an array");
+        assert_eq!(refused_setting(None, "", None), None);
+        let long = format!("Sandbox required but unavailable: failed validation {}", "x".repeat(900));
+        assert!(refused_setting(None, &long, None).unwrap().chars().count() <= 400);
+    }
+
+    #[test]
+    fn budget_and_max_turns_stops_with_an_unrelated_validation_line_keep_their_own_handling() {
+        use crate::orchestrator::cli_runner::{is_budget_stop, is_settings_refused, BUDGET_STOP_SUBTYPE};
+        let stderr = "[Bootstrap] Gateway /v1/models failed validation: expected a list\n";
+        let budget = format!(
+            r#"{{"type":"result","subtype":"{BUDGET_STOP_SUBTYPE}","is_error":true,"num_turns":7,
+            "session_id":"s","total_cost_usd":1.5}}"#
+        );
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(is_budget_stop(err) && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        let turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,
+            "session_id":"s","total_cost_usd":0.4}"#;
+        let outcome = parse_cli_result(turns, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.contains("error_max_turns") && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        // Even the real refused-settings line does not take over a budget stop
+        // or a session that ran turns.
+        let real = "Error: Sandbox required but unavailable: settings failed validation (x: y)";
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, real).unwrap();
+        assert!(is_budget_stop(outcome.error.as_deref().unwrap()));
+        let ran = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,
+            "session_id":"s","total_cost_usd":0.1}"#;
+        let outcome = parse_cli_result(ran, false, ArtifactKind::Diff, real).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+        // A generic execution error with only the unrelated line stays generic.
+        let plain = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0}"#;
+        let outcome = parse_cli_result(plain, false, ArtifactKind::Diff, stderr).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn a_refused_settings_result_is_not_escalated_nor_resumed() {
+        use crate::orchestrator::cli_runner::{is_settings_refused, SETTINGS_REFUSED};
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0,"errors":["Sandbox required but unavailable: settings failed validation (x: y)."]}"#;
+        let outcome = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert_eq!(err, format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: settings failed validation (x: y)."));
+        assert!(is_settings_refused(err));
+        assert_eq!(outcome.session_id, None);
+        // An ordinary execution error is unchanged.
+        let plain = parse_cli_result(&line.replace("failed validation", "broke"), false, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_settings_refused(plain.error.as_deref().unwrap()));
+        assert_eq!(plain.session_id.as_deref(), Some("s"));
+    }
 
     #[test]
     fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
@@ -8650,6 +11311,132 @@ mod cli_runner_tests {
         }
         // Exit 0 is still a clean Done.
         assert_eq!(parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap().status, StageStatus::Done);
+    }
+
+    #[test]
+    fn hook_deferred_built_in_tool_halts_and_keeps_the_session() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred};
+        const DEFERRED: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"",
+            "session_id":"sess-d","total_cost_usd":0.02,"usage":{"input_tokens":50,"output_tokens":7},
+            "terminal_reason":"tool_deferred","deferred_tool_use":{"id":"toolu_1","name":"Edit","input":{}}}"#;
+        let o = parse_cli_result(DEFERRED, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(o.status, StageStatus::Failed, "not an empty success");
+        let err = o.error.as_deref().unwrap();
+        assert_eq!(err, "A hook paused Edit before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)");
+        assert!(is_tool_deferred(err) && !is_deferred_tool_unavailable(err) && !is_session_not_saved(err));
+        assert_eq!(o.session_id.as_deref(), Some("sess-d"));
+        assert_eq!(o.input_tokens, 50);
+    }
+
+    #[test]
+    fn unavailable_deferred_tool_on_exit_1_is_not_an_unsaved_session() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred};
+        const GONE: &str = r#"{"type":"result","subtype":"success","is_error":true,"result":"Edit isn't available.",
+            "session_id":"sess-u","terminal_reason":"tool_deferred_unavailable","deferred_tool_use":{"name":"Edit"}}"#;
+        let o = parse_cli_result(GONE, false, ArtifactKind::Diff, "exit 1").unwrap();
+        let err = o.error.as_deref().unwrap();
+        assert!(err.starts_with("The resumed session was waiting to run Edit, which isn't available anymore."), "{err}");
+        assert!(is_deferred_tool_unavailable(err) && !is_tool_deferred(err) && !is_session_not_saved(err), "{err}");
+        assert!(err.ends_with("— stderr —\nexit 1"), "{err}");
+        assert_eq!(o.session_id.as_deref(), Some("sess-u"));
+        assert!(o.artifact.text.is_empty());
+        // No deferred_tool_use at all still explains the halt.
+        const NAMELESS: &str = r#"{"type":"result","subtype":"success","is_error":true,"result":"x",
+            "terminal_reason":"tool_deferred_unavailable"}"#;
+        let o = parse_cli_result(NAMELESS, false, ArtifactKind::Diff, "").unwrap();
+        assert!(o.error.as_deref().unwrap().starts_with("The resumed session was waiting to run a tool, which"));
+    }
+
+    #[test]
+    fn deferred_tool_label_names_the_server_only_when_it_splits_cleanly() {
+        use crate::orchestrator::cli_runner::deferred_tool_label;
+        assert_eq!(deferred_tool_label("mcp__fixture-srv__echo"), "echo (MCP server fixture-srv)");
+        assert_eq!(deferred_tool_label("Edit"), "Edit");
+        // A `__` inside the server (or tool) name is ambiguous: name the tool whole.
+        assert_eq!(deferred_tool_label("mcp__my__srv__echo"), "mcp__my__srv__echo");
+        assert_eq!(deferred_tool_label("mcp__srv__"), "mcp__srv__");
+        assert_eq!(deferred_tool_label("mcp____echo"), "mcp____echo");
+        assert_eq!(deferred_tool_label("mcp__srv"), "mcp__srv");
+        assert_eq!(deferred_tool_label(""), "a tool");
+    }
+
+    #[test]
+    fn a_paused_call_is_shown_with_its_input_like_a_tool_card() {
+        use crate::orchestrator::cli_runner::{deferred_call_preview, is_tool_deferred, parse_cli_result_redacting};
+        use crate::secret_scan::KnownSecret;
+        use serde_json::json;
+        // The card's hint (command, else path, …): its first line, spaces collapsed.
+        assert_eq!(deferred_call_preview("Bash", Some(&json!({"command": "npm publish   --tag beta"})), &[]), "Bash · npm publish --tag beta");
+        assert_eq!(deferred_call_preview("Bash", Some(&json!({"command": "make\nmake install"})), &[]), "Bash · make");
+        assert_eq!(deferred_call_preview("mcp__srv__echo", Some(&json!({"text": "hi"})), &[]), "echo (MCP server srv) · hi");
+        assert_eq!(deferred_call_preview("Edit", Some(&json!({})), &[]), "Edit");
+        assert_eq!(deferred_call_preview("Edit", None, &[]), "Edit");
+        // Cut like a refused call's hint (80 chars).
+        let long = deferred_call_preview("Bash", Some(&json!({"command": format!("echo {}", "word ".repeat(40))})), &[]);
+        assert!(long.starts_with("Bash · echo word") && long.ends_with('…'), "{long}");
+        assert_eq!(long.chars().count(), "Bash · ".chars().count() + 80, "{long}");
+        // Redacted by the secret guard, in the halt too. Built at run time so
+        // no token-shaped literal sits in the source.
+        let gh = format!("ghp_{}", "a1B2c3D4e5F6".repeat(3));
+        let mine = format!("team-gateway-{}", "Zq81".repeat(5));
+        let known = [KnownSecret::new("your LiteLLM key", mine.clone())];
+        let line = json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "", "session_id": "sess-d",
+            "terminal_reason": "tool_deferred",
+            "deferred_tool_use": {"id": "toolu_9", "name": "Bash", "input": {"command": format!("GH_TOKEN={gh} curl -H {mine} x")}},
+        })
+        .to_string();
+        let o = parse_cli_result_redacting(&line, true, ArtifactKind::Diff, "", &known).unwrap();
+        let err = o.error.as_deref().unwrap();
+        assert!(is_tool_deferred(err), "{err}");
+        assert!(
+            err.starts_with("A hook paused Bash · GH_TOKEN=[redacted] curl -H [redacted] x before it ran. Resume once it may run"),
+            "{err}"
+        );
+        assert!(!err.contains(&gh) && !err.contains(&mine), "{err}");
+        // Redacted before the cut: a token past the card's 120 chars, pulled
+        // inside 80 by collapsed spaces, never shows even in part.
+        let spaced = format!("echo{}{gh} done", " ".repeat(115));
+        let p = deferred_call_preview("Bash", Some(&json!({"command": spaced})), &[]);
+        assert_eq!(p, "Bash · echo [redacted] done", "{p}");
+    }
+
+    #[test]
+    fn dropping_a_deferred_call_sets_its_env_only_on_a_claude_resume() {
+        use crate::orchestrator::cli_runner::{drop_deferred_env, CliDialect, DROP_DEFERRED_TOOL_ENV};
+        assert_eq!(drop_deferred_env(CliDialect::Claude, true, true), vec![(DROP_DEFERRED_TOOL_ENV, "1".to_string())]);
+        assert_eq!(DROP_DEFERRED_TOOL_ENV, "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL");
+        // A plain resume, a fresh run (the empty-resume fallback) and Codex: none.
+        assert!(drop_deferred_env(CliDialect::Claude, true, false).is_empty());
+        assert!(drop_deferred_env(CliDialect::Claude, false, true).is_empty());
+        assert!(drop_deferred_env(CliDialect::Codex, true, true).is_empty());
+    }
+
+    #[test]
+    fn dropping_a_deferred_call_resumes_with_a_prompt_saying_so() {
+        use crate::orchestrator::cli_runner::{CliDialect, DROP_DEFERRED_PROMPT};
+        // The drop needs a prompt (Claude answers it after the call's error).
+        let p = CliDialect::Claude.resume_stdin(None, true);
+        assert_eq!(p, DROP_DEFERRED_PROMPT);
+        assert!(p.contains("isn't available anymore") && p.contains("without it"), "{p}");
+        // Every other resume keeps today's nudge.
+        assert_eq!(CliDialect::Claude.resume_stdin(None, false), CliDialect::Claude.resume_prompt(None));
+        assert_eq!(CliDialect::Claude.resume_stdin(Some("use sqlite"), false), CliDialect::Claude.resume_prompt(Some("use sqlite")));
+        assert_eq!(CliDialect::Codex.resume_stdin(None, true), CliDialect::Codex.resume_prompt(None));
+    }
+
+    #[test]
+    fn results_without_a_deferred_terminal_reason_read_as_before() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred};
+        // An unknown reason (or none) changes nothing: exit 0 is Done, exit 1 an unsaved session.
+        const OTHER: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"Done.",
+            "session_id":"s","terminal_reason":"completed"}"#;
+        for line in [SUCCESS, OTHER] {
+            assert_eq!(parse_cli_result(line, true, ArtifactKind::Diff, "").unwrap().status, StageStatus::Done);
+            let err = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap().error.unwrap();
+            assert!(is_session_not_saved(err.as_str()), "{err}");
+            assert!(!is_tool_deferred(&err) && !is_deferred_tool_unavailable(&err), "{err}");
+        }
     }
 
     #[test]
@@ -8816,12 +11603,13 @@ wait
 
         let limits = ReadLimits {
             idle: Duration::from_secs(20),
+            command_idle: Duration::from_secs(20),
             cap: Duration::from_secs(60),
             settle: Duration::from_millis(200),
         };
         let end = tokio::time::timeout(
             Duration::from_secs(10),
-            read_stream(stdout, CliDialect::Claude, limits, |_| {}),
+            read_stream(stdout, CliDialect::Claude, limits, |_| {}, |_| {}),
         )
         .await
         .expect("read_stream did not settle — it is waiting for the process to exit");
@@ -8846,14 +11634,58 @@ mod cli_args_tests {
     fn read_only_review_stages_disallow_write_tools() {
         // B9: a worktree review stage must not be able to edit files — the API
         // substrate enforces this via its allowlist; the CLI does it with
-        // --disallowedTools. Non-review stages carry no denial.
-        let ro = build_cli_args("m", "sys", 10, true);
-        let i = ro.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
-        assert!(ro[i + 1].contains("Write") && ro[i + 1].contains("Edit"), "{ro:?}");
-        let rw = build_cli_args("m", "sys", 10, false);
-        assert!(!rw.contains(&"--disallowedTools".to_string()));
-        let ro_resume = build_cli_args_resume("m", "sess", 10, true);
-        assert!(ro_resume.contains(&"--disallowedTools".to_string()));
+        // --disallowedTools. Writer stages deny no file tool.
+        let denied = |args: &[String]| -> Vec<String> {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            args[i + 1].split(',').map(str::to_string).collect()
+        };
+        for ro in [build_cli_args("m", "sys", 10, true), build_cli_args_resume("m", "sess", 10, true)] {
+            let tools = denied(&ro[..]);
+            for t in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+                assert!(tools.iter().any(|x| x == t), "{t} missing: {ro:?}");
+            }
+        }
+        for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
+            assert!(!denied(&rw[..]).iter().any(|x| x.contains("Write") || x.contains("Edit")), "{rw:?}");
+        }
+    }
+
+    #[test]
+    fn every_claude_stage_disallows_ask_user_question_once() {
+        // #701: headless, nobody answers AskUserQuestion; with it denied, a
+        // question can only reach the final message and the trailing-question
+        // guard. Writer, reviewer, fresh and resumed: one flag, the tool once.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--disallowedTools").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --disallowedTools: {args:?}");
+            let n = args[at[0] + 1].split(',').filter(|t| *t == "AskUserQuestion").count();
+            assert_eq!(n, 1, "AskUserQuestion exactly once: {args:?}");
+            assert_eq!(args.iter().filter(|a| a.contains("AskUserQuestion")).count(), 1, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn every_claude_stage_disallows_the_worktree_tools_once() {
+        // #1002: a stage's workspace is fixed. EnterWorktree would move its
+        // work out of the worktree Octopush watches; before Claude Code
+        // 2.1.330, ExitWorktree could remove one another session works in.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            for tool in ["EnterWorktree", "ExitWorktree"] {
+                let n = args[i + 1].split(',').filter(|t| *t == tool).count();
+                assert_eq!(n, 1, "{tool} exactly once: {args:?}");
+            }
+        }
     }
 
     #[test]
@@ -8901,6 +11733,383 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn only_a_sandboxed_mission_blocks_file_reads_outside_the_worktree() {
+        use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, read_guard_label, CliDialect, CodexWriteScope};
+        // #702: the Seatbelt profile denies writes only; a sandboxed mission's
+        // Claude stages also get the read guard, fresh and resumed.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        let argvs = || {
+            vec![
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ]
+        };
+        for mut args in argvs() {
+            assert!(confine_reads_in_sandbox(CliDialect::Claude, "sandbox", &mut args));
+            let v = settings(&args);
+            assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+            assert_eq!(v["permissions"]["blockReadsOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+        }
+        for mut args in argvs() {
+            assert!(!confine_reads_in_sandbox(CliDialect::Claude, "none", &mut args));
+            let v = settings(&args);
+            assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+            assert!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_none(), "{args:?}");
+        }
+        // Codex has no `--settings`; its argv is left alone even when sandboxed.
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox, "/ws");
+        let mut swapped = codex.clone();
+        assert!(!confine_reads_in_sandbox(CliDialect::Codex, "sandbox", &mut swapped));
+        assert_eq!(swapped, codex);
+        // The launch line says so only on a known CLI too old for the read guard.
+        assert_eq!(
+            read_guard_label(true, Some("2.1.250")).as_deref(),
+            Some("file reads not confined (Claude Code 2.1.257+ needed)")
+        );
+        assert_eq!(read_guard_label(true, Some("2.1.257")), None);
+        assert_eq!(read_guard_label(true, None), None, "an unknown version never warns");
+        assert_eq!(read_guard_label(false, Some("2.1.250")), None, "unsandboxed: nothing was asked for");
+    }
+
+    #[test]
+    fn every_seatbelt_wrapped_claude_stage_turns_claude_codes_own_bash_sandbox_off() {
+        use crate::orchestrator::cli_runner::{
+            confine_reads_in_sandbox, turn_off_inner_sandbox, CliDialect, CodexWriteScope, INNER_SANDBOX_OFF_LABEL,
+        };
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #1001: a user's `sandbox.enabled` in ~/.claude/settings.json can't
+        // nest in the mission profile, so every stage the profile wraps
+        // overrides it in `--settings`, beside the guards, fresh and resumed.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        for (git, exec, wrapped, reads) in [
+            ("worktree", "sandbox", true, true),
+            ("readonly", "sandbox", true, true),
+            ("readonly", "none", true, false),
+            ("worktree", "none", false, false),
+        ] {
+            let iso = stage_isolation(git, exec, "/ws");
+            for mut args in [
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ] {
+                assert_eq!(confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args), reads);
+                assert_eq!(turn_off_inner_sandbox(CliDialect::Claude, &iso.exec_isolation, &mut args), wrapped, "{git}/{exec}");
+                let v = settings(&args);
+                assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+                assert_eq!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some(), reads, "{args:?}");
+                if wrapped {
+                    assert_eq!(v["sandbox"], serde_json::json!({ "enabled": false }), "{git}/{exec}: {args:?}");
+                } else {
+                    assert!(v.get("sandbox").is_none(), "unsandboxed: the user's own sandbox is left alone: {args:?}");
+                }
+            }
+        }
+        // Codex has no `--settings`; its argv is left alone.
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox, "/ws");
+        let mut same = codex.clone();
+        assert!(!turn_off_inner_sandbox(CliDialect::Codex, "sandbox", &mut same));
+        assert_eq!(same, codex);
+        assert_eq!(
+            INNER_SANDBOX_OFF_LABEL,
+            "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage"
+        );
+    }
+
+    #[test]
+    fn claude_codes_sandbox_is_off_refusal_is_named_and_not_escalated() {
+        use crate::orchestrator::cli_runner::{
+            is_inner_sandbox_off, is_plan_limit, name_inner_sandbox_off, parse_cli_result, CliDialect,
+            InnerSandboxWatch, INNER_SANDBOX_OFF,
+        };
+        use crate::orchestrator::types::{ArtifactKind, StageStatus};
+        // #1001: since Claude Code 2.1.328 a sandbox that can't start makes the
+        // next sandboxed Bash command refuse, saying the sandbox is off for the
+        // session. The stage names that instead of failing generically.
+        let refusal_text = "Sandbox is off for the session: the sandbox could not start, so this command was not run.";
+        let tool_use = |name: &str, id: &str| {
+            serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "tool_use", "id": id, "name": name, "input": { "command": "npm test" } }
+            ] } })
+        };
+        let result = |id: &str, is_error: bool, content: serde_json::Value| {
+            serde_json::json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": content }
+            ] } })
+        };
+        fn watch(exec: &str, events: &[serde_json::Value]) -> InnerSandboxWatch {
+            let mut w = InnerSandboxWatch::for_stage(CliDialect::Claude, exec);
+            for e in events {
+                w.observe(e);
+            }
+            w
+        }
+        let refused_bash = |id: &str| [tool_use("Bash", id), result(id, true, serde_json::json!(refusal_text))];
+        let ran_bash = |id: &str| [tool_use("Bash", id), result(id, false, serde_json::json!("ok"))];
+
+        // A Bash refusal counts, as string or block content.
+        let w = watch("sandbox", &refused_bash("t1"));
+        assert!(w.refused() && w.decisive());
+        let w = watch(
+            "sandbox",
+            &[
+                tool_use("Bash", "t1"),
+                result("t1", true, serde_json::json!([{ "type": "text", "text": "Refused: the sandbox is off for the session." }])),
+            ],
+        );
+        assert!(w.refused());
+
+        // Review point 1: only an `is_error` result of a Bash call counts. A
+        // Read or Grep of this repo's docs quoting the phrase does not, nor a
+        // Bash `cat` that printed it, nor a result whose call never opened.
+        for events in [
+            vec![tool_use("Read", "r1"), result("r1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Grep", "g1"), result("g1", true, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", true, serde_json::json!("npm test: 3 failed"))],
+            vec![result("t9", true, serde_json::json!(refusal_text))],
+            vec![serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "text", "text": "the sandbox is off for the session" }
+            ] } })],
+        ] {
+            let w = watch("sandbox", &events);
+            assert!(!w.refused() && !w.decisive(), "{events:?}");
+        }
+
+        // Review point 2: only a stage the Seatbelt profile wraps is watched.
+        assert!(!watch("none", &refused_bash("t1")).refused(), "an unsandboxed stage's stream doesn't count");
+        let mut codex = InnerSandboxWatch::for_stage(CliDialect::Codex, "sandbox");
+        refused_bash("t1").iter().for_each(|e| codex.observe(e));
+        assert!(!codex.refused());
+
+        // Review point 3: decisive only when the refusal is the last Bash result.
+        let last: Vec<_> = [ran_bash("a"), refused_bash("b")].concat();
+        assert!(watch("sandbox", &last).decisive(), "the refusal was the last Bash result");
+        let all: Vec<_> = [ran_bash("a"), refused_bash("b"), refused_bash("c"), refused_bash("d")].concat();
+        assert!(watch("sandbox", &all).decisive(), "every Bash result after the first refusal was refused");
+        let then_read: Vec<_> =
+            [refused_bash("b").to_vec(), vec![tool_use("Read", "r"), result("r", false, serde_json::json!("x"))]].concat();
+        assert!(watch("sandbox", &then_read).decisive(), "a later non-Bash result doesn't change it");
+        let recovered: Vec<_> = [refused_bash("b"), ran_bash("c")].concat();
+        let w = watch("sandbox", &recovered);
+        assert!(w.refused(), "the notice still says it");
+        assert!(!w.decisive(), "a later Bash command ran: the failure has another cause");
+
+        let failed = parse_cli_result(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s"}"#,
+            false,
+            ArtifactKind::Diff,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(failed.status, StageStatus::Failed));
+        let named = name_inner_sandbox_off(failed.clone(), true);
+        let err = named.error.as_deref().unwrap();
+        assert!(err.starts_with(INNER_SANDBOX_OFF) && is_inner_sandbox_off(err), "{err}");
+        assert!(err.contains("error_max_turns"), "the CLI's own error is kept: {err}");
+        assert_eq!(name_inner_sandbox_off(named.clone(), true).error, named.error, "named once");
+        assert_eq!(name_inner_sandbox_off(failed.clone(), false).error, failed.error, "no refusal: unchanged");
+        assert!(!is_inner_sandbox_off(failed.error.as_deref().unwrap()));
+        // A refusal a later Bash command got past leaves a max-turns failure's
+        // error as it was, so `try_escalate` still escalates it.
+        let kept = name_inner_sandbox_off(failed.clone(), watch("sandbox", &recovered).decisive());
+        assert_eq!(kept.error, failed.error);
+        assert!(!is_inner_sandbox_off(kept.error.as_deref().unwrap()));
+        let named_last = name_inner_sandbox_off(failed.clone(), watch("sandbox", &last).decisive());
+        assert!(is_inner_sandbox_off(named_last.error.as_deref().unwrap()));
+        assert!(!is_plan_limit(err));
+        // A finished stage keeps its outcome; the notice alone says it.
+        let done = parse_cli_result(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s"}"#,
+            true,
+            ArtifactKind::Note,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(done.status, StageStatus::Done));
+        let kept = name_inner_sandbox_off(done, true);
+        assert!(matches!(kept.status, StageStatus::Done) && kept.error.is_none());
+    }
+
+    #[test]
+    fn a_read_confined_stage_adds_only_its_own_cache_root_and_temp_dir_as_working_dirs() {
+        use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, sandbox_read_dir_args, CliDialect};
+        // #743 review: the read guard must not refuse the stage's own temp dir
+        // and the build-cache root `sandbox_cache_env` points npm/cargo at,
+        // and must not add the user-wide `$TMPDIR`: every app and stage writes
+        // there, and Claude Code loads `.claude/skills` from an `--add-dir`.
+        let root = "/Users/u/Library/Caches/octopush/build-cache/0123abcd/4567ef01";
+        let tmp = "/Users/u/Library/Caches/octopush/tmp/89abcdef01234567";
+        let dirs = vec![root.to_string(), tmp.to_string(), format!("{root}/"), "  ".to_string()];
+        let added = |args: &[String]| -> Vec<String> {
+            args.iter().enumerate().filter(|(_, a)| *a == "--add-dir").map(|(i, _)| args[i + 1].clone()).collect()
+        };
+        for (choice, want) in [
+            ("sandbox", vec![root, tmp]),
+            ("none", vec![]),
+        ] {
+            for mut args in [
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ] {
+                let reads = confine_reads_in_sandbox(CliDialect::Claude, choice, &mut args);
+                args.extend(sandbox_read_dir_args(reads, &dirs));
+                assert_eq!(added(&args), want, "{choice}: {args:?}");
+                assert!(
+                    !added(&args).iter().any(|d| d.contains("/var/folders") || d.starts_with("/tmp") || d.starts_with("/private/tmp")),
+                    "{args:?}"
+                );
+                assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1, "{args:?}");
+            }
+        }
+        // A readonly mission whose own choice is `none` isn't read-confined, so
+        // it gets no `--add-dir` either, even though its sandbox is forced on.
+        let iso = crate::orchestrator::sandbox::stage_isolation("readonly", "none", "/ws");
+        let mut args = build_cli_args("m", "sys", 10, true);
+        let reads = confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args);
+        assert!(sandbox_read_dir_args(reads, &dirs).is_empty());
+        assert!(sandbox_read_dir_args(true, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_readonly_mission_gets_the_read_guard_only_when_its_user_chose_sandbox() {
+        use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, CliDialect};
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #702 review: a readonly (review/probe) mission's sandbox is forced on,
+        // but the read guard follows the mission's own exec choice.
+        let read_guard = |git: &str, exec: &str| -> (String, bool) {
+            let iso = stage_isolation(git, exec, "/ws");
+            let mut args = build_cli_args("m", "sys", 10, true);
+            confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args);
+            let at = args.iter().position(|a| a == "--settings").expect("--settings");
+            let v: serde_json::Value = serde_json::from_str(&args[at + 1]).expect("valid JSON");
+            assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true));
+            (iso.exec_isolation, v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some())
+        };
+        assert_eq!(read_guard("readonly", "none"), ("sandbox".to_string(), false), "forced sandbox: write guard only");
+        assert_eq!(read_guard("readonly", "sandbox"), ("sandbox".to_string(), true));
+        assert_eq!(read_guard("worktree", "sandbox"), ("sandbox".to_string(), true));
+        assert_eq!(read_guard("worktree", "none"), ("none".to_string(), false));
+        // The derivation keeps the write roots the sandbox already used.
+        let ro = stage_isolation("readonly", "none", "/ws");
+        assert_eq!((ro.exec_choice.as_str(), ro.allowed_write_roots), ("none", Vec::<String>::new()));
+        assert_eq!(stage_isolation("worktree", "none", "/ws").allowed_write_roots, vec!["/ws".to_string()]);
+        assert_eq!(stage_isolation("worktree", "sandbox", "/ws").allowed_write_roots, vec!["/ws".to_string()]);
+    }
+
+    #[test]
+    fn only_equally_confined_claude_stages_can_write_the_dirs_a_read_confined_stage_add_dirs() {
+        use crate::orchestrator::cli_runner::{cli_cache_tenant, confine_reads_in_sandbox, CliDialect};
+        use crate::orchestrator::sandbox::{
+            codex_cache_root, sandbox_write_roots, stage_dir_paths, stage_isolation, CacheTenant,
+        };
+        use std::path::{Path, PathBuf};
+        // #743 review: every readonly mission had write roots `[]`, so an
+        // exec-`none` review (reads open, untrusted diffs) shared its cache
+        // root and temp dir with a read-confined readonly stage, which loads
+        // `.claude/skills` from both through `--add-dir`. This pins, for
+        // every kind of launch that writes these dirs, that none can write a
+        // dir a read-confined Claude stage `--add-dir`s unless it is itself a
+        // read-confined Claude stage of the same workspace, access mode and
+        // exec choice.
+        let cache_base = Path::new("/Users/u/Library/Caches/octopush/build-cache");
+        let tmp_base = Path::new("/Users/u/Library/Caches/octopush/tmp");
+        #[derive(Debug, Clone, PartialEq)]
+        struct Launch {
+            who: &'static str,
+            ws: &'static str,
+            git: &'static str,
+            exec: &'static str,
+            reads_confined: bool,
+            writes: Vec<PathBuf>,
+        }
+        let mut launches: Vec<Launch> = Vec::new();
+        let dirs = |ws: &str, roots: &[String], tenant: CacheTenant, private_tmp: bool| -> Vec<PathBuf> {
+            let (root, tmp) = stage_dir_paths(cache_base, tmp_base, ws, roots, tenant, private_tmp);
+            assert_eq!(tmp.is_some(), private_tmp);
+            std::iter::once(root).chain(tmp).collect()
+        };
+        for ws in ["/ws-a", "/ws-b"] {
+            for git in ["worktree", "readonly"] {
+                for exec in ["none", "sandbox"] {
+                    let iso = stage_isolation(git, exec, ws);
+                    // CLI stages, as `CliRunner` launches them.
+                    if iso.exec_isolation == "sandbox" {
+                        for (who, dialect) in [("claude-cli", CliDialect::Claude), ("codex-cli", CliDialect::Codex)] {
+                            let mut args = build_cli_args("m", "sys", 10, true);
+                            let reads = confine_reads_in_sandbox(dialect, &iso.exec_choice, &mut args);
+                            let tenant = cli_cache_tenant(&iso.exec_choice, reads);
+                            let private_tmp = dialect == CliDialect::Claude;
+                            let writes = dirs(ws, &iso.allowed_write_roots, tenant, private_tmp);
+                            launches.push(Launch { who, ws, git, exec, reads_confined: reads, writes });
+                        }
+                        // An API-substrate DIRECT stage's `run_command`
+                        // (`StageContext.allowed_write_roots`, `sandbox::prepare`).
+                        let writes = dirs(ws, &iso.allowed_write_roots, CacheTenant::InProcess, false);
+                        launches.push(Launch { who: "api-run-command", ws, git, exec, reads_confined: false, writes });
+                    }
+                    // TALK's `run_command` (`send_agentic`, `sandbox::prepare`).
+                    if let Some(roots) = sandbox_write_roots(git, exec, ws) {
+                        let writes = dirs(ws, &roots, CacheTenant::InProcess, false);
+                        launches.push(Launch { who: "talk-run-command", ws, git, exec, reads_confined: false, writes });
+                    }
+                    // A Codex writer in its own sandbox (`codex_build_cache`).
+                    if iso.exec_isolation == "none" {
+                        let writes = vec![codex_cache_root(cache_base, ws)];
+                        launches.push(Launch { who: "codex-workspace-write", ws, git, exec, reads_confined: false, writes });
+                    }
+                }
+            }
+        }
+        let readers: Vec<&Launch> = launches.iter().filter(|l| l.reads_confined).collect();
+        // Read-confined stages: Claude in a mission whose own choice is sandbox.
+        assert_eq!(readers.len(), 4, "{readers:?}");
+        assert!(readers.iter().all(|r| r.who == "claude-cli" && r.exec == "sandbox"));
+        for r in &readers {
+            // What the stage passes with `--add-dir` is exactly what it writes.
+            assert_eq!(r.writes.len(), 2);
+            for w in &launches {
+                let shared: Vec<&PathBuf> = w.writes.iter().filter(|d| r.writes.contains(d)).collect();
+                let equally_confined =
+                    w.who == "claude-cli" && w.reads_confined && w.ws == r.ws && w.git == r.git && w.exec == r.exec;
+                if equally_confined {
+                    assert_eq!(shared.len(), 2, "{w:?} should share {r:?}'s dirs");
+                } else {
+                    assert!(shared.is_empty(), "{} ({} {} {}) can write {shared:?}, which {r:?} --add-dirs", w.who, w.ws, w.git, w.exec);
+                }
+            }
+        }
+        // The case the review found: a readonly exec-`none` review stage no
+        // longer shares a readonly sandboxed stage's cache root or temp dir.
+        let ro_open = launches
+            .iter()
+            .find(|l| l.who == "claude-cli" && l.ws == "/ws-a" && l.git == "readonly" && l.exec == "none")
+            .unwrap();
+        assert!(!ro_open.reads_confined && ro_open.writes.len() == 2, "it keeps its own temp dir");
+        let ro_confined = readers.iter().find(|l| l.ws == "/ws-a" && l.git == "readonly").unwrap();
+        assert!(ro_open.writes.iter().all(|d| !ro_confined.writes.contains(d)));
+        // Every dir still sits in its workspace's cache dir (or the temp base),
+        // keyed so `remove_workspace_build_caches` and the prune find it.
+        for l in &launches {
+            assert!(l.writes[0].starts_with(cache_base), "{l:?}");
+            assert!(l.writes.iter().skip(1).all(|t| t.parent() == Some(tmp_base)), "{l:?}");
+        }
+    }
+
+    #[test]
     fn budget_cap_becomes_max_budget_usd_only_with_a_limit() {
         use crate::orchestrator::cli_runner::{cli_budget_cap, max_budget_args};
         // #362: a run budget's remaining headroom caps the Claude stage.
@@ -8925,10 +12134,12 @@ mod cli_args_tests {
 
     #[test]
     fn codex_stages_carry_no_claude_settings() {
-        use crate::orchestrator::cli_runner::CliDialect;
+        use crate::orchestrator::cli_runner::{CliDialect, CodexWriteScope};
         for ro in [false, true] {
-            let args = CliDialect::Codex.argv("gpt-5", "sys", 10, ro);
-            assert!(!args.contains(&"--settings".to_string()), "{args:?}");
+            for scope in [CodexWriteScope::Workspace, CodexWriteScope::MissionSandbox] {
+                let args = CliDialect::Codex.argv("gpt-5", "sys", 10, ro, scope, "/ws");
+                assert!(!args.contains(&"--settings".to_string()), "{args:?}");
+            }
         }
     }
 
@@ -8960,7 +12171,7 @@ mod cli_args_tests {
 mod cli_dialect_tests {
     use crate::orchestrator::cli_runner::{
         build_codex_outcome, codex_fold_event, codex_usage_from_event, dialect_for_model,
-        CliDialect, CodexAccum,
+        CliDialect, CodexAccum, CodexWriteScope,
     };
     use crate::orchestrator::types::{ArtifactKind, StageStatus};
     use serde_json::json;
@@ -8978,12 +12189,125 @@ mod cli_dialect_tests {
     }
 
     #[test]
-    fn claude_stages_pass_their_effort_and_codex_stages_do_not() {
+    fn cli_stages_pass_their_effort_in_each_dialect() {
         use crate::providers::Effort;
-        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::High)), vec!["--effort", "high"]);
-        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::Xhigh)), vec!["--effort", "xhigh"]);
-        assert!(CliDialect::Claude.effort_args(None).is_empty(), "no effort ⇒ the CLI's own default");
-        assert!(CliDialect::Codex.effort_args(Some(Effort::High)).is_empty());
+        let m = "claude-opus-5-5";
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::High)), vec!["--effort", "high"]);
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::Xhigh)), vec!["--effort", "xhigh"]);
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::Max)), vec!["--effort", "max"]);
+        assert!(CliDialect::Claude.effort_args(m, None).is_empty(), "no effort ⇒ the CLI's own default");
+        assert_eq!(
+            CliDialect::Codex.effort_args("gpt-5.5", Some(Effort::High)),
+            vec!["-c", "model_reasoning_effort=\"high\""]
+        );
+        assert!(CliDialect::Codex.effort_args("gpt-5.5", None).is_empty(), "no effort ⇒ Codex's own default");
+        // A model missing from Codex's catalog keeps Codex's default.
+        assert!(CliDialect::Codex.effort_args("gpt-5-codex", Some(Effort::High)).is_empty());
+    }
+
+    #[test]
+    fn codex_effort_table_parses_and_lists_only_codex_tokens() {
+        use crate::orchestrator::cli_runner::codex_effort_levels;
+        // The shared table must parse, or every Codex model reads as unknown.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/codexEffortLevels.json")).expect("valid JSON");
+        let models = raw["models"].as_object().expect("models map");
+        assert!(models.len() >= 12, "{models:?}");
+        assert!(raw["source"].as_str().is_some_and(|s| s.contains("models.json")));
+        let known = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+        for (slug, levels) in models {
+            assert_eq!(slug, &slug.to_ascii_lowercase(), "slugs are matched lowercased");
+            let levels: Vec<String> = serde_json::from_value(levels.clone()).unwrap();
+            assert!(levels.iter().all(|l| known.contains(&l.as_str())), "{slug}: {levels:?}");
+            assert_eq!(codex_effort_levels(slug).map(<[String]>::to_vec), Some(levels), "{slug}");
+        }
+        assert_eq!(codex_effort_levels("GPT-5.5 ").map(<[String]>::len), Some(4), "case/space-insensitive");
+        assert_eq!(codex_effort_levels("gpt-5-codex"), None);
+    }
+
+    #[test]
+    fn codex_effort_levels_match_like_codex_longest_prefix_then_one_namespace() {
+        use crate::orchestrator::cli_runner::codex_effort_levels;
+        use crate::providers::Effort::High;
+        let gpt55 = codex_effort_levels("gpt-5.5");
+        assert!(gpt55.is_some());
+        // A dated or suffixed id takes its longest-prefix slug's levels.
+        assert_eq!(codex_effort_levels("gpt-5.5-2026-03-01"), gpt55);
+        assert_eq!(codex_effort_levels("gpt-6-luna-preview"), codex_effort_levels("gpt-6-luna"));
+        // One `namespace/` is stripped, and only one.
+        assert_eq!(codex_effort_levels("openai/gpt-5.5"), gpt55);
+        assert_eq!(codex_effort_levels("OpenAI/GPT-5.5-2026-03-01"), gpt55);
+        assert_eq!(codex_effort_levels("a/b/gpt-5.5"), None);
+        // Unknown ids still get no `-c`, and the journal says why.
+        for m in ["gpt-5-codex", "o3", "gpt-6", "openai/o3"] {
+            assert_eq!(codex_effort_levels(m), None, "{m}");
+            assert!(CliDialect::Codex.effort_args(m, Some(High)).is_empty(), "{m}");
+        }
+        assert_eq!(
+            CliDialect::Codex.unpassed_effort_notice("o3", Some(High)).as_deref(),
+            Some("This stage's high effort is not passed to Codex: o3 isn't in Octopush's copy of Codex's model catalog, so it runs at Codex's default effort.")
+        );
+        assert_eq!(
+            CliDialect::Codex.effort_args("gpt-5.5-2026-03-01", Some(High)),
+            vec!["-c".to_string(), "model_reasoning_effort=\"high\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn codex_effort_follows_the_catalog_for_every_model() {
+        use crate::providers::Effort::*;
+        let all = [Low, Medium, High, Xhigh, Max];
+        // Catalog @ a7a9d82: everything lists low..xhigh; max on these.
+        let with_max = [
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "codex-auto-review",
+        ];
+        for m in with_max {
+            assert_eq!(dialect_for_model(m), CliDialect::Codex, "{m}");
+            for e in all {
+                assert_eq!(CliDialect::Codex.effort_level(m, Some(e)), Some(e.as_str()), "{m} {e:?}");
+            }
+        }
+        // gpt-5.5 tops out at xhigh: max clamps down, the rest pass.
+        for e in [Low, Medium, High, Xhigh] {
+            assert_eq!(CliDialect::Codex.effort_level("gpt-5.5", Some(e)), Some(e.as_str()));
+        }
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5.5", Some(Max)), Some("xhigh"));
+        // Unknown to the catalog (older or non-reasoning models, typos): nothing.
+        for m in ["gpt-5-codex", "o3", "o4-mini", "gpt-5", "gpt-4o", "GPT-6"] {
+            for e in all {
+                assert_eq!(CliDialect::Codex.effort_level(m, Some(e)), None, "{m} {e:?}");
+                assert!(CliDialect::Codex.effort_args(m, Some(e)).is_empty(), "{m} {e:?}");
+            }
+            assert!(CliDialect::Codex.unpassed_effort_notice(m, Some(High)).is_some_and(|n| n.contains(m)));
+        }
+        assert_eq!(CliDialect::Codex.unpassed_effort_notice("gpt-5.5", Some(Max)), None);
+        assert_eq!(CliDialect::Codex.unpassed_effort_notice("gpt-5-codex", None), None);
+        assert_eq!(CliDialect::Claude.unpassed_effort_notice("claude-opus-5-5", Some(High)), None);
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5.5", None), None);
+    }
+
+    #[test]
+    fn codex_clamps_to_the_highest_listed_level_below() {
+        use crate::orchestrator::cli_runner::codex_effort_level;
+        use crate::providers::Effort::*;
+        // Exercised on the real table; the clamp itself is generic.
+        assert_eq!(codex_effort_level("gpt-5.5", Max), Some("xhigh"));
+        assert_eq!(codex_effort_level("gpt-6-luna", Max), Some("max"));
+        assert_eq!(codex_effort_level("gpt-6-luna", Low), Some("low"));
+        use crate::orchestrator::cli_runner::clamp_to_listed_levels;
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A non-reasoning model (no levels) gets nothing at any effort.
+        for e in [Low, Medium, High, Xhigh, Max] {
+            assert_eq!(clamp_to_listed_levels(&l(&[]), e), None, "{e:?}");
+            assert_eq!(clamp_to_listed_levels(&l(&["none", "minimal"]), e), None, "{e:?}");
+        }
+        // Down to the highest listed level below; up to the lowest when none is below.
+        assert_eq!(clamp_to_listed_levels(&l(&["low", "medium", "high"]), Max), Some("high"));
+        assert_eq!(clamp_to_listed_levels(&l(&["low", "medium", "high"]), Xhigh), Some("high"));
+        assert_eq!(clamp_to_listed_levels(&l(&["medium", "high"]), Low), Some("medium"));
+        assert_eq!(clamp_to_listed_levels(&l(&["low", "high"]), Medium), Some("low"));
     }
 
     #[test]
@@ -9016,32 +12340,205 @@ mod cli_dialect_tests {
     }
 
     #[test]
-    fn effort_applies_to_api_and_claude_cli_only() {
+    fn effort_applies_to_api_and_both_cli_dialects() {
         use crate::orchestrator::cli_runner::effort_applies;
         assert!(effort_applies("api", "gpt-5"));
         assert!(effort_applies("cli", "claude-opus-5-5"));
+        assert!(effort_applies("cli", "gpt-5.5"));
+        assert!(effort_applies("cli", "gpt-5.6-sol"));
+        // A Codex model missing from Codex's catalog gets no effort.
         assert!(!effort_applies("cli", "gpt-5-codex"));
+        assert!(!effort_applies("cli", "o3"));
+        assert!(effort_applies("api", "gpt-5-codex"));
         assert!(!effort_applies("bogus", "claude-opus-5-5"));
     }
 
     #[test]
+    fn a_codex_writer_outside_a_sandboxed_mission_never_bypasses_codexs_sandbox() {
+        let ws = CodexWriteScope::Workspace;
+        for model in ["gpt-5", "gpt-6.1-terra", "o3", "gpt-5-codex"] {
+            let argv = CliDialect::Codex.argv(model, "sys", 25, false, ws, "/ws");
+            assert!(!argv.iter().any(|a| a.contains("dangerously")), "{argv:?}");
+            let config = |v: &str| argv.windows(2).any(|w| w[0] == "-c" && w[1] == v);
+            assert!(config("approval_policy=\"never\""), "{argv:?}");
+            // The network stays on, as under Octopush's own Seatbelt profile.
+            assert!(config("sandbox_workspace_write.network_access=true"), "{argv:?}");
+            // No writable root of its own (a worktree's git dir would hand over
+            // its `commondir`); the runner adds only the build-cache root.
+            assert!(!argv.iter().any(|a| a.starts_with("sandbox_workspace_write.writable_roots")), "{argv:?}");
+        }
+        assert_eq!(CliDialect::Codex.sandbox_label(false, ws), Some("workspace-write sandbox"));
+        assert_eq!(CliDialect::Codex.sandbox_label(true, ws), None);
+        assert_eq!(CliDialect::Claude.sandbox_label(false, ws), None);
+        assert_eq!(CliDialect::Codex.sandbox_label(false, CodexWriteScope::MissionSandbox), None);
+        // The launch line names Codex's version when it is known.
+        assert_eq!(CliDialect::Codex.version_label(Some("0.169.0")).as_deref(), Some("codex 0.169.0"));
+        assert_eq!(CliDialect::Codex.version_label(None), None);
+        assert_eq!(CliDialect::Claude.version_label(Some("0.169.0")), None);
+        // Claude stages ignore the scope.
+        assert_eq!(
+            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, ws, "/ws"),
+            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, CodexWriteScope::MissionSandbox, "/ws")
+        );
+    }
+
+    #[test]
+    fn the_runner_picks_codexs_sandbox_only_outside_a_sandboxed_mission() {
+        use crate::orchestrator::cli_runner::{codex_write_scope, guards_git_entry};
+        assert_eq!(codex_write_scope("sandbox"), CodexWriteScope::MissionSandbox);
+        assert_eq!(codex_write_scope("none"), CodexWriteScope::Workspace);
+        // The `.git` entry is checked only for a Codex writer in Codex's own sandbox.
+        assert!(guards_git_entry(CliDialect::Codex, false, "none"));
+        assert!(!guards_git_entry(CliDialect::Codex, false, "sandbox"));
+        assert!(!guards_git_entry(CliDialect::Codex, true, "none"));
+        assert!(!guards_git_entry(CliDialect::Codex, true, "sandbox"));
+        assert!(!guards_git_entry(CliDialect::Claude, false, "none"));
+        assert!(!guards_git_entry(CliDialect::Claude, false, "sandbox"));
+        // End to end: an unsandboxed mission never bypasses Codex's sandbox,
+        // a sandboxed one keeps the bypass under Seatbelt.
+        let none = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("none"), "/ws");
+        assert!(none.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{none:?}");
+        assert!(!none.iter().any(|a| a.contains("dangerously")), "{none:?}");
+        let sandboxed = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("sandbox"), "/ws");
+        assert!(sandboxed.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{sandboxed:?}");
+    }
+
+    #[test]
+    fn a_codex_writers_build_cache_root_is_its_one_extra_writable_root_before_the_prompt() {
+        use crate::orchestrator::cli_runner::codex_writable_root_args;
+        let flags = codex_writable_root_args("/Users/u/Library/Caches/octopush/build-cache/ab12");
+        assert_eq!(
+            flags,
+            vec![
+                "-c".to_string(),
+                "sandbox_workspace_write.writable_roots=[\"/Users/u/Library/Caches/octopush/build-cache/ab12\"]".to_string()
+            ]
+        );
+        // A quote or backslash in the path stays inside one TOML string.
+        let odd = codex_writable_root_args("/a \"b\\c");
+        assert_eq!(odd[1], "sandbox_workspace_write.writable_roots=[\"/a \\\"b\\\\c\"]");
+        let mut argv = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::Workspace, "/ws");
+        CliDialect::Codex.push_flags(&mut argv, flags.clone());
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "prompt still rides stdin");
+        assert!(argv.windows(2).any(|w| w[0] == "-c" && w[1] == flags[1]), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| a.starts_with("sandbox_workspace_write.writable_roots")).count(), 1);
+    }
+
+    #[test]
+    fn an_action_role_on_a_codex_writer_in_codexs_sandbox_is_told_it_cant_commit() {
+        use crate::orchestrator::cli_runner::codex_git_notice;
+        use crate::orchestrator::types::RoleEnvironment::{Action, Worktree};
+        let ws = CodexWriteScope::Workspace;
+        let note = codex_git_notice(CliDialect::Codex, false, ws, Action).unwrap();
+        assert!(note.contains("can't commit"), "{note}");
+        // Only a Claude model is recommended until a sandboxed Codex mission
+        // is checked on a Mac (#784).
+        assert!(note.ends_with("Give this stage a Claude model."), "{note}");
+        assert!(!note.contains("sandboxed"), "{note}");
+        assert!(codex_git_notice(CliDialect::Codex, false, ws, Worktree).is_none());
+        assert!(codex_git_notice(CliDialect::Codex, false, CodexWriteScope::MissionSandbox, Action).is_none());
+        assert!(codex_git_notice(CliDialect::Codex, true, ws, Action).is_none());
+        assert!(codex_git_notice(CliDialect::Claude, false, ws, Action).is_none());
+    }
+
+    #[test]
+    fn a_read_only_codex_stage_in_a_sandboxed_mission_is_refused() {
+        use crate::orchestrator::cli_runner::{codex_read_only_refusal, codex_write_scope, CODEX_READ_ONLY_SANDBOX_REFUSAL};
+        use crate::orchestrator::sandbox::stage_isolation;
+        let sandboxed = CodexWriteScope::MissionSandbox;
+        assert_eq!(
+            codex_read_only_refusal(CliDialect::Codex, true, sandboxed),
+            Some("A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.")
+        );
+        assert_eq!(CODEX_READ_ONLY_SANDBOX_REFUSAL, codex_read_only_refusal(CliDialect::Codex, true, sandboxed).unwrap());
+        // A writer in a sandboxed mission runs; so does a read-only stage in
+        // Codex's own sandbox, and any Claude stage.
+        assert_eq!(codex_read_only_refusal(CliDialect::Codex, false, sandboxed), None);
+        assert_eq!(codex_read_only_refusal(CliDialect::Codex, true, CodexWriteScope::Workspace), None);
+        assert_eq!(codex_read_only_refusal(CliDialect::Claude, true, sandboxed), None);
+        // A readonly mission forces the sandbox on, so it is refused there too.
+        assert_eq!(codex_write_scope(&stage_isolation("readonly", "none", "/ws").exec_isolation), sandboxed);
+    }
+
+    #[test]
+    fn a_codex_home_failure_is_the_preflights_message_or_a_fail_closed_line() {
+        use crate::orchestrator::cli_runner::codex_home_failure;
+        use crate::orchestrator::sandbox::{CodexHomeError, CODEX_REFRESH_SIGN_IN};
+        assert_eq!(codex_home_failure(&CodexHomeError::SignIn(CODEX_REFRESH_SIGN_IN)), "Open Codex once to refresh sign-in");
+        let setup = codex_home_failure(&CodexHomeError::Setup("x is not a directory you own".into()));
+        assert!(setup.starts_with("Sandbox setup failed — refusing to run the stage"), "{setup}");
+        assert!(setup.ends_with("x is not a directory you own"), "{setup}");
+    }
+
+    #[test]
+    fn a_changed_git_entry_fails_the_stage_but_keeps_its_spend() {
+        use crate::orchestrator::cli_runner::fail_keeping_usage;
+        use crate::orchestrator::types::StageArtifact;
+        let done = crate::orchestrator::types::StageOutcome {
+            cli: Default::default(),
+            artifact: StageArtifact { kind: ArtifactKind::Note, text: "done".into(), payload: None, refs_worktree: true },
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 3,
+            cache_creation_tokens: 4,
+            cost_usd: 0.5,
+            status: StageStatus::Done,
+            tool_calls: vec![],
+            error: None,
+            verdict: None,
+            session_id: None,
+            blocked: None,
+            blocked_transcript: None,
+        };
+        let failed = fail_keeping_usage(done, ".git changed");
+        assert!(matches!(failed.status, StageStatus::Failed));
+        assert_eq!(failed.error.as_deref(), Some(".git changed"));
+        assert_eq!((failed.input_tokens, failed.output_tokens), (10, 20));
+        assert_eq!((failed.cache_read_tokens, failed.cache_creation_tokens), (3, 4));
+        assert_eq!(failed.cost_usd, 0.5);
+        assert!(failed.artifact.text.is_empty(), "the stage's result is not handed on");
+    }
+
+    #[test]
     fn codex_argv_maps_read_only_to_its_native_sandbox() {
-        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false);
+        let ws = CodexWriteScope::Workspace;
+        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false, ws, "/ws");
         assert_eq!(rw[0], "exec");
         assert!(rw.contains(&"--json".to_string()));
-        assert!(rw.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(rw.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{rw:?}");
         assert!(rw.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5"), "{rw:?}");
         assert_eq!(rw.last().map(String::as_str), Some("-"), "prompt rides stdin");
         // System prompt never appears in argv (codex has no flag for it).
         assert!(!rw.iter().any(|a| a.contains("system prompt")));
 
-        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true);
-        assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
-        assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        // Read-only never bypasses Codex's sandbox (inside a sandboxed mission
+        // such a stage is refused before launch, `codex_read_only_refusal`).
+        for scope in [ws, CodexWriteScope::MissionSandbox] {
+            let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, scope, "/ws");
+            assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
+            assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+            assert!(!ro.iter().any(|a| a.starts_with("sandbox_workspace_write.")), "{ro:?}");
+        }
 
-        // Codex has no confirmed resume contract → fresh-run fallback.
-        assert!(CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false).is_none());
-        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false).is_some());
+        // Inside a sandboxed mission, Octopush's Seatbelt profile confines it.
+        let mission = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::MissionSandbox, "/ws");
+        assert!(mission.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{mission:?}");
+        assert!(!mission.contains(&"--sandbox".to_string()), "{mission:?}");
+
+        // Codex resumes with `exec … resume <id> -` (#682; the argv shape is
+        // pinned against the recorded help in `codex_contract.rs`).
+        let resumed = CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false, ws, "/ws").unwrap();
+        assert_eq!(resumed[resumed.len() - 3..], ["resume", "sess", "-"]);
+        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false, ws, "/ws").is_some());
+
+        // Both name the stage's worktree (`-C`), so a resume on Codex 0.172.0+
+        // never runs in the thread's saved directory (#1110).
+        for argv in [&rw, &mission, &resumed] {
+            assert!(argv.windows(2).any(|w| w[0] == "-C" && w[1] == "/ws"), "{argv:?}");
+        }
+        // Claude Code takes its directory from the process, not a flag.
+        let claude = CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, ws, "/ws");
+        assert!(!claude.iter().any(|a| a == "-C" || a == "/ws"), "{claude:?}");
 
         // Stdin payload: claude = user only; codex = system + user joined.
         assert_eq!(CliDialect::Claude.stdin_payload("SYS", "USER"), "USER");
@@ -9097,17 +12594,185 @@ mod cli_dialect_tests {
         assert_eq!(u.input_tokens, 400, "billable fresh input excludes cached");
         assert_eq!(u.cache_read_input_tokens, 600);
         assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_creation_input_tokens, 0, "older CLIs omit cache writes");
         // Non-usage events report nothing.
         assert!(codex_usage_from_event(&json!({"type":"turn.started"})).is_none());
     }
 
     #[test]
+    fn codex_usage_splits_cache_writes_out_of_input() {
+        // GPT-5.6+ bills cache writes: Codex reports them inside input_tokens
+        // as `cache_write_input_tokens` (openai/codex exec_events.rs `Usage`).
+        let (_, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":300,"output_tokens":50}})).unwrap();
+        assert_eq!(u.input_tokens, 100, "fresh input excludes cached and written");
+        assert_eq!(u.cache_read_input_tokens, 600);
+        assert_eq!(u.cache_creation_input_tokens, 300);
+        // A write count larger than the uncached remainder is clamped.
+        let (_, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":900,"output_tokens":0}})).unwrap();
+        assert_eq!((u.input_tokens, u.cache_creation_input_tokens), (0, 400));
+        // Legacy cumulative token_count events carry the same field.
+        let (key, u) = codex_usage_from_event(&json!({"msg":{"type":"token_count","info":{"total_token_usage":
+            {"input_tokens":500,"cached_input_tokens":100,"cache_write_input_tokens":200,"output_tokens":5}}}})).unwrap();
+        assert_eq!(key.as_deref(), Some("token_count"));
+        assert_eq!((u.input_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens), (200, 100, 200));
+    }
+
+    /// The per-stage usage map the runner streams a Codex stage into.
+    fn codex_stream_usage(
+        events: &[serde_json::Value],
+    ) -> std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage> {
+        let mut map = std::collections::HashMap::new();
+        for ev in events {
+            if let Some((id, u)) = codex_usage_from_event(ev) {
+                let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                map.insert(key, u);
+            }
+        }
+        map
+    }
+
+    /// Fold a Codex stream the way the runner does: the accumulator and the
+    /// per-stage usage map.
+    fn codex_stream(
+        events: &[serde_json::Value],
+    ) -> (CodexAccum, std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage>) {
+        let mut accum = CodexAccum::default();
+        for ev in events {
+            codex_fold_event(&mut accum, ev);
+        }
+        (accum, codex_stream_usage(events))
+    }
+
+    #[test]
+    fn codex_stage_stopped_before_turn_completed_reports_usage_unreported_not_zero() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage};
+        // Assistant items streamed, then the stall: no turn.completed arrived.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Reading the code."}}),
+            json!({"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"ls","status":"completed"}}),
+        ]);
+        assert!(accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &map, accum.turn_open);
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert!(err.starts_with("codex timed out — no output for 5 minutes\n"), "the cause stays the first line: {err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // Stopped between turns: every turn reported, so the usage is kept unflagged.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Done with turn one."}}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+        ]);
+        assert!(!accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "codex exceeded the 60-minute cap", "gpt-5", &map, accum.turn_open);
+        let err = out.error.as_deref().unwrap();
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!(err, "codex exceeded the 60-minute cap");
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (400, 600, 50));
+
+        // A Claude stage with nothing streamed is unchanged (it streams usage per message).
+        let out = stopped_stage(CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-sonnet-4-6", &Default::default(), false);
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn codex_stage_stopped_mid_turn_keeps_earlier_turns_usage_and_is_flagged() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage};
+        // Turn one reported its usage; turn two was stopped before turn.completed.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"Working on turn two."}}),
+        ]);
+        assert!(accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "Stopped by the director", "gpt-5", &map, accum.turn_open);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "the open turn's tokens are unknown: {err}");
+        assert!(err.starts_with("Stopped by the director\n"), "{err}");
+        assert_eq!(
+            (out.input_tokens, out.cache_read_tokens, out.output_tokens),
+            (400, 600, 50),
+            "the turns that reported keep their usage"
+        );
+    }
+
+    #[test]
+    fn codex_turn_failed_without_turn_completed_reports_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Starting."}}),
+            json!({"type":"turn.failed","error":{"message":"stream disconnected"}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("stream disconnected"), "the cause stays the first line: {err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // An earlier turn's usage is kept; the failed turn still flags it.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.failed","error":{"message":"rate limited"}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (400, 600, 50));
+    }
+
+    #[test]
+    fn codex_crash_without_turn_completed_reports_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        // The process died mid-turn: no message, no turn.completed, a bad exit.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Note, "gpt-5", "thread 'main' panicked");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("codex exited with an error"), "{err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!(out.session_id.as_deref(), Some("th"));
+
+        // A clean exit that ended without a message, after a completed turn, stays unflagged.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage.clone(), true, ArtifactKind::Note, "gpt-5", "");
+        let err = out.error.as_deref().unwrap();
+        assert!(err.contains("no final message"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+
+        // The same stream crashing mid-turn instead is flagged.
+        let (accum, _) = codex_stream(&[json!({"type":"turn.started"})]);
+        let out = build_codex_outcome(&accum, usage, true, ArtifactKind::Note, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+    }
+
+    #[test]
     fn codex_outcome_is_the_last_message_or_an_honest_failure() {
-        let usage = Default::default();
+        let usage = crate::orchestrator::cli_runner::CliUsage::default();
         // Final message → Done, with the verdict sentinel still parsed.
         let ok = build_codex_outcome(
-            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()) },
-            usage, true, ArtifactKind::Review, "gpt-5", "",
+            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()), turn_open: false, activity: true },
+            usage.clone(), true, ArtifactKind::Review, "gpt-5", "",
         );
         assert!(matches!(ok.status, StageStatus::Done));
         assert_eq!(ok.artifact.text, "findings\nVERDICT: PASS");
@@ -9116,8 +12781,8 @@ mod cli_dialect_tests {
 
         // turn.failed → Failed, last message preserved as context.
         let failed = build_codex_outcome(
-            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None },
-            usage, true, ArtifactKind::Diff, "gpt-5", "",
+            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None, turn_open: false, activity: true },
+            usage.clone(), true, ArtifactKind::Diff, "gpt-5", "",
         );
         assert!(matches!(failed.status, StageStatus::Failed));
         let msg = failed.error.as_deref().unwrap();
@@ -9127,6 +12792,75 @@ mod cli_dialect_tests {
         let empty = build_codex_outcome(&CodexAccum::default(), usage, true, ArtifactKind::Note, "gpt-5", "stderr says hi");
         assert!(matches!(empty.status, StageStatus::Failed));
         assert!(empty.error.as_deref().unwrap().contains("no final message"));
+        assert!(
+            !crate::orchestrator::cli_runner::is_usage_unreported(empty.error.as_deref().unwrap()),
+            "no turn ran, so the cost is known to be $0"
+        );
+    }
+
+    #[test]
+    fn codex_failure_before_any_turn_is_not_flagged_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        // An `error` event before Codex starts a turn: nothing was spent.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+        ]);
+        assert!(!accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // The real stream of an expired login or an unknown model: Codex
+        // starts the turn before the request, so the turn is open when it
+        // fails and the stage is flagged (the stream can't show the spend).
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+            json!({"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized"}}),
+        ]);
+        assert!(accum.turn_open && accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A bad exit with only stderr (a bad flag): nothing streamed at all.
+        let out = build_codex_outcome(
+            &CodexAccum::default(), Default::default(), false, ArtifactKind::Note, "gpt-5",
+            "error: unexpected argument '--bogus' found",
+        );
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("codex exited with an error"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A legacy-schema error before any agent event is not flagged either…
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"session_configured","session_id":"s"}}),
+            json!({"msg":{"type":"error","message":"not logged in"}}),
+        ]);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+
+        // …but one after agent activity with no `token_count` is (the legacy
+        // schema has no `turn.started`).
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"exec_command_begin","command":["ls"]}}),
+            json!({"msg":{"type":"error","message":"stream disconnected"}}),
+        ]);
+        assert!(accum.activity && !accum.turn_open);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
     }
 }
 
@@ -9266,6 +13000,18 @@ mod cli_path_tests {
         assert_eq!(found, bin);
 
         assert!(resolve_executable("does-not-exist-xyz", &path_env).is_none());
+
+        // A relative entry would resolve against the working directory: skipped.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = pathdiff_rel(dir.path(), &cwd);
+        assert!(resolve_executable("claude", &format!(".:{rel}")).is_none(), "{rel}");
+    }
+
+    /// `to` written relative to `from` (`../../tmp/x`), so it isn't absolute.
+    fn pathdiff_rel(to: &std::path::Path, from: &std::path::Path) -> String {
+        let depth = from.components().count().saturating_sub(1);
+        let up = "../".repeat(depth);
+        format!("{up}{}", to.strip_prefix("/").unwrap().display())
     }
 
     #[test]
@@ -9523,6 +13269,76 @@ mod live_tests {
         assert_eq!(tool["hint"], "a.rs");
     }
 
+    /// Scripted turns, recording each request as the Responses body it becomes.
+    struct ResponsesRecorder { turns: Mutex<VecDeque<LlmResponse>>, bodies: Mutex<Vec<Value>> }
+    #[async_trait::async_trait]
+    impl LlmProvider for ResponsesRecorder {
+        async fn complete(&self, b: &str, _k: Option<&str>, r: &LlmRequest, _c: &reqwest::Client)
+            -> crate::error::AppResult<LlmResponse> {
+            self.bodies.lock().push(crate::providers::openai_compat::build_responses_request(r, "openai", b));
+            Ok(self.turns.lock().pop_front().expect("ResponsesRecorder ran out of turns"))
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_replays_gpt6_reasoning_but_not_a_truncated_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let gpt_turn = |rs: &str, call: &str| crate::providers::openai_compat::parse_responses_response(json!({
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "id": rs, "summary": [], "encrypted_content": format!("enc-{rs}") },
+                { "type": "function_call", "id": format!("fc-{call}"), "call_id": call, "name": "read_file",
+                  "arguments": "{\"path\":\"a.rs\"}", "status": "completed" }
+            ]
+        }), "gpt-6-sol", "openai", "https://api.openai.com/v1");
+        let mut cut = gpt_turn("rs_2", "call_2");
+        cut.stop_reason = LlmStopReason::MaxTokens;
+        let provider = ResponsesRecorder {
+            turns: Mutex::new(VecDeque::from(vec![
+                gpt_turn("rs_1", "call_1"),
+                cut,
+                resp("done", vec![], LlmStopReason::EndTurn),
+            ])),
+            bodies: Mutex::new(vec![]),
+        };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "https://api.openai.com/v1", None, &client, "gpt-6-sol",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[], None,
+                                   None,).await.unwrap();
+        assert_eq!(out.text, "done");
+
+        let bodies = provider.bodies.lock();
+        assert_eq!(bodies.len(), 3);
+        // Every turn leads with the one system-prompt developer item (the
+        // cacheable prefix); replays never repeat it.
+        for body in bodies.iter() {
+            assert!(body.get("instructions").is_none());
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input[0]["role"], "developer");
+            assert_eq!(input[0]["content"][0]["text"], "sys");
+            assert_eq!(input.iter().filter(|i| i["role"] == "developer").count(), 1);
+        }
+        // Turn 2: the reasoning item, then its call with its fc id, then the output.
+        let input = bodies[1]["input"].as_array().unwrap();
+        assert_eq!(input[2]["type"], "reasoning");
+        assert_eq!(input[2]["encrypted_content"], "enc-rs_1");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["id"], "fc-call_1");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call_1");
+        // Turn 3: the truncated turn's reasoning is dropped and its call rebuilt.
+        let input = bodies[2]["input"].as_array().unwrap();
+        let text = serde_json::to_string(input).unwrap();
+        assert!(text.contains("enc-rs_1"), "the completed turn still replays");
+        assert!(!text.contains("enc-rs_2") && !text.contains("fc-call_2"), "{text}");
+        let call_2 = input.iter().find(|i| i["type"] == "function_call" && i["call_id"] == "call_2").unwrap();
+        assert!(call_2.get("id").is_none());
+    }
+
     #[tokio::test]
     async fn agentic_loop_exhaustion_forces_a_toolless_close() {
         let dir = tempfile::tempdir().unwrap();
@@ -9721,6 +13537,50 @@ mod live_tests {
         assert_eq!(compact(&mut small, 0, 1_000_000), 0);
     }
 
+    #[test]
+    fn compact_history_counts_encrypted_reasoning_in_the_estimate() {
+        use crate::orchestrator::agentic::compact_history_for_tests as compact;
+        use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolResult};
+        // A GPT-6 turn whose encrypted reasoning alone is over the budget.
+        let gpt = crate::providers::openai_compat::parse_responses_response(json!({
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "A".repeat(200_000) },
+                { "type": "function_call", "id": "fc_1", "call_id": "c1", "name": "read_file", "arguments": "{}" }
+            ]
+        }), "gpt-6-sol", "openai", "https://api.openai.com/v1");
+        let results = |id: &str| LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::ToolResults(vec![LlmToolResult {
+                tool_use_id: id.into(),
+                content: "x".repeat(5_000),
+                is_error: false,
+            }]),
+        };
+        let mut messages = vec![
+            LlmMessage {
+                role: LlmRole::Assistant,
+                content: LlmContent::AssistantWithTools {
+                    raw: gpt.raw_content,
+                    text: String::new(),
+                    tool_uses: gpt.tool_uses,
+                },
+            },
+            results("c1"),
+            results("t1"),
+            results("t2"),
+            results("t3"),
+            results("t4"),
+        ];
+        // Reasoning still occupies the context window: ~150k decoded chars of
+        // it plus ~30k of tool output is over a 100k budget, so older tool
+        // output is compacted rather than letting the stage overflow.
+        assert!(compact(&mut messages, 0, 100_000) > 0);
+        // Without the reasoning, the same history fits.
+        let mut visible: Vec<_> = messages.iter().skip(1).cloned().collect();
+        assert_eq!(compact(&mut visible, 0, 100_000), 0);
+    }
+
     #[tokio::test]
     async fn agentic_loop_ask_stage_unknown_step_errors_and_continues() {
         use crate::orchestrator::agentic::PeerStage;
@@ -9788,6 +13648,42 @@ mod live_tests {
             .map(|(_, p)| p["entry"]["text"].as_str().unwrap().to_string())
             .collect();
         assert!(notices.iter().any(|n| n.contains("run budget reached mid-stage")), "{notices:?}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn agentic_loop_prices_each_haiku_5_5_request_at_its_own_tier() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let sized = |mut r: LlmResponse, input: u64, read: u64, output: u64| {
+            (r.input_tokens, r.cache_read_tokens, r.output_tokens) = (input, read, output);
+            r
+        };
+        // A 40K-token request that calls a tool, then a 140K-token answer.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            sized(resp("reading",
+                       vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
+                             input: serde_json::json!({"path": "a.rs"}) }],
+                       LlmStopReason::ToolUse), 10_000, 30_000, 1_000),
+            sized(resp("done", vec![], LlmStopReason::EndTurn), 20_000, 120_000, 2_000),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "claude-haiku-5-5",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false,
+                                   None, &[], None,
+                                   None,).await.unwrap();
+        assert!(out.finished);
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (30_000, 150_000, 3_000));
+        // 40K at 0.10 / 0.01 / 0.50; 140K at 0.50 / 0.05 / 2.50 — not the
+        // 180K sum at either one tier.
+        let short = (10_000.0 * 0.10 + 30_000.0 * 0.01 + 1_000.0 * 0.50) / 1e6;
+        let long = (20_000.0 * 0.50 + 120_000.0 * 0.05 + 2_000.0 * 2.50) / 1e6;
+        assert!((out.cost_usd - (short + long)).abs() < 1e-12, "{}", out.cost_usd);
     }
 
     #[test]
@@ -9873,6 +13769,216 @@ mod live_tests {
         // others still bill at $4/$20.
         let c = streamed_cost("claude-opus-5-5", &map);
         assert!((c - 2.0 * (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{c}");
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_haiku_5_5_stage_prices_each_streamed_request_at_its_own_tier() {
+        use crate::orchestrator::cli_runner::{streamed_cost, usage_from_stream_event};
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let mk = |id: &str, input: u64, read: u64, output: u64| serde_json::json!({
+            "type": "assistant",
+            "message": { "id": id, "model": "claude-haiku-5-5", "usage": { "input_tokens": input,
+                "output_tokens": output, "cache_read_input_tokens": read, "cache_creation_input_tokens": 0 } }
+        });
+        // A 40K-token request, then a 140K-token one streamed as two content
+        // blocks that repeat the same message's usage.
+        let events = [mk("msg_short", 10_000, 30_000, 1_000), mk("msg_long", 20_000, 120_000, 2_000), mk("msg_long", 20_000, 120_000, 2_000)];
+        let mut map = std::collections::HashMap::new();
+        for ev in &events {
+            let (id, u) = usage_from_stream_event(ev).unwrap();
+            assert!(u.one_request);
+            map.insert(id.unwrap(), u);
+        }
+        assert_eq!(map.len(), 2, "the repeated message id counts once");
+        // 40K at 0.10 / 0.01 / 0.50; 140K at 0.50 / 0.05 / 2.50.
+        let short = (10_000.0 * 0.10 + 30_000.0 * 0.01 + 1_000.0 * 0.50) / 1e6;
+        let long = (20_000.0 * 0.50 + 120_000.0 * 0.05 + 2_000.0 * 2.50) / 1e6;
+        let c = streamed_cost("claude-haiku-5-5", &map);
+        assert!((c - (short + long)).abs() < 1e-12, "{c}");
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_codex_stage_keeps_the_base_tier_for_its_turn_totals() {
+        use crate::orchestrator::cli_runner::{codex_usage_from_event, streamed_cost};
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // A turn total spans many requests, so its 300K input isn't one
+        // request over GPT-6's 272K threshold.
+        let ev = serde_json::json!({ "type": "turn.completed",
+            "usage": { "input_tokens": 300_000, "cached_input_tokens": 0, "output_tokens": 1_000 } });
+        let (_, u) = codex_usage_from_event(&ev).unwrap();
+        assert!(!u.one_request);
+        let map = std::collections::HashMap::from([("turn".to_string(), u)]);
+        let c = streamed_cost("gpt-6.1-terra", &map);
+        assert!((c - (300_000.0 * 1.0 + 1_000.0 * 5.0) / 1e6).abs() < 1e-12, "{c}");
+    }
+
+    /// One streamed assistant message: 1,000 in / 100 out, on `model` (none
+    /// when `None`), fast when `fast`.
+    fn streamed_msg(id: &str, model: Option<&str>, fast: bool) -> serde_json::Value {
+        let mut usage = serde_json::json!({ "input_tokens": 1_000, "output_tokens": 100,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 });
+        if fast {
+            usage["speed"] = serde_json::Value::from("fast");
+        }
+        let mut message = serde_json::json!({ "id": id, "usage": usage });
+        if let Some(m) = model {
+            message["model"] = serde_json::Value::from(m);
+        }
+        serde_json::json!({ "type": "assistant", "message": message })
+    }
+
+    fn streamed_map(events: &[serde_json::Value]) -> std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage> {
+        events
+            .iter()
+            .map(|e| {
+                let (id, u) = crate::orchestrator::cli_runner::usage_from_stream_event(e).unwrap();
+                (id.unwrap(), u)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_stage_prices_each_streamed_message_at_its_own_model() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_cost};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // An Opus 5 stage whose Haiku subagent answered one message; a message
+        // naming no model is the stage's.
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-haiku-4-5-20251001"), false),
+            streamed_msg("msg_3", None, false),
+        ]);
+        assert_eq!(map["msg_2"].model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        assert_eq!(map["msg_3"].model, None);
+        let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+        let haiku = (1_000.0 * 1.0 + 100.0 * 5.0) / 1e6;
+        let c = streamed_cost("claude-opus-5", &map);
+        assert!((c - (2.0 * opus + haiku)).abs() < 1e-12, "{c}, not the two priced separately");
+        // Before: every message at the stage's model — the subagent over-billed.
+        assert!((c - 3.0 * opus).abs() > 1e-6);
+        // The reverse case: a Haiku stage with an Opus subagent is not under-billed.
+        let rev = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-haiku-4-5"), false),
+            streamed_msg("msg_2", Some("claude-opus-5"), false),
+        ]);
+        assert!((streamed_cost("claude-haiku-4-5", &rev) - (opus + haiku)).abs() < 1e-12);
+        // Everything priced: the stopped stage keeps all its tokens, no marker.
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+        assert_eq!(out.error.as_deref(), Some("Stopped by the director"));
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.output_tokens), (3_000, 300));
+        assert!((out.cost_usd - (2.0 * opus + haiku)).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_stage_with_a_fast_message_and_no_fast_rate_reads_usage_not_reported() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, usage_unreported_line, USAGE_UNPRICED};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // Opus 5.5 has no fast rate: its fast message is unpriced, not $0.
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5-5"), false),
+            streamed_msg("msg_2", Some("claude-opus-5-5"), true),
+        ]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-opus-5-5", &map, false);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert!(err.starts_with("claude timed out — no output for 5 minutes\n"), "the cause stays the first line: {err}");
+        assert_eq!(usage_unreported_line(err), Some(format!("{USAGE_UNPRICED} (claude-opus-5-5 (fast))").as_str()));
+        // Only the priced message is spend — and only its tokens are recorded,
+        // so the baseline never re-prices the unknown part as saved.
+        assert!((out.cost_usd - (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{}", out.cost_usd);
+        assert_eq!((out.input_tokens, out.output_tokens), (1_000, 100));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn an_unknown_subagent_model_is_unpriced_and_kept_out_of_savings() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, usage_unreported_line, USAGE_UNPRICED};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-mystery-9"), false),
+            streamed_msg("msg_3", Some("claude-mystery-9"), false),
+        ]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!(usage_unreported_line(err), Some(format!("{USAGE_UNPRICED} (claude-mystery-9)").as_str()));
+        // The unknown model's tokens are neither spend nor baseline.
+        assert_eq!((out.input_tokens, out.output_tokens), (1_000, 100));
+        assert!((out.cost_usd - (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6).abs() < 1e-12);
+
+        // A stage that is all its own unpriced model is unchanged: no marker —
+        // its model already reads "unpriced" — and every token kept at $0
+        // (a $0 stage with tokens stays out of the baseline).
+        let own = streamed_map(&[streamed_msg("msg_1", Some("claude-mystery-9"), false), streamed_msg("msg_2", None, false)]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-mystery-9", &own, false);
+        assert_eq!(out.error.as_deref(), Some("Stopped by the director"));
+        assert_eq!((out.input_tokens, out.cost_usd), (2_000, 0.0));
+        // …but an unpriced stage model with an unknown subagent model is marked.
+        let both = streamed_map(&[streamed_msg("msg_1", None, false), streamed_msg("msg_2", Some("claude-enigma-1"), false)]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-mystery-9", &both, false);
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.cost_usd), (2_000, 0.0), "nothing priced: every token kept, $0");
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_claude_stream_ending_without_a_result_keeps_its_streamed_estimate() {
+        use crate::orchestrator::cli_runner::{
+            claude_no_result_stage, read_stream, usage_from_stream_event, CliDialect, ReadEnd, ReadLimits,
+        };
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        use std::time::Duration;
+        let limits = ReadLimits {
+            idle: Duration::from_secs(20),
+            command_idle: Duration::from_secs(20),
+            cap: Duration::from_secs(60),
+            settle: Duration::from_millis(150),
+        };
+        // Read a stream to EOF the way the runner does, keyed by message id.
+        let read = |events: &[serde_json::Value]| {
+            let bytes: String = events.iter().map(|e| format!("{e}\n")).collect();
+            let mut map = std::collections::HashMap::new();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let end = rt.block_on(read_stream(
+                std::io::Cursor::new(bytes.into_bytes()),
+                CliDialect::Claude,
+                limits,
+                |v| {
+                    if let Some((id, u)) = usage_from_stream_event(v) {
+                        map.insert(id.unwrap(), u);
+                    }
+                },
+                |_| {},
+            ));
+            assert!(matches!(end, ReadEnd::Eof(None, _)), "expected EOF with no result, got {end:?}");
+            map
+        };
+        // An Opus 5 stage and its Haiku subagent each streamed a message, then the CLI died.
+        let map = read(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-haiku-4-5-20251001"), false),
+        ]);
+        let out = claude_no_result_stage("Killed: 9", "claude-opus-5", &map);
+        assert!(matches!(out.status, crate::orchestrator::types::StageStatus::Failed));
+        assert_eq!(out.error.as_deref(), Some("claude produced no result: Killed: 9"));
+        assert_eq!((out.input_tokens, out.output_tokens), (2_000, 200));
+        let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+        let haiku = (1_000.0 * 1.0 + 100.0 * 5.0) / 1e6;
+        assert!((out.cost_usd - (opus + haiku)).abs() < 1e-12, "{}, not the streamed estimate", out.cost_usd);
+
+        // No assistant usage streamed: still $0 and no tokens.
+        let none = read(&[serde_json::json!({ "type": "system", "subtype": "init", "model": "claude-opus-5" })]);
+        let out = claude_no_result_stage("claude emitted no result event", "claude-opus-5", &none);
+        assert_eq!(out.error.as_deref(), Some("claude produced no result: claude emitted no result event"));
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
     }
 
     #[tokio::test]
@@ -10070,6 +14176,28 @@ mod live_tests {
         // result/system → none
         assert!(entries_from_stream_event(&json!({"type":"result","subtype":"success"})).is_empty());
         assert!(entries_from_stream_event(&json!({"type":"system","subtype":"init"})).is_empty());
+    }
+
+    #[test]
+    fn entries_from_stream_event_journals_a_refused_ask_user_question() {
+        // #701: an older CLI may still offer the tool; the journal says the
+        // question was refused, right after the tool entry.
+        let ask = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"toolu_q","name":"AskUserQuestion","input":{"questions":[{"question":"Postgres or SQLite?"}]}}
+        ]}});
+        let es = entries_from_stream_event(&ask);
+        assert_eq!(es.len(), 2, "{es:?}");
+        assert_eq!(es[0]["kind"], "tool");
+        assert_eq!(es[1], json!({"kind":"notice","text":"the agent tried to ask a question; it was refused"}));
+        // Inside a sub-agent the notice nests under its spawner too.
+        let mut sub = ask.clone();
+        sub["parent_tool_use_id"] = json!("toolu_agent_1");
+        assert_eq!(entries_from_stream_event(&sub)[1]["parent"], "toolu_agent_1");
+        // Other tools add no notice.
+        let read = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","name":"Read","input":{"file_path":"a"}}
+        ]}});
+        assert_eq!(entries_from_stream_event(&read).len(), 1);
     }
 
     #[test]
@@ -10370,6 +14498,46 @@ mod stage_log_tests {
     }
 
     #[test]
+    fn an_api_key_session_clears_a_stale_login_end() {
+        use crate::orchestrator::cli_runner::forward_plan_and_login;
+        let (db, rec, sink, _tmp) = harness();
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r1", "s1");
+        let init = |source: &str| json!({ "type": "system", "subtype": "init", "apiKeySource": source });
+        let result = json!({ "type": "result", "subtype": "success", "credential_expires_at": 1_797_000_000_i64 });
+
+        // A plan session reports the end…
+        let mut auth = None;
+        forward_plan_and_login(&mut auth, &init("none"), &emitter);
+        forward_plan_and_login(&mut auth, &result, &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap().map(|l| l.expires_at), Some(1_797_000_000));
+
+        // …and a later API-key session forgets it, ignoring any end it streams.
+        let mut auth = None;
+        forward_plan_and_login(&mut auth, &init("ANTHROPIC_API_KEY"), &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap(), None);
+        forward_plan_and_login(&mut auth, &result, &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap(), None);
+
+        // The app hears it, so the notes reload and hide.
+        let fwd = rec.events.lock();
+        assert_eq!(fwd.len(), 2);
+        assert_eq!(fwd[1].0, crate::claude_login::LOGIN_EVENT);
+        assert!(fwd[1].1["expiresAt"].is_null());
+        assert!(db.lock().list_stage_log("s1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_session_whose_init_does_not_say_keeps_the_login_end() {
+        use crate::orchestrator::cli_runner::forward_plan_and_login;
+        let (db, _rec, sink, _tmp) = harness();
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r1", "s1");
+        emitter.login_expiry(1_797_000_000);
+        let mut auth = None;
+        forward_plan_and_login(&mut auth, &json!({ "type": "system", "subtype": "init" }), &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap().map(|l| l.expires_at), Some(1_797_000_000));
+    }
+
+    #[test]
     fn plan_snapshot_round_trips_an_unknown_window_kind() {
         let (db, _rec, _sink, _tmp) = harness();
         let w = crate::orchestrator::cli_runner::PlanWindow {
@@ -10657,6 +14825,34 @@ mod conflict_resolution_tests {
         git(tmp.path(), &["merge", "--abort"]);
         assert_eq!(operation_state(tmp.path()).unwrap(), None);
         assert_eq!(status_files(tmp.path()).unwrap().operation, None);
+    }
+
+    /// HEAD's oid is in the status, so a commit on a branch with no upstream
+    /// (clean before and after) still changes it.
+    #[test]
+    fn status_carries_the_head_oid() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@t"]);
+        git(d, &["config", "user.name", "t"]);
+        assert_eq!(status_files(d).unwrap().head, None, "an unborn branch has no HEAD commit");
+        let rev = || {
+            let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(d).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        fs::write(d.join("file.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "one"]);
+        let first = status_files(d).unwrap();
+        assert!(first.changed_files.is_empty());
+        assert_eq!(first.head.as_deref(), Some(rev().as_str()));
+        fs::write(d.join("file.txt"), "two\n").unwrap();
+        git(d, &["commit", "-am", "two"]);
+        let second = status_files(d).unwrap();
+        assert!(second.changed_files.is_empty());
+        assert_eq!(second.head.as_deref(), Some(rev().as_str()));
+        assert_ne!(first.head, second.head);
     }
 
     #[tokio::test]
@@ -11136,7 +15332,7 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_targets_the_pr_head_ref() {
         assert_eq!(
-            pr_fetch_command(42, "feat/dark-mode"),
+            pr_fetch_command(42, "feat/dark-mode").unwrap(),
             "git fetch origin 'pull/42/head:feat/dark-mode' 2>&1",
         );
     }
@@ -11144,9 +15340,39 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_escapes_single_quotes_in_the_branch() {
         assert_eq!(
-            pr_fetch_command(1, "weird'name"),
+            pr_fetch_command(1, "weird'name").unwrap(),
             "git fetch origin 'pull/1/head:weird'\\''name' 2>&1",
         );
+    }
+
+    #[test]
+    fn fetch_command_refuses_a_head_ref_that_isnt_a_branch_name() {
+        for bad in ["a\\'; touch PWNED; echo '", "-x", "--upload-pack=touch PWNED", "a b", ""] {
+            let err = pr_fetch_command(9, bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            assert!(err.contains("PR #9"), "{err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_pr_branch_refuses_a_hostile_head_ref_before_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        crate::git_ops::ensure_initial_commit(dir.path()).unwrap();
+        let hostile = "a\\'; touch PWNED; echo '";
+        let err = tauri::async_runtime::block_on(crate::commands::ensure_pr_branch(
+            dir.path().to_string_lossy().into(),
+            5,
+            hostile.into(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
+        assert!(!err.contains(hostile), "{err}");
+        assert!(!dir.path().join("PWNED").exists());
     }
 
     #[test]
@@ -11217,7 +15443,7 @@ mod ancestry_tests {
             session_id: None,
             resume_pending: false,
             baseline_commit: None,
-            blocked_questions: None, blocked_transcript: None,
+            blocked_questions: None, blocked_transcript: None, secret_hold: None,
         }
     }
 
@@ -12571,17 +16797,26 @@ mod clone_command_tests {
 
     #[test]
     fn first_attempt_uses_the_users_helpers_in_a_fixed_locale() {
+        let (cmd, env) = build_clone_command("https://dev.azure.com/o/p/_git/r", "/tmp/r", false);
         assert_eq!(
-            build_clone_command("https://dev.azure.com/o/p/_git/r", "/tmp/r", false),
-            "env LC_ALL=C git clone --progress -- 'https://dev.azure.com/o/p/_git/r' '/tmp/r'"
+            cmd,
+            "env LC_ALL=C git clone --progress -- \"$OCTOPUSH_CLONE_URL\" \"$OCTOPUSH_CLONE_TARGET\""
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("OCTOPUSH_CLONE_URL", "https://dev.azure.com/o/p/_git/r".to_string()),
+                ("OCTOPUSH_CLONE_TARGET", "/tmp/r".to_string()),
+            ]
         );
     }
 
     #[test]
     fn a_retry_with_typed_credentials_bypasses_stored_helpers() {
+        let (cmd, _) = build_clone_command("https://github.com/o/r", "/tmp/r", true);
         assert_eq!(
-            build_clone_command("https://github.com/o/r", "/tmp/r", true),
-            "env LC_ALL=C git -c credential.helper= clone --progress -- 'https://github.com/o/r' '/tmp/r'"
+            cmd,
+            "env LC_ALL=C git -c credential.helper= clone --progress -- \"$OCTOPUSH_CLONE_URL\" \"$OCTOPUSH_CLONE_TARGET\""
         );
     }
 
@@ -12603,11 +16838,34 @@ mod clone_command_tests {
     }
 
     #[test]
-    fn single_quotes_in_url_or_path_are_escaped() {
-        assert_eq!(
-            build_clone_command("https://h/o/it's", "/tmp/o'k", false),
-            "env LC_ALL=C git clone --progress -- 'https://h/o/it'\\''s' '/tmp/o'\\''k'"
-        );
+    fn the_url_and_path_never_reach_the_command_line() {
+        let url = "https://h/o/it's\\'; touch PWNED; echo '";
+        let target = "/tmp/o'k\\'; touch PWNED #";
+        let (cmd, env) = build_clone_command(url, target, false);
+        assert!(!cmd.contains("it's") && !cmd.contains("o'k") && !cmd.contains("PWNED"), "{cmd}");
+        assert_eq!(env[0].1, url);
+        assert_eq!(env[1].1, target);
+    }
+
+    #[test]
+    fn a_hostile_url_and_path_clone_verbatim_under_every_shell() {
+        // A local repo whose path, and a target, hold `\'` — the sequence fish
+        // reads as an escaped quote inside single quotes.
+        for shell in crate::tests::login_shell_fixture::available_shells() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src a\\'; touch PWNED; echo '");
+            std::fs::create_dir(&src).unwrap();
+            crate::tests::login_shell_fixture::git(&src, &["init", "-q"]);
+            crate::tests::login_shell_fixture::git(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
+            let target = dir.path().join("dst it's\\'; touch PWNED #");
+
+            let (cmd, env) = build_clone_command(&src.to_string_lossy(), &target.to_string_lossy(), false);
+            let out = crate::commands::login_shell_output(&shell, &dir.path().to_string_lossy(), &cmd, &env)
+                .unwrap();
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(target.join(".git").is_dir(), "{shell}: clone not where asked");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the path");
+        }
     }
 }
 
@@ -13111,6 +17369,383 @@ mod transcript_tests {
         v.to_string()
     }
 
+    // ── One session, read for the Run Companion (`get_session_usage`) ──
+
+    /// [`line`] written by the Claude Code session `session`.
+    fn line_of(session: &str, req: &str, model: &str, i: u64, cr: u64, cc: u64, o: u64, ts: &str, cwd: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&line("assistant", req, model, i, cr, cc, o, ts, cwd)).unwrap();
+        v["sessionId"] = serde_json::json!(session);
+        v.to_string()
+    }
+
+    fn sidechain(l: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["isSidechain"] = serde_json::json!(true);
+        v.to_string()
+    }
+
+    #[test]
+    fn last_prompt_is_the_sessions_own_last_message_never_a_subagents() {
+        use crate::transcripts::{last_prompt, LastPrompt};
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/last-prompt";
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("cc-a/subagents")).unwrap();
+        let m = "claude-fable-5-2";
+        std::fs::write(
+            pdir.join("cc-a.jsonl"),
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                line_of("cc-a", "req_1", m, 10, 90_000, 2_000, 50, "2026-11-18T10:00:00Z", cwd),
+                line("user", "req_u", m, 0, 0, 0, 0, "2026-11-18T10:00:30Z", cwd),
+                // input 12 + cache read 140 000 + cache write 8 000: the whole prompt.
+                line_of("cc-a", "req_2", m, 12, 140_000, 8_000, 70, "2026-11-18T10:01:00Z", cwd),
+                // An inline sub-agent message (older Claude Code): its prompt is its own context.
+                sidechain(&line_of("cc-a", "req_side", m, 5, 3_000, 0, 9, "2026-11-18T10:02:00Z", cwd)),
+            ),
+        )
+        .unwrap();
+        // A sub-agent's own file is never the session's transcript.
+        std::fs::write(
+            pdir.join("cc-a/subagents/agent-1.jsonl"),
+            format!("{}\n", line_of("cc-a", "req_sub", m, 7, 1_000, 0, 9, "2026-11-18T10:03:00Z", cwd)),
+        )
+        .unwrap();
+        assert_eq!(
+            last_prompt(root.path(), cwd, "cc-a"),
+            Some(LastPrompt { tokens: 148_012, model: m.into(), ts_utc: "2026-11-18T10:01:00+00:00".into() }),
+        );
+        // No transcript, another cwd, or an id that would leave the directory: nothing.
+        assert_eq!(last_prompt(root.path(), cwd, "cc-missing"), None);
+        assert_eq!(last_prompt(root.path(), "/tmp/proj/elsewhere", "cc-a"), None);
+        assert_eq!(last_prompt(root.path(), cwd, "../cc-a"), None);
+        assert_eq!(last_prompt(root.path(), cwd, "cc-a/subagents/agent-1"), None);
+        assert_eq!(last_prompt(root.path(), cwd, ""), None);
+
+        // A half-written last line (the CLI mid-write) is skipped, not fatal.
+        let mut text = std::fs::read_to_string(pdir.join("cc-a.jsonl")).unwrap();
+        text.push_str(&line_of("cc-a", "req_3", m, 1, 1, 1, 1, "2026-11-18T10:04:00Z", cwd)[..40]);
+        std::fs::write(pdir.join("cc-a.jsonl"), &text).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-a").map(|p| p.tokens), Some(148_012));
+    }
+
+    #[test]
+    fn last_prompt_is_unknown_right_after_a_compaction_and_steps_over_a_large_line() {
+        use crate::transcripts::last_prompt;
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/compacted";
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let m = "claude-fable-5-2";
+        let before = line_of("cc-c", "req_1", m, 10, 900_000, 0, 50, "2026-11-18T10:00:00Z", cwd);
+        let boundary = serde_json::json!({ "type": "system", "subtype": "compact_boundary", "sessionId": "cc-c" }).to_string();
+        // Compacted, no message since: the old prompt size no longer describes the context.
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c"), None);
+        // The first message after it says how large the compacted context is.
+        let after = line_of("cc-c", "req_2", m, 10, 0, 30_000, 50, "2026-11-18T10:05:00Z", cwd);
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n{after}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c").map(|p| p.tokens), Some(30_010));
+        // A user line larger than the first tail read (a pasted image) after
+        // the last message: the longer read finds the message behind it.
+        let image = serde_json::json!({ "type": "user", "message": { "content": "x".repeat(300 * 1024) } }).to_string();
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n{after}\n{image}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c").map(|p| p.tokens), Some(30_010));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn session_usage_reads_one_terminals_claude_session_from_the_ledger_and_its_transcript() {
+        use crate::transcripts::session_usage;
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/session-usage";
+        {
+            let d = db.lock();
+            d.insert_project("p-su", "P", "/tmp/proj").unwrap();
+            d.insert_workspace("w-su", "p-su", "ws", "", "b-su", Some(cwd), "", None).unwrap();
+            d.create_terminal("term-a", "w-su", "Agent", 0, 0).unwrap();
+            d.create_terminal("term-b", "w-su", "Other agent", 1, 0).unwrap();
+        }
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("cc-a/subagents")).unwrap();
+        let m = "claude-fable-5-2";
+        // Fable 5.2: $8/M input, $40/M output, $0.20/M cache read, $10/M cache write.
+        std::fs::write(
+            pdir.join("cc-a.jsonl"),
+            format!(
+                "{}\n{}\n",
+                line_of("cc-a", "req_a1", m, 1_000, 0, 100_000, 1_000, "2026-11-18T10:00:00Z", cwd),
+                line_of("cc-a", "req_a2", m, 2_000, 100_000, 46_000, 1_000, "2026-11-18T10:01:00Z", cwd),
+            ),
+        )
+        .unwrap();
+        // Its sub-agent: billed to the session, newer than its last own message.
+        std::fs::write(
+            pdir.join("cc-a/subagents/agent-1.jsonl"),
+            format!("{}\n", line_of("cc-a", "req_a_sub", "claude-haiku-4-5", 4_000, 0, 0, 500, "2026-11-18T10:02:00Z", cwd)),
+        )
+        .unwrap();
+        // A second agent in the same worktree: never part of the first one's figures.
+        std::fs::write(
+            pdir.join("cc-b.jsonl"),
+            format!("{}\n", line_of("cc-b", "req_b1", m, 500_000, 0, 0, 9_000, "2026-11-18T10:03:00Z", cwd)),
+        )
+        .unwrap();
+        // Each terminal's hooks named its session when it started.
+        let (at_a, at_b) = ("2026-11-18T09:59:00+00:00", "2026-11-18T10:02:30+00:00");
+        db.lock().link_terminal_claude_session("term-a", "cc-a", at_a, true).unwrap();
+        db.lock().link_terminal_claude_session("term-b", "cc-b", at_b, true).unwrap();
+        // Nothing ingested yet: no row, so nothing to show (never zeroes).
+        assert_eq!(session_usage(&db, root.path(), "term-a", "cc-a", at_a).unwrap(), None);
+
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 4);
+        let u = session_usage(&db, root.path(), "term-a", "cc-a", at_a).unwrap().expect("the session's usage");
+        // The context is the session's own last prompt (2 000 + 100 000 + 46 000),
+        // not the sub-agent's newer, smaller one.
+        assert_eq!(u.context_tokens, Some(148_000));
+        assert_eq!(u.max_context, Some(1_000_000));
+        assert_eq!(u.model, m);
+        assert_eq!(u.as_of, "2026-11-18T10:01:00+00:00");
+        assert_eq!((u.calls, u.unpriced_calls), (3, 0));
+        let fable = (1_000.0 * 8.0 + 100_000.0 * 10.0 + 1_000.0 * 40.0 + 2_000.0 * 8.0 + 100_000.0 * 0.20 + 46_000.0 * 10.0 + 1_000.0 * 40.0) / 1e6;
+        let haiku = crate::token_engine::prices_for("claude-haiku-4-5").unwrap().cost(4_000, 500, 0, 0);
+        assert!((u.spent_usd - (fable + haiku)).abs() < 1e-9, "{} vs {}", u.spent_usd, fable + haiku);
+        // Cache share: 100 000 read of 253 000 prompt tokens (input + read + write).
+        let pct = u.cache_hit_pct.expect("cache share");
+        assert!((pct - 100_000.0 / 253_000.0 * 100.0).abs() < 1e-9, "{pct}");
+
+        // The other agent's session reads its own rows.
+        let b = session_usage(&db, root.path(), "term-b", "cc-b", at_b).unwrap().unwrap();
+        assert_eq!((b.calls, b.context_tokens), (1, Some(500_000)));
+        // A session the ledger never saw, or a terminal that no longer exists: nothing.
+        assert_eq!(session_usage(&db, root.path(), "term-a", "cc-unknown", at_a).unwrap(), None);
+        assert_eq!(session_usage(&db, root.path(), "term-gone", "cc-a", at_a).unwrap(), None);
+
+        // The transcript gone (Claude Code prunes old ones): spend, cache share
+        // and the model still come from the ledger; the context size does not.
+        std::fs::remove_file(pdir.join("cc-b.jsonl")).unwrap();
+        let b = session_usage(&db, root.path(), "term-b", "cc-b", at_b).unwrap().unwrap();
+        assert_eq!((b.context_tokens, b.model.as_str(), b.as_of.as_str()), (None, m, "2026-11-18T10:03:00+00:00"));
+        assert!(b.spent_usd > 0.0);
+    }
+
+    /// A workspace with two Run terminals, a transcript directory and an
+    /// ingestor: the stage for what a terminal's Context may show.
+    struct UsageStage {
+        db: Arc<Mutex<Db>>,
+        root: TempDir,
+        pdir: std::path::PathBuf,
+        cwd: &'static str,
+    }
+
+    impl UsageStage {
+        fn new(cwd: &'static str) -> Self {
+            let db = Arc::new(Mutex::new(test_db()));
+            let root = TempDir::new().unwrap();
+            {
+                let d = db.lock();
+                d.insert_project("p-st", "P", "/tmp/proj-stage").unwrap();
+                d.insert_workspace("w-st", "p-st", "ws", "", "b-st", Some(cwd), "", None).unwrap();
+                d.create_terminal("term-a", "w-st", "Agent", 0, 0).unwrap();
+                d.create_terminal("term-b", "w-st", "Other agent", 1, 0).unwrap();
+            }
+            let pdir = root.path().join(project_dir_name(cwd));
+            std::fs::create_dir_all(&pdir).unwrap();
+            Self { db, root, pdir, cwd }
+        }
+
+        /// The session's transcript holds these messages `(time, prompt tokens)`, and the ledger has read them.
+        fn says(&self, session: &str, messages: &[(&str, u64)]) {
+            let text: String = messages
+                .iter()
+                .enumerate()
+                .map(|(i, (ts, prompt))| format!("{}\n", line_of(session, &format!("req_{session}_{i}"), "claude-fable-5-2", *prompt, 0, 0, 5, ts, self.cwd)))
+                .collect();
+            std::fs::write(self.pdir.join(format!("{session}.jsonl")), text).unwrap();
+            TranscriptIngestor::with_root(Arc::clone(&self.db), self.root.path().to_path_buf()).ingest().unwrap();
+        }
+
+        fn start(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().link_terminal_claude_session(terminal, session, at, true).unwrap();
+        }
+
+        /// A `Stop` or `Notification`: all a session whose hooks predate `SessionStart` ever says.
+        fn signal(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().link_terminal_claude_session(terminal, session, at, false).unwrap();
+        }
+
+        fn end(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().end_terminal_claude_session(terminal, session, at).unwrap();
+        }
+
+        /// What the terminal's Context shows: its context size, or nothing.
+        fn shows(&self, terminal: &str) -> Option<u64> {
+            crate::transcripts::terminal_usage(&self.db, self.root.path(), terminal).unwrap().and_then(|u| u.context_tokens)
+        }
+    }
+
+    /// (c) `/clear` or a fresh `claude`: the terminal moves to the new
+    /// session the moment its `SessionStart` fires, so the old conversation's
+    /// figures are gone before a message is sent, and the meter can never
+    /// read "Past 80%" on an empty conversation.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn after_clear_the_old_conversations_figures_are_gone_at_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-clear");
+        st.start("term-a", "cc-full", "2026-11-18T10:00:00+00:00");
+        st.says("cc-full", &[("2026-11-18T10:01:00Z", 900_000)]);
+        assert_eq!(st.shows("term-a"), Some(900_000));
+
+        // `/clear`: the old session ends, the new one starts (30 ms apart).
+        st.end("term-a", "cc-full", "2026-11-18T10:10:00+00:00");
+        assert_eq!(st.shows("term-a"), None, "no current session");
+        st.start("term-a", "cc-fresh", "2026-11-18T10:10:00.030+00:00");
+        assert_eq!(st.shows("term-a"), None, "an empty conversation shows nothing, not the old 900k");
+        // Its first reply is what the meter then reads.
+        st.says("cc-fresh", &[("2026-11-18T10:12:00Z", 4_000)]);
+        assert_eq!(st.shows("term-a"), Some(4_000));
+        // The finished conversation is nobody's rival, here or next door.
+        // (term-b's last word is older than the cleared conversation's.)
+        st.start("term-b", "cc-b", "2026-11-18T10:00:30+00:00");
+        st.says("cc-b", &[("2026-11-18T10:00:45Z", 70_000)]);
+        assert_eq!((st.shows("term-a"), st.shows("term-b")), (Some(4_000), Some(70_000)));
+    }
+
+    /// (a) After `claude` exits the terminal has no session: a bare prompt,
+    /// or Codex started there, shows no Claude Code figures, however long
+    /// ago that was and whatever the ledger still holds.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn after_claude_exits_the_terminal_shows_nothing() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-exit");
+        st.start("term-a", "cc-a", "2026-11-18T10:00:00+00:00");
+        st.says("cc-a", &[("2026-11-18T10:01:00Z", 120_000)]);
+        assert_eq!(st.shows("term-a"), Some(120_000));
+        st.end("term-a", "cc-a", "2026-11-18T10:20:00+00:00");
+        assert_eq!(st.shows("term-a"), None);
+        // Its last `Stop`, landing after the end, changes nothing.
+        st.signal("term-a", "cc-a", "2026-11-18T10:20:01+00:00");
+        assert_eq!(st.shows("term-a"), None);
+        // A closed terminal's session is no terminal's.
+        st.start("term-b", "cc-b", "2026-11-18T10:30:00+00:00");
+        st.says("cc-b", &[("2026-11-18T10:31:00Z", 50_000)]);
+        st.db.lock().delete_terminal("term-b").unwrap();
+        assert_eq!(st.db.lock().terminal_claude_session("term-b").unwrap(), None);
+    }
+
+    /// (b) `/resume`, `--resume` or `--continue` of an older conversation:
+    /// its `SessionStart` puts the terminal on it at once, and the figures
+    /// are the resumed conversation's own, never the one it replaced.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn resuming_an_older_session_shows_that_sessions_own_figures_at_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-resume");
+        // Yesterday's conversation, ended properly.
+        st.start("term-a", "cc-old", "2026-11-17T09:00:00+00:00");
+        st.says("cc-old", &[("2026-11-17T09:30:00Z", 300_000)]);
+        st.end("term-a", "cc-old", "2026-11-17T10:00:00+00:00");
+        // Today's.
+        st.start("term-a", "cc-today", "2026-11-18T10:00:00+00:00");
+        st.says("cc-today", &[("2026-11-18T10:01:00Z", 20_000)]);
+        assert_eq!(st.shows("term-a"), Some(20_000));
+        // `/resume` yesterday's: today's ends, yesterday's starts again.
+        st.end("term-a", "cc-today", "2026-11-18T10:05:00+00:00");
+        st.start("term-a", "cc-old", "2026-11-18T10:05:00.030+00:00");
+        assert_eq!(st.shows("term-a"), Some(300_000), "the resumed conversation's own context, before any new message");
+
+        // The same conversation resumed in another terminal instead: it is
+        // that terminal's, and the first has none (not an older one).
+        st.end("term-a", "cc-old", "2026-11-18T10:20:00+00:00");
+        st.start("term-a", "cc-today", "2026-11-18T10:20:01+00:00");
+        st.start("term-b", "cc-today", "2026-11-18T10:25:00+00:00");
+        assert_eq!((st.shows("term-a"), st.shows("term-b")), (None, Some(20_000)));
+    }
+
+    /// The fallback for a session whose hooks predate `SessionStart` and
+    /// `SessionEnd` (it was already running when they were installed): its
+    /// `Stop` links it, and `/clear`, a resume or a restart are silent until
+    /// the next one. Then a newer rival in the workspace means hide.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn without_session_events_a_newer_rival_hides_the_figures() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-rival");
+        // A session someone ran in this worktree before, outside Octopush.
+        st.says("cc-outside", &[("2026-11-18T09:00:00Z", 10)]);
+        st.says("cc-a", &[("2026-11-18T09:59:00Z", 1_000)]);
+        st.signal("term-a", "cc-a", "2026-11-18T10:00:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(1_000), "nothing newer than its own last word");
+
+        // A new conversation appears and no hook has named its terminal:
+        // term-a may have been cleared into it. Hidden, not guessed.
+        st.says("cc-new", &[("2026-11-18T10:40:00Z", 50)]);
+        assert_eq!(st.shows("term-a"), None);
+        // term-a's own session speaks after it: still the one in term-a.
+        st.says("cc-a", &[("2026-11-18T09:59:00Z", 1_000), ("2026-11-18T10:41:00Z", 2_000)]);
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // An OLDER conversation resumed without a word from the hooks (the
+        // case a "started after" test would miss): it has a newer message.
+        st.says("cc-outside", &[("2026-11-18T09:00:00Z", 10), ("2026-11-18T10:50:00Z", 10)]);
+        assert_eq!(st.shows("term-a"), None);
+        // Once it is another terminal's, it is no rival.
+        st.signal("term-b", "cc-outside", "2026-11-18T10:55:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // Nor is a conversation that is over.
+        st.says("cc-gone", &[("2026-11-18T11:00:00Z", 5)]);
+        assert_eq!(st.shows("term-a"), None);
+        st.end("term-b", "cc-gone", "2026-11-18T11:01:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        assert_eq!(st.shows("term-b"), Some(10), "an end naming another session leaves the terminal's own");
+        // A `claude -p` the agent ran from term-a: set aside when it starts
+        // (`record_hook_at` queues a print-mode start as an end), so its
+        // messages never hide the terminal's own figures.
+        st.end("term-a", "cc-print", "2026-11-18T11:02:00+00:00");
+        st.says("cc-print", &[("2026-11-18T11:03:00Z", 9)]);
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // And when the newcomer was term-a's after all, its `Stop` says so.
+        st.says("cc-next", &[("2026-11-18T11:10:00Z", 77)]);
+        assert_eq!(st.shows("term-a"), None);
+        st.signal("term-a", "cc-next", "2026-11-18T11:15:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(77));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn session_usage_leaves_unpriced_calls_out_of_the_spend_and_has_no_window_for_an_unlisted_model() {
+        use crate::transcripts::session_usage;
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/session-unpriced";
+        {
+            let d = db.lock();
+            d.insert_project("p-un", "P", "/tmp/proj-un").unwrap();
+            d.insert_workspace("w-un", "p-un", "ws", "", "b-un", Some(cwd), "", None).unwrap();
+            d.create_terminal("term-u", "w-un", "Agent", 0, 0).unwrap();
+        }
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("cc-u.jsonl"),
+            format!("{}\n", line_of("cc-u", "req_u1", "gateway-model-nobody-lists", 3_000, 0, 0, 100, "2026-11-18T11:00:00Z", cwd)),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        db.lock().link_terminal_claude_session("term-u", "cc-u", "2026-11-18T11:00:30+00:00", true).unwrap();
+        let u = session_usage(&db, root.path(), "term-u", "cc-u", "2026-11-18T11:00:30+00:00").unwrap().unwrap();
+        assert_eq!((u.calls, u.unpriced_calls, u.spent_usd), (1, 1, 0.0));
+        assert_eq!((u.context_tokens, u.max_context), (Some(3_000), None), "an unlisted model has no known window");
+        assert_eq!(u.cache_hit_pct, None, "nothing about the cache was reported");
+    }
+
     #[test]
     fn parses_the_one_hour_cache_write_breakdown() {
         let u = parse_transcript_line(&line_1h("req_1", "claude-fable-5-1", 400, 600, "2026-10-31T10:00:00Z", "/w"), "f").unwrap();
@@ -13143,6 +17778,34 @@ mod transcript_tests {
         let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
         // Split row: 0.4 × 12.50 + 0.6 × 20 + 1 in + 1 out; plain row: 12.50 (all 5-minute).
         let expected = 5.0 + 12.0 + (10.0 + 50.0) / 1e6 + 12.50;
+        assert!((rep.totals.cost_usd - expected).abs() < 1e-6, "{} vs {expected}", rep.totals.cost_usd);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn ingest_prices_fable_5_2_transcripts_instead_of_leaving_them_unpriced() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/fable-5-2";
+        session_on(&db.lock(), "sess-f52", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        // Fable 5.2: $8 in, $40 out, $0.20 hits, $10 5-minute writes.
+        std::fs::write(
+            pdir.join("cc-sess.jsonl"),
+            format!(
+                "{}\n",
+                line("assistant", "req_f52", "claude-fable-5-2", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "2026-11-09T10:00:00Z", cwd),
+            ),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.unpriced_calls, 0);
+        let expected = 8.0 + 0.20 + 10.0 + 40.0;
         assert!((rep.totals.cost_usd - expected).abs() < 1e-6, "{} vs {expected}", rep.totals.cost_usd);
     }
 
@@ -13405,6 +18068,126 @@ mod transcript_tests {
         engine.scan_and_record("term-1", 2, b"Total cost: $5.00 | Input: 10K | Output: 1K");
         let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
         assert_eq!(rep.totals.calls, 2);
+    }
+    /// A workspace on `cwd` with an active mission: `(db file, mission id)`.
+    fn mission_ws(db: &Db, cwd: &str) -> String {
+        db.insert_project("p861", "P", "/tmp/p861").unwrap();
+        db.insert_workspace("w861", "p861", "ws", "", "b861", Some(cwd), "", None).unwrap();
+        let ws = db.get_workspace("w861").unwrap().unwrap();
+        crate::mission::ensure_for_workspace(db, &ws, "build", "worktree").unwrap().id
+    }
+
+    fn cc_now(session: &str, req: &str, cwd: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&line("assistant", req, "claude-opus-4-8", 500, 0, 0, 100, &now_iso(), cwd)).unwrap();
+        v["sessionId"] = serde_json::json!(session);
+        v.to_string()
+    }
+
+    /// #861: RUN rows recorded from a Direct stage's transcript before its
+    /// session id was known (or before the fix) are removed once it is —
+    /// the stage's session and its sub-agent files — and an unrelated
+    /// transcript in the same worktree keeps its rows.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn direct_session_cleanup_removes_duplicates_and_keeps_unrelated_transcripts() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let cwd = "/tmp/octo-861/cleanup";
+        let mission = mission_ws(&db.lock(), cwd);
+        let root = TempDir::new().unwrap();
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct.jsonl"), format!("{}\n{}\n", cc_now("sess-direct", "req_d1", cwd), cc_now("sess-direct", "req_d2", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct/subagents/agent-1.jsonl"), format!("{}\n", cc_now("sess-direct", "req_dsub", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-user.jsonl"), format!("{}\n", cc_now("sess-user", "req_u1", cwd))).unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 4, "not yet known as a Direct session: all metered");
+        let (all, _) = db.lock().mission_spend(&mission, ALL.0, ALL.1).unwrap();
+
+        db.lock().record_direct_cli_session("stage-x", "sess-direct").unwrap();
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 3), "the session and its sub-agent rows are removed");
+        let (left, _) = db.lock().mission_spend(&mission, ALL.0, ALL.1).unwrap();
+        assert!(left > 0.0 && (left - all / 4.0).abs() < 1e-9, "only the unrelated transcript's row stays: {left} of {all}");
+        let keys: Vec<String> = db.lock().conn_ref()
+            .prepare("SELECT idempotency_key FROM spend_events WHERE surface = 'run'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(keys, vec!["cc:req_u1".to_string()]);
+
+        // Later passes skip the Direct files without reading them again.
+        std::fs::write(pdir.join("sess-direct.jsonl"), format!("{}\n{}\n{}\n", cc_now("sess-direct", "req_d1", cwd), cc_now("sess-direct", "req_d2", cwd), cc_now("sess-direct", "req_d3", cwd))).unwrap();
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
+
+    /// #890: a pass whose snapshot of Direct sessions was taken before the
+    /// stage reported its session (and before the drive's drop) re-checks
+    /// membership under the DB lock, so it never puts back what the drop
+    /// removed; an unrelated transcript in the same directory is still metered.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stale_direct_snapshot_never_re_inserts_a_dropped_session() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let cwd = "/tmp/octo-890/race";
+        let mission = mission_ws(&db.lock(), cwd);
+        let root = TempDir::new().unwrap();
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct.jsonl"), format!("{}\n", cc_now("sess-direct", "req_d1", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct/subagents/agent-1.jsonl"), format!("{}\n", cc_now("sess-direct", "req_dsub", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-user.jsonl"), format!("{}\n", cc_now("sess-user", "req_u1", cwd))).unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+
+        // The pass snapshots no Direct session; then the stage reports its
+        // session and the drive drops what was metered (nothing yet).
+        let stale = db.lock().direct_cli_session_ids().unwrap();
+        assert!(stale.is_empty());
+        db.lock().record_direct_cli_session("stage-x", "sess-direct").unwrap();
+        assert_eq!(crate::transcripts::drop_direct_session(&db, root.path(), "sess-direct").unwrap(), 0);
+
+        let s = ing.ingest_with_direct_snapshot(stale).unwrap();
+        assert_eq!(s.rows_inserted, 1, "only the unrelated transcript is metered");
+        let keys: Vec<String> = db.lock().conn_ref()
+            .prepare("SELECT idempotency_key FROM spend_events WHERE surface = 'run'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(keys, vec!["cc:req_u1".to_string()]);
+        let (spend, _) = db.lock().mission_spend(&mission, ALL.0, ALL.1).unwrap();
+        assert!(spend > 0.0);
+        // No offset was written for the Direct files: nothing left to undo.
+        let offset = db.lock().meta_get(&format!("cc_transcript:{}", pdir.join("sess-direct.jsonl").display())).unwrap();
+        assert_eq!(offset, None);
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
+
+    /// #861: the one-time migration seeds `direct_cli_sessions` from the
+    /// session ids stage rows still carry, so existing duplicates are found.
+    #[test]
+    fn migration_backfills_direct_cli_sessions_from_stage_rows() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let db = Db::open(tmp.path()).unwrap();
+            db.insert_project("p1", "P", "/tmp/p1").unwrap();
+            db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt861"), "", None).unwrap();
+            db.seed_builtin_pipelines().unwrap();
+            let pid = db.list_pipelines().unwrap()[0].id.clone();
+            let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+            let stages = db.list_run_stages(&run).unwrap();
+            // Rows from before the table existed: written behind its back.
+            db.conn_ref().execute("UPDATE run_stages SET session_id = 'sess-old' WHERE id = ?1", [&stages[0].id]).unwrap();
+            db.conn_ref()
+                .execute(
+                    "UPDATE run_stages SET session_usage = ?2 WHERE id = ?1",
+                    rusqlite::params![stages[1 % stages.len()].id, r#"{"session":"sess-usage","usage":{}}"#],
+                )
+                .unwrap();
+            db.conn_ref().execute("DELETE FROM direct_cli_sessions", []).unwrap();
+            db.meta_delete("direct_cli_sessions_backfill_v1").unwrap();
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        let ids = db.direct_cli_session_ids().unwrap();
+        assert!(ids.contains("sess-old") && ids.contains("sess-usage"), "{ids:?}");
     }
 }
 
@@ -13850,6 +18633,51 @@ mod pricing_table_tests {
     }
 
     #[test]
+    fn gpt_6_long_context_tier_applies_over_272k_input_tokens() {
+        use crate::token_engine::{request_cost, request_prices};
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // OpenAI's API pricing page (2026-11-17), long context (>272K input
+        // tokens): (input, 30-minute write, cached input, output).
+        for (id, (input, write, hit, output)) in [
+            ("gpt-6.1-terra", (2.0, 2.50, 0.10, 7.50)),
+            ("gpt-6.2-astra", (16.0, 20.0, 0.80, 60.0)),
+            ("gpt-6.2-sol", (4.0, 5.0, 0.20, 15.0)),
+            ("gpt-6.1-sol", (4.0, 5.0, 0.20, 15.0)),
+            ("gpt-6-astra", (20.0, 25.0, 2.0, 75.0)),
+            ("gpt-6-sol", (4.0, 5.0, 0.40, 15.0)),
+            ("gpt-6-luna", (0.20, 0.25, 0.02, 0.75)),
+        ] {
+            let base = builtin_prices(id).unwrap();
+            // Exactly 272,000 prompt tokens: the short tier.
+            assert_eq!(request_prices(id, base, 272_000), base, "{id}");
+            let long = request_prices(id, base, 272_001);
+            assert!(near(long.input_per_m, input) && near(long.output_per_m, output), "{id}: {long:?}");
+            assert!(near(long.cache_read_per_m, hit) && near(long.cache_creation_per_m, write), "{id}: {long:?}");
+            // Not a Claude model: the 1-hour column stays the write price.
+            assert!(near(long.cache_creation_1h_per_m, write), "{id}: {long:?}");
+            // The `openai/` gateway spelling gets the tier too.
+            assert_eq!(request_prices(&format!("openai/{id}"), base, 272_001), long, "{id}");
+        }
+        // Cached input and cache writes count toward the 272K: 1 fresh +
+        // 272,000 cached crosses it, and 1M output bills at Terra's $7.50.
+        let terra = builtin_prices("gpt-6.1-terra").unwrap();
+        let c = request_cost("gpt-6.1-terra", terra, 1, 1_000_000, 272_000, 0);
+        assert!(near(c, (2.0 + 7_500_000.0 + 272_000.0 * 0.10) / 1e6), "{c}");
+        let c = request_cost("gpt-6.1-terra", terra, 0, 1_000_000, 0, 272_001);
+        assert!(near(c, (7_500_000.0 + 272_001.0 * 2.50) / 1e6), "{c}");
+        // 272,000 total stays short: 1M output at $5.
+        let c = request_cost("gpt-6.1-terra", terra, 72_000, 1_000_000, 200_000, 0);
+        assert!(near(c, (72_000.0 + 5_000_000.0 + 200_000.0 * 0.05) / 1e6), "{c}");
+        // A user-edited base price scales.
+        let mut edited = terra;
+        edited.input_per_m = 3.0;
+        assert!(near(request_prices("gpt-6.1-terra", edited, 300_000).input_per_m, 6.0));
+        // Older OpenAI models have no tier.
+        let gpt4o = builtin_prices("gpt-4o").unwrap();
+        assert_eq!(request_prices("gpt-4o", gpt4o, 900_000), gpt4o);
+    }
+
+    #[test]
     fn fast_mode_prices_opus_5_and_4_8_at_twice_standard_and_nothing_else() {
         use crate::token_engine::{fast_prices, is_fast, prices_at_speed, usage_speed};
         let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
@@ -13937,6 +18765,28 @@ mod pricing_table_tests {
     }
 
     #[test]
+    fn fable_5_2_and_mythos_5_2_are_priced_in_every_spelling() {
+        // Pricing page: $8 in / $10 5m write / $16 1h write / $0.20 hit / $40 out.
+        for m in [
+            "claude-fable-5-2",
+            "claude-fable-5.2[1m]",
+            "eu.anthropic.claude-fable-5-2-v1",
+            "claude-mythos-5-2",
+            "claude-mythos-5.2[1m]",
+            "us.anthropic.claude-mythos-5-2-v1:0",
+        ] {
+            assert_prices(m, 8.0, 10.0, 0.20, 40.0);
+            let p = builtin_prices(m).unwrap();
+            assert!((p.cache_creation_1h_per_m - 16.0).abs() < 1e-9, "{m}");
+        }
+        assert_eq!(crate::token_engine::normalize_model_id("eu.anthropic.claude-fable-5-2-v1"), "claude-fable-5-2");
+        // Mythos 5.2 is priced, not offered: it stays out of the catalog.
+        let catalog = crate::provider_router::builtin_providers();
+        assert!(catalog["anthropic"].models.iter().any(|m| m.id == "claude-fable-5-2"));
+        assert!(!catalog.values().flat_map(|p| &p.models).any(|m| m.id.contains("mythos")));
+    }
+
+    #[test]
     fn corrected_prices_for_opus_4_6_and_sonnet_5() {
         // Opus 4.6 was $15/$75 (Opus 4.1's tier); Sonnet 5 was $3/$15.
         assert_prices("claude-opus-4-6", 5.0, 6.25, 0.50, 25.0);
@@ -14004,13 +18854,17 @@ mod pricing_table_tests {
         let providers = crate::provider_router::builtin_providers();
         let router = crate::provider_router::ProviderRouter::from_map(providers.clone());
         for name in ["anthropic", "openai"] {
+            let local = providers[name].local;
             for m in &providers[name].models {
                 let t = builtin_prices(&m.id).unwrap_or_else(|| panic!("{} missing from the table", m.id));
                 assert_eq!(t.input_per_m, m.input_cost_per_m, "{}", m.id);
                 assert_eq!(t.output_per_m, m.output_cost_per_m, "{}", m.id);
-                if m.cache_read_cost_per_m > 0.0 {
-                    assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{}", m.id);
-                    assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{}", m.id);
+                // Cache columns too: a $0 here would bill cached input at the
+                // wrong rate. Only explicitly free or local entries skip them.
+                let free = m.input_cost_per_m == 0.0 && m.output_cost_per_m == 0.0;
+                if !local && !free {
+                    assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{} cache read", m.id);
+                    assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{} cache write", m.id);
                 }
                 // 1-hour writes: 2× input, the same on the catalog-first path.
                 if m.id.starts_with("claude-") {
@@ -14059,6 +18913,241 @@ mod pricing_table_tests {
         assert_eq!((get("claude-opus-4-6").input_cost_per_m, get("claude-opus-4-6").output_cost_per_m), (5.0, 25.0));
         assert_eq!(get("claude-opus-4-6").cache_read_cost_per_m, 0.50);
         assert_eq!((get("claude-sonnet-5").input_cost_per_m, get("claude-sonnet-5").output_cost_per_m), (2.2, 11.0));
+    }
+
+    #[test]
+    fn stale_gpt_4o_cache_prices_on_disk_are_corrected_but_edits_kept() {
+        use crate::provider_router::{builtin_providers, migrate_stale_builtin_prices};
+        let defaults = builtin_providers();
+        let mut list: Vec<_> = vec![defaults["openai"].clone()];
+        for m in &mut list[0].models {
+            match m.id.as_str() {
+                // The old shipped default: cached input at $0 → corrected.
+                "gpt-4o" => {
+                    (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                        (2.5, 10.0, 0.0, 0.0);
+                }
+                // A user edit → left alone.
+                "gpt-4o-mini" => {
+                    (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                        (0.2, 0.6, 0.0, 0.0);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(migrate_stale_builtin_prices(&mut list, &defaults), 1);
+        let get = |id: &str| list[0].models.iter().find(|m| m.id == id).unwrap().clone();
+        assert_eq!((get("gpt-4o").cache_read_cost_per_m, get("gpt-4o").cache_creation_cost_per_m), (1.25, 2.50));
+        assert_eq!((get("gpt-4o-mini").input_cost_per_m, get("gpt-4o-mini").cache_read_cost_per_m), (0.2, 0.0));
+        // The old mini default alone is corrected too.
+        let mut mini = vec![defaults["openai"].clone()];
+        for m in &mut mini[0].models {
+            if m.id == "gpt-4o-mini" {
+                (m.cache_read_cost_per_m, m.cache_creation_cost_per_m) = (0.0, 0.0);
+            }
+        }
+        assert_eq!(migrate_stale_builtin_prices(&mut mini, &defaults), 1);
+        let m = mini[0].models.iter().find(|m| m.id == "gpt-4o-mini").unwrap();
+        assert_eq!((m.cache_read_cost_per_m, m.cache_creation_cost_per_m), (0.075, 0.15));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn gpt_4o_cached_input_is_priced_at_its_cached_rate() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        // 1,000 cached tokens (OpenAI's `prompt_tokens_details.cached_tokens`).
+        let gpt = prices_for("gpt-4o").expect("gpt-4o is priced");
+        assert!(near(gpt.cost(0, 0, 1_000, 0), 1_000.0 * 1.25 / 1e6), "{gpt:?}");
+        let mini = prices_for("gpt-4o-mini").expect("gpt-4o-mini is priced");
+        assert!(near(mini.cost(0, 0, 1_000, 0), 1_000.0 * 0.075 / 1e6), "{mini:?}");
+        // Catalog-first and the table agree.
+        assert_eq!(Some(gpt), builtin_prices("gpt-4o"));
+        assert_eq!(Some(mini), builtin_prices("gpt-4o-mini"));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn gpt_6_1_terra_is_priced_and_in_the_openai_catalog() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // OpenAI's model and pricing pages (2026-11-10): $1 input, $0.05
+        // cached input, $5 output, $1.25 for 30-minute cache writes.
+        // Not `assert_prices`: its 1-hour check (2× input) is Claude-only.
+        let terra = ModelPrices {
+            input_per_m: 1.0,
+            output_per_m: 5.0,
+            cache_read_per_m: 0.05,
+            cache_creation_per_m: 1.25,
+            cache_creation_1h_per_m: 1.25,
+        };
+        assert_eq!(builtin_prices("gpt-6.1-terra"), Some(terra));
+        assert_eq!(builtin_prices("openai/gpt-6.1-terra"), Some(terra));
+        let p = prices_for("gpt-6.1-terra").expect("gpt-6.1-terra is priced");
+        assert_eq!(Some(p), builtin_prices("gpt-6.1-terra"));
+        // Not a Claude model: no 1-hour write tier.
+        assert_eq!(p.cache_creation_1h_per_m, p.cache_creation_per_m);
+        assert_eq!(ledger_cost_basis("gpt-6.1-terra", 0.0, 1_000), "computed");
+        let providers = crate::provider_router::builtin_providers();
+        let m = providers["openai"].models.iter().find(|m| m.id == "gpt-6.1-terra").expect("in the openai catalog");
+        assert_eq!(m.display_name, "GPT-6.1 Terra");
+        assert_eq!(m.max_context, 1_050_000);
+        assert!(m.supports_vision, "image input is supported");
+        assert!(m.supports_tools);
+        assert_eq!(m.tags, vec!["balanced".to_string()]);
+        // 100K fresh + 100K written + 100K cached + 100K output (a 300K
+        // prompt: the long tier) = (2 + 2.50 + 0.10 + 7.50) / 10.
+        let cost = crate::token_engine::request_cost_for("gpt-6.1-terra", 100_000, 100_000, 100_000, 100_000);
+        assert!((cost - 1.21).abs() < 1e-9, "terra request cost: {cost}");
+        // The beta's cache-write-at-input price migrates to $1.25.
+        let mut list = vec![crate::provider_router::ProviderConfig {
+            models: vec![crate::provider_router::ModelInfo { cache_creation_cost_per_m: 1.0, ..m.clone() }],
+            ..providers["openai"].clone()
+        }];
+        assert_eq!(crate::provider_router::migrate_stale_builtin_prices(&mut list, &providers), 1);
+        assert_eq!(list[0].models[0].cache_creation_cost_per_m, 1.25);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn every_gpt_6_model_is_priced() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // OpenAI's API pricing page (2026-11-17), short context:
+        // (input, 30-minute write, cached input, output).
+        for (id, (input, write, hit, output)) in [
+            ("gpt-6.2-astra", (8.0, 10.0, 0.40, 40.0)),
+            ("gpt-6.2-sol", (2.0, 2.50, 0.10, 10.0)),
+            ("gpt-6-astra", (10.0, 12.50, 1.0, 50.0)),
+            ("gpt-6-sol", (2.0, 2.50, 0.20, 10.0)),
+            ("gpt-6-luna", (0.10, 0.125, 0.01, 0.50)),
+            ("gpt-6.1-sol", (2.0, 2.50, 0.10, 10.0)),
+        ] {
+            let want = ModelPrices {
+                input_per_m: input,
+                output_per_m: output,
+                cache_read_per_m: hit,
+                cache_creation_per_m: write,
+                // Not a Claude model: no 1-hour write tier.
+                cache_creation_1h_per_m: write,
+            };
+            assert_eq!(builtin_prices(id), Some(want), "{id}");
+            assert_eq!(builtin_prices(&format!("openai/{id}")), Some(want), "{id}");
+            assert_eq!(prices_for(id), Some(want), "{id}");
+            assert_eq!(ledger_cost_basis(id, 0.0, 1_000), "computed", "{id}");
+        }
+        // Only the bare ids: a similar id stays unpriced.
+        assert_eq!(builtin_prices("gpt-6.2-terra"), None);
+        assert_eq!(builtin_prices("gpt-6-sol-pro"), None);
+        // 50K fresh + 50K written + 50K cached + 50K output (a 150K prompt:
+        // the short tier) = (8 + 10 + 0.40 + 40) / 20.
+        let cost = crate::token_engine::request_cost_for("gpt-6.2-astra", 50_000, 50_000, 50_000, 50_000);
+        assert!((cost - 2.92).abs() < 1e-9, "astra request cost: {cost}");
+
+        // The two new models lead the OpenAI catalog.
+        let providers = crate::provider_router::builtin_providers();
+        let openai = &providers["openai"].models;
+        for (i, (id, name)) in [("gpt-6.2-astra", "GPT-6.2 Astra"), ("gpt-6.2-sol", "GPT-6.2 Sol")].into_iter().enumerate() {
+            let m = &openai[i];
+            assert_eq!(m.id, id);
+            assert_eq!(m.display_name, name);
+            assert_eq!(m.max_context, 1_050_000);
+            assert!(m.supports_tools);
+            assert!(crate::providers::openai_compat::uses_responses_api(id, &providers["openai"].api_base));
+            assert_eq!(crate::providers::openai_compat::effort_off_level(id), None, "{id} rejects effort none");
+        }
+        // The older GPT-6 models are priced but not listed (#938): Talk uses
+        // them only once added in Settings › Models, as FEATURES.md says.
+        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"] {
+            assert!(!openai.iter().any(|m| m.id == id), "{id} is not in the openai catalog");
+        }
+    }
+
+    #[test]
+    fn cache_write_unset_on_a_custom_model_bills_at_the_input_price() {
+        use crate::provider_router::{builtin_providers, ProviderRouter};
+        use crate::token_engine::prices_in;
+        let mut map = builtin_providers();
+        // A user-added model through a LiteLLM gateway: the Models dialog
+        // saves cacheCreationCostPerM (and cacheReadCostPerM) as 0.
+        let mut gw = map["openai"].clone();
+        gw.name = "litellm".into();
+        gw.models.truncate(1);
+        let m = &mut gw.models[0];
+        m.id = "house-gpt".into();
+        (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) = (2.0, 8.0, 0.0, 0.0);
+        map.insert("litellm".into(), gw);
+        // A deliberately free custom model stays free.
+        let mut free = map["openai"].clone();
+        free.name = "zero-co".into();
+        free.models.truncate(1);
+        let f = &mut free.models[0];
+        f.id = "house-free".into();
+        (f.input_cost_per_m, f.output_cost_per_m, f.cache_read_cost_per_m, f.cache_creation_cost_per_m) = (0.0, 0.0, 0.0, 0.0);
+        map.insert("zero-co".into(), free);
+        let router = ProviderRouter::from_map(map);
+
+        let p = prices_in(Some(&router), "house-gpt").expect("custom model is priced");
+        assert_eq!(p.cache_creation_per_m, 2.0, "unset write price falls back to input");
+        assert_eq!(p.cache_creation_1h_per_m, 2.0);
+        // 1M cache-write tokens bill like 1M input tokens, never $0.
+        let writes = p.cost(0, 0, 0, 1_000_000);
+        assert!((writes - 2.0).abs() < 1e-9, "cache writes: {writes}");
+        assert!((crate::token_engine::request_cost("house-gpt", p, 0, 0, 0, 1_000_000) - 2.0).abs() < 1e-9);
+        assert_eq!(prices_in(Some(&router), "house-free"), Some(ModelPrices::FREE));
+
+        // A builtin with an explicit write price keeps it: Terra at $1.25,
+        // and every paid builtin has a non-zero write price.
+        let t = prices_in(Some(&router), "gpt-6.1-terra").expect("terra is priced");
+        assert_eq!(t.cache_creation_per_m, 1.25);
+        assert!((t.cost(0, 0, 0, 1_000_000) - 1.25).abs() < 1e-9);
+        for (name, prov) in builtin_providers() {
+            if prov.local || name == "deepseek" {
+                continue;
+            }
+            for m in &prov.models {
+                assert!(m.cache_creation_cost_per_m > 0.0, "{} has no write price", m.id);
+                let c = prices_in(Some(&router), &m.id).unwrap();
+                assert_eq!(c.cache_creation_per_m, m.cache_creation_cost_per_m, "{}", m.id);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn saved_terra_entry_gets_vision_backfilled_and_keeps_user_edits() {
+        use crate::provider_router::{backfill_builtin_vision, builtin_providers, write_providers, ProviderRouter};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let defaults = builtin_providers();
+        let mut openai = defaults["openai"].clone();
+        for m in &mut openai.models {
+            if m.id == "gpt-6.1-terra" {
+                // As #664 saved it, plus a user edit to other fields.
+                m.supports_vision = false;
+                m.display_name = "Terra (team)".into();
+                m.tags = vec!["house".into()];
+                m.input_cost_per_m = 1.1;
+            }
+        }
+        // A custom provider reusing the id is not a builtin entry.
+        let mut other = openai.clone();
+        other.name = "litellm".into();
+        other.models.retain(|m| m.id == "gpt-6.1-terra");
+        let mut list = vec![openai, other];
+        assert_eq!(backfill_builtin_vision(&mut list.clone()), 1);
+
+        write_providers(&list).unwrap();
+        let router = ProviderRouter::load().unwrap();
+        let by_name = |n: &str| router.list_providers().into_iter().find(|p| p.name == n).cloned().unwrap();
+        let terra = by_name("openai").models.into_iter().find(|m| m.id == "gpt-6.1-terra").unwrap();
+        assert!(terra.supports_vision, "vision backfilled");
+        assert_eq!(terra.display_name, "Terra (team)");
+        assert_eq!(terra.tags, vec!["house".to_string()]);
+        assert_eq!(terra.input_cost_per_m, 1.1);
+        assert!(!by_name("litellm").models[0].supports_vision, "custom provider untouched");
+        // Idempotent.
+        list = router.list_providers().into_iter().cloned().collect();
+        assert_eq!(backfill_builtin_vision(&mut list), 0);
     }
 }
 
@@ -14184,6 +19273,7 @@ mod unpriced_ledger_tests {
         assert_eq!(cost_of(&d, "e"), (0.0, "computed".into()));
         assert!(d.meta_get("ledger_unpriced_classify_v1").unwrap().is_some());
         assert!(d.meta_get("ledger_stale_price_fix_2026_10_v1").unwrap().is_some());
+        assert!(d.meta_get("ledger_stale_price_fix_2026_11_gpt4o_v1").unwrap().is_some());
         // Flags set: a later legacy $0 row is no longer scanned, and the stale
         // pass never re-runs.
         d.insert_spend_event(&spend("claude-mythos-2", "f", "run", None, 0.0, "computed", 1_000, 0)).unwrap();
@@ -14193,6 +19283,106 @@ mod unpriced_ledger_tests {
         let d = db.lock();
         assert_eq!(cost_of(&d, "f"), (0.0, "computed".into()));
         assert!((cost_of(&d, "g").0 - 0.0225).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn concurrent_reprices_run_the_october_pass_once() {
+        // Several rounds: two passes started together overlap almost always
+        // without the reprice lock.
+        for round in 0..8 {
+            let db = Arc::new(Mutex::new(test_db()));
+            let run = {
+                let d = db.lock();
+                let now = chrono::Utc::now().to_rfc3339();
+                d.conn_ref()
+                    .execute("INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)", [&now])
+                    .unwrap();
+                d.conn_ref()
+                    .execute(
+                        "INSERT INTO workspaces (id,project_id,name,branch,created_at,last_active) VALUES ('w1','p1','W','main',?1,?1)",
+                        [&now],
+                    )
+                    .unwrap();
+                let pid = d.insert_pipeline("P", "d", false).unwrap();
+                d.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+                // A pre-v0.4.89 DIRECT stage billed at the stale $15/$75.
+                let run = d.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+                let stages = d.list_run_stages(&run).unwrap();
+                d.complete_run_stage(&stages[0].id, "done", 10_000, 2_000, 0, 0, 0.30, None).unwrap();
+                d.set_run_cost(&run, 0.30, 0.60).unwrap();
+                run
+            };
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let passes: Vec<_> = (0..2)
+                .map(|_| {
+                    let (db, barrier) = (Arc::clone(&db), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        // The test config dir is per thread.
+                        let _cfg = crate::provider_router::TestConfigDir::new();
+                        barrier.wait();
+                        crate::commands::reprice_ledger(&db).unwrap();
+                    })
+                })
+                .collect();
+            for p in passes {
+                p.join().unwrap();
+            }
+            let d = db.lock();
+            let stage = d.list_run_stages(&run).unwrap()[0].cost_usd;
+            assert!((stage - 0.10).abs() < 1e-9, "round {round}: stage scaled once to $0.10, got {stage}");
+            let r = d.get_run(&run).unwrap().unwrap();
+            assert!((r.cost_usd - 0.10).abs() < 1e-9, "round {round}: run cost {}", r.cost_usd);
+            assert!(d.meta_get("ledger_stale_price_fix_2026_10_v1").unwrap().is_some());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn upgraded_ledger_gets_the_gpt4o_cached_input_fix_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        // Billed with cached input at the full input price: (i + cr) × in + out × out.
+        let old = |i: f64, cr: f64, inp: f64, out: f64| ((i + cr) * inp + 100.0 * out) / 1e6;
+        let gpt4o_old = old(1_000.0, 50_000.0, 2.5, 10.0);
+        let mini_old = old(1_000.0, 50_000.0, 0.15, 0.6);
+        let opus46_stale = (1_000.0 * 15.0 + 100.0 * 75.0) / 1e6;
+        {
+            let d = db.lock();
+            // An install upgraded from v0.4.89+: the October pass already ran.
+            d.meta_set("ledger_stale_price_fix_2026_10_v1", "done").unwrap();
+            d.meta_set("ledger_unpriced_classify_v1", "done").unwrap();
+            d.insert_spend_event(&spend("gpt-4o", "a", "talk", Some("director"), gpt4o_old, "computed", 1_000, 50_000)).unwrap();
+            d.insert_spend_event(&spend("openai/gpt-4o-mini", "b", "run", None, mini_old, "computed", 1_000, 50_000)).unwrap();
+            // Provider-reported cost: never recomputed.
+            let mut reported = spend("gpt-4o", "c", "talk", Some("director"), gpt4o_old, "provider", 1_000, 50_000);
+            reported.provider_cost_usd = Some(gpt4o_old);
+            d.insert_spend_event(&reported).unwrap();
+            // A subscription-billed row: not 'computed', left alone.
+            d.insert_spend_event(&spend("gpt-4o", "d", "talk", Some("director"), gpt4o_old, "subscription", 1_000, 50_000)).unwrap();
+            // The October pass is not re-run for other stale ids.
+            d.insert_spend_event(&spend("claude-opus-4-6", "e", "run", None, opus46_stale, "computed", 1_000, 0)).unwrap();
+        }
+        crate::commands::reprice_ledger(&db).unwrap();
+        let gpt4o_new = (1_000.0 * 2.5 + 50_000.0 * 1.25 + 100.0 * 10.0) / 1e6;
+        let mini_new = (1_000.0 * 0.15 + 50_000.0 * 0.075 + 100.0 * 0.6) / 1e6;
+        let check = |d: &Db| {
+            let (a, basis) = cost_of(d, "a");
+            assert!((a - gpt4o_new).abs() < 1e-12 && basis == "computed", "gpt-4o row: {a} vs {gpt4o_new}");
+            let (b, _) = cost_of(d, "b");
+            assert!((b - mini_new).abs() < 1e-12, "gpt-4o-mini row: {b} vs {mini_new}");
+            assert_eq!(cost_of(d, "c"), (gpt4o_old, "provider".into()));
+            assert_eq!(cost_of(d, "d"), (gpt4o_old, "subscription".into()));
+            assert!((cost_of(d, "e").0 - opus46_stale).abs() < 1e-12);
+        };
+        {
+            let d = db.lock();
+            check(&d);
+            assert!(d.meta_get("ledger_stale_price_fix_2026_11_gpt4o_v1").unwrap().is_some());
+        }
+        // A second run changes nothing.
+        crate::commands::reprice_ledger(&db).unwrap();
+        check(&db.lock());
     }
 
     #[test]
@@ -14493,6 +19683,569 @@ mod sync_opt_in_tests {
     }
 }
 
+// ── Sync pulls through the api_base()/access_token() seams (#753) ─────
+#[cfg(test)]
+mod sync_pull_tests {
+    use crate::settings::test_sync_override;
+    use crate::sync::{test_net, SyncKind};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    /// An HTTP server answering every request with `code` and `body` (JSON).
+    /// Returns its base URL and the request heads it received.
+    async fn serve(code: u16, body: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (log, body) = (seen.clone(), body.to_string());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, body) = (log.clone(), body.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = String::from_utf8_lossy(&buf).find("\r\n\r\n") {
+                            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..end]).to_string());
+                            break;
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The one request the server saw: its request line, and whether it
+    /// carried the test token.
+    fn only_request(seen: &Arc<Mutex<Vec<String>>>) -> (String, bool) {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let head = &seen[0];
+        let line = head.lines().next().unwrap_or_default().to_string();
+        let authed = head.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer test-token"));
+        (line, authed)
+    }
+
+    const RUNS: &str = r#"{"runs":[
+        {"run_id":"r1","task":"t","status":"completed","cost_usd":0.5,"stages":[{"role":"implement","status":"done"}]},
+        {"task":"no run id: unreadable"},
+        "not even an object"
+    ]}"#;
+
+    #[tokio::test]
+    async fn pull_runs_keeps_the_readable_rows() {
+        reset(true, false);
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(runs.len(), 1, "the malformed rows are skipped");
+        assert_eq!((runs[0].run_id.as_str(), runs[0].stages.len()), ("r1", 1));
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-runs "), "{line}");
+        assert!(authed, "the session token is sent");
+    }
+
+    #[tokio::test]
+    async fn pull_runs_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_reads_404_as_no_detail_and_an_unreadable_blob_as_none() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        let (base, seen) = serve(200, r#"{"detail":{"run_id":"r1","stages":[]}}"#).await;
+        test_net::set(Some(base), token());
+        let detail = crate::sync::pull_run_detail(&client, "r1").await.unwrap().expect("a detail");
+        assert_eq!(detail.run_id, "r1");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-run-detail?run_id=r1 "), "{line}");
+        assert!(authed);
+
+        test_net::set(Some(serve(404, r#"{"error":"no_detail"}"#).await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "404 no_detail: no detail");
+        // Any other 404 (a moved route, a proxy page) is an error, not "no detail".
+        for body in ["{}", r#"{"error":"no detail for this run"}"#, "<html>Not Found</html>"] {
+            test_net::set(Some(serve(404, body).await.0), token());
+            let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+            assert!(err.contains("history detail fetch failed: HTTP 404"), "{body}: {err}");
+        }
+        test_net::set(Some(serve(200, r#"{"detail":{"stages":"not a list"}}"#).await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "unreadable: no detail");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history detail fetch failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_library_keeps_the_readable_items() {
+        reset(false, true);
+        let body = r#"{"items":[
+            {"kind":"pipeline","item_id":"p1","updated_at":"2026-11-01T00:00:00Z","data":{"id":"p1"}},
+            {"kind":"role","item_id":"r1","deleted":true},
+            {"item_id":"no kind: unreadable"}
+        ]}"#;
+        let (base, seen) = serve(200, body).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert!(!pull.incremental && pull.next_since.is_none(), "no stored since, no next_since");
+        let got: Vec<(&str, bool)> = pull.items.iter().map(|i| (i.item_id.as_str(), i.deleted)).collect();
+        assert_eq!(got, [("p1", false), ("r1", true)], "the malformed item is skipped; tombstones stay");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-library "), "{line}");
+        assert!(authed);
+    }
+
+    #[tokio::test]
+    async fn pull_library_http_errors_and_signed_out() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("library sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+}
+
+// ── Last sync attempt under each Sync toggle (#518) ───────────────────
+#[cfg(test)]
+mod sync_status_tests {
+    use crate::settings::{test_sync_override, AppSettings};
+    use crate::sync::{
+        attempt_matters, status, test_net, AttemptOutcome, PushOutcome, SyncAttempt, SyncKind,
+        SyncStatus,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+        status::forget(SyncKind::History);
+        status::forget(SyncKind::Library);
+    }
+
+    fn a_run(id: &str) -> crate::sync::SyncRun {
+        crate::sync::SyncRun {
+            run_id: id.into(),
+            machine_id: "m1".into(),
+            machine_name: None,
+            workspace_name: None,
+            task: "secret task title".into(),
+            status: "completed".into(),
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+            stages: vec![],
+        }
+    }
+
+    /// A one-shot-per-connection HTTP server answering every request with
+    /// `code`. Returns its base URL.
+    async fn serve(code: u16) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    // Read the headers, then the declared body, before answering.
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    let l = l.to_ascii_lowercase();
+                                    l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A base URL nothing listens on — a network error, no HTTP status.
+    async fn dead_base() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    #[tokio::test]
+    async fn sent_runs_record_time_outcome_and_count() {
+        reset(true, false);
+        test_net::set(Some(serve(200).await), token());
+        let client = reqwest::Client::new();
+        let out = crate::sync::push_runs(&client, vec![a_run("a"), a_run("b"), a_run("c")]).await;
+        assert_eq!(out, PushOutcome::Sent);
+        let rec = status::snapshot().history.expect("recorded");
+        assert_eq!(rec.outcome, AttemptOutcome::Sent);
+        assert_eq!(rec.count, 3);
+        assert_eq!(rec.http_status, None);
+        assert!(chrono::DateTime::parse_from_rfc3339(&rec.at).is_ok(), "{}", rec.at);
+        assert!(status::snapshot().library.is_none(), "kinds are independent");
+    }
+
+    #[tokio::test]
+    async fn failed_push_records_the_http_status() {
+        reset(true, true);
+        test_net::set(Some(serve(503).await), token());
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run("a")]).await, PushOutcome::Failed);
+        let rec = status::snapshot().history.unwrap();
+        assert_eq!((rec.outcome, rec.count, rec.http_status), (AttemptOutcome::Failed, 1, Some(503)));
+
+        let items = vec![
+            crate::sync::SyncLibraryItem::tombstone("pipeline", "p1"),
+            crate::sync::SyncLibraryItem::tombstone("role", "r1"),
+        ];
+        assert_eq!(crate::sync::push_library_items(&client, items).await, PushOutcome::Failed);
+        let rec = status::snapshot().library.unwrap();
+        assert_eq!((rec.outcome, rec.count, rec.http_status), (AttemptOutcome::Failed, 2, Some(503)));
+    }
+
+    #[tokio::test]
+    async fn network_error_records_failed_without_a_status() {
+        reset(false, true);
+        test_net::set(Some(dead_base().await), token());
+        let client = reqwest::Client::new();
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(crate::sync::push_library_items(&client, vec![item]).await, PushOutcome::Failed);
+        let rec = status::snapshot().library.unwrap();
+        assert_eq!((rec.outcome, rec.http_status), (AttemptOutcome::Failed, None));
+    }
+
+    #[tokio::test]
+    async fn signed_out_push_records_nothing() {
+        reset(true, true);
+        test_net::set(Some(dead_base().await), Some(None));
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run("a")]).await, PushOutcome::SignedOut);
+        let detail = crate::sync::SyncRunDetail { run_id: "a".into(), stages: vec![] };
+        assert_eq!(crate::sync::push_run_detail(&client, detail).await, PushOutcome::SignedOut);
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(crate::sync::push_library_items(&client, vec![item]).await, PushOutcome::SignedOut);
+        assert!(status::snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_recorded_when_disabled_or_empty() {
+        reset(false, false);
+        test_net::set(Some(serve(200).await), token());
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run("a")]).await, PushOutcome::Disabled);
+        let detail = crate::sync::SyncRunDetail { run_id: "a".into(), stages: vec![] };
+        assert_eq!(crate::sync::push_run_detail(&client, detail).await, PushOutcome::Disabled);
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(crate::sync::push_library_items(&client, vec![item]).await, PushOutcome::Disabled);
+        assert!(status::snapshot().is_empty());
+
+        test_sync_override::set(SyncKind::History, Some(true));
+        test_sync_override::set(SyncKind::Library, Some(true));
+        assert_eq!(crate::sync::push_runs(&client, vec![]).await, PushOutcome::Empty);
+        assert_eq!(crate::sync::push_library_items(&client, vec![]).await, PushOutcome::Empty);
+        assert!(status::snapshot().is_empty());
+    }
+
+    #[test]
+    fn record_push_maps_every_outcome() {
+        for (outcome, expected) in [
+            (PushOutcome::Disabled, None),
+            (PushOutcome::Empty, None),
+            (PushOutcome::Sent, Some(AttemptOutcome::Sent)),
+            (PushOutcome::Failed, Some(AttemptOutcome::Failed)),
+            (PushOutcome::SignedOut, None),
+        ] {
+            reset(true, true);
+            crate::sync::record_push(SyncKind::History, outcome, 4, Some(500));
+            let rec = status::snapshot().history;
+            assert_eq!(rec.as_ref().map(|r| r.outcome), expected, "{outcome:?}");
+            if let Some(r) = rec {
+                assert_eq!(r.count, 4);
+                // Only a failure carries an HTTP status.
+                assert_eq!(r.http_status, (outcome == PushOutcome::Failed).then_some(500));
+            }
+        }
+        // Toggle turned off while the push was in flight ⇒ nothing recorded.
+        reset(false, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 1, None);
+        assert!(status::snapshot().history.is_none());
+    }
+
+    #[test]
+    fn detail_push_keeps_the_batch_count_but_shows_its_own_failure() {
+        reset(true, false);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 500, None);
+        crate::sync::record_detail_push(PushOutcome::Sent, None);
+        assert_eq!(status::snapshot().history.unwrap().count, 500);
+        crate::sync::record_detail_push(PushOutcome::Failed, Some(413));
+        let rec = status::snapshot().history.unwrap();
+        assert_eq!((rec.outcome, rec.count, rec.http_status), (AttemptOutcome::Failed, 1, Some(413)));
+        // A later successful detail push doesn't hide that failure…
+        crate::sync::record_detail_push(PushOutcome::Sent, None);
+        assert_eq!(status::snapshot().history.unwrap().outcome, AttemptOutcome::Failed);
+        // …and with no record yet it counts its one run.
+        reset(true, false);
+        crate::sync::record_detail_push(PushOutcome::Sent, None);
+        assert_eq!(status::snapshot().history.unwrap().count, 1);
+    }
+
+    #[test]
+    fn only_visible_changes_need_a_disk_write() {
+        let a = SyncAttempt {
+            at: "2026-11-09T14:02:05Z".into(),
+            outcome: AttemptOutcome::Sent,
+            count: 3,
+            http_status: None,
+        };
+        assert!(attempt_matters(None, &a));
+        let same_minute = SyncAttempt { at: "2026-11-09T14:02:59Z".into(), ..a.clone() };
+        assert!(!attempt_matters(Some(&a), &same_minute));
+        let next_minute = SyncAttempt { at: "2026-11-09T14:03:00Z".into(), ..a.clone() };
+        assert!(attempt_matters(Some(&a), &next_minute));
+        assert!(attempt_matters(Some(&a), &SyncAttempt { count: 4, ..a.clone() }));
+        assert!(attempt_matters(
+            Some(&a),
+            &SyncAttempt { outcome: AttemptOutcome::Failed, http_status: Some(503), ..a.clone() }
+        ));
+    }
+
+    #[test]
+    fn settings_field_round_trips_with_only_the_four_fields() {
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.last_sync_attempt.is_empty());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("lastSyncAttempt"), "absent when empty: {json}");
+
+        let mut s = AppSettings::default();
+        s.last_sync_attempt = SyncStatus {
+            history: Some(SyncAttempt {
+                at: "2026-11-09T14:02:00Z".into(),
+                outcome: AttemptOutcome::Failed,
+                count: 3,
+                http_status: Some(503),
+            }),
+            library: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        let rec = &json["lastSyncAttempt"]["history"];
+        let mut keys: Vec<_> = rec.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["at", "count", "httpStatus", "outcome"]);
+        assert_eq!(rec["outcome"], "failed");
+        let back: AppSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.last_sync_attempt, s.last_sync_attempt);
+    }
+
+    fn a_record() -> SyncAttempt {
+        SyncAttempt {
+            at: "2026-11-09T14:02:00Z".into(),
+            outcome: AttemptOutcome::Sent,
+            count: 1,
+            http_status: None,
+        }
+    }
+
+    /// Apply one toggle change the way `set_sync_opted_in` does.
+    fn toggle(s: &mut AppSettings, kind: SyncKind, on: bool, sub: &str) -> Vec<SyncKind> {
+        let before = s.sync_prefs();
+        let before_owner = s.sync_owner.clone();
+        s.set_sync_opted_in_by(kind, on, sub);
+        s.drop_stale_sync_attempts(before, before_owner.as_deref())
+    }
+
+    #[test]
+    fn a_record_never_outlives_its_toggle_or_its_account() {
+        let rec = a_record();
+        let mut s = AppSettings::default();
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        toggle(&mut s, SyncKind::Library, true, "user_1");
+        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()), ..Default::default() };
+        // Re-asserting an ON toggle keeps both records.
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        assert!(s.last_sync_attempt.history.is_some() && s.last_sync_attempt.library.is_some());
+
+        // Off drops that kind only.
+        toggle(&mut s, SyncKind::Library, false, "user_1");
+        assert!(s.last_sync_attempt.history.is_some());
+        assert!(s.last_sync_attempt.library.is_none());
+
+        // Off → on starts clean, even if a stale record slipped in meanwhile.
+        s.last_sync_attempt.library = Some(rec.clone());
+        toggle(&mut s, SyncKind::Library, true, "user_1");
+        assert!(s.last_sync_attempt.library.is_none());
+
+        // Another account turning a sync on never inherits the first one's record.
+        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()), ..Default::default() };
+        toggle(&mut s, SyncKind::History, true, "user_2");
+        assert!(s.last_sync_attempt.is_empty());
+    }
+
+    #[test]
+    fn persisting_never_re_adds_a_kind_turned_off_meanwhile() {
+        reset(true, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 3, None);
+        crate::sync::record_push(SyncKind::Library, PushOutcome::Sent, 2, None);
+        // On disk, library was turned off after the push recorded.
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::History, true, "user_1");
+        crate::sync::merge_status_into(&mut s);
+        assert_eq!(s.last_sync_attempt.history.as_ref().map(|r| r.count), Some(3));
+        assert!(s.last_sync_attempt.library.is_none(), "kept off disk");
+        assert!(status::snapshot().library.is_none(), "and forgotten in memory");
+    }
+
+    #[test]
+    fn an_unknown_outcome_drops_only_that_entry() {
+        let json = r#"{
+            "providerKeys": {"anthropic": "sk-ant-keep"},
+            "gitCredentials": {"github.com": {"username": "u", "token": "t"}},
+            "historySyncEnabled": true,
+            "lastSyncAttempt": {
+                "history": {"at": "2026-11-09T14:02:00Z", "outcome": "signedOut", "count": 3},
+                "library": {"at": "2026-11-09T14:02:00Z", "outcome": "sent", "count": 2}
+            }
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).expect("the file still loads");
+        assert_eq!(s.provider_keys.get("anthropic").map(String::as_str), Some("sk-ant-keep"));
+        assert!(s.git_credentials.contains_key("github.com"));
+        assert!(s.history_sync_enabled);
+        assert!(s.last_sync_attempt.history.is_none(), "the unreadable entry is dropped");
+        assert_eq!(s.last_sync_attempt.library.as_ref().map(|r| r.count), Some(2));
+
+        // A wholly wrong shape falls back to no record, never a failed file.
+        let s: AppSettings =
+            serde_json::from_str(r#"{"providerKeys":{"a":"k"},"lastSyncAttempt":"garbage"}"#).unwrap();
+        assert!(s.last_sync_attempt.is_empty());
+        assert_eq!(s.provider_keys.get("a").map(String::as_str), Some("k"));
+    }
+
+    #[test]
+    fn an_unparseable_settings_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        crate::settings::test_settings_path::set(Some(path.clone()));
+        reset(true, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 3, None);
+
+        for corrupt in ["{", r#"{"providerKeys":{"anthropic":"sk"},"historySyncEnabled":"yes"}"#] {
+            std::fs::write(&path, corrupt).unwrap();
+            // The app's read side keeps its old behaviour: defaults.
+            assert!(crate::settings::load_settings().unwrap().provider_keys.is_empty());
+            // Every writer refuses, and the bytes stay as they were.
+            assert!(crate::settings::update_settings(|s| s.editor_command = Some("x".into())).is_err());
+            assert!(crate::sync::persist_status_now().is_err(), "background persist");
+            assert!(crate::settings::clear_sync_opt_ins().is_err());
+            assert!(crate::settings::save_settings_from_ui(AppSettings::default()).is_err());
+            assert!(crate::settings::set_update_channel(crate::updater::UpdateChannel::Beta).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        }
+
+        // A missing file still starts from defaults, and a valid one is written.
+        std::fs::remove_file(&path).unwrap();
+        crate::sync::persist_status_now().unwrap();
+        let written: AppSettings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Flags are off in a fresh file, so the record is kept off disk.
+        assert!(written.last_sync_attempt.is_empty());
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[test]
+    fn sign_out_and_stale_saves_handle_the_record() {
+        let rec = a_record();
+        let mut s = AppSettings::default();
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        s.last_sync_attempt = SyncStatus { history: Some(rec), library: None, ..Default::default() };
+
+        // A stale whole-file save from a settings pane carries the record over.
+        let mut incoming = AppSettings::default();
+        incoming.preserve_sync_fields_from(&s);
+        assert_eq!(incoming.last_sync_attempt, s.last_sync_attempt);
+
+        s.clear_sync_opt_ins();
+        assert!(s.last_sync_attempt.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod updater_channel_tests {
     use crate::settings::AppSettings;
@@ -14572,6 +20325,109 @@ mod updater_channel_tests {
         let raw = serde_json::json!({"version": "1.2.0", "pub_date": "2026-10-30T06:00:00Z"});
         assert_eq!(manifest_date(&raw).as_deref(), Some("2026-10-30T06:00:00Z"));
         assert_eq!(manifest_date(&serde_json::json!({})), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod login_shell_fixture {
+    //! The shells a user's login shell may be. sh, bash and zsh ship with
+    //! macOS; fish runs only where it is installed and is skipped otherwise.
+    use std::process::Command;
+
+    pub fn available_shells() -> Vec<String> {
+        let fish = ["/opt/homebrew/bin/fish", "/usr/local/bin/fish", "/usr/bin/fish", "/bin/fish"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        ["/bin/sh", "/bin/bash", "/bin/zsh"]
+            .into_iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .chain(fish)
+            .map(String::from)
+            .collect()
+    }
+
+    /// `git` in `dir` with a fixed identity and no signing, so the user's
+    /// own gitconfig can't fail the test.
+    pub fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@e", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A repo with one commit whose local config sets the identity, as the
+    /// login shell's `git commit` reads it from there.
+    pub fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        for (k, v) in [("user.name", "T"), ("user.email", "t@e"), ("commit.gpgsign", "false")] {
+            git(dir.path(), &["config", k, v]);
+        }
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
+    pub fn head_message(dir: &std::path::Path) -> String {
+        let out = Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    }
+}
+
+#[cfg(test)]
+mod commit_message_shell_tests {
+    use super::login_shell_fixture::{available_shells, git, head_message, repo};
+    use crate::commands::{commit_in_login_shell, git_commit_command, COMMIT_MSG_FILE_ENV};
+
+    const HOSTILE: &str = "a\\'; touch PWNED; echo '";
+
+    #[test]
+    fn the_command_is_constant_and_names_the_message_file() {
+        assert_eq!(git_commit_command(false), "git commit -F \"$OCTOPUSH_COMMIT_MSG_FILE\"");
+        assert_eq!(git_commit_command(true), "git commit --amend -F \"$OCTOPUSH_COMMIT_MSG_FILE\"");
+        assert_eq!(COMMIT_MSG_FILE_ENV, "OCTOPUSH_COMMIT_MSG_FILE");
+    }
+
+    #[test]
+    fn refs_keep_their_single_quoting() {
+        assert_eq!(crate::git_ops::quote_git_ref("feat/it's"), "'feat/it'\\''s'");
+    }
+
+    #[test]
+    fn a_hostile_message_commits_verbatim_under_every_shell() {
+        for shell in available_shells() {
+            let dir = repo();
+            std::fs::write(dir.path().join("f.txt"), &shell).unwrap();
+            git(dir.path(), &["add", "f.txt"]);
+            let ws = dir.path().to_string_lossy().to_string();
+            let sha = commit_in_login_shell(&shell, &ws, HOSTILE, false)
+                .unwrap_or_else(|e| panic!("{shell}: {e}"));
+            assert!(!sha.is_empty(), "{shell}");
+            assert_eq!(head_message(dir.path()), HOSTILE, "{shell}");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the message");
+        }
+    }
+
+    #[test]
+    fn a_hostile_message_amends_verbatim_under_every_shell() {
+        for shell in available_shells() {
+            let dir = repo();
+            // The fixture's commit is empty; stage a change so the amend isn't.
+            std::fs::write(dir.path().join("f.txt"), &shell).unwrap();
+            git(dir.path(), &["add", "f.txt"]);
+            let ws = dir.path().to_string_lossy().to_string();
+            let msg = format!("{HOSTILE}\n\nbody $(id) `id` \"q\" #");
+            commit_in_login_shell(&shell, &ws, &msg, true).unwrap_or_else(|e| panic!("{shell}: {e}"));
+            assert_eq!(head_message(dir.path()), msg, "{shell}");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the message");
+        }
     }
 }
 
@@ -14708,6 +20564,194 @@ mod open_pull_request_tests {
     }
 
     #[test]
+    fn diff_size_counts_the_branch_against_its_base_plus_uncommitted_and_untracked() {
+        use crate::git_ops::{diff_size, DiffSize};
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        // Nothing changed yet: a real zero, against the named base.
+        assert_eq!(diff_size(d, Some("main")).unwrap(), DiffSize { files: 0, added: 0, removed: 0, base: Some("main".into()), untracked_skipped: 0 });
+        // A commit (2 lines changed), an unstaged edit and an untracked file.
+        std::fs::write(d.join("a.txt"), "1\nTWO\n3\n4\n").unwrap();
+        git(d, &["commit", "-qam", "crew work"]);
+        std::fs::write(d.join("b.txt"), "x\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n1\nn2\n").unwrap();
+        git(d, &["add", "b.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size, DiffSize { files: 3, added: 5, removed: 1, base: Some("main".into()), untracked_skipped: 0 });
+        // main moving on adds nothing to the crew's diff (merge base, not tip).
+        git(d, &["stash", "-u", "-q"]);
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "m\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "crew"]);
+        git(d, &["stash", "pop", "-q"]);
+        assert_eq!(diff_size(d, Some("main")).unwrap(), size);
+        // No base, or one that no longer resolves: the uncommitted changes vs HEAD.
+        let uncommitted = DiffSize { files: 2, added: 3, removed: 0, base: None, untracked_skipped: 0 };
+        assert_eq!(diff_size(d, None).unwrap(), uncommitted);
+        assert_eq!(diff_size(d, Some("gone/branch")).unwrap(), uncommitted);
+    }
+
+    /// A repo on `main` with one committed `a.txt`, checked out on `crew`.
+    fn diff_size_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        dir
+    }
+
+    #[test]
+    fn diff_size_uses_the_collision_radars_merge_base_so_a_stale_local_base_adds_nothing() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // Upstream moved on (origin/main = C1) while the local `main` stayed
+        // at C0; the crew branched from origin/main.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("up.txt"), "u\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "upstream"]);
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["checkout", "-q", "-B", "crew"]);
+        git(d, &["branch", "-f", "main", "HEAD~1"]);
+        std::fs::write(d.join("crew.txt"), "c\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "crew work"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        // Only the crew's file — not upstream's, as `merge_base(HEAD, main)` would add.
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 0), "{size:?}");
+        assert_eq!(size.base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn committed_diff_shows_the_branch_since_its_merge_base_without_working_tree_changes() {
+        use crate::git_ops::committed_diff;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // Nothing committed yet: zero commits, an empty diff, still on its base.
+        let none = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!((none.commits, none.diff.as_str(), none.base.as_deref()), (0, "", Some("main")));
+        // Two crew commits: an edit, then a rename with an edit.
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n").unwrap();
+        git(d, &["commit", "-qam", "edit"]);
+        git(d, &["mv", "a.txt", "moved.txt"]);
+        git(d, &["commit", "-qm", "move"]);
+        // Working-tree noise the committed view must leave out.
+        std::fs::write(d.join("moved.txt"), "dirty\n").unwrap();
+        std::fs::write(d.join("untracked.txt"), "u\n").unwrap();
+        // main moving on adds nothing (merge base, not tip).
+        git(d, &["stash", "-q"]);
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "m\n").unwrap();
+        git(d, &["add", "main-only.txt"]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "crew"]);
+        git(d, &["stash", "pop", "-q"]);
+
+        let c = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!(c.commits, 2, "{c:?}");
+        assert_eq!(c.base.as_deref(), Some("main"));
+        assert_eq!(c.merge_base.as_ref().map(String::len), Some(7));
+        // One file section: the rename paired, carrying only its edit.
+        assert_eq!(c.diff.matches("diff --git ").count(), 1, "{}", c.diff);
+        assert!(c.diff.contains("diff --git a/a.txt b/moved.txt"), "{}", c.diff);
+        assert!(c.diff.contains("+TEN") && c.diff.contains("-10"), "{}", c.diff);
+        assert!(!c.diff.contains("dirty"), "the working tree is not committed: {}", c.diff);
+        assert!(!c.diff.contains("untracked.txt"), "untracked files are not committed: {}", c.diff);
+        assert!(!c.diff.contains("main-only.txt"), "the base's own commits never count: {}", c.diff);
+        // Cached by (HEAD, merge base): the same answer on a repeat call.
+        assert_eq!(committed_diff(d, Some("main"), false).unwrap(), c);
+        // Another base at the same merge base: same diff, but the answer names
+        // the base asked for, never the cached one (#903).
+        let mb_sha = String::from_utf8(
+            std::process::Command::new("git").args(["merge-base", "crew", "main"]).current_dir(d).output().unwrap().stdout,
+        )
+        .unwrap();
+        git(d, &["branch", "same-base", mb_sha.trim()]);
+        let other = committed_diff(d, Some("same-base"), false).unwrap();
+        assert_eq!(other.base.as_deref(), Some("same-base"));
+        assert_eq!((other.commits, &other.merge_base, &other.diff), (c.commits, &c.merge_base, &c.diff));
+        assert_eq!(committed_diff(d, Some("main"), false).unwrap().base.as_deref(), Some("main"));
+        // A new commit moves HEAD and the answer with it.
+        std::fs::write(d.join("moved.txt"), "dirty\n").unwrap();
+        git(d, &["commit", "-qam", "third"]);
+        let c3 = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!(c3.commits, 3);
+        assert!(c3.diff.contains("+dirty"), "{}", c3.diff);
+        assert_eq!(c3.head.as_ref().map(String::len), Some(7));
+        assert_ne!(c3.head, c.head);
+        // An amend keeps the count and merge base but still moves HEAD (#820).
+        git(d, &["commit", "-q", "--amend", "-m", "third, reworded"]);
+        let amended = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!((amended.commits, &amended.merge_base, &amended.diff), (c3.commits, &c3.merge_base, &c3.diff));
+        assert_ne!(amended.head, c3.head, "{amended:?}");
+        // No base, or one that doesn't resolve: nothing to show.
+        assert_eq!(committed_diff(d, None, false).unwrap().commits, 0);
+        assert_eq!(committed_diff(d, Some("gone/branch"), false).unwrap().commits, 0);
+    }
+
+    #[test]
+    fn workspace_base_falls_back_to_the_projects_default_branch() {
+        use crate::collisions::workspace_base;
+        assert_eq!(workspace_base(Some("dev".into()), Some("main")).as_deref(), Some("dev"));
+        assert_eq!(workspace_base(None, Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(Some("  ".into()), Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(None, None), None);
+    }
+
+    #[test]
+    fn diff_size_pairs_a_rename_so_a_moved_file_counts_only_its_edit() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        git(d, &["mv", "a.txt", "moved.txt"]);
+        std::fs::write(d.join("moved.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n").unwrap();
+        git(d, &["add", "moved.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 1), "a rename, not a delete plus add: {size:?}");
+    }
+
+    #[test]
+    fn diff_size_bounds_untracked_content() {
+        use crate::collisions::MAX_UNTRACKED_DIR_FILES;
+        use crate::git_ops::{diff_size, MAX_UNTRACKED_LINE_BYTES};
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // A small untracked file, last line without a newline: 2 lines.
+        std::fs::write(d.join("note.txt"), "one\ntwo").unwrap();
+        // An untracked directory past the cap: one entry, never read.
+        std::fs::create_dir(d.join("vendor")).unwrap();
+        for i in 0..=MAX_UNTRACKED_DIR_FILES {
+            std::fs::write(d.join("vendor").join(format!("f{i}.js")), "x\n".repeat(100)).unwrap();
+        }
+        // A small untracked directory: each file counted.
+        std::fs::create_dir(d.join("small")).unwrap();
+        std::fs::write(d.join("small").join("s.txt"), "s\n").unwrap();
+        // A file past the byte budget: a file, its lines not read.
+        std::fs::write(d.join("huge.log"), vec![b'l'; MAX_UNTRACKED_LINE_BYTES as usize + 1]).unwrap();
+        // A binary file: a file with no lines, like git.
+        std::fs::write(d.join("blob.bin"), [0u8, 1, 2, b'\n']).unwrap();
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size.files, 5, "note, vendor/, small/s.txt, huge.log, blob.bin: {size:?}");
+        assert_eq!(size.added, 3, "note's 2 + s.txt's 1: {size:?}");
+        assert_eq!(size.untracked_skipped, 2, "vendor/ and huge.log: {size:?}");
+    }
+
+    #[test]
     fn branch_pr_context_diffs_against_the_base_remote() {
         let dir = tempdir().unwrap();
         let d = dir.path();
@@ -14805,5 +20849,8577 @@ mod open_pull_request_tests {
         assert!(!diff.contains("main-only.txt"), "{diff}");
         assert_eq!(commits, vec!["Add b".to_string()]);
         assert!(crate::git_ops::branch_pr_context(d, "nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod crew_tests {
+    use crate::crew;
+    use crate::db::{Db, StageDraft};
+    use crate::orchestrator::roles::RoleDef;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> (Db, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    fn draft(role: &str) -> StageDraft {
+        StageDraft {
+            role: role.into(), agent_model: "claude-haiku-4-5".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        }
+    }
+
+    /// A custom review role (it can carry a loop).
+    fn triage(prompt: &str) -> RoleDef {
+        let (db, _tmp) = test_db();
+        let mut r = db.get_role("code_review").unwrap().unwrap();
+        r.key = "triage".into();
+        r.label = "Triage".into();
+        r.prompt_body = prompt.into();
+        r.is_builtin = false;
+        r
+    }
+
+    /// plan → implement → triage (custom, loops back to implement), with
+    /// effort, escalation, tools, instructions, names and canvas positions.
+    fn rich_stages() -> Vec<StageDraft> {
+        let mut plan = draft("plan");
+        plan.effort = Some(crate::providers::Effort::High);
+        plan.tools = Some(vec!["read_file".into(), "list_files".into()]);
+        plan.instructions = Some("Keep the plan to five steps.".into());
+        plan.custom_name = Some("Cheap planner".into());
+        plan.pos_x = Some(10.0);
+        plan.pos_y = Some(20.0);
+        let mut implement = draft("implement");
+        implement.agent_model = "claude-sonnet-4-6".into();
+        implement.parents = vec![0];
+        implement.checkpoint = true;
+        implement.max_iterations = 40;
+        implement.escalate_model = Some("claude-opus-4-6".into());
+        implement.escalate_effort = Some(crate::providers::Effort::Max);
+        let mut review = draft("triage");
+        review.parents = vec![1];
+        review.loop_target_position = Some(1);
+        review.loop_max_iterations = 3;
+        review.loop_mode = Some("auto".into());
+        review.tools = Some(vec!["read_file".into(), "grep".into(), "run_command".into()]);
+        vec![plan, implement, review]
+    }
+
+    fn as_json(stages: &[StageDraft]) -> serde_json::Value {
+        serde_json::to_value(stages).unwrap()
+    }
+
+    #[test]
+    fn export_then_import_produces_an_identical_pipeline() {
+        let (a, _ta) = test_db();
+        a.upsert_role(&triage("Find the real defects.")).unwrap();
+        let stages = rich_stages();
+        let pid = a.save_pipeline(None, "Bugfix relay (cheap plan)", "Haiku plans, Sonnet builds", &stages).unwrap();
+
+        let text = crew::to_json(&crew::export(&a, &pid).unwrap()).unwrap();
+        let parsed = crew::parse(&text).unwrap();
+        assert_eq!(parsed.octocrew, crew::CREW_FORMAT);
+
+        let (b, _tb) = test_db();
+        let new_id = crew::import(&b, &parsed, &[]).unwrap();
+        assert_eq!(as_json(&b.pipeline_stage_drafts(&new_id).unwrap()), as_json(&stages));
+        let head = b.list_pipelines().unwrap().into_iter().find(|p| p.id == new_id).unwrap();
+        assert_eq!(head.name, "Bugfix relay (cheap plan)");
+        assert_eq!(head.description, "Haiku plans, Sonnet builds");
+        assert!(!head.is_builtin);
+        let role = b.get_role("triage").unwrap().unwrap();
+        assert_eq!(role.prompt_body, "Find the real defects.");
+        assert!(!role.is_builtin);
+        assert_eq!(crew::file_name(&head.name), "bugfix-relay-cheap-plan.octocrew.json");
+    }
+
+    #[test]
+    fn the_file_holds_only_the_referenced_custom_roles_and_no_private_data() {
+        let (db, tmp) = test_db();
+        db.upsert_role(&triage("Find the real defects.")).unwrap();
+        let mut unused = triage("Never referenced.");
+        unused.key = "unused_role".into();
+        db.upsert_role(&unused).unwrap();
+        let pid = db.save_pipeline(None, "Relay", "", &rich_stages()).unwrap();
+
+        let text = crew::to_json(&crew::export(&db, &pid).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top.sort();
+        assert_eq!(top, vec!["minApp", "octocrew", "pipeline", "roles"]);
+        let mut pipe: Vec<&str> = v["pipeline"].as_object().unwrap().keys().map(String::as_str).collect();
+        pipe.sort();
+        assert_eq!(pipe, vec!["description", "name", "stages"]);
+        let keys: Vec<&str> = v["roles"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["triage"], "built-ins (plan, implement) and unused roles never travel");
+        for secret in ["apiKey", "api_key", "baseUrl", "base_url", "worktreePath", "workspaceId", "runId", "costUsd", "\"id\""] {
+            assert!(!text.contains(secret), "crew file must not carry {secret}");
+        }
+        assert!(!text.contains(&*tmp.path().to_string_lossy()), "no local paths");
+    }
+
+    #[test]
+    fn a_taken_role_key_is_suffixed_never_overwritten_and_an_identical_one_is_reused() {
+        let (a, _ta) = test_db();
+        a.upsert_role(&triage("Find the real defects.")).unwrap();
+        let pid = a.save_pipeline(None, "Relay", "", &rich_stages()).unwrap();
+        let file = crew::export(&a, &pid).unwrap();
+
+        // Same machine: the identical role is reused, not duplicated.
+        let again = crew::preview(&a, &file, &[]).unwrap();
+        assert_eq!(again.roles[0].fate, "existing");
+        assert_eq!(again.roles[0].key, "triage");
+        crew::import(&a, &file, &[]).unwrap();
+        assert!(a.get_role("triage-2").unwrap().is_none());
+
+        // Another machine has its own `triage`: the import becomes `triage-2`.
+        let (b, _tb) = test_db();
+        b.upsert_role(&triage("Local prompt.")).unwrap();
+        let preview = crew::preview(&b, &file, &[]).unwrap();
+        assert_eq!(preview.roles[0].fate, "renamed");
+        assert_eq!(preview.roles[0].key, "triage-2");
+        assert_eq!(preview.stages[2].role, "triage-2");
+        let new_id = crew::import(&b, &file, &[]).unwrap();
+        assert_eq!(b.get_role("triage").unwrap().unwrap().prompt_body, "Local prompt.");
+        assert_eq!(b.get_role("triage-2").unwrap().unwrap().prompt_body, "Find the real defects.");
+        assert_eq!(b.pipeline_stage_drafts(&new_id).unwrap()[2].role, "triage-2");
+
+        // A file role named like a built-in never touches the built-in.
+        let mut hostile = file.clone();
+        hostile.roles[0].key = "code_review".into();
+        hostile.pipeline.stages[2].role = "code_review".into();
+        let p = crew::preview(&b, &hostile, &[]).unwrap();
+        assert_eq!(p.roles[0].key, "code_review-2");
+        assert!(b.get_role("code_review").unwrap().unwrap().is_builtin);
+    }
+
+    #[test]
+    fn the_preview_shows_writers_tools_instructions_and_model_swaps() {
+        let (db, _t) = test_db();
+        db.upsert_role(&triage("Find the real defects.")).unwrap();
+        let pid = db.save_pipeline(None, "Relay", "", &rich_stages()).unwrap();
+        let file = crew::export(&db, &pid).unwrap();
+
+        let p = crew::preview(&db, &file, &[]).unwrap();
+        assert!(p.ok, "{:?}", p);
+        assert!(p.stages[0].read_only, "read_file + list_files only");
+        assert!(!p.stages[1].read_only, "no allowlist = writer");
+        assert!(!p.stages[2].read_only, "run_command = writer");
+        assert_eq!(p.stages[0].label, "Cheap planner");
+        assert_eq!(p.stages[0].instructions.as_deref(), Some("Keep the plan to five steps."));
+        assert!(p.stages[1].tools.contains(&"write_file".to_string()), "role defaults shown when no allowlist");
+        assert_eq!(p.roles[0].prompt_body, "Find the real defects.");
+
+        let swaps = vec![("claude-opus-4-6".to_string(), "claude-sonnet-4-6".to_string())];
+        let swapped = crew::preview(&db, &file, &swaps).unwrap();
+        assert_eq!(swapped.stages[1].escalate_model.as_deref(), Some("claude-sonnet-4-6"));
+        let id = crew::import(&db, &file, &swaps).unwrap();
+        assert_eq!(db.pipeline_stage_drafts(&id).unwrap()[1].escalate_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn an_invalid_crew_reports_each_stage_and_saves_nothing() {
+        let (db, _t) = test_db();
+        let mut stages = vec![draft("plan"), draft("implement"), draft("code_review"), draft("test")];
+        stages[1].tools = Some(vec!["format_disk".into()]);
+        stages[2].loop_target_position = Some(3);
+        stages[2].loop_max_iterations = 2;
+        stages[2].loop_mode = Some("gated".into());
+        stages[3].parents = vec![3];
+        stages[0].instructions = Some("x".repeat(8_001));
+        let mut bad_role = triage("p");
+        bad_role.key = "odd".into();
+        bad_role.default_tools = vec!["teleport".into()];
+        let file = crew::CrewFile {
+            octocrew: 1,
+            min_app: String::new(),
+            pipeline: crew::CrewPipeline { name: "Broken".into(), description: String::new(), stages },
+            roles: vec![bad_role],
+        };
+        let pipelines_before = db.list_pipelines().unwrap().len();
+        let roles_before = db.list_roles().unwrap().len();
+
+        let p = crew::preview(&db, &file, &[]).unwrap();
+        assert!(!p.ok);
+        // Each message names its stage exactly once.
+        assert_eq!(p.stages[0].problem.as_deref(), Some("Stage 1 instructions are too long (max 8000 characters)"));
+        assert_eq!(p.stages[1].problem.as_deref(), Some("Stage 2: unknown tool 'format_disk'"));
+        assert!(p.stages[0].problem.as_deref().unwrap().contains("too long"));
+        assert!(p.stages[1].problem.as_deref().unwrap().contains("unknown tool 'format_disk'"));
+        assert!(p.stages[2].problem.as_deref().unwrap().contains("loop target"));
+        assert!(p.stages[3].problem.as_deref().unwrap().contains("acyclic"));
+        assert!(p.problems.iter().any(|m| m.contains("teleport")));
+
+        assert!(crew::import(&db, &file, &[]).is_err());
+        let mut no_role_problem = file.clone();
+        no_role_problem.roles.clear();
+        let err = crew::import(&db, &no_role_problem, &[]).unwrap_err().to_string();
+        assert!(err.contains("Stage 1 instructions are too long"), "{err}");
+        assert!(!err.to_lowercase().contains("stage 1: stage 1"), "{err}");
+        // save_pipeline's own messages are unchanged.
+        let save_err = db.save_pipeline(None, "Broken", "", &no_role_problem.pipeline.stages).unwrap_err().to_string();
+        assert!(save_err.contains("stage 1 instructions are too long"), "{save_err}");
+        assert_eq!(db.list_pipelines().unwrap().len(), pipelines_before);
+        assert_eq!(db.list_roles().unwrap().len(), roles_before);
+        assert!(db.get_role("odd").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_refuses_non_crews_and_newer_formats() {
+        assert!(crew::parse("not json").unwrap_err().to_string().contains("isn't JSON"));
+        assert!(crew::parse("{\"name\":\"x\"}").unwrap_err().to_string().contains("isn't an Octopush crew"));
+        let newer = r#"{"octocrew":2,"pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(newer).unwrap_err().to_string().contains("newer Octopush"));
+        let later = r#"{"octocrew":1,"minApp":"99.0.0","pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(later).unwrap_err().to_string().contains("99.0.0"));
+        let ok = r#"{"octocrew":1,"minApp":"0.1.0","pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(ok).is_ok());
+    }
+
+    #[test]
+    fn a_format_1_file_carries_the_fixed_floor_and_imports() {
+        let (a, _ta) = test_db();
+        let pid = a.save_pipeline(None, "Relay", "", &[draft("plan")]).unwrap();
+        let exported = crew::export(&a, &pid).unwrap();
+        // The floor for format 1, never the exporting app's version.
+        assert_eq!(exported.min_app, crew::CREW_MIN_APP);
+        let text = format!(
+            r#"{{"octocrew":1,"minApp":"{}","pipeline":{{"name":"Floor","stages":[{}]}}}}"#,
+            crew::CREW_MIN_APP,
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        let (b, _tb) = test_db();
+        let id = crew::import(&b, &crew::parse(&text).unwrap(), &[]).unwrap();
+        assert_eq!(b.pipeline_stage_drafts(&id).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_scan_skips_a_symlinked_crews_folder() {
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("crews");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let body = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"Outside","stages":[{}]}}}}"#,
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        std::fs::write(elsewhere.join("a.octocrew.json"), body).unwrap();
+
+        // `.octopush/crews` itself is a link out of the worktree.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wt.path().join(".octopush")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, wt.path().join(crew::REPO_CREWS_DIR)).unwrap();
+        assert!(crew::scan_repo(wt.path()).is_empty());
+
+        // `.octopush` is a link out of the worktree.
+        let wt2 = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), wt2.path().join(".octopush")).unwrap();
+        assert!(crew::scan_repo(wt2.path()).is_empty());
+    }
+
+    #[test]
+    fn repo_crews_are_listed_from_the_worktree_and_re_read_each_time() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(crew::scan_repo(dir.path()).is_empty(), "no folder = no crews");
+        let crews = dir.path().join(crew::REPO_CREWS_DIR);
+        std::fs::create_dir_all(&crews).unwrap();
+        let body = |name: &str| {
+            format!(
+                r#"{{"octocrew":1,"pipeline":{{"name":"{name}","stages":[{}]}}}}"#,
+                serde_json::to_string(&draft("plan")).unwrap()
+            )
+        };
+        std::fs::write(crews.join("a.octocrew.json"), body("Repo relay")).unwrap();
+        std::fs::write(crews.join("b.octocrew.json"), "{ broken").unwrap();
+        std::fs::write(crews.join("notes.json"), body("Ignored")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(crews.join("a.octocrew.json"), crews.join("c.octocrew.json")).unwrap();
+
+        let found = crew::scan_repo(dir.path());
+        let files: Vec<&str> = found.iter().map(|c| c.file.as_str()).collect();
+        assert_eq!(files, vec!["a.octocrew.json", "b.octocrew.json"], "symlinks and other files skipped");
+        assert_eq!(found[0].name, "Repo relay");
+        assert_eq!(found[0].stage_count, 1);
+        assert!(found[0].problem.is_none());
+        assert!(found[1].problem.is_some());
+
+        std::fs::write(crews.join("a.octocrew.json"), body("Renamed relay")).unwrap();
+        assert_eq!(crew::scan_repo(dir.path())[0].name, "Renamed relay");
+
+        // Fork: the text is read through the safe reader, then the normal import.
+        let (db, _t) = test_db();
+        let text = crew::read_repo_crew(dir.path(), &found[0].file).unwrap();
+        let id = crew::import(&db, &crew::parse(&text).unwrap(), &[]).unwrap();
+        assert_eq!(db.pipeline_stage_drafts(&id).unwrap().len(), 1);
+        // Only names inside the folder, and never a symlink.
+        assert!(crew::read_repo_crew(dir.path(), "../a.octocrew.json").is_err());
+        assert!(crew::read_repo_crew(dir.path(), "notes.json").is_err());
+        #[cfg(unix)]
+        assert!(crew::read_repo_crew(dir.path(), "c.octocrew.json").unwrap_err().to_string().contains("link"));
+    }
+
+    /// The listing carries names and counts only, each bounded, never the text.
+    #[test]
+    fn the_repo_listing_is_metadata_only_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let crews = dir.path().join(crew::REPO_CREWS_DIR);
+        std::fs::create_dir_all(&crews).unwrap();
+        let body = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"Relay","description":"{}","stages":[{}]}}}}"#,
+            "d".repeat(1_500),
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        std::fs::write(crews.join("a.octocrew.json"), &body).unwrap();
+        let hidden = body.replace("\"Relay\"", "\"Re\\u202elay\"");
+        std::fs::write(crews.join("b.octocrew.json"), hidden).unwrap();
+        let found = crew::scan_repo(dir.path());
+        let v = serde_json::to_value(&found).unwrap();
+        assert!(v[0].get("json").is_none(), "no file text in the listing");
+        assert!(found[0].description.chars().count() <= 281);
+        assert!(found[0].problem.is_none());
+        assert_eq!(found[1].name, "b", "a hidden character in the name lists the file name instead");
+        assert!(found[1].problem.as_deref().unwrap().contains("U+202E"));
+        assert!(serde_json::to_string(&found).unwrap().len() < 2_000);
+    }
+
+    fn one_stage_file(stages: Vec<StageDraft>, roles: Vec<RoleDef>) -> crew::CrewFile {
+        crew::CrewFile {
+            octocrew: 1,
+            min_app: String::new(),
+            pipeline: crew::CrewPipeline { name: "Relay".into(), description: String::new(), stages },
+            roles,
+        }
+    }
+
+    #[test]
+    fn cli_stages_show_their_shell_dialect_not_a_tool_list() {
+        let (db, _t) = test_db();
+        let mut claude = draft("implement");
+        claude.substrate = "cli".into();
+        claude.agent_model = "claude-sonnet-4-6".into();
+        claude.tools = Some(vec!["read_file".into()]);
+        let mut codex = draft("implement");
+        codex.substrate = "cli".into();
+        codex.agent_model = "gpt-5-codex".into();
+        let api = draft("plan");
+        let p = crew::preview(&db, &one_stage_file(vec![claude, codex, api], vec![]), &[]).unwrap();
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.stages[0].cli_dialect.as_deref(), Some("claude"));
+        assert_eq!(p.stages[1].cli_dialect.as_deref(), Some("codex"));
+        assert_eq!(p.stages[2].cli_dialect, None);
+        assert!(p.stages[0].tools.is_empty(), "the allowlist does not apply on the CLI");
+        assert!(!p.stages[0].read_only, "a read_file-only allowlist does not make a CLI stage read-only");
+        assert!(p.stages[0].warnings.iter().any(|w| w.contains("full shell")));
+        assert!(p.stages[1].warnings.is_empty());
+        assert!(!p.stages[2].tools.is_empty());
+    }
+
+    #[test]
+    fn the_preview_shows_loops_effort_and_escalation_effort() {
+        let (db, _t) = test_db();
+        db.upsert_role(&triage("Find the real defects.")).unwrap();
+        let p = crew::preview(&db, &one_stage_file(rich_stages(), vec![triage("Find the real defects.")]), &[]).unwrap();
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.stages[0].effort, Some(crate::providers::Effort::High));
+        assert_eq!(p.stages[1].escalate_effort, Some(crate::providers::Effort::Max));
+        assert_eq!(p.stages[2].loop_target_position, Some(1));
+        assert_eq!(p.stages[2].loop_mode.as_deref(), Some("auto"));
+        assert_eq!(p.stages[2].loop_max_iterations, 3);
+    }
+
+    #[test]
+    fn loop_max_iterations_is_capped_like_the_builder() {
+        let (db, _t) = test_db();
+        let mut stages = vec![draft("implement"), draft("code_review")];
+        stages[1].loop_target_position = Some(0);
+        stages[1].loop_mode = Some("auto".into());
+        stages[1].loop_max_iterations = crate::db::MAX_LOOP_ITERATIONS;
+        assert!(db.validate_pipeline_stages(&stages).is_ok());
+        stages[1].loop_max_iterations = 1_000_000;
+        let err = db.validate_pipeline_stages(&stages).unwrap_err().to_string();
+        assert!(err.contains("between 1 and 9"), "{err}");
+        let p = crew::preview(&db, &one_stage_file(stages, vec![]), &[]).unwrap();
+        assert!(!p.ok);
+        assert!(p.stages[1].problem.as_deref().unwrap().contains("between 1 and 9"));
+    }
+
+    #[test]
+    fn stored_loop_counts_above_the_cap_are_clamped_not_rejected() {
+        let (db, _t) = test_db();
+        let mut stages = vec![draft("implement"), draft("code_review")];
+        stages[1].loop_target_position = Some(0);
+        stages[1].loop_mode = Some("auto".into());
+        stages[1].loop_max_iterations = 3;
+        let pid = db.save_pipeline(None, "Old Loop", "d", &stages).unwrap();
+        // A row saved before the cap existed.
+        db.conn_ref()
+            .execute("UPDATE pipeline_stages SET loop_max_iterations = 15 WHERE pipeline_id = ?1 AND position = 1", [&pid])
+            .unwrap();
+        assert_eq!(db.get_pipeline_stages(&pid).unwrap()[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+        let drafts = db.pipeline_stage_drafts(&pid).unwrap();
+        assert_eq!(drafts[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+        // What the builder and sync read back re-saves cleanly.
+        db.save_pipeline(Some(pid.clone()), "Old Loop", "d", &drafts).unwrap();
+
+        // A pulled item from a Mac that still holds 15 applies, clamped.
+        let mut remote = stages.clone();
+        remote[1].loop_max_iterations = 15;
+        let sp = crate::sync::SyncPipeline {
+            id: "remote-old-loop".into(), name: "Remote".into(), description: String::new(),
+            updated_at: "2099-01-01T00:00:00Z".into(), stages: remote.clone(),
+        };
+        assert!(db.upsert_pipeline_from_sync(&sp).unwrap());
+        assert_eq!(db.get_pipeline_stages("remote-old-loop").unwrap()[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+
+        // New input above the cap is still rejected.
+        assert!(db.validate_pipeline_stages(&remote).is_err());
+        assert!(db.save_pipeline(None, "New", "d", &remote).is_err());
+        assert!(!crew::preview(&db, &one_stage_file(remote, vec![]), &[]).unwrap().ok);
+    }
+
+    #[test]
+    fn imported_token_estimates_are_reset_to_the_local_defaults() {
+        let (db, _t) = test_db();
+        let mut r = triage("Find the real defects.");
+        r.token_est_in = 1;
+        r.token_est_out = 99_999_999;
+        let mut st = draft("triage");
+        st.agent_model = "claude-haiku-4-5".into();
+        crew::import(&db, &one_stage_file(vec![st], vec![r]), &[]).unwrap();
+        let saved = db.get_role("triage").unwrap().unwrap();
+        assert_eq!((saved.token_est_in, saved.token_est_out), (crew::DEFAULT_TOKEN_EST_IN, crew::DEFAULT_TOKEN_EST_OUT));
+    }
+
+    /// Every invisible or reordering character, in every string field, blocks.
+    #[test]
+    fn hidden_and_bidi_characters_block_the_import_in_every_field() {
+        let hostile = [
+            '\u{E0041}', '\u{E007F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200B}', '\u{200F}',
+            '\u{2060}', '\u{2064}', '\u{FEFF}', '\u{0000}', '\u{001B}', '\u{000D}', '\u{007F}', '\u{0085}', '\u{009F}',
+            // Variation selectors (both blocks), other Cf, Zl/Zp and blank fillers.
+            '\u{FE00}', '\u{FE0F}', '\u{E0100}', '\u{E01EF}', '\u{061C}', '\u{206A}', '\u{206F}', '\u{FFF9}',
+            '\u{FFFB}', '\u{180E}', '\u{00AD}', '\u{034F}', '\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}',
+            '\u{1D173}', '\u{1D17A}', '\u{2028}', '\u{2029}', '\u{0600}', '\u{13430}', '\u{E0001}',
+        ];
+        for c in hostile {
+            assert!(crew::is_hidden_char(c), "U+{:04X} is hidden", c as u32);
+            assert!(!crew::escape_hidden(&c.to_string()).contains(c), "U+{:04X} is escaped", c as u32);
+        }
+        // Ordinary text stays visible: accents, CJK, Hangul, Arabic, a bare emoji.
+        for ok in "é ü 漢字 한국어 عربي 🐙 — “q”".chars() {
+            assert!(!crew::is_hidden_char(ok), "U+{:04X} is ordinary text", ok as u32);
+        }
+        type Inject = fn(&mut crew::CrewFile, &str);
+        let fields: Vec<(&str, Inject)> = vec![
+            ("name", |f, x| f.pipeline.name = format!("Relay{x}")),
+            ("description", |f, x| f.pipeline.description = format!("d{x}")),
+            ("role key", |f, x| {
+                f.roles[0].key = format!("triage{x}");
+                f.pipeline.stages[0].role = f.roles[0].key.clone();
+            }),
+            ("role label", |f, x| f.roles[0].label = format!("Triage{x}")),
+            ("role description", |f, x| f.roles[0].description = format!("d{x}")),
+            ("prompt body", |f, x| f.roles[0].prompt_body = format!("Find{x} defects")),
+            ("stage role", |f, x| f.pipeline.stages[1].role = format!("plan{x}")),
+            ("custom name", |f, x| f.pipeline.stages[0].custom_name = Some(format!("n{x}"))),
+            ("instructions", |f, x| f.pipeline.stages[0].instructions = Some(format!("ok\n\tthen{x}"))),
+            ("model", |f, x| f.pipeline.stages[0].agent_model = format!("claude-haiku-4-5{x}")),
+            ("escalate model", |f, x| f.pipeline.stages[0].escalate_model = Some(format!("claude-opus-4-6{x}"))),
+            ("tool", |f, x| f.pipeline.stages[0].tools = Some(vec![format!("read_file{x}")])),
+        ];
+        let base = one_stage_file(vec![draft("triage"), draft("plan")], vec![triage("Find the real defects.")]);
+        {
+            let (db, _t) = test_db();
+            let p = crew::preview(&db, &base, &[]).unwrap();
+            assert!(p.ok, "the clean file imports: {p:?}");
+        }
+        for (what, inject) in &fields {
+            for c in hostile {
+                let (db, _t) = test_db();
+                let mut f = base.clone();
+                inject(&mut f, &c.to_string());
+                let p = crew::preview(&db, &f, &[]).unwrap();
+                assert!(!p.ok, "{what} with U+{:04X} must block", c as u32);
+                let shown = serde_json::to_string(&p).unwrap();
+                assert!(!shown.contains(c), "{what}: U+{:04X} reaches the sheet unescaped", c as u32);
+                assert!(crew::import(&db, &f, &[]).is_err(), "{what} with U+{:04X} must not import", c as u32);
+                assert!(db.get_role("triage").unwrap().is_none());
+            }
+        }
+        // Newlines and tabs in prompts and instructions are fine.
+        let (db, _t) = test_db();
+        let mut f = base.clone();
+        f.pipeline.stages[0].instructions = Some("one\n\ttwo".into());
+        assert!(crew::preview(&db, &f, &[]).unwrap().ok);
+    }
+
+    /// Issue #661: a crew whose text holds an ordinary emoji (`⚠️`, a ZWJ
+    /// sequence, a keycap) exports and imports back unchanged.
+    #[test]
+    fn emoji_with_a_variation_selector_or_joiner_round_trip() {
+        const WARN: &str = "\u{26A0}\u{FE0F}"; // ⚠️
+        const CHECK: &str = "\u{2714}\u{FE0F}"; // ✔️
+        const HEART: &str = "\u{2764}\u{FE0F}"; // ❤️
+        const CODER: &str = "\u{1F469}\u{200D}\u{1F4BB}"; // 👩‍💻
+        const RAINBOW: &str = "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"; // 🏳️‍🌈
+        const BACK_TEXT: &str = "\u{21A9}\u{FE0E}"; // ↩︎
+        const KEYCAP: &str = "1\u{FE0F}\u{20E3}"; // 1️⃣
+        let text = format!(
+            "{WARN} Never force-push. {CHECK} tests, {HEART} docs, {CODER} review, {RAINBOW} ok, {BACK_TEXT} back, {KEYCAP} first"
+        );
+        let name = format!("Relay {WARN}");
+        let description = format!("{HEART} {CODER}");
+        let prompt = format!("{WARN} Find the real defects.");
+        let (a, _ta) = test_db();
+        a.upsert_role(&triage(&prompt)).unwrap();
+        let mut stages = rich_stages();
+        stages[0].instructions = Some(WARN.into());
+        stages[1].instructions = Some(text.clone());
+        stages[2].custom_name = Some(format!("{CHECK} Triage"));
+        let pid = a.save_pipeline(None, &name, &description, &stages).unwrap();
+
+        let json = crew::to_json(&crew::export(&a, &pid).unwrap()).unwrap();
+        let parsed = crew::parse(&json).unwrap();
+        let (b, _tb) = test_db();
+        let p = crew::preview(&b, &parsed, &[]).unwrap();
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.stages[0].instructions.as_deref(), Some(WARN), "shown as written, not escaped");
+        assert_eq!(p.stages[1].instructions.as_deref(), Some(text.as_str()));
+        assert_eq!(p.name, name);
+        let new_id = crew::import(&b, &parsed, &[]).unwrap();
+        assert_eq!(as_json(&b.pipeline_stage_drafts(&new_id).unwrap()), as_json(&stages));
+        let head = b.list_pipelines().unwrap().into_iter().find(|p| p.id == new_id).unwrap();
+        assert_eq!((head.name.as_str(), head.description.as_str()), (name.as_str(), description.as_str()));
+        assert_eq!(b.get_role("triage").unwrap().unwrap().prompt_body, prompt);
+    }
+
+    /// Only one selector or joiner per visible emoji gets through: runs, other
+    /// selectors and joiners outside an emoji still block, and stay escaped.
+    #[test]
+    fn selectors_and_joiners_outside_an_emoji_still_block() {
+        let hostile = [
+            "\u{FE0F}",
+            "a\u{FE0F}",
+            "1\u{FE0F}",
+            "\u{26A0}\u{FE0F}\u{FE0F}",
+            "\u{26A0}\u{FE0E}\u{FE0F}",
+            "\u{26A0}\u{FE00}",
+            "\u{26A0}\u{E0100}",
+            "a\u{200D}b",
+            "\u{1F419}\u{200D}",
+            "\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}\u{200D}\u{1F419}",
+            "a\u{FE0F}\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}a",
+            // Issue #690: a joiner needs an Extended_Pictographic on each side.
+            "\u{1F1FA}\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}\u{1F1FA}",
+            "\u{1F3FD}\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}\u{1F3FD}",
+            "\u{1F1FA}\u{1F3FD}\u{200D}\u{1F419}",
+        ];
+        for s in hostile {
+            assert!(crew::first_hidden(s).is_some(), "{s:?} has a hidden character");
+            let (db, _t) = test_db();
+            let mut f = one_stage_file(vec![draft("plan")], vec![]);
+            f.pipeline.stages[0].instructions = Some(format!("ok {s}"));
+            let p = crew::preview(&db, &f, &[]).unwrap();
+            assert!(!p.ok, "{s:?} must block");
+            let shown = p.stages[0].instructions.clone().unwrap();
+            assert!(shown.contains("\\u{"), "{s:?} is escaped: {shown}");
+            assert!(crew::import(&db, &f, &[]).is_err(), "{s:?} must not import");
+        }
+        for ok in [
+            "\u{26A0}\u{FE0F}",                           // ⚠️
+            "\u{26A0}\u{FE0E}",                           // ⚠︎
+            "\u{1F469}\u{200D}\u{1F4BB}",                 // 👩‍💻
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",          // ❤️‍🔥
+            "\u{1F468}\u{1F3FD}\u{200D}\u{1F4BB}",        // 👨🏽‍💻
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{26A7}\u{FE0F}",  // 🏳️‍⚧️
+            "\u{1F3F4}\u{200D}\u{2620}\u{FE0F}",          // 🏴‍☠️
+            "\u{1F441}\u{FE0F}\u{200D}\u{1F5E8}\u{FE0F}", // 👁️‍🗨️
+            "\u{1F43B}\u{200D}\u{2744}\u{FE0F}",          // 🐻‍❄️
+            "\u{1F408}\u{200D}\u{2B1B}",                  // 🐈‍⬛
+            "\u{1F642}\u{200D}\u{2194}\u{FE0F}",          // 🙂‍↔️
+            "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}", // 👩‍👩‍👧‍👦
+            "\u{1F9D1}\u{1F3FB}\u{200D}\u{1F91D}\u{200D}\u{1F9D1}\u{1F3FC}", // 🧑🏻‍🤝‍🧑🏼
+            "#\u{FE0F}\u{20E3}",                          // #️⃣
+            "\u{1F419}",                                  // 🐙
+        ] {
+            assert_eq!(crew::first_hidden(ok), None, "{ok:?} is an ordinary emoji");
+            assert_eq!(crew::escape_hidden(ok), ok);
+        }
+    }
+
+    #[test]
+    fn role_keys_and_lengths_are_bounded() {
+        let (db, _t) = test_db();
+        let base = one_stage_file(vec![draft("triage")], vec![triage("p")]);
+        let blocked = |f: &crew::CrewFile| !crew::preview(&db, f, &[]).unwrap().ok;
+        for key in ["Triage", "-triage", "tri age", "tri.age", "", &"a".repeat(49)] {
+            let mut f = base.clone();
+            f.roles[0].key = key.to_string();
+            f.pipeline.stages[0].role = key.to_string();
+            assert!(blocked(&f), "key {key:?}");
+        }
+        let mut ok = base.clone();
+        ok.roles[0].key = format!("a{}", "-".repeat(47));
+        ok.pipeline.stages[0].role = ok.roles[0].key.clone();
+        assert!(!blocked(&ok), "48 characters is allowed");
+        let long = "x".repeat(129);
+        let cases: Vec<fn(&mut crew::CrewFile, &str)> = vec![
+            |f, l| f.roles[0].label = l.into(),
+            |f, l| f.pipeline.stages[0].custom_name = Some(l.into()),
+            |f, l| f.pipeline.stages[0].agent_model = l.into(),
+            |f, l| f.pipeline.stages[0].escalate_model = Some(l.into()),
+            |f, l| f.pipeline.name = l.into(),
+        ];
+        for (i, set) in cases.iter().enumerate() {
+            let mut f = base.clone();
+            set(&mut f, &long);
+            assert!(blocked(&f), "case {i}");
+        }
+        let mut f = base.clone();
+        f.pipeline.description = "d".repeat(2_001);
+        assert!(blocked(&f));
+    }
+
+    #[test]
+    fn a_stage_naming_a_rejected_file_role_never_falls_back_to_a_local_one() {
+        let (db, _t) = test_db();
+        // The local `triage` is a harmless review role.
+        db.upsert_role(&triage("Local, harmless.")).unwrap();
+        // The file's `triage` is malformed, so it is rejected…
+        let mut bad = triage("");
+        bad.prompt_body = String::new();
+        let f = one_stage_file(vec![draft("triage")], vec![bad]);
+        let p = crew::preview(&db, &f, &[]).unwrap();
+        assert!(!p.ok);
+        // …and the stage says so instead of quietly using the local role.
+        assert!(p.stages[0].problem.as_deref().unwrap().contains("defines but can't import"), "{p:?}");
+        assert!(crew::import(&db, &f, &[]).is_err());
+    }
+
+    #[test]
+    fn parse_bounds_text_stages_and_roles_and_handles_pre_releases() {
+        let big = format!(r#"{{"octocrew":1,"pipeline":{{"name":"{}","stages":[]}}}}"#, "x".repeat(crew::MAX_CREW_BYTES as usize));
+        assert!(crew::parse(&big).unwrap_err().to_string().contains("too large"));
+        let stage = serde_json::to_string(&draft("plan")).unwrap();
+        let many = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"x","stages":[{}]}}}}"#,
+            vec![stage.as_str(); crew::MAX_CREW_STAGES + 1].join(",")
+        );
+        assert!(crew::parse(&many).unwrap_err().to_string().contains("at most 64"));
+        let role = serde_json::to_string(&triage("p")).unwrap();
+        let roles = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"x","stages":[]}},"roles":[{}]}}"#,
+            vec![role.as_str(); crew::MAX_CREW_ROLES + 1].join(",")
+        );
+        assert!(crew::parse(&roles).unwrap_err().to_string().contains("at most 32"));
+
+        assert_eq!(crew::version_parts("0.4.117-beta.2"), [0, 4, 117]);
+        assert_eq!(crew::version_parts("v0.4.117+build.5"), [0, 4, 117]);
+        assert_eq!(crew::version_parts("1.2"), [1, 2, 0]);
+        assert!(crew::version_parts("0.4.117-beta.1") > crew::version_parts("0.4.116"));
+        assert!(crew::version_parts("0.4.117-beta.1") == crew::version_parts(crew::CREW_MIN_APP));
+        assert_eq!(crew::CREW_MIN_APP, "0.4.117", "v0.4.116 shipped without crews");
+        let beta_floor = r#"{"octocrew":1,"minApp":"0.4.117-beta.3","pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(beta_floor).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_fifo_never_blocks_and_an_oversized_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("x.octocrew.json");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((crew::read_file(&path, true).is_err(), crew::read_file(&path, false).is_err()));
+        });
+        let (followed, nofollow) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("reading a FIFO blocked");
+        assert!(followed && nofollow, "a FIFO is not a crew file");
+
+        let big = dir.path().join("big.octocrew.json");
+        std::fs::write(&big, vec![b' '; crew::MAX_CREW_BYTES as usize + 1]).unwrap();
+        assert!(crew::read_file(&big, true).unwrap_err().to_string().contains("too large"));
+        let exact = dir.path().join("ok.octocrew.json");
+        std::fs::write(&exact, vec![b' '; crew::MAX_CREW_BYTES as usize]).unwrap();
+        assert!(crew::read_file(&exact, true).is_ok());
+        std::fs::write(&exact, [0xff, 0xfe]).unwrap();
+        assert!(crew::read_file(&exact, true).unwrap_err().to_string().contains("UTF-8"));
+
+        // The dialog's pick may be a link; a repo's crew may not.
+        let link = dir.path().join("link.octocrew.json");
+        std::os::unix::fs::symlink(&exact, &link).unwrap();
+        std::fs::write(&exact, "{}").unwrap();
+        assert_eq!(crew::read_file(&link, true).unwrap(), "{}");
+        assert!(crew::read_file(&link, false).unwrap_err().to_string().contains("link"));
+    }
+}
+
+#[cfg(test)]
+mod cli_command_idle_tests {
+    use crate::orchestrator::cli_runner::{
+        command_idle_window, idle_timeout_message, long_command_notice, read_stream, retry_idle_window, CliDialect,
+        IdleStall, OpenTool, OpenTools, ReadEnd, ReadLimits,
+    };
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+
+    const LIMITS: ReadLimits = ReadLimits {
+        idle: Duration::from_millis(200),
+        command_idle: Duration::from_millis(1500),
+        cap: Duration::from_secs(20),
+        settle: Duration::from_secs(5),
+    };
+
+    fn tool_use(id: &str, name: &str, command: &str) -> Value {
+        json!({"type": "assistant", "message": {"id": format!("msg_{id}"), "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": {"command": command}}
+        ]}})
+    }
+
+    fn tool_result(id: &str) -> Value {
+        json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "content": "ok"}
+        ]}})
+    }
+
+    fn result() -> Value {
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"})
+    }
+
+    /// A stdout that writes `script` (`Some(line)` or `None` = pause), then
+    /// stays open and silent unless `eof`.
+    fn stdout(script: Vec<Option<Value>>, pause: Duration, eof: bool) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            for step in script {
+                match step {
+                    Some(v) => tx.write_all(format!("{v}\n").as_bytes()).await.unwrap(),
+                    None => tokio::time::sleep(pause).await,
+                }
+            }
+            if !eof {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        (rx, task)
+    }
+
+    async fn read(script: Vec<Option<Value>>, pause: Duration, eof: bool, dialect: CliDialect) -> (ReadEnd, Vec<Duration>, Duration) {
+        let (rx, task) = stdout(script, pause, eof);
+        let started = Instant::now();
+        let mut notes = Vec::new();
+        let end = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_stream(rx, dialect, LIMITS, |_| {}, |w| notes.push(w)),
+        )
+        .await
+        .expect("read_stream never ended");
+        task.abort();
+        (end, notes, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn an_open_bash_call_outlives_the_idle_window_and_settles_normally() {
+        let (end, notes, took) = read(
+            vec![Some(tool_use("toolu_1", "Bash", "npm test")), None, Some(tool_result("toolu_1")), Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert_eq!(notes, vec![LIMITS.command_idle], "one journal line, naming the window");
+    }
+
+    #[tokio::test]
+    async fn an_open_bash_call_still_times_out_after_the_command_window() {
+        let (end, notes, took) =
+            read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall.window, LIMITS.command_idle);
+        assert_eq!(stall.tool.as_ref().map(OpenTool::label).as_deref(), Some("Bash `npm test`"));
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_call_trips_idle_at_the_plain_window() {
+        let (end, notes, took) = read(
+            vec![Some(tool_use("toolu_1", "Bash", "npm test")), Some(tool_result("toolu_1"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_tool_result_does_not_extend_the_window() {
+        let (end, notes, took) = read(vec![Some(tool_result("toolu_ghost"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall.tool, None);
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_open_non_command_tool_keeps_the_plain_window_but_is_named() {
+        let (end, _, took) = read(vec![Some(tool_use("toolu_1", "Read", ""))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(idle_timeout_message(&stall, None), "timed out — Read gave no result for 1 minute");
+    }
+
+    #[tokio::test]
+    async fn codex_keeps_the_plain_idle_window() {
+        let (end, notes, took) =
+            read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
+        assert!(notes.is_empty());
+    }
+
+    fn api_retry(delay_ms: u64, error: &str) -> Value {
+        json!({"type": "system", "subtype": "api_retry", "attempt": 3, "max_retries": 10,
+            "retry_delay_ms": delay_ms, "error_status": 529, "error": error})
+    }
+
+    #[tokio::test]
+    async fn a_stage_waiting_out_an_api_retry_outlives_the_idle_window() {
+        // The retry's delay (600ms) is three times `idle` (200ms): the answer
+        // arriving 700ms later is still inside delay + idle.
+        let (end, notes, took) = read(
+            vec![Some(api_retry(600, "overloaded")), None, Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert!(notes.is_empty(), "a retry wait is not a long command: {notes:?}");
+    }
+
+    #[tokio::test]
+    async fn silence_past_the_retry_delay_plus_idle_still_stalls_and_names_the_retry() {
+        let (end, notes, took) = read(vec![Some(api_retry(600, "overloaded"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= Duration::from_millis(800), "{took:?}");
+        assert_eq!(stall.window, Duration::from_millis(800));
+        assert_eq!(stall.after_retry.as_deref(), Some("overloaded"));
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_non_retry_line_goes_back_to_the_plain_window() {
+        let (end, _, took) = read(
+            vec![Some(api_retry(5000, "overloaded")), Some(tool_result("toolu_ghost"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_a_numeric_delay_keeps_the_plain_window() {
+        let bare = json!({"type": "system", "subtype": "api_retry", "error": "overloaded", "retry_delay_ms": "soon"});
+        let (end, _, took) = read(vec![Some(bare)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
+    }
+
+    #[tokio::test]
+    async fn codex_ignores_a_retry_delay() {
+        let (end, _, took) = read(vec![Some(api_retry(5000, "overloaded"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
+    }
+
+    #[test]
+    fn the_retry_window_is_the_delay_plus_the_plain_window() {
+        let idle = ReadLimits::STAGE.idle;
+        // `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS` at its 2.1.323 maximum.
+        assert_eq!(retry_idle_window(idle, Duration::from_millis(300_000)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::ZERO), idle);
+        // Longer waits (a 429 Retry-After, CLAUDE_CODE_RETRY_WATCHDOG) are
+        // capped at the 300s overload ceiling: about 10 minutes at most.
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(301)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(3_600)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_stall_after_a_retry_names_it() {
+        let stall = |c: &str| IdleStall {
+            tool: None,
+            window: Duration::from_secs(600),
+            after_retry: Some(c.into()),
+            before_first_request: false,
+        };
+        assert_eq!(
+            idle_timeout_message(&stall("overloaded"), None),
+            "timed out — no output for 10 minutes after an API retry (overloaded)"
+        );
+        assert_eq!(idle_timeout_message(&stall(""), None), "timed out — no output for 10 minutes after an API retry");
+    }
+
+    #[test]
+    fn open_tools_pair_calls_with_their_results() {
+        let mut open = OpenTools::default();
+        open.observe(&tool_use("a", "Bash", "cargo build\ncargo test"));
+        open.observe(&tool_use("b", "Read", ""));
+        assert!(open.command_open());
+        // The latest command is blamed, not a later non-command tool.
+        assert_eq!(open.latest().map(OpenTool::label).as_deref(), Some("Bash `cargo build …`"));
+        open.observe(&tool_result("ghost"));
+        assert!(open.command_open(), "an unmatched result closes nothing");
+        open.observe(&tool_result("a"));
+        assert!(!open.command_open());
+        assert_eq!(open.latest().map(|t| t.name.as_str()), Some("Read"));
+        open.observe(&tool_result("b"));
+        assert_eq!(open.latest(), None);
+        // A tool_result inside an assistant event is not a result.
+        open.observe(&tool_use("c", "PowerShell", "Invoke-Pester"));
+        open.observe(&json!({"type": "assistant", "message": {"content": [{"type": "tool_result", "tool_use_id": "c"}]}}));
+        assert!(open.command_open());
+    }
+
+    #[test]
+    fn a_long_command_is_shortened_in_the_label() {
+        let mut open = OpenTools::default();
+        open.observe(&tool_use("a", "Bash", &"x".repeat(100)));
+        let label = open.latest().unwrap().label();
+        assert_eq!(label, format!("Bash `{}…`", "x".repeat(59)));
+    }
+
+    #[test]
+    fn the_command_window_follows_bash_max_timeout_ms() {
+        assert_eq!(command_idle_window(None), Duration::from_secs(660));
+        assert_eq!(ReadLimits::STAGE.command_idle, Duration::from_secs(660));
+        assert_eq!(ReadLimits::STAGE.idle, Duration::from_secs(300));
+        assert_eq!(command_idle_window(Some("900000")), Duration::from_secs(960));
+        // Never below the plain idle window.
+        assert_eq!(command_idle_window(Some("60000")), Duration::from_secs(360));
+        assert_eq!(command_idle_window(Some(" 1200000 ")), Duration::from_secs(1260));
+        assert_eq!(command_idle_window(Some("junk")), Duration::from_secs(660));
+        assert_eq!(command_idle_window(Some("0")), Duration::from_secs(660));
+        assert_eq!(ReadLimits::for_stage(Some("900000")).command_idle, Duration::from_secs(960));
+        assert_eq!(ReadLimits::for_stage(None).cap, ReadLimits::STAGE.cap);
+    }
+
+    #[test]
+    fn idle_messages_name_the_open_call() {
+        let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
+        assert_eq!(
+            idle_timeout_message(
+                &IdleStall { tool: Some(bash), window: Duration::from_secs(660), after_retry: None, before_first_request: false },
+                None
+            ),
+            "timed out — Bash `npm test` gave no result for 11 minutes"
+        );
+        assert_eq!(
+            idle_timeout_message(
+                &IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None, before_first_request: false },
+                Some("2.1.300")
+            ),
+            "timed out — no output for 5 minutes",
+            "a stall after start-up keeps its message on an old CLI"
+        );
+        assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
+    }
+
+    fn init() -> Value {
+        json!({"type": "system", "subtype": "init", "session_id": "s", "model": "claude-sonnet-5-5"})
+    }
+
+    #[tokio::test]
+    async fn an_init_only_stream_stalls_before_the_first_request() {
+        let status = json!({"type": "system", "subtype": "status"});
+        let (end, _, _) = read(vec![Some(init()), Some(status)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: true });
+    }
+
+    #[tokio::test]
+    async fn any_sign_of_a_request_after_init_ends_start_up() {
+        let text = json!({"type": "assistant", "message": {"id": "msg_1", "content": [{"type": "text", "text": "hi"}]}});
+        let delta = json!({"type": "stream_event", "event": {"type": "message_start"}});
+        let limits = json!({"type": "rate_limit_event", "session_id": "s"});
+        for line in [text, delta, limits, api_retry(0, "overloaded")] {
+            let (end, _, _) =
+                read(vec![Some(init()), Some(line.clone()), Some(init())], Duration::ZERO, false, CliDialect::Claude).await;
+            let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+            assert!(!stall.before_first_request, "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_an_init_or_on_codex_a_stall_is_not_named_pre_request() {
+        let status = json!({"type": "system", "subtype": "status"});
+        let (end, _, _) = read(vec![Some(status)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(!stall.before_first_request);
+        let (end, _, _) = read(vec![Some(init())], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(!stall.before_first_request);
+    }
+
+    #[test]
+    fn a_stall_before_the_first_request_names_it_and_the_fix_on_an_old_cli() {
+        let stall = IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None, before_first_request: true };
+        let plain = "timed out — Claude Code sent no request in 5 minutes";
+        assert_eq!(
+            idle_timeout_message(&stall, Some("2.1.326")),
+            format!(
+                "{plain}; Claude Code 2.1.327 fixes a hang before the first request when a model's settings fetch \
+                 stalls (for example at a proxy). Update Claude Code"
+            )
+        );
+        assert_eq!(idle_timeout_message(&stall, Some("2.1.327")), plain, "the fixed CLI");
+        assert_eq!(idle_timeout_message(&stall, Some("2.2.0")), plain, "a newer CLI");
+        assert_eq!(idle_timeout_message(&stall, None), plain, "an unknown version never names the update");
+        assert_eq!(idle_timeout_message(&stall, Some("garbage")), plain);
+    }
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use crate::collisions::{
+        overlap, uncommitted_paths_capped, CollisionCache, ScanInput, Severity, MAX_CONFIRMED_PAIRS,
+        MAX_PAIR_FILES, MAX_UNCOMMITTED_PATHS, MAX_UNTRACKED_DIR_FILES, REPORT_TTL,
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use tempfile::{tempdir, TempDir};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    const LIMITS: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+
+    /// A repo on `main` with a few files, plus `names` linked worktrees.
+    struct Fixture {
+        _dir: TempDir,
+        root: PathBuf,
+        wts: Vec<(String, PathBuf)>,
+    }
+
+    impl Fixture {
+        fn new(names: &[&str]) -> Self {
+            let dir = tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.email", "t@t.dev"]);
+            git(&root, &["config", "user.name", "T"]);
+            std::fs::write(root.join("src/limits.ts"), LIMITS).unwrap();
+            std::fs::write(root.join("src/plan.ts"), "plan\n").unwrap();
+            std::fs::write(root.join("README.md"), "readme\n").unwrap();
+            std::fs::write(root.join("package-lock.json"), "{\"v\":1}\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-qm", "base"]);
+            let mut wts = Vec::new();
+            for n in names {
+                let p = dir.path().join(format!("wt-{n}"));
+                git(&root, &["worktree", "add", "-q", "-b", n, p.to_str().unwrap(), "main"]);
+                git(&p, &["config", "user.email", "t@t.dev"]);
+                git(&p, &["config", "user.name", "T"]);
+                wts.push((n.to_string(), p));
+            }
+            Fixture { _dir: dir, root, wts }
+        }
+        fn wt(&self, name: &str) -> &Path {
+            &self.wts.iter().find(|(n, _)| n == name).unwrap().1
+        }
+        fn write_commit(&self, name: &str, file: &str, body: &str) {
+            let p = self.wt(name);
+            std::fs::write(p.join(file), body).unwrap();
+            git(p, &["add", "-A"]);
+            git(p, &["commit", "-qm", &format!("{name} edits {file}")]);
+        }
+        fn inputs(&self) -> Vec<ScanInput> {
+            self.wts
+                .iter()
+                .map(|(n, p)| ScanInput {
+                    id: format!("ws-{n}"),
+                    name: n.clone(),
+                    path: p.clone(),
+                    base: Some("main".into()),
+                })
+                .collect()
+        }
+        /// Everything a scan must leave untouched: the bytes and mtime of
+        /// every index (the main one and each `.git/worktrees/*/index`), each
+        /// worktree's status, every ref, and the object count. Hashed before
+        /// any git command runs, and the git commands use
+        /// `--no-optional-locks` so the snapshot itself never refreshes an
+        /// index.
+        fn snapshot(&self) -> String {
+            let gitdir = self.root.join(".git");
+            let mut indexes = vec![gitdir.join("index")];
+            let mut slots: Vec<PathBuf> = std::fs::read_dir(gitdir.join("worktrees"))
+                .unwrap()
+                .map(|e| e.unwrap().path().join("index"))
+                .collect();
+            slots.sort();
+            indexes.extend(slots);
+            let mut s = String::new();
+            for idx in &indexes {
+                let bytes = std::fs::read(idx).unwrap();
+                let mtime = std::fs::metadata(idx).unwrap().modified().unwrap();
+                let hash: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+                s += &format!("{} {hash} {mtime:?}\n", idx.display());
+            }
+            let quiet = |dir: &Path, args: &[&str]| {
+                let mut all = vec!["--no-optional-locks"];
+                all.extend_from_slice(args);
+                git(dir, &all)
+            };
+            s += &quiet(&self.root, &["for-each-ref"]);
+            s += &quiet(&self.root, &["count-objects", "-v"]);
+            s += &quiet(&self.root, &["status", "--porcelain"]);
+            for (_, p) in &self.wts {
+                s += &quiet(p, &["status", "--porcelain"]);
+                s += &quiet(p, &["rev-parse", "HEAD"]);
+            }
+            s
+        }
+    }
+
+    fn replace_line(body: &str, from: &str, to: &str) -> String {
+        body.replacen(from, to, 1)
+    }
+
+    #[test]
+    fn no_overlap_reports_nothing() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "plan b\n");
+        f.write_commit("gamma", "README.md", "readme c\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.scanned, 3);
+        assert!(report.collisions.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn same_file_that_merges_cleanly_is_an_overlap() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!((c.a.as_str(), c.b.as_str()), ("ws-alpha", "ws-beta"));
+        assert_eq!(c.files, vec!["src/limits.ts".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(c.confirmed);
+        assert!(c.conflicting_files.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_conflict_is_reported_as_such() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "alpha"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "one", "beta"));
+        f.write_commit("gamma", "src/plan.ts", "gamma\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.severity, Severity::Conflict);
+        assert_eq!(c.conflicting_files, vec!["src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_lockfile_only_overlap_is_low_severity() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        std::fs::write(f.wt("beta").join("package-lock.json"), "{\"v\":1,\"b\":1}\n").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        assert_eq!(report.collisions[0].severity, Severity::Lockfile);
+        assert!(crate::collisions::is_lockfile("web/pnpm-lock.yaml"));
+        assert!(!crate::collisions::is_lockfile("src/lock.ts"));
+    }
+
+    #[test]
+    fn uncommitted_changes_count_but_are_not_merge_confirmed() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // Alpha: staged only. Beta: an untracked new file plus a worktree edit.
+        std::fs::write(f.wt("alpha").join("src/plan.ts"), "alpha plan\n").unwrap();
+        git(f.wt("alpha"), &["add", "src/plan.ts"]);
+        std::fs::write(f.wt("beta").join("src/plan.ts"), "beta plan\n").unwrap();
+        std::fs::write(f.wt("beta").join("notes.md"), "new\n").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!(c.files, vec!["src/plan.ts".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(!c.confirmed);
+    }
+
+    fn collision(a: &str, b: &str, files: &[&str], severity: Severity) -> crate::collisions::Collision {
+        crate::collisions::Collision {
+            a: format!("ws-{a}"),
+            a_name: a.into(),
+            b: format!("ws-{b}"),
+            b_name: b.into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            truncated: 0,
+            conflicting_files: vec![],
+            conflicting_truncated: 0,
+            severity,
+            confirmed: false,
+        }
+    }
+
+    #[test]
+    fn the_dossier_note_names_each_peer_conflicts_first_without_lockfiles() {
+        use crate::collisions::{concurrent_work_note, ProjectCollisions};
+        let report = ProjectCollisions {
+            collisions: vec![
+                collision("auth-flow", "billing", &["src/plan.ts", "Cargo.lock"], Severity::Overlap),
+                collision("refund-webhooks", "auth-flow", &["src/limits.ts"], Severity::Conflict),
+                collision("auth-flow", "deps", &["package-lock.json"], Severity::Lockfile),
+                collision("billing", "deps", &["src/other.ts"], Severity::Overlap),
+            ],
+            scanned: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            concurrent_work_note(&report, "ws-auth-flow").as_deref(),
+            Some(
+                "Note: workspace `refund-webhooks` is concurrently changing src/limits.ts. Avoid unrelated edits there.\n\
+                 Note: workspace `billing` is concurrently changing src/plan.ts. Avoid unrelated edits there."
+            )
+        );
+        // Not part of any collision, or only through a lockfile: nothing.
+        assert_eq!(concurrent_work_note(&report, "ws-quiet"), None);
+        let lock_only = ProjectCollisions { collisions: vec![report.collisions[2].clone()], ..Default::default() };
+        assert_eq!(concurrent_work_note(&lock_only, "ws-deps"), None);
+    }
+
+    #[test]
+    fn the_dossier_note_stays_short() {
+        use crate::collisions::{concurrent_work_note, ProjectCollisions, MAX_NOTE_FILES, MAX_NOTE_PEERS};
+        let files: Vec<String> = (0..MAX_NOTE_FILES + 2).map(|i| format!("src/f{i}.ts")).collect();
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let mut first = collision("me", "p0", &refs, Severity::Overlap);
+        first.truncated = 3;
+        let mut collisions = vec![first];
+        for i in 1..MAX_NOTE_PEERS + 2 {
+            collisions.push(collision("me", &format!("p{i}"), &["src/x.ts"], Severity::Overlap));
+        }
+        let note = concurrent_work_note(&ProjectCollisions { collisions, ..Default::default() }, "ws-me").unwrap();
+        let lines: Vec<&str> = note.lines().collect();
+        assert_eq!(lines.len(), MAX_NOTE_PEERS + 1, "{note}");
+        assert!(lines[0].contains("src/f4.ts and 5 more files."), "{note}");
+        assert!(!lines[0].contains("src/f5.ts"), "{note}");
+        assert_eq!(lines[MAX_NOTE_PEERS], "Note: 2 more workspaces of this project change files you may touch.");
+    }
+
+    #[test]
+    fn a_rename_counts_its_old_path() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        git(f.wt("alpha"), &["mv", "src/plan.ts", "src/strategy.ts"]);
+        git(f.wt("alpha"), &["commit", "-qm", "rename"]);
+        f.write_commit("beta", "src/plan.ts", "plan b\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        assert_eq!(report.collisions[0].files, vec!["src/plan.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_delete_against_an_edit_is_a_conflict() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        git(f.wt("alpha"), &["rm", "-q", "src/limits.ts"]);
+        git(f.wt("alpha"), &["commit", "-qm", "drop limits"]);
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "five", "FIVE"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        assert_eq!(report.collisions[0].severity, Severity::Conflict);
+        assert_eq!(report.collisions[0].conflicting_files, vec!["src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn the_same_file_in_three_workspaces_gives_every_pair() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "five", "FIVE"));
+        std::fs::write(f.wt("gamma").join("src/limits.ts"), replace_line(LIMITS, "ten", "TEN")).unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        let pairs: Vec<(&str, &str)> =
+            report.collisions.iter().map(|c| (c.a.as_str(), c.b.as_str())).collect();
+        assert_eq!(pairs, vec![("ws-alpha", "ws-beta"), ("ws-alpha", "ws-gamma"), ("ws-beta", "ws-gamma")]);
+        // Only the committed pair gets a merge-tree check.
+        let confirmed: Vec<bool> = report.collisions.iter().map(|c| c.confirmed).collect();
+        assert_eq!(confirmed, vec![true, false, false]);
+    }
+
+    #[test]
+    fn the_base_branch_moving_on_does_not_count() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/plan.ts", "alpha\n");
+        f.write_commit("beta", "README.md", "beta\n");
+        // main moves on and touches both files; neither workspace changed them.
+        std::fs::write(f.root.join("src/plan.ts"), "main\n").unwrap();
+        std::fs::write(f.root.join("README.md"), "main\n").unwrap();
+        git(&f.root, &["commit", "-qam", "main moves"]);
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_single_workspace_is_skipped() {
+        let f = Fixture::new(&["alpha"]);
+        f.write_commit("alpha", "src/plan.ts", "alpha\n");
+        let mut cache = CollisionCache::default();
+        let report = cache.scan(&f.inputs());
+        assert!(report.collisions.is_empty());
+        assert_eq!(cache.stats.committed_diffs, 0);
+    }
+
+    #[test]
+    fn a_scan_modifies_no_worktree_index_ref_or_object() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "alpha"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "one", "beta"));
+        // Gamma merges cleanly with alpha: libgit2 writes the merged blob
+        // during an automerge, which must land in memory, not on disk.
+        f.write_commit("gamma", "src/limits.ts", &replace_line(LIMITS, "ten", "gamma"));
+        std::fs::write(f.wt("gamma").join("scratch.txt"), "wip\n").unwrap();
+        let before = f.snapshot();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 3);
+        assert_eq!(f.snapshot(), before);
+    }
+
+    #[test]
+    fn scans_are_throttled_and_cached() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let inputs = f.inputs();
+        let mut cache = CollisionCache::default();
+        let t0 = Instant::now();
+        let first = cache.scan_throttled("p", &inputs, t0, REPORT_TTL, false);
+        assert_eq!(first.collisions.len(), 1);
+        assert_eq!((cache.stats.scans, cache.stats.committed_diffs, cache.stats.merges), (1, 2, 1));
+
+        // Within the TTL the report is reused, even though a file changed.
+        std::fs::write(f.wt("alpha").join("README.md"), "alpha\n").unwrap();
+        std::fs::write(f.wt("beta").join("README.md"), "beta\n").unwrap();
+        let again = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(again, first);
+        assert_eq!(cache.stats.scans, 1);
+
+        // Past the TTL it rescans; HEADs are unchanged, so neither committed
+        // diff nor the merge confirmation runs again.
+        let later = cache.scan_throttled("p", &inputs, t0 + REPORT_TTL + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 2);
+        assert_eq!((cache.stats.committed_diffs, cache.stats.merges), (2, 1));
+        assert_eq!(later.collisions[0].files, vec!["README.md".to_string(), "src/limits.ts".to_string()]);
+
+        // A changed workspace list invalidates the report at once.
+        let fewer = cache.scan_throttled("p", &inputs[..1], t0 + REPORT_TTL + Duration::from_secs(2), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 3);
+        assert!(fewer.collisions.is_empty());
+    }
+
+    #[test]
+    fn force_and_a_new_commit_bypass_the_report_ttl() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let inputs = f.inputs();
+        let mut cache = CollisionCache::default();
+        let t0 = Instant::now();
+        cache.scan_throttled("p", &inputs, t0, REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 1);
+
+        // An uncommitted edit within the TTL: reused unless forced.
+        std::fs::write(f.wt("alpha").join("README.md"), "alpha\n").unwrap();
+        std::fs::write(f.wt("beta").join("README.md"), "beta\n").unwrap();
+        cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 1);
+        let forced = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, true);
+        assert_eq!(cache.stats.scans, 2);
+        assert_eq!(forced.collisions[0].files, vec!["README.md".to_string(), "src/limits.ts".to_string()]);
+
+        // A commit moves HEAD: the cached report is stale at once, no force needed.
+        f.write_commit("alpha", "src/plan.ts", "alpha plan\n");
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let after = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(2), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 3);
+        assert_eq!(after.collisions[0].severity, Severity::Conflict);
+    }
+
+    #[test]
+    fn a_lockfile_conflict_alone_is_low_severity() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        f.write_commit("beta", "package-lock.json", "{\"v\":1,\"b\":1}\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert!(c.confirmed, "both sides committed the lockfile, so a merge check ran");
+        assert_eq!(c.severity, Severity::Lockfile);
+        assert!(c.conflicting_files.is_empty(), "{c:?}");
+    }
+
+    #[test]
+    fn a_lockfile_conflict_plus_a_clean_overlap_is_an_overlap() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        f.write_commit("beta", "package-lock.json", "{\"v\":1,\"b\":1}\n");
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(c.conflicting_files.is_empty(), "the lockfile is not counted: {c:?}");
+        assert_eq!(c.files, vec!["package-lock.json".to_string(), "src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_large_untracked_dir_collapses_and_pair_files_are_capped() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // A big untracked dir on each side collapses to one `gen/` entry.
+        for wt in ["alpha", "beta"] {
+            let dir = f.wt(wt).join("gen");
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..=MAX_UNTRACKED_DIR_FILES {
+                std::fs::write(dir.join(format!("f{i}.txt")), wt).unwrap();
+            }
+        }
+        // A small untracked dir keeps its files.
+        let small = f.wt("alpha").join("small");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::write(small.join("one.txt"), "1").unwrap();
+        let repo = git2::Repository::open(f.wt("alpha")).unwrap();
+        let set = crate::collisions::uncommitted_paths(&repo);
+        assert!(set.contains("gen/"), "{set:?}");
+        assert!(set.contains("small/one.txt"), "{set:?}");
+        assert!(!set.iter().any(|p| p.starts_with("gen/f")), "{set:?}");
+
+        // More shared files than the IPC cap: the list stops, the rest is counted.
+        let total = MAX_PAIR_FILES + 7;
+        for wt in ["alpha", "beta"] {
+            let src = f.wt(wt).join("src");
+            for i in 0..total {
+                std::fs::write(src.join(format!("m{i:03}.ts")), wt).unwrap();
+            }
+        }
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!(c.files.len(), MAX_PAIR_FILES);
+        // `gen/` + every src/mNNN.ts
+        assert_eq!(c.files.len() + c.truncated, total + 1);
+    }
+
+    #[test]
+    fn a_collapsed_dir_overlaps_the_files_under_it_on_the_other_side() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // Alpha: more than the cap under `gen/`, so one `gen/` entry.
+        let big = f.wt("alpha").join("gen");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..=MAX_UNTRACKED_DIR_FILES {
+            std::fs::write(big.join(format!("f{i}.txt")), "a").unwrap();
+        }
+        // Beta: a few files under `gen/`, listed one by one.
+        let small = f.wt("beta").join("gen");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::write(small.join("f3.txt"), "b").unwrap();
+        std::fs::write(small.join("own.txt"), "b").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.files, vec!["gen/f3.txt".to_string(), "gen/own.txt".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+
+        let a: BTreeSet<String> = ["gen/".to_string(), "lib/".to_string()].into();
+        let b: BTreeSet<String> = ["gen/x/".to_string(), "gen".to_string(), "lib/".to_string(), "genx.ts".to_string()].into();
+        let both: Vec<String> = overlap(&a, &b).into_iter().collect();
+        assert_eq!(both, vec!["gen/x/".to_string(), "lib/".to_string()]);
+    }
+
+    #[test]
+    fn untracked_dirs_are_counted_before_they_are_listed() {
+        let f = Fixture::new(&["alpha"]);
+        let wt = f.wt("alpha");
+        // Ignored files never count toward the cap.
+        std::fs::write(wt.join(".gitignore"), "*.log\n").unwrap();
+        let mixed = wt.join("mixed");
+        std::fs::create_dir_all(mixed.join("deep")).unwrap();
+        for i in 0..MAX_UNTRACKED_DIR_FILES * 3 {
+            std::fs::write(mixed.join(format!("noise{i}.log")), "x").unwrap();
+        }
+        std::fs::write(mixed.join("deep").join("kept.ts"), "x").unwrap();
+        // A tracked edit and a top-level untracked file come from the first pass.
+        std::fs::write(wt.join("README.md"), "edited\n").unwrap();
+        std::fs::write(wt.join("loose.txt"), "x").unwrap();
+        let repo = git2::Repository::open(wt).unwrap();
+        let (set, capped) = uncommitted_paths_capped(&repo);
+        let want: BTreeSet<String> =
+            [".gitignore", "README.md", "loose.txt", "mixed/deep/kept.ts"].map(String::from).into();
+        assert_eq!(set, want);
+        assert!(!capped);
+    }
+
+    #[test]
+    fn hitting_the_uncommitted_path_cap_is_reported() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // Loose files (no directory to collapse into), one past the cap.
+        for i in 0..=MAX_UNCOMMITTED_PATHS {
+            std::fs::write(f.wt("alpha").join(format!("loose{i:05}.txt")), "a").unwrap();
+        }
+        let repo = git2::Repository::open(f.wt("alpha")).unwrap();
+        let (set, capped) = uncommitted_paths_capped(&repo);
+        assert_eq!(set.len(), MAX_UNCOMMITTED_PATHS);
+        assert!(capped);
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.uncommitted_capped);
+
+        let quiet = Fixture::new(&["alpha", "beta"]);
+        std::fs::write(quiet.wt("alpha").join("one.txt"), "a").unwrap();
+        assert!(!CollisionCache::default().scan(&quiet.inputs()).uncommitted_capped);
+    }
+
+    #[test]
+    fn past_the_pair_cap_the_scan_is_marked_capped() {
+        // 9 workspaces all committing the same file = 36 pairs > the 32 cap.
+        let names = ["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9"];
+        assert!(names.len() * (names.len() - 1) / 2 > MAX_CONFIRMED_PAIRS);
+        let f = Fixture::new(&names);
+        for (i, n) in names.iter().enumerate() {
+            let body = LIMITS.lines().enumerate()
+                .map(|(j, l)| if j == i { format!("{l}-{n}\n") } else { format!("{l}\n") })
+                .collect::<String>();
+            f.write_commit(n, "src/limits.ts", &body);
+        }
+        let mut cache = CollisionCache::default();
+        let report = cache.scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 36);
+        assert!(report.capped);
+        assert_eq!(report.collisions.iter().filter(|c| c.confirmed).count(), MAX_CONFIRMED_PAIRS);
+        assert_eq!(cache.stats.merges, MAX_CONFIRMED_PAIRS);
+    }
+
+    /// Point `refs/remotes/origin/main` at `rev` in the shared repo.
+    fn set_origin_main(f: &Fixture, rev: &str) {
+        let oid = git(&f.root, &["rev-parse", rev]);
+        git(&f.root, &["update-ref", "refs/remotes/origin/main", oid.trim()]);
+    }
+
+    #[test]
+    fn a_newer_origin_base_is_used_over_a_stale_local_one() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // origin/main moves on (touching plan.ts); local main stays behind.
+        git(&f.root, &["switch", "-q", "-c", "upstream"]);
+        std::fs::write(f.root.join("src/plan.ts"), "upstream\n").unwrap();
+        git(&f.root, &["commit", "-qam", "upstream moves"]);
+        set_origin_main(&f, "HEAD");
+        git(&f.root, &["switch", "-q", "main"]);
+        // Alpha starts from origin/main; beta from the stale local main.
+        git(f.wt("alpha"), &["reset", "-q", "--hard", "origin/main"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "upstream's plan.ts is not alpha's: {report:?}");
+    }
+
+    #[test]
+    fn a_newer_local_base_is_used_over_a_stale_origin() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // origin/main stays at the base; local main moves on (touching plan.ts).
+        set_origin_main(&f, "main");
+        std::fs::write(f.root.join("src/plan.ts"), "local\n").unwrap();
+        git(&f.root, &["commit", "-qam", "local main moves"]);
+        // Alpha starts from the newer local main; beta from the old base.
+        git(f.wt("alpha"), &["reset", "-q", "--hard", "main"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "local main's plan.ts is not alpha's: {report:?}");
+    }
+
+    #[test]
+    fn eight_live_workspaces_stay_cheap() {
+        let names = ["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8"];
+        let f = Fixture::new(&names);
+        for (i, n) in names.iter().enumerate() {
+            // Every workspace edits its own line of the shared file and a file of its own.
+            let body = LIMITS.lines().enumerate()
+                .map(|(j, l)| if j == i { format!("{l}-{n}\n") } else { format!("{l}\n") })
+                .collect::<String>();
+            f.write_commit(n, "src/limits.ts", &body);
+            f.write_commit(n, &format!("{n}.txt"), "own\n");
+        }
+        let mut cache = CollisionCache::default();
+        let started = Instant::now();
+        let report = cache.scan(&f.inputs());
+        let cold = started.elapsed();
+        assert_eq!(report.collisions.len(), 28);
+        assert!(!report.capped);
+        let started = Instant::now();
+        cache.scan(&f.inputs());
+        let warm = started.elapsed();
+        assert_eq!(cache.stats.merges, 28, "warm scan reuses every merge confirmation");
+        assert!(cold < Duration::from_secs(10), "cold scan took {cold:?}");
+        assert!(warm < Duration::from_secs(3), "warm scan took {warm:?}");
+    }
+}
+
+// ─── Secret guard (#730) ────────────────────────────────────────────────
+//
+// Every credential-shaped string here is ASSEMBLED AT RUNTIME from fragments
+// and a seeded generator, so this source file never holds anything a scanner
+// (ours, GitHub push protection) would flag.
+#[cfg(test)]
+mod secret_guard_tests {
+    use crate::secret_scan::*;
+    use std::path::Path;
+
+    /// Deterministic pseudo-random string over `alphabet`.
+    fn rnd(seed: u64, len: usize, alphabet: &str) -> String {
+        let a: Vec<char> = alphabet.chars().collect();
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                a[((x >> 33) as usize) % a.len()]
+            })
+            .collect()
+    }
+    const B62: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const B64: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const DIGITS: &str = "123456789";
+
+    fn file(path: &str, lines: &[&str]) -> AddedFile {
+        AddedFile {
+            path: path.into(),
+            is_new: true,
+            lines: lines.iter().enumerate().map(|(i, l)| (i as u32 + 1, l.to_string())).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn scan_one(path: &str, lines: &[&str]) -> Vec<SecretFinding> {
+        scan_added(&[file(path, lines)], &[])
+    }
+
+    /// (rule id, the secret itself, the line holding it)
+    fn true_positives() -> Vec<(&'static str, String, String)> {
+        let mut v = Vec::new();
+        let ant = ["sk-", "ant-", "api03-"].concat() + &rnd(1, 93, B62) + "AA";
+        v.push(("anthropic-key", ant.clone(), format!("const KEY = \"{ant}\";")));
+        let proj = ["sk-", "proj-"].concat() + &rnd(2, 64, B62);
+        v.push(("openai-key", proj.clone(), format!("OPENAI={proj}")));
+        let legacy = format!("sk-{}{}{}", rnd(3, 20, B62), ["T3Blbk", "FJ"].concat(), rnd(4, 20, B62));
+        v.push(("openai-key", legacy.clone(), format!("key: '{legacy}'")));
+        let plain48 = format!("sk-{}", rnd(5, 48, B62));
+        v.push(("openai-key", plain48.clone(), format!("let k = \"{plain48}\"")));
+        let ghp = ["gh", "p_"].concat() + &rnd(6, 36, B62);
+        v.push(("github-token", ghp.clone(), format!("token = \"{ghp}\"")));
+        let gho = ["gh", "o_"].concat() + &rnd(7, 36, B62);
+        v.push(("github-token", gho.clone(), format!("{gho}")));
+        let pat = ["github", "_pat_", "11"].concat() + &rnd(8, 20, B62) + "_" + &rnd(9, 59, B62);
+        v.push(("github-token", pat.clone(), format!("GH_TOKEN: {pat}")));
+        let stripe = ["sk", "_live_"].concat() + &rnd(10, 24, B62);
+        v.push(("stripe-key", stripe.clone(), format!("stripe.key = \"{stripe}\"")));
+        let slack = format!("{}{}-{}-{}", "xox", "b", rnd(11, 12, DIGITS), rnd(12, 24, B62));
+        v.push(("slack-token", slack.clone(), format!("SLACK={slack}")));
+        let google = ["AI", "za"].concat() + &rnd(13, 35, B62);
+        v.push(("google-api-key", google.clone(), format!("apiKey: \"{google}\",")));
+        v
+    }
+
+    #[test]
+    fn every_prefixed_rule_finds_its_true_positive() {
+        for (rule, secret, line) in true_positives() {
+            let f = scan_one("src/config.ts", &[&line]);
+            assert_eq!(f.len(), 1, "{rule}: expected one finding");
+            assert_eq!(f[0].rule, rule);
+            assert_eq!(f[0].line, Some(1));
+            assert_eq!(f[0].file, "src/config.ts");
+            assert!(!f[0].yours);
+            // A prefixed key is a leak in a fixture too.
+            assert_eq!(scan_one("tests/fixtures/a.ts", &[&line]).len(), 1, "{rule} in a test path");
+            let _ = secret;
+        }
+    }
+
+    #[test]
+    fn prefixed_lookalikes_do_not_match() {
+        let x40 = "x".repeat(44);
+        let near = vec![
+            format!("sk-ant-{x40}"),                                   // placeholder
+            format!("{}{}", ["sk-", "ant-", "api03-"].concat(), "short"), // too short
+            format!("sk-proj-your-key-here-{}", "0".repeat(30)),       // placeholder
+            format!("{}{}", ["gh", "p_"].concat(), rnd(20, 35, B62)), // 35 chars: too short
+            format!("{}{}", ["gh", "p_"].concat(), rnd(21, 37, B62)), // 37 chars: runs on
+            format!("{}{}", ["sk", "_test_"].concat(), rnd(22, 24, B62)), // a test-mode key
+            "xoxb-your-token-goes-here".to_string(),
+            format!("task-{}", rnd(23, 48, B62)),                      // no word boundary
+            format!("{}{}", ["AI", "za"].concat(), rnd(24, 30, B62)), // too short
+            format!("sk-{}", "abcdefghij".repeat(5)),                  // low randomness
+            "Bearer <your-token>".to_string(),
+        ];
+        for line in near {
+            assert!(scan_one("src/a.ts", &[&line]).is_empty(), "false positive on {line:?}");
+        }
+    }
+
+    #[test]
+    fn aws_needs_the_key_id_and_a_secret_nearby() {
+        let id = ["AK", "IA"].concat() + &rnd(30, 16, UPPER);
+        let secret = rnd(31, 40, B64);
+        let both = scan_one("deploy/creds.ini", &[
+            "[default]",
+            &format!("aws_access_key_id = {id}"),
+            &format!("aws_secret_access_key = {secret}"),
+        ]);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].rule, "aws-access-key");
+        assert_eq!(both[0].line, Some(2));
+        // Same-line CSV form.
+        let csv = scan_one("creds.csv", &[&format!("{id},{secret}")]);
+        assert_eq!(csv.len(), 1);
+        // The key id alone is not enough.
+        assert!(scan_one("a.txt", &[&format!("user = {id}")]).is_empty());
+        // AWS's own documentation example is a placeholder.
+        let doc_id = ["AK", "IA", "IOSFODNN7", "EXAMPLE"].concat();
+        let doc_secret = ["wJalrXUtnFEMI/K7MDENG/bPxRfiCY", "EXAMPLE", "KEY"].concat();
+        assert!(scan_one("README.md", &[
+            &format!("aws_access_key_id = {doc_id}"),
+            &format!("aws_secret_access_key = {doc_secret}"),
+        ]).is_empty());
+    }
+
+    #[test]
+    fn private_keys_need_key_material_under_the_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let body = rnd(40, 64, B64);
+        let f = scan_one("deploy/key.pem", &[&header, &body, "-----END RSA PRIVATE KEY-----"]);
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["pem-file", "private-key"], "a new .pem is also flagged by name");
+        let f = scan_one("deploy/key.txt", &[&header, &body, "-----END RSA PRIVATE KEY-----"]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "private-key");
+        // Inline in JSON, with an escaped newline.
+        let inline = format!("\"private_key\": \"{}\\n{}\\n\"", ["-----BEGIN ", "PRIVATE", " KEY-----"].concat(), body);
+        assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
+        // Code that only mentions the header is not a key.
+        let code = format!("if pem.starts_with(\"{}\") {{", ["-----BEGIN ", "PRIVATE", " KEY-----"].concat());
+        assert!(scan_one("src/pem.rs", &[&code, "    return true;", "}"]).is_empty());
+    }
+
+    #[test]
+    fn env_files_flag_credential_named_variables_only() {
+        let pw = rnd(41, 18, B62);
+        let f = scan_one(".env", &[
+            "LOG_LEVEL=debug",
+            "API_URL=https://api.example.org",
+            "AUTH_ENABLED=true",
+            "TOKEN=${OTHER_TOKEN}",
+            "PORT=8080",
+            &format!("DATABASE_PASSWORD=\"{pw}\""),
+        ]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "env-credential");
+        assert_eq!(f[0].line, Some(6));
+        assert!(f[0].kind.contains("DATABASE_PASSWORD"));
+        assert_eq!(scan_one("apps/web/.env.local", &[&format!("SECRET_KEY={pw}")]).len(), 1);
+        // Templates are committed on purpose.
+        assert!(scan_one(".env.example", &[&format!("SECRET_KEY={pw}")]).is_empty());
+        assert!(scan_one(".env.sample", &[&format!("SECRET_KEY={pw}")]).is_empty());
+        // A URL with credentials in it is one.
+        let url = format!("DATABASE_URL_AUTH=postgres://app:{pw}@db/app");
+        assert!(scan_one(".env", &[&url]).len() == 1 || !url.starts_with("http"));
+        let http = format!("AUTH_URL=https://user:{pw}@host/x");
+        assert_eq!(scan_one(".env", &[&http]).len(), 1);
+    }
+
+    #[test]
+    fn generic_assignment_is_entropy_gated_and_quiet_in_tests() {
+        let v = rnd(50, 32, B62);
+        let line = format!("const apiKey = \"{v}\";");
+        let f = scan_one("src/config.ts", &[&line]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "generic-secret");
+        assert!(scan_one("tests/config.test.ts", &[&line]).is_empty(), "test paths are quiet");
+        assert!(scan_one("src/__mocks__/api.ts", &[&line]).is_empty());
+        let near = [
+            "password = \"correcthorsebatterystaple\"".to_string(),   // no digits, low entropy
+            "api_key = \"your-api-key-goes-here-123\"".to_string(),
+            "auth_token = \"{{ secrets.AUTH_TOKEN_VALUE_2 }}\"".to_string(),
+            "client_secret = \"https://vault.local/secret/path/1\"".to_string(),
+        ];
+        for l in near {
+            assert!(scan_one("src/a.py", &[&l]).is_empty(), "false positive on {l:?}");
+        }
+    }
+
+    #[test]
+    fn placeholders_are_suppressed() {
+        for p in ["xxxxxxxxxxxxxxxxxxxx", "your-key-here", "<token>", "AKIAIOSFODNN7EXAMPLE", "REDACTED", "aaaaaaaaaaaaaaaaaa", "changeme"] {
+            assert!(is_placeholder(p), "{p}");
+        }
+        assert!(!is_placeholder(&rnd(60, 40, B62)));
+    }
+
+    #[test]
+    fn the_canary_names_your_own_configured_key() {
+        let mine = format!("zq{}", rnd(70, 30, B62)); // matches no pattern
+        let mut settings = crate::settings::AppSettings::default();
+        settings.provider_keys.insert("anthropic".into(), mine.clone());
+        settings.provider_keys.insert("short".into(), "tooshort".into());
+        let known = known_secrets_from(&settings);
+        assert_eq!(known.len(), 1, "a too-short credential is never matched");
+        assert!(!format!("{known:?}").contains(&mine), "Debug redacts the value");
+        let f = scan_added(&[file("scripts/seed.js", &["// setup", &format!("client({mine})")])], &known);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "your-credential");
+        assert_eq!(f[0].kind, "your Anthropic API key");
+        assert!(f[0].yours);
+        assert_eq!(f[0].line, Some(2));
+        // The canary wins over a pattern on the same line.
+        let (_, ant, line) = true_positives().remove(0);
+        let known = vec![KnownSecret::new("your Anthropic API key", ant)];
+        let f = scan_added(&[file("a.ts", &[&line])], &known);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].yours);
+    }
+
+    #[test]
+    fn a_newly_added_ssh_key_file_is_flagged_by_name() {
+        let f = scan_added(&[AddedFile { path: "deploy/id_rsa".into(), is_new: true, ..Default::default() }], &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "ssh-private-key-file");
+        assert_eq!(f[0].line, None);
+        assert!(scan_added(&[AddedFile { path: "deploy/id_rsa.pub".into(), is_new: true, ..Default::default() }], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_newly_added_pem_or_claude_local_settings_file_is_flagged_by_name() {
+        let new = |p: &str, lines: Vec<(u32, String)>| AddedFile { path: p.into(), is_new: true, lines, ..Default::default() };
+        for (path, rule) in [
+            ("certs/server.pem", "pem-file"),
+            ("deploy/CA.PEM", "pem-file"),
+            (".claude/settings.local.json", "claude-local-settings"),
+            ("apps/web/.claude/settings.local.json", "claude-local-settings"),
+        ] {
+            // Whatever it holds, even nothing.
+            for lines in [vec![], vec![(1, "{}".to_string())]] {
+                let f = scan_added(&[new(path, lines)], &[]);
+                assert_eq!(f.len(), 1, "{path}: {f:?}");
+                assert_eq!(f[0].rule, rule);
+                assert_eq!(f[0].line, None);
+                assert_eq!(f[0].location(), path);
+            }
+        }
+        // Only a newly added file: an edit to one already tracked is not.
+        let edited = AddedFile { path: "certs/server.pem".into(), is_new: false, lines: vec![(3, "x".into())], ..Default::default() };
+        assert!(scan_added(&[edited], &[]).is_empty());
+        for path in ["certs/server.pem.example", "docs/pem.md", ".claude/settings.json", "settings.local.json", ".claude/settings.local.json.bak"] {
+            assert!(scan_added(&[new(path, vec![])], &[]).is_empty(), "false positive on {path}");
+        }
+    }
+
+    #[test]
+    fn a_newly_added_key_or_keystore_file_is_flagged_by_name() {
+        let new = |p: &str| AddedFile { path: p.into(), is_new: true, ..Default::default() };
+        for (path, rule, kind) in [
+            ("certs/server.p12", "keystore-file", "certificate or keystore file"),
+            ("certs/client.PFX", "keystore-file", "certificate or keystore file"),
+            ("android/release.jks", "keystore-file", "certificate or keystore file"),
+            ("tls/server.key", "key-file", "private key file"),
+        ] {
+            let f = scan_added(&[new(path)], &[]);
+            assert_eq!(f.len(), 1, "{path}: {f:?}");
+            assert_eq!((f[0].rule.as_str(), f[0].kind.as_str(), f[0].line), (rule, kind, None));
+            assert_eq!(f[0].preview, None);
+            // An edit to one already tracked is not.
+            let edited = AddedFile { is_new: false, lines: vec![(3, "x".into())], ..new(path) };
+            assert!(scan_added(&[edited], &[]).is_empty(), "{path}");
+        }
+        // A zip `.key` is a Keynote document; a zip keystore still counts.
+        assert!(scan_added(&[AddedFile { zip: true, ..new("slides/Pitch.key") }], &[]).is_empty());
+        assert_eq!(scan_added(&[AddedFile { zip: true, ..new("certs/a.p12") }], &[]).len(), 1);
+        for path in ["src/key.ts", "docs/p12.md", "certs/server.key.example", "a.keystore.md", "monkey"] {
+            assert!(scan_added(&[new(path)], &[]).is_empty(), "false positive on {path}");
+        }
+    }
+
+    #[test]
+    fn a_keynote_document_stays_quiet_but_a_key_file_asks() {
+        let (dir, git) = repo();
+        std::fs::write(dir.path().join("Pitch.key"), b"PK\x03\x04\x14\x00\x00\x00index.apxl").unwrap();
+        std::fs::write(dir.path().join("server.key"), "-----BEGIN PRIVATE KEY-----\n").unwrap();
+        std::fs::write(dir.path().join("tiny.key"), "PK").unwrap();
+        // Untracked (read from the worktree), then staged (read from the blob).
+        let rules = |c: &Collected| {
+            let mut v: Vec<String> = scan_added(c, &[]).iter().filter(|f| f.rule == "key-file").map(|f| f.file.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(rules(&worktree_files(dir.path(), Some("main")).unwrap()), ["server.key", "tiny.key"]);
+        for name in ["Pitch.key", "server.key", "tiny.key"] {
+            stage(&git, name);
+        }
+        assert_eq!(rules(&staged_files(dir.path()).unwrap()), ["server.key", "tiny.key"]);
+    }
+
+    #[test]
+    fn a_large_keynote_blob_is_read_four_bytes_at_a_time() {
+        let (dir, git) = repo();
+        let mut keynote = b"PK\x03\x04".to_vec();
+        keynote.resize(4096, b'x');
+        // Names that differ by more than case: macOS's file system ignores it.
+        std::fs::write(dir.path().join("Deck.key"), &keynote).unwrap();
+        std::fs::write(dir.path().join("server.key"), vec![b'-'; 4096]).unwrap();
+        stage(&git, "Deck.key");
+        stage(&git, "server.key");
+        let id = |rel: &str| git.index().unwrap().get_path(Path::new(rel), 0).unwrap().id;
+        // Past the limit the blob is streamed, so the worktree isn't needed.
+        std::fs::remove_file(dir.path().join("Deck.key")).unwrap();
+        assert!(starts_like_zip_within(&git, "Deck.key", id("Deck.key"), 16));
+        assert!(!starts_like_zip_within(&git, "server.key", id("server.key"), 16));
+        // Under the limit the blob is read whole, with the same answer.
+        assert!(starts_like_zip_within(&git, "Deck.key", id("Deck.key"), 1 << 20));
+        assert!(!starts_like_zip_within(&git, "server.key", id("server.key"), 1 << 20));
+        // No blob in git: the worktree file's first bytes.
+        std::fs::write(dir.path().join("New.key"), &keynote).unwrap();
+        assert!(starts_like_zip_within(&git, "New.key", git2::Oid::zero(), 16));
+    }
+
+    #[test]
+    fn a_keynote_at_the_path_of_an_earlier_key_in_the_range_still_asks() {
+        let (dir, git) = repo();
+        let head = git.head().unwrap().peel_to_commit().unwrap();
+        git.branch("feature", &head, false).unwrap();
+        git.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("x.key"), "not a zip\n").unwrap();
+        commit_all(&git, "add a key");
+        std::fs::remove_file(dir.path().join("x.key")).unwrap();
+        {
+            let mut idx = git.index().unwrap();
+            idx.remove_path(Path::new("x.key")).unwrap();
+            idx.write().unwrap();
+        }
+        commit_all(&git, "take it out");
+        std::fs::write(dir.path().join("x.key"), b"PK\x03\x04index.apxl").unwrap();
+        commit_all(&git, "add a deck");
+        let f = scan_added(&branch_files(dir.path(), "main").unwrap(), &[]);
+        assert!(f.iter().any(|f| f.rule == "key-file" && f.file == "x.key"), "{f:?}");
+    }
+
+    #[test]
+    fn mcp_configs_flag_credential_named_env_values() {
+        let pw = rnd(300, 24, B62);
+        let lines: Vec<String> = vec![
+            "{".into(),
+            "  \"mcpServers\": {".into(),
+            "    \"db\": {".into(),
+            "      \"command\": \"npx\",".into(),
+            "      \"args\": [\"-y\", \"@acme/db-mcp\"],".into(),
+            "      \"env\": {".into(),
+            "        \"LOG_LEVEL\": \"debug\",".into(),
+            "        \"API_URL\": \"https://api.example.org\",".into(),
+            "        \"AUTH_ENABLED\": \"true\",".into(),
+            "        \"GITHUB_TOKEN\": \"${GITHUB_TOKEN}\",".into(),
+            "        \"OTHER_KEY\": \"$OTHER_KEY\",".into(),
+            "        \"API_KEY\": \"your-api-key-here\",".into(),
+            format!("        \"DB_PASSWORD\": \"{pw}\""),
+            "      }".into(),
+            "    }".into(),
+            "  }".into(),
+            "}".into(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let f = scan_one(".mcp.json", &refs);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "mcp-env-credential");
+        assert_eq!(f[0].line, Some(13));
+        assert!(f[0].kind.contains("DB_PASSWORD"));
+        assert!(!f[0].kind.contains(&pw));
+        // Cursor's config, nested projects and a one-line config.
+        let inline = format!("{{\"mcpServers\":{{\"s\":{{\"env\":{{\"STRIPE_SECRET\":\"{pw}\"}}}}}}}}");
+        for path in [
+            ".cursor/mcp.json",
+            "packages/api/.mcp.json",
+            "packages/api/.cursor/mcp.json",
+            ".claude/mcp.json",
+            "apps/web/.claude/mcp.json",
+            ".vscode/mcp.json",
+            "apps/web/.vscode/mcp.json",
+        ] {
+            let f = scan_one(path, &[&inline]);
+            assert_eq!(f.iter().filter(|f| f.rule == "mcp-env-credential").count(), 1, "{path}: {f:?}");
+        }
+        // A provider token in the env block is listed once, as what it is.
+        let ghp = ["gh", "p_"].concat() + &rnd(301, 36, B62);
+        let f = scan_one(".mcp.json", &[&format!("\"GITHUB_PERSONAL_ACCESS_TOKEN\": \"{ghp}\"")]);
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["github-token"]);
+        // VS Code's `servers` shape: a real value asks, `${VAR}` and an
+        // `${input:…}` reference don't.
+        let vscode = |v: &str| format!("{{\"servers\":{{\"gh\":{{\"type\":\"stdio\",\"env\":{{\"GITHUB_TOKEN\":\"{v}\"}}}}}}}}");
+        let f = scan_one(".vscode/mcp.json", &[&vscode(&pw)]);
+        assert_eq!(f.iter().filter(|f| f.rule == "mcp-env-credential").count(), 1, "{f:?}");
+        for v in ["${GITHUB_TOKEN}", "${env:GITHUB_TOKEN}", "${input:github-token}"] {
+            assert!(scan_one(".vscode/mcp.json", &[&vscode(v)]).is_empty(), "{v}");
+        }
+        // Not an MCP config: the rule stays out.
+        for path in ["config/mcp.json", ".mcp.json.example", "docs/.mcp.json.md", ".vscode/settings.json", ".claude/mcp.json.bak"] {
+            let f = scan_one(path, &[&inline]);
+            assert!(f.iter().all(|f| f.rule != "mcp-env-credential"), "{path}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn a_hex_secret_assigned_to_a_credential_name_is_flagged() {
+        // A random-looking hex value: not a placeholder by the existing
+        // filter, and above 3 bits/char.
+        let hex = |seed: u64, len: usize| {
+            (seed..).map(|s| rnd(s, len, HEX)).find(|v| !is_placeholder(v) && shannon_entropy(v) > 3.0).unwrap()
+        };
+        let (h32, h40, h64) = (hex(310, 32), hex(320, 40), hex(330, 64));
+        for (path, line) in [
+            ("src/a.py", format!("secret = \"{h40}\"")),
+            ("src/config.ts", format!("const API_KEY = '{h32}';")),
+            ("config/app.json", format!("\"client_secret\": \"{h64}\",")),
+            ("src/a.rb", format!("auth_token: \"{}\"", h40.to_ascii_uppercase())),
+        ] {
+            let f = scan_one(path, &[&line]);
+            assert_eq!(f.len(), 1, "{line}: {f:?}");
+            assert_eq!(f[0].rule, "generic-secret");
+        }
+        let near = [
+            ("src/a.py", format!("secret = \"{}\"", &h32[..31])),                // 31: too short
+            ("tests/a.py", format!("secret = \"{h40}\"")),                        // test path
+            ("src/a_test.go", format!("secret := \"{h40}\"")),
+            ("src/a.py", format!("password_hash = \"{h64}\"")),                   // a digest
+            ("src/a.py", format!("secret_sha256: \"{h64}\"")),
+            ("src/a.py", format!("commit = \"{h40}\"")),                          // not a credential name
+            ("src/a.py", format!("api_key = \"{}\"", "0123456789abcdef".repeat(2))), // placeholder
+            ("src/a.py", format!("secret = \"{}\"", "deadbeef".repeat(4))),       // few distinct chars
+            ("src/a.py", format!("secret = \"{}\"", "1".repeat(40))),             // no letters
+        ];
+        for (path, line) in near {
+            assert!(scan_one(path, &[&line]).is_empty(), "false positive on {line:?} in {path}");
+        }
+    }
+
+    /// The secret never reaches a finding's Debug/Serialize output, the
+    /// error's Display or its IPC form, the summary, the journal notice, the
+    /// persisted hold or its fingerprint.
+    #[test]
+    fn no_secret_value_appears_in_any_output() {
+        let mut lines = Vec::new();
+        let mut secrets = Vec::new();
+        for (_, secret, line) in true_positives() {
+            secrets.push(secret);
+            lines.push(line);
+        }
+        let mine = format!("zq{}", rnd(80, 30, B62));
+        lines.push(format!("x = {mine}"));
+        secrets.push(mine.clone());
+        let known = vec![KnownSecret::new("your OpenAI API key", mine)];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let findings = scan_added(&[file("src/leak.ts", &refs)], &known);
+        assert_eq!(findings.len(), secrets.len());
+
+        let report = scan_report(&[file("src/leak.ts", &refs)], &known, false);
+        let err = crate::error::AppError::SecretsFound {
+            findings: findings.clone(), total: report.total, partial: false, fingerprint: report.fingerprint.clone(),
+        };
+        let hold = SecretHold::from_report(report);
+        let outputs = [
+            format!("{findings:?}"),
+            serde_json::to_string(&findings).unwrap(),
+            err.to_string(),
+            format!("{err:?}"),
+            serde_json::to_string(&err).unwrap(),
+            refusal_summary(&findings, findings.len(), true),
+            hold_notice("the pull request", &hold),
+            serde_json::to_string(&hold).unwrap(),
+            format!("{known:?}"),
+        ];
+        for out in &outputs {
+            for s in &secrets {
+                assert!(!out.contains(s.as_str()), "a secret leaked into {out}");
+                // Not even a recognisable tail of it.
+                assert!(!out.contains(&s[s.len() - 8..]), "a secret's tail leaked into {out}");
+            }
+        }
+        let ipc: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(ipc["kind"], "SecretsFound");
+        assert_eq!(ipc["findings"][0]["file"], "src/leak.ts");
+        assert_eq!(ipc["findings"][0]["line"], 1);
+        assert_eq!(ipc["total"], secrets.len());
+        assert_eq!(ipc["partial"], false);
+        assert_eq!(ipc["fingerprint"].as_str().unwrap().len(), 64);
+
+        // The dialog gets a masked preview of each (#820); the summary, the
+        // journal notice and the persisted hold never carry one.
+        assert!(findings.iter().all(|f| f.preview.is_some()), "{findings:?}");
+        assert!(ipc["findings"][0]["preview"].as_str().unwrap().contains('…'));
+        let tails: Vec<String> = findings.iter().filter_map(|f| f.preview.clone()).collect();
+        let quiet = [
+            err.to_string(),
+            refusal_summary(&findings, findings.len(), true),
+            hold_notice("the pull request", &hold),
+            serde_json::to_string(&hold).unwrap(),
+        ];
+        for out in &quiet {
+            for t in &tails {
+                assert!(!out.contains(t.as_str()), "a preview leaked into {out}");
+            }
+            assert!(!out.contains("preview"), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_masked_preview_keeps_the_public_prefix_and_the_last_four() {
+        let ant = ["sk-", "ant-", "api03-"].concat() + &rnd(1, 93, B62) + "9fQ2";
+        assert_eq!(masked_preview(&ant).as_deref(), Some("sk-ant-…9fQ2"));
+        let ghp = ["gh", "p_"].concat() + &rnd(6, 32, B62) + "WXYZ";
+        assert_eq!(masked_preview(&ghp).as_deref(), Some("ghp_…WXYZ"));
+        assert_eq!(masked_preview("AKIAABCDEFGHIJKL1234").as_deref(), Some("AKIA…1234"));
+        // A separator inside the random part is never kept as "prefix".
+        let glpat = format!("glpat-Ab_{}", rnd(2, 24, B62));
+        assert!(masked_preview(&glpat).unwrap().starts_with("glpat-…"));
+        // A generic value gets the tail alone; a short one gets nothing.
+        assert_eq!(masked_preview("q8Zr2kLm0pXv7NcT4bYw").as_deref(), Some("…4bYw"));
+        assert_eq!(masked_preview("short-pass-123"), None);
+        assert_eq!(masked_preview("sk-ant-1234567890"), None);
+
+        // Per rule: the token's preview, the AWS key id (never its secret),
+        // and none for a private key or a file found by name.
+        let f = scan_one("src/config.ts", &[&true_positives()[0].2]);
+        assert_eq!(f[0].preview.as_deref(), Some(masked_preview(&true_positives()[0].1).unwrap().as_str()));
+        assert!(f[0].preview.as_deref().unwrap().starts_with("sk-ant-…"));
+        let secret = rnd(40, 40, B64);
+        let aws = scan_one("src/aws.ts", &[&format!("id = AKIA{}", rnd(41, 16, UPPER)), &format!("aws_secret_access_key = {secret}")]);
+        let p = aws.iter().find(|f| f.rule == "aws-access-key").and_then(|f| f.preview.clone()).expect("aws preview");
+        assert!(p.starts_with("AKIA…"), "{p}");
+        assert!(!p.contains(&secret[secret.len() - 4..]), "{p}");
+        let new_pem = AddedFile { path: "deploy/key.pem".into(), is_new: true, ..Default::default() };
+        assert_eq!(scan_added(&[new_pem], &[])[0].preview, None);
+
+        // A value no provider rule matched keeps none of its start, even one
+        // that happens to begin like a provider prefix: the tail alone.
+        assert_eq!(masked_tail("sk-mypassword2024tR7q").as_deref(), Some("…tR7q"));
+        assert_eq!(masked_tail("short-pass-123"), None);
+        let preview_of = |f: &[SecretFinding], rule: &str| {
+            f.iter().find(|f| f.rule == rule).and_then(|f| f.preview.clone()).unwrap_or_else(|| panic!("{rule}: {f:?}"))
+        };
+        let env = scan_one(".env", &["PASSWORD=sk-mypassword2024tR7q"]);
+        assert_eq!(preview_of(&env, "env-credential"), "…tR7q");
+        let mcp = scan_one(".mcp.json", &[r#""API_KEY": "AKIAmcpvalue9Zr2kLm0pXv7Nq""#]);
+        assert_eq!(preview_of(&mcp, "mcp-env-credential"), "…v7Nq");
+        let generic = scan_one("src/app.ts", &[r#"const secret = "sk-q8Zr2kLm0pXv7NcT4bYw";"#]);
+        assert_eq!(preview_of(&generic, "generic-secret"), "…4bYw");
+        let mine = format!("sk-ant-{}", rnd(81, 30, B62));
+        let known = vec![KnownSecret::new("your Anthropic API key", mine.clone())];
+        let yours = scan_added(&[file("src/app.ts", &[&format!("k = {mine}")])], &known);
+        assert_eq!(preview_of(&yours, "your-credential"), format!("…{}", &mine[mine.len() - 4..]));
+    }
+
+    /// "Scan this branch's commits" (#820): every commit since the base,
+    /// including a key added and removed again, read-only, guard on or off.
+    #[tokio::test]
+    async fn the_branch_scan_reads_every_commit_since_the_base() {
+        let (dir, repo) = repo();
+        let (_, secret, line) = true_positives().remove(5);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add a key");
+        std::fs::write(dir.path().join("cfg.ts"), "const token = process.env.TOKEN;\n").unwrap();
+        let tip = commit_all(&repo, "take it out again");
+        let path = dir.path().to_string_lossy().to_string();
+
+        for guard in [true, false] {
+            let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": guard }));
+            let p = crate::commands::secret_scan_branch(path.clone(), "main".into()).await.unwrap();
+            assert_eq!(p.total, 1, "{p:?}");
+            assert_eq!(p.findings[0].location(), "cfg.ts:1");
+            assert!(p.findings[0].preview.as_deref().unwrap().starts_with("gho_…"));
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(!json.contains(&secret) && !json.contains("fingerprint"), "{json}");
+        }
+        // Read-only: the branch is where it was.
+        assert_eq!(repo.head().unwrap().target(), Some(tip));
+
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        // Nothing since the base: nothing to find.
+        repo.set_head("refs/heads/main").unwrap();
+        let clean = crate::commands::secret_scan_branch(path.clone(), "main".into()).await.unwrap();
+        assert_eq!((clean.total, clean.partial), (0, false));
+        // A base that doesn't resolve is an error, not a clean bill.
+        assert!(crate::commands::secret_scan_branch(path, "no-such-branch".into()).await.is_err());
+    }
+
+    /// Past the push/PR scans' 200-commit cap the branch scan still reads
+    /// each commit on its own: a key added and removed again early in a long
+    /// branch is found, where a net diff would see nothing.
+    #[test]
+    fn the_branch_scan_reads_every_commit_past_two_hundred() {
+        let (dir, repo) = repo();
+        let (_, _, line) = true_positives().remove(5);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add a key");
+        std::fs::write(dir.path().join("cfg.ts"), "const token = process.env.TOKEN;\n").unwrap();
+        commit_all(&repo, "take it out again");
+        for i in 0..210 {
+            std::fs::write(dir.path().join("log.txt"), format!("{i}\n")).unwrap();
+            commit_all(&repo, "more");
+        }
+
+        let c = branch_files(dir.path(), "main").unwrap();
+        assert!(!c.partial);
+        let report = scan_collected(&c, &[]);
+        assert_eq!(report.total, 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].location(), "cfg.ts:1");
+    }
+
+    #[test]
+    fn summary_and_notice_read_kind_file_and_line() {
+        let f = scan_one("tests/fixtures.ts", &["", "", "", "", "", "", "", "", "", "", "", &true_positives()[0].2]);
+        assert_eq!(refusal_summary(&f, 1, false), "Anthropic API key in tests/fixtures.ts:12");
+        let tp = true_positives().remove(0).2;
+        let lines = ["", "", "", "", "", "", "", "", "", "", "", tp.as_str()];
+        let hold = SecretHold::from_report(scan_report(&[file("tests/fixtures.ts", &lines)], &[], false));
+        assert_eq!(
+            hold_notice("the pull request", &hold),
+            "Held before the pull request: possible secret · Anthropic API key in tests/fixtures.ts:12"
+        );
+        let partial = SecretHold::from_report(scan_report(&[], &[], true));
+        assert_eq!(
+            hold_notice("the push", &partial),
+            "Held before the push: secret scan incomplete · scanned the first 16 MB; the rest wasn't checked"
+        );
+        assert_eq!(
+            hold_notice("the push", &SecretHold::unreadable()),
+            "Held before the push: the secret guard couldn't read the worktree's changes, so nothing was checked"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_every_finding_the_value_and_partial_not_order() {
+        let tps = true_positives();
+        let a = file("a.ts", &[tps[0].2.as_str()]);
+        let b = file("b.ts", &[tps[1].2.as_str()]);
+        let fp = |files: &[AddedFile], partial: bool| scan_report(files, &[], partial).fingerprint;
+        assert_eq!(fp(&[a.clone(), b.clone()], false), fp(&[b.clone(), a.clone()], false));
+        assert_ne!(fp(&[a.clone()], false), fp(&[a.clone(), b.clone()], false));
+        assert_ne!(fp(&[a.clone()], false), fp(&[a.clone()], true), "a partial scan is a different question");
+        // Same file, line and rule, a different value: a different fingerprint.
+        let other = ["sk-", "ant-", "api03-"].concat() + &rnd(99, 93, B62) + "AA";
+        let a2 = file("a.ts", &[&format!("const KEY = \"{other}\";")]);
+        assert_eq!(scan_added(&[a2.clone()], &[])[0].rule, "anthropic-key");
+        assert_ne!(fp(&[a.clone()], false), fp(&[a2], false));
+        // Past the display cap: the 51st finding still changes it.
+        let many: Vec<String> = (0..MAX_FINDINGS + 1)
+            .map(|i| format!("k = \"{}\"", ["gh", "p_"].concat() + &rnd(1000 + i as u64, 36, B62)))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let full = scan_report(&[file("m.ts", &refs)], &[], false);
+        assert_eq!(full.findings.len(), MAX_FINDINGS);
+        assert_eq!(full.total, MAX_FINDINGS + 1);
+        let capped = scan_report(&[file("m.ts", &refs[..MAX_FINDINGS])], &[], false);
+        assert_eq!(capped.findings, full.findings, "the shown list is identical");
+        assert_ne!(capped.fingerprint, full.fingerprint, "but the fingerprint is not");
+        // The fingerprint holds no part of any value.
+        for (_, secret, _) in tps {
+            assert!(!full.fingerprint.contains(&secret[secret.len() - 8..]));
+        }
+    }
+
+    // ── git-level collection ────────────────────────────────────────────
+
+    fn sig() -> git2::Signature<'static> {
+        git2::Signature::now("Test", "test@example.invalid").unwrap()
+    }
+
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig(), &sig(), msg, &tree, &parents).unwrap()
+    }
+
+    fn stage(repo: &git2::Repository, rel: &str) {
+        let mut idx = repo.index().unwrap();
+        idx.add_path(Path::new(rel)).unwrap();
+        idx.write().unwrap();
+    }
+
+    /// A repo with one clean commit on `main`.
+    fn repo() -> (tempfile::TempDir, git2::Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        commit_all(&repo, "init");
+        {
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("main", &head, true).unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        (dir, repo)
+    }
+
+    /// Point `settings.json` at a temp file for this thread.
+    struct SettingsGuard(tempfile::TempDir);
+    impl SettingsGuard {
+        fn new(json: serde_json::Value) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("settings.json");
+            std::fs::write(&p, json.to_string()).unwrap();
+            crate::settings::test_settings_path::set(Some(p));
+            SettingsGuard(dir)
+        }
+    }
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            crate::settings::test_settings_path::set(None);
+        }
+    }
+
+    #[test]
+    fn staged_scan_sees_only_what_is_staged() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(0).2;
+        std::fs::write(dir.path().join("staged.ts"), format!("a\n{line}\n")).unwrap();
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        stage(&repo, "staged.ts");
+        let f = scan_added(&staged_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].location(), "staged.ts:2");
+    }
+
+    #[test]
+    fn push_and_pr_scans_cover_every_commit_on_the_branch() {
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("leak.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add");
+        // Removed in the next commit: still in the history being pushed.
+        std::fs::write(dir.path().join("leak.ts"), "clean\n").unwrap();
+        commit_all(&repo, "remove");
+        let pr = scan_added(&pr_files(dir.path(), "main").unwrap(), &[]);
+        assert_eq!(pr.len(), 1, "{pr:?}");
+        assert_eq!(pr[0].rule, "openai-key");
+        // No remote: a first push sends the whole history.
+        let push = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(push.len(), 1);
+        // Main itself is clean against main.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force())).unwrap();
+        assert!(scan_added(&pr_files(dir.path(), "main").unwrap(), &[]).is_empty());
+    }
+
+    #[test]
+    fn worktree_scan_includes_untracked_files_and_skips_ignored_ones() {
+        let (dir, _repo) = repo();
+        let line = true_positives().remove(4).2;
+        std::fs::write(dir.path().join(".gitignore"), "ignored.ts\n").unwrap();
+        std::fs::write(dir.path().join("ignored.ts"), format!("{line}\n")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests/fixtures")).unwrap();
+        std::fs::write(dir.path().join("tests/fixtures/data.ts"), format!("x\n{line}\n")).unwrap();
+        let f = scan_added(&worktree_files(dir.path(), Some("main")).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].location(), "tests/fixtures/data.ts:2");
+    }
+
+    // ── Talk's shell (#819) ─────────────────────────────────────────────
+
+    #[test]
+    fn shell_plan_reads_commits_pushes_and_prs_per_segment() {
+        let plan = |c: &str| shell_plan(c);
+        assert_eq!(plan("git status"), None);
+        assert_eq!(plan("npm test && git log --oneline"), None);
+        assert_eq!(plan("echo commit push"), None);
+        assert_eq!(plan("gh pr view 3"), None);
+        assert_eq!(plan("git commit -m 'fix'"), Some(ShellPlan { commit: Some(false), ..Default::default() }));
+        assert_eq!(plan("git -C sub commit --amend --no-edit").unwrap().commit, Some(false));
+        // Staging in the same command (or `-a`) covers every uncommitted change.
+        for c in ["git add -A && git commit -m x", "git commit -am x", "git commit --all -m x", "git stage . ; git commit"] {
+            let p = plan(c).unwrap();
+            assert_eq!(p.commit, Some(true), "{c}");
+            assert!(p.covers_uncommitted(), "{c}");
+        }
+        assert_eq!(plan("git add -A").unwrap_or_default().commit, None, "staging alone sends nothing");
+        let p = plan("git add -A && git commit -m x && /usr/bin/git push -u origin HEAD").unwrap();
+        assert_eq!((p.commit, p.push), (Some(true), true));
+        assert_eq!(plan("gh pr create --fill").unwrap().pr, Some(None));
+        assert_eq!(plan("gh pr create --base develop --fill").unwrap().pr, Some(Some("develop".into())));
+        assert_eq!(plan("gh pr create -B Release/2.0").unwrap().pr, Some(Some("Release/2.0".into())));
+        assert_eq!(plan("gh pr create --base=main").unwrap().pr, Some(Some("main".into())));
+        assert_eq!(plan("digit commit"), None, "only git itself");
+    }
+
+    #[test]
+    fn shell_files_scan_what_the_command_would_send() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(0).2;
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        let commit = ShellPlan { commit: Some(false), ..Default::default() };
+        let staging = ShellPlan { commit: Some(true), ..Default::default() };
+        // A plain commit records only the index: nothing staged, nothing found.
+        assert!(scan_added(&shell_files(dir.path(), &commit).unwrap(), &[]).is_empty());
+        // `git add -A && git commit` would record the untracked file.
+        let f = scan_added(&shell_files(dir.path(), &staging).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].location(), "unstaged.ts:1");
+        // Committed: a push sends it, and so does a PR with no --base given.
+        commit_all(&repo, "leak");
+        let push = ShellPlan { push: true, ..Default::default() };
+        assert_eq!(scan_added(&shell_files(dir.path(), &push).unwrap(), &[]).len(), 1);
+        let c = shell_files(dir.path(), &ShellPlan { commit: Some(false), push: true, ..Default::default() }).unwrap();
+        assert_eq!(c.scope, "shell");
+        assert_eq!(scan_added(&c, &[]).len(), 1, "the push's finding; nothing is staged");
+    }
+
+    #[tokio::test]
+    async fn guard_scans_a_shell_command_only_when_the_setting_is_on() {
+        let (dir, _repo) = repo();
+        std::fs::write(dir.path().join("a.ts"), format!("{}\n", true_positives().remove(0).2)).unwrap();
+        let plan = shell_plan("git add -A && git commit -m x").unwrap();
+        let p = dir.path().to_path_buf();
+        let collect = move || shell_files(&p, &plan);
+        {
+            let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+            assert!(guarded_scan(collect.clone()).await.is_none(), "setting off: today's behaviour");
+        }
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        let report = guarded_scan(collect.clone()).await.unwrap();
+        assert!(report.needs_confirmation());
+        let fp = report.fingerprint.clone();
+        assert!(matches!(guard(None, collect.clone()).await, Err(crate::error::AppError::SecretsFound { .. })));
+        assert!(guard(Some(fp), collect).await.is_ok(), "the confirm's fingerprint lets this run through");
+    }
+
+    /// Scanning a 5,000-line staged diff stays far below a click's latency.
+    #[test]
+    fn a_5k_line_diff_scans_fast() {
+        let (dir, repo) = repo();
+        let mut body = String::new();
+        for i in 0..5000 {
+            body.push_str(&format!(
+                "export const value{i} = computeToken(\"key-{i}\", {{ secret: process.env.SECRET_{i}, password: input }});\n"
+            ));
+        }
+        std::fs::write(dir.path().join("big.ts"), &body).unwrap();
+        stage(&repo, "big.ts");
+        let start = std::time::Instant::now();
+        let files = staged_files(dir.path()).unwrap();
+        let f = scan_added(&files, &[]);
+        let took = start.elapsed();
+        assert_eq!(files[0].lines.len(), 5000);
+        assert!(f.is_empty(), "{f:?}");
+        assert!(took < std::time::Duration::from_millis(1500), "took {took:?}");
+    }
+
+    // ── block points: commit, amend, push, pull request ────────────────
+
+    #[tokio::test]
+    async fn commit_amend_push_and_pr_refuse_a_change_with_a_secret() {
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        let (dir, repo) = repo();
+        let (_, secret, line) = true_positives().remove(5);
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        stage(&repo, "cfg.ts");
+        let path = dir.path().to_string_lossy().to_string();
+
+        let commit = crate::commands::commit_changes(path.clone(), "msg".into(), None).await;
+        let amend = crate::commands::amend_commit(path.clone(), "msg".into(), Some("stale".into())).await;
+        for r in [commit, amend] {
+            match r {
+                Err(crate::error::AppError::SecretsFound { findings, .. }) => {
+                    assert_eq!(findings[0].location(), "cfg.ts:1");
+                }
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            }
+        }
+        // Nothing was committed.
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap(), Some("init"));
+
+        commit_all(&repo, "leak");
+        let push = crate::commands::push_branch(path.clone(), None).await;
+        let e = push.expect_err("push refused");
+        assert!(matches!(e, crate::error::AppError::SecretsFound { .. }));
+        assert!(!e.to_string().contains(&secret));
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        // `main` must not contain the leak for a PR from feature: rewind it.
+        let init = head.parent(0).unwrap();
+        repo.branch("main", &init, true).unwrap();
+        let pr = crate::commands::create_pull_request(path, "main".into(), "t".into(), "b".into(), false, None).await;
+        assert!(matches!(pr, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    /// The Review Companion's preview of the staged diff: the findings, no
+    /// fingerprint (it can't stand in for the confirm), nothing when off.
+    #[tokio::test]
+    async fn the_staged_preview_lists_findings_without_a_fingerprint() {
+        let (dir, repo) = repo();
+        let (_, secret, line) = true_positives().remove(5);
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        {
+            let _s = SettingsGuard::new(serde_json::json!({}));
+            let clean = crate::commands::secret_scan_staged(path.clone()).await.unwrap().expect("guard on");
+            assert_eq!(clean.total, 0, "nothing staged yet: {clean:?}");
+            stage(&repo, "cfg.ts");
+            let p = crate::commands::secret_scan_staged(path.clone()).await.unwrap().expect("guard on");
+            assert_eq!(p.total, 1, "{p:?}");
+            assert!(!p.partial);
+            assert_eq!(p.findings[0].location(), "cfg.ts:1");
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(!json.contains("fingerprint"), "{json}");
+            assert!(!json.contains(&secret));
+            // A preview commits nothing.
+            assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap(), Some("init"));
+        }
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        assert!(crate::commands::secret_scan_staged(path).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn confirming_or_turning_the_guard_off_restores_todays_path() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(5).2;
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "leak");
+        let path = dir.path().to_string_lossy().to_string();
+        // Explicit confirm for this one push, bound to what the dialog showed:
+        // the guard steps aside and git runs (and fails here only because
+        // there is no remote).
+        {
+            let _s = SettingsGuard::new(serde_json::json!({}));
+            let shown = match crate::commands::push_branch(path.clone(), None).await {
+                Err(crate::error::AppError::SecretsFound { fingerprint, .. }) => fingerprint,
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            };
+            let r = crate::commands::push_branch(path.clone(), Some(shown.clone())).await;
+            assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+            // A fingerprint that doesn't match the fresh scan is refused.
+            let r = crate::commands::push_branch(path.clone(), Some("0".repeat(64))).await;
+            assert!(matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+            // A new secret after the dialog: the old fingerprint no longer
+            // covers it, and the refusal carries the new findings.
+            let more = true_positives().remove(4).2;
+            std::fs::write(dir.path().join("more.ts"), format!("{more}\n")).unwrap();
+            commit_all(&repo, "more");
+            match crate::commands::push_branch(path.clone(), Some(shown)).await {
+                Err(crate::error::AppError::SecretsFound { findings, total, .. }) => {
+                    assert_eq!(total, 2);
+                    assert!(findings.iter().any(|f| f.file == "more.ts"));
+                }
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            }
+        }
+        // Setting off: no scan at all.
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        let r = crate::commands::push_branch(path, None).await;
+        assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    #[test]
+    fn the_push_command_quotes_only_a_branch_name() {
+        assert_eq!(
+            crate::commands::push_command("feat/it's").unwrap(),
+            "git push --set-upstream origin 'feat/it'\\''s' 2>&1",
+        );
+        for bad in ["-x", "--force", "a\\'; touch PWNED; echo '", "a b", ""] {
+            let err = crate::commands::push_command(bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    /// git lets a ref like `refs/heads/-x` exist (only `git branch` refuses
+    /// the name), so the branch HEAD is on can read as an option.
+    #[tokio::test]
+    async fn push_refuses_a_branch_that_reads_as_an_option() {
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/heads/-x", head, false, "test").unwrap();
+        repo.set_head("refs/heads/-x").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let err = crate::commands::push_branch(path, None).await.unwrap_err().to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
+    }
+
+    const HEX: &str = "0123456789abcdef";
+    const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    /// (rule id, line) for the provider formats added after review. Formats:
+    /// TruffleHog's openrouter/xai/groq detectors; gitleaks' huggingface,
+    /// gitlab-pat, npm-access-token and slack-app-token rules.
+    fn more_true_positives() -> Vec<(&'static str, String)> {
+        vec![
+            ("openrouter-key", format!("OPENROUTER_API_KEY={}", ["sk-", "or-", "v1-"].concat() + &rnd(200, 64, HEX))),
+            ("xai-key", format!("const k = \"{}\";", ["xa", "i-"].concat() + &rnd(201, 80, B62))),
+            ("groq-key", format!("groq = '{}'", ["gs", "k_"].concat() + &rnd(202, 52, B62))),
+            ("huggingface-token", format!("HF_TOKEN: {}", ["h", "f_"].concat() + &rnd(203, 34, LETTERS))),
+            ("gitlab-token", format!("token = \"{}\"", ["gl", "pat-"].concat() + &rnd(204, 20, B62))),
+            ("npm-token", format!("//registry.npmjs.org/:_authToken={}", ["np", "m_"].concat() + &rnd(205, 36, B62))),
+            ("slack-token", format!(
+                "SLACK_APP={}-1-A{}-{}-{}",
+                ["xa", "pp"].concat(), rnd(206, 10, UPPER), rnd(207, 13, DIGITS), rnd(208, 64, HEX)
+            )),
+        ]
+    }
+
+    #[test]
+    fn the_added_provider_rules_find_their_true_positives() {
+        for (rule, line) in more_true_positives() {
+            let f = scan_one("src/config.ts", &[&line]);
+            assert_eq!(f.len(), 1, "{rule}: {f:?}");
+            assert_eq!(f[0].rule, rule);
+        }
+    }
+
+    #[test]
+    fn the_added_provider_rules_skip_near_misses() {
+        let near = vec![
+            ["sk-", "or-", "v1-"].concat() + &rnd(210, 63, HEX),           // 63 hex
+            ["sk-", "or-", "v1-"].concat() + &rnd(211, 64, B62),           // not hex
+            ["xa", "i-"].concat() + &rnd(212, 79, B62),                    // 79
+            ["xa", "i-"].concat() + &rnd(213, 81, B62),                    // runs on
+            ["gs", "k_"].concat() + &rnd(214, 51, B62),                    // 51
+            ["h", "f_"].concat() + &rnd(215, 33, LETTERS),                 // 33
+            ["h", "f_"].concat() + &rnd(216, 34, LETTERS) + "7",           // runs on
+            ["gl", "pat-"].concat() + &rnd(217, 19, B62),                  // 19
+            ["gl", "pat-"].concat() + &"x".repeat(20),                     // placeholder
+            ["np", "m_"].concat() + &rnd(218, 35, B62),                    // 35
+            ["xa", "pp"].concat() + "-your-app-token-here",
+        ];
+        for t in near {
+            assert!(scan_one("src/a.ts", &[&format!("k = \"{t}\"")]).is_empty(), "false positive on {t:?}");
+        }
+    }
+
+    #[test]
+    fn an_encrypted_pem_key_is_still_a_private_key() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let f = scan_one("deploy/key.key", &[&header, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D", "", &rnd(42, 64, B64)]);
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["key-file", "private-key"], "a new .key is also flagged by name");
+        let inline = format!("\"key\": \"{}\\nProc-Type: 4,ENCRYPTED\\n\"", header);
+        assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
+    }
+
+    #[test]
+    fn public_by_design_values_are_not_flagged() {
+        let google = ["AI", "za"].concat() + &rnd(220, 35, B62);
+        // A Firebase web config's apiKey is a public identifier.
+        let fb = scan_one("src/firebase.ts", &[
+            "const firebaseConfig = {",
+            &format!("  apiKey: \"{google}\","),
+            "  authDomain: \"demo-app.firebaseapp.com\",",
+            "  projectId: \"demo-app\",",
+            "};",
+        ]);
+        assert!(fb.is_empty(), "{fb:?}");
+        // The same key outside a Firebase config still is one.
+        assert_eq!(scan_one("src/maps.ts", &[&format!("const apiKey = \"{google}\";")]).len(), 1);
+        // NEXT_PUBLIC_* values ship to the browser on purpose…
+        let v = rnd(221, 32, B62);
+        assert!(scan_one(".env.local", &[&format!("NEXT_PUBLIC_API_KEY={v}")]).is_empty());
+        assert!(scan_one(".env", &[&format!("NEXT_PUBLIC_FIREBASE_API_KEY={google}")]).is_empty());
+        assert!(scan_one("src/env.ts", &[&format!("  NEXT_PUBLIC_API_KEY: \"{v}\",")]).is_empty());
+        // …but a provider secret there is still a leak.
+        let stripe = ["sk", "_live_"].concat() + &rnd(222, 24, B62);
+        assert_eq!(scan_one(".env", &[&format!("NEXT_PUBLIC_STRIPE_KEY={stripe}")])[0].rule, "stripe-key");
+        // An example JWT in prose docs is an illustration; in code it isn't.
+        let jwt = format!("eyJ{}.eyJ{}.{}", rnd(223, 30, B62), rnd(224, 60, B62), rnd(225, 43, B62));
+        let line = format!("\"access_token\": \"{jwt}\"");
+        assert!(scan_one("README.md", &[&line]).is_empty());
+        assert!(scan_one("docs/auth.mdx", &[&line]).is_empty());
+        assert_eq!(scan_one("src/client.ts", &[&line]).len(), 1);
+    }
+
+    #[test]
+    fn a_scan_past_the_byte_budget_is_partial_and_needs_confirmation() {
+        let fresh = repo;
+        let (dir, git) = repo();
+        // Three 6 MB files: the 16 MB budget runs out inside the third.
+        let chunk = "const ok = computeValue(input, other) + 1; // filler line\n".repeat(6 * 1024 * 1024 / 58);
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(dir.path().join(name), &chunk).unwrap();
+            stage(&git, name);
+        }
+        let c = staged_files(dir.path()).unwrap();
+        assert!(c.partial);
+        let r = scan_report(&c.files, &[], c.partial);
+        assert_eq!(r.total, 0);
+        assert!(r.needs_confirmation(), "partial is never clean");
+        let err = enforce(r.clone(), None).unwrap_err();
+        assert!(err.to_string().contains("scanned the first 16 MB; the rest wasn't checked"), "{err}");
+        assert!(enforce(r.clone(), Some(&r.fingerprint)).is_ok());
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        // One file larger than the whole budget is never read as text.
+        let (dir, git) = fresh();
+        std::fs::write(dir.path().join("huge.txt"), "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        stage(&git, "huge.txt");
+        assert!(staged_files(dir.path()).unwrap().partial);
+        // A small change is complete.
+        let (dir, git) = fresh();
+        std::fs::write(dir.path().join("x.ts"), "ok\n").unwrap();
+        stage(&git, "x.ts");
+        assert!(!staged_files(dir.path()).unwrap().partial);
+    }
+
+    #[test]
+    fn with_no_upstream_or_default_branch_push_scans_only_unpushed_commits() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let pushed = commit_all(&repo, "already on a fork");
+        // On a remote, but not origin's default branch nor an upstream.
+        repo.reference("refs/remotes/fork/topic", pushed, true, "test").unwrap();
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "history already on a remote isn't rescanned: {f:?}");
+        let more = true_positives().remove(4).2;
+        std::fs::write(dir.path().join("new.ts"), format!("{more}\n")).unwrap();
+        commit_all(&repo, "local leak");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].file, "new.ts");
+    }
+
+    /// Make `<remote>/<branch>` (a ref at `at`) the upstream of the local
+    /// branch `branch`.
+    fn track(repo: &git2::Repository, branch: &str, remote: &str, at: git2::Oid) {
+        if repo.find_remote(remote).is_err() {
+            repo.remote(remote, &format!("https://example.invalid/{remote}.git")).unwrap();
+        }
+        repo.reference(&format!("refs/remotes/{remote}/{branch}"), at, true, "test").unwrap();
+        let mut local = repo.find_branch(branch, git2::BranchType::Local).unwrap();
+        local.set_upstream(Some(&format!("{remote}/{branch}"))).unwrap();
+        let upstream = local.upstream().unwrap().get().target();
+        assert_eq!(upstream, Some(at), "the test's upstream is set");
+    }
+
+    /// The push goes to `origin/<branch>`, so that ref bounds the scan even
+    /// when the branch tracks another remote (#859). Here the upstream is
+    /// ahead of origin: its commits are new to origin, so they are scanned.
+    #[test]
+    fn push_scans_commits_origin_lacks_when_the_upstream_is_another_remote() {
+        let (dir, repo) = repo();
+        let on_origin = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_fork = commit_all(&repo, "on the other remote only");
+        track(&repo, "main", "fork", on_fork);
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+    }
+
+    /// The other way round: the upstream on another remote is behind origin,
+    /// and what origin already has isn't scanned again.
+    #[test]
+    fn push_skips_commits_origin_has_when_the_upstream_is_another_remote() {
+        let (dir, repo) = repo();
+        let behind = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_origin = commit_all(&repo, "already on origin");
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        track(&repo, "main", "fork", behind);
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "{f:?}");
+        let more = true_positives().remove(4).2;
+        std::fs::write(dir.path().join("new.ts"), format!("{more}\n")).unwrap();
+        commit_all(&repo, "local leak");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "new.ts");
+    }
+
+    /// A branch that isn't on origin yet keeps the earlier bases: its
+    /// upstream, else origin's default branch.
+    #[test]
+    fn push_of_a_branch_not_on_origin_yet_keeps_the_earlier_bases() {
+        let (dir, repo) = repo();
+        let root = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.reference("refs/remotes/origin/main", root.id(), true, "test").unwrap();
+        repo.branch("feature", &root, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_fork = commit_all(&repo, "on the other remote only");
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+
+        // No upstream, no origin/feature: everything since origin's default branch.
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+
+        // With an upstream on another remote and still no origin/feature,
+        // the upstream bounds the range, as before.
+        track(&repo, "feature", "fork", on_fork);
+        assert!(repo.find_reference("refs/remotes/origin/feature").is_err());
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    /// A `git push` typed in Talk's shell goes to the branch's upstream, not
+    /// necessarily `origin`, so its scan keeps the upstream range: commits
+    /// `origin/<branch>` already has are still new to the other remote.
+    #[test]
+    fn shell_push_keeps_the_upstream_range_when_origin_is_ahead() {
+        let (dir, repo) = repo();
+        let behind = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_origin = commit_all(&repo, "already on origin");
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        track(&repo, "main", "fork", behind);
+        let push = ShellPlan { push: true, ..Default::default() };
+        let f = scan_added(&shell_files(dir.path(), &push).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+        // The Push button sends to origin, which has that commit already.
+        assert!(scan_added(&push_files(dir.path()).unwrap(), &[]).is_empty());
+    }
+
+    /// A committed blob larger than the scan budget: in a tree-to-tree diff
+    /// its size isn't known until the patch is generated, so it must still
+    /// make push and PR scans partial (never silently clean).
+    #[test]
+    fn a_committed_blob_past_the_limit_makes_push_and_pr_scans_partial() {
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("huge.bin"), "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        std::fs::write(dir.path().join("small.ts"), "ok\n").unwrap();
+        commit_all(&repo, "add a large blob");
+        let blob = repo.head().unwrap().peel_to_tree().unwrap().get_name("huge.bin").unwrap().id();
+        for (scope, c) in [("push", push_files(dir.path()).unwrap()), ("pr", pr_files(dir.path(), "main").unwrap())] {
+            assert!(c.partial, "{scope}: a blob past the limit was treated as clean");
+            assert_eq!(c.scope, scope);
+            assert!(c.unscanned.contains(&format!("huge.bin@{blob}")), "{scope}: {:?}", c.unscanned);
+            let r = scan_collected(&c, &[]);
+            assert_eq!(r.total, 0);
+            assert!(r.needs_confirmation(), "{scope}: the action must ask first");
+            assert!(enforce(r.clone(), None).is_err());
+            assert!(enforce(r.clone(), Some(&r.fingerprint)).is_ok());
+        }
+        // Push and PR fingerprints differ for the same change.
+        let push = scan_collected(&push_files(dir.path()).unwrap(), &[]);
+        let pr = scan_collected(&pr_files(dir.path(), "main").unwrap(), &[]);
+        assert_ne!(push.fingerprint, pr.fingerprint);
+        std::fs::remove_file(dir.path().join("huge.bin")).unwrap();
+    }
+
+    /// A worktree file git hasn't hashed (untracked, too large to read) is
+    /// bound by size, mtime and inode, not a zero blob id: confirming it
+    /// can't cover a different file at the same path later.
+    #[test]
+    fn an_unhashed_worktree_file_is_bound_to_its_content() {
+        let (dir, _repo) = repo();
+        let big = dir.path().join("huge.bin");
+        std::fs::write(&big, "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        let c1 = worktree_files(dir.path(), Some("main")).unwrap();
+        assert!(c1.partial);
+        let entry = c1.unscanned.iter().find(|u| u.starts_with("huge.bin@")).expect("listed").clone();
+        assert!(!entry.contains(&"0".repeat(40)), "a zero blob id: {entry}");
+        assert!(entry.starts_with("huge.bin@stat:"), "{entry}");
+        let fp1 = scan_collected(&c1, &[]).fingerprint;
+        assert_eq!(scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint, fp1, "stable");
+        std::fs::write(&big, "z".repeat(16 * 1024 * 1024 + 20)).unwrap();
+        let fp2 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        assert_ne!(fp1, fp2, "a different file at the same path asks again");
+        std::fs::remove_file(&big).unwrap();
+    }
+
+    /// Every rule but the generic one reads the whole line: a secret past
+    /// column 16K (a minified bundle) is still found.
+    #[test]
+    fn a_secret_past_column_16k_is_found() {
+        let filler = "a=b(c,d);".repeat(20 * 1024 / 9);
+        assert!(filler.len() > 16 * 1024);
+        for (rule, _secret, line) in true_positives() {
+            let long = format!("{filler} {line}");
+            let f = scan_one("dist/bundle.min.js", &[&long]);
+            assert_eq!(f.len(), 1, "{rule} past 16K: {f:?}");
+            assert_eq!(f[0].rule, rule);
+        }
+        // Your own credential too.
+        let mine = rnd(300, 40, B62);
+        let known = vec![KnownSecret::new("your Anthropic API key", mine.clone())];
+        let f = scan_added(&[file("dist/app.js", &[&format!("{filler}x({mine})")])], &known);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].yours);
+        // The generic assignment rule stays on the first 16 KB of a line.
+        let generic = format!("api_key = \"{}9z\"", rnd(301, 30, B62));
+        assert_eq!(scan_one("src/a.ts", &[&generic]).len(), 1);
+        assert!(scan_one("src/a.ts", &[&format!("{filler} {generic}")]).is_empty());
+    }
+
+    #[test]
+    fn every_value_on_a_line_is_bound_into_the_fingerprint() {
+        let a = ["sk-", "ant-", "api03-"].concat() + &rnd(310, 93, B62) + "AA";
+        let b1 = ["sk-", "ant-", "api03-"].concat() + &rnd(311, 93, B62) + "AA";
+        let b2 = ["sk-", "ant-", "api03-"].concat() + &rnd(312, 93, B62) + "AA";
+        let line = |b: &str| format!("const A = \"{a}\", B = \"{b}\";");
+        let r1 = scan_report(&[file("k.ts", &[&line(&b1)])], &[], false);
+        let r2 = scan_report(&[file("k.ts", &[&line(&b2)])], &[], false);
+        assert_eq!(r1.total, 2, "two keys on one line are two findings");
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the second key asks again");
+        // The same key twice on a line is one finding.
+        let same = scan_report(&[file("k.ts", &[&format!("{a} {a}")])], &[], false);
+        assert_eq!(same.total, 1);
+    }
+
+    /// A provider hit on a line no longer hides the other rules: a generic
+    /// assignment, a `.env` credential or an AWS key on the same line is
+    /// hashed too, so editing it asks again.
+    #[test]
+    fn a_provider_hit_does_not_hide_the_other_rules_on_its_line() {
+        let ghp = ["gh", "p_"].concat() + &rnd(320, 36, B62);
+        let line = |v: &str| format!("const t = \"{ghp}\"; const apiKey = \"{v}\";");
+        let r1 = scan_report(&[file("src/a.ts", &[&line(&rnd(321, 32, B62))])], &[], false);
+        let r2 = scan_report(&[file("src/a.ts", &[&line(&rnd(322, 32, B62))])], &[], false);
+        let rules: Vec<_> = r1.findings.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["github-token", "generic-secret"]);
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the generic value asks again");
+
+        // Your own key on a line with a generic secret: both bound.
+        let mine = rnd(323, 40, B62);
+        let known = [KnownSecret::new("your Anthropic key", mine.clone())];
+        let mline = |v: &str| format!("x = \"{mine}\"; secret = \"{v}\"");
+        let k1 = scan_report(&[file("src/b.ts", &[&mline(&rnd(324, 32, B62))])], &known, false);
+        let k2 = scan_report(&[file("src/b.ts", &[&mline(&rnd(325, 32, B62))])], &known, false);
+        assert_eq!(k1.total, 2);
+        assert_ne!(k1.fingerprint, k2.fingerprint);
+
+        // An `.env` value that IS a provider key is listed once, but the
+        // `.env` rule's value is hashed as well.
+        let env = scan_report(&[file(".env", &[&format!("GITHUB_TOKEN={ghp}")])], &[], false);
+        assert_eq!(env.total, 1, "{:?}", env.findings);
+        assert_eq!(env.findings[0].rule, "github-token");
+    }
+
+    /// The per-line dedupe is linear: a multi-MB minified line holding 100k
+    /// distinct provider tokens scans in well under a few seconds.
+    #[test]
+    fn a_line_with_100k_distinct_tokens_scans_fast() {
+        let prefix = ["gh", "p_"].concat();
+        let line_of = |count: u64| {
+            let mut line = String::with_capacity(count as usize * 42);
+            for i in 0..count {
+                line.push_str(&prefix);
+                line.push_str(&rnd(1_000_000 + i, 36, B62));
+                line.push(' ');
+            }
+            line
+        };
+        let timed = |line: &str| {
+            let started = std::time::Instant::now();
+            let r = scan_report(&[file("dist/bundle.min.js", &[line])], &[], false);
+            (r, started.elapsed())
+        };
+        let big = line_of(100_000);
+        assert!(big.len() > 4_000_000, "a multi-MB line");
+        let (r, took) = timed(&big);
+        // A handful of random bodies read as placeholders or low-entropy.
+        assert!(r.total > 99_900, "{}", r.total);
+        assert_eq!(r.findings.len(), MAX_FINDINGS);
+        let (_, took_10k) = timed(&line_of(10_000));
+        eprintln!("100k-token line: {took:?}; 10k: {took_10k:?}");
+        // Linear: ten times the tokens costs about ten times the time (the
+        // quadratic dedupe cost a hundred times, minutes in all). Debug
+        // builds on a slow runner stay well inside the absolute bound.
+        assert!(took < took_10k * 30, "not linear: 100k {took:?} vs 10k {took_10k:?}");
+        assert!(took < std::time::Duration::from_secs(60), "took {took:?}");
+    }
+
+    /// The whole PEM block is hashed, not the header and first body line:
+    /// that pair is a constant for every unencrypted OpenSSH ed25519 key.
+    #[test]
+    fn two_openssh_keys_at_one_place_have_different_fingerprints() {
+        let header = ["-----BEGIN ", "OPENSSH PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "OPENSSH PRIVATE", " KEY-----"].concat();
+        // `openssh-key-v1\0`, cipher `none`, kdf `none`, one ed25519 key: the
+        // same first line for every such key.
+        let first = ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW", "QyNTUxOQAAACA"].concat();
+        let key = |seed: u64| {
+            let mut lines = vec![header.clone(), first.clone()];
+            for i in 0..4 {
+                lines.push(rnd(seed * 10 + i, 70, B64));
+            }
+            lines.push(footer.clone());
+            lines
+        };
+        let fp = |lines: &[String]| {
+            let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+            let r = scan_report(&[file("deploy/id_key", &refs)], &[], false);
+            assert_eq!(r.total, 1, "{:?}", r.findings);
+            assert_eq!(r.findings[0].rule, "private-key");
+            assert_eq!(r.findings[0].line, Some(1));
+            r.fingerprint
+        };
+        let (k1, k2) = (key(400), key(401));
+        assert_ne!(fp(&k1), fp(&k2), "two keys at the same file:line");
+        // The last body line counts; what follows the END line does not.
+        let mut k1_last = k1.clone();
+        k1_last[5] = rnd(402, 70, B64);
+        assert_ne!(fp(&k1), fp(&k1_last));
+        let mut k1_after = k1.clone();
+        k1_after.push("unrelated = 1".into());
+        assert_eq!(fp(&k1), fp(&k1_after));
+    }
+
+    /// On a long line the block is hashed from the header on: a key whose
+    /// header starts past the first 64 KB is not reduced to the unrelated
+    /// prefix, so two different keys there ask separately.
+    #[test]
+    fn a_pem_key_past_64k_on_a_long_line_is_hashed_from_its_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let pad = "x".repeat(70_000);
+        let line = |seed: u64| {
+            format!(
+                "{{\"pad\": \"{pad}\", \"key\": \"{header}\\n{}\\n{}\\n{footer}\"}}",
+                rnd(seed, 64, B64),
+                rnd(seed + 1, 64, B64)
+            )
+        };
+        let fp = |l: &str| {
+            let r = scan_report(&[file("config/creds.json", &[l])], &[], false);
+            assert!(r.findings.iter().any(|f| f.rule == "private-key"), "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (k1, k2) = (line(500), line(510));
+        assert!(k1.find(&header).unwrap() > 64 * 1024);
+        assert_ne!(fp(&k1), fp(&k2), "two keys after the same 70K prefix");
+    }
+
+    /// A PEM walk stops at the next header: repeated headers with no END
+    /// don't each run on through the following blocks.
+    #[test]
+    fn a_pem_walk_stops_at_the_next_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(520, 64, B64), rnd(521, 64, B64));
+        let lines: Vec<(u32, String)> =
+            vec![(1, header.clone()), (2, b1.clone()), (3, header.clone()), (4, b2.clone())];
+        let v = pem_block(&lines, &Default::default(), 0, 0, &header);
+        assert!(v.contains(&b1));
+        assert!(!v.contains(&b2), "walked into the next block");
+        let refs: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
+        let r = scan_report(&[file("deploy/keys.pem", &refs)], &[], false);
+        assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 2, "{:?}", r.findings);
+    }
+
+    /// A gap in the added lines' numbers is walked through the unchanged
+    /// lines read from the file, up to the END line.
+    #[test]
+    fn a_pem_walk_reads_through_unchanged_lines() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, mid, b2) = (rnd(540, 64, B64), rnd(541, 64, B64), rnd(542, 64, B64));
+        let lines: Vec<(u32, String)> =
+            vec![(1, header.clone()), (2, b1.clone()), (4, b2.clone()), (5, footer.clone()), (6, "after".into())];
+        let unchanged = std::collections::BTreeMap::from([(1, vec![mid.clone()])]);
+        let v = pem_block(&lines, &unchanged, 0, 0, &header);
+        for part in [&b1, &mid, &b2, &footer] {
+            assert!(v.contains(part.as_str()), "{part} missing from the block");
+        }
+        assert!(!v.contains("after"), "walked past the END line");
+        // Without the unchanged line the walk stops at the gap.
+        let v = pem_block(&lines, &Default::default(), 0, 0, &header);
+        assert!(v.contains(&b1) && !v.contains(&b2));
+    }
+
+    /// Two keys alike in their added lines but not in an unchanged line
+    /// inside them (or after their last added line) ask separately: the
+    /// block is hashed whole from the file, staged or not yet staged.
+    #[test]
+    fn a_pem_key_split_by_an_unchanged_line_is_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(550, 64, B64), rnd(551, 64, B64));
+        // `base` is the file's committed content, `key` its new one, `added`
+        // how many lines the staged diff adds.
+        let fp = |base: String, key: Vec<&str>, added: usize, staged: bool| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("deploy.txt"), base).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("deploy.txt"), key.join("\n") + "\n").unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                let c = staged_files(dir.path()).unwrap();
+                assert_eq!(c.files[0].lines.len(), added, "{:?}", c.files[0].lines);
+                c
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (m1, m2) = (rnd(552, 64, B64), rnd(553, 64, B64));
+        for staged in [true, false] {
+            // An unchanged line inside the key.
+            let inside =
+                |m: &str| fp(format!("{m}\n"), vec![header.as_str(), b1.as_str(), m, b2.as_str(), footer.as_str()], 4, staged);
+            assert_ne!(inside(&m1), inside(&m2), "an unchanged line inside the key (staged: {staged})");
+            // The key's rest after its last added line.
+            let tail = |m: &str| {
+                fp(format!("{m}\n{footer}\n"), vec![header.as_str(), b1.as_str(), b2.as_str(), m, footer.as_str()], 3, staged)
+            };
+            assert_ne!(tail(&m1), tail(&m2), "the key's unchanged rest (staged: {staged})");
+        }
+    }
+
+    /// An added header over a key body the diff didn't touch is still a
+    /// private key, hashed whole; a header that only names itself in code
+    /// stays quiet.
+    #[test]
+    fn an_added_header_over_an_unchanged_body_is_a_private_key() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(560, 64, B64), rnd(561, 64, B64));
+        let f = AddedFile {
+            path: "deploy.txt".into(),
+            lines: vec![(1, header.clone())],
+            unchanged: std::collections::BTreeMap::from([(0, vec![b1.clone(), footer.clone()])]),
+            ..Default::default()
+        };
+        let r = scan_report(&[f], &[], false);
+        assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+        let quiet = AddedFile {
+            path: "src/pem.ts".into(),
+            lines: vec![(1, format!("const HEADER = \"{header}\";"))],
+            unchanged: std::collections::BTreeMap::from([(0, vec!["export default HEADER;".into()])]),
+            ..Default::default()
+        };
+        assert!(scan_added(&[quiet], &[]).is_empty());
+
+        let fp = |b2: &str, staged: bool| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("deploy.txt"), format!("{b1}\n{b2}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("deploy.txt"), format!("{header}\n{b1}\n{b2}\n{footer}\n")).unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            assert_eq!(c.files[0].lines.len(), 1, "only the header is added: {:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            let keys: Vec<_> = r.findings.iter().filter(|f| f.rule == "private-key").collect();
+            assert_eq!(keys.len(), 1, "{:?}", r.findings);
+            assert_eq!(keys[0].line, Some(1));
+            r.fingerprint
+        };
+        for staged in [true, false] {
+            assert_ne!(fp(&b2, staged), fp(&rnd(562, 64, B64), staged), "hashed whole (staged: {staged})");
+        }
+    }
+
+    /// A range scan appends one diff per commit (newest first). A key's walk
+    /// stays in its own commit's lines and reads its unchanged rest from that
+    /// commit's file, not from an older commit's line that happens to carry
+    /// the next number.
+    #[test]
+    fn a_pem_walk_in_a_range_stays_in_its_own_commit() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let b1 = rnd(570, 64, B64);
+        let fps = |m: &str| -> Vec<String> {
+            let (dir, repo) = repo();
+            let k = dir.path().join("k.txt");
+            std::fs::write(&k, format!("{m}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("feature", &head, false).unwrap();
+            repo.set_head("refs/heads/feature").unwrap();
+            // The older commit adds line 3; the newer one adds the header
+            // and first body line, so its key reads on through line 3 (`m`).
+            std::fs::write(&k, format!("{m}\n{footer}\nnote\n")).unwrap();
+            commit_all(&repo, "a note");
+            std::fs::write(&k, format!("{header}\n{b1}\n{m}\n{footer}\nnote\n")).unwrap();
+            commit_all(&repo, "the key");
+            [
+                ("history", branch_files(dir.path(), "main")),
+                ("pr", pr_files(dir.path(), "main")),
+                ("push", push_files(dir.path())),
+            ]
+            .into_iter()
+            .map(|(scope, c)| {
+                let c = c.unwrap();
+                let f = c.files.iter().find(|f| f.path == "k.txt").unwrap();
+                let at = f.lines.iter().position(|(_, l)| *l == header).unwrap();
+                assert_eq!(f.lines.get(at + 2), Some(&(3, "note".to_string())), "{scope}: {:?}", f.lines);
+                let r = scan_collected(&c, &[]);
+                assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{scope}: {:?}", r.findings);
+                r.fingerprint
+            })
+            .collect()
+        };
+        let (a, b) = (fps(&rnd(571, 64, B64)), fps(&rnd(572, 64, B64)));
+        for (scope, (x, y)) in ["history", "pr", "push"].iter().zip(a.iter().zip(&b)) {
+            assert_ne!(x, y, "{scope}: the key's unchanged line counts, the older commit's doesn't");
+        }
+    }
+
+    /// A key with no END line runs on into the file's unchanged rest, up to
+    /// the next header, the end of the file or 64 KB, so editing the text
+    /// below it asks again. Fail-safe: a confirm never covers what it didn't see.
+    #[test]
+    fn a_truncated_key_hashes_the_unchanged_text_below_it() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(575, 64, B64), rnd(576, 64, B64));
+        let fp = |tail: &str| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("notes.txt"), format!("{tail}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("notes.txt"), format!("{header}\n{b1}\n{b2}\n{tail}\n")).unwrap();
+            stage(&repo, "notes.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert_eq!(c.files[0].lines.len(), 3, "{:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        assert_ne!(fp("see the runbook"), fp("see the wiki"));
+    }
+
+    /// Reading a file's new side to hash a key whole counts against the scan
+    /// budget: one past what is left marks the scan partial and names the file.
+    #[test]
+    fn reading_a_new_side_for_a_key_counts_against_the_budget() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (dir, repo) = repo();
+        let big = dir.path().join("big.txt");
+        // About 10 MB: one new side fits the 16 MB budget, two don't.
+        let filler: String = (0..10_000).map(|i| format!("{i:05} {}\n", "y".repeat(1000))).collect();
+        std::fs::write(&big, &filler).unwrap();
+        commit_all(&repo, "base");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        for (seed, partial) in [(580, false), (581, true)] {
+            let cur = std::fs::read_to_string(&big).unwrap();
+            std::fs::write(&big, format!("{header}\n{}\n{cur}", rnd(seed, 64, B64))).unwrap();
+            commit_all(&repo, "a key on top");
+            let c = branch_files(dir.path(), "main").unwrap();
+            assert_eq!(c.partial, partial, "{:?}", c.unscanned);
+            assert_eq!(c.unscanned.iter().any(|u| u.starts_with("big.txt@")), partial, "{:?}", c.unscanned);
+        }
+    }
+
+    /// The new side is read only when a key reaches a line the diff didn't
+    /// add, and the added lines it holds aren't counted twice: a large file
+    /// with a key in it isn't partial when every line was scanned.
+    #[test]
+    fn a_new_side_is_read_only_when_a_key_needs_it() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let b1 = rnd(600, 64, B64);
+        let whole = vec![(1, header.clone()), (2, b1.clone()), (3, footer.clone())];
+        assert!(!pem_needs_new_side(&whole));
+        assert!(pem_needs_new_side(&whole[..2]), "no END among the added lines");
+        assert!(pem_needs_new_side(&[(1, header.clone()), (3, footer.clone())]), "a gap inside the key");
+        assert!(!pem_needs_new_side(&[(1, "no key here".to_string())]));
+
+        // About 9 MB: more than the budget left once the diff has read it.
+        let filler: String = (0..9_000).map(|i| format!("{i:05} {}\n", "y".repeat(1000))).collect();
+        // A newly added file holding a whole key.
+        {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("bundle.txt"), format!("{filler}{header}\n{b1}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+        }
+
+        // A modified file whose key reads on into an unchanged line: the
+        // read is needed, but the added lines it holds were already counted.
+        let fp = |m: &str| {
+            let (dir, repo) = repo();
+            let p = dir.path().join("bundle.txt");
+            std::fs::write(&p, format!("{m}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(&p, format!("{filler}{header}\n{b1}\n{m}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        assert_ne!(fp(&rnd(601, 64, B64)), fp(&rnd(602, 64, B64)), "the unchanged line is hashed");
+    }
+
+    /// The new side must hold the diff's lines where the diff saw them: a
+    /// clean filter's output (a Git LFS pointer, git-crypt ciphertext) or a
+    /// file rewritten since lends its lines to no key. CRLF still matches.
+    #[test]
+    fn a_new_side_unlike_the_diff_fills_nothing() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, mid) = (rnd(585, 64, B64), rnd(586, 64, B64));
+        let lines = vec![(1, header.clone()), (2, b1.clone())];
+        let same = format!("{header}\n{b1}\n{mid}\n{footer}\n");
+        let want = vec![mid.clone(), footer.clone()];
+        assert_eq!(pem_unchanged(&lines, &same).get(&1), Some(&want));
+        assert_eq!(pem_unchanged(&lines, &same.replace('\n', "\r\n")).get(&1), Some(&want), "CRLF");
+        let pointer = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1704\n", rnd(587, 64, "0123456789abcdef"));
+        assert!(pem_unchanged(&lines, &pointer).is_empty());
+        let moved = format!("# moved\n{same}");
+        assert!(pem_unchanged(&lines, &moved).is_empty(), "the lines aren't at the diff's numbers");
+    }
+
+    /// A CRLF key split by an unchanged line is hashed whole, with or without
+    /// `core.autocrlf`, staged or not.
+    #[test]
+    fn a_crlf_key_split_by_an_unchanged_line_is_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(590, 64, B64), rnd(591, 64, B64));
+        let fp = |m: &str, autocrlf: bool, staged: bool| {
+            let (dir, repo) = repo();
+            repo.config().unwrap().set_bool("core.autocrlf", autocrlf).unwrap();
+            std::fs::write(dir.path().join("deploy.txt"), format!("{m}\r\n")).unwrap();
+            commit_all(&repo, "base");
+            let key = [header.as_str(), b1.as_str(), m, b2.as_str(), footer.as_str()].join("\r\n") + "\r\n";
+            std::fs::write(dir.path().join("deploy.txt"), key).unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            assert_eq!(c.files[0].lines.len(), 4, "{:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (m1, m2) = (rnd(592, 64, B64), rnd(593, 64, B64));
+        for autocrlf in [false, true] {
+            for staged in [true, false] {
+                assert_ne!(fp(&m1, autocrlf, staged), fp(&m2, autocrlf, staged), "autocrlf {autocrlf}, staged {staged}");
+            }
+        }
+    }
+
+    /// Two keys in one file, apart by unchanged lines and each with an
+    /// unchanged line inside: each is hashed whole, and neither runs into
+    /// the other.
+    #[test]
+    fn two_keys_apart_in_a_repo_are_each_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, m1, b2, m2) = (rnd(595, 64, B64), rnd(596, 64, B64), rnd(597, 64, B64), rnd(598, 64, B64));
+        for staged in [true, false] {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("keys.txt"), format!("{m1}\nsep one\nsep two\n{m2}\n")).unwrap();
+            commit_all(&repo, "base");
+            let (h, e) = (header.as_str(), footer.as_str());
+            let new = [h, b1.as_str(), m1.as_str(), e, "sep one", "sep two", h, b2.as_str(), m2.as_str(), e];
+            std::fs::write(dir.path().join("keys.txt"), new.join("\n") + "\n").unwrap();
+            let c = if staged {
+                stage(&repo, "keys.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            let f = &c.files[0];
+            let numbers: Vec<u32> = f.lines.iter().map(|(n, _)| *n).collect();
+            assert_eq!(numbers, [1, 2, 4, 7, 8, 10], "staged: {staged}");
+            let r = scan_report(&c.files, &[], c.partial);
+            let at: Vec<_> = r.findings.iter().filter(|f| f.rule == "private-key").map(|f| f.line).collect();
+            assert_eq!(at, [Some(1), Some(7)], "staged: {staged}: {:?}", r.findings);
+            let k1 = pem_block(&f.lines, &f.unchanged, 0, 0, &header);
+            let k2 = pem_block(&f.lines, &f.unchanged, 3, 0, &header);
+            for part in [&b1, &m1, &footer] {
+                assert!(k1.contains(part.as_str()), "first key misses {part} (staged: {staged})");
+            }
+            for part in [&b2, &m2, &footer] {
+                assert!(k2.contains(part.as_str()), "second key misses {part} (staged: {staged})");
+            }
+            assert!(!k1.contains("sep one") && !k1.contains(&b2), "the first key ran on (staged: {staged})");
+            assert!(!k2.contains(&b1), "staged: {staged}");
+        }
+    }
+
+    /// A provider token that only partly overlaps one of your own keys is
+    /// still hashed, so editing its other part asks again.
+    #[test]
+    fn a_token_partly_overlapping_your_key_is_still_bound() {
+        let ghp = ["gh", "p_"].concat() + &rnd(410, 36, B62);
+        let known = [KnownSecret::new("your GitHub token", ghp[..24].to_string())];
+        let edited = format!("{}{}", &ghp[..24], rnd(411, 16, B62));
+        let r1 = scan_report(&[file("src/a.ts", &[&format!("t = \"{ghp}\"")])], &known, false);
+        let r2 = scan_report(&[file("src/a.ts", &[&format!("t = \"{edited}\"")])], &known, false);
+        assert_eq!(r1.total, 1, "listed once, as yours: {:?}", r1.findings);
+        assert!(r1.findings[0].yours);
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the part outside your key asks again");
+    }
+
+    /// Rewriting an unhashed worktree file with the same size and restoring
+    /// its mtime still changes the stamp: the ctime moves.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_rewrite_with_a_restored_mtime_asks_again() {
+        let (dir, _repo) = repo();
+        let big = dir.path().join("huge.bin");
+        std::fs::write(&big, "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        let mtime = std::fs::metadata(&big).unwrap().modified().unwrap();
+        let fp1 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&big, "z".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        std::fs::File::options().write(true).open(&big).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(std::fs::metadata(&big).unwrap().modified().unwrap(), mtime, "mtime restored");
+        let fp2 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        assert_ne!(fp1, fp2, "same size and mtime, new content");
+        std::fs::remove_file(&big).unwrap();
+    }
+
+    /// The Firebase and AWS proximity checks are lookups, not a scan of the
+    /// file per line: tens of thousands of apiKey / AWS lines stay fast.
+    #[test]
+    fn many_api_key_and_aws_lines_scan_fast() {
+        let google = |i: u64| ["AI", "za"].concat() + &rnd(5_000_000 + i, 35, B62);
+        let id = |i: u64| ["AK", "IA"].concat() + &rnd(6_000_000 + i, 16, UPPER);
+        let mut lines = Vec::new();
+        for i in 0..20_000u64 {
+            lines.push(format!("  apiKey: \"{}\",", google(i)));
+            lines.push(format!("aws_access_key_id = {}", id(i)));
+            lines.push(format!("aws_secret_access_key = {}", rnd(7_000_000 + i, 40, B64)));
+        }
+        // Firebase context only at the very end: no apiKey is near it but the last few.
+        lines.push("  authDomain: \"demo.firebaseapp.com\",".into());
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        let started = std::time::Instant::now();
+        let r = scan_report(&[file("src/config.ts", &refs)], &[], false);
+        let took = started.elapsed();
+        eprintln!("60k apiKey/AWS lines: {took:?}");
+        assert!(r.total > 39_000, "{}", r.total);
+        // Lines are appended from several commits in a range scan: unsorted
+        // line numbers must give the same answer.
+        let mut shuffled = file("src/config.ts", &refs);
+        shuffled.lines.reverse();
+        assert_eq!(scan_report(&[shuffled], &[], false).total, r.total);
+        assert!(took < std::time::Duration::from_secs(30), "took {took:?}");
+    }
+
+    #[test]
+    fn a_partial_fingerprint_is_bound_to_what_was_not_scanned() {
+        let c = |scope: &'static str, unscanned: &[&str]| Collected {
+            files: vec![],
+            partial: true,
+            scope,
+            unscanned: unscanned.iter().map(|s| s.to_string()).collect(),
+        };
+        let fp = |c: Collected| scan_collected(&c, &[]).fingerprint;
+        assert_ne!(fp(c("push", &["big.bin@aaaa"])), fp(c("push", &["big.bin@bbbb"])));
+        assert_ne!(fp(c("push", &["big.bin@aaaa"])), fp(c("pr", &["big.bin@aaaa"])));
+        assert_eq!(fp(c("push", &["a@1", "b@2"])), fp(c("push", &["b@2", "a@1"])));
+    }
+
+    #[test]
+    fn the_key_file_is_created_once_and_a_corrupt_one_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = load_or_create_key_in(&dir.path().join(".octopush")).expect("created");
+        let path = dir.path().join(".octopush").join(KEY_FILE);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(load_or_create_key_in(&dir.path().join(".octopush")), Some(k1), "the same key on every load");
+        // An empty (half-written) key file is replaced, not trusted.
+        std::fs::write(&path, "").unwrap();
+        let k2 = load_or_create_key_in(&dir.path().join(".octopush")).expect("replaced");
+        assert_ne!(k2, k1);
+        assert_eq!(load_or_create_key_in(&dir.path().join(".octopush")), Some(k2));
+        // No temp files are left behind.
+        let names: Vec<_> = std::fs::read_dir(dir.path().join(".octopush")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(KEY_FILE)]);
+        // An unreadable key (a directory in its place) falls back to None.
+        let odd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(odd.path().join(KEY_FILE)).unwrap();
+        assert_eq!(load_or_create_key_in(odd.path()), None);
+    }
+
+    #[test]
+    fn the_setting_defaults_on() {
+        let s = crate::settings::AppSettings::default();
+        assert!(guard_enabled(&s));
+        let s: crate::settings::AppSettings = serde_json::from_str(r#"{"secretGuardEnabled":false}"#).unwrap();
+        assert!(!guard_enabled(&s));
+    }
+}
+
+/// Secret guard at the crew boundary: an Action stage parks needs-you.
+#[cfg(test)]
+mod secret_guard_orchestrator_tests {
+    use crate::db::Db;
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    struct Sink(Mutex<Vec<(String, Value)>>);
+    impl EventSink for Sink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.0.lock().push((event.to_string(), payload));
+        }
+    }
+
+    struct Ok1;
+    #[async_trait::async_trait]
+    impl AgentRunner for Ok1 {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.0,
+                status: StageStatus::Done, tool_calls: vec![], error: None, verdict: None, session_id: None,
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// The leaked value — assembled at runtime.
+    fn secret() -> String {
+        ["gh", "p_"].concat() + "Qm7Rt2Vx9Lk4Pz8Wn3Hy6Bc1Df5Gj0Ks7Eab"
+    }
+
+    fn setup(settings: Value) -> (Arc<Mutex<Db>>, String, tempfile::TempDir, tempfile::TempDir) {
+        let sdir = tempfile::tempdir().unwrap();
+        let sp = sdir.path().join("settings.json");
+        std::fs::write(&sp, settings.to_string()).unwrap();
+        crate::settings::test_settings_path::set(Some(sp));
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("README.md")).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        // The crew wrote a key into a tracked-to-be fixture.
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/fixtures.ts"), format!("// seed\nexport const t = \"{}\";\n", secret())).unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main',?1,?2,?2)",
+            rusqlite::params![dir.path().to_string_lossy(), now]).unwrap();
+        let pid = db.insert_pipeline("Ship", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "pull_request", "m", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        (Arc::new(Mutex::new(db)), run, dir, sdir)
+    }
+
+    #[tokio::test]
+    async fn a_pr_stage_with_a_secret_in_the_worktree_parks_needs_you() {
+        let (db, run, _dir, _s) = setup(serde_json::json!({}));
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink.clone(), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+
+        let stages = db.lock().list_run_stages(&run).unwrap();
+        assert_eq!(stages[0].status, "done", "the non-Action stage ran");
+        let pr = &stages[1];
+        assert_eq!(pr.status, "awaiting_checkpoint");
+        assert!(pr.started_at.is_none(), "the PR stage never started");
+        let hold = pr.secret_hold.as_ref().expect("held");
+        assert!(!hold.acknowledged);
+        assert_eq!(hold.findings[0].location(), "tests/fixtures.ts:2");
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "paused");
+
+        // A "decision" checkpoint: needs-you, the native notification, the beacon.
+        let events = sink.0.lock().clone();
+        assert!(events.iter().any(|(e, p)| e == "run://checkpoint" && p["stageId"] == pr.id.as_str() && p["reason"] == "decision"));
+
+        // The journal says why, without the value.
+        let log = db.lock().list_stage_log(&pr.id).unwrap().join("\n");
+        assert!(log.contains("Held before the pull request: possible secret · GitHub token in tests/fixtures.ts:2"), "{log}");
+        let s = secret();
+        for (_, p) in &events {
+            assert!(!p.to_string().contains(&s), "a secret leaked into an event");
+        }
+        assert!(!log.contains(&s));
+        assert!(!serde_json::to_string(&stages).unwrap().contains(&s), "nor into the stage rows sent to the UI");
+        let raw: String = db.lock().conn_ref()
+            .query_row("SELECT secret_hold FROM run_stages WHERE id = ?1", [&pr.id], |r| r.get(0)).unwrap();
+        assert!(!raw.contains(&s), "nor into the database");
+
+        // Re-driving without a decision holds again.
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        assert_eq!(db.lock().list_run_stages(&run).unwrap()[1].status, "awaiting_checkpoint");
+
+        // The director's explicit approval lets exactly these findings through.
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let stages = db.lock().list_run_stages(&run).unwrap();
+        assert_eq!(stages[1].status, "done");
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "completed");
+        let log = db.lock().list_stage_log(&stages[1].id).unwrap().join("\n");
+        assert!(log.contains("the director approved proceeding"), "{log}");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_new_secret_after_approval_holds_again() {
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        orch.run_to_pause(&run).await.unwrap();
+        // Approve, but add another key before the re-drive scans.
+        let pr_id = db.lock().list_run_stages(&run).unwrap()[1].id.clone();
+        std::fs::write(dir.path().join("seed.js"), format!("{}\n", ["gh", "o_"].concat() + "Zx8Wq2Lm5Np7Rt3Vy6Bk9Cd1Fh4Gj0Ks2Eab")).unwrap();
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let pr = db.lock().list_run_stages(&run).unwrap().into_iter().find(|s| s.id == pr_id).unwrap();
+        assert_eq!(pr.status, "awaiting_checkpoint", "a different set of findings needs a new decision");
+        assert_eq!(pr.secret_hold.unwrap().findings.len(), 2);
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_clean_worktree_or_the_guard_off_runs_straight_through() {
+        let (db, run, _dir, _s) = setup(serde_json::json!({ "secretGuardEnabled": false }));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Completed));
+        assert!(db.lock().list_run_stages(&run).unwrap()[1].secret_hold.is_none());
+        crate::settings::test_settings_path::set(None);
+
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        std::fs::remove_file(dir.path().join("tests/fixtures.ts")).unwrap();
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Completed));
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_worktree_parks_instead_of_shipping_unchecked() {
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        // The worktree vanished (or isn't a repo any more): nothing can be checked.
+        std::fs::remove_dir_all(dir.path().join(".git")).unwrap();
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        let pr = db.lock().list_run_stages(&run).unwrap()[1].clone();
+        assert_eq!(pr.status, "awaiting_checkpoint");
+        let hold = pr.secret_hold.clone().expect("held");
+        assert!(hold.unreadable);
+        let log = db.lock().list_stage_log(&pr.id).unwrap().join("\n");
+        assert!(log.contains("couldn't read the worktree's changes, so nothing was checked"), "{log}");
+        // The director may still choose to proceed.
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(db.lock().list_run_stages(&run).unwrap()[1].status, "done");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn turning_the_guard_off_clears_a_stale_hold() {
+        let (db, run, _dir, sdir) = setup(serde_json::json!({}));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        assert!(db.lock().list_run_stages(&run).unwrap()[1].secret_hold.is_some());
+        std::fs::write(sdir.path().join("settings.json"), r#"{"secretGuardEnabled":false}"#).unwrap();
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let pr = db.lock().list_run_stages(&run).unwrap()[1].clone();
+        assert_eq!(pr.status, "done");
+        assert!(pr.secret_hold.is_none(), "no stale hold left behind");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[test]
+    fn hold_labels_read_naturally() {
+        assert_eq!(crate::orchestrator::secret_hold_stage_label("pull_request", "Pull request"), "the pull request");
+        assert_eq!(crate::orchestrator::secret_hold_stage_label("deploy", "Deploy"), "the deploy stage");
+    }
+}
+
+
+#[cfg(test)]
+mod plan_wait_tests {
+    //! #731: a Claude plan limit parks the run and resumes it at the reset.
+    use crate::db::Db;
+    use crate::orchestrator::cli_runner::{apply_plan_limit, is_plan_limit, PlanLimitWatch};
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::plan_wait::{PlanClaim, AUTO_RESUME_CAP, RESUME_JITTER_SECS, RESUME_MARGIN_SECS, RETRY_SECS};
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Records every `run://checkpoint` reason.
+    #[derive(Default)]
+    struct ReasonSink {
+        reasons: Mutex<Vec<String>>,
+    }
+    impl EventSink for ReasonSink {
+        fn emit(&self, event: &str, payload: Value) {
+            if event == "run://checkpoint" {
+                self.reasons.lock().push(payload["reason"].as_str().unwrap_or_default().to_string());
+            }
+        }
+    }
+
+    /// Hits the plan wall on its first `walls` runs (as the CLI runner
+    /// reports it), then finishes. Records every built `StageSpec`.
+    struct PlanWallRunner {
+        walls: Mutex<u32>,
+        resets_at: i64,
+        seen: Arc<Mutex<Vec<StageSpec>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for PlanWallRunner {
+        async fn run(&self, stage: &StageSpec, _input: &StageInput, _ctx: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(stage.clone());
+            let wall = {
+                let mut w = self.walls.lock();
+                let hit = *w > 0;
+                if hit {
+                    *w -= 1;
+                }
+                hit
+            };
+            let outcome = StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: "did it".into(), payload: None, refs_worktree: false },
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.02,
+                status: if wall { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: wall.then(|| "You've hit your 5-hour limit · resets 7:40pm (UTC)".to_string()),
+                verdict: None,
+                session_id: Some("sess-p".into()),
+                blocked: None,
+                blocked_transcript: None,
+            };
+            if !wall {
+                return Ok(outcome);
+            }
+            let mut watch = PlanLimitWatch::default();
+            watch.observe(&json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": self.resets_at, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "isUsingOverage": false}}));
+            Ok(apply_plan_limit(outcome, &watch))
+        }
+    }
+
+    fn seed(path: &Path) -> (Arc<Mutex<Db>>, String) {
+        let db = Db::open(path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main','/tmp',?1,?1)", [&now]).unwrap();
+        let pid = db.insert_pipeline("Plan", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        (Arc::new(Mutex::new(db)), run_id)
+    }
+
+    fn orch(db: &Arc<Mutex<Db>>, walls: u32, resets_at: i64) -> (Orchestrator, Arc<ReasonSink>, Arc<Mutex<Vec<StageSpec>>>) {
+        let reasons = Arc::new(ReasonSink::default());
+        let sink: Arc<dyn EventSink> = Arc::new(crate::orchestrator::persist::PersistingSink::new(
+            Arc::clone(&reasons) as Arc<dyn EventSink>,
+            Arc::clone(db),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = PlanWallRunner { walls: Mutex::new(walls), resets_at, seen: Arc::clone(&seen) };
+        (Orchestrator::new_with_runner(Arc::clone(db), sink, Box::new(runner)), reasons, seen)
+    }
+
+    /// Make the scheduled resume due now (the clock is not injectable here;
+    /// the schedule's arithmetic is unit-tested in `plan_wait`).
+    fn make_due(db: &Arc<Mutex<Db>>, run_id: &str) {
+        db.lock().conn_ref().execute(
+            "UPDATE runs SET plan_resume_at = ?2 WHERE id = ?1 AND plan_resume_at IS NOT NULL",
+            rusqlite::params![run_id, chrono::Utc::now().timestamp() - 1],
+        ).unwrap();
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    #[tokio::test]
+    async fn a_plan_limit_parks_the_run_keeping_spend_and_session_and_schedules_the_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let resets = now() + 3_600;
+        let (orch, reasons, _) = orch(&db, 1, resets);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed");
+        assert!(is_plan_limit(stage.error.as_deref().unwrap()), "{:?}", stage.error);
+        assert!(stage.error.as_deref().unwrap().starts_with("Paused by your Claude plan"));
+        assert_eq!(stage.session_id.as_deref(), Some("sess-p"), "the session is kept for the Resume");
+        assert_eq!(stage.cost_usd, 0.02, "the spend is kept");
+        assert!(!stage.escalated, "a plan wall never escalates");
+
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("parked by the plan");
+        assert_eq!(wait.window, "five_hour");
+        assert_eq!(wait.resets_at, resets);
+        let at = wait.resume_at.expect("an automatic resume is scheduled");
+        assert!((resets + RESUME_MARGIN_SECS..=resets + RESUME_MARGIN_SECS + RESUME_JITTER_SECS).contains(&at), "{at}");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("plan_limit"), "nobody needs to decide");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("Paused by your Claude plan · resumes at")), "{log:?}");
+        // Not due yet: nothing claims it.
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        assert!(db.lock().list_due_plan_resumes(now()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_schedule_survives_a_restart_and_resumes_the_same_session_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let run_id = {
+            let (db, run_id) = seed(&path);
+            let (orch, _, _) = orch(&db, 1, now() + 600);
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            run_id
+        }; // the app quits: orchestrator and DB handle are gone
+
+        let db = Arc::new(Mutex::new(Db::open(&path).unwrap())); // relaunch (migrations re-run)
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap().resume_at.is_some());
+        make_due(&db, &run_id);
+        assert_eq!(db.lock().list_due_plan_resumes(now()).unwrap(), vec![run_id.clone()]);
+
+        let (orch, _, seen) = orch(&db, 0, now());
+        let over = orch.claim_plan_resume(&run_id).unwrap();
+        assert_eq!(over, PlanClaim::Resumed { budget_override: false }, "claimed and applied");
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed, "a second claimant gets nothing");
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Completed);
+        assert_eq!(seen.lock()[0].resume_session.as_deref(), Some("sess-p"), "--resume of the same session");
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none());
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "a finished stage resets the allowance");
+    }
+
+    #[tokio::test]
+    async fn automatic_resumes_are_capped_then_the_run_waits_for_the_director() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 10, now() + 60);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        for i in 1..=AUTO_RESUME_CAP {
+            make_due(&db, &run_id);
+            let over = orch.claim_plan_resume(&run_id).unwrap();
+            assert!(matches!(over, PlanClaim::Resumed { .. }), "automatic resume {i}");
+            assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Paused, "hit the wall again");
+        }
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!(wait.resume_at, None, "after {AUTO_RESUME_CAP} automatic resumes it waits for the director");
+        assert_eq!(wait.resume_count, AUTO_RESUME_CAP);
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"), "now it needs you");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("automatic resumes already ran")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reset_already_past_resumes_once_uncounted_then_waits_for_the_director() {
+        // #1109: Claude Code before 2.1.332 can report a limit that already
+        // reset; the stream's `resetsAt` is then in the past.
+        use crate::orchestrator::plan_wait::STALE_REPORT_NOTICE;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 10, now() - 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("parked by the plan");
+        assert_eq!(wait.stale_count, 1);
+        let at = wait.resume_at.expect("one automatic resume, after the margin");
+        let t = now();
+        assert!((t + RESUME_MARGIN_SECS - 5..=t + RESUME_MARGIN_SECS + RESUME_JITTER_SECS).contains(&at), "{at}");
+        // Resumes on its own: Notify me elsewhere stays quiet.
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("plan_limit"));
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("had already reset") && e.contains("not counted")), "{log:?}");
+
+        make_due(&db, &run_id);
+        assert!(matches!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { .. }));
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "the stale report's resume isn't counted");
+
+        // The second stale report in a row: the director, with the cap untouched.
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Paused);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!((wait.resume_at, wait.stale_count, wait.resume_count), (None, 2, 0));
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"), "now it needs you");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains(STALE_REPORT_NOTICE)), "{log:?}");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+
+        // The director acting starts the count over.
+        db.lock().reset_plan_resume_count(&run_id).unwrap();
+        assert_eq!(db.lock().plan_stale_count(&run_id).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_stale_claim_puts_the_park_back_uncounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() - 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let w = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        // Two real resumes ran before this stale report.
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_count = 2 WHERE id = ?1", [&run_id]).unwrap();
+        make_due(&db, &run_id);
+        let t = now();
+        assert!(db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap());
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 2, "the stale claim isn't counted");
+        assert!(db.lock().restore_plan_resume(&run_id, &w.window, w.resets_at, Some(t + RETRY_SECS), t + RETRY_SECS).unwrap());
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 2, "nor is it taken back");
+        assert_eq!(db.lock().plan_stale_count(&run_id).unwrap(), 1, "still the same stale park");
+    }
+
+    #[tokio::test]
+    async fn the_director_can_resume_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, seen) = orch(&db, 1, now() + 3_600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        // "Resume now" is the ordinary Resume.
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+        assert_eq!(seen.lock()[1].resume_session.as_deref(), Some("sess-p"));
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none(), "the park ended");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty(), "no stale resume left behind");
+    }
+
+    #[tokio::test]
+    async fn the_director_can_turn_the_automatic_resume_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, seen) = orch(&db, 1, now() + 3_600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.cancel_plan_resume(&run_id).unwrap();
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked by the plan");
+        assert_eq!(wait.resume_at, None, "waits for a manual Resume");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("director"), "their own hand: silent");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed, "nothing resumes on its own");
+        assert_eq!(seen.lock().len(), 1);
+        // Today's manual Resume still works.
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_budget_is_spent_never_resumes_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        db.lock().set_run_budget(&run_id, Some(0.01)).unwrap();
+        let (orch, reasons, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!(wait.resume_at, None, "$0.02 spent of $0.01: no automatic resume");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    #[tokio::test]
+    async fn a_budget_spent_while_waiting_is_checked_again_at_the_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, seen) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        db.lock().set_run_budget(&run_id, Some(0.01)).unwrap(); // lowered meanwhile
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou, "the worker must announce it");
+        assert_eq!(seen.lock().len(), 1, "never resumed");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed", "still parked for the director");
+    }
+
+    /// What a [`RoleRunner`] does on one run of a role.
+    #[derive(Clone, Copy)]
+    enum Act {
+        Wall,
+        Halt,
+        Done,
+    }
+
+    /// Plays a script per role (then finishes), so sibling branches can hit
+    /// the plan wall, halt for real or finish. Records every built spec.
+    struct RoleRunner {
+        script: Mutex<std::collections::HashMap<String, std::collections::VecDeque<Act>>>,
+        resets_at: i64,
+        seen: Arc<Mutex<Vec<StageSpec>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for RoleRunner {
+        async fn run(&self, stage: &StageSpec, _input: &StageInput, _ctx: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(stage.clone());
+            let act = self.script.lock().get_mut(&stage.role).and_then(|q| q.pop_front()).unwrap_or(Act::Done);
+            let failed = !matches!(act, Act::Done);
+            let outcome = StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.01,
+                status: if failed { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: match act {
+                    Act::Wall => Some("You've hit your 5-hour limit".into()),
+                    Act::Halt => Some("the build broke".into()),
+                    Act::Done => None,
+                },
+                verdict: None,
+                session_id: Some(format!("sess-{}", stage.role)),
+                blocked: None,
+                blocked_transcript: None,
+            };
+            if !matches!(act, Act::Wall) {
+                return Ok(outcome);
+            }
+            let mut watch = PlanLimitWatch::default();
+            watch.observe(&json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": self.resets_at, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "isUsingOverage": false}}));
+            Ok(apply_plan_limit(outcome, &watch))
+        }
+    }
+
+    fn draft(role: &str, parents: Vec<i64>, checkpoint: bool) -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            // The substrate is the runner's business here (it reports the
+            // plan wall itself); API read-only tools let branches share a batch.
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents,
+            tools: (!parents_is_root(role)).then(|| vec!["read_file".into(), "list_files".into()]),
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        }
+    }
+    fn parents_is_root(role: &str) -> bool {
+        role == "plan"
+    }
+
+    /// plan → two read-only branches (`a`, `b`) ready in one batch.
+    fn branches(path: &Path, b_gated: bool, script: &[(&str, Vec<Act>)]) -> (Arc<Mutex<Db>>, String, Orchestrator, Arc<ReasonSink>, Arc<Mutex<Vec<StageSpec>>>) {
+        let (db, _) = seed(path);
+        let stages = vec![draft("plan", vec![], false), draft("critique", vec![0], false), draft("plan_review", vec![0], b_gated)];
+        let pid = db.lock().save_pipeline(None, "Branches", "d", &stages).unwrap();
+        let run_id = db.lock().create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        let reasons = Arc::new(ReasonSink::default());
+        let sink: Arc<dyn EventSink> = Arc::new(crate::orchestrator::persist::PersistingSink::new(
+            Arc::clone(&reasons) as Arc<dyn EventSink>,
+            Arc::clone(&db),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = RoleRunner {
+            script: Mutex::new(script.iter().map(|(r, a)| (r.to_string(), a.iter().copied().collect())).collect()),
+            resets_at: now() + 600,
+            seen: Arc::clone(&seen),
+        };
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(runner));
+        (db, run_id, orch, reasons, seen)
+    }
+
+    fn statuses(db: &Arc<Mutex<Db>>, run_id: &str) -> Vec<String> {
+        db.lock().list_run_stages(run_id).unwrap().into_iter().map(|s| s.status).collect()
+    }
+
+    fn failed(error: &str) -> StageOutcome {
+        StageOutcome {
+            cli: Default::default(),
+            artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+            input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.0,
+            status: StageStatus::Failed, tool_calls: vec![], error: Some(error.into()),
+            verdict: None, session_id: None, blocked: None, blocked_transcript: None,
+        }
+    }
+
+    fn rate_event(status: &str, kind: &str, resets_at: i64) -> Value {
+        json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": status, "resetsAt": resets_at, "rateLimitType": kind, "isUsingOverage": false}})
+    }
+
+    /// Detection: a failure is the plan's only when the rejection was the last
+    /// rate-limit event before the result, or the CLI wrote its limit notice.
+    #[test]
+    fn a_failure_after_a_later_allowed_request_is_not_a_plan_limit() {
+        let at = now() + 600;
+        // Rejected, then another window allowed a request: another cause.
+        let mut w = PlanLimitWatch::default();
+        w.observe(&rate_event("rejected", "five_hour", at));
+        w.observe(&rate_event("allowed", "seven_day", at + 86_400));
+        let out = apply_plan_limit(failed("network error"), &w);
+        assert!(out.cli.plan_limit.is_none());
+        assert_eq!(out.error.as_deref(), Some("network error"));
+        // The same, but the CLI wrote its own limit notice: the plan.
+        w.observe(&json!({"type": "assistant", "error": "rate_limit", "message": {"content": []}}));
+        assert!(apply_plan_limit(failed("x"), &w).cli.plan_limit.is_some());
+        // The rejection is the last rate-limit event: the plan.
+        let mut w = PlanLimitWatch::default();
+        w.observe(&rate_event("allowed", "seven_day", at + 86_400));
+        w.observe(&rate_event("rejected", "five_hour", at));
+        let out = apply_plan_limit(failed("x"), &w);
+        assert_eq!(out.cli.plan_limit.as_ref().map(|l| l.resets_at), Some(at));
+        assert!(is_plan_limit(out.error.as_deref().unwrap()));
+    }
+
+    /// Detection only reads the stage's own top-level messages: a
+    /// sub-agent's rejection or limit notice is not the stage's stop.
+    #[test]
+    fn a_sub_agents_rejection_is_not_the_stages_stop() {
+        let mut w = PlanLimitWatch::default();
+        let mut ev = rate_event("rejected", "five_hour", now() + 600);
+        ev["parent_tool_use_id"] = json!("toolu_1");
+        w.observe(&ev);
+        w.observe(&json!({"type": "assistant", "parent_tool_use_id": "toolu_1", "error": "rate_limit", "message": {"content": []}}));
+        assert!(w.limit().is_none());
+        assert!(apply_plan_limit(failed("x"), &w).cli.plan_limit.is_none());
+        // `parent_tool_use_id: null` is top-level.
+        let mut ev = rate_event("rejected", "five_hour", now() + 600);
+        ev["parent_tool_use_id"] = Value::Null;
+        w.observe(&ev);
+        assert!(w.limit().is_some());
+    }
+
+    /// A: two branches hit the wall together; the automatic resume resumes
+    /// BOTH, each on its own session.
+    #[tokio::test]
+    async fn the_automatic_resume_resumes_every_plan_limited_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, seen) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "failed"]);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(crate::fleet_status::plan_waiting(&run), "only plan limits wait: calm");
+        assert!(!reasons.reasons.lock().iter().any(|r| r == "decision"), "{:?}", reasons.reasons.lock());
+
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { budget_override: false });
+        assert_eq!(statuses(&db, &run_id), ["done", "pending", "pending"], "both plan-limited stages resumed");
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Completed);
+        let runs_of = |role: &str| seen.lock().iter().filter(|s| s.role == role).count();
+        assert_eq!((runs_of("critique"), runs_of("plan_review")), (2, 2), "each ran again");
+        assert_eq!(statuses(&db, &run_id), ["done", "done", "done"]);
+    }
+
+    /// A, by hand: the director's Resume on one plan-limited stage resumes them all.
+    #[tokio::test]
+    async fn the_directors_resume_resumes_every_plan_limited_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+        assert_eq!(statuses(&db, &run_id), ["done", "done", "done"]);
+    }
+
+    /// C: a sibling's real halt next to a plan limit still needs you: not
+    /// calm, a `decision` checkpoint, and the badge counts it.
+    #[tokio::test]
+    async fn a_siblings_real_halt_still_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, _) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Halt])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        let wait = run.plan_wait.clone().expect("parked by the plan");
+        assert!(wait.resume_at.is_some(), "the plan stage still resumes on its own");
+        assert!(wait.other_hold, "the halt is another hold");
+        assert!(!crate::fleet_status::plan_waiting(&run));
+        assert!(crate::fleet_status::needs_you(&run.status, crate::fleet_status::plan_waiting(&run)));
+        let rs = reasons.reasons.lock().clone();
+        assert!(!rs.iter().any(|r| r == "plan_limit"), "nothing about this run is calm: {rs:?}");
+        assert!(rs.iter().any(|r| r == "decision"), "{rs:?}");
+    }
+
+    /// C: a sibling's gate next to a plan limit is a decision too.
+    #[tokio::test]
+    async fn a_siblings_gate_still_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, _) =
+            branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.as_ref().is_some_and(|w| w.other_hold));
+        assert!(!crate::fleet_status::plan_waiting(&run));
+        assert!(!reasons.reasons.lock().iter().any(|r| r == "plan_limit"), "{:?}", reasons.reasons.lock());
+        // Approving the gate leaves the plan park and its schedule in place.
+        let gate = db.lock().list_run_stages(&run_id).unwrap()[2].id.clone();
+        let _ = orch.resolve_checkpoint_scoped(&run_id, Some(&gate), CheckpointAction::Approve).await.unwrap();
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        let wait = run.plan_wait.clone().expect("still parked by the plan");
+        assert!(wait.resume_at.is_some(), "the automatic resume survives a sibling's decision");
+        assert!(!wait.other_hold);
+        assert!(crate::fleet_status::plan_waiting(&run), "now only the plan waits: calm");
+    }
+
+    /// B: a claim whose Resume can't be applied puts the park back (due
+    /// shortly, uncounted) instead of losing the resume.
+    #[tokio::test]
+    async fn a_resume_that_fails_to_apply_is_scheduled_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        orch.set_active_for_test(&run_id, true); // another driver holds the run
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        let at = wait.resume_at.expect("the resume is scheduled again");
+        assert!(at > now() && at <= now() + RETRY_SECS, "{at}");
+        assert_eq!(wait.resume_count, 0, "the failed claim doesn't count");
+        orch.set_active_for_test(&run_id, false);
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { budget_override: false });
+    }
+
+    /// A re-run of the plan-limited stage ends the park: no stale resume is
+    /// left to claim a run that is no longer parked.
+    #[tokio::test]
+    async fn a_rerun_ends_a_stale_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_count = 2 WHERE id = ?1", [&run_id]).unwrap();
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        orch.prepare_rerun(&run_id, &stage, None).unwrap();
+        orch.release_active(&run_id);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none(), "nothing plan-limited is left");
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "the director acted");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+
+    /// The worker waits for the plan itself only when the plan is all that
+    /// waits; a sibling's halt makes it announce instead.
+    #[tokio::test]
+    async fn the_worker_waits_only_when_the_plan_is_all_that_waits() {
+        use crate::orchestrator::plan_wait::{needs_director, worker_plan_wait};
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("a.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(worker_plan_wait(&run).is_some(), "only the plan waits: the worker waits");
+        assert!(!needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("b.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Halt])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.as_ref().is_some_and(|w| w.resume_at.is_some()));
+        assert_eq!(worker_plan_wait(&run), None, "a sibling's halt needs you: announce, don't wait");
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+    }
+
+    /// A claim that finds the plan stages resolved while a sibling's gate
+    /// still waits is `NotClaimed`, and the run still needs the director.
+    #[tokio::test]
+    async fn not_claimed_with_a_gate_left_still_needs_you() {
+        use crate::orchestrator::plan_wait::needs_director;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let critique = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        db.lock().conn_ref().execute(
+            "UPDATE run_stages SET status = 'done', error = NULL WHERE id = ?1", [&critique]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none());
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()), "the gate still waits: announce");
+    }
+
+    /// Approve with an explicit stage id resolves THAT stage, never the first
+    /// resolvable one (here the plan-limited stage sits before the gate).
+    #[tokio::test]
+    async fn approve_with_a_stage_id_resolves_that_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let gate = db.lock().list_run_stages(&run_id).unwrap()[2].id.clone();
+        assert!(orch.resolve_checkpoint_apply_only(&run_id, Some(&gate), CheckpointAction::Approve).unwrap().is_some());
+        let st = statuses(&db, &run_id);
+        assert_eq!(st[1], "failed", "the plan-limited stage is untouched");
+        assert_ne!(st[2], "awaiting_checkpoint", "the gate was approved");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+    }
+
+    /// A claim moves the resume forward instead of clearing it: a claimant
+    /// that dies before applying it never loses the park.
+    #[tokio::test]
+    async fn a_claim_that_is_never_applied_keeps_the_park_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let t = now();
+        assert!(db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap());
+        assert!(!db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap(), "exactly one claimant");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, Some(t + RETRY_SECS));
+        assert_eq!(db.lock().list_due_plan_resumes(t + RETRY_SECS).unwrap(), vec![run_id.clone()]);
+    }
+
+    /// Retries are capped: after MAX_PLAN_RETRIES failed applies the run waits
+    /// for the director (and the worker announces it).
+    #[tokio::test]
+    async fn retries_are_capped_then_it_needs_you() {
+        use crate::orchestrator::plan_wait::MAX_PLAN_RETRIES;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.set_active_for_test(&run_id, true);
+        for i in 1..MAX_PLAN_RETRIES {
+            make_due(&db, &run_id);
+            assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry, "retry {i}");
+        }
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, None, "waits for the director");
+        assert_eq!(wait.resume_count, 0, "failed claims don't count");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    /// The retry cap is counted on the run's row (#857): another process (the
+    /// app beside a detached worker, or the app after a restart) continues
+    /// the same count instead of starting its own.
+    #[tokio::test]
+    async fn the_retry_cap_is_shared_across_processes() {
+        use crate::orchestrator::plan_wait::MAX_PLAN_RETRIES;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (first, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(first.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        first.set_active_for_test(&run_id, true);
+        for i in 1..MAX_PLAN_RETRIES {
+            make_due(&db, &run_id);
+            assert_eq!(first.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry, "retry {i}");
+        }
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), MAX_PLAN_RETRIES - 1);
+        drop(first);
+        let (second, reasons, _) = orch(&db, 0, now() + 600);
+        second.set_active_for_test(&run_id, true);
+        make_due(&db, &run_id);
+        assert_eq!(second.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou, "the count carried over");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, None, "waits for the director");
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 0, "handed over: the count starts over");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    /// The director acting (a decision, a re-run, turning the automatic
+    /// resume off) starts the failed-claim count over (#857).
+    #[tokio::test]
+    async fn the_director_acting_resets_the_retry_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.set_active_for_test(&run_id, true);
+        for _ in 0..3 {
+            make_due(&db, &run_id);
+            assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry);
+        }
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 3);
+        // A decision (`dispatch_checkpoint`) or a re-run.
+        db.lock().reset_plan_resume_count(&run_id).unwrap();
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 0);
+
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry);
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 1);
+        // Turning the automatic resume off.
+        orch.cancel_plan_resume(&run_id).unwrap();
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 0);
+    }
+
+    /// A decision naming a stage that is no longer waiting (decided
+    /// elsewhere) is refused, never redirected to the first resolvable
+    /// stage: the other gate and the plan stage stay as they were.
+    #[tokio::test]
+    async fn a_stale_stage_id_is_refused_and_nothing_else_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let stale = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone(); // already done
+        for action in [CheckpointAction::Approve, CheckpointAction::Resume { max_turns_override: None }] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&stale), action).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
+        let err = orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Approve).unwrap_err();
+        assert!(err.to_string().contains("already decided"), "{err}");
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"], "the other gate stays waiting");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+        // No id keeps the single-parked rule; Abort never needs a live stage.
+        assert!(orch.check_named_stage(&run_id, None, &CheckpointAction::Approve).is_ok());
+        assert!(orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Abort).is_ok());
+    }
+
+    /// The director turning the automatic resume off while a claim is in
+    /// flight wins: the apply doesn't resume, and putting the claim's park
+    /// back never brings the schedule back.
+    #[tokio::test]
+    async fn a_cancel_during_a_claim_is_never_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let before = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        let t = now();
+        let claimed_at = t + RETRY_SECS;
+        assert!(db.lock().claim_plan_resume(&run_id, t, claimed_at).unwrap());
+        orch.cancel_plan_resume(&run_id).unwrap(); // the director, mid-claim
+        assert_eq!(orch.apply_claimed_plan_resume(&run_id, claimed_at).unwrap(), PlanClaim::NotClaimed);
+        assert_eq!(statuses(&db, &run_id), ["failed"], "not resumed");
+        let restored = db
+            .lock()
+            .restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + RETRY_SECS), claimed_at)
+            .unwrap();
+        assert!(!restored, "the cancel stands");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked by the plan");
+        assert_eq!(wait.resume_at, None, "no automatic resume came back");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+        // The claim's own park is still put back when it is untouched.
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_at = ?2 WHERE id = ?1", rusqlite::params![run_id, claimed_at]).unwrap();
+        assert!(db.lock().restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + 5), claimed_at).unwrap());
+    }
+
+    /// A Resume applied only in part (the plan stage reset to pending, then
+    /// the apply failed) leaves a paused run nobody drives: the next claim
+    /// announces it instead of going quiet.
+    #[tokio::test]
+    async fn a_partial_apply_with_no_driver_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
+        let log = db.lock().list_stage_log(&stage).unwrap();
+        assert!(log.iter().any(|e| e.contains("the resume didn't finish")), "{log:?}");
+    }
+
+    /// The same partial apply with a driver on the run says nothing: that
+    /// driver runs the pending stage.
+    #[tokio::test]
+    async fn a_partial_apply_with_a_driver_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        orch.set_active_for_test(&run_id, true);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+    }
+
+    /// Two windows in one batch: the park keeps the one that resets LAST.
+    #[tokio::test]
+    async fn the_park_keeps_the_latest_reset() {
+        use crate::orchestrator::cli_runner::PlanLimit;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 0, now());
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let late = now() + 7_200;
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "seven_day".into(), resets_at: late }).unwrap();
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "five_hour".into(), resets_at: now() + 600 }).unwrap();
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!((wait.window.as_str(), wait.resets_at), ("seven_day", late));
+        assert!(wait.resume_at.unwrap() >= late + RESUME_MARGIN_SECS);
+    }
+
+    /// A budget of 0 is no budget (the drive gate's own rule): it resumes.
+    #[tokio::test]
+    async fn a_zero_budget_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        db.lock().set_run_budget(&run_id, Some(0.0)).unwrap();
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap().resume_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn aborting_ends_the_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.abort_run(&run_id).await.unwrap();
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod refused_calls_tests {
+    use crate::orchestrator::cli_runner::{
+        parse_cli_result, parse_cli_result_redacting, refused_calls, refused_handoff, refused_notice, refused_total,
+        RefusedCall, REFUSED_NOTICE_PREFIX,
+    };
+    use crate::orchestrator::types::{ArtifactKind, StageStatus};
+    use crate::secret_scan::{redact_line, KnownSecret, REDACTED};
+    use serde_json::json;
+
+    fn result_with(denials: serde_json::Value) -> String {
+        json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "s", "total_cost_usd": 0.01, "permission_denials": denials,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_missing_or_malformed_list_reads_as_nothing_refused() {
+        for denials in [None, Some(json!(null)), Some(json!({"tool_name": "Bash"})), Some(json!("Bash")), Some(json!([]))] {
+            assert!(refused_calls(denials.as_ref(), &[]).is_empty(), "{denials:?}");
+        }
+        // An entry without a tool name is skipped; one without an input keeps the tool.
+        let calls = refused_calls(Some(&json!([{"tool_input": {"command": "ls"}}, 7, {"tool_name": "WebFetch"}])), &[]);
+        assert_eq!(calls, [RefusedCall { tool: "WebFetch".into(), hint: String::new(), count: 1 }]);
+        assert_eq!(refused_notice(&calls[0]), "refused · WebFetch");
+        // The result event without the field still parses as before.
+        let line = json!({"type": "result", "subtype": "success", "is_error": false, "result": "ok"}).to_string();
+        let out = parse_cli_result(&line, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(out.status, StageStatus::Done);
+        assert_eq!(out.artifact.text, "ok");
+        assert!(out.cli.refused_calls.is_empty());
+    }
+
+    #[test]
+    fn the_hint_is_the_command_then_file_path_then_path_on_one_line() {
+        let calls = refused_calls(
+            Some(&json!([
+                {"tool_name": "Bash", "tool_input": {"command": "npm\n   test  --  --run", "file_path": "x"}},
+                {"tool_name": "Edit", "tool_input": {"file_path": "/etc/hosts", "path": "y"}},
+                {"tool_name": "Glob", "tool_input": {"path": "/Users/dev", "pattern": "*"}},
+                {"tool_name": "Read", "tool_input": {"command": "   ", "path": "/tmp/a"}},
+            ])),
+            &[],
+        );
+        let hints: Vec<&str> = calls.iter().map(|c| c.hint.as_str()).collect();
+        assert_eq!(hints, ["npm test -- --run", "/etc/hosts", "/Users/dev", "/tmp/a"]);
+    }
+
+    #[test]
+    fn a_long_hint_is_cut_to_80_chars() {
+        let long = format!("echo {}", "word ".repeat(40));
+        let calls = refused_calls(Some(&json!([{"tool_name": "Bash", "tool_input": {"command": long}}])), &[]);
+        let hint = &calls[0].hint;
+        assert_eq!(hint.chars().count(), 80, "{hint}");
+        assert!(hint.ends_with('…') && hint.starts_with("echo word"), "{hint}");
+    }
+
+    #[test]
+    fn repeats_of_the_same_tool_and_hint_collapse() {
+        let push = json!({"tool_name": "Bash", "tool_input": {"command": "git push"}});
+        let calls = refused_calls(
+            Some(&json!([push, {"tool_name": "Bash", "tool_input": {"command": "npm test"}}, push, push,
+                {"tool_name": "Read", "tool_input": {"command": "git push"}}])),
+            &[],
+        );
+        let notices: Vec<String> = calls.iter().map(refused_notice).collect();
+        assert_eq!(notices, ["refused · Bash · git push ×3", "refused · Bash · npm test", "refused · Read · git push"]);
+        assert_eq!(refused_total(&calls), 5);
+        assert!(notices.iter().all(|n| n.starts_with(REFUSED_NOTICE_PREFIX)));
+    }
+
+    #[test]
+    fn hints_pass_through_the_secret_guard_redaction() {
+        // Built at run time so no token-shaped literal sits in the source.
+        let gh = format!("ghp_{}", "a1B2c3D4e5F6".repeat(3));
+        let mine = format!("team-gateway-{}", "Zq81".repeat(5));
+        let known = [KnownSecret::new("your LiteLLM key", mine.clone())];
+        let calls = refused_calls(
+            Some(&json!([
+                {"tool_name": "Bash", "tool_input": {"command": format!("GH_TOKEN={gh} gh pr create")}},
+                {"tool_name": "Bash", "tool_input": {"command": format!("curl -H 'Authorization: Bearer {mine}' https://x")}},
+                {"tool_name": "Bash", "tool_input": {"command": "git push https://dev:hunter2pass@example.com/r.git"}},
+            ])),
+            &known,
+        );
+        let hints: Vec<&str> = calls.iter().map(|c| c.hint.as_str()).collect();
+        assert_eq!(hints, [
+            "GH_TOKEN=[redacted] gh pr create",
+            "curl -H 'Authorization: Bearer [redacted]' https://x",
+            "git push https://dev:[redacted]@example.com/r.git",
+        ]);
+        // Through the parser too, with your own key.
+        let line = result_with(json!([{"tool_name": "Bash", "tool_input": {"command": format!("echo {mine} | pbcopy")}}]));
+        let out = parse_cli_result_redacting(&line, true, ArtifactKind::Diff, "", &known).unwrap();
+        assert_eq!(refused_notice(&out.cli.refused_calls[0]), format!("refused · Bash · echo {REDACTED} | pbcopy"));
+        assert!(!out.artifact.text.contains(&mine));
+    }
+
+    #[test]
+    fn redaction_leaves_ordinary_commands_alone() {
+        for line in ["npm test", "git push origin main", "PATH=/opt/bin:$PATH make", "TOKEN=$GITHUB_TOKEN gh auth status"] {
+            assert_eq!(redact_line(line, &[]), line);
+        }
+        let gh = format!("ghp_{}", "a1B2c3D4e5F6".repeat(3));
+        assert_eq!(redact_line(&format!("a {gh} b {gh}"), &[]), "a [redacted] b [redacted]");
+    }
+
+    #[test]
+    fn a_done_writer_stage_hands_its_refused_calls_on() {
+        let line = result_with(json!([{"tool_name": "Bash", "tool_input": {"command": "npm test"}}]));
+        let out = parse_cli_result(&line, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(out.status, StageStatus::Done);
+        assert_eq!(out.artifact.text, format!("done{}", refused_handoff(&out.cli.refused_calls)));
+        assert!(out.artifact.text.ends_with("\n- Bash: npm test"), "{}", out.artifact.text);
+        // A failed stage keeps the count but hands nothing on.
+        let failed = parse_cli_result(&line, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(refused_total(&failed.cli.refused_calls), 1);
+        assert!(!failed.artifact.text.contains("refused"));
+        assert_eq!(refused_handoff(&[]), "");
+    }
+}
+
+#[cfg(test)]
+mod ran_model_tests {
+    use crate::orchestrator::cli_runner::{ran_on_notice, same_model, substituted_model};
+    use serde_json::json;
+
+    #[test]
+    fn aliases_snapshots_and_gateway_spellings_are_the_same_model() {
+        for (asked, ran) in [
+            ("sonnet", "claude-sonnet-5-5"),
+            ("sonnet[1m]", "claude-sonnet-5-5"),
+            ("opus", "claude-opus-5-5-20261001"),
+            ("haiku", "claude-haiku-5-5"),
+            ("fable", "claude-fable-5-2"),
+            ("opusplan", "claude-sonnet-5-5"),
+            ("default", "claude-opus-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-opus-4.8", "claude-opus-4-8"),
+            ("bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "claude-sonnet-5-5"),
+            ("claude-opus-4-6[1m]", "claude-opus-4-6"),
+            ("claude-sonnet-latest", "claude-sonnet-latest"),
+            ("Claude-Sonnet-5-5", "claude-sonnet-5-5"),
+        ] {
+            assert!(same_model(asked, ran), "{asked} vs {ran}");
+            assert!(same_model(ran, asked), "{ran} vs {asked}");
+        }
+    }
+
+    #[test]
+    fn another_model_is_not_the_same() {
+        for (asked, ran) in [
+            ("claude-opus-5-5", "claude-sonnet-5-5"),
+            ("opus", "claude-sonnet-5-5"),
+            ("sonnet", "claude-haiku-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+            ("claude-fable-5-2", "claude-fable-5-1"),
+            ("opusplan", "claude-haiku-5-5"),
+        ] {
+            assert!(!same_model(asked, ran), "{asked} vs {ran}");
+        }
+    }
+
+    #[test]
+    fn only_an_init_naming_another_model_is_a_substitution() {
+        let init = |m: serde_json::Value| json!({"type": "system", "subtype": "init", "model": m});
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!("claude-sonnet-5-5"))).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(substituted_model("sonnet", &init(json!("claude-sonnet-5-5"))), None, "no false alarm on an alias");
+        // A missing, empty or non-string model changes nothing.
+        assert_eq!(substituted_model("claude-opus-5-5", &json!({"type": "system", "subtype": "init"})), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(""))), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(42))), None);
+        // Only `system/init` counts.
+        let assistant = json!({"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": []}});
+        assert_eq!(substituted_model("claude-opus-5-5", &assistant), None);
+    }
+
+    #[test]
+    fn a_provider_native_id_without_a_claude_family_is_not_a_substitution() {
+        let init = |m: &str| json!({"type": "system", "subtype": "init", "model": m});
+        // Bedrock application-inference-profile ARNs and Foundry deployment
+        // names: unknown, not another model — no note, cost stays as asked.
+        for ran in [
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5f6",
+            "my-foundry-deployment",
+            "prod-opus",
+        ] {
+            for asked in ["claude-opus-5-5", "opus", "bedrock/us.anthropic.claude-sonnet-5-5-v1:0"] {
+                assert_eq!(substituted_model(asked, &init(ran)), None, "{asked} vs {ran}");
+            }
+        }
+        // A Claude id behind a provider prefix is still a real substitution.
+        assert_eq!(
+            substituted_model("claude-opus-5-5", &init("us.anthropic.claude-sonnet-5-5-v1:0")).as_deref(),
+            Some("us.anthropic.claude-sonnet-5-5-v1:0")
+        );
+        // A stage that asked for a non-Claude id still sees any other id.
+        assert_eq!(substituted_model("team-model", &init("other-model")).as_deref(), Some("other-model"));
+        assert_eq!(substituted_model("team-model", &init("claude-sonnet-5-5")).as_deref(), Some("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn the_notice_names_both_models_by_their_catalog_names() {
+        let router = crate::provider_router::ProviderRouter::from_map(crate::provider_router::builtin_providers());
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "claude-sonnet-5-5", Some(&router)),
+            "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model settings picked another model"
+        );
+        // An id the catalog doesn't know prints as given.
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "team-model", None),
+            "ran on team-model, not claude-opus-5-5 — Claude Code's model settings picked another model"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_only_role_tests {
+    // #847: in the Bugfix relay, Reproduce and Verify applied the change and
+    // committed it. Read-only roles get a firm instruction everywhere, lose
+    // the file-write tools on the API and are denied git writes on both.
+    use crate::orchestrator::agentic::ToolGate;
+    use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume, cli_disallowed_tools};
+    use crate::orchestrator::read_only::{
+        git_write_in, read_only_api_tools, role_is_read_only, stripped_write_tools, stripped_write_tools_notice, ReadOnlyGitGate,
+    };
+    use crate::orchestrator::roles::{builtin_roles, compose_stage_system_prompt, READ_ONLY_CLAUSE};
+
+    #[test]
+    fn read_only_is_decided_per_builtin_role() {
+        let ro: Vec<String> = builtin_roles()
+            .into_iter()
+            .filter(|r| role_is_read_only(&r.artifact_kind, r.environment))
+            .map(|r| r.key)
+            .collect();
+        let mut got = ro.clone();
+        got.sort();
+        assert_eq!(got, ["code_review", "critique", "plan_review", "repro", "security_review", "verify"]);
+        // Writers keep their tools: Tests writes the tests it runs, Fix applies
+        // the fix, action roles commit by design.
+        for k in ["implement", "fix", "test", "refine", "pull_request", "merge", "release"] {
+            assert!(!ro.iter().any(|r| r == k), "{k} must stay a writer");
+        }
+    }
+
+    #[test]
+    fn read_only_api_stages_lose_the_write_tools_but_keep_run_command() {
+        // A seeded builtin stage has no allowlist (= the full set).
+        let t = read_only_api_tools(None);
+        assert!(!t.iter().any(|x| x == "write_file" || x == "edit_file"), "{t:?}");
+        for keep in ["read_file", "list_files", "grep", "glob", "run_command"] {
+            assert!(t.iter().any(|x| x == keep), "{keep} missing: {t:?}");
+        }
+        // An author's allowlist that grants writes is stripped, order kept.
+        let own: Vec<String> = ["read_file", "write_file", "run_command", "edit_file"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(read_only_api_tools(Some(&own)), vec!["read_file".to_string(), "run_command".to_string()]);
+    }
+
+    #[test]
+    fn git_writes_are_detected_and_reads_are_not() {
+        for (cmd, sub) in [
+            ("git commit -am 'append line'", "commit"),
+            ("echo x >> f && git add f && git commit -m x", "add"),
+            ("git -C /w -c user.name=x commit -m y", "commit"),
+            ("cd repo; git push origin HEAD", "push"),
+            ("/usr/bin/git stash", "stash"),
+            ("git --no-pager checkout -- src/a.rs", "checkout"),
+            ("npm test | tee out.txt; git reset --hard", "reset"),
+            ("(git restore .)", "restore"),
+            // #902: stash write forms, including the bare and option-led push.
+            ("git stash push -m wip", "stash"),
+            ("git stash pop", "stash"),
+            ("git stash apply stash@{0}", "stash"),
+            ("git stash drop", "stash"),
+            ("git stash clear", "stash"),
+            ("git stash -u", "stash"),
+            // #902: `--git-dir`/`--work-tree` with a separate value.
+            ("git --git-dir /w/.git commit -m x", "commit"),
+            ("git --work-tree /w add .", "add"),
+            ("git --git-dir /w/.git --work-tree /w reset --hard", "reset"),
+            ("git --git-dir=/w/.git push", "push"),
+            // A quoted option value still counts as one word.
+            ("git --git-dir \"/w/.git\" commit -m x", "commit"),
+            ("git -C \"/w\" commit", "commit"),
+            ("git -c \"user.name=x\" commit -m y", "commit"),
+            ("git --work-tree \"$PWD\" add .", "add"),
+            ("git --git-dir=\"/w/.git\" push", "push"),
+            ("git --attr-source HEAD commit -m x", "commit"),
+            ("git --exec-path commit", "commit"),
+        ] {
+            assert_eq!(git_write_in(cmd), Some(sub), "{cmd}");
+        }
+        for cmd in [
+            "git status",
+            "git diff HEAD~1",
+            "git log --oneline -5",
+            "git -C /w show HEAD",
+            "git branch --show-current",
+            "cargo test commit",
+            "grep -rn 'git commit' src",
+            "echo commit",
+            // #902: stash reads stay allowed.
+            "git stash list",
+            "git stash show -p stash@{0}",
+            "git -C /w stash list",
+            // #902: a separate-value option is not taken for the subcommand.
+            "git --git-dir /w/.git log",
+            "git --work-tree /w status",
+            "git --git-dir add log",
+            "grep 'git commit' src",
+            "git log --grep \"commit\"",
+        ] {
+            assert_eq!(git_write_in(cmd), None, "{cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_gate_refuses_git_writes_only() {
+        let g = ReadOnlyGitGate;
+        let deny = g.check("run_command", &serde_json::json!({"command": "git commit -m x"})).await;
+        assert!(deny.is_some_and(|d| d.contains("read-only")));
+        assert!(g.check("run_command", &serde_json::json!({"command": "cargo test"})).await.is_none());
+        assert!(g.check("run_command", &serde_json::json!({"command": "git diff"})).await.is_none());
+        assert!(g.check("read_file", &serde_json::json!({"path": "a"})).await.is_none());
+        assert!(g.check("run_command", &serde_json::json!({"command": "git stash list"})).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_only_gate_refuses_write_tools_called_by_name() {
+        // #902: API execution dispatches by name, so an unoffered write tool
+        // must still be refused at the gate.
+        let g = ReadOnlyGitGate;
+        for name in ["write_file", "edit_file"] {
+            let deny = g.check(name, &serde_json::json!({"path": "a", "content": "x"})).await;
+            assert!(deny.is_some_and(|d| d.contains(name) && d.contains("read-only")), "{name}");
+        }
+        for name in ["read_file", "list_files", "grep", "glob"] {
+            assert!(g.check(name, &serde_json::json!({"path": "a"})).await.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn stripped_write_tools_are_named_in_a_journal_notice() {
+        // #902: a custom read-only role that saved write tools is told so.
+        let own: Vec<String> = ["read_file", "write_file", "run_command", "edit_file"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(stripped_write_tools(true, Some(&own)), vec!["write_file".to_string(), "edit_file".to_string()]);
+        let note = stripped_write_tools_notice(true, Some(&own)).expect("notice");
+        assert!(note.contains("`write_file`, `edit_file` were removed"), "{note}");
+        let one: Vec<String> = ["read_file", "edit_file"].iter().map(|s| s.to_string()).collect();
+        assert!(stripped_write_tools_notice(true, Some(&one)).is_some_and(|n| n.contains("`edit_file` was removed")));
+        // No list (builtin), no write tools, or a writer role: no notice.
+        assert!(stripped_write_tools_notice(true, None).is_none());
+        let reads: Vec<String> = ["read_file", "grep"].iter().map(|s| s.to_string()).collect();
+        assert!(stripped_write_tools_notice(true, Some(&reads)).is_none());
+        assert!(stripped_write_tools_notice(false, Some(&own)).is_none());
+    }
+
+    #[test]
+    fn read_only_roles_get_the_clause_on_both_substrates() {
+        for r in builtin_roles() {
+            let ro = role_is_read_only(&r.artifact_kind, r.environment);
+            for api in [true, false] {
+                let s = compose_stage_system_prompt(&r.prompt_body, r.environment, ro, None, None, api);
+                assert_eq!(s.contains(READ_ONLY_CLAUSE), ro, "{} api={api}", r.key);
+            }
+        }
+        let repro = builtin_roles().into_iter().find(|r| r.key == "repro").unwrap();
+        assert!(repro.prompt_body.contains("Do not fix it yourself"));
+    }
+
+    #[test]
+    fn read_only_claude_stages_deny_git_writes_in_cli_args() {
+        let denied = |args: &[String]| -> Vec<String> {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            args[i + 1].split(',').map(str::to_string).collect()
+        };
+        for ro in [build_cli_args("m", "sys", 10, true), build_cli_args_resume("m", "sess", 10, true)] {
+            let tools = denied(&ro[..]);
+            for t in [
+                "Bash(git commit:*)",
+                "Bash(git push:*)",
+                "Bash(git add:*)",
+                "Bash(git stash)",
+                "Bash(git stash -*)",
+                "Bash(git stash push:*)",
+                "Bash(git stash pop:*)",
+                "Bash(git stash apply:*)",
+                "Bash(git stash drop:*)",
+                "Bash(git stash clear:*)",
+                "Write",
+                "Edit",
+            ] {
+                assert!(tools.iter().any(|x| x == t), "{t} missing: {ro:?}");
+            }
+            // #902: no wholesale stash rule, so `stash list`/`show` stay allowed.
+            assert!(!tools.iter().any(|x| x == "Bash(git stash:*)"), "{ro:?}");
+            assert!(!tools.iter().any(|x| x.contains("stash list") || x.contains("stash show")), "{ro:?}");
+        }
+        for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
+            assert!(!denied(&rw[..]).iter().any(|x| x.starts_with("Bash(")), "{rw:?}");
+        }
+        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion,EnterWorktree,ExitWorktree");
+        assert!(cli_disallowed_tools(true).starts_with("AskUserQuestion,EnterWorktree,ExitWorktree,"));
+    }
+}
+
+/// Rail groups: the `groups` table, `group_id` on projects and workspaces,
+/// and the rules of membership (one group per item, same scope, same project).
+#[cfg(test)]
+mod group_tests {
+    use crate::db::{Db, GroupRow, GROUP_TINTS};
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn seed_project(db: &Db, id: &str) {
+        db.insert_project(id, id, &format!("/tmp/octo-groups-{id}")).unwrap();
+    }
+
+    fn seed_workspace(db: &Db, project_id: &str, id: &str) {
+        db.insert_workspace(id, project_id, id, "", id, None, "", None).unwrap();
+    }
+
+    /// One project `p1` holding `w1`, `w2`, `w3`, created in that order.
+    fn seeded() -> Db {
+        let db = test_db();
+        seed_project(&db, "p1");
+        for ws in ["w1", "w2", "w3"] {
+            seed_workspace(&db, "p1", ws);
+        }
+        db
+    }
+
+    fn workspace_group(db: &Db, project_id: &str, name: &str, members: &[&str]) -> GroupRow {
+        let members: Vec<String> = members.iter().map(|m| m.to_string()).collect();
+        db.create_group("workspace", Some(project_id), name, None, &members).unwrap()
+    }
+
+    fn project_group(db: &Db, name: &str, members: &[&str]) -> GroupRow {
+        let members: Vec<String> = members.iter().map(|m| m.to_string()).collect();
+        db.create_group("project", None, name, None, &members).unwrap()
+    }
+
+    fn group_of_workspace(db: &Db, id: &str) -> Option<String> {
+        db.get_workspace(id).unwrap().unwrap().group_id
+    }
+
+    fn group_of_project(db: &Db, id: &str) -> Option<String> {
+        db.get_project(id).unwrap().unwrap().group_id
+    }
+
+    /// Sibling group names in stored order.
+    fn names(db: &Db, scope: &str, project_id: Option<&str>) -> Vec<String> {
+        db.list_groups()
+            .unwrap()
+            .into_iter()
+            .filter(|g| g.scope == scope && g.project_id.as_deref() == project_id)
+            .map(|g| g.name)
+            .collect()
+    }
+
+    fn refusal(result: crate::error::AppResult<impl std::fmt::Debug>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    fn has_column(db: &Db, table: &str, column: &str) -> bool {
+        let mut stmt = db.conn_ref().prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names.iter().any(|n| n == column)
+    }
+
+    #[test]
+    fn migration_adds_groups_to_an_existing_db() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            // A database from before groups: the first-release tables, with rows.
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE projects (
+                    id              TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL,
+                    path            TEXT NOT NULL UNIQUE,
+                    created_at      TEXT NOT NULL,
+                    last_opened     TEXT NOT NULL
+                );
+                CREATE TABLE workspaces (
+                    id              TEXT PRIMARY KEY,
+                    project_id      TEXT NOT NULL,
+                    name            TEXT NOT NULL,
+                    task            TEXT NOT NULL DEFAULT '',
+                    branch          TEXT NOT NULL,
+                    worktree_path   TEXT,
+                    setup_script    TEXT NOT NULL DEFAULT '',
+                    status          TEXT NOT NULL DEFAULT 'active',
+                    created_at      TEXT NOT NULL,
+                    last_active     TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+                );
+                INSERT INTO projects (id, name, path, created_at, last_opened)
+                    VALUES ('p1', 'Old project', '/tmp/octo-groups-old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO workspaces (id, project_id, name, branch, created_at, last_active)
+                    VALUES ('w1', 'p1', 'main', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        assert!(has_column(&db, "projects", "group_id"), "projects.group_id missing");
+        assert!(has_column(&db, "workspaces", "group_id"), "workspaces.group_id missing");
+        assert!(db.list_groups().unwrap().is_empty());
+        // Rows from before the migration read as ungrouped.
+        assert_eq!(group_of_project(&db, "p1"), None);
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+        assert_eq!(db.list_projects().unwrap()[0].7, None);
+        assert_eq!(db.list_workspaces("p1").unwrap()[0].group_id, None);
+        // And they can be grouped right away.
+        let group = workspace_group(&db, "p1", "PR reviews", &["w1"]);
+        assert_eq!(group_of_workspace(&db, "w1"), Some(group.id.clone()));
+        drop(db);
+
+        // migrate() runs on every launch: a second open keeps the data.
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+        assert_eq!(group_of_workspace(&db, "w1"), Some(group.id));
+    }
+
+    #[test]
+    fn create_group_assigns_its_members() {
+        let db = seeded();
+        let group = db
+            .create_group(
+                "workspace",
+                Some("p1"),
+                "  Vulnerability fixes  ",
+                Some("verdigris"),
+                &["w2".to_string(), "w3".to_string()],
+            )
+            .unwrap();
+        assert_eq!(group.scope, "workspace");
+        assert_eq!(group.project_id.as_deref(), Some("p1"));
+        assert_eq!(group.name, "Vulnerability fixes", "the name is trimmed");
+        assert_eq!(group.tint.as_deref(), Some("verdigris"));
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+        assert_eq!(db.get_group(&group.id).unwrap(), Some(group.clone()));
+
+        // The rows the rail already loads carry the membership.
+        let rows = db.list_workspaces("p1").unwrap();
+        let by_id = |id: &str| rows.iter().find(|w| w.id == id).unwrap().group_id.clone();
+        assert_eq!(by_id("w1"), None);
+        assert_eq!(by_id("w2"), Some(group.id.clone()));
+        assert_eq!(by_id("w3"), Some(group.id.clone()));
+        let found = db.find_workspace_by_branch("p1", "w2").unwrap().unwrap();
+        assert_eq!(found.group_id, Some(group.id));
+    }
+
+    #[test]
+    fn project_groups_hold_projects() {
+        let db = test_db();
+        for p in ["pa", "pb", "pc"] {
+            seed_project(&db, p);
+        }
+        let group = project_group(&db, "Client work", &["pa", "pc"]);
+        assert_eq!(group.scope, "project");
+        assert_eq!(group.project_id, None);
+
+        let rows = db.list_projects().unwrap();
+        let by_id = |id: &str| rows.iter().find(|p| p.0 == id).unwrap().7.clone();
+        assert_eq!(by_id("pa"), Some(group.id.clone()));
+        assert_eq!(by_id("pb"), None);
+        assert_eq!(by_id("pc"), Some(group.id.clone()));
+        assert_eq!(group_of_project(&db, "pa"), Some(group.id.clone()));
+
+        // A closed project keeps its group, in the closed list too.
+        db.close_project("pc").unwrap();
+        let closed = db.list_closed_projects().unwrap();
+        assert_eq!(closed[0].0, "pc");
+        assert_eq!(closed[0].7, Some(group.id));
+    }
+
+    #[test]
+    fn create_group_refuses_bad_scopes_and_writes_nothing() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+
+        assert_eq!(
+            refusal(db.create_group("workspace", None, "PR reviews", None, &[])),
+            "other: A workspace group needs the project it belongs to."
+        );
+        assert_eq!(
+            refusal(db.create_group("project", Some("p1"), "PR reviews", None, &[])),
+            "other: A project group cannot belong to a project."
+        );
+        assert_eq!(
+            refusal(db.create_group("folder", None, "PR reviews", None, &[])),
+            "other: Unknown group scope 'folder'. Use 'project' or 'workspace'."
+        );
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("nope"), "PR reviews", None, &[])),
+            "other: Project not found."
+        );
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("p1"), "   ", None, &[])),
+            "other: Group name cannot be empty."
+        );
+        // A member from another project refuses the whole create: no group, and
+        // the valid member listed before it is left alone.
+        assert_eq!(
+            refusal(db.create_group(
+                "workspace",
+                Some("p1"),
+                "PR reviews",
+                None,
+                &["w1".to_string(), "x1".to_string()],
+            )),
+            "other: A workspace can only join a group in its own project."
+        );
+        // A project is not a member of a workspace group, nor the reverse.
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("p1"), "PR reviews", None, &["p1".to_string()])),
+            "other: Workspace not found."
+        );
+        assert_eq!(
+            refusal(db.create_group("project", None, "PR reviews", None, &["w1".to_string()])),
+            "other: Project not found."
+        );
+        assert!(db.list_groups().unwrap().is_empty());
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+
+        // The table itself refuses a scope that disagrees with its owner.
+        let insert = |scope: &str, project: Option<&str>| {
+            db.conn_ref().execute(
+                "INSERT INTO groups (id, scope, project_id, name, sort_order, created_at)
+                 VALUES ('raw', ?1, ?2, 'Raw', 0, '2026-01-01T00:00:00Z')",
+                rusqlite::params![scope, project],
+            )
+        };
+        assert!(insert("workspace", None).is_err());
+        assert!(insert("project", Some("p1")).is_err());
+        assert!(insert("folder", None).is_err());
+    }
+
+    #[test]
+    fn a_new_group_takes_the_place_of_its_first_member() {
+        let db = seeded();
+        seed_workspace(&db, "p1", "w4");
+        // The first group, around the third workspace.
+        workspace_group(&db, "p1", "Third", &["w3"]);
+        // An empty one goes last.
+        workspace_group(&db, "p1", "Empty", &[]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["Third", "Empty"]);
+        // A group around the first workspace sits before "Third"; the member
+        // order given doesn't matter, the rail's does.
+        workspace_group(&db, "p1", "First", &["w2", "w1"]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["First", "Third", "Empty"]);
+        // A group whose first member comes after every other group's goes last.
+        workspace_group(&db, "p1", "Fourth", &["w4"]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["First", "Third", "Empty", "Fourth"]);
+        // Taking w2 out of "First" into its own group: "First" still starts at
+        // w1, so the new group lands right after it.
+        workspace_group(&db, "p1", "Second", &["w2"]);
+        assert_eq!(
+            names(&db, "workspace", Some("p1")),
+            ["First", "Second", "Third", "Empty", "Fourth"]
+        );
+        // Stored positions are distinct.
+        let mut orders: Vec<i64> = db.list_groups().unwrap().iter().map(|g| g.sort_order).collect();
+        orders.dedup();
+        assert_eq!(orders.len(), 5);
+
+        // Each scope and each project is its own run of positions.
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        workspace_group(&db, "p2", "Other project", &["x1"]);
+        project_group(&db, "Projects", &["p2"]);
+        project_group(&db, "Projects first", &["p1"]);
+        assert_eq!(names(&db, "workspace", Some("p2")), ["Other project"]);
+        assert_eq!(names(&db, "project", None), ["Projects first", "Projects"]);
+        assert_eq!(
+            names(&db, "workspace", Some("p1")),
+            ["First", "Second", "Third", "Empty", "Fourth"]
+        );
+    }
+
+    #[test]
+    fn an_item_is_in_one_group_at_a_time() {
+        let db = seeded();
+        let a = workspace_group(&db, "p1", "Vulnerability fixes", &["w1"]);
+        let b = workspace_group(&db, "p1", "PR reviews", &[]);
+
+        db.set_item_group("workspace", "w1", Some(&b.id)).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), Some(b.id.clone()));
+        let in_a: i64 = db
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM workspaces WHERE group_id = ?1", [&a.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(in_a, 0);
+
+        // Creating a group around a grouped item moves it as well.
+        let c = workspace_group(&db, "p1", "Later", &["w1"]);
+        assert_eq!(group_of_workspace(&db, "w1"), Some(c.id));
+
+        // Out of any group.
+        db.set_item_group("workspace", "w1", None).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+
+        // Projects move the same way.
+        let pg = project_group(&db, "Client work", &[]);
+        db.set_item_group("project", "p1", Some(&pg.id)).unwrap();
+        assert_eq!(group_of_project(&db, "p1"), Some(pg.id));
+        db.set_item_group("project", "p1", None).unwrap();
+        assert_eq!(group_of_project(&db, "p1"), None);
+    }
+
+    #[test]
+    fn set_item_group_refuses_scope_and_cross_project_moves() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        let mine = workspace_group(&db, "p1", "PR reviews", &["w1"]);
+        let theirs = workspace_group(&db, "p2", "PR reviews", &[]);
+        let projects = project_group(&db, "Client work", &[]);
+
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "w1", Some(&theirs.id))),
+            "other: A workspace can only join a group in its own project."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "w1", Some(&projects.id))),
+            "other: A workspace can only join a workspace group."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("project", "p1", Some(&mine.id))),
+            "other: A project can only join a project group."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "w1", Some("nope"))),
+            "other: Group not found."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "nope", Some(&mine.id))),
+            "other: Workspace not found."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("project", "nope", None)),
+            "other: Project not found."
+        );
+        for group in [Some(mine.id.as_str()), None] {
+            assert_eq!(
+                refusal(db.set_item_group("mission", "w1", group)),
+                "other: Unknown item kind 'mission'. Use 'project' or 'workspace'."
+            );
+        }
+        // Every refusal left the membership as it was.
+        assert_eq!(group_of_workspace(&db, "w1"), Some(mine.id));
+        assert_eq!(group_of_workspace(&db, "x1"), None);
+        assert_eq!(group_of_project(&db, "p1"), None);
+    }
+
+    #[test]
+    fn set_items_group_moves_all_or_none() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        let fixes = workspace_group(&db, "p1", "Fixes", &["w1"]);
+        let ids = |items: &[&str]| items.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+
+        db.set_items_group("workspace", &ids(&["w1", "w2", "w3"]), Some(&fixes.id)).unwrap();
+        for ws in ["w1", "w2", "w3"] {
+            assert_eq!(group_of_workspace(&db, ws), Some(fixes.id.clone()));
+        }
+
+        // One mission of another project refuses the whole move.
+        let later = workspace_group(&db, "p1", "Later", &[]);
+        assert_eq!(
+            refusal(db.set_items_group("workspace", &ids(&["w1", "x1", "w2"]), Some(&later.id))),
+            "other: A workspace can only join a group in its own project."
+        );
+        assert_eq!(
+            refusal(db.set_items_group("workspace", &ids(&["w1", "nope"]), None)),
+            "other: Workspace not found."
+        );
+        assert_eq!(
+            refusal(db.set_items_group("mission", &ids(&["w1"]), None)),
+            "other: Unknown item kind 'mission'. Use 'project' or 'workspace'."
+        );
+        for ws in ["w1", "w2", "w3"] {
+            assert_eq!(group_of_workspace(&db, ws), Some(fixes.id.clone()));
+        }
+
+        db.set_items_group("workspace", &ids(&["w1", "w3"]), None).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+        assert_eq!(group_of_workspace(&db, "w2"), Some(fixes.id));
+        assert_eq!(group_of_workspace(&db, "w3"), None);
+    }
+
+    #[test]
+    fn rename_group_trims_and_refuses_an_empty_name() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &[]);
+
+        db.rename_group(&group.id, "  Reviews to do \n").unwrap();
+        assert_eq!(db.get_group(&group.id).unwrap().unwrap().name, "Reviews to do");
+
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                refusal(db.rename_group(&group.id, blank)),
+                "other: Group name cannot be empty."
+            );
+        }
+        assert_eq!(db.get_group(&group.id).unwrap().unwrap().name, "Reviews to do");
+        assert_eq!(refusal(db.rename_group("nope", "Name")), "other: Group not found.");
+    }
+
+    #[test]
+    fn group_tint_is_one_of_the_monogram_tints_or_none() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &[]);
+        assert_eq!(group.tint, None);
+        let tint = |db: &Db| db.get_group(&group.id).unwrap().unwrap().tint;
+
+        for name in GROUP_TINTS {
+            db.set_group_tint(&group.id, Some(name)).unwrap();
+            assert_eq!(tint(&db).as_deref(), Some(name));
+        }
+        // No hue outside the list, on change or on create; the stored one stays.
+        let expected =
+            "other: Unknown tint 'teal'. Use one of: brass, verdigris, rouge, indigo, lavender, smoke, bone.";
+        assert_eq!(refusal(db.set_group_tint(&group.id, Some("teal"))), expected);
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("p1"), "Tinted", Some("teal"), &[])),
+            expected
+        );
+        assert!(db.set_group_tint(&group.id, Some("purple")).is_err());
+        assert!(db.set_group_tint(&group.id, Some("Brass")).is_err());
+        assert_eq!(tint(&db).as_deref(), Some("bone"));
+        assert_eq!(db.list_groups().unwrap().len(), 1);
+
+        db.set_group_tint(&group.id, None).unwrap();
+        assert_eq!(tint(&db), None);
+        db.set_group_tint(&group.id, Some("rouge")).unwrap();
+        db.set_group_tint(&group.id, Some("  ")).unwrap();
+        assert_eq!(tint(&db), None, "a blank tint clears it");
+        assert_eq!(refusal(db.set_group_tint("nope", Some("brass"))), "other: Group not found.");
+    }
+
+    /// The backend list is the frontend's `TINT_NAMES`, name for name.
+    #[test]
+    fn group_tints_match_the_frontend_monogram_tints() {
+        let source = include_str!("../../src/lib/monogram.ts");
+        let start = source.find("export const TINT_NAMES").expect("TINT_NAMES in monogram.ts");
+        let list = &source[start..];
+        let list = &list[list.find("= [").unwrap() + 3..];
+        let list = &list[..list.find(']').unwrap()];
+        let frontend: Vec<&str> = list
+            .split(',')
+            .map(|name| name.trim().trim_matches('"'))
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert_eq!(frontend, GROUP_TINTS);
+    }
+
+    #[test]
+    fn delete_group_keeps_its_members_and_clears_their_group() {
+        let db = seeded();
+        let doomed = workspace_group(&db, "p1", "Vulnerability fixes", &["w1", "w2"]);
+        let kept = workspace_group(&db, "p1", "PR reviews", &["w3"]);
+        // An archived member is cleared too, so a later restore can't point at
+        // a group that is gone.
+        db.archive_workspace("w2").unwrap();
+
+        db.delete_group(&doomed.id).unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![kept.clone()]);
+        assert!(db.get_workspace("w1").unwrap().is_some(), "the members stay");
+        assert_eq!(db.list_archived_workspaces("p1").unwrap().len(), 1);
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+        assert_eq!(group_of_workspace(&db, "w2"), None);
+        assert_eq!(group_of_workspace(&db, "w3"), Some(kept.id.clone()));
+        let dangling: i64 = db
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM workspaces WHERE group_id = ?1", [&doomed.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dangling, 0);
+
+        // Project groups: same rule, closed projects included.
+        seed_project(&db, "p2");
+        let projects = project_group(&db, "Client work", &["p1", "p2"]);
+        db.close_project("p2").unwrap();
+        db.delete_group(&projects.id).unwrap();
+        assert_eq!(group_of_project(&db, "p1"), None);
+        assert_eq!(group_of_project(&db, "p2"), None);
+        assert!(db.get_project_by_id("p2").unwrap().is_some());
+        assert_eq!(db.list_groups().unwrap(), vec![kept]);
+
+        // Deleting what is already gone is not an error.
+        db.delete_group(&doomed.id).unwrap();
+    }
+
+    #[test]
+    fn an_emptied_group_still_lists() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &["w1", "w2"]);
+        db.set_item_group("workspace", "w1", None).unwrap();
+        db.set_item_group("workspace", "w2", None).unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+
+        // Its last member deleted outright: still there.
+        db.set_item_group("workspace", "w3", Some(&group.id)).unwrap();
+        db.delete_workspace("w3").unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+
+        // And it takes members again.
+        db.set_item_group("workspace", "w1", Some(&group.id)).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), Some(group.id));
+    }
+
+    #[test]
+    fn archive_and_restore_keep_the_group_membership() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &["w1"]);
+
+        db.archive_workspace("w1").unwrap();
+        let archived = db.list_archived_workspaces("p1").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].group_id, Some(group.id.clone()), "the archived row names its group");
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()], "the group outlives its only member");
+
+        db.restore_workspace("w1").unwrap();
+        let restored = db.list_workspaces("p1").unwrap().into_iter().find(|w| w.id == "w1").unwrap();
+        assert_eq!(restored.status, "active");
+        assert_eq!(restored.group_id, Some(group.id.clone()), "restored into its group");
+
+        // The group deleted while the workspace is archived: it restores ungrouped.
+        db.archive_workspace("w1").unwrap();
+        db.delete_group(&group.id).unwrap();
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+    }
+
+    #[test]
+    fn deleting_a_project_removes_its_workspace_groups() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        workspace_group(&db, "p1", "Vulnerability fixes", &["w1"]);
+        workspace_group(&db, "p1", "PR reviews", &[]);
+        let other = workspace_group(&db, "p2", "PR reviews", &["x1"]);
+        let projects = project_group(&db, "Client work", &["p1", "p2"]);
+
+        db.delete_project("p1").unwrap();
+        let left: Vec<String> = db.list_groups().unwrap().into_iter().map(|g| g.id).collect();
+        assert_eq!(left, [projects.id.clone(), other.id.clone()]);
+        // The other project's rows are untouched, and the project group that
+        // held the deleted project keeps its other member.
+        assert_eq!(group_of_workspace(&db, "x1"), Some(other.id));
+        assert_eq!(group_of_project(&db, "p2"), Some(projects.id));
+    }
+
+    #[test]
+    fn set_group_order_persists_a_manual_order() {
+        let db = seeded();
+        let a = workspace_group(&db, "p1", "A", &[]);
+        let b = workspace_group(&db, "p1", "B", &[]);
+        let c = workspace_group(&db, "p1", "C", &[]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["A", "B", "C"]);
+
+        db.set_group_order(&[c.id.clone(), a.id.clone(), "nope".to_string(), b.id.clone()]).unwrap();
+        assert_eq!(names(&db, "workspace", Some("p1")), ["C", "A", "B"]);
+        // A group made afterwards still goes last.
+        workspace_group(&db, "p1", "D", &[]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["C", "A", "B", "D"]);
+    }
+}
+
+// ── "Starts after" (#960/#1031): a mission that waits on another one ───────
+#[cfg(test)]
+mod prerequisite_tests {
+    use crate::db::{Db, PrerequisiteRow, PREREQUISITE_CONDITIONS};
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn seed_project(db: &Db, id: &str) {
+        db.insert_project(id, id, &format!("/tmp/octo-prereq-{id}")).unwrap();
+    }
+
+    fn seed_workspace(db: &Db, project_id: &str, id: &str) {
+        db.insert_workspace(id, project_id, id, "", id, None, "", None).unwrap();
+    }
+
+    /// One project `p1` holding `w1`, `w2`, `w3`.
+    fn seeded() -> Db {
+        let db = test_db();
+        seed_project(&db, "p1");
+        for ws in ["w1", "w2", "w3"] {
+            seed_workspace(&db, "p1", ws);
+        }
+        db
+    }
+
+    fn link(db: &Db, ws: &str, after: &str) {
+        db.set_workspace_prerequisite(ws, after, "run_finished", false, false).unwrap();
+    }
+
+    fn after_of(db: &Db, ws: &str) -> Option<String> {
+        db.get_workspace_prerequisite(ws).unwrap().map(|p| p.after_workspace_id)
+    }
+
+    fn refusal(result: crate::error::AppResult<impl std::fmt::Debug>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    /// The raw columns, so a cleared link is checked down to its flags.
+    fn columns(db: &Db, ws: &str) -> (Option<String>, Option<String>, i64, i64) {
+        db.conn_ref()
+            .query_row(
+                "SELECT after_workspace_id, after_condition, branch_from_prerequisite, auto_start
+                 FROM workspaces WHERE id = ?1",
+                [ws],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    const CLEARED: (Option<String>, Option<String>, i64, i64) = (None, None, 0, 0);
+
+    #[test]
+    fn a_new_mission_has_no_prerequisite_and_auto_start_is_off() {
+        let db = seeded();
+        assert_eq!(db.get_workspace_prerequisite("w1").unwrap(), None);
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(refusal(db.get_workspace_prerequisite("nope")), "other: Mission not found.");
+    }
+
+    #[test]
+    fn set_stores_the_link_and_replaces_an_earlier_one() {
+        let db = seeded();
+        let row = db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        let expected = PrerequisiteRow {
+            workspace_id: "w2".into(),
+            after_workspace_id: "w1".into(),
+            after_condition: "pr_merged".into(),
+            branch_from_prerequisite: true,
+            auto_start: true,
+        };
+        assert_eq!(row, expected);
+        assert_eq!(db.get_workspace_prerequisite("w2").unwrap(), Some(expected));
+
+        // Setting again replaces the link, flags included.
+        db.set_workspace_prerequisite("w2", "w3", "run_finished", false, false).unwrap();
+        let row = db.get_workspace_prerequisite("w2").unwrap().unwrap();
+        assert_eq!(row.after_workspace_id, "w3");
+        assert_eq!(row.after_condition, "run_finished");
+        assert!(!row.branch_from_prerequisite);
+        assert!(!row.auto_start);
+
+        // Several missions can wait on the same one.
+        link(&db, "w1", "w3");
+        assert_eq!(after_of(&db, "w1").as_deref(), Some("w3"));
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn every_condition_is_accepted_and_nothing_else() {
+        let db = seeded();
+        for condition in PREREQUISITE_CONDITIONS {
+            db.set_workspace_prerequisite("w2", "w1", condition, false, false).unwrap();
+            assert_eq!(db.get_workspace_prerequisite("w2").unwrap().unwrap().after_condition, condition);
+        }
+        db.clear_workspace_prerequisite("w2").unwrap();
+        for bad in ["", "merged", "RUN_FINISHED"] {
+            assert_eq!(
+                refusal(db.set_workspace_prerequisite("w2", "w1", bad, false, false)),
+                format!("other: Unknown condition '{bad}'. Use one of: run_finished, pr_merged.")
+            );
+        }
+        assert_eq!(columns(&db, "w2"), CLEARED);
+    }
+
+    #[test]
+    fn set_refuses_cycles_and_leaves_the_links_as_they_were() {
+        let db = seeded();
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w1", "run_finished", false, false)),
+            "other: These missions would wait on each other."
+        );
+        link(&db, "w2", "w1");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w2", "run_finished", false, false)),
+            "other: These missions would wait on each other."
+        );
+        // Longer loops too: w3 → w2 → w1, then w1 → w3.
+        link(&db, "w3", "w2");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w3", "pr_merged", true, true)),
+            "other: These missions would wait on each other."
+        );
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
+        assert_eq!(after_of(&db, "w3").as_deref(), Some("w2"));
+
+        // A chain that doesn't come back is fine.
+        seed_workspace(&db, "p1", "w4");
+        link(&db, "w4", "w3");
+        assert_eq!(after_of(&db, "w4").as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn set_refuses_other_projects_missing_and_archived_missions() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "x1", "run_finished", false, false)),
+            "other: A mission can only wait on a mission of its own project."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("x1", "w1", "run_finished", false, false)),
+            "other: A mission can only wait on a mission of its own project."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "nope", "run_finished", false, false)),
+            "other: The mission to wait on was not found."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("nope", "w1", "run_finished", false, false)),
+            "other: Mission not found."
+        );
+        db.archive_workspace("w3").unwrap();
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w3", "run_finished", false, false)),
+            "other: A mission can't wait on an archived mission."
+        );
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(columns(&db, "x1"), CLEARED);
+    }
+
+    #[test]
+    fn clear_removes_the_link_and_its_flags() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        db.clear_workspace_prerequisite("w2").unwrap();
+        assert_eq!(db.get_workspace_prerequisite("w2").unwrap(), None);
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // Clearing a mission with no link is not an error; an unknown one is.
+        db.clear_workspace_prerequisite("w2").unwrap();
+        assert_eq!(refusal(db.clear_workspace_prerequisite("nope")), "other: Mission not found.");
+    }
+
+    #[test]
+    fn deleting_a_prerequisite_clears_the_links_to_it() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        link(&db, "w3", "w1");
+        seed_workspace(&db, "p1", "w4");
+        link(&db, "w1", "w4");
+
+        db.delete_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        assert_eq!(columns(&db, "w3"), CLEARED);
+        let dangling: i64 = db
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM workspaces WHERE after_workspace_id = 'w1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dangling, 0);
+        assert!(db.get_workspace("w4").unwrap().is_some());
+    }
+
+    #[test]
+    fn archiving_a_prerequisite_clears_the_links_and_restore_keeps_them_cleared() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        link(&db, "w1", "w3");
+
+        db.archive_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // The archived mission's own link is not one that points at it.
+        assert_eq!(after_of(&db, "w1").as_deref(), Some("w3"));
+
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // Once restored it can be waited on again.
+        link(&db, "w2", "w1");
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn the_migration_is_idempotent() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let db = Db::open(tmp.path()).unwrap();
+            seed_project(&db, "p1");
+            seed_workspace(&db, "p1", "w1");
+            seed_workspace(&db, "p1", "w2");
+            link(&db, "w2", "w1");
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
+    }
+}
+
+// ── Sync contract with octopush-api #24/#27/#28: run paging, run size cap,
+// library rejections, `no_detail`, library `?since=` (#799, #823) ─────────
+#[cfg(test)]
+mod sync_contract_tests {
+    use crate::settings::{test_settings_path, test_sync_override, AppSettings};
+    use crate::sync::{
+        apply_library_rejections, cap_run_payload, library_item_bytes, library_since,
+        library_since_usable, status, test_net, LibraryRejection, PushOutcome, SyncKind,
+        SyncLibraryItem, SyncRun, MAX_LIBRARY_ITEM_BYTES, MAX_RUN_PAYLOAD_BYTES, TRUNCATION_MARK,
+    };
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The API's own fixtures (octopush-api `test/fixtures/sync/`), copied with
+    /// their invented data, plus the #27/#28 shapes.
+    fn fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sync-api")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn fixture_json(name: &str) -> serde_json::Value {
+        serde_json::from_str(&fixture(name)).unwrap()
+    }
+
+    /// A `next_since` an hour old (the fixtures' fixed dates age out of the
+    /// 90-day window).
+    fn fresh_since() -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// The fixture with its `next_since` replaced by `since`.
+    fn with_since(name: &str, since: &str) -> String {
+        let mut v = fixture_json(name);
+        v["next_since"] = serde_json::Value::String(since.to_string());
+        v.to_string()
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+        test_settings_path::set(None);
+        status::forget(SyncKind::History);
+        status::forget(SyncKind::Library);
+    }
+
+    /// One request as the server saw it.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        line: String,
+        body: String,
+    }
+
+    impl Seen {
+        fn path(&self) -> String {
+            self.line.split_whitespace().nth(1).unwrap_or_default().to_string()
+        }
+        fn query(&self, key: &str) -> Option<String> {
+            let url = reqwest::Url::parse(&format!("http://x{}", self.path())).ok()?;
+            url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// An HTTP server answering requests in order from `script` (then 500).
+    async fn scripted(script: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, queue) = (log.clone(), queue.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    let (head, body) = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            let body = String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).to_string();
+                            break (head, body);
+                        }
+                    };
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let (code, answer) = {
+                        log.lock().unwrap().push(Seen { line, body });
+                        queue.lock().unwrap().pop_front().unwrap_or((500, "{}".into()))
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn requests(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        seen.lock().unwrap().clone()
+    }
+
+    // ── Contract: the shapes the app sends and parses ───────────────────
+
+    #[test]
+    fn contract_push_bodies_match_the_api_fixtures() {
+        // Runs: the app's SyncRun writes exactly the fixture's run.
+        let body = fixture_json("sync-runs.push.one.json");
+        let run: SyncRun = serde_json::from_value(body["runs"][0].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&run).unwrap(), body["runs"][0]);
+        // A fixture-sized run is far under the cap and left alone.
+        let mut capped = run.clone();
+        assert!(!cap_run_payload(&mut capped));
+
+        // Library: pipeline, role and tombstone round-trip to the same envelope.
+        let body = fixture_json("sync-library.push.json");
+        for item in body["items"].as_array().unwrap() {
+            let parsed: SyncLibraryItem = serde_json::from_value(item.clone()).unwrap();
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), item);
+            assert!(library_item_bytes(&parsed) <= MAX_LIBRARY_ITEM_BYTES);
+        }
+
+        // Detail: `{ run_id, data }` with data the app's SyncRunDetail.
+        let body = fixture_json("sync-run-detail.push.json");
+        let detail: crate::sync::SyncRunDetail = serde_json::from_value(body["data"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&detail).unwrap(), body["data"]);
+        assert_eq!(body["run_id"], body["data"]["run_id"]);
+    }
+
+    #[tokio::test]
+    async fn contract_pull_fixtures_parse_the_way_the_app_reads_them() {
+        reset(true, true);
+        let client = reqwest::Client::new();
+        let (base, _) = scripted(vec![
+            (200, fixture("sync-runs.pull.response.json")),
+            (200, fixture("sync-run-detail.pull.response.json")),
+            (404, fixture("sync-run-detail.pull.404.response.json")),
+            (200, fixture("sync-library.pull.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&client).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].stages.len(), 3);
+        let detail = crate::sync::pull_run_detail(&client, "r1").await.unwrap().expect("detail");
+        assert_eq!(detail.stages.len(), 2);
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "no_detail");
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        let got: Vec<(&str, &str, bool)> =
+            pull.items.iter().map(|i| (i.kind.as_str(), i.item_id.as_str(), i.deleted)).collect();
+        assert_eq!(
+            got,
+            [
+                ("pipeline", "00000000-0000-4000-8000-0000000b0001", false),
+                ("role", "fixture-role", false),
+                ("pipeline", "00000000-0000-4000-8000-0000000b0002", true),
+            ]
+        );
+        assert!(pull.next_since.is_none(), "this fixture predates next_since");
+    }
+
+    // ── Run pull paging (#799 item 3) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn run_pull_follows_every_page_before_answering() {
+        reset(true, false);
+        let (base, seen) = scripted(vec![
+            (200, fixture("sync-runs.pull.page1.response.json")),
+            (200, fixture("sync-runs.pull.page2.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "00000000-0000-4000-8000-0000000f0003",
+                "00000000-0000-4000-8000-0000000f0002",
+                "00000000-0000-4000-8000-0000000f0001",
+            ]
+        );
+        let reqs = requests(&seen);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path(), "/api/sync-runs", "the first page sends no query, as before");
+        assert_eq!(
+            reqs[1].query("cursor").as_deref(),
+            Some("WyIyMDI2LTExLTAyVDEyOjAwOjAwLjAwMFoiLCJmaXh0dXJlIl0")
+        );
+        assert_eq!(reqs[1].query("since"), None, "a full pull never sends since");
+    }
+
+    #[tokio::test]
+    async fn run_pull_with_a_failed_page_is_an_error_so_the_mirror_is_kept() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        // Page 2 fails with a status, then with an unreadable body.
+        for second in [(500, "{}".to_string()), (200, "not json".to_string())] {
+            let (base, seen) =
+                scripted(vec![(200, fixture("sync-runs.pull.page1.response.json")), second]).await;
+            test_net::set(Some(base), token());
+            assert!(crate::sync::pull_runs(&client).await.is_err(), "a partial set is never returned");
+            assert_eq!(requests(&seen).len(), 2);
+        }
+        // history_sync_pull replaces the mirror only on Ok; on Err it lists the
+        // existing mirror. The mirror itself is untouched by a failed pull:
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let old: SyncRun = serde_json::from_value(fixture_json("sync-runs.push.one.json")["runs"][0].clone()).unwrap();
+        db.replace_synced_runs(std::slice::from_ref(&old)).unwrap();
+        let (base, _) = scripted(vec![(200, fixture("sync-runs.pull.page1.response.json")), (503, "{}".into())]).await;
+        test_net::set(Some(base), token());
+        if let Ok(runs) = crate::sync::pull_runs(&client).await {
+            db.replace_synced_runs(&runs).unwrap();
+        }
+        let kept = db.list_synced_runs().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].run_id, old.run_id);
+    }
+
+    #[tokio::test]
+    async fn run_pull_against_an_older_server_is_one_page() {
+        reset(true, false);
+        // No next_cursor / next_since at all: the pre-#27 `{ runs }`.
+        let (base, seen) = scripted(vec![(200, fixture("sync-runs.push.one.json"))]).await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(requests(&seen).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_pull_stops_on_a_repeated_cursor() {
+        reset(true, false);
+        let page1 = fixture("sync-runs.pull.page1.response.json");
+        let (base, seen) = scripted(vec![(200, page1.clone()), (200, page1.clone()), (200, page1)]).await;
+        test_net::set(Some(base), token());
+        let err = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap_err().to_string();
+        assert!(err.contains("repeated a page"), "{err}");
+        assert_eq!(requests(&seen).len(), 2, "the loop ends at the first repeat");
+    }
+
+    // ── Run payload cap (#799 item 2) ───────────────────────────────────
+
+    fn big_run(task: String) -> SyncRun {
+        let mut run: SyncRun =
+            serde_json::from_value(fixture_json("sync-runs.push.one.json")["runs"][0].clone()).unwrap();
+        run.task = task;
+        run
+    }
+
+    fn json_len(run: &SyncRun) -> usize {
+        serde_json::to_string(run).unwrap().len()
+    }
+
+    #[test]
+    fn an_oversized_run_is_cut_under_the_limit_with_a_marker() {
+        for task in [
+            "x".repeat(300_000),
+            "é".repeat(200_000),   // multibyte: cuts on a char boundary
+            "\"".repeat(200_000),  // each byte serializes as two
+            "\u{1}".repeat(60_000), // each byte serializes as six
+        ] {
+            let mut run = big_run(task.clone());
+            let (id, created, stages) = (run.run_id.clone(), run.created_at.clone(), run.stages.len());
+            assert!(cap_run_payload(&mut run));
+            assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES, "{}", json_len(&run));
+            assert!(run.task.ends_with(TRUNCATION_MARK));
+            assert!(task.starts_with(run.task.trim_end_matches(TRUNCATION_MARK)));
+            assert_eq!((run.run_id, run.created_at, run.stages.len()), (id, created, stages));
+        }
+        // Long names are capped too, before the task.
+        let mut run = big_run("short".into());
+        run.workspace_name = Some("w".repeat(300_000));
+        assert!(cap_run_payload(&mut run));
+        assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+        assert!(run.workspace_name.as_deref().unwrap().ends_with(TRUNCATION_MARK));
+        assert_eq!(run.task, "short");
+        // Just under the limit: untouched.
+        let mut run = big_run(String::new());
+        let room = MAX_RUN_PAYLOAD_BYTES - json_len(&run);
+        run.task = "y".repeat(room);
+        assert_eq!(json_len(&run), MAX_RUN_PAYLOAD_BYTES);
+        assert!(!cap_run_payload(&mut run));
+    }
+
+    #[tokio::test]
+    async fn push_runs_sends_every_run_under_the_server_limit() {
+        reset(true, false);
+        let (base, seen) = scripted(vec![(200, r#"{"ok":true,"count":2,"skipped":0}"#.into())]).await;
+        test_net::set(Some(base), token());
+        let small = big_run("small".into());
+        let mut huge = big_run("z".repeat(400_000));
+        huge.run_id = "00000000-0000-4000-8000-0000000f0009".into();
+        let out = crate::sync::push_runs(&reqwest::Client::new(), vec![small, huge]).await;
+        assert_eq!(out, PushOutcome::Sent);
+        let reqs = requests(&seen);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2, "the big run still travels, cut");
+        for run in runs {
+            assert!(serde_json::to_string(run).unwrap().len() <= 256 * 1024);
+        }
+        assert_eq!(runs[0]["task"], "small");
+        assert!(runs[1]["task"].as_str().unwrap().ends_with(TRUNCATION_MARK));
+        // Nothing new is sent: the same keys as the contract fixture.
+        let mut keys: Vec<_> = runs[1].as_object().unwrap().keys().cloned().collect();
+        let fixture = fixture_json("sync-runs.push.one.json");
+        let mut want: Vec<_> = fixture["runs"][0].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        want.sort();
+        assert_eq!(keys, want);
+    }
+
+    // ── Library rejections and the 64,000-byte limit (#799 item 1) ──────
+
+    /// A pipeline item whose `data` JSON is exactly `bytes` bytes.
+    fn pipeline_of_size(id: &str, bytes: usize) -> SyncLibraryItem {
+        let empty = serde_json::json!({ "p": "" }).to_string().len();
+        SyncLibraryItem {
+            kind: "pipeline".into(),
+            item_id: id.into(),
+            updated_at: "2026-11-01T12:00:00+00:00".into(),
+            deleted: false,
+            data: Some(serde_json::json!({ "p": "x".repeat(bytes - empty) })),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_over_64000_bytes_is_refused_locally_and_named() {
+        reset(false, true);
+        let (base, seen) =
+            scripted(vec![(200, r#"{"ok":true,"count":2,"rejected":[]}"#.into())]).await;
+        test_net::set(Some(base), token());
+        let at_limit = pipeline_of_size("p-at-limit", MAX_LIBRARY_ITEM_BYTES);
+        let over = pipeline_of_size("p-over", MAX_LIBRARY_ITEM_BYTES + 1);
+        assert_eq!(library_item_bytes(&at_limit), 64_000);
+        let tomb = SyncLibraryItem::tombstone("role", "r-gone");
+        let out = crate::sync::push_library_items(&reqwest::Client::new(), vec![at_limit, over, tomb]).await;
+        assert_eq!(out, PushOutcome::Sent);
+        let reqs = requests(&seen);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let sent: Vec<&str> = body["items"].as_array().unwrap().iter().map(|i| i["item_id"].as_str().unwrap()).collect();
+        assert_eq!(sent, ["p-at-limit", "r-gone"], "the oversized item never leaves the Mac");
+        let snap = status::snapshot();
+        assert_eq!(
+            snap.library_rejected,
+            [LibraryRejection { kind: "pipeline".into(), id: "p-over".into(), reason: "oversize".into(), name: None }]
+        );
+        assert_eq!(snap.library.unwrap().count, 2, "Sent counts the items stored");
+
+        // Everything oversized: no request at all, still named.
+        reset(false, true);
+        let (base, seen) = scripted(vec![]).await;
+        test_net::set(Some(base), token());
+        let out = crate::sync::push_library_items(
+            &reqwest::Client::new(),
+            vec![pipeline_of_size("p-over", MAX_LIBRARY_ITEM_BYTES + 1)],
+        )
+        .await;
+        assert_eq!(out, PushOutcome::Empty);
+        assert!(requests(&seen).is_empty());
+        assert_eq!(status::snapshot().library_rejected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn server_rejections_stay_unsent_until_a_push_is_stored() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        let items: Vec<SyncLibraryItem> = serde_json::from_value(fixture_json("sync-library.push.json")["items"].clone()).unwrap();
+        let (base, _) = scripted(vec![
+            (200, fixture("sync-library.push.rejected.response.json")),
+            (503, "{}".into()),
+            (200, fixture("sync-library.push.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+
+        // 1. The service refuses the pipeline: it is listed, the other two count.
+        assert_eq!(crate::sync::push_library_items(&client, items.clone()).await, PushOutcome::Sent);
+        let snap = status::snapshot();
+        assert_eq!(snap.library.as_ref().unwrap().count, 2);
+        assert_eq!(snap.library_rejected.len(), 1);
+        assert_eq!(snap.library_rejected[0].id, "00000000-0000-4000-8000-0000000b0001");
+        assert_eq!(snap.library_rejected[0].kind, "pipeline");
+        assert_eq!(snap.library_rejected[0].reason, "future_stamp");
+
+        // 2. A failed retry changes nothing about it.
+        assert_eq!(crate::sync::push_library_items(&client, vec![items[0].clone()]).await, PushOutcome::Failed);
+        assert_eq!(status::snapshot().library_rejected.len(), 1);
+
+        // 3. A stored push clears it.
+        assert_eq!(crate::sync::push_library_items(&client, items).await, PushOutcome::Sent);
+        assert!(status::snapshot().library_rejected.is_empty());
+        assert_eq!(status::snapshot().library.unwrap().count, 3);
+    }
+
+    #[tokio::test]
+    async fn rejections_match_kind_and_an_older_server_reads_as_all_stored() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        let pipeline = pipeline_of_size("shared", 100);
+        let mut role = pipeline_of_size("shared", 100);
+        role.kind = "role".into();
+        let (base, _) = scripted(vec![
+            (200, r#"{"ok":true,"count":1,"rejected":[{"id":"shared","kind":"role","reason":"bad_stamp"}]}"#.into()),
+            (200, r#"{"ok":true,"count":2}"#.into()),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        crate::sync::push_library_items(&client, vec![pipeline.clone(), role.clone()]).await;
+        let rejected = status::snapshot().library_rejected;
+        assert_eq!(rejected.len(), 1);
+        assert_eq!((rejected[0].kind.as_str(), rejected[0].reason.as_str()), ("role", "bad_stamp"));
+
+        // Pre-#27 answer `{ ok, count }`: every item stored.
+        crate::sync::push_library_items(&client, vec![pipeline, role]).await;
+        assert!(status::snapshot().library_rejected.is_empty());
+        assert_eq!(status::snapshot().library.unwrap().count, 2);
+    }
+
+    #[test]
+    fn rejection_list_merges_and_clears_with_its_toggle() {
+        let r = |id: &str, reason: &str| LibraryRejection {
+            kind: "pipeline".into(),
+            id: id.into(),
+            reason: reason.into(),
+            name: Some("never kept".into()),
+        };
+        let mut list = Vec::new();
+        assert!(apply_library_rejections(&mut list, &[], vec![r("a", "oversize"), r("b", "bad_stamp")]));
+        assert!(list.iter().all(|e| e.name.is_none()), "names are never recorded");
+        assert!(apply_library_rejections(&mut list, &[], vec![r("a", "future_stamp")]));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].reason, "future_stamp");
+        assert!(!apply_library_rejections(&mut list, &[("role".into(), "a".into())], vec![]), "kind must match");
+        assert!(apply_library_rejections(&mut list, &[("pipeline".into(), "a".into())], vec![]));
+        assert_eq!(list.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        // Bounded.
+        let many: Vec<_> = (0..80).map(|i| r(&format!("x{i}"), "oversize")).collect();
+        apply_library_rejections(&mut list, &[], many);
+        assert_eq!(list.len(), 50);
+        assert_eq!(list.last().unwrap().id, "x79", "the newest are kept");
+
+        // Clearing the library kind (toggle off, sign-out) drops the list.
+        let mut s = crate::sync::SyncStatus { library_rejected: list, ..Default::default() };
+        assert!(!s.is_empty());
+        s.clear(SyncKind::History);
+        assert!(!s.library_rejected.is_empty());
+        s.clear(SyncKind::Library);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn rejections_round_trip_in_settings_without_names() {
+        let mut s = AppSettings::default();
+        s.last_sync_attempt.library_rejected = vec![LibraryRejection {
+            kind: "role".into(),
+            id: "my-role".into(),
+            reason: "oversize".into(),
+            name: None,
+        }];
+        let json = serde_json::to_value(&s).unwrap();
+        let row = &json["lastSyncAttempt"]["libraryRejected"][0];
+        let mut keys: Vec<_> = row.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["id", "kind", "reason"]);
+        // A name that somehow reached disk is dropped on read; a bad row only
+        // drops itself.
+        let text = r#"{"lastSyncAttempt":{"libraryRejected":[
+            {"kind":"role","id":"my-role","reason":"oversize","name":"Leaked"},
+            {"kind":7}
+        ]}}"#;
+        let back: AppSettings = serde_json::from_str(text).unwrap();
+        assert_eq!(back.last_sync_attempt.library_rejected.len(), 1);
+        assert_eq!(back.last_sync_attempt.library_rejected[0].name, None);
+    }
+
+    #[test]
+    fn rejections_are_named_from_the_local_library_and_gone_items_dropped() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let pid = db.save_pipeline(None, "Big crew", "d", &[library_draft()]).unwrap();
+        let mut list = vec![
+            LibraryRejection { kind: "pipeline".into(), id: pid, reason: "oversize".into(), name: None },
+            LibraryRejection { kind: "pipeline".into(), id: "deleted-since".into(), reason: "oversize".into(), name: None },
+        ];
+        crate::commands::name_library_rejections(&db, &mut list);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name.as_deref(), Some("Big crew"));
+    }
+
+    // ── 404 means "no detail" only with the service's body (#799 item 4) ─
+
+    #[test]
+    fn only_the_no_detail_body_means_no_detail() {
+        assert!(crate::sync::is_no_detail_body(&fixture("sync-run-detail.pull.404.response.json")));
+        for body in ["", "{}", r#"{"error":"no detail for this run"}"#, r#"{"error":"not_found"}"#, "<html/>"] {
+            assert!(!crate::sync::is_no_detail_body(body), "{body}");
+        }
+    }
+
+    // ── Library `?since=` (#823) ─────────────────────────────────────────
+
+    /// Point settings at a temp file where library sync is on for `user_a`.
+    fn library_settings(dir: &tempfile::TempDir) {
+        test_settings_path::set(Some(dir.path().join("settings.json")));
+        crate::settings::update_settings(|s| {
+            s.set_sync_opted_in_by(SyncKind::Library, true, "user_a");
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_first_pull_stores_next_since_and_the_next_pull_sends_it() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let client = reqwest::Client::new();
+        let (first, second) = (fresh_since(), fresh_since());
+        let (base, seen) = scripted(vec![
+            (200, with_since("sync-library.pull.response.json", &first)),
+            (200, with_since("sync-library.pull.since.response.json", &second)),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        assert!(!pull.incremental);
+        assert_eq!(pull.items.len(), 3);
+        assert_eq!(library_since::load(), None, "stored only after the caller applied it");
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load().as_deref(), Some(first.as_str()));
+
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        assert!(pull.incremental);
+        assert_eq!(pull.items.len(), 1);
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load().as_deref(), Some(second.as_str()));
+
+        let reqs = requests(&seen);
+        assert_eq!(reqs[0].path(), "/api/sync-library", "the first pull is full");
+        assert_eq!(reqs[1].query("since").as_deref(), Some(first.as_str()));
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn bad_since_drops_the_stored_value_and_does_a_full_pull() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        crate::settings::update_settings(|s| s.set_library_since(Some(fresh_since()))).unwrap();
+        let next = fresh_since();
+        let (base, seen) = scripted(vec![
+            (400, fixture("sync-library.pull.400.bad-since.response.json")),
+            (200, with_since("sync-library.pull.response.json", &next)),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert!(!pull.incremental);
+        assert_eq!(pull.items.len(), 3);
+        assert_eq!(library_since::load(), None, "the refused value is gone");
+        let reqs = requests(&seen);
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].query("since").is_some());
+        assert_eq!(reqs[1].path(), "/api/sync-library");
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), Some(next));
+
+        // Any other 400 is an error, and keeps the stored value.
+        let kept = library_since::load();
+        let (base, seen) = scripted(vec![(400, r#"{"error":"bad_cursor"}"#.into())]).await;
+        test_net::set(Some(base), token());
+        assert!(crate::sync::pull_library(&reqwest::Client::new()).await.is_err());
+        assert_eq!(requests(&seen).len(), 1);
+        assert_eq!(library_since::load(), kept);
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_stored_value_older_than_90_days_means_a_full_pull() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let old = (chrono::Utc::now() - chrono::Duration::days(91)).to_rfc3339();
+        crate::settings::update_settings(|s| s.set_library_since(Some(old))).unwrap();
+        let (base, seen) = scripted(vec![(200, fixture("sync-library.pull.response.json"))]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert!(!pull.incremental);
+        assert_eq!(requests(&seen)[0].query("since"), None);
+        assert_eq!(library_since::load(), None);
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_older_server_that_ignores_since_is_still_correct() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        crate::settings::update_settings(|s| s.set_library_since(Some(fresh_since()))).unwrap();
+        // The pre-#28 answer: the whole library, no next_since.
+        let (base, seen) = scripted(vec![
+            (200, fixture("sync-library.pull.response.json")),
+            (200, fixture("sync-library.pull.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let client = reqwest::Client::new();
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        assert_eq!(pull.items.len(), 3, "everything, applied by LWW as before");
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None, "no next_since: the next pull is full");
+        crate::sync::pull_library(&client).await.unwrap();
+        let reqs = requests(&seen);
+        assert!(reqs[0].query("since").is_some());
+        assert_eq!(reqs[1].query("since"), None);
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn next_since_is_per_account_and_reset_by_switch_sign_out_and_toggle() {
+        let since = fresh_since();
+        let mut s = AppSettings::default();
+        s.set_library_since(Some(since.clone()));
+        assert_eq!(s.library_pull_since, None, "nothing is stored while library sync is off");
+
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_a");
+        s.set_library_since(Some(since.clone()));
+        assert_eq!(s.library_since_for_owner(), Some(since.as_str()));
+        // Carried over a whole-file save from the UI.
+        let mut incoming = AppSettings::default();
+        incoming.preserve_sync_fields_from(&s);
+        assert_eq!(incoming.library_since_for_owner(), Some(since.as_str()));
+
+        // A value stored for another account is never used.
+        let mut other = s.clone();
+        other.sync_owner = Some("user_b".into());
+        assert_eq!(other.library_since_for_owner(), None);
+
+        // Account switch: another user turning sync on starts with a full pull.
+        let mut switched = s.clone();
+        switched.set_sync_opted_in_by(SyncKind::Library, true, "user_b");
+        assert_eq!(switched.library_pull_since, None);
+
+        // Sign-out.
+        let mut out = s.clone();
+        out.clear_sync_opt_ins();
+        assert_eq!(out.library_pull_since, None);
+
+        // Turning library sync off (and on again).
+        let mut off = s.clone();
+        let before = off.sync_prefs();
+        off.set_sync_opted_in_by(SyncKind::Library, false, "user_a");
+        off.drop_stale_sync_attempts(before, Some("user_a"));
+        assert_eq!(off.library_pull_since, None);
+
+        // History toggles leave it alone.
+        let mut hist = s.clone();
+        let before = hist.sync_prefs();
+        hist.set_sync_opted_in_by(SyncKind::History, true, "user_a");
+        hist.drop_stale_sync_attempts(before, Some("user_a"));
+        assert_eq!(hist.library_since_for_owner(), Some(since.as_str()));
+    }
+
+    #[test]
+    fn since_usability_window() {
+        let now = chrono::Utc::now();
+        let at = |d: chrono::Duration| (now + d).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert!(library_since_usable(&at(chrono::Duration::minutes(-5)), now));
+        assert!(library_since_usable(&at(chrono::Duration::days(-89)), now));
+        assert!(!library_since_usable(&at(chrono::Duration::days(-91)), now));
+        assert!(!library_since_usable(&at(chrono::Duration::days(2)), now));
+        assert!(library_since_usable(&(now - chrono::Duration::hours(1)).to_rfc3339(), now), "9 fraction digits");
+        let long = "9".repeat(65);
+        for bad in ["", "yesterday", "2026-13-01T00:00:00Z", long.as_str()] {
+            assert!(!library_since_usable(bad, now), "{bad}");
+        }
+    }
+
+    fn library_draft() -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m1".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 30, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None, escalate_model: None, escalate_effort: None,
+        }
+    }
+
+    #[test]
+    fn an_item_missing_from_an_incremental_pull_is_unchanged_never_deleted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let kept = db.save_pipeline(None, "Kept", "d", &[library_draft()]).unwrap();
+        let gone = db.save_pipeline(None, "Gone", "d", &[library_draft()]).unwrap();
+        let store = parking_lot::Mutex::new(db);
+        // An incremental pull: one tombstone (newer than the local edit) and
+        // nothing about `kept`.
+        let mut tomb = SyncLibraryItem::tombstone("pipeline", &gone);
+        tomb.updated_at = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        let done = crate::commands::apply_pulled_library(&store, &[tomb]);
+        assert_eq!((done.applied, done.skipped), (1, 0));
+        assert_eq!(crate::commands::apply_pulled_library(&store, &[]).applied, 0);
+        let db = store.lock();
+        assert!(db.pipeline_sync_state(&kept).unwrap().is_some(), "absent from the pull: unchanged");
+        assert!(db.pipeline_sync_state(&gone).unwrap().is_none(), "only a tombstone deletes");
+    }
+
+    // ── Review follow-ups ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_item_this_build_cant_apply_makes_the_next_pull_full() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let store = parking_lot::Mutex::new(db);
+        // A pipeline whose data this build can't read (e.g. saved by a newer
+        // build), next to a readable role edit.
+        let body = serde_json::json!({
+            "items": [
+                { "kind": "pipeline", "item_id": "p-new", "updated_at": "2026-11-02T00:00:00Z",
+                  "deleted": false, "data": { "id": "p-new", "stages": "not a list" } },
+                fixture_json("sync-library.pull.since.response.json")["items"][0].clone(),
+            ],
+            "next_since": fresh_since(),
+        });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        let done = crate::commands::apply_pulled_library(&store, &pull.items);
+        assert_eq!(done.skipped, 1, "the unreadable pipeline");
+        crate::sync::commit_library_pull(&pull, done.skipped);
+        assert_eq!(library_since::load(), None, "next pull is full, so the item comes back");
+
+        // An LWW loss is not a skip: applying the same role twice.
+        let again = crate::commands::apply_pulled_library(&store, &pull.items[1..]);
+        assert_eq!(again.skipped, 0);
+
+        // An envelope this build can't read counts too.
+        let body = serde_json::json!({
+            "items": [ { "item_id": "no kind" } ],
+            "next_since": fresh_since(),
+        });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!((pull.received, pull.unreadable, pull.items.len()), (1, 1, 0));
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None);
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_racing_an_account_switch_stores_nothing_for_the_new_account() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir); // user_a
+        let (base, _) = scripted(vec![(200, with_since("sync-library.pull.response.json", &fresh_since()))]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(pull.owner.as_deref(), Some("user_a"));
+        // user_b turns library sync on before user_a's pull is committed.
+        crate::settings::update_settings(|s| s.set_sync_opted_in_by(SyncKind::Library, true, "user_b")).unwrap();
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None);
+        let on_disk = crate::settings::load_settings().unwrap();
+        assert_eq!(on_disk.library_pull_since, None, "nothing stored under user_b");
+
+        // The settings-level guard on its own.
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_b");
+        s.set_library_since_for("user_a", fresh_since());
+        assert_eq!(s.library_pull_since, None);
+        s.set_library_since_for("user_b", "x".into());
+        assert_eq!(s.library_since_for_owner(), Some("x"));
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_at_the_services_item_cap_keeps_no_next_since() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let tomb = fixture_json("sync-library.pull.response.json")["items"][2].clone();
+        let items: Vec<serde_json::Value> = (0..crate::sync::LIBRARY_PULL_MAX_ITEMS)
+            .map(|i| {
+                let mut t = tomb.clone();
+                t["item_id"] = serde_json::Value::String(format!("p{i}"));
+                t
+            })
+            .collect();
+        let body = serde_json::json!({ "items": items, "next_since": fresh_since() });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(pull.received, 2_000);
+        assert!(pull.next_since.is_some());
+        assert_eq!(crate::sync::library_since_to_keep(&pull, 0), None);
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None, "the next pull is full");
+
+        // One under the cap keeps it.
+        let mut under = pull.clone();
+        under.received = crate::sync::LIBRARY_PULL_MAX_ITEMS - 1;
+        assert!(crate::sync::library_since_to_keep(&under, 0).is_some());
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_push_answer_keeps_items_unsent_and_refusals_listed() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        let item = pipeline_of_size("p1", 100);
+        let (base, _) = scripted(vec![
+            (200, r#"{"ok":true,"count":0,"rejected":[{"id":"p1","kind":"pipeline","reason":"bad_stamp"}]}"#.into()),
+            (200, "not json".into()),
+            (200, r#"{"ok":true,"rejected":"oops"}"#.into()),
+            (200, String::new()),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        crate::sync::push_library_items(&client, vec![item.clone()]).await;
+        assert_eq!(status::snapshot().library_rejected.len(), 1);
+        for _ in 0..3 {
+            assert_eq!(crate::sync::push_library_items(&client, vec![item.clone()]).await, PushOutcome::Failed);
+            let snap = status::snapshot();
+            assert_eq!(snap.library_rejected.len(), 1, "the earlier refusal stays");
+            let rec = snap.library.unwrap();
+            assert_eq!((rec.count, rec.http_status), (1, None));
+        }
+        assert_eq!(crate::sync::read_library_push_answer(r#"{"ok":true,"count":2}"#), Some(vec![]));
+        assert_eq!(crate::sync::read_library_push_answer("[]"), None);
+    }
+
+    #[test]
+    fn dropped_stages_are_replaced_by_one_honest_summary_stage() {
+        let mut run = big_run("short".into());
+        let stage = |i: usize| crate::sync::SyncStage {
+            role: format!("role-{i}-{}", "r".repeat(200)),
+            model: Some("m".repeat(200)),
+            status: "completed".into(),
+            cost_usd: 0.5,
+            includes_unpriced: false,
+        };
+        run.stages = (0..2_000).map(stage).collect();
+        let total: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!(cap_run_payload(&mut run));
+        assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+        assert_eq!(run.task, "short", "a short task is never cut for the stages' sake");
+        let last = run.stages.last().unwrap();
+        let kept = run.stages.len() - 1;
+        let dropped = 2_000 - kept;
+        assert!(dropped > 0 && kept > 0);
+        assert_eq!(last.role, crate::sync::truncated_stages_label(dropped));
+        assert_eq!(last.role, format!("… ({dropped} stages truncated)"));
+        assert_eq!(last.status, crate::sync::TRUNCATED_STAGES_STATUS);
+        assert_eq!(last.model, None);
+        let after: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!((after - total).abs() < 1e-6, "stage costs still add up");
+        // Same keys as the contract fixture: no new field.
+        let v = serde_json::to_value(&run.stages[kept]).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["cost_usd", "model", "role", "status"]);
+        assert_eq!(crate::sync::truncated_stages_label(1), "… (1 stage truncated)");
+    }
+
+    // ── Sync follow-ups (#978) ───────────────────────────────────────────
+
+    /// `n` stages of about 290 JSON bytes each, priced (cost 0.5) on a known
+    /// model, so 2,000 of them (about 580 KB) are well over the per-run budget.
+    fn many_stages(n: usize) -> Vec<crate::sync::SyncStage> {
+        (0..n)
+            .map(|i| crate::sync::SyncStage {
+                role: format!("role-{i}-{}", "r".repeat(200)),
+                model: Some("claude-sonnet-4-5".into()),
+                status: "completed".into(),
+                cost_usd: 0.5,
+                includes_unpriced: false,
+            })
+            .collect()
+    }
+
+    fn keys_of(v: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// The test's price check: only `gw/` models are unpriced.
+    fn gw_unpriced(model: &str) -> bool {
+        model.starts_with("gw/")
+    }
+
+    #[test]
+    fn an_unknown_library_kind_is_unreadable() {
+        let raw: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"kind":"pipeline","item_id":"p1","updated_at":"2026-11-01T00:00:00Z","data":{"id":"p1"}},
+                {"kind":"role","item_id":"r1","deleted":true},
+                {"kind":"prompt","item_id":"x1","updated_at":"2026-11-01T00:00:00Z","data":{}},
+                {"kind":"prompt","item_id":"x2","deleted":true},
+                {"item_id":"no kind"}
+            ]"#,
+        )
+        .unwrap();
+        let (items, unreadable) = crate::sync::read_library_items(raw);
+        let got: Vec<(&str, &str)> = items.iter().map(|i| (i.kind.as_str(), i.item_id.as_str())).collect();
+        assert_eq!(got, [("pipeline", "p1"), ("role", "r1")]);
+        assert_eq!(unreadable, 3, "two of an unknown kind (an edit and a tombstone) and one malformed");
+        assert_eq!(crate::sync::LIBRARY_KINDS, ["pipeline", "role"]);
+        let (items, unreadable) = crate::sync::read_library_items(Vec::new());
+        assert!(items.is_empty() && unreadable == 0);
+    }
+
+    #[tokio::test]
+    async fn a_pull_with_an_unknown_kind_keeps_no_next_since() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let mut body = fixture_json("sync-library.pull.response.json");
+        let known = body["items"].as_array().unwrap().len();
+        body["items"].as_array_mut().unwrap().push(serde_json::json!({
+            "kind": "prompt", "item_id": "x1", "updated_at": "2026-11-01T00:00:00Z", "data": {}
+        }));
+        body["next_since"] = serde_json::Value::String(fresh_since());
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!((pull.received, pull.items.len(), pull.unreadable), (known + 1, known, 1));
+        assert!(pull.next_since.is_some());
+        assert_eq!(crate::sync::library_since_to_keep(&pull, 0), None);
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None, "the next pull is full, so the item comes back once it can be read");
+
+        // The same answer with only known kinds keeps it.
+        let mut known_only = pull.clone();
+        known_only.unreadable = 0;
+        assert!(crate::sync::library_since_to_keep(&known_only, 0).is_some());
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn folded_unpriced_stages_keep_the_marker_on_the_summary() {
+        let mut run = big_run("short".into());
+        run.stages = many_stages(2_000);
+        // The last stage (certainly folded) ran on a model this Mac can't price.
+        let last = run.stages.last_mut().unwrap();
+        last.model = Some("gw/mystery-1".into());
+        last.cost_usd = 0.0;
+        let total: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!(crate::sync::cap_run_payload_with(&mut run, &gw_unpriced));
+        assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+        let (summary, kept) = run.stages.split_last().unwrap();
+        assert_eq!(summary.status, crate::sync::TRUNCATED_STAGES_STATUS);
+        assert!(summary.includes_unpriced);
+        let after: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!((after - total).abs() < 1e-6, "stage costs still add up");
+
+        // On the wire the one new key is on the summary stage only.
+        let v = serde_json::to_value(&run).unwrap();
+        let stages = v["stages"].as_array().unwrap();
+        assert_eq!(
+            keys_of(stages.last().unwrap()),
+            ["cost_usd", "includes_unpriced", "model", "role", "status"]
+        );
+        assert_eq!(stages.last().unwrap()["includes_unpriced"], true);
+        for s in &stages[..kept.len()] {
+            assert_eq!(keys_of(s), ["cost_usd", "model", "role", "status"]);
+        }
+        let want = keys_of(&fixture_json("sync-runs.push.one.json")["runs"][0]);
+        assert_eq!(keys_of(&v), want, "no run-level key is added");
+
+        // It reads back, and the local mirror keeps it.
+        let back: SyncRun = serde_json::from_value(v).unwrap();
+        assert!(back.stages.last().unwrap().includes_unpriced);
+    }
+
+    #[test]
+    fn the_marker_follows_historys_unpriced_rule() {
+        // History flags a stage only with no cost and a model it can't price.
+        for (model, cost, flagged) in [
+            (Some("gw/mystery-1"), 0.0, true),
+            (Some("gw/mystery-1"), 0.25, false), // priced on its origin Mac
+            (Some("claude-sonnet-4-5"), 0.0, false), // a priced model that cost nothing
+            (None, 0.0, false),
+            (Some(""), 0.0, false),
+        ] {
+            let mut run = big_run("short".into());
+            run.stages = many_stages(2_000);
+            let last = run.stages.last_mut().unwrap();
+            last.model = model.map(str::to_string);
+            last.cost_usd = cost;
+            assert!(crate::sync::cap_run_payload_with(&mut run, &gw_unpriced));
+            let summary = run.stages.last().unwrap();
+            assert_eq!(summary.status, crate::sync::TRUNCATED_STAGES_STATUS);
+            assert_eq!(summary.includes_unpriced, flagged, "{model:?} at {cost}");
+            let json = serde_json::to_string(&run).unwrap();
+            assert_eq!(json.contains("includes_unpriced"), flagged, "sent only when true");
+        }
+
+        // An unpriced stage that stays in the list doesn't mark the summary:
+        // History still sees it on its own.
+        let mut run = big_run("short".into());
+        run.stages = many_stages(2_000);
+        run.stages[0].model = Some("gw/mystery-1".into());
+        run.stages[0].cost_usd = 0.0;
+        assert!(crate::sync::cap_run_payload_with(&mut run, &gw_unpriced));
+        assert_eq!(run.stages[0].model.as_deref(), Some("gw/mystery-1"));
+        assert!(!run.stages.last().unwrap().includes_unpriced);
+
+        // A run under the budget is untouched and carries no marker at all.
+        let mut small = big_run("short".into());
+        assert!(!crate::sync::cap_run_payload_with(&mut small, &|_: &str| true));
+        assert!(!serde_json::to_string(&small).unwrap().contains("includes_unpriced"));
+    }
+
+    #[test]
+    fn an_older_payload_reads_the_marker_as_false() {
+        let fixture = fixture_json("sync-runs.push.one.json");
+        let run: SyncRun = serde_json::from_value(fixture["runs"][0].clone()).unwrap();
+        assert!(run.stages.iter().all(|s| !s.includes_unpriced));
+        // Re-serialized (the local mirror, the frontend), it is the same JSON.
+        assert_eq!(serde_json::to_value(&run).unwrap()["stages"], fixture["runs"][0]["stages"]);
+        let marked: crate::sync::SyncStage = serde_json::from_str(
+            r#"{"role":"… (3 stages truncated)","model":null,"status":"truncated","cost_usd":0,"includes_unpriced":true}"#,
+        )
+        .unwrap();
+        assert!(marked.includes_unpriced);
+    }
+
+    #[tokio::test]
+    async fn push_runs_sends_the_marker_only_on_a_folded_summary() {
+        reset(true, false);
+        let (base, seen) = scripted(vec![(200, r#"{"ok":true,"count":2,"skipped":0}"#.into())]).await;
+        test_net::set(Some(base), token());
+        let small = big_run("small".into());
+        let mut folded = big_run("short".into());
+        folded.run_id = "00000000-0000-4000-8000-0000000f0010".into();
+        folded.stages = many_stages(2_000);
+        let last = folded.stages.last_mut().unwrap();
+        last.model = Some("gw/not-in-any-price-table".into());
+        last.cost_usd = 0.0;
+        assert_eq!(crate::sync::push_runs(&reqwest::Client::new(), vec![small, folded]).await, PushOutcome::Sent);
+        let reqs = requests(&seen);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let runs = body["runs"].as_array().unwrap();
+        assert!(!runs[0].to_string().contains("includes_unpriced"), "an uncut run is sent as before");
+        let stages = runs[1]["stages"].as_array().unwrap();
+        assert_eq!(stages.last().unwrap()["includes_unpriced"], true);
+        let marked = stages.iter().filter(|s| s.get("includes_unpriced").is_some()).count();
+        assert_eq!(marked, 1);
+    }
+
+    #[test]
+    fn the_task_keeps_its_4096_byte_floor_while_stages_can_go() {
+        assert_eq!(crate::sync::TASK_FLOOR_BYTES, 4_096);
+        // A long task and too many stages: the task stops at the floor, and
+        // the stages are folded to make the rest of the room.
+        for task in ["t".repeat(100_000), "é".repeat(50_000), "t".repeat(4_097)] {
+            let mut run = big_run(task.clone());
+            run.stages = many_stages(2_000);
+            assert!(cap_run_payload(&mut run));
+            assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+            assert!(run.task.ends_with(TRUNCATION_MARK), "cut, with the mark");
+            assert!(run.task.len() <= crate::sync::TASK_FLOOR_BYTES);
+            // On a char boundary: a two-byte char may leave it one byte short.
+            assert!(run.task.len() >= crate::sync::TASK_FLOOR_BYTES - 1, "{}", run.task.len());
+            assert!(task.starts_with(run.task.trim_end_matches(TRUNCATION_MARK)));
+            assert_eq!(run.stages.last().unwrap().status, crate::sync::TRUNCATED_STAGES_STATUS);
+            assert!(run.stages.len() > 1, "stages were kept as well");
+        }
+        // A task at the floor is not cut at all for the stages' sake.
+        let mut run = big_run("f".repeat(4_096));
+        run.stages = many_stages(2_000);
+        assert!(cap_run_payload(&mut run));
+        assert_eq!(run.task, "f".repeat(4_096));
+        assert_eq!(run.stages.last().unwrap().status, crate::sync::TRUNCATED_STAGES_STATUS);
+        // With stages that fit, a task over the budget is cut to fit the run,
+        // far above the floor, and no stage is folded.
+        let mut run = big_run("g".repeat(300_000));
+        let stages = run.stages.len();
+        assert!(cap_run_payload(&mut run));
+        assert!(run.task.len() > 200_000, "{}", run.task.len());
+        assert_eq!(run.stages.len(), stages);
+        assert!(run.stages.iter().all(|s| s.status != crate::sync::TRUNCATED_STAGES_STATUS));
+    }
+}
+
+#[cfg(test)]
+mod talk_checkpoint_tests {
+    //! #958: Talk checkpoints — rewind a turn's files, undo, fork.
+    use crate::talk_checkpoints::{self as ck, AfterTurn, Budget, RewindChange, Untouched};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const THREAD: &str = "5b1e-thread-a";
+
+    fn repo(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("octo-talk-ckpt-{tag}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write(dir: &Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn read(dir: &Path, rel: &str) -> String {
+        std::fs::read_to_string(dir.join(rel)).unwrap()
+    }
+
+    fn change<'a>(changes: &'a [RewindChange], path: &str) -> &'a RewindChange {
+        changes.iter().find(|c| c.path == path).unwrap_or_else(|| panic!("no change for {path}: {changes:?}"))
+    }
+
+    /// The whole loop: a turn edits, creates and deletes files; the director
+    /// edits another between turns; the rewind shows all of it (the
+    /// director's file flagged), restores the turn's start, leaves the index,
+    /// HEAD and ignored files alone, and the undo puts everything back.
+    #[test]
+    fn rewind_restores_the_turn_start_and_undo_puts_it_back() {
+        let dir = repo("loop");
+        write(&dir, "a.txt", "A\n");
+        write(&dir, "b.txt", "B\n");
+        write(&dir, "gone.txt", "G\n");
+        write(&dir, ".gitignore", "ignored.log\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        // The user has something staged and an ignored file around.
+        write(&dir, "a.txt", "A staged\n");
+        git(&dir, &["add", "a.txt"]);
+        write(&dir, "ignored.log", "secret\n");
+
+        assert!(ck::capture_before(&dir, THREAD, 10));
+        // The turn writes.
+        write(&dir, "a.txt", "A agent\n");
+        write(&dir, "sub/new.txt", "N\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        AfterTurn::new(&dir, THREAD, 10).record();
+        // The director edits between turns; the ignored file changes too.
+        write(&dir, "b.txt", "B director\n");
+        write(&dir, "ignored.log", "changed\n");
+
+        let p = ck::preview(&dir, THREAD, 10).unwrap();
+        assert_eq!(p.changes.len(), 4, "{:?}", p.changes);
+        assert_eq!(change(&p.changes, "a.txt").kind, "reverted");
+        assert!(!change(&p.changes, "a.txt").outside_talk);
+        assert_eq!(change(&p.changes, "sub/new.txt").kind, "removed");
+        assert_eq!(change(&p.changes, "gone.txt").kind, "restored");
+        assert!(change(&p.changes, "b.txt").outside_talk, "the director's edit is flagged");
+
+        assert_eq!(ck::rewind(&dir, THREAD, 10, &p.current).unwrap().changed, 4);
+        assert_eq!(read(&dir, "a.txt"), "A staged\n");
+        assert_eq!(read(&dir, "b.txt"), "B\n");
+        assert_eq!(read(&dir, "gone.txt"), "G\n");
+        assert!(!dir.join("sub").exists(), "the created file and its folder are gone");
+        assert_eq!(read(&dir, "ignored.log"), "changed\n", "ignored files are never touched");
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]), head, "HEAD never moves");
+        assert_eq!(git(&dir, &["diff", "--cached", "--name-only"]), "a.txt", "the user's index is kept");
+        assert_eq!(git(&dir, &["show", ":a.txt"]), "A staged");
+
+        assert_eq!(ck::undo(&dir, THREAD).unwrap().changed, 4);
+        assert_eq!(read(&dir, "a.txt"), "A agent\n");
+        assert_eq!(read(&dir, "b.txt"), "B director\n");
+        assert_eq!(read(&dir, "sub/new.txt"), "N\n");
+        assert!(!dir.join("gone.txt").exists());
+        assert!(ck::undo(&dir, THREAD).is_err(), "an undo is used once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewind_refuses_when_the_files_moved_on_since_the_preview() {
+        let dir = repo("stale");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 3));
+        write(&dir, "a.txt", "agent\n");
+        let p = ck::preview(&dir, THREAD, 3).unwrap();
+        write(&dir, "a.txt", "typed after the preview\n");
+        assert!(ck::rewind(&dir, THREAD, 3, &p.current).is_err());
+        assert_eq!(read(&dir, "a.txt"), "typed after the preview\n", "nothing is overwritten");
+        assert!(ck::rewind(&dir, THREAD, 3, "--force").is_err(), "a preview id is never an option");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo only puts back what the rewind changed: once a new turn or
+    /// the user edits the files, it refuses and writes nothing.
+    #[test]
+    fn undo_refuses_when_the_files_moved_on_since_the_rewind() {
+        let dir = repo("undo-stale");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 2));
+        write(&dir, "a.txt", "agent\n");
+        let p = ck::preview(&dir, THREAD, 2).unwrap();
+        assert_eq!(ck::rewind(&dir, THREAD, 2, &p.current).unwrap().changed, 1);
+        write(&dir, "b.txt", "a later turn's file\n");
+        let err = ck::undo(&dir, THREAD).unwrap_err().to_string();
+        assert!(err.contains("changed since the rewind"), "{err}");
+        assert_eq!(read(&dir, "a.txt"), "A\n", "nothing is written");
+        assert_eq!(read(&dir, "b.txt"), "a later turn's file\n");
+        // Back to the state the rewind left, the undo works again.
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        assert_eq!(ck::undo(&dir, THREAD).unwrap().changed, 1);
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project folder that only sits inside a parent repository takes no
+    /// checkpoint: its snapshot would be the parent's whole tree.
+    #[test]
+    fn a_folder_nested_in_a_parent_repo_is_not_a_repo() {
+        let parent = repo("nested");
+        write(&parent, "top.txt", "T\n");
+        git(&parent, &["add", "-A"]);
+        git(&parent, &["commit", "-qm", "init"]);
+        let proj = parent.join("projects/app");
+        write(&proj, "main.txt", "M\n");
+        assert!(!ck::capture_before(&proj, THREAD, 1));
+        assert!(ck::list(&proj, THREAD).unwrap().is_empty());
+        assert!(ck::preview(&proj, THREAD, 1).is_err());
+        assert!(ck::undo(&proj, THREAD).is_err());
+        assert_eq!(git(&parent, &["for-each-ref", ck::REF_ROOT]), "", "no ref in the parent repo");
+        assert_eq!(read(&parent, "top.txt"), "T\n");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_regenerate_keeps_the_first_checkpoint_and_pruning_clears_the_thread() {
+        let dir = repo("regen");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 7));
+        write(&dir, "a.txt", "first attempt\n");
+        assert!(ck::capture_before(&dir, THREAD, 7), "the regenerate still has a checkpoint");
+        assert!(ck::capture_before(&dir, THREAD, 9));
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![7, 9]);
+        let p = ck::rewind(&dir, THREAD, 7, &ck::preview(&dir, THREAD, 7).unwrap().current);
+        assert_eq!(p.unwrap().changed, 1);
+        assert_eq!(read(&dir, "a.txt"), "A\n", "back to before the FIRST attempt");
+
+        ck::prune_thread(&dir, THREAD);
+        assert!(ck::list(&dir, THREAD).unwrap().is_empty());
+        assert_eq!(git(&dir, &["for-each-ref", ck::REF_ROOT]), "", "undo ref pruned too");
+        assert!(!ck::capture_before(&dir, "../heads/main", 1), "a bad thread id never reaches a ref");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn works_before_the_first_commit_and_outside_a_repo() {
+        let dir = repo("empty");
+        write(&dir, "x.txt", "X\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("x.txt")).unwrap();
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(change(&p.changes, "x.txt").kind, "restored");
+        ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(read(&dir, "x.txt"), "X\n");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let plain = std::env::temp_dir().join(format!("octo-talk-ckpt-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!ck::capture_before(&plain, THREAD, 1));
+        assert!(ck::list(&plain, THREAD).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn a_fork_gets_the_checkpoints_of_the_turns_it_copied() {
+        let dir = repo("fork");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 4));
+        write(&dir, "a.txt", "turn 4\n");
+        ck::copy_to_fork(&dir, THREAD, "5b1e-thread-b", &[(4, 40), (5, 50)]);
+        assert_eq!(ck::list(&dir, "5b1e-thread-b").unwrap(), vec![40]);
+        let p = ck::preview(&dir, "5b1e-thread-b", 40).unwrap();
+        assert_eq!(change(&p.changes, "a.txt").kind, "reverted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_diff_parsing_and_age_pruning_are_exact() {
+        let raw = b":100644 100644 aaa bbb M\0src/a.rs\0:000000 100644 000 ccc A\0new file.txt\0:160000 160000 d e M\0vendor/sub\0";
+        let parsed = ck::parse_raw_diff(raw);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!((parsed[0].status, parsed[0].path.as_str(), parsed[0].submodule), ('M', "src/a.rs", false));
+        assert_eq!((parsed[1].status, parsed[1].path.as_str()), ('A', "new file.txt"));
+        assert!(parsed[2].submodule, "submodules are never rewound");
+
+        let lines = "refs/octopush/talk/t/1 100\nrefs/octopush/talk/t/2 500\ngarbage\n";
+        assert_eq!(ck::expired_refs(lines, 200), vec!["refs/octopush/talk/t/1".to_string()]);
+    }
+
+    fn left(untouched: &[Untouched], path: &str) -> &'static str {
+        untouched.iter().find(|u| u.path == path).map(|u| u.reason).unwrap_or("")
+    }
+
+    fn rewind_now(dir: &Path, id: i64) -> ck::RewindOutcome {
+        let p = ck::preview(dir, THREAD, id).unwrap();
+        ck::rewind(dir, THREAD, id, &p.current).unwrap()
+    }
+
+    fn tree_paths(dir: &Path, rev: &str) -> Vec<String> {
+        git(dir, &["ls-tree", "-r", "--name-only", rev]).lines().map(str::to_string).collect()
+    }
+
+    fn committed(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = repo(tag);
+        for (rel, body) in files {
+            write(&dir, rel, body);
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// The checkpoint ignored a file; the turn un-ignored it, so the
+    /// snapshot of "now" holds it and the checkpoint does not. Neither the
+    /// rewind nor its undo may remove or rewrite it.
+    #[test]
+    fn a_file_ignored_at_the_checkpoint_survives_rewind_and_undo() {
+        let dir = committed("ign-then", &[(".gitignore", "local.cfg\n"), ("a.txt", "A\n")]);
+        write(&dir, "local.cfg", "mine\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        // The turn drops the rule and edits a file.
+        write(&dir, ".gitignore", "");
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(left(&p.untouched, "local.cfg"), "ignored", "{:?}", p.untouched);
+        assert!(p.changes.iter().all(|c| c.path != "local.cfg"));
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 2);
+        assert_eq!(left(&out.untouched, "local.cfg"), "ignored");
+        assert_eq!(read(&dir, "local.cfg"), "mine\n");
+        assert_eq!(read(&dir, ".gitignore"), "local.cfg\n");
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+
+        // The file changes while it is ignored again: the undo's target
+        // holds the old copy and must not write it back over this one.
+        write(&dir, "local.cfg", "mine, edited\n");
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(left(&undone.untouched, "local.cfg"), "ignored", "{:?}", undone.untouched);
+        assert_eq!(read(&dir, "local.cfg"), "mine, edited\n");
+        assert_eq!(read(&dir, ".gitignore"), "");
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: the turn ADDS an ignore rule and ignored files
+    /// appear. The rewind takes the rule away, so the next snapshot holds
+    /// them, while the undo's target does not. The undo must not remove them.
+    #[test]
+    fn files_ignored_since_the_checkpoint_survive_rewind_and_undo() {
+        let dir = committed("ign-now", &[(".gitignore", ""), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, ".gitignore", "build/\n.cache\n");
+        write(&dir, "a.txt", "agent\n");
+        write(&dir, "build/out.bin", "artefact\n");
+        write(&dir, "build/deep/more.bin", "artefact 2\n");
+        write(&dir, ".cache", "warm\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(out.changed, 2, "{out:?}");
+        assert!(out.untouched.is_empty(), "{:?}", out.untouched);
+        assert_eq!(read(&dir, ".gitignore"), "");
+        assert_eq!(read(&dir, "build/out.bin"), "artefact\n");
+
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None);
+        assert_eq!(left(&undone.untouched, "build/out.bin"), "ignored", "{:?}", undone.untouched);
+        assert_eq!(left(&undone.untouched, "build/deep/more.bin"), "ignored");
+        assert_eq!(left(&undone.untouched, ".cache"), "ignored");
+        assert_eq!(read(&dir, "build/out.bin"), "artefact\n");
+        assert_eq!(read(&dir, "build/deep/more.bin"), "artefact 2\n");
+        assert_eq!(read(&dir, ".cache"), "warm\n");
+        assert_eq!(read(&dir, ".gitignore"), "build/\n.cache\n");
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the checkpoint holds is ignored now and was edited since: its
+    /// current content is in no snapshot, so the rewind leaves it. Holds for
+    /// an untracked file and for a tracked one.
+    #[test]
+    fn a_file_ignored_now_is_never_overwritten() {
+        let dir = committed("ign-over", &[(".gitignore", ""), ("tracked.cfg", "T\n")]);
+        write(&dir, "loose.cfg", "L\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, ".gitignore", "*.cfg\n");
+        write(&dir, "loose.cfg", "L filled in\n");
+        write(&dir, "tracked.cfg", "T filled in\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "loose.cfg"), "ignored", "{:?}", out.untouched);
+        assert_eq!(left(&out.untouched, "tracked.cfg"), "ignored");
+        assert_eq!(read(&dir, "loose.cfg"), "L filled in\n");
+        assert_eq!(read(&dir, "tracked.cfg"), "T filled in\n");
+        assert_eq!(read(&dir, ".gitignore"), "");
+
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(read(&dir, "loose.cfg"), "L filled in\n", "{:?}", undone.untouched);
+        assert_eq!(read(&dir, "tracked.cfg"), "T filled in\n");
+        assert_eq!(read(&dir, ".gitignore"), "*.cfg\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rule in a nested `.gitignore` of the destination counts too.
+    #[test]
+    fn a_nested_ignore_file_of_the_destination_is_honoured() {
+        let dir = committed("ign-nested", &[("pkg/.gitignore", "*.local\n"), ("pkg/a.txt", "A\n")]);
+        write(&dir, "pkg/db.local", "mine\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("pkg/.gitignore")).unwrap();
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "pkg/db.local"), "ignored", "{:?}", out.untouched);
+        assert_eq!(read(&dir, "pkg/db.local"), "mine\n");
+        assert_eq!(read(&dir, "pkg/.gitignore"), "*.local\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The checkpoint has a FILE where a directory with ignored content now
+    /// sits. The directory is never removed to put the file back, whether
+    /// the whole directory is ignored or only what it holds.
+    #[test]
+    fn a_directory_holding_ignored_content_is_never_removed_to_place_a_file() {
+        let dir = committed("dir-file", &[(".gitignore", "*.bin\n"), ("cache", "a plain file\n"), ("store", "plain\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        // `cache` becomes a directory with one ignored and one plain file.
+        std::fs::remove_file(dir.join("cache")).unwrap();
+        write(&dir, "cache/keep.bin", "ignored bytes\n");
+        write(&dir, "cache/note.txt", "plain\n");
+        // `store` becomes a directory that is ignored as a whole.
+        std::fs::remove_file(dir.join("store")).unwrap();
+        write(&dir, ".gitignore", "*.bin\nstore/\n");
+        write(&dir, "store/data", "ignored too\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "cache"), "exists", "{:?}", out.untouched);
+        assert_eq!(left(&out.untouched, "store"), "ignored");
+        assert_eq!(read(&dir, "cache/keep.bin"), "ignored bytes\n");
+        assert!(!dir.join("cache/note.txt").exists(), "the plain file the turn created is removed");
+        assert_eq!(read(&dir, "store/data"), "ignored too\n");
+        assert_eq!(read(&dir, ".gitignore"), "*.bin\n");
+
+        // The undo puts the turn's own file back and still removes nothing.
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "cache/keep.bin"), "ignored bytes\n");
+        assert_eq!(read(&dir, "cache/note.txt"), "plain\n");
+        assert_eq!(read(&dir, "store/data"), "ignored too\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Something on disk that the current snapshot doesn't hold (here an
+    /// embedded repository, which a snapshot leaves out) is not replaced by
+    /// the file the checkpoint has at that path.
+    #[test]
+    fn what_the_current_snapshot_does_not_hold_is_not_overwritten() {
+        let dir = committed("unknown", &[("vendor", "a plain file\n"), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("vendor")).unwrap();
+        write(&dir, "vendor/lib.txt", "someone's checkout\n");
+        git(&dir.join("vendor"), &["init", "-q"]);
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(left(&p.untouched, "vendor"), "exists", "{:?}", p.untouched);
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 1);
+        assert_eq!(read(&dir, "vendor/lib.txt"), "someone's checkout\n");
+        assert!(dir.join("vendor/.git").exists());
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder that became a symbolic link is never written through: the
+    /// link itself goes (it is in the snapshot), what it points at stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_never_writes_through_a_symbolic_link() {
+        let dir = committed("symlink", &[("d/f.txt", "F\n")]);
+        let outside = repo("symlink-outside");
+        write(&outside, "f.txt", "outside\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_dir_all(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(read(&outside, "f.txt"), "outside\n", "nothing is written outside the worktree");
+        assert!(std::fs::symlink_metadata(dir.join("d")).map(|m| !m.file_type().is_symlink()).unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Files the Secret guard's name rules treat as sensitive never enter a
+    /// snapshot, tracked or not, so a rewind never writes or removes them.
+    #[test]
+    fn sensitive_named_files_are_never_stored_or_rewound() {
+        let dir = committed("sensitive", &[("a.txt", "A\n"), ("certs/server.pem", "tracked pem\n"), (".env.example", "KEY=\n")]);
+        write(&dir, ".env", "TOKEN=before\n");
+        write(&dir, "deploy/id_rsa", "key before\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        let stored = tree_paths(&dir, &ck::ref_for(THREAD, 1));
+        assert_eq!(stored, vec![".env.example".to_string(), "a.txt".to_string()], "only plain files are stored");
+
+        write(&dir, ".env", "TOKEN=after\n");
+        write(&dir, "certs/server.pem", "pem after\n");
+        write(&dir, ".env.local", "created by the turn\n");
+        std::fs::remove_file(dir.join("deploy/id_rsa")).unwrap();
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(p.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), vec!["a.txt"]);
+        assert!(tree_paths(&dir, &p.current).iter().all(|f| f == "a.txt" || f == ".env.example"));
+        // The tracked one the turn edited can't be put back, and says so;
+        // the untracked ones can't be told from the user's own.
+        assert_eq!(left(&p.untouched, "certs/server.pem"), "sensitive", "{:?}", p.untouched);
+        assert_eq!(p.untouched.len(), 1, "{:?}", p.untouched);
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 1);
+        assert_eq!(left(&out.untouched, "certs/server.pem"), "sensitive");
+        assert_eq!(read(&dir, ".env"), "TOKEN=after\n");
+        assert_eq!(read(&dir, "certs/server.pem"), "pem after\n");
+        assert_eq!(read(&dir, ".env.local"), "created by the turn\n");
+        assert!(!dir.join("deploy/id_rsa").exists());
+        assert_eq!(git(&dir, &["status", "--porcelain", "--", "certs/server.pem"]), "M certs/server.pem", "the real index is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the budget (files, bytes or time) the turn takes no checkpoint,
+    /// nothing is left to rewind to, and the thread says so with the reason.
+    /// A regenerate of that turn takes none either.
+    #[test]
+    fn a_snapshot_over_its_budget_is_skipped_and_marked() {
+        let dir = committed("budget", &[("a.txt", "A\n")]);
+        for i in 0..4 {
+            write(&dir, &format!("big/f{i}.txt"), "0123456789\n");
+        }
+        let second = std::time::Duration::from_secs(20);
+        let few = Budget { files: 3, bytes: 1 << 20, timeout: second };
+        assert!(!ck::capture_before_with(&dir, THREAD, 1, &few));
+        let small = Budget { files: 100, bytes: 30, timeout: second };
+        assert!(!ck::capture_before_with(&dir, THREAD, 2, &small));
+        let instant = Budget { files: 100, bytes: 1 << 20, timeout: std::time::Duration::ZERO };
+        assert!(!ck::capture_before_with(&dir, THREAD, 3, &instant));
+        // A refused snapshot wrote none of the files into the object store.
+        let blob = git(&dir, &["hash-object", "big/f0.txt"]);
+        assert_eq!(git(&dir, &["cat-file", "-t", &blob]), "", "nothing was hashed into the repository");
+        assert!(ck::capture_before_with(&dir, THREAD, 4, &Budget::DEFAULT));
+        assert_eq!(git(&dir, &["cat-file", "-t", &blob]), "blob");
+
+        let cps = ck::checkpoints(&dir, THREAD).unwrap();
+        assert_eq!(cps.turns, vec![4]);
+        assert!(!cps.can_undo);
+        let reasons: Vec<(i64, &str)> = cps.skipped.iter().map(|s| (s.message_id, s.reason.as_str())).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (1, "more than 3 changed or untracked files"),
+                (2, "more than 0 MB of changed or untracked files"),
+                (3, "reading the changed files took too long"),
+            ]
+        );
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![4]);
+        assert!(ck::preview(&dir, THREAD, 1).is_err(), "a skipped turn can't be rewound");
+        // A regenerate must not take a late checkpoint for the skipped turn.
+        assert!(!ck::capture_before(&dir, THREAD, 1));
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![4]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewind that stops part-way reports it, keeps the state from before
+    /// it as the undo, and a second attempt from the half-rewound state
+    /// keeps that FIRST undo target.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_that_stops_part_way_keeps_the_first_undo_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = committed("partial", &[("a.txt", "A\n"), ("locked/b.txt", "B\n"), ("gone.txt", "G\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent a\n");
+        write(&dir, "locked/b.txt", "agent b\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        write(&dir, "made.txt", "agent made\n");
+
+        let lock = |mode: u32| std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(mode)).unwrap();
+        lock(0o555);
+        if std::fs::write(dir.join("locked/probe"), "").is_ok() {
+            // Running as a user the mode doesn't bind (root): nothing to test.
+            let _ = std::fs::remove_file(dir.join("locked/probe"));
+            lock(0o755);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let first = rewind_now(&dir, 1);
+        lock(0o755);
+        assert!(first.error.is_some(), "the locked folder stops it: {first:?}");
+        assert!(first.can_undo);
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert!(!dir.join("made.txt").exists(), "the part that ran did run");
+        assert!(ck::checkpoints(&dir, THREAD).unwrap().can_undo);
+
+        // A second attempt from the half-rewound state finishes the job…
+        let second = rewind_now(&dir, 1);
+        assert_eq!(second.error, None, "{second:?}");
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "B\n");
+        assert_eq!(read(&dir, "gone.txt"), "G\n");
+        // …and the undo goes back to before the FIRST attempt.
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "a.txt"), "agent a\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert_eq!(read(&dir, "made.txt"), "agent made\n");
+        assert!(!dir.join("gone.txt").exists());
+        assert!(!ck::checkpoints(&dir, THREAD).unwrap().can_undo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo of a part-way rewind, taken straight away, puts back
+    /// exactly what the rewind managed to change.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_that_stops_part_way_can_be_undone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = committed("partial-undo", &[("a.txt", "A\n"), ("locked/b.txt", "B\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent a\n");
+        write(&dir, "locked/b.txt", "agent b\n");
+        write(&dir, "made.txt", "agent made\n");
+        let lock = |mode: u32| std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(mode)).unwrap();
+        lock(0o555);
+        if std::fs::write(dir.join("locked/probe"), "").is_ok() {
+            let _ = std::fs::remove_file(dir.join("locked/probe"));
+            lock(0o755);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let first = rewind_now(&dir, 1);
+        lock(0o755);
+        assert!(first.error.is_some() && first.can_undo, "{first:?}");
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "a.txt"), "agent a\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert_eq!(read(&dir, "made.txt"), "agent made\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scratch files never sit under a guessable name in the temp folder:
+    /// a snapshot, a preview with destination rules and a rewind leave
+    /// nothing behind there under the old fixed prefixes.
+    #[test]
+    fn scratch_files_use_private_directories_and_are_removed() {
+        let dir = committed("scratch", &[(".gitignore", "*.log\n"), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent\n");
+        rewind_now(&dir, 1);
+        let pid = std::process::id().to_string();
+        let stray: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("octopush-talk-idx-") || n.starts_with("octopush-talk-rules-"))
+            .filter(|n| n.contains(&pid))
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A later, unrelated rewind does not inherit a stale undo target.
+    #[test]
+    fn a_fresh_rewind_replaces_the_undo_target() {
+        let dir = committed("fresh-undo", &[("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "one\n");
+        rewind_now(&dir, 1);
+        write(&dir, "a.txt", "two\n");
+        rewind_now(&dir, 1);
+        ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(read(&dir, "a.txt"), "two\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting or archiving a workspace prunes its threads' refs from any
+    /// checkout of the repository, the removed worktree's included.
+    #[test]
+    fn pruning_a_workspace_clears_its_threads_from_the_shared_repository() {
+        let dir = committed("ws-prune", &[("a.txt", "A\n")]);
+        let wt = dir.with_file_name(format!("{}-wt", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&wt);
+        git(&dir, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"]);
+        write(&wt, "big.txt", "x\n");
+        assert!(ck::capture_before(&wt, THREAD, 1));
+        assert!(!ck::capture_before_with(&wt, THREAD, 2, &Budget { files: 0, ..Budget::DEFAULT }));
+        assert!(ck::capture_before(&wt, "5b1e-thread-b", 1));
+        assert!(ck::capture_before(&dir, "5b1e-thread-c", 1));
+        // Pruned from the main checkout, as after the worktree is removed.
+        ck::prune_threads(&dir, &[THREAD.to_string(), "../heads/side".to_string()]);
+        let refs = git(&dir, &["for-each-ref", "--format=%(refname)", ck::REF_ROOT]);
+        assert_eq!(refs, "refs/octopush/talk/5b1e-thread-b/1\nrefs/octopush/talk/5b1e-thread-c/1");
+        assert!(!git(&dir, &["branch", "--list", "side"]).is_empty(), "a bad id never reaches another ref");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_rewind_note_names_the_turn() {
+        use crate::commands::rewind_note;
+        assert_eq!(rewind_note(Some("Fix the parser"), 1), "Files rewound to before “Fix the parser” · 1 file");
+        assert_eq!(
+            rewind_note(Some("\nMake the whole importer stream rows instead of loading them"), 3),
+            "Files rewound to before “Make the whole importer stream rows inst…” · 3 files"
+        );
+        assert_eq!(rewind_note(None, 0), "Files rewound to before a turn · 0 files");
+    }
+
+    #[test]
+    fn fork_copies_the_history_before_a_user_turn() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-fork", "P", "/tmp/p-fork").unwrap();
+        db.insert_workspace("w-fork", "p-fork", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-fork", "Parser work").unwrap();
+        let u1 = db.insert_chat_message("w-fork", &t.id, "user", "one", None, None, None, None).unwrap();
+        let a1 = db.insert_chat_message("w-fork", &t.id, "assistant", "ok", Some("m"), Some(5), Some(2), Some(0.01)).unwrap();
+        let u2 = db.insert_chat_message("w-fork", &t.id, "user", "two", None, None, None, None).unwrap();
+        db.insert_chat_message("w-fork", &t.id, "assistant", "done", None, None, None, None).unwrap();
+
+        let (fork, draft, pairs) = db.fork_chat_thread(&t.id, u2).unwrap();
+        assert_eq!(fork.title, "Parser work · fork");
+        assert_eq!(fork.workspace_id, "w-fork");
+        assert_eq!(draft, "two");
+        assert_eq!(pairs.iter().map(|p| p.0).collect::<Vec<_>>(), vec![u1, a1]);
+        let copied = db.list_chat_messages(&fork.id).unwrap();
+        let shape: Vec<(&str, &str)> = copied.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+        assert_eq!(shape, vec![("user", "one"), ("assistant", "ok")]);
+        assert_eq!(copied[1].output_tokens, Some(2));
+        assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 4, "the original is untouched");
+        assert!(db.fork_chat_thread(&t.id, a1).is_err(), "only a user turn forks");
+        assert_eq!(db.chat_thread_worktree(&t.id).unwrap(), None);
+    }
+
+    /// What a rewind checks before it writes: every conversation of every
+    /// workspace checked out at the same folder, and a Direct run in
+    /// progress there. The folder comes from the database.
+    #[test]
+    fn the_worktree_a_rewind_writes_to_is_known_from_the_database() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-idle", "P", "/tmp/p-idle").unwrap();
+        db.insert_workspace("w-a", "p-idle", "a", "", "main", Some("/tmp/p-idle/wt"), "", None).unwrap();
+        db.insert_workspace("w-b", "p-idle", "b", "", "main", Some("/tmp/p-idle/wt/"), "", None).unwrap();
+        db.insert_workspace("w-c", "p-idle", "c", "", "side", Some("/tmp/p-idle/other"), "", None).unwrap();
+        db.insert_workspace("w-d", "p-idle", "d", "", "none", None, "", None).unwrap();
+        let ta = db.create_chat_thread("w-a", "A").unwrap();
+        let ta2 = db.create_chat_thread("w-a", "A2").unwrap();
+        let tb = db.create_chat_thread("w-b", "B").unwrap();
+        let tc = db.create_chat_thread("w-c", "C").unwrap();
+        let td = db.create_chat_thread("w-d", "D").unwrap();
+
+        assert_eq!(db.chat_thread_home(&ta.id).unwrap(), Some(("w-a".to_string(), Some("/tmp/p-idle/wt".to_string()))));
+        assert_eq!(db.chat_thread_home(&td.id).unwrap(), Some(("w-d".to_string(), None)));
+        assert_eq!(db.chat_thread_home("no-such-thread").unwrap(), None);
+
+        let mut sharing = db.chat_threads_sharing_worktree(&ta.id).unwrap();
+        sharing.sort();
+        let mut expected = vec![ta.id.clone(), ta2.id.clone(), tb.id.clone()];
+        expected.sort();
+        assert_eq!(sharing, expected, "same folder, a trailing slash ignored; another folder left out");
+        assert_eq!(db.chat_threads_sharing_worktree(&td.id).unwrap(), vec![td.id.clone()]);
+        assert_eq!(db.chat_threads_sharing_worktree(&tc.id).unwrap(), vec![tc.id.clone()]);
+
+        let mut ids = db.chat_thread_ids("w-a").unwrap();
+        ids.sort();
+        let mut own = vec![ta.id.clone(), ta2.id.clone()];
+        own.sort();
+        assert_eq!(ids, own);
+
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline = db.list_pipelines().unwrap()[0].id.clone();
+        let run = db.create_run("w-b", &pipeline, "task", None, None, &[]).unwrap();
+        assert!(!db.has_active_run_at("/tmp/p-idle/wt").unwrap(), "a draft is not in progress");
+        db.set_run_status(&run, "running", false).unwrap();
+        assert!(db.has_active_run_at("/tmp/p-idle/wt").unwrap(), "a run in a workspace at the same folder counts");
+        assert!(!db.has_active_run_at("/tmp/p-idle/other").unwrap());
+        db.set_run_status(&run, "paused", false).unwrap();
+        assert!(db.has_active_run_at("/tmp/p-idle/wt/").unwrap());
+        db.set_run_status(&run, "completed", true).unwrap();
+        assert!(!db.has_active_run_at("/tmp/p-idle/wt").unwrap());
+    }
+
+    #[test]
+    fn the_note_says_what_was_left_untouched_or_stopped() {
+        use crate::commands::rewind_note_tail;
+        let mut outcome = ck::RewindOutcome { changed: 2, untouched: Vec::new(), error: None, can_undo: true };
+        assert_eq!(rewind_note_tail(&outcome), "");
+        outcome.untouched.push(Untouched { path: "local.cfg".into(), reason: "ignored" });
+        assert_eq!(rewind_note_tail(&outcome), " · 1 left untouched");
+        outcome.error = Some("checkout-index: failed".into());
+        assert_eq!(rewind_note_tail(&outcome), " · 1 left untouched · stopped part-way");
+    }
+
+    /// A copy that fails part-way leaves no half-copied `· fork` thread.
+    #[test]
+    fn a_fork_that_fails_part_way_leaves_nothing() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-fork2", "P", "/tmp/p-fork2").unwrap();
+        db.insert_workspace("w-fork2", "p-fork2", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-fork2", "Atomic").unwrap();
+        db.insert_chat_message("w-fork2", &t.id, "user", "one", None, None, None, None).unwrap();
+        db.insert_chat_message("w-fork2", &t.id, "assistant", "boom", None, None, None, None).unwrap();
+        let u2 = db.insert_chat_message("w-fork2", &t.id, "user", "two", None, None, None, None).unwrap();
+        // The second row's copy fails, after the thread and the first row.
+        db.conn_ref()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_copy BEFORE INSERT ON chat_messages
+                 WHEN NEW.content = 'boom' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        assert!(db.fork_chat_thread(&t.id, u2).is_err());
+        let titles: Vec<String> = db.list_chat_threads("w-fork2").unwrap().into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, vec!["Atomic".to_string()], "no half-copied fork");
+        db.conn_ref().execute_batch("DROP TRIGGER fail_copy;").unwrap();
+        let (fork, _, pairs) = db.fork_chat_thread(&t.id, u2).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(db.list_chat_messages(&fork.id).unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use crate::request_context::{
+        agents_item, apportion, estimate_tokens, memory_files, memory_imports, request_context, session_files, skills_item,
+        CarriedItem, MAX_SESSIONS,
+    };
+    use crate::transcripts::project_dir_name;
+    use std::collections::HashSet;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn file_item(label: &str, bytes: u64) -> CarriedItem {
+        CarriedItem { kind: "memory".into(), label: label.into(), path: None, count: 1, bytes, tokens: 0 }
+    }
+
+    fn assistant(session: &str, req: &str, model: &str, i: u64, cr: u64, cc: u64, o: u64, ts: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "requestId": req,
+            "timestamp": ts,
+            "sessionId": session,
+            "message": {
+                "id": format!("msg_{req}"),
+                "model": model,
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": i,
+                    "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cc,
+                    "output_tokens": o
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Labels of the items whose file sits under one of `roots` (the
+    /// machine's own `/tmp/CLAUDE.md`, if any, is not the test's).
+    fn labels_under(items: &[CarriedItem], roots: &[&Path]) -> Vec<String> {
+        items
+            .iter()
+            .filter(|i| i.path.as_deref().is_some_and(|p| roots.iter().any(|r| Path::new(p).starts_with(r))))
+            .map(|i| i.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn estimates_fill_the_measured_total_and_the_rest_is_by_difference() {
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(1), 1);
+        assert_eq!(estimate_tokens(4_000), 1_000);
+
+        // Under the total: the remainder is one "by difference" row, ranked with the rest.
+        let items = apportion(vec![file_item("CLAUDE.md", 40_000), file_item("AGENTS.md", 4_000)], Some(30_000));
+        let rows: Vec<(&str, &str, u64)> = items.iter().map(|i| (i.kind.as_str(), i.label.as_str(), i.tokens)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("by_difference", "MCP and built-in tools, by difference", 19_000),
+                ("memory", "CLAUDE.md", 10_000),
+                ("memory", "AGENTS.md", 1_000),
+            ]
+        );
+        assert_eq!(items.iter().map(|i| i.tokens).sum::<u64>(), 30_000);
+
+        // Over the total: scaled down to add up to it exactly, no difference row.
+        let items = apportion(vec![file_item("a", 4_000), file_item("b", 4_000), file_item("c", 4_000)], Some(1_000));
+        assert_eq!(items.iter().map(|i| i.tokens).sum::<u64>(), 1_000);
+        assert!(items.iter().all(|i| i.kind == "memory" && (333..=334).contains(&i.tokens)));
+
+        // An exact fit leaves no empty difference row; an empty file is no row.
+        let items = apportion(vec![file_item("a", 400), file_item("empty", 0)], Some(100));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tokens, 100);
+
+        // Nothing measured: the raw estimates stand.
+        let items = apportion(vec![file_item("a", 400)], None);
+        assert_eq!(items.iter().map(|i| i.tokens).collect::<Vec<_>>(), [100]);
+    }
+
+    #[test]
+    fn imports_are_at_paths_outside_code_fences() {
+        let text = "Read @AGENTS.md, then @docs/style.md.\nMail a@b.co or `@code`.\n```\n@inside-fence.md\n```\nAgain @AGENTS.md\n";
+        assert_eq!(memory_imports(text), ["AGENTS.md", "docs/style.md"]);
+    }
+
+    #[test]
+    fn the_claude_md_chain_is_user_then_top_down_with_imports() {
+        let home = TempDir::new().unwrap();
+        let tree = TempDir::new().unwrap();
+        let project = tree.path().join("work").join("repo");
+        write(&home.path().join(".claude/CLAUDE.md"), "user rules");
+        write(&tree.path().join("work/CLAUDE.md"), "parent rules");
+        // AGENTS.md counts only because CLAUDE.md imports it; it imports
+        // CLAUDE.md back, which is not counted twice.
+        write(&project.join("CLAUDE.md"), "See @AGENTS.md.\n```\n@fenced.md\n```\n");
+        write(&project.join("AGENTS.md"), "agents rules, see @CLAUDE.md");
+        write(&project.join("fenced.md"), "not loaded");
+        write(&project.join("CLAUDE.local.md"), "local");
+        write(&project.join("sub/AGENTS.md"), "never imported");
+
+        let items = memory_files(&project, Some(home.path()));
+        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
+        assert_eq!(
+            labels_under(&items, &[home.path(), tree.path()]),
+            ["~/.claude/CLAUDE.md".to_string(), parent, "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
+        );
+        let local = items.iter().find(|i| i.label == "CLAUDE.local.md").unwrap();
+        assert_eq!((local.kind.as_str(), local.count, local.bytes), ("memory", 1, 5));
+    }
+
+    #[test]
+    fn skills_and_agents_count_their_listings_project_first() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(&project.path().join(".claude/skills/tests/SKILL.md"), "---\nname: tests\ndescription: abcd\n---\nA long body that is not in context.");
+        write(&home.path().join(".claude/skills/tests/SKILL.md"), "---\nname: tests\ndescription: shadowed by the project's\n---\nx");
+        write(&home.path().join(".claude/skills/docs/SKILL.md"), "---\nname: docs\ndescription: ab\n---\nx");
+        write(&home.path().join(".claude/skills/broken/SKILL.md"), "no frontmatter");
+        let skills = skills_item(project.path(), Some(home.path())).unwrap();
+        assert_eq!((skills.kind.as_str(), skills.label.as_str(), skills.count), ("skills", "Skills", 2));
+        assert_eq!(skills.bytes, ("tests".len() + "abcd".len() + "docs".len() + "ab".len()) as u64);
+
+        write(&project.path().join(".claude/agents/reviewer.md"), "---\nname: reviewer\ndescription: Reviews\n---\nbody");
+        write(&project.path().join(".claude/agents/notes.txt"), "---\nname: notes\ndescription: not an agent\n---\n");
+        let agents = agents_item(project.path(), Some(home.path())).unwrap();
+        assert_eq!((agents.kind.as_str(), agents.count, agents.bytes), ("agents", 1, ("reviewer".len() + "Reviews".len()) as u64));
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(skills_item(empty.path(), Some(empty.path())), None);
+        assert_eq!(agents_item(empty.path(), None), None);
+    }
+
+    #[test]
+    fn the_total_is_the_smallest_first_request_of_the_projects_sessions() {
+        let root = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let cwd = project.path().display().to_string();
+        let dir = root.path().join(project_dir_name(&cwd));
+        let m = "claude-sonnet-5-5";
+        write(
+            &dir.join("s-old.jsonl"),
+            &format!(
+                "{}\n{}\n",
+                assistant("s-old", "o1", m, 10, 0, 30_000, 50, "2026-11-20T10:00:00Z"),
+                assistant("s-old", "o2", m, 5, 30_000, 200, 40, "2026-11-20T10:01:00Z"),
+            ),
+        );
+        let mut side: serde_json::Value =
+            serde_json::from_str(&assistant("s-new", "n0", m, 100, 0, 0, 5, "2026-11-21T09:59:00Z")).unwrap();
+        side["isSidechain"] = serde_json::json!(true);
+        write(
+            &dir.join("s-new.jsonl"),
+            &format!(
+                "{}\n{}\n{}\n{}\n",
+                // An inline sub-agent's request is not the session's first.
+                side,
+                serde_json::json!({ "type": "user", "message": { "role": "user", "content": "hi" } }),
+                assistant("s-new", "n1", m, 10, 20_000, 5_000, 30, "2026-11-21T10:00:00Z"),
+                assistant("s-new", "n2", m, 3, 25_000, 100, 20, "2026-11-21T10:01:00Z"),
+            ),
+        );
+        // A Direct stage's session and a sub-agent's file are not the project's sessions.
+        write(&dir.join("d-1.jsonl"), &format!("{}\n", assistant("d-1", "d1", m, 1, 0, 1_000, 5, "2026-11-21T11:00:00Z")));
+        write(
+            &dir.join("s-new/subagents/agent-1.jsonl"),
+            &format!("{}\n", assistant("s-new", "a1", m, 1, 0, 50, 5, "2026-11-21T10:02:00Z")),
+        );
+        write(&project.path().join("CLAUDE.md"), &"x".repeat(4_000));
+
+        let direct: HashSet<String> = ["d-1".to_string()].into();
+        let ctx = request_context(root.path(), Some(home.path()), project.path(), &[cwd.clone()], &direct);
+        assert_eq!(ctx.measured_tokens, Some(25_010));
+        assert_eq!(ctx.sessions_measured, 2);
+        assert_eq!(ctx.model.as_deref(), Some(m));
+        let hit = ctx.cache_hit_pct.unwrap();
+        let expected = 75_000.0 / (128.0 + 75_000.0 + 35_300.0) * 100.0;
+        assert!((hit - expected).abs() < 1e-9, "{hit} vs {expected}");
+
+        let prices = crate::token_engine::prices_for(m).expect("a priced model");
+        let uncached = ctx.uncached_usd.unwrap();
+        assert!((uncached - prices.input_per_m * 25_010.0 / 1_000_000.0).abs() < 1e-12);
+        // Most of these prompts were cache reads: the usual request pays less.
+        let usual = ctx.usual_usd.unwrap();
+        assert!(usual > 0.0 && usual < uncached, "{usual} vs {uncached}");
+
+        let claude_md = ctx.items.iter().find(|i| i.label == "CLAUDE.md").unwrap();
+        assert_eq!(claude_md.tokens, 1_000);
+        assert_eq!(ctx.items[0].kind, "by_difference");
+        assert_eq!(ctx.items.iter().map(|i| i.tokens).sum::<u64>(), 25_010);
+
+        // An unpriced model: tokens measured, no price invented.
+        let other = TempDir::new().unwrap();
+        let cwd2 = other.path().display().to_string();
+        write(
+            &root.path().join(project_dir_name(&cwd2)).join("u.jsonl"),
+            &format!("{}\n", assistant("u", "u1", "mystery-model-9", 10, 0, 900, 5, "2026-11-21T10:00:00Z")),
+        );
+        let ctx = request_context(root.path(), None, other.path(), &[cwd2], &HashSet::new());
+        assert_eq!(ctx.measured_tokens, Some(910));
+        assert_eq!((ctx.uncached_usd, ctx.usual_usd), (None, None));
+
+        // No transcript: nothing measured, the files stand as raw estimates.
+        let none = TempDir::new().unwrap();
+        let ctx = request_context(root.path(), None, project.path(), &[none.path().display().to_string()], &HashSet::new());
+        assert_eq!((ctx.measured_tokens, ctx.sessions_measured, ctx.model.as_deref()), (None, 0, None));
+        assert!(ctx.items.iter().all(|i| i.kind != "by_difference"));
+    }
+
+    #[test]
+    fn only_the_most_recent_sessions_are_read() {
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/request-context-recent";
+        let dir = root.path().join(project_dir_name(cwd));
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        for n in 0..=MAX_SESSIONS {
+            let path = dir.join(format!("s{n}.jsonl"));
+            // s0 is the oldest and the smallest.
+            let l = assistant(&format!("s{n}"), &format!("r{n}"), "claude-sonnet-5-5", 1, 0, 1_000 + n as u64, 5, "2026-11-21T10:00:00Z");
+            write(&path, &format!("{l}\n"));
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(n as u64 * 10)).unwrap();
+        }
+        let files = session_files(root.path(), &[cwd.to_string()], &HashSet::new());
+        assert_eq!(files.len(), MAX_SESSIONS);
+        assert_eq!(files[0].file_name().unwrap(), format!("s{MAX_SESSIONS}.jsonl").as_str());
+        assert!(!files.iter().any(|f| f.file_name().unwrap() == "s0.jsonl"));
+        let ctx = request_context(root.path(), None, Path::new(cwd), &[cwd.to_string()], &HashSet::new());
+        assert_eq!(ctx.measured_tokens, Some(1_002));
+    }
+}
+
+/// #963: what archiving a merged mission re-checks at the moment it acts.
+#[cfg(test)]
+mod merged_archive_tests {
+    use crate::commands::{archive_workspace_at, changed_since_named, merged_archive_skip, worktree_busy};
+    use crate::git_ops::{head_sha, is_hooks_only_settings, is_rebuildable_ignored, local_ignored_files, LOCAL_FILES_WALK_CAP};
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    /// What a confirm named when it named no local files.
+    const NOTHING: &[String] = &[];
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A clean repo with one commit; its HEAD stands for the merged PR's head.
+    fn merged_repo() -> (tempfile::TempDir, String) {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "t@t.dev"]);
+        git(p, &["config", "user.name", "T"]);
+        std::fs::write(p.join(".gitignore"), ".env\nnode_modules/\n*.sqlite\n*.db\n").unwrap();
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        let head = head_sha(p).unwrap();
+        (dir, head)
+    }
+
+    #[test]
+    fn a_mission_that_changed_after_the_offer_is_skipped() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), None, "offered: merged and clean");
+        std::fs::write(p.join("a.txt"), "edited\n").unwrap();
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("changed"));
+        git(p, &["commit", "-qam", "after the merge"]);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("moved"));
+        assert_eq!(merged_archive_skip(p, None, false, Some(NOTHING)), Some("moved"), "no merged PR on the branch");
+    }
+
+    #[test]
+    fn an_untracked_file_in_an_untracked_folder_is_a_change() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join("notes/draft")).unwrap();
+        std::fs::write(p.join("notes/draft/idea.md"), "x\n").unwrap();
+        assert_eq!(changed_since_named(p, None), Some("changed"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, None), Some("changed"));
+    }
+
+    #[test]
+    fn a_turn_or_run_started_while_the_confirm_was_open_is_skipped() {
+        let (dir, head) = merged_repo();
+        let wt = dir.path().to_string_lossy().to_string();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-merged", "P", "/tmp/p-merged").unwrap();
+        db.insert_workspace("w-merged", "p-merged", "ws", "", "fix/a", Some(&wt), "", None).unwrap();
+        let thread = db.create_chat_thread("w-merged", "Talk").unwrap();
+        let idle = |_: &[String]| false;
+        assert!(!worktree_busy(&db, idle, &wt));
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), worktree_busy(&db, idle, &wt), Some(NOTHING)), None);
+
+        // A Talk turn starts on one of its conversations…
+        let talking = |t: &[String]| t.contains(&thread.id);
+        let busy = worktree_busy(&db, talking, &format!("{wt}/"));
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, Some(NOTHING)), Some("busy"));
+
+        // …or a Direct run does.
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline = db.list_pipelines().unwrap()[0].id.clone();
+        let run = db.create_run("w-merged", &pipeline, "task", None, None, &[]).unwrap();
+        db.set_run_status(&run, "running", false).unwrap();
+        let busy = worktree_busy(&db, idle, &wt);
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, Some(NOTHING)), Some("busy"));
+    }
+
+    #[test]
+    fn local_files_are_skipped_unless_the_confirm_named_them() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+        std::fs::write(p.join("node_modules/x/i.js"), "").unwrap();
+        assert!(local_ignored_files(p).unwrap().is_empty(), "a dependency folder is not local work");
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), None);
+        std::fs::write(p.join(".env"), "TOKEN=1\n").unwrap();
+        let named = local_ignored_files(p).unwrap();
+        assert_eq!(named, vec![".env".to_string()]);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("local-files"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(&named)), None);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, None), None, "the offer lists them instead");
+
+        // The confirm named `.env`; then a local database appears.
+        std::fs::write(p.join("local.db"), "rows").unwrap();
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(&named)), Some("local-files"));
+        assert_eq!(changed_since_named(p, Some(&named)), Some("local-files"), "also just before the delete");
+    }
+
+    #[test]
+    fn ignored_files_inside_an_untracked_folder_are_local_files() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join("db")).unwrap();
+        std::fs::write(p.join("db/dev.sqlite"), "rows").unwrap();
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with("db/")), "{files:?}");
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("local-files"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(&files)), None);
+    }
+
+    #[test]
+    fn the_hooked_claude_settings_alone_and_empty_folders_are_not_local_files() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join(".git/info")).unwrap();
+        let exclude = p.join(".git/info/exclude");
+        let mut lines = std::fs::read_to_string(&exclude).unwrap_or_default();
+        lines.push_str(crate::claude_hooks::EXCLUDE_LINE);
+        lines.push('\n');
+        std::fs::write(&exclude, lines).unwrap();
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        std::fs::write(p.join(".claude/settings.local.json"), "{}").unwrap();
+        std::fs::create_dir_all(p.join("tmp/empty")).unwrap();
+        assert_eq!(local_ignored_files(p).unwrap(), Vec::<String>::new());
+        assert_eq!(changed_since_named(p, Some(NOTHING)), None);
+    }
+
+    #[test]
+    fn rebuildable_ignored_paths() {
+        for p in [
+            "node_modules/", "web/node_modules/", ".venv/", "venv/", "dist/", "app/build/", "target/", ".next/",
+            "src/__pycache__/", ".DS_Store", "docs/.DS_Store",
+        ] {
+            assert!(is_rebuildable_ignored(p), "{p}");
+        }
+        for p in [".env", "web/.env.local", "data.db", "notes/", ".claude/", ".claude/settings.local.json"] {
+            assert!(!is_rebuildable_ignored(p), "{p}");
+        }
+    }
+
+    /// Octopush's hooks in a settings file, plus `extra` keys of the user's.
+    fn hooked_settings(extra: serde_json::Value) -> String {
+        let merged = crate::agent_adapter::merge_claude_hooks(extra, std::path::Path::new("/opt/octopush-mcp")).unwrap();
+        serde_json::to_string(&merged).unwrap()
+    }
+
+    fn exclude_hooked_settings(p: &std::path::Path) {
+        std::fs::create_dir_all(p.join(".git/info")).unwrap();
+        let exclude = p.join(".git/info/exclude");
+        let mut lines = std::fs::read_to_string(&exclude).unwrap_or_default();
+        lines.push_str(crate::claude_hooks::EXCLUDE_LINE);
+        lines.push('\n');
+        std::fs::write(&exclude, lines).unwrap();
+    }
+
+    #[test]
+    fn claude_settings_are_local_files_only_with_more_than_our_hooks() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        exclude_hooked_settings(p);
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        let settings = p.join(".claude/settings.local.json");
+        std::fs::write(&settings, hooked_settings(serde_json::json!({}))).unwrap();
+        assert!(is_hooks_only_settings(p, ".claude/settings.local.json"));
+        assert!(local_ignored_files(p).unwrap().is_empty());
+
+        // Claude Code saved a "don't ask again" choice in it.
+        let choices = serde_json::json!({ "permissions": { "allow": ["Bash(npm test)"] } });
+        std::fs::write(&settings, hooked_settings(choices)).unwrap();
+        assert!(!is_hooks_only_settings(p, ".claude/settings.local.json"));
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with(".claude/")), "{files:?}");
+
+        // Only our hooks again, but another ignored file beside them.
+        std::fs::write(&settings, hooked_settings(serde_json::json!({}))).unwrap();
+        std::fs::write(p.join(".claude/.env"), "TOKEN=1\n").unwrap();
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with(".claude/")), "{files:?}");
+    }
+
+    #[test]
+    fn a_dependency_folder_inside_a_folder_is_skipped_not_counted() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        let deps = p.join("pkg/node_modules/big");
+        std::fs::create_dir_all(&deps).unwrap();
+        for i in 0..LOCAL_FILES_WALK_CAP + 100 {
+            std::fs::write(deps.join(format!("f{i}.js")), "").unwrap();
+        }
+        assert!(local_ignored_files(p).unwrap().is_empty(), "pkg/ holds only a dependency folder");
+        std::fs::write(p.join("pkg/.env"), "TOKEN=1\n").unwrap();
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with("pkg/")), "{files:?}");
+    }
+
+    #[test]
+    fn a_folder_too_big_to_walk_counts_as_local_files() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        for i in 0..3 {
+            std::fs::create_dir_all(p.join(format!("small/d{i}"))).unwrap();
+        }
+        assert!(local_ignored_files(p).unwrap().is_empty(), "empty folders hold nothing");
+        for i in 0..=LOCAL_FILES_WALK_CAP {
+            std::fs::create_dir_all(p.join(format!("big/d{i}"))).unwrap();
+        }
+        assert_eq!(local_ignored_files(p).unwrap(), vec!["big/".to_string()], "the cap was reached");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_holding_only_a_symlink_counts_and_the_link_is_not_followed() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        std::fs::write(p.join(".gitignore"), ".env\nnode_modules/\n*.sqlite\n*.db\nlinks/\n").unwrap();
+        git(p, &["commit", "-qam", "ignore links"]);
+        std::fs::create_dir_all(p.join("links")).unwrap();
+        std::os::unix::fs::symlink("..", p.join("links/up")).unwrap();
+        assert_eq!(local_ignored_files(p).unwrap(), vec!["links/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_mission_skipped_at_the_last_check_keeps_its_talk_checkpoints() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        git(&project, &["init", "-q"]);
+        git(&project, &["config", "user.email", "t@t.dev"]);
+        git(&project, &["config", "user.name", "T"]);
+        std::fs::write(project.join("a.txt"), "a\n").unwrap();
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-qm", "base"]);
+        let wt = root.path().join("wt");
+        let wt_s = wt.to_string_lossy().to_string();
+        let project_s = project.to_string_lossy().to_string();
+        git(&project, &["worktree", "add", "-q", "-b", "fix/a", wt_s.as_str()]);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(tmp.path()).unwrap());
+        db.lock().insert_project("p-cp", "P", &project_s).unwrap();
+        db.lock().insert_workspace("w-cp", "p-cp", "ws", "", "fix/a", Some(&wt_s), "", None).unwrap();
+        let thread = db.lock().create_chat_thread("w-cp", "Talk").unwrap();
+        let checkpoint = format!("{}/{}/1", crate::talk_checkpoints::REF_ROOT, thread.id);
+        git(&wt, &["update-ref", checkpoint.as_str(), "HEAD"]);
+        let has_checkpoint = || {
+            Command::new("git")
+                .args(["show-ref", "--verify", "--quiet", checkpoint.as_str()])
+                .current_dir(&project)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(has_checkpoint());
+        let status = || db.lock().get_workspace("w-cp").unwrap().unwrap().status;
+
+        // A file changed after the confirm: left in place, checkpoints kept.
+        std::fs::write(wt.join("late.txt"), "x").unwrap();
+        let out = archive_workspace_at(&db, |_| false, "w-cp", &project_s, Some(&wt_s), Some(NOTHING)).await.unwrap();
+        assert_eq!(out, Some("changed"));
+        assert!(wt.is_dir() && has_checkpoint() && status() != "archived");
+
+        // A Talk turn started there: the same.
+        std::fs::remove_file(wt.join("late.txt")).unwrap();
+        let talking = |t: &[String]| t.contains(&thread.id);
+        let out = archive_workspace_at(&db, talking, "w-cp", &project_s, Some(&wt_s), Some(NOTHING)).await.unwrap();
+        assert_eq!(out, Some("busy"));
+        assert!(wt.is_dir() && has_checkpoint() && status() != "archived");
+
+        // Clean and idle: archived, and only then are its checkpoints pruned.
+        let out = archive_workspace_at(&db, |_| false, "w-cp", &project_s, Some(&wt_s), Some(NOTHING)).await.unwrap();
+        assert_eq!(out, None);
+        assert!(!wt.exists() && !has_checkpoint());
+        assert_eq!(status(), "archived");
+    }
+}
+
+#[cfg(test)]
+mod talk_context_guard_tests {
+    use crate::commands::{read_file_lines_inner, LineRangeResult};
+    use crate::secret_scan::{scan_collected, text_files, TextBlock};
+    use std::io::Write;
+
+    fn temp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn lines(bytes: &[u8], start: u32, end: u32, max: usize) -> (String, u32, u32, Option<u32>, bool) {
+        let f = temp(bytes);
+        match read_file_lines_inner(f.path().to_str().unwrap(), start, end, max).unwrap() {
+            LineRangeResult::Text { content, start, end, total, cut } => (content, start, end, total, cut),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_range_stops_at_its_last_line() {
+        assert_eq!(lines(b"a\nb\nc\nd", 2, 3, 1000), ("b\nc".into(), 2, 3, None, false));
+        // At the end of the file the total is known, counted like split('\n').
+        assert_eq!(lines(b"a\nb\n", 1, 2, 1000), ("a\nb".into(), 1, 2, Some(3), false));
+        assert_eq!(lines(b"a\nb", 2, 9, 1000), ("b".into(), 2, 2, Some(2), false));
+        assert_eq!(lines(b"a\nb", 5, 6, 1000).0, "");
+    }
+
+    #[test]
+    fn a_range_spans_buffer_chunks_and_is_capped() {
+        let body: String = (1..=5000).map(|n| format!("line {n}\n")).collect();
+        let got = lines(body.as_bytes(), 4000, 4002, 1000);
+        assert_eq!(got, ("line 4000\nline 4001\nline 4002".into(), 4000, 4002, None, false));
+        let (content, _, _, _, cut) = lines(body.as_bytes(), 1, 5000, 20);
+        assert_eq!(content.len(), 20);
+        assert!(cut);
+        // A cut never splits a character.
+        let (content, _, _, _, cut) = lines("ééé".as_bytes(), 1, 1, 3);
+        assert_eq!((content.as_str(), cut), ("é", true));
+    }
+
+    #[test]
+    fn a_range_of_a_binary_or_non_utf8_file_says_so() {
+        let f = temp(b"PK\x03\x04\x00binary");
+        assert!(matches!(read_file_lines_inner(f.path().to_str().unwrap(), 1, 1, 100).unwrap(), LineRangeResult::Binary));
+        let f = temp(&[0xff, 0xfe, 0x41]);
+        assert!(matches!(
+            read_file_lines_inner(f.path().to_str().unwrap(), 1, 1, 100).unwrap(),
+            LineRangeResult::UnsupportedEncoding
+        ));
+    }
+
+    #[test]
+    fn talk_blocks_are_scanned_with_their_labels_and_line_numbers() {
+        let token = ["gh", "p_"].concat() + "Zq8LmT2vXc9RpW4nKs7YbH1dFg6JuE3aQo5V";
+        let blocks = vec![
+            TextBlock { label: "@session:dev".into(), text: "$ echo hi\nhi".into(), first_line: None, whole_file: false },
+            TextBlock { label: "src/a.ts".into(), text: format!("x\nconst t = \"{token}\";"), first_line: Some(40), whole_file: false },
+        ];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.findings[0].file, "src/a.ts");
+        assert_eq!(report.findings[0].line, Some(41));
+        assert_eq!(report.findings[0].rule, "github-token");
+        assert!(!report.partial);
+    }
+
+    #[test]
+    fn a_whole_file_block_is_judged_by_its_name_too() {
+        let blocks = vec![TextBlock { label: "keys/server.pem".into(), text: "x".into(), first_line: None, whole_file: true }];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert!(report.findings.iter().any(|f| f.line.is_none() && f.file == "keys/server.pem"));
+    }
+
+    /// `@diff` with an untracked `.env` and `id_rsa`, as Talk splits it
+    /// (`diffScanInputs`): one block per file section, by the file's path,
+    /// without the `+` prefix, so the rules a path decides apply.
+    #[test]
+    fn a_diff_split_per_file_flags_an_untracked_env_and_key() {
+        let env = "HOST=localhost\nDB_PASSWORD=Vb7qR2mxK9tLw";
+        let blocks = vec![
+            TextBlock { label: "src/a.ts".into(), text: "keep\nnew".into(), first_line: Some(10), whole_file: false },
+            TextBlock { label: ".env".into(), text: env.into(), first_line: Some(1), whole_file: true },
+            TextBlock { label: "id_rsa".into(), text: String::new(), first_line: Some(1), whole_file: true },
+        ];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert!(report.findings.iter().any(|f| f.file == ".env" && f.line == Some(2) && f.rule == "env-credential"));
+        assert!(report.findings.iter().any(|f| f.file == "id_rsa" && f.line.is_none() && f.rule == "ssh-private-key-file"));
+        assert_eq!(report.total, 2);
+    }
+
+    /// libgit2 writes the nearest earlier line that starts with a letter, `_`
+    /// or `$` after a hunk header's `@@ … @@`, so `@diff` sends it even when
+    /// it is far from the change. Talk scans it as an input of its own, by
+    /// the file's path, numbered as the line before the hunk's new start
+    /// (`diffScanInputs`).
+    #[test]
+    fn a_diff_hunk_headers_context_line_is_flagged() {
+        use std::process::Command;
+        let token = ["gh", "p_"].concat() + "Zq8LmT2vXc9RpW4nKs7YbH1dFg6JuE3aQo5V";
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        let before = format!("GITHUB_TOKEN={token}\n1\n2\n3\n4\n5\n6\nold\n");
+        std::fs::write(dir.path().join("deploy.sh"), &before).unwrap();
+        Command::new("git").args(["add", "."]).current_dir(dir.path()).output().unwrap();
+        Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-m", "x"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("deploy.sh"), before.replace("old", "new")).unwrap();
+        let diff = crate::git_ops::get_diff_text(dir.path(), false).unwrap();
+        let header = diff.lines().find(|l| l.starts_with("@@ ")).expect("a hunk header");
+        let (range, context) = header.split_once(" @@ ").expect("function context after the header");
+        assert_eq!(context, format!("GITHUB_TOKEN={token}"));
+        // The changed hunk's own lines don't hold it.
+        assert!(!diff.lines().any(|l| l.starts_with(['+', '-', ' ']) && l.contains(&token)));
+
+        let new_start: u32 = range.split('+').nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        let blocks = vec![
+            TextBlock { label: "deploy.sh".into(), text: context.to_string(), first_line: Some(new_start.saturating_sub(1).max(1)), whole_file: false },
+            TextBlock { label: "deploy.sh".into(), text: "4\n5\n6\nnew".into(), first_line: Some(new_start), whole_file: false },
+            TextBlock { label: "deploy.sh".into(), text: "old".into(), first_line: Some(new_start + 3), whole_file: false },
+        ];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.file == "deploy.sh" && f.line == Some(new_start - 1) && f.rule == "github-token"));
+    }
+}
+
+#[cfg(test)]
+mod talk_mcp_scope_tests {
+    use crate::db::Db;
+    use crate::mcp::scope::McpServerState;
+    use crate::mcp::{McpRegistry, McpServerConfig};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn thread_db() -> (NamedTempFile, Db, String) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.insert_project("p-mcp", "P", "/tmp/p-mcp").unwrap();
+        db.insert_workspace("w-mcp", "p-mcp", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-mcp", "Docs work").unwrap();
+        (tmp, db, t.id)
+    }
+
+    #[test]
+    fn a_conversation_from_before_the_column_has_every_server_on() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            // The v11 thread table, with a row, before `mcp_disabled`.
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL, last_opened TEXT NOT NULL);
+                CREATE TABLE workspaces (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL,
+                    task TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL, worktree_path TEXT,
+                    setup_script TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL, last_active TEXT NOT NULL);
+                CREATE TABLE chat_threads (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT 'New conversation', created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0);
+                INSERT INTO projects VALUES ('p1', 'Old', '/tmp/octo-mcp-old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO workspaces (id, project_id, name, branch, created_at, last_active)
+                    VALUES ('w1', 'p1', 'main', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO chat_threads (id, workspace_id, title, created_at, updated_at)
+                    VALUES ('t-old', 'w1', 'Old talk', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        assert!(db.thread_mcp_disabled("t-old").unwrap().is_empty(), "an old row has nothing off");
+        assert_eq!(db.list_chat_threads("w1").unwrap()[0].title, "Old talk");
+        db.set_thread_mcp_disabled("t-old", &["docs-server".into()]).unwrap();
+        drop(db);
+        // Reopening runs the migration again: idempotent, and the value stays.
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(db.thread_mcp_disabled("t-old").unwrap(), vec!["docs-server".to_string()]);
+        assert!(db.thread_mcp_disabled("no-such-thread").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_off_list_is_trimmed_sorted_and_cleared_to_null() {
+        let (_tmp, db, t) = thread_db();
+        let names = ["  example-remote ", "docs-server", "", "docs-server"].map(String::from);
+        db.set_thread_mcp_disabled(&t, &names).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs-server".to_string(), "example-remote".to_string()]);
+        db.set_thread_mcp_disabled(&t, &[]).unwrap();
+        let raw: Option<String> = db
+            .conn_ref()
+            .query_row("SELECT mcp_disabled FROM chat_threads WHERE id = ?1", [&t], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None, "all on is stored as NULL, like a row from before the column");
+        // An unreadable value reads as all on rather than failing the turn.
+        db.conn_ref().execute("UPDATE chat_threads SET mcp_disabled = 'not json' WHERE id = ?1", [&t]).unwrap();
+        assert!(db.thread_mcp_disabled(&t).unwrap().is_empty());
+    }
+
+    #[test]
+    fn renaming_a_server_keeps_it_off_where_it_was_off() {
+        let (_tmp, db, t) = thread_db();
+        let other = db.create_chat_thread("w-mcp", "Other").unwrap().id;
+        let none = db.create_chat_thread("w-mcp", "All on").unwrap().id;
+        let broken = db.create_chat_thread("w-mcp", "Broken").unwrap().id;
+        db.set_thread_mcp_disabled(&t, &["docs-server".into(), "example-remote".into()]).unwrap();
+        db.set_thread_mcp_disabled(&other, &["example-remote".into()]).unwrap();
+        db.conn_ref().execute("UPDATE chat_threads SET mcp_disabled = 'not json' WHERE id = ?1", [&broken]).unwrap();
+        let renames = vec![("docs-server".to_string(), "docs".to_string())];
+        assert_eq!(db.rename_thread_mcp_servers(&renames, |_, _| false).unwrap(), 1);
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs".to_string(), "example-remote".to_string()]);
+        assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["example-remote".to_string()], "untouched");
+        assert!(db.thread_mcp_disabled(&none).unwrap().is_empty(), "all on stays all on");
+        let raw: Option<String> =
+            db.conn_ref().query_row("SELECT mcp_disabled FROM chat_threads WHERE id = ?1", [&broken], |r| r.get(0)).unwrap();
+        assert_eq!(raw.as_deref(), Some("not json"), "an unreadable value is left alone");
+        // Two servers swapping names swap in the list too.
+        let swap = vec![("docs".to_string(), "example-remote".to_string()), ("example-remote".to_string(), "docs".to_string())];
+        db.rename_thread_mcp_servers(&swap, |_, _| false).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["docs".to_string()]);
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs".to_string(), "example-remote".to_string()]);
+        assert_eq!(db.rename_thread_mcp_servers(&[], |_, _| false).unwrap(), 0);
+
+        // A project that defines the old name itself keeps it in its conversations.
+        let renames = vec![("docs".to_string(), "docs-renamed".to_string())];
+        let asked: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
+        db.rename_thread_mcp_servers(&renames, |path, name| {
+            asked.borrow_mut().push((path.to_string(), name.to_string()));
+            path == "/tmp/p-mcp" && name == "docs"
+        })
+        .unwrap();
+        assert_eq!(db.thread_mcp_disabled(&other).unwrap(), vec!["docs".to_string()], "the project's own docs");
+        let asked = asked.into_inner();
+        assert!(!asked.is_empty() && asked.iter().all(|(p, n)| p == "/tmp/p-mcp" && n == "docs"), "{asked:?}");
+    }
+
+    #[test]
+    fn a_fork_keeps_the_conversations_mcp_scope() {
+        let (_tmp, db, t) = thread_db();
+        let u = db.insert_chat_message("w-mcp", &t, "user", "one", None, None, None, None).unwrap();
+        db.set_thread_mcp_disabled(&t, &["docs-server".into()]).unwrap();
+        let (fork, _, _) = db.fork_chat_thread(&t, u).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&fork.id).unwrap(), vec!["docs-server".to_string()]);
+        // And they are separate from then on.
+        db.set_thread_mcp_disabled(&fork.id, &[]).unwrap();
+        assert_eq!(db.thread_mcp_disabled(&t).unwrap(), vec!["docs-server".to_string()]);
+    }
+
+    /// A worktree whose project config names two servers that can't start.
+    fn two_servers() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = |n: &str| McpServerConfig {
+            command: format!("/nonexistent/octopush-test/{n}"),
+            ..Default::default()
+        };
+        let servers = HashMap::from([("docs-server", cfg("docs-server")), ("example-remote", cfg("example-remote"))]);
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/mcp.json"), serde_json::json!({ "mcpServers": servers }).to_string())
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn one_toggle_never_loses_another() {
+        let (_tmp, db, t) = thread_db();
+        assert_eq!(db.set_thread_mcp_server_off(&t, "docs-server", true).unwrap(), vec!["docs-server".to_string()]);
+        assert_eq!(
+            db.set_thread_mcp_server_off(&t, "example-remote", true).unwrap(),
+            vec!["docs-server".to_string(), "example-remote".to_string()]
+        );
+        assert_eq!(db.set_thread_mcp_server_off(&t, "docs-server", false).unwrap(), vec!["example-remote".to_string()]);
+        // Idempotent both ways.
+        assert_eq!(db.set_thread_mcp_server_off(&t, "docs-server", false).unwrap(), vec!["example-remote".to_string()]);
+        assert_eq!(db.set_thread_mcp_server_off(&t, "example-remote", true).unwrap(), vec!["example-remote".to_string()]);
+    }
+
+    #[test]
+    fn a_call_is_checked_against_the_list_as_it_is_at_the_call() {
+        use crate::chat_agents::{mcp_off_refusal, thread_mcp_off};
+        let (_tmp, db, t) = thread_db();
+        let db = parking_lot::Mutex::new(db);
+        let call = |db: &parking_lot::Mutex<Db>| mcp_off_refusal("mcp__docs-server__search", &thread_mcp_off(db, &t));
+        // The turn starts with the server on; it is turned off mid-turn.
+        assert_eq!(call(&db), None);
+        db.lock().set_thread_mcp_server_off(&t, "docs-server", true).unwrap();
+        let refusal = call(&db).expect("off from the next call");
+        assert!(refusal.starts_with("docs-server is turned off in this conversation"), "{refusal}");
+        assert!(refusal.contains("Companion's \"can use\" row"), "{refusal}");
+        // Another server's tools and built-in tools are untouched.
+        let off = thread_mcp_off(&db, &t);
+        assert_eq!(mcp_off_refusal("mcp__example-remote__fetch", &off), None);
+        assert_eq!(mcp_off_refusal("read_file", &off), None);
+        // Turned back on mid-turn: the next call runs.
+        db.lock().set_thread_mcp_server_off(&t, "docs-server", false).unwrap();
+        assert_eq!(call(&db), None);
+    }
+
+    #[tokio::test]
+    async fn a_turn_and_its_sub_agents_discover_only_the_servers_on_in_their_conversation() {
+        use crate::chat_agents::{discover_thread_mcp_tools, thread_mcp_off};
+        let (_tmp, db, t) = thread_db();
+        let other = db.create_chat_thread("w-mcp", "Other").unwrap().id;
+        db.set_thread_mcp_disabled(&t, &["docs-server".into()]).unwrap();
+        let db = parking_lot::Mutex::new(db);
+        let wt = two_servers();
+        let wp = wt.path().to_string_lossy().into_owned();
+        let reg = Arc::new(McpRegistry::new());
+
+        let off = thread_mcp_off(&db, &t);
+        assert_eq!(off.iter().cloned().collect::<Vec<_>>(), vec!["docs-server".to_string()]);
+        // The one discovery path the turn, the fan-out and a continuation use.
+        assert!(discover_thread_mcp_tools(Arc::clone(&reg), &db, &wp, &t).await.is_empty());
+        let status = reg.status(wt.path());
+        assert_eq!(status[0].name, "docs-server");
+        assert_eq!(status[0].state, McpServerState::Idle, "an off server is never started for the conversation");
+        assert_eq!(status[1].state, McpServerState::Failed);
+        let reason = status[1].reason.as_deref().unwrap();
+        assert!(reason.contains("example-remote") && !reason.contains('\n'), "the first line only: {reason}");
+
+        // Another conversation in the same workspace has both on, so it tries both.
+        assert!(thread_mcp_off(&db, &other).is_empty());
+        discover_thread_mcp_tools(Arc::clone(&reg), &db, &wp, &other).await;
+        assert!(reg.status(wt.path()).iter().all(|s| s.state == McpServerState::Failed));
     }
 }

@@ -29,11 +29,20 @@ vi.mock("../hooks/useEntitlement", () => ({
 }));
 const estimateMock = vi.hoisted(() => vi.fn());
 const cliVersionMock = vi.hoisted(() => vi.fn());
+const floorNoteMock = vi.hoisted(() => vi.fn());
+const knownBadMock = vi.hoisted(() => vi.fn());
+const codexTrustMock = vi.hoisted(() => vi.fn());
+const repoHooksMock = vi.hoisted(() => vi.fn());
+const repoCrewsMock = vi.hoisted(() => vi.fn());
+const readRepoCrewMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<any>();
   return {
     ...actual,
-    ipc: { ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock },
+    ipc: {
+      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock, claudeKnownBadNote: knownBadMock, codexTrustNote: codexTrustMock, repoHooksNotice: repoHooksMock,
+      listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock,
+    },
   };
 });
 
@@ -63,6 +72,49 @@ beforeEach(() => {
   estimateMock.mockResolvedValue({ estimateUsd: 0.05, baselineUsd: 0.4 });
   useRunsStore.setState({ launcherPrefill: null });
   useMissionsStore.setState({ missionByWorkspaceId: {} });
+  repoCrewsMock.mockReset();
+  repoCrewsMock.mockResolvedValue([]);
+  floorNoteMock.mockReset();
+  floorNoteMock.mockResolvedValue(null);
+  knownBadMock.mockReset();
+  knownBadMock.mockResolvedValue(null);
+  codexTrustMock.mockReset();
+  codexTrustMock.mockResolvedValue(null);
+  repoHooksMock.mockReset();
+  repoHooksMock.mockResolvedValue(null);
+});
+
+describe("PipelineSetup crews from the repo", () => {
+  it("lists .octopush/crews files read-only and forks one through the review sheet", async () => {
+    const { useCrewImportStore } = await import("../stores/crewImportStore");
+    useCrewImportStore.getState().close();
+    repoCrewsMock.mockResolvedValue([
+      { file: "relay.octocrew.json", name: "Repo relay", description: "", stageCount: 3, problem: null },
+      { file: "broken.octocrew.json", name: "broken", description: "", stageCount: 0, problem: "This isn't JSON" },
+    ]);
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect(await screen.findByText("Repo relay")).toBeInTheDocument();
+    expect(repoCrewsMock).toHaveBeenCalledWith("/tmp/w1");
+    expect(screen.getByText("from this repo")).toBeInTheDocument();
+    expect(screen.getByText("This isn't JSON")).toBeInTheDocument();
+    // Only the valid file can be forked, and forking only opens the review.
+    const forks = screen.getAllByRole("button", { name: "Fork into my library" });
+    expect(forks).toHaveLength(1);
+    readRepoCrewMock.mockResolvedValue("{\"octocrew\":1}");
+    fireEvent.click(forks[0]);
+    // The text is read only on Fork, through the backend's safe reader.
+    await waitFor(() => expect(useCrewImportStore.getState().open).toBe(true));
+    expect(readRepoCrewMock).toHaveBeenCalledWith("/tmp/w1", "relay.octocrew.json");
+    const s = useCrewImportStore.getState();
+    expect(s.text).toBe("{\"octocrew\":1}");
+    expect(s.origin).toBe(".octopush/crews/relay.octocrew.json");
+  });
+
+  it("hides the group when the repo has no crews", async () => {
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await waitFor(() => expect(repoCrewsMock).toHaveBeenCalled());
+    expect(screen.queryByText("from this repo")).not.toBeInTheDocument();
+  });
 });
 
 describe("PipelineSetup begin gate", () => {
@@ -360,6 +412,19 @@ describe("PipelineSetup launcher prefill (R3)", () => {
     // default pipeline, no stale overrides
     expect(onBegin).toHaveBeenCalledWith("p1", "ghost pipeline run", [], null);
   });
+
+  it("an append prefill keeps the brief the user already typed and adds below it", () => {
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const brief = screen.getByRole("textbox", { name: /brief/i }) as HTMLTextAreaElement;
+    fireEvent.change(brief, { target: { value: "keep my notes" } });
+    act(() => {
+      useRunsStore.getState().setLauncherPrefill({
+        task: "CI checks are failing", pipelineId: "", overrides: [], workspaceId: "w1", append: true,
+      });
+    });
+    expect(brief.value).toBe("keep my notes\n\nCI checks are failing");
+    expect(useRunsStore.getState().launcherPrefill).toBeNull();
+  });
 });
 
 describe("PipelineSetup Claude Code version preflight", () => {
@@ -445,6 +510,208 @@ describe("PipelineSetup Claude Code version preflight", () => {
     } finally {
       usePerfStore.setState({ stats: null });
     }
+  });
+
+  it("names a model this CLI is too old to launch, for a CLI stage or its escalation, and still lets the run begin", async () => {
+    const pipe = cliPipe("claude-sonnet-5-5");
+    pipe.stages.push({ ...pipe.stages[0], id: "c1", position: 1, agentModel: "claude-haiku-5-5", escalateModel: "claude-fable-5-2" } as any);
+    pipe.stages.push({ ...pipe.stages[0], id: "c2", position: 2, agentModel: "claude-fable-5-2", substrate: "api" } as any);
+    storeState.pipelines = [pipe];
+    cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
+    floorNoteMock.mockResolvedValue({ label: "Fable 5.2", needs: "2.1.321", installed: "2.1.316" });
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-claude-model-floor");
+    expect(line).toHaveTextContent("Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.316.");
+    expect(line).toHaveClass("text-octo-warning");
+    expect(line).toHaveAttribute("title", "A stage on this model may not run until Claude Code is updated. The run can still begin.");
+    // Only the CLI stages' models (and the escalation) are checked; the API stage isn't.
+    expect(floorNoteMock).toHaveBeenCalledWith(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"]);
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("shows no model line when no stage needs a newer CLI", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(floorNoteMock).toHaveBeenCalled());
+    expect(screen.queryByTestId("launcher-claude-model-floor")).not.toBeInTheDocument();
+  });
+
+  it("shows no model line when the CLI isn't found", async () => {
+    storeState.pipelines = [cliPipe("claude-fable-5-2")];
+    cliVersionMock.mockResolvedValue({ version: null, floor: "2.1.314", belowFloor: false });
+    floorNoteMock.mockResolvedValue({ label: "Fable 5.2", needs: "2.1.321", installed: "2.1.316" });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(cliVersionMock).toHaveBeenCalled());
+    await screen.findByTestId("estimate-range");
+    expect(floorNoteMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-claude-model-floor")).not.toBeInTheDocument();
+  });
+
+  it("names a Claude Code release to skip when a CLI stage runs a gateway model, and still lets the run begin", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-latest")];
+    const knownBad = { version: "2.1.329", reason: "drops the retry", scope: "gatewayStages" };
+    cliVersionMock.mockResolvedValue({ version: "2.1.329", floor: "2.1.314", belowFloor: false, securityFix: null, knownBad });
+    const note = "Claude Code 2.1.329 drops the retry. A stage on a gateway model may fail every turn; update Claude Code.";
+    knownBadMock.mockResolvedValue(note);
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-claude-known-bad");
+    expect(line).toHaveTextContent(note);
+    expect(line).toHaveAttribute("data-tour", "direct-launcher-known-bad");
+    expect(knownBadMock).toHaveBeenCalledWith(["claude-sonnet-latest"]);
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("shows no known-bad line when the backend finds no gateway stage", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    const knownBad = { version: "2.1.329", reason: "drops the retry", scope: "gatewayStages" };
+    cliVersionMock.mockResolvedValue({ version: "2.1.329", floor: "2.1.314", belowFloor: false, knownBad });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(knownBadMock).toHaveBeenCalledWith(["claude-sonnet-5-5"]));
+    expect(screen.queryByTestId("launcher-claude-known-bad")).not.toBeInTheDocument();
+  });
+
+  it("never asks about a release to skip on any other version", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-latest")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.330", floor: "2.1.314", belowFloor: false, knownBad: null });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(floorNoteMock).toHaveBeenCalled());
+    expect(knownBadMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-claude-known-bad")).not.toBeInTheDocument();
+  });
+
+  it("reads the version for a Codex stage escalating to Claude, and names the model", async () => {
+    const pipe = cliPipe("gpt-5-codex");
+    (pipe.stages[0] as any).escalateModel = "claude-fable-5-2";
+    storeState.pipelines = [pipe];
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
+    floorNoteMock.mockResolvedValue({ label: "Fable 5.2", needs: "2.1.321", installed: "2.1.307" });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-claude-model-floor");
+    expect(line).toHaveTextContent("Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.307.");
+    expect(floorNoteMock).toHaveBeenCalledWith(["claude-fable-5-2"]);
+    // The update/security notes stay with crews whose own stages run Claude Code.
+    expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
+  });
+
+  it("warns that a Codex Action stage can't commit outside a sandboxed mission, and still lets the run begin", async () => {
+    const { useRolesStore } = await import("../stores/rolesStore");
+    useRolesStore.setState({
+      roles: [{ key: "ship", label: "Ship", environment: "action" } as any, { key: "implement", label: "Implement", environment: "worktree" } as any],
+      loaded: true,
+    });
+    const pipe = cliPipe("gpt-5-codex");
+    pipe.stages.push({ ...pipe.stages[0], id: "c1", position: 1, role: "ship" });
+    storeState.pipelines = [pipe];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = screen.getByTestId("launcher-codex-commit");
+    expect(line).toHaveTextContent("Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push.");
+    expect(line).toHaveClass("text-octo-warning");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+    // A sandboxed mission confines it with Octopush's own profile instead.
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "sandbox" } as any } }));
+    expect(screen.queryByTestId("launcher-codex-commit")).not.toBeInTheDocument();
+  });
+
+  it("warns before the run that a read-only Codex stage can't run in a sandboxed mission, and still lets it begin", async () => {
+    const { useRolesStore } = await import("../stores/rolesStore");
+    useRolesStore.setState({
+      roles: [{ key: "code_review", label: "Code review", artifactKind: "review", environment: "worktree" } as any],
+      loaded: true,
+    });
+    const pipe = cliPipe("gpt-5-codex");
+    pipe.stages[0] = { ...pipe.stages[0], role: "code_review" };
+    storeState.pipelines = [pipe];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect(screen.queryByTestId("launcher-codex-read-only")).not.toBeInTheDocument();
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "sandbox", gitIsolation: "worktree" } as any } }));
+    const line = screen.getByTestId("launcher-codex-read-only");
+    expect(line).toHaveTextContent("A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.");
+    expect(line).toHaveClass("text-octo-warning");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+    // A readonly mission forces the sandbox on: the same warning.
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "none", gitIsolation: "readonly" } as any } }));
+    expect(screen.getByTestId("launcher-codex-read-only")).toBeInTheDocument();
+  });
+
+  it("says when Codex will skip the repo's .codex/ config, and still lets the run begin", async () => {
+    codexTrustMock.mockResolvedValue({
+      line: "Codex will ignore this repo's .codex/ settings and MCP servers: the project isn't trusted in Codex.",
+      how: "To trust it, open Codex in the repo once and accept, or run `codex exec --trust` there yourself. Octopush never changes your Codex config.",
+    });
+    storeState.pipelines = [cliPipe("gpt-5-codex")];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-codex-trust");
+    expect(codexTrustMock).toHaveBeenCalledWith("/tmp/w1");
+    expect(note).toHaveTextContent("Codex will ignore this repo's .codex/ settings and MCP servers");
+    expect(note).toHaveTextContent("codex exec --trust");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("does not read Codex trust for a crew without a Codex stage", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await act(async () => {});
+    expect(codexTrustMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-codex-trust")).not.toBeInTheDocument();
+  });
+
+  it("shows what the repo's own hooks and MCP servers run for a Claude Code crew, and says the sandbox holds them", async () => {
+    repoHooksMock.mockResolvedValue({
+      hooks: [
+        { event: "PreToolUse", matcher: "Bash", kind: "command", runs: "./scripts/guard.sh" },
+        { event: "statusLine", matcher: null, kind: "status_line", runs: "~/.claude/status.sh" },
+      ],
+      servers: [{ name: "db", runs: "npx -y db-mcp" }],
+      hash: "ab".repeat(32),
+    });
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-repo-hooks");
+    expect(repoHooksMock).toHaveBeenCalledWith("/tmp/w1");
+    expect(note).toHaveAttribute("data-tour", "direct-launcher-repo-hooks");
+    expect(note).toHaveTextContent("This repo's own Claude Code config runs 1 hook, a status line and 1 MCP server.");
+    expect(note).toHaveTextContent("PreToolUse Bash · ./scripts/guard.sh");
+    expect(note).toHaveTextContent("MCP db · npx -y db-mcp");
+    expect(note).not.toHaveTextContent("inside the sandbox");
+    expect(note.querySelector(".text-octo-warning")).toBeNull();
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "sandbox" } as any } }));
+    expect(screen.getByTestId("launcher-repo-hooks")).toHaveTextContent("and it runs inside the sandbox.");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("does not read the repo's hooks for a crew without a Claude Code stage", async () => {
+    repoHooksMock.mockResolvedValue({ hooks: [], servers: [{ name: "db", runs: "npx db" }], hash: "h" });
+    storeState.pipelines = [cliPipe("gpt-5-codex")];
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await act(async () => {});
+    expect(repoHooksMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-repo-hooks")).not.toBeInTheDocument();
+  });
+
+  it("tells a project marked untrusted in Codex to change its trust_level, not to run --trust", async () => {
+    codexTrustMock.mockResolvedValue({
+      line: "Codex will ignore this repo's .codex/ settings and MCP servers: the project is marked untrusted in Codex.",
+      how: "To trust it, change its trust_level from \"untrusted\" to \"trusted\" in ~/.codex/config.toml yourself. Octopush never changes your Codex config.",
+    });
+    storeState.pipelines = [cliPipe("gpt-5-codex")];
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-codex-trust");
+    expect(note).toHaveTextContent("marked untrusted in Codex");
+    expect(note).toHaveTextContent("~/.codex/config.toml");
+    expect(note).not.toHaveTextContent("--trust");
   });
 
   it("does not probe for crews without a Claude Code CLI stage", async () => {

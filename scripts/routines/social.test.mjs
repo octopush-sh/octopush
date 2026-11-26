@@ -7,7 +7,7 @@ import {
   checkDraft, prepareDrafts, prepareIntel, applyCadence, historyFrom, parseDrafts, parsePosted, lastDraftNumber, fingerprint,
   linkProblems, extractUrls, aiRuleOk, secretProblems, secretValues, isEnglish, phaseOf, fence, post, buildContext, todaysIssue,
   vision, quote, unquote, normText, oneLine, threadKey, presentsProRuns, planWording, MARKETING_FILES, MAX_BODY, FOOTER,
-  canonical, octoMentionProblems,
+  canonical, octoMentionProblems, rulebook, isNotFound, draftsBody,
 } from "./social.mjs";
 import { claudeArgs, ROLES } from "./agent.mjs";
 import { localDate } from "./ideas.mjs";
@@ -418,7 +418,7 @@ test("post: files a `social` issue, or comments on today's and continues the num
 
 test("rulebook: from main only — missing there, nothing is filed and the context refuses", () => {
   const branchOnly = [
-    [/contents\/marketing\/README\.md\?ref=main$/, () => { throw new Error("404"); }],
+    [/contents\/marketing\/README\.md\?ref=main$/, () => { throw new Error("HTTP 404"); }],
     [/contents\/marketing\/README\.md\?ref=pm/, b64("from the branch")],
   ];
   const { gh, writes } = fakeGh(webRoutes(1, branchOnly));
@@ -427,6 +427,20 @@ test("rulebook: from main only — missing there, nothing is filed and the conte
   assert.equal(writes.length, 0);
   assert.deepEqual(c.out, ["::warning title=rulebook::the marketing rulebook is not on octopush-web main — nothing filed"]);
   assert.throws(() => buildContext("intel", { web: gh, app: { get: () => null }, now: NOW, webIds, visionText: "" }), /not on octopush-web main/);
+});
+
+test("rulebook: a transient error is retried once, then fails the run instead of reading as missing", () => {
+  let calls = 0;
+  const flaky = [[/contents\/marketing\/README\.md\?ref=main$/, () => { calls++; if (calls === 1) throw new Error("gh: Bad Gateway (HTTP 502)"); return b64("rules"); }]];
+  assert.equal(rulebook(fakeGh(webRoutes(1, flaky)).gh).missing.length, 0);
+  assert.equal(calls, 2);
+  const down = [[/contents\/marketing\/README\.md\?ref=main$/, () => { throw new Error("gh: Bad Gateway (HTTP 502)"); }]];
+  const { gh, writes } = fakeGh(webRoutes(1, down));
+  assert.throws(() => rulebook(gh), /could not read marketing\/README\.md/);
+  assert.throws(() => post("drafts", JSON.stringify([draft()]), { web: gh, now: NOW, webIds, env: {}, ...capture() }), /could not read/);
+  assert.equal(writes.length, 0);
+  assert.ok(isNotFound(new Error("Command failed: gh api x\ngh: Not Found (HTTP 404)")));
+  assert.ok(!isNotFound(new Error("gh: Bad Gateway (HTTP 502)")));
 });
 
 test("context: fenced, structured history only (no free text), a 7-day window", () => {
@@ -467,4 +481,13 @@ test("the social agent: web research, read-only checkout, writes only .agent-out
   const s = JSON.parse(claudeArgs("social", "/home/runner/work/_temp", "/home/runner/work/o/o").find((a) => a.startsWith("{")));
   assert.deepEqual(s.permissions.allow.filter((x) => x.startsWith("Edit")), ["Edit(//home/runner/work/o/o/.agent-out/**)"]);
   assert.ok(s.permissions.deny.includes("Read(//home/runner/work/_temp/**)"), "the runner's temp dir (prompt, script copies) is out of reach");
+});
+
+test("an empty drafts batch says whether the drafter proposed none or the validator dropped them", () => {
+  const history = { mentions: 0, total: 0 };
+  const none = draftsBody({ phase: 1, drafts: [], history });
+  assert.match(none, /the drafter proposed none/);
+  assert.doesNotMatch(none, /nothing passed the rules/);
+  const dropped = draftsBody({ phase: 1, drafts: [], history, rejected: [{ i: 0, reason: "no thread" }] });
+  assert.match(dropped, /nothing passed the rules/);
 });

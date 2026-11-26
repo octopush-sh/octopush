@@ -37,6 +37,7 @@ const mockIpc = {
     (workspaceId: string, label: string) => Promise<TerminalRecord>
   >(),
   renameTerminal: vi.fn<(id: string, label: string) => Promise<void>>(),
+  reorderTerminals: vi.fn<(workspaceId: string, ids: string[]) => Promise<void>>(),
   deleteTerminal: vi.fn<(id: string) => Promise<void>>(),
   listPtySessions: vi.fn<() => Promise<PtySession[]>>(),
 };
@@ -334,6 +335,110 @@ describe("terminalsStore — renameTerminal", () => {
   });
 });
 
+describe("terminalsStore — reorderTerminals", () => {
+  beforeEach(() => resetStore());
+
+  const ws = "ws-order";
+  const seedOrder = (ids: string[]) =>
+    useTerminalsStore.setState({
+      terminalsByWs: {
+        [ws]: ids.map((id, position) => ({
+          id,
+          label: id,
+          position,
+          running: true,
+          busy: false,
+          restored: false,
+          role: "shell" as const,
+          command: null,
+        })),
+      },
+    });
+  const order = () => useTerminalsStore.getState().getTerminals(ws).map((t) => t.id);
+
+  it("puts the sessions in the new order at once, renumbered, and saves it", async () => {
+    seedOrder(["a", "b", "c"]);
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    const done = useTerminalsStore.getState().reorderTerminals(ws, ["c", "a", "b"]);
+    expect(order()).toEqual(["c", "a", "b"]);
+    expect(useTerminalsStore.getState().getTerminals(ws).map((t) => t.position)).toEqual([0, 1, 2]);
+    await done;
+    expect(mockIpc.reorderTerminals).toHaveBeenCalledWith(ws, ["c", "a", "b"]);
+    expect(order()).toEqual(["c", "a", "b"]);
+  });
+
+  it("puts the old order back and says so when the save fails", async () => {
+    seedOrder(["a", "b", "c"]);
+    mockIpc.reorderTerminals.mockRejectedValueOnce(new Error("db locked"));
+    await useTerminalsStore.getState().reorderTerminals(ws, ["b", "a", "c"]);
+    expect(order()).toEqual(["a", "b", "c"]);
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "error", title: "Couldn't reorder sessions" }),
+    );
+  });
+
+  it("puts the old order back after a failed save even when a busy tick changed the list", async () => {
+    seedOrder(["a", "b", "c"]);
+    let fail!: (e: Error) => void;
+    mockIpc.reorderTerminals.mockReturnValueOnce(new Promise<void>((_, reject) => (fail = reject)));
+    const done = useTerminalsStore.getState().reorderTerminals(ws, ["c", "a", "b"]);
+    useTerminalsStore.setState((s) => ({
+      terminalsByWs: { [ws]: s.terminalsByWs[ws].map((t) => (t.id === "a" ? { ...t, busy: true } : t)) },
+    }));
+    fail(new Error("db locked"));
+    await done;
+    expect(order()).toEqual(["a", "b", "c"]);
+    expect(useTerminalsStore.getState().getTerminals(ws).map((t) => t.position)).toEqual([0, 1, 2]);
+    // The live change survives the rollback.
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].busy).toBe(true);
+  });
+
+  it("leaves a newer order alone when an older save fails", async () => {
+    seedOrder(["a", "b", "c"]);
+    let fail!: (e: Error) => void;
+    mockIpc.reorderTerminals.mockReturnValueOnce(new Promise<void>((_, reject) => (fail = reject)));
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    const first = useTerminalsStore.getState().reorderTerminals(ws, ["c", "a", "b"]);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["b", "c", "a"]);
+    fail(new Error("db locked"));
+    await first;
+    expect(order()).toEqual(["b", "c", "a"]);
+  });
+
+  it("saves nothing when the order doesn't change", async () => {
+    seedOrder(["a", "b"]);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["a", "b"]);
+    expect(mockIpc.reorderTerminals).not.toHaveBeenCalled();
+  });
+
+  it("ignores unknown ids and keeps sessions left out after the listed ones", async () => {
+    seedOrder(["a", "b", "c", "d"]);
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["c", "gone", "a", "c"]);
+    expect(order()).toEqual(["c", "a", "b", "d"]);
+    expect(mockIpc.reorderTerminals).toHaveBeenCalledWith(ws, ["c", "a", "b", "d"]);
+  });
+
+  it("leaves the panes as they are", async () => {
+    seedOrder(["a", "b", "c"]);
+    useTerminalsStore.getState().updateLayout(ws, (l) => ({ ...l, slots: ["b", "c"], focused: 1, ratios: [0.5, 0.5] }));
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["c", "b", "a"]);
+    expect(useTerminalLayoutStore.getState().getRun(ws).slots).toEqual(["b", "c"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("c");
+  });
+});
+
+describe("moveSession", () => {
+  it("moves a session to where the one it is dropped on stands", async () => {
+    const { moveSession } = await import("./terminalsStore");
+    expect(moveSession(["a", "b", "c", "d"], "a", "c")).toEqual(["b", "c", "a", "d"]);
+    expect(moveSession(["a", "b", "c", "d"], "d", "b")).toEqual(["a", "d", "b", "c"]);
+    expect(moveSession(["a", "b"], "a", "a")).toEqual(["a", "b"]);
+    expect(moveSession(["a", "b"], "a", "zz")).toEqual(["a", "b"]);
+  });
+});
+
 describe("terminalsStore — deleteTerminal", () => {
   beforeEach(() => resetStore());
 
@@ -593,6 +698,37 @@ describe("terminalsStore — markFailed", () => {
   });
 });
 
+describe("terminalsStore — markStarted", () => {
+  beforeEach(() => resetStore());
+
+  it("a loaded session is starting until its pane's first output, across reloads", async () => {
+    const ws = "ws-starting";
+    const rec = makeRecord(ws, "Main", 0);
+    mockIpc.listTerminals.mockResolvedValue([rec]);
+    mockIpc.listPtySessions.mockResolvedValue([]);
+    await useTerminalsStore.getState().loadTerminals(ws);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(true);
+
+    // The PTY spawned, but nothing is drawn yet: still starting.
+    useTerminalsStore.getState().markRunning(ws, rec.id, true);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(true);
+
+    useTerminalsStore.getState().markStarted(ws, rec.id);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(false);
+
+    // A reload keeps it started: the prompt is still on the canvas.
+    await useTerminalsStore.getState().loadTerminals(ws);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(false);
+  });
+
+  it("a created session is starting", async () => {
+    const ws = "ws-starting-new";
+    mockIpc.createTerminal.mockResolvedValue(makeRecord(ws, "Main", 0));
+    const t = await useTerminalsStore.getState().createTerminal(ws);
+    expect(t.starting).toBe(true);
+  });
+});
+
 describe("terminalsStore — workspace isolation", () => {
   beforeEach(() => resetStore());
 
@@ -680,6 +816,25 @@ describe("session roles", () => {
     expect(t.busy).toBe(true);
     expect(t.role).toBe("dev");
     expect(t.command).toBe("npm run dev");
+  });
+
+  it("records which agent CLI set an agent role, and replaces it with the role", () => {
+    seed();
+    const cli = () => useTerminalsStore.getState().getTerminals(ws)[0].agentCli ?? null;
+    expect(cli()).toBeNull();
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "claude --resume");
+    expect([useTerminalsStore.getState().getTerminals(ws)[0].role, cli()]).toEqual(["agent", "claude"]);
+    // Sticky with the role: back at the prompt, or under a command we can't
+    // place, it is still the terminal that ran Claude Code.
+    useTerminalsStore.getState().setBusy(ws, "t1", false);
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "./script.sh");
+    expect(cli()).toBe("claude");
+    // Another agent CLI in the same terminal: the role stays, the CLI doesn't.
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "codex");
+    expect([useTerminalsStore.getState().getTerminals(ws)[0].role, cli()]).toEqual(["agent", "codex"]);
+    // A placeable non-agent command takes both.
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "npm run dev");
+    expect([useTerminalsStore.getState().getTerminals(ws)[0].role, cli()]).toEqual(["dev", null]);
   });
 
   it("keeps the role but drops the command when the shell returns", () => {

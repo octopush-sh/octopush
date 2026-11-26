@@ -3,13 +3,13 @@ import { RUN_EVENTS, ipc, type Run } from "./ipc";
 import { deriveProjectName } from "./genesis";
 import { pushToast } from "../components/Toasts";
 import { useProjectStore } from "../stores/projectStore";
+import { resolveHelperModel } from "./helperModels";
 
 // Post-build rename (genesis G6): once a prompt-born project's FIRST crew ships,
 // the project knows what it built — the anonymous heuristic slug can become the
 // real thing. One quiet, one-shot suggestion; never automatic, never on a
 // project-first project.
 
-const RENAME_MODEL = "claude-haiku-4-5";
 const NAME_SYSTEM =
   "You name software projects. Given a build brief, reply with ONLY a short " +
   "kebab-case project name of 1-3 words (lowercase, hyphens, no punctuation, no " +
@@ -38,7 +38,7 @@ function slugifyName(raw: string): string {
  *  local heuristic slug if the call fails or returns junk. */
 async function suggestName(prompt: string, workspaceId: string): Promise<string> {
   try {
-    const res = await ipc.aiComplete(RENAME_MODEL, NAME_SYSTEM, prompt, {
+    const res = await ipc.aiComplete(await resolveHelperModel("fast"), NAME_SYSTEM, prompt, {
       maxTokens: 24,
       workspaceId,
     });

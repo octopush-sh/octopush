@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { isModalOpen } from "../components/ModalShell";
-import { roleForCommand, type SessionRole } from "../lib/sessionRole";
+import { agentCliForCommand, roleForCommand, type SessionRole } from "../lib/sessionRole";
 import type { SetupRun } from "../lib/setupRun";
 import { navigate } from "../lib/tour/surfaces";
 import { useAttentionStore } from "./attentionStore";
@@ -37,6 +37,10 @@ export interface TerminalState {
    *  sandbox denial, daemon down). Cleared by the next successful spawn.
    *  Absent is the same as false. */
   failed?: boolean;
+  /** true until the PTY's first output (the prompt, or replayed scrollback)
+   *  reaches the pane — exactly while the canvas reads "Starting shell in …".
+   *  Absent is the same as false. */
+  starting?: boolean;
   /** true while a non-shell command is executing in this PTY (foreground
    *  process != shell). Distinct from `running` (= shell session alive);
    *  driven by the daemon's `pty://foreground` events. */
@@ -58,6 +62,13 @@ export interface TerminalState {
    * meaningful command replaces it.
    */
   role: SessionRole;
+  /**
+   * For an `agent` role, which CLI gave it (`claude`, `codex`, …); null
+   * otherwise. Sticky with the role, and set with it: the role alone can't
+   * tell Claude Code, whose context and spend Octopush can read, from another
+   * agent CLI in the same terminal. Absent is the same as null.
+   */
+  agentCli?: string | null;
   /** The command currently running, or null at the prompt. */
   command: string | null;
 }
@@ -104,6 +115,35 @@ function saveSetupTerminals(ids: string[]) {
   }
 }
 
+/**
+ * `terminals` in `ids`' order, renumbered. Ids that aren't sessions of the
+ * list are ignored, and a session `ids` leaves out keeps its relative place
+ * after the listed ones (the backend's `set_terminal_order` does the same).
+ */
+export function orderSessions(terminals: readonly TerminalState[], ids: readonly string[]): TerminalState[] {
+  const byId = new Map(terminals.map((t) => [t.id, t]));
+  const seen = new Set<string>();
+  const ordered: TerminalState[] = [];
+  for (const id of [...ids, ...terminals.map((t) => t.id)]) {
+    const t = byId.get(id);
+    if (!t || seen.has(id)) continue;
+    seen.add(id);
+    ordered.push(t);
+  }
+  return ordered.map((t, position) => (t.position === position ? t : { ...t, position }));
+}
+
+/** `ids` with `id` moved to where `overId` stands, as a drop on it does. */
+export function moveSession(ids: readonly string[], id: string, overId: string): string[] {
+  const from = ids.indexOf(id);
+  const to = ids.indexOf(overId);
+  if (from === -1 || to === -1 || from === to) return [...ids];
+  const next = [...ids];
+  next.splice(from, 1);
+  next.splice(to, 0, id);
+  return next;
+}
+
 // ─── Store interface ──────────────────────────────────────────────
 
 interface TerminalsStore {
@@ -131,6 +171,10 @@ interface TerminalsStore {
     targetSlot?: (layout: RunLayout) => number,
   ) => Promise<TerminalState>;
   renameTerminal: (workspaceId: string, id: string, label: string) => Promise<void>;
+  /** Put the workspace's sessions in `ids`' order (the session line's drag),
+   *  so cells, ⌘⌥N and the switcher follow it. Optimistic; a failed save
+   *  puts the old order back and says so. */
+  reorderTerminals: (workspaceId: string, ids: string[]) => Promise<void>;
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
   /** Focus `id`'s pane if it is on screen; otherwise put it in the focused pane. */
   setActive: (workspaceId: string, id: string | null) => void;
@@ -162,6 +206,8 @@ interface TerminalsStore {
   /** Record that a terminal's PTY failed to start (or, with `false`, that
    *  the failure was cleared). A failed session is never running. */
   markFailed: (workspaceId: string, id: string, failed: boolean) => void;
+  /** The terminal's pane drew its first output: it is no longer starting. */
+  markStarted: (workspaceId: string, id: string) => void;
   /** Set whether a command is currently executing in a terminal (foreground
    *  busy), from the daemon's `pty://foreground` events. `command` is the
    *  daemon's argv summary when it could resolve one; it updates the session's
@@ -242,7 +288,13 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       const prevLiveById = new Map(
         (prev ?? []).map((t) => [
           t.id,
-          { role: t.role, command: t.command, failed: t.failed ?? false },
+          {
+            role: t.role,
+            agentCli: t.agentCli ?? null,
+            command: t.command,
+            failed: t.failed ?? false,
+            starting: t.starting ?? false,
+          },
         ]),
       );
 
@@ -272,9 +324,13 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           // A spawn failure is live state too; a session that is running
           // after all is no longer failed.
           failed: !running && (live?.failed ?? false),
+          // A session new to the store gets its pane now, which shows
+          // "Starting shell in …" until the first output.
+          starting: live ? live.starting : true,
           busy: false,
           restored,
           role: live?.role ?? ("shell" as SessionRole),
+          agentCli: live?.agentCli ?? null,
           command: live?.command ?? null,
         };
       });
@@ -323,6 +379,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       label: record.label,
       position: record.position,
       running: false,
+      starting: true,
       busy: false,
       restored: false,
       role: "shell",
@@ -361,6 +418,30 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         terminalsByWs: { ...s.terminalsByWs, [workspaceId]: prev },
       }));
       throw err;
+    }
+  },
+
+  reorderTerminals: async (workspaceId, ids) => {
+    const prev = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+    const next = orderSessions(prev, ids);
+    if (next.every((t, i) => t.id === prev[i]?.id)) return;
+    bumpLoadGen(workspaceId); // a snapshot fetched before the move is stale
+    set((s) => ({ terminalsByWs: { ...s.terminalsByWs, [workspaceId]: next } }));
+
+    try {
+      await ipc.reorderTerminals(workspaceId, next.map((t) => t.id));
+    } catch (e) {
+      // Put the old order back. A list that changed since but still stands in
+      // this call's order (a busy tick) gets the old order over its live
+      // entries; a newer reorder, or a session opened or closed, is left be.
+      set((s) => {
+        const now = s.terminalsByWs[workspaceId];
+        if (now === next) return { terminalsByWs: { ...s.terminalsByWs, [workspaceId]: prev } };
+        if (!now || now.length !== next.length || now.some((t, i) => t.id !== next[i]?.id)) return s;
+        const restored = orderSessions(now, prev.map((t) => t.id));
+        return { terminalsByWs: { ...s.terminalsByWs, [workspaceId]: restored } };
+      });
+      pushToast({ level: "error", title: "Couldn't reorder sessions", body: String(e) });
     }
   },
 
@@ -513,6 +594,18 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       };
     }),
 
+  markStarted: (workspaceId, id) =>
+    set((s) => {
+      const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+      if (!prev.some((t) => t.id === id && t.starting)) return s;
+      return {
+        terminalsByWs: {
+          ...s.terminalsByWs,
+          [workspaceId]: prev.map((t) => (t.id === id ? { ...t, starting: false } : t)),
+        },
+      };
+    }),
+
   setBusy: (workspaceId, id, busy, command) =>
     set((s) => {
       const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
@@ -525,16 +618,29 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       // session's identity. "shell" and "unknown" leave it alone, so a dev
       // server keeps its icon through every quiet moment between rebuilds.
       const derived = busy && command ? roleForCommand(command) : null;
-      const nextRole =
-        derived && derived !== "shell" && derived !== "unknown" ? derived : target.role;
-      if (target.busy === busy && target.command === nextCommand && target.role === nextRole) {
+      const placed = !!derived && derived !== "shell" && derived !== "unknown";
+      const nextRole = placed ? derived : target.role;
+      // Which agent CLI set an agent role travels with the role: a command
+      // that replaces the role replaces it too (Codex after Claude Code, or a
+      // dev server after either).
+      const nextAgentCli = placed
+        ? derived === "agent"
+          ? agentCliForCommand(command)
+          : null
+        : (target.agentCli ?? null);
+      if (
+        target.busy === busy &&
+        target.command === nextCommand &&
+        target.role === nextRole &&
+        (target.agentCli ?? null) === nextAgentCli
+      ) {
         return s;
       }
       return {
         terminalsByWs: {
           ...s.terminalsByWs,
           [workspaceId]: prev.map((t) =>
-            t.id === id ? { ...t, busy, command: nextCommand, role: nextRole } : t,
+            t.id === id ? { ...t, busy, command: nextCommand, role: nextRole, agentCli: nextAgentCli } : t,
           ),
         },
       };
@@ -563,7 +669,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       },
     }));
     // Never replaces a session on screen: with more than one pane open it
-    // starts unseated, and its rail cell marks it as usual.
+    // starts unseated, and its cell on the session line marks it as usual.
     get().updateLayout(workspaceId, (layout) =>
       layout.slots.length > 1 ? layout : assign(layout, layout.focused, id),
     );

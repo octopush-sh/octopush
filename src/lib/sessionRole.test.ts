@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { roleForCommand, ROLE_WORD, type SessionRole } from "./sessionRole";
+import { agentCliForCommand, roleForCommand, ROLE_WORD, type SessionRole } from "./sessionRole";
 
 describe("roleForCommand", () => {
   it("treats an absent command as a shell at the prompt", () => {
@@ -132,5 +132,34 @@ describe("roleForCommand", () => {
       "shell", "dev", "build", "test", "deps", "git", "agent", "edit", "unknown",
     ];
     for (const r of roles) expect(ROLE_WORD[r]).toBeTruthy();
+  });
+});
+
+describe("agentCliForCommand", () => {
+  it("names the agent CLI behind an agent role", () => {
+    expect(agentCliForCommand("claude")).toBe("claude");
+    expect(agentCliForCommand("/opt/homebrew/bin/claude --resume abc")).toBe("claude");
+    expect(agentCliForCommand("codex exec fix")).toBe("codex");
+    expect(agentCliForCommand("aider --model x")).toBe("aider");
+  });
+
+  it("looks through the delegators the role looks through", () => {
+    expect(agentCliForCommand("npx claude")).toBe("claude");
+    expect(agentCliForCommand("env FOO=1 claude -p hi")).toBe("claude");
+    expect(agentCliForCommand("sudo -E codex")).toBe("codex");
+  });
+
+  it("is null for anything that is not an agent CLI", () => {
+    expect(agentCliForCommand(null)).toBeNull();
+    expect(agentCliForCommand("")).toBeNull();
+    expect(agentCliForCommand("npm run dev")).toBeNull();
+    expect(agentCliForCommand("node claude")).toBeNull();
+    expect(agentCliForCommand("zsh")).toBeNull();
+  });
+
+  it("agrees with the role: an agent CLI is exactly what gets the agent role", () => {
+    for (const cmd of ["claude", "codex", "aider", "gemini", "npx opencode", "npm test", "vim a.ts", "git status"]) {
+      expect(agentCliForCommand(cmd) !== null).toBe(roleForCommand(cmd) === "agent");
+    }
   });
 });

@@ -11,6 +11,7 @@ import { Reveal } from "../primitives/Reveal";
 import { PaneHeader, SectionLabel, SegmentedRow, Switch, ToggleRow } from "./shared";
 import { ReadinessCard } from "./ReadinessCard";
 import { useNotifyPrefs } from "../../stores/notifyPrefsStore";
+import { NotifyElsewhereRow } from "./NotifyElsewhereRow";
 
 const MODE_OPTIONS = MODES.map((m) => ({ value: m, label: MODE_LABELS[m] }));
 
@@ -39,7 +40,7 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
         subtitle="Application-wide preferences live here. More options will appear as the app grows."
       />
 
-      <div className="max-w-[640px] space-y-8">
+      <div className="space-y-8">
         <ReadinessCard onShowCaches={onShowCaches} />
 
         <div className="space-y-4">
@@ -74,6 +75,11 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
         </div>
 
         <div className="space-y-4">
+          <SectionLabel>Safety</SectionLabel>
+          <SecretGuardRow />
+        </div>
+
+        <div className="space-y-4">
           <SectionLabel>Attention</SectionLabel>
           <ToggleRow
             label="Play sound when an agent or terminal needs attention"
@@ -87,6 +93,7 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
             checked={crewNotifications}
             onChange={setCrewNotifications}
           />
+          <NotifyElsewhereRow />
           <ClaudeHooksRow />
         </div>
       </div>
@@ -120,10 +127,45 @@ function ClaudeHooksRow() {
     <div data-tour="settings-claude-hooks">
       <ToggleRow
         label="Let Claude Code say what it's waiting on"
-        description="Octopush adds hook entries to the workspace's .claude/settings.local.json and keeps that file out of git."
+        description="Octopush adds hook entries to the workspace's .claude/settings.local.json and keeps that file out of git. The hooks also say which Claude Code session each terminal runs, which is what the Context section in Run reads. Nothing they report leaves this Mac."
         checked={enabled}
         onChange={(on) => void persist(on)}
         testId="claude-hooks-switch"
+      />
+    </div>
+  );
+}
+
+/** `secretGuardEnabled` — **on unless saved as `false`** (#730). Off restores
+ *  the unguarded commit, push and pull request paths exactly. */
+function SecretGuardRow() {
+  const [enabled, setEnabled] = useState(true);
+
+  useEffect(() => {
+    ipc
+      .getSettings()
+      .then((s) => setEnabled(s.secretGuardEnabled ?? true))
+      .catch(() => {});
+  }, []);
+
+  async function persist(on: boolean) {
+    setEnabled(on);
+    try {
+      const s = await ipc.getSettings();
+      await ipc.saveSettings({ ...s, secretGuardEnabled: on });
+    } catch {
+      // Leave the switch where the user put it; the next change retries.
+    }
+  }
+
+  return (
+    <div data-tour="settings-secret-guard">
+      <ToggleRow
+        label="Guard commits against secrets"
+        description="Before a commit, a push or a pull request, and before a crew's commit, PR, merge or release stage, Octopush checks the change on this Mac for API keys, tokens, private keys and the keys you saved here. A finding asks you first; a crew run waits for you. Nothing is sent anywhere."
+        checked={enabled}
+        onChange={(on) => void persist(on)}
+        testId="secret-guard-switch"
       />
     </div>
   );

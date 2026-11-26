@@ -6,6 +6,12 @@ import { AlertTriangle, CheckCircle, Circle, Clock, Copy, Loader2, XCircle } fro
 import type { ReadinessCheck } from "../../lib/ipc";
 import { copyToClipboard } from "../../lib/clipboard";
 import { useReadinessStore } from "../../stores/readinessStore";
+import { usePipelineStore } from "../../stores/pipelineStore";
+import { useRoutinesStore } from "../../stores/routinesStore";
+import { useTerminalsStore } from "../../stores/terminalsStore";
+import { useModelRetirements } from "../../hooks/useModelRetirements";
+import { libraryModels, readinessRetirementCheck } from "../../lib/modelRetirement";
+import { claudeRecommendedNote } from "../../lib/claudeCli";
 import { tourId } from "../../lib/tour/ids";
 import { SectionLabel, formatRelative } from "./shared";
 
@@ -19,6 +25,13 @@ const STATUS: Record<ReadinessCheck["status"], StatusStyle> = {
 
 /** A status this build doesn't know (an older or newer backend): mute, never a verdict. */
 const PENDING: StatusStyle = { word: "Unknown", tone: "text-octo-mute", Icon: Circle };
+
+/** The rows a tour can point at. */
+const ROW_TOUR: Partial<Record<ReadinessCheck["id"], string>> = {
+  disk: tourId("settings-readiness-disk"),
+  codex: tourId("settings-readiness-codex"),
+  models: tourId("settings-readiness-models"),
+};
 
 /** `onShowCaches` closes Settings and opens the footer's Workspace Caches;
  *  the disk row links to it when space runs low. */
@@ -42,6 +55,30 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
     return () => clearInterval(id);
   }, [checkedAt]);
 
+  // Saved crews and Routines on a model that retires: a row of its own,
+  // built here from the library (the backend only knows the table).
+  const pipelines = usePipelineStore((s) => s.pipelines);
+  const pipelinesLoaded = usePipelineStore((s) => s.loaded);
+  const loadPipelines = usePipelineStore((s) => s.load);
+  const routines = useRoutinesStore((s) => s.routines);
+  const routinesLoaded = useRoutinesStore((s) => s.loaded);
+  const loadRoutines = useRoutinesStore((s) => s.load);
+  useEffect(() => {
+    if (!pipelinesLoaded) void loadPipelines();
+    if (!routinesLoaded) void loadRoutines();
+  }, [pipelinesLoaded, loadPipelines, routinesLoaded, loadRoutines]);
+  const retirements = useModelRetirements(libraryModels(pipelines, routines));
+  const modelsRow = readinessRetirementCheck(pipelines, routines, retirements, new Date());
+  const rows = checks && checks.length > 0 && modelsRow ? [...checks, modelsRow] : checks;
+
+  // The Claude Code row's recommended note (#1002, #1065): a `run` fix
+  // (interactive sessions share worktrees) shows only while a Run-mode
+  // session runs Claude Code; an `any` fix also while a crew or Routine has
+  // a Claude Code CLI stage.
+  const claudeInRun = useTerminalsStore((s) =>
+    Object.values(s.terminalsByWs).some((ts) => ts.some((t) => t.running && t.agentCli === "claude")),
+  );
+
   const neverChecked = !checks && !loading && !error;
 
   return (
@@ -63,7 +100,7 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
           <button
             type="button"
             data-tour="settings-readiness-again"
-            onClick={() => void check()}
+            onClick={() => void check({ explicit: true })}
             disabled={loading}
             className="shrink-0 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi disabled:opacity-50"
           >
@@ -92,10 +129,18 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
           </p>
         )}
 
-        {checks && checks.length > 0 && (
+        {rows && rows.length > 0 && (
           <ul className="mt-3 divide-y divide-octo-hairline">
-            {checks.map((c, i) => (
-              <ReadinessRow key={c.id ?? i} check={c} index={i} onShowCaches={c.id === "disk" ? onShowCaches : undefined} />
+            {rows.map((c, i) => (
+              <ReadinessRow
+                key={c.id ?? i}
+                check={c}
+                index={i}
+                note={
+                  c.id === "claude" ? claudeRecommendedNote(c.recommended, { inRun: claudeInRun }) : null
+                }
+                onShowCaches={c.id === "disk" ? onShowCaches : undefined}
+              />
             ))}
           </ul>
         )}
@@ -115,7 +160,18 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
   );
 }
 
-function ReadinessRow({ check, index, onShowCaches }: { check: ReadinessCheck; index: number; onShowCaches?: () => void }) {
+function ReadinessRow({
+  check,
+  index,
+  note,
+  onShowCaches,
+}: {
+  check: ReadinessCheck;
+  index: number;
+  /** Shown under the row whatever its status; never a verdict. */
+  note?: string | null;
+  onShowCaches?: () => void;
+}) {
   const [copied, setCopied] = useState(false);
   const { word, tone, Icon: StatusIcon } = STATUS[check.status] ?? PENDING;
   const Icon = check.timedOut ? Clock : StatusIcon;
@@ -130,7 +186,7 @@ function ReadinessRow({ check, index, onShowCaches }: { check: ReadinessCheck; i
 
   return (
     <li
-      data-tour={check.id === "disk" ? tourId("settings-readiness-disk") : undefined}
+      data-tour={ROW_TOUR[check.id]}
       data-testid={`readiness-row-${check.id}`}
       data-status={check.status}
       className="octo-rise-in py-2.5"
@@ -175,6 +231,15 @@ function ReadinessRow({ check, index, onShowCaches }: { check: ReadinessCheck; i
             </button>
           )}
         </div>
+      )}
+      {note && (
+        <p
+          data-tour="settings-readiness-claude-note"
+          data-testid="readiness-note"
+          className="octo-fade-in mt-1.5 pl-[25px] text-[12px] leading-[1.55] text-octo-sage"
+        >
+          {note}
+        </p>
       )}
     </li>
   );

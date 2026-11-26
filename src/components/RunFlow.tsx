@@ -1,21 +1,37 @@
 import { useEffect, useRef } from "react";
 import type { LiveEntry, RunStage } from "../lib/ipc";
-import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runStatus";
-import { stageTitle, fmtTokens } from "../lib/stageMeta";
+import { stageStatusGlyph, stageStatusWord, isTransientHalt, runStatusMeta } from "../lib/runStatus";
+import {
+  stageTitle,
+  fmtTokens,
+  fmtTokensFull,
+  fmtTokensShort,
+  essenceShedsTokens,
+  stageContextReading,
+  contextToneClass,
+  subjectShedsContext,
+  currentContext,
+} from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
-import { shortModel } from "../lib/modelLabel";
+import { ranOnNote, ranOnTitle, shortModel } from "../lib/modelLabel";
+import { refusedCallsNote, REFUSED_CALLS_TITLE } from "../lib/refusedCalls";
 import { effortApplies } from "../lib/claudeCli";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
-import { RunFlowNav } from "./RunFlowNav";
+import { tourId } from "../lib/tour/ids";
+import { formatEstimateUsd, formatUsd, unpricedTitle, USAGE_UNREPORTED_TITLE } from "../lib/cost";
+import { RunFlowNav, railEdgeFade, useRailEdges } from "./RunFlowNav";
 
 interface Props {
   stages: RunStage[];
   selectedStageId: string | null;
   /** Law 2 — the one stage allowed to pulse (beaconAnchor kind "stage"). */
   beaconStageId: string | null;
+  /** The run was aborted: the stage it froze at running / awaiting checkpoint
+   *  reads as aborted (muted), never as live or waiting for you (#891). */
+  runAborted?: boolean;
   onSelectStage: (id: string) => void;
 }
 
@@ -28,7 +44,7 @@ const EMPTY_ENTRIES: LiveEntry[] = [];
  *  Connectors are drawn solid lines — brass once work has flowed through,
  *  hairline ahead (gradients and the ⟶ glyph are retired); the ⟜ gate mark
  *  lives on the gated card itself. */
-export function RunFlow({ stages, selectedStageId, beaconStageId, onSelectStage }: Props) {
+export function RunFlow({ stages, selectedStageId, beaconStageId, runAborted = false, onSelectStage }: Props) {
   const railRef = useRef<HTMLDivElement | null>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
@@ -45,11 +61,17 @@ export function RunFlow({ stages, selectedStageId, beaconStageId, onSelectStage 
     });
   }, [selectedStageId]);
 
+  // Each chevron sits at the edge whose stages it brings back, and that edge
+  // fades while it hides any.
+  const edges = useRailEdges(railRef, stages.length);
+
   return (
     <div className="flex items-stretch gap-2">
+      {edges.overflowing && <RunFlowNav containerRef={railRef} side="earlier" disabled={edges.atStart} />}
       <div
         ref={railRef}
-        className="octo-no-scrollbar flex min-w-0 flex-1 snap-x snap-proximity flex-nowrap items-stretch overflow-x-auto py-1 scroll-smooth"
+        data-tour="direct-run-track"
+        className={`octo-no-scrollbar flex min-w-0 flex-1 snap-x snap-proximity flex-nowrap items-stretch overflow-x-auto py-1 scroll-smooth ${railEdgeFade(edges)}`}
       >
         {stages.map((s, i) => {
           const prev = stages[i - 1];
@@ -78,6 +100,7 @@ export function RunFlow({ stages, selectedStageId, beaconStageId, onSelectStage 
                   stages={stages}
                   selected={s.id === selectedStageId}
                   beacon={s.id === beaconStageId}
+                  runAborted={runAborted}
                   onSelect={() => onSelectStage(s.id)}
                 />
               </div>
@@ -85,7 +108,7 @@ export function RunFlow({ stages, selectedStageId, beaconStageId, onSelectStage 
           );
         })}
       </div>
-      <RunFlowNav containerRef={railRef} stageCount={stages.length} />
+      {edges.overflowing && <RunFlowNav containerRef={railRef} side="later" disabled={edges.atEnd} />}
     </div>
   );
 }
@@ -96,6 +119,7 @@ function StageCard({
   stages,
   selected,
   beacon,
+  runAborted,
   onSelect,
 }: {
   stage: RunStage;
@@ -103,41 +127,78 @@ function StageCard({
   stages: RunStage[];
   selected: boolean;
   beacon: boolean;
+  runAborted: boolean;
   onSelect: () => void;
 }) {
   const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
-  const elapsed = useElapsed(s.status === "running" ? s.startedAt : null);
-  const running = s.status === "running";
-  const awaiting = s.status === "awaiting_checkpoint";
+  const liveContext = useRunsStore((st) => st.liveContextByStage?.[s.id]);
+  // An abort never rewrites the stage row: the stage it was on stays
+  // `running` / `awaiting_checkpoint`. Read it as aborted, muted (#891).
+  const cut = runAborted && (s.status === "running" || s.status === "awaiting_checkpoint");
+  const running = s.status === "running" && !cut;
+  const awaiting = s.status === "awaiting_checkpoint" && !cut;
+  const elapsed = useElapsed(running ? s.startedAt : null);
   const failed = s.status === "failed";
   const transientHalt = failed && isTransientHalt(s.error);
 
   // Depth of field (Law 1): the subject keeps full ink; everything else
   // recedes to its essence — 38% ink, rising on hover. Nothing is removed:
   // the full detail lives in the focus pane one click away.
-  const subject = running || awaiting || failed || selected;
+  // The stage an abort cut keeps the subject geometry (it is where the run
+  // ended) but in muted ink: no brass, no verdigris, no timer.
+  const subject = running || awaiting || failed || cut || selected;
 
+  const aborted = runStatusMeta("aborted");
   const base = stageStatusGlyph(s.status);
-  const glyph = transientHalt ? "⟳" : base.label;
-  const glyphCls = transientHalt ? "text-octo-warning" : base.className;
-  const word = transientHalt ? "stalled" : stageStatusWord(s.status);
+  const glyph = cut ? aborted.glyph : transientHalt ? "⟳" : base.label;
+  const glyphCls = cut ? aborted.className : transientHalt ? "text-octo-warning" : base.className;
+  const word = cut ? aborted.word : transientHalt ? "stalled" : stageStatusWord(s.status);
   const Icon = iconForRole(s.role);
   const cliManaged = s.substrate === "cli";
 
   // ONE fixed-height live/meta line on the subject; content picked by status.
+  // A running stage with no activity yet says so here, the one place the
+  // waiting state lives (the focus pane keeps only its Player).
   const verdict = s.status === "done" ? lastNotice(entries) : "";
-  const live: { node: React.ReactNode; cls: string } = running
-    ? { node: lastActivity(entries), cls: "text-octo-sage" }
+  const activity = running ? lastActivity(entries) : "";
+  const live: { node: React.ReactNode; cls: string; tour?: string } = cut
+    ? { node: "the run ended at this stage", cls: "text-octo-mute" }
+    : running
+    ? activity
+      ? { node: activity, cls: "text-octo-sage" }
+      : { node: "waiting for first tool call", cls: "text-octo-mute", tour: tourId("direct-stage-waiting") }
     : verdict
       ? { node: verdict, cls: "text-octo-verdigris" }
       : { node: <MetaTokens stage={s} />, cls: "text-octo-mute" };
+  // Calls Claude Code refused ride the at-rest line in amber, after the
+  // verdict or tokens — a fact to check, not a gate (no brass).
+  const refused = !cut && !running ? s.refusedCalls ?? 0 : 0;
+
+  // The meta line's shrink-0 notes, and the context reading (#895): only
+  // while the stage runs (a finished stage's final reading is in the focus
+  // pane), and only when it fits beside the short model name, position,
+  // notes and pill (`subjectShedsContext`: the reading sheds first).
+  const shownModel = s.escalated && s.escalateModel ? s.escalateModel : s.agentModel;
+  const effortShown = !!s.effort && effortApplies(s.substrate, shownModel);
+  const escalatedNote = s.escalated ? `↑ ${s.escalateModel ? shortModel(s.escalateModel) : "retry"}` : "";
+  // A running card names its model short (`opus-5-5`), full id in the tooltip.
+  const modelLabel = running ? shortModel(s.agentModel) : s.agentModel;
+  const ctx = running ? stageContextReading(currentContext(s, liveContext)) : null;
+  const metaNotes = [s.ranModel ? ranOnNote(s.ranModel) : "", effortShown ? s.effort ?? "" : "", escalatedNote].filter(Boolean);
+  const ctxShed = ctx ? subjectShedsContext(String(index + 1), modelLabel, ctx.cardLabel, metaNotes) : false;
 
   const looping = s.loopTargetPosition !== null;
   const target = looping ? stages.find((t) => t.position === s.loopTargetPosition) : undefined;
 
   // Status keeps its own colour family (running verdigris, needs-you brass,
   // stall amber, hard fail rouge) — but the PULSE belongs to the beacon alone.
-  const skin = transientHalt
+  // A cut card drops its live colour but keeps the selection highlight (#904).
+  const selectedSkin = "border-[var(--brass-dim)] bg-[var(--brass-ghost)]";
+  const skin = cut
+    ? selected
+      ? selectedSkin
+      : "border-octo-hairline bg-octo-panel-2"
+    : transientHalt
     ? "border-[var(--warning-border)] bg-octo-panel-2 hover:border-octo-warning"
     : failed
       ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
@@ -146,7 +207,7 @@ function StageCard({
         : awaiting
           ? "border-octo-brass bg-octo-panel-2"
           : selected
-            ? "border-[var(--brass-dim)] bg-[var(--brass-ghost)]"
+            ? selectedSkin
             : "border-octo-hairline bg-octo-panel-2";
 
   return (
@@ -156,20 +217,20 @@ function StageCard({
       style={{ animationDelay: `calc(${Math.min(index, 8)} * var(--stagger-step))` }}
       className={`octo-rise-in flex shrink-0 flex-col gap-2 overflow-hidden rounded-lg border px-3.5 py-3 text-left transition-[width,opacity,border-color,background-color,color] duration-[280ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
         subject ? "w-[210px]" : "w-[150px] opacity-[0.38] hover:opacity-70 focus-visible:opacity-70"
-      } ${beacon ? "octo-stage-pulse " : ""}${skin}`}
+      } ${beacon && !cut ? (running ? "octo-stage-pulse octo-stage-pulse-running " : "octo-stage-pulse ") : ""}${skin}`}
     >
       {/* Header — gate mark · role icon · title · status glyph. Rows are
           `w-full min-w-0` so they clip against the card in WebKit too (#312). */}
       <div className="flex w-full min-w-0 items-center gap-2">
         {s.checkpoint && (
           <span
-            className="shrink-0 font-mono text-[12px] text-octo-brass"
-            title="Checkpoint — pauses for your approval"
+            className={`shrink-0 font-mono text-[12px] ${runAborted ? "text-octo-mute" : "text-octo-brass"}`}
+            title={runAborted ? "Checkpoint — the run ended" : "Checkpoint — pauses for your approval"}
           >
             ⟜
           </span>
         )}
-        <span className={subject ? "text-octo-brass" : "text-octo-sage"}>
+        <span className={subject && !cut ? "text-octo-brass" : "text-octo-sage"}>
           <Icon size={13} strokeWidth={1.75} />
         </span>
         <span
@@ -178,7 +239,7 @@ function StageCard({
         >
           {stageTitle(s)}
         </span>
-        <span key={`${s.status}-${transientHalt}`} className={`octo-pop-in font-mono text-[10px] ${glyphCls}`} title={word}>
+        <span key={`${s.status}-${transientHalt}-${cut}`} className={`octo-pop-in font-mono text-[10px] ${glyphCls}`} title={word}>
           {glyph}
         </span>
       </div>
@@ -195,17 +256,59 @@ function StageCard({
 
           {/* Live activity / verdict / tokens — fixed height, status-picked. */}
           <span
-            key={`${s.status}-live`}
+            key={`${s.status}-${cut}-live`}
+            data-tour={live.tour}
             className={`octo-fade-in block h-4 truncate font-mono text-[10px] leading-4 ${live.cls}`}
           >
-            {live.node}
+            {refused > 0 ? (
+              <span className="flex w-full min-w-0 items-center gap-2">
+                <span className="min-w-0 truncate">{live.node}</span>
+                <span
+                  className="octo-pop-in shrink-0 text-octo-warning"
+                  title={REFUSED_CALLS_TITLE}
+                  data-tour="direct-stage-refused"
+                >
+                  {refusedCallsNote(refused)}
+                </span>
+              </span>
+            ) : (
+              live.node
+            )}
           </span>
 
           {/* Meta — discreet position · model · effort · substrate pill. */}
           <span className="flex h-4 w-full min-w-0 items-center gap-2 font-mono text-[10px] text-octo-mute">
             <span className="octo-tabular shrink-0">{index + 1}</span>
-            <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
-            {s.effort && effortApplies(s.substrate, s.escalated && s.escalateModel ? s.escalateModel : s.agentModel) && (
+            <span className="min-w-0 flex-1 truncate" title={s.agentModel}>
+              {modelLabel}
+            </span>
+            {/* Mounted for the whole run of the stage, shed until a reading
+                arrives, so it grows in through the demote rung's own motion. */}
+            {running && (
+              <span
+                className={`octo-demote octo-tabular ${ctx ? contextToneClass(ctx.tone) : "text-octo-mute"}${
+                  !ctx || ctxShed ? " octo-demote-shed" : ""
+                }`}
+                title={ctx?.cardTitle}
+                data-tour="direct-stage-context"
+                data-tone={ctx?.tone}
+                aria-hidden={ctx ? undefined : true}
+              >
+                {ctx?.cardLabel ?? ""}
+              </span>
+            )}
+            {/* A shed reading is hidden from screen readers too; they get the figures. */}
+            {ctx && ctxShed && <span className="sr-only">{ctx.cardTitle}</span>}
+            {s.ranModel && (
+              <span
+                className="octo-pop-in shrink-0 text-octo-warning"
+                title={ranOnTitle(s.agentModel, s.ranModel)}
+                data-tour="direct-stage-ran-on"
+              >
+                {ranOnNote(s.ranModel)}
+              </span>
+            )}
+            {effortShown && (
               <span className="shrink-0 text-octo-brass" title="Reasoning effort for this stage">
                 {s.effort}
               </span>
@@ -215,7 +318,7 @@ function StageCard({
                 className="shrink-0 text-octo-brass"
                 title={`Escalated${s.escalateModel ? ` to ${s.escalateModel}` : ""} after a failed attempt`}
               >
-                ↑ {s.escalateModel ? shortModel(s.escalateModel) : "retry"}
+                {escalatedNote}
               </span>
             )}
             <span
@@ -249,13 +352,60 @@ function StageCard({
           )}
         </span>
       ) : (
-        /* Essence meta — discreet position · cost · tokens. */
-        <span key="essence" className="octo-fade-in flex h-4 items-center gap-2 font-mono text-[10px] text-octo-mute">
-          <span className="octo-tabular shrink-0">{index + 1}</span>
-          {(s.costUsd > 0 || s.inputTokens > 0 || s.outputTokens > 0) && <MetaTokens stage={s} />}
-        </span>
+        <EssenceMeta key="essence" stage={s} position={String(index + 1)} />
       )}
     </button>
+  );
+}
+
+/** Essence meta — discreet position · cost · tokens, on ONE nowrap line (S1).
+ *  When the three don't fit the card, the token pair sheds (E2); it stays in
+ *  the line's tooltip, in sr-only text (a shed pair is `visibility:hidden`) and
+ *  in the focus pane one click away. An unknown cost reads "unreported" /
+ *  "unpriced" in mute, never "$0.00"; under a cent reads "<$0.01". */
+function EssenceMeta({ stage: s, position }: { stage: RunStage; position: string }) {
+  const hasTokens = s.inputTokens > 0 || s.outputTokens > 0;
+  const unreported = s.usageUnreported && s.costUsd === 0;
+  const unpriced = !unreported && s.unpricedModel && s.costUsd === 0 && hasTokens;
+  const hasMeta = s.costUsd > 0 || hasTokens || unreported;
+  // "usage not reported" (18ch) never fits the 17ch line; the card says "unreported".
+  const cost = unreported ? "unreported" : unpriced ? "unpriced" : formatEstimateUsd(s.costUsd);
+  const tokens = hasTokens ? `↑${fmtTokensShort(s.inputTokens)} ↓${fmtTokensShort(s.outputTokens)}` : "";
+  const shed = hasTokens && essenceShedsTokens(position, cost, tokens);
+  const fullTokens = `↑${fmtTokensFull(s.inputTokens)} ↓${fmtTokensFull(s.outputTokens)} tokens`;
+  return (
+    <span
+      className="octo-fade-in flex h-4 w-full min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap font-mono text-[10px] text-octo-mute"
+      title={shed ? `${unreported ? "usage not reported" : cost} · ${fullTokens}` : undefined}
+    >
+      <span className="octo-tabular shrink-0">{position}</span>
+      {hasMeta &&
+        (unreported ? (
+          <span className="shrink-0 text-octo-mute" title={`Usage not reported. ${USAGE_UNREPORTED_TITLE}`}>
+            {cost}
+          </span>
+        ) : unpriced ? (
+          <span className="shrink-0 text-octo-mute" title={unpricedTitle([s.ranModel ?? s.agentModel])}>
+            {cost}
+          </span>
+        ) : (
+          <span className="octo-tabular shrink-0 text-octo-brass">{cost}</span>
+        ))}
+      {hasTokens && (
+        <span
+          className={`octo-demote octo-tabular text-octo-mute${shed ? " octo-demote-shed" : ""}`}
+          title="input / output tokens"
+        >
+          {tokens}
+        </span>
+      )}
+      {/* A shed pair is hidden from screen readers too; they get the full figures. */}
+      {shed && (
+        <span className="sr-only">
+          {`${fmtTokensFull(s.inputTokens)} input, ${fmtTokensFull(s.outputTokens)} output tokens`}
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -264,7 +414,7 @@ function MetaTokens({ stage: s }: { stage: RunStage }) {
   const hasTokens = s.inputTokens > 0 || s.outputTokens > 0;
   return (
     <span className="flex items-center gap-2">
-      <span className="octo-tabular text-octo-brass">${s.costUsd.toFixed(2)}</span>
+      <span className="octo-tabular text-octo-brass">{formatUsd(s.costUsd)}</span>
       {hasTokens && (
         <span className="octo-tabular text-octo-mute" title="input / output tokens">
           ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}

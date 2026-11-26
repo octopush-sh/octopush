@@ -3,8 +3,16 @@ import { ipc } from "../lib/ipc";
 import { useProjectStore } from "./projectStore";
 import { useTerminalsStore } from "./terminalsStore";
 import { useTerminalLayoutStore } from "./terminalLayoutStore";
+import { useCollisionStore } from "./collisionStore";
 import { pushToast } from "../components/Toasts";
+import { beginMembershipLoad } from "../lib/membershipGuard";
+import { shareToasts } from "../lib/shareWithMissions";
 import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
+
+// `load` and `loadAllWorkspaces` run under the membership guard
+// (`lib/membershipGuard.ts`): a group move the read could have missed is laid
+// over the rows in the step that commits them, so a reload in flight never
+// undoes a move, and never brings back one the backend refused.
 
 interface WorkspaceState {
   workspaces: Workspace[];
@@ -17,14 +25,37 @@ interface WorkspaceState {
    * jumping to the first one in the list.
    */
   lastActiveByProject: Record<string, string>;
+  /** The workspace the app made active by itself when it launched (the
+   *  remembered one of the project it reopened, or that project's first), as
+   *  opposed to one somebody activated. `undefined` until the startup restore
+   *  has loaded its project, and for good when the app launched with no
+   *  project to reopen; `null` when that project had none. The rail reads it
+   *  to tell a restore from an activation: only the latter unfolds a group. */
+  launchRestoredId?: string | null;
   /** Workspaces grouped by project ID for hierarchical display in the rail. */
   workspacesByProjectId: Record<string, Workspace[]>;
   /** Per-workspace git signal for the rail, keyed by workspace id. */
   gitSummaryByWs: Record<string, WorkspaceGitSummary>;
   /** Open PR per workspace id (null = none), for the rail indicator. */
   prByWs: Record<string, Pr | null>;
+  /** The merged PR of each mission that is merged and clean
+   *  (`merged_workspaces`); absent = not merged, or not clean. */
+  mergedPrByWs: Record<string, Pr>;
+  /** Each merged mission's local files (`MergedWorkspace.localFiles`):
+   *  git-ignored, not a dependency or build folder; archiving deletes them. */
+  localFilesByWs: Record<string, string[]>;
+  /** Missions an archive of merged missions is working on right now: their
+   *  "merged · archive?" is disabled and a second click is ignored. */
+  archivingIds: Record<string, true>;
 
   load: (projectId: string) => Promise<void>;
+  /** The startup restore is reopening the last project: what the loads make
+   *  active until its own `load` lands is the launch restore, not an
+   *  activation. Call it before opening the project. */
+  beginLaunchRestore: () => void;
+  /** The startup restore opened nothing (the project couldn't be opened):
+   *  the next project the user opens is an activation. */
+  cancelLaunchRestore: () => void;
   /** Fetches + replaces workspacesByProjectId for the given ids; also syncs
    *  the flat `workspaces` array (and reconciles `activeId`) when the
    *  currently-open project is among them, so `activeWorkspace` resolves
@@ -54,6 +85,10 @@ interface WorkspaceState {
   remove: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) => Promise<void>;
   /** Archive a workspace (worktree removed, branch kept) — drops it from the rail. */
   archive: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) => Promise<void>;
+  /** Drop a workspace the backend just archived from every rail map. */
+  forgetArchived: (workspaceId: string) => void;
+  /** Mark `ids` as being archived (`on`) or done with (`archivingIds`). */
+  setArchiving: (ids: readonly string[], on: boolean) => void;
   /** Rename a workspace in the backend + both rail maps. */
   rename: (workspaceId: string, name: string) => Promise<void>;
   /** Drop a whole project's workspaces from the rail map; clears the active
@@ -63,6 +98,12 @@ interface WorkspaceState {
   loadGitSummaries: (projectId: string) => Promise<void>;
   /** Fetch a project's open PRs (gh batch) and map them onto its workspaces by branch. */
   loadProjectPrs: (projectId: string, projectPath: string) => Promise<void>;
+  /** Fetch which of a project's missions are merged and clean
+   *  (`merged_workspaces`). `loadProjectPrs` calls it on a project's first PR
+   *  read of the session and when a PR leaves the open list, never on every
+   *  refresh; the archive itself re-checks everything. Resolves to whether
+   *  the merged PRs could be read. */
+  loadMergedPrs: (projectId: string, projectPath: string) => Promise<boolean>;
   updateCustomization: (workspaceId: string, glyph: string | null, tint: string | null) => Promise<void>;
   notify: (workspaceId: string) => void;
   clearNotification: (workspaceId: string) => void;
@@ -76,12 +117,29 @@ const prFetchInFlight = new Set<string>();
  *  the same project isn't re-fetched more than once per 15s (focus +
  *  project-set + pin/reorder can all fire in quick succession). */
 const prFetchLastAt = new Map<string, number>();
+/** Projects whose merged missions were read this session (`loadMergedPrs`). */
+const mergedReadFor = new Set<string>();
+/** When a project whose merged PRs couldn't be read may be asked again. */
+const mergedRetryAt = new Map<string, number>();
+/** How long after a failed merged-PR read the next one waits (gh missing,
+ *  signed out, offline): a later refresh in the session tries again. */
+const MERGED_RETRY_MS = 5 * 60_000;
 
 /** Test-only: clears the module-level PR-fetch dedup/throttle state so the
  *  throttle Map doesn't leak across tests sharing a projectId. */
 export const __resetPrFetchThrottle = (): void => {
   prFetchInFlight.clear();
   prFetchLastAt.clear();
+  mergedReadFor.clear();
+  mergedRetryAt.clear();
+};
+
+/** Whether the startup restore is reopening a project whose `load` has not
+ *  landed yet: that load's pick is the launch restore. */
+let launchPending = false;
+/** Test-only: no launch restore in flight. */
+export const __resetLaunchRestore = (): void => {
+  launchPending = false;
 };
 
 const loadLastActiveFromStorage = (): Record<string, string> => {
@@ -102,43 +160,68 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   workspacesByProjectId: {},
   gitSummaryByWs: {},
   prByWs: {},
+  mergedPrByWs: {},
+  localFilesByWs: {},
+  archivingIds: {},
 
   load: async (projectId) => {
     set({ loading: true });
-    const workspaces = await ipc.listWorkspaces(projectId);
-    // Atomic update: pick the activeId in the same set() call so React never
-    // sees a frame with `workspaces.find(activeId) === undefined`, which
-    // would briefly flip activeWorkspace to null and unmount all the
-    // TerminalPanes (killing their PTYs). Prefer the last-active for this
-    // project, fall back to the first workspace.
-    const remembered = get().lastActiveByProject[projectId];
-    const exists = remembered && workspaces.some((w) => w.id === remembered);
-    const nextActive = exists
-      ? remembered
-      : workspaces.length > 0
-        ? workspaces[0].id
-        : null;
-    set((s) => ({
-      workspaces,
-      loading: false,
-      activeId: nextActive,
-      workspacesByProjectId: {
-        ...s.workspacesByProjectId,
-        [projectId]: workspaces,
-      },
-    }));
+    const guard = beginMembershipLoad("workspace");
+    try {
+      const workspaces = guard.overlay(await ipc.listWorkspaces(projectId));
+      // Atomic update: pick the activeId in the same set() call so React never
+      // sees a frame with `workspaces.find(activeId) === undefined`, which
+      // would briefly flip activeWorkspace to null and unmount all the
+      // TerminalPanes (killing their PTYs). Prefer the last-active for this
+      // project, fall back to the first workspace.
+      const remembered = get().lastActiveByProject[projectId];
+      const exists = remembered && workspaces.some((w) => w.id === remembered);
+      const nextActive = exists
+        ? remembered
+        : workspaces.length > 0
+          ? workspaces[0].id
+          : null;
+      // The load the startup restore is waiting for is the launch restore.
+      const atLaunch = launchPending;
+      launchPending = false;
+      set((s) => ({
+        workspaces,
+        loading: false,
+        activeId: nextActive,
+        ...(atLaunch ? { launchRestoredId: nextActive } : {}),
+        workspacesByProjectId: {
+          ...s.workspacesByProjectId,
+          [projectId]: workspaces,
+        },
+      }));
+    } finally {
+      guard.end();
+    }
+  },
+
+  beginLaunchRestore: () => {
+    launchPending = true;
+  },
+
+  cancelLaunchRestore: () => {
+    launchPending = false;
   },
 
   loadAllWorkspaces: async (projectIds) => {
     if (projectIds.length === 0) return;
     set({ loading: true });
+    const guard = beginMembershipLoad("workspace");
     try {
-      const results = await Promise.all(
+      const fetched = await Promise.all(
         projectIds.map(async (id) => {
           const wss = await ipc.listWorkspaces(id);
           return { projectId: id, workspaces: wss };
         })
       );
+      // One overlay for the whole batch, in the step that commits it: the
+      // batch is written after its slowest read, and a move may have started,
+      // settled or been refused since a faster one returned.
+      const results = fetched.map((r) => ({ ...r, workspaces: guard.overlay(r.workspaces) }));
       set((s) => {
         const newByProject = { ...s.workspacesByProjectId };
         results.forEach(({ projectId, workspaces }) => {
@@ -157,16 +240,22 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           return { workspacesByProjectId: newByProject, loading: false };
         }
         const activeStillExists = current.workspaces.some((w) => w.id === s.activeId);
+        const activeId = activeStillExists ? s.activeId : (current.workspaces[0]?.id ?? null);
         return {
           workspacesByProjectId: newByProject,
           loading: false,
           workspaces: current.workspaces,
-          activeId: activeStillExists ? s.activeId : (current.workspaces[0]?.id ?? null),
+          activeId,
+          // At launch this reload can land before `load` picks the remembered
+          // workspace: what it makes active meanwhile is no activation either.
+          ...(launchPending && !activeStillExists ? { launchRestoredId: activeId } : {}),
         };
       });
     } catch (err) {
       console.error("loadAllWorkspaces failed:", err);
       set({ loading: false });
+    } finally {
+      guard.end();
     }
   },
 
@@ -183,7 +272,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript, intent = null, gitIsolation = null, execIsolation = null) => {
-    const { setupTerminalId, setupError, ...ws } = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation);
+    const { setupTerminalId, setupError, shared, ...ws } = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation);
+    // What the worktree borrowed shows on the setup terminal's first line;
+    // without one (or for what was left out) a toast says so.
+    for (const t of shareToasts(shared, Boolean(setupTerminalId))) pushToast(t);
     // A fresh worktree's setup script is already running in its `setup`
     // terminal (backend-spawned); register it before the Run pane mounts so
     // its exit is announced. It never blocks the workspace.
@@ -266,6 +358,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     await ipc.deleteWorkspace(workspaceId, projectPath, branch, worktreePath);
     // Its sessions are gone with it: so are its Run and Talk layouts.
     useTerminalLayoutStore.getState().forgetWorkspace(workspaceId);
+    useCollisionStore.getState().forgetWorkspace(workspaceId);
     set((s) => {
       // Drop the workspace from every project's group too — the rail renders
       // from `workspacesByProjectId`, so leaving a stale entry there keeps the
@@ -288,6 +381,21 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   archive: async (workspaceId, projectPath, branch, worktreePath) => {
     await ipc.archiveWorkspace(workspaceId, projectPath, branch, worktreePath);
+    get().forgetArchived(workspaceId);
+  },
+
+  setArchiving: (ids, on) =>
+    set((s) => {
+      const next = { ...s.archivingIds };
+      for (const id of ids) {
+        if (on) next[id] = true;
+        else delete next[id];
+      }
+      return { archivingIds: next };
+    }),
+
+  forgetArchived: (workspaceId) => {
+    useCollisionStore.getState().forgetWorkspace(workspaceId);
     // Archived rows are excluded from list_workspaces, so drop locally like
     // remove (also prune the git summary for hygiene).
     set((s) => {
@@ -297,11 +405,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       }
       const { [workspaceId]: _dropped, ...nextSummaries } = s.gitSummaryByWs;
       const { [workspaceId]: _droppedPr, ...nextPrs } = s.prByWs;
+      const { [workspaceId]: _droppedMerged, ...nextMerged } = s.mergedPrByWs;
+      const { [workspaceId]: _droppedFiles, ...nextFiles } = s.localFilesByWs;
       return {
         workspaces: s.workspaces.filter((w) => w.id !== workspaceId),
         workspacesByProjectId: nextByProject,
         gitSummaryByWs: nextSummaries,
         prByWs: nextPrs,
+        mergedPrByWs: nextMerged,
+        localFilesByWs: nextFiles,
         activeId: s.activeId === workspaceId ? null : s.activeId,
       };
     });
@@ -336,7 +448,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       for (const id of removedIds) delete nextSummaries[id];
       const nextPrs = { ...s.prByWs };
       for (const id of removedIds) delete nextPrs[id];
+      const nextMerged = { ...s.mergedPrByWs };
+      const nextFiles = { ...s.localFilesByWs };
+      for (const id of removedIds) {
+        delete nextMerged[id];
+        delete nextFiles[id];
+      }
       return {
+        mergedPrByWs: nextMerged,
+        localFilesByWs: nextFiles,
         workspacesByProjectId: restByProject,
         workspaces: activeWasPruned ? [] : s.workspaces,
         activeId: activeWasPruned ? null : s.activeId,
@@ -367,16 +487,59 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     try {
       const branchPrs = await ipc.openPrsForProject(projectPath);
       const byBranch = new Map(branchPrs.map((bp) => [bp.branch, bp.pr]));
+      let leftOpen = false;
       set((s) => {
         const wss = s.workspacesByProjectId[projectId] ?? [];
         const next = { ...s.prByWs };
-        for (const w of wss) next[w.id] = byBranch.get(w.branch) ?? null;
+        for (const w of wss) {
+          next[w.id] = byBranch.get(w.branch) ?? null;
+          if (s.prByWs[w.id] && !next[w.id]) leftOpen = true;
+        }
         return { prByWs: next };
       });
+      // "Merged · archive?" rides this read (#963): the merged lookup runs on
+      // the project's first read (again, a while after one that failed), then
+      // only once a PR left the open list.
+      const firstRead = !mergedReadFor.has(projectId) && now >= (mergedRetryAt.get(projectId) ?? 0);
+      if (leftOpen || firstRead) {
+        mergedReadFor.add(projectId);
+        if (!(await get().loadMergedPrs(projectId, projectPath))) {
+          mergedReadFor.delete(projectId);
+          mergedRetryAt.set(projectId, Date.now() + MERGED_RETRY_MS);
+        }
+      }
     } catch {
       // Non-critical — no PR indicators for this project.
     } finally {
       prFetchInFlight.delete(projectId);
+    }
+  },
+
+  loadMergedPrs: async (projectId, projectPath) => {
+    try {
+      const merged = await ipc.mergedWorkspaces(projectId, projectPath);
+      const byWs = new Map(merged.map((m) => [m.workspaceId, m]));
+      set((s) => {
+        const next = { ...s.mergedPrByWs };
+        const files = { ...s.localFilesByWs };
+        // The listed ids too: the project's rows may not have loaded yet.
+        const ids = new Set([...(s.workspacesByProjectId[projectId] ?? []).map((w) => w.id), ...byWs.keys()]);
+        for (const id of ids) {
+          const m = byWs.get(id);
+          if (m) {
+            next[id] = m.pr;
+            files[id] = m.localFiles ?? [];
+          } else {
+            delete next[id];
+            delete files[id];
+          }
+        }
+        return { mergedPrByWs: next, localFilesByWs: files };
+      });
+      return true;
+    } catch {
+      // Non-critical — nothing new is offered for archive in this project.
+      return false;
     }
   },
 

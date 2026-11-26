@@ -62,6 +62,37 @@ pub struct AppSettings {
     #[serde(default)]
     pub claude_hooks_enabled: Option<bool>,
 
+    /// Opt-in (Settings › Privacy › "Quiet Claude Code in crews and
+    /// Routines", #703): Claude Code launched for crew stages — fresh,
+    /// `--resume`d and detached — and the shell commands a Routine runs get
+    /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. **Off by default**,
+    /// including for every settings file written before this field existed
+    /// (`serde(default)` ⇒ `false`). Run terminals and Talk never get it.
+    /// Read fresh per stage by [`quiet_claude_code`].
+    #[serde(default)]
+    pub quiet_claude_code: bool,
+
+    /// Opt-in (Settings › General › Attention › "Notify me elsewhere", #964):
+    /// POST a short JSON message to `notify_elsewhere_url` when a crew needs a
+    /// decision, a crew run fails or a Routine finishes
+    /// (`crate::notify_elsewhere`). **Off by default**, including for every
+    /// settings file written before this field existed. Owned by
+    /// `set_notify_elsewhere`; whole-file saves carry both fields over.
+    #[serde(default)]
+    pub notify_elsewhere_enabled: bool,
+
+    /// The webhook URL for "Notify me elsewhere", validated before it is
+    /// stored (`notify_elsewhere::validate_url`). Never logged: webhook URLs
+    /// carry their secret in the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_elsewhere_url: Option<String>,
+
+    /// Secret guard (#730, Settings › General › "Guard commits against
+    /// secrets"): `None` = the default, read as **on** by
+    /// `secret_scan::guard_enabled`; an explicit `false` turns it off.
+    #[serde(default)]
+    pub secret_guard_enabled: Option<bool>,
+
     /// Provider-agnostic model tiers — `fast`, `balanced`, `strong` → a
     /// configured model id. What a sub-agent definition's `model: haiku`
     /// (or an `Agent` call's `model: "fast"`) resolves to on THIS machine,
@@ -91,9 +122,35 @@ pub struct AppSettings {
     #[serde(default)]
     pub sync_owner: Option<String>,
 
+    /// The last push attempt per sync kind, for the status line under each
+    /// Sync toggle (#518): time, outcome, count and HTTP status — **nothing
+    /// else** (no payloads, run titles or error bodies). Owned by
+    /// `sync::record_push`; cleared when its toggle turns off and on sign-out.
+    /// Parsed leniently (per kind): an entry this build can't read — an
+    /// outcome from a newer or dev build — drops only that entry, never the
+    /// whole file.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::sync::SyncStatus::is_empty",
+        deserialize_with = "crate::sync::SyncStatus::deserialize_lenient"
+    )]
+    pub last_sync_attempt: crate::sync::SyncStatus,
+
+    /// The library pull's `next_since` (#823): a server time, sent as
+    /// `?since=` on the next library pull so only what changed comes back.
+    /// Bound to the account that owns the opt-ins (`owner` must equal
+    /// `sync_owner`); dropped with the library opt-in, on an owner change and
+    /// on sign-out, so those start with a full pull. Owned by
+    /// `sync::library_since`; whole-file saves carry it over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_pull_since: Option<LibraryPullSince>,
+
     /// Update channel (Settings › About): `stable` (default) or `beta`.
     /// Owned by `set_update_channel` — whole-file saves carry it over.
-    #[serde(default)]
+    /// Parsed leniently: a value this build doesn't know — a channel written
+    /// by a newer build, before a downgrade — reads as the default instead
+    /// of failing the whole file (#642).
+    #[serde(default, deserialize_with = "enum_or_default")]
     pub update_channel: crate::updater::UpdateChannel,
 
     /// A version the user chose "Skip this version" for: the launch alert
@@ -108,20 +165,95 @@ pub struct AppSettings {
     pub legacy_openai_api_key: Option<String>,
 }
 
+/// `settings.json`'s reader for an enum-valued field: a value this build
+/// can't read (an unknown variant, or a wrong shape) falls back to the
+/// field's own default, never a failed file (malformed JSON still fails) — the same rule
+/// `SyncStatus::deserialize_lenient` applies to `lastSyncAttempt`. Every
+/// enum-valued field of [`AppSettings`] uses it.
+fn enum_or_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    // A syntax error inside the value is still an error: only a well-formed
+    // value this build can't read falls back. Broken JSON must keep failing
+    // the whole file, so no writer overwrites it (#641).
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
+}
+
 fn settings_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_settings_path::get() {
+        return p;
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".octopush")
         .join("settings.json")
 }
 
+/// Read `settings.json` for the app. Missing ⇒ defaults; **unparseable ⇒
+/// defaults too** (the long-standing read-side behaviour, unchanged). Writers
+/// must not use this for a read-modify-write — see [`load_settings_for_write`].
 pub fn load_settings() -> AppResult<AppSettings> {
+    match load_settings_strict() {
+        Err(LoadError::Unparseable) => Ok(AppSettings::default()),
+        Err(LoadError::Io(e)) => Err(e.into()),
+        Ok(s) => Ok(s),
+    }
+}
+
+enum LoadError {
+    Io(std::io::Error),
+    Unparseable,
+}
+
+/// Read for a read-modify-write: a missing file starts from defaults, but a
+/// file that exists and doesn't parse is an **error** — writing defaults back
+/// would wipe provider keys, git credentials and the Jira config. Logged
+/// without the file's contents.
+fn load_settings_for_write() -> AppResult<AppSettings> {
+    match load_settings_strict() {
+        Ok(s) => Ok(s),
+        Err(LoadError::Io(e)) => Err(e.into()),
+        Err(LoadError::Unparseable) => {
+            tracing::warn!("settings.json exists but doesn't parse; refusing to overwrite it");
+            Err(crate::error::AppError::Other(
+                "Your change wasn't saved: settings.json couldn't be read, so it was left unchanged.".into(),
+            ))
+        }
+    }
+}
+
+/// The path of `settings.json` when it exists but doesn't parse — the app is
+/// then showing defaults and every save is refused — so the UI can say so
+/// and name the file. `None` when it is missing, readable, or fails for
+/// another reason (an I/O error already reaches the caller of
+/// [`load_settings`]).
+pub fn unreadable_settings_path() -> Option<String> {
+    match load_settings_strict() {
+        Err(LoadError::Unparseable) => Some(settings_path().to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+fn load_settings_strict() -> Result<AppSettings, LoadError> {
     let path = settings_path();
     if !path.exists() {
         return Ok(AppSettings::default());
     }
-    let content = std::fs::read_to_string(&path)?;
-    let mut settings: AppSettings = serde_json::from_str(&content).unwrap_or_default();
+    let content = std::fs::read_to_string(&path).map_err(LoadError::Io)?;
+    let mut settings: AppSettings = serde_json::from_str(&content).map_err(|e| {
+        // Category and position only — never the contents (they hold keys).
+        tracing::warn!(
+            "settings.json parse failed ({:?} at line {}, column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        );
+        LoadError::Unparseable
+    })?;
 
     if let Some(k) = settings.legacy_anthropic_api_key.take() {
         if !k.is_empty() && !settings.provider_keys.contains_key("anthropic") {
@@ -137,13 +269,41 @@ pub fn load_settings() -> AppResult<AppSettings> {
     Ok(settings)
 }
 
-pub fn save_settings(settings: &AppSettings) -> AppResult<()> {
+/// Serializes every read-modify-write of `settings.json` made through
+/// [`update_settings`], so a background writer (the sync status, #518) can
+/// never resurrect a value another writer just changed — e.g. flip a sync
+/// opt-in back on.
+static SETTINGS_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+/// Read-modify-write `settings.json` under [`SETTINGS_WRITE_LOCK`]. A read
+/// failure aborts without writing.
+pub fn update_settings<R>(f: impl FnOnce(&mut AppSettings) -> R) -> AppResult<R> {
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let mut settings = load_settings_for_write()?;
+    let out = f(&mut settings);
+    save_settings(&settings)?;
+    Ok(out)
+}
+
+/// Overwrite the whole file. Writers outside this module go through
+/// [`update_settings`] (read-modify-write under the write lock) instead.
+pub(crate) fn save_settings(settings: &AppSettings) -> AppResult<()> {
     let path = settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, serde_json::to_string_pretty(settings)?)?;
     Ok(())
+}
+
+/// A stored library-pull `next_since` and the account it belongs to.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPullSince {
+    /// The Clerk `sub` that owned the opt-ins when it was stored.
+    pub owner: String,
+    /// The service's `next_since` (RFC 3339, server clock).
+    pub next_since: String,
 }
 
 /// The two cloud-sync opt-ins as one value — the wire shape of
@@ -197,8 +357,41 @@ impl AppSettings {
             self.history_sync_enabled = false;
             self.library_sync_enabled = false;
             self.sync_owner = Some(sub.to_string());
+            self.library_pull_since = None; // another account: full pull
         }
         self.set_flag(kind, enabled);
+        if kind == crate::sync::SyncKind::Library && !enabled {
+            self.library_pull_since = None;
+        }
+    }
+
+    /// The stored library `next_since`, only while library sync is on and it
+    /// was stored for the account that owns the opt-ins.
+    pub fn library_since_for_owner(&self) -> Option<&str> {
+        let stored = self.library_pull_since.as_ref()?;
+        let owner = self.sync_owner.as_deref()?;
+        (self.library_sync_enabled && !owner.is_empty() && stored.owner == owner)
+            .then_some(stored.next_since.as_str())
+    }
+
+    /// Store the library `next_since` for `owner`, only if `owner` still owns
+    /// the opt-ins and library sync is on; otherwise nothing changes (a pull
+    /// that began under another account never writes over this one's).
+    pub fn set_library_since_for(&mut self, owner: &str, value: String) {
+        if self.library_sync_enabled && !owner.is_empty() && self.sync_owner.as_deref() == Some(owner) {
+            self.library_pull_since = Some(LibraryPullSince { owner: owner.to_string(), next_since: value });
+        }
+    }
+
+    /// Store (or drop) the library `next_since` for the account that owns the
+    /// opt-ins. Nothing is stored while library sync is off or unowned.
+    pub fn set_library_since(&mut self, value: Option<String>) {
+        self.library_pull_since = match (value, self.sync_owner.as_deref()) {
+            (Some(v), Some(owner)) if self.library_sync_enabled && !owner.is_empty() => {
+                Some(LibraryPullSince { owner: owner.to_string(), next_since: v })
+            }
+            _ => None,
+        };
     }
 
     fn set_flag(&mut self, kind: crate::sync::SyncKind, enabled: bool) {
@@ -208,11 +401,42 @@ impl AppSettings {
         }
     }
 
-    /// Forget every opt-in (sign-out).
+    /// Forget every opt-in (sign-out), and the last-attempt records with them.
     pub fn clear_sync_opt_ins(&mut self) {
         self.history_sync_enabled = false;
         self.library_sync_enabled = false;
         self.sync_owner = None;
+        self.last_sync_attempt = crate::sync::SyncStatus::default();
+        self.library_pull_since = None;
+    }
+
+    /// After a toggle change, drop the last-attempt record of every kind that
+    /// is now off, just went from off to on, or changed owner (`before` /
+    /// `before_owner` are the values prior to the change) — a record never
+    /// outlives its toggle or carries over to another account. Returns the
+    /// kinds dropped, so the caller can forget them in memory too.
+    pub fn drop_stale_sync_attempts(
+        &mut self,
+        before: SyncPrefs,
+        before_owner: Option<&str>,
+    ) -> Vec<crate::sync::SyncKind> {
+        let owner_changed = self.sync_owner.as_deref() != before_owner;
+        let mut dropped = Vec::new();
+        for (kind, was_on) in [
+            (crate::sync::SyncKind::History, before.history_sync),
+            (crate::sync::SyncKind::Library, before.library_sync),
+        ] {
+            let on = self.flag(kind);
+            if !on || !was_on || owner_changed {
+                self.last_sync_attempt.clear(kind);
+                if kind == crate::sync::SyncKind::Library {
+                    // Turned on again or another account: start with a full pull.
+                    self.library_pull_since = None;
+                }
+                dropped.push(kind);
+            }
+        }
+        dropped
     }
 
     /// `set_sync_pref` is the ONLY writer of the opt-ins: a whole-file save
@@ -222,6 +446,8 @@ impl AppSettings {
         self.history_sync_enabled = on_disk.history_sync_enabled;
         self.library_sync_enabled = on_disk.library_sync_enabled;
         self.sync_owner = on_disk.sync_owner.clone();
+        self.last_sync_attempt = on_disk.last_sync_attempt.clone();
+        self.library_pull_since = on_disk.library_pull_since.clone();
     }
 
     /// Same rule for the updater prefs: `set_update_channel` /
@@ -230,6 +456,30 @@ impl AppSettings {
         self.update_channel = on_disk.update_channel;
         self.skipped_update_version = on_disk.skipped_update_version.clone();
     }
+
+    /// Same rule for "Notify me elsewhere" (#964): `set_notify_elsewhere`,
+    /// which validates the URL, is the only writer.
+    pub fn preserve_notify_fields_from(&mut self, on_disk: &AppSettings) {
+        self.notify_elsewhere_enabled = on_disk.notify_elsewhere_enabled;
+        self.notify_elsewhere_url = on_disk.notify_elsewhere_url.clone();
+    }
+}
+
+/// Persist "Notify me elsewhere" (read-modify-write). Callers validate the
+/// URL first (`notify_elsewhere::save`).
+pub fn set_notify_elsewhere(enabled: bool, url: Option<String>) -> AppResult<()> {
+    update_settings(|s| {
+        s.notify_elsewhere_enabled = enabled;
+        s.notify_elsewhere_url = url;
+    })
+}
+
+/// Is "Quiet Claude Code in crews and Routines" on? Reads `settings.json`
+/// fresh each call, so a toggle reaches the next stage (in-process or in the
+/// detached worker, which reads the same file) without a restart. Any read
+/// or parse failure answers **no** — the default.
+pub fn quiet_claude_code() -> bool {
+    load_settings().map(|s| s.quiet_claude_code).unwrap_or(false)
 }
 
 /// The persisted update channel (any read failure ⇒ stable).
@@ -239,9 +489,7 @@ pub fn update_channel() -> crate::updater::UpdateChannel {
 
 /// Persist the update channel (read-modify-write).
 pub fn set_update_channel(channel: crate::updater::UpdateChannel) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.update_channel = channel;
-    save_settings(&settings)
+    update_settings(|s| s.update_channel = channel)
 }
 
 /// The version the user skipped, if any.
@@ -251,9 +499,7 @@ pub fn skipped_update_version() -> Option<String> {
 
 /// Persist (or clear, with `None`) the skipped version.
 pub fn set_skipped_update_version(version: Option<String>) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.skipped_update_version = version.filter(|v| !v.trim().is_empty());
-    save_settings(&settings)
+    update_settings(|s| s.skipped_update_version = version.filter(|v| !v.trim().is_empty()))
 }
 
 /// Has the signed-in user opted in to this kind of cloud sync? Reads
@@ -274,6 +520,17 @@ pub fn sync_opted_in(kind: crate::sync::SyncKind) -> bool {
     settings.sync_opted_in_for(kind, sub.as_deref())
 }
 
+/// Is this kind's opt-in flag set at all (ignoring which account set it)? The
+/// sync status recorder's re-check: an attempt that finishes after the toggle
+/// went off records nothing. Any read failure answers **no**.
+pub fn sync_flag_on(kind: crate::sync::SyncKind) -> bool {
+    #[cfg(test)]
+    if let Some(v) = test_sync_override::get(kind) {
+        return v;
+    }
+    load_settings().map(|s| s.flag(kind)).unwrap_or(false)
+}
+
 /// The opt-ins as they apply to whoever is signed in now.
 pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
     let settings = load_settings()?;
@@ -285,8 +542,12 @@ pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
 /// return the new effective pair. Enabling requires a signed-in user (the
 /// opt-in is bound to their Clerk id); disabling always succeeds.
 pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResult<SyncPrefs> {
-    let mut settings = load_settings()?;
+    // The keychain read stays outside the write lock.
     let sub = crate::auth::current_identity().map(|(sub, _)| sub);
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let mut settings = load_settings_for_write()?;
+    let before = settings.sync_prefs();
+    let before_owner = settings.sync_owner.clone();
     match sub.as_deref() {
         Some(me) if !me.is_empty() => settings.set_sync_opted_in_by(kind, enabled, me),
         _ if enabled => {
@@ -294,26 +555,54 @@ pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResul
         }
         _ => settings.set_flag(kind, false),
     }
+    // A toggle that is off shows no status and keeps none; one just turned on
+    // (or now owned by another account) starts with none.
+    for stale in settings.drop_stale_sync_attempts(before, before_owner.as_deref()) {
+        crate::sync::status::forget(stale);
+    }
     save_settings(&settings)?;
     Ok(settings.sync_prefs_for(sub.as_deref()))
 }
 
-/// Sign-out: drop both opt-ins and their owner.
+/// Sign-out: drop both opt-ins, their owner and the last-attempt records.
 pub fn clear_sync_opt_ins() -> AppResult<()> {
-    let mut settings = load_settings()?;
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let mut settings = load_settings_for_write()?;
     settings.clear_sync_opt_ins();
+    crate::sync::status::forget(crate::sync::SyncKind::History);
+    crate::sync::status::forget(crate::sync::SyncKind::Library);
     save_settings(&settings)
 }
 
 /// A whole-settings save coming from the frontend: everything but the sync
-/// opt-ins (owned by `set_sync_pref`) and the updater prefs (owned by
-/// `set_update_channel` / `set_skipped_update_version`), which are carried
-/// over from disk.
+/// opt-ins (owned by `set_sync_pref`), the updater prefs (owned by
+/// `set_update_channel` / `set_skipped_update_version`) and "Notify me
+/// elsewhere" (owned by `set_notify_elsewhere`), which are carried over from
+/// disk.
 pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
-    let on_disk = load_settings()?;
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let on_disk = load_settings_for_write()?;
     incoming.preserve_sync_fields_from(&on_disk);
     incoming.preserve_update_fields_from(&on_disk);
+    incoming.preserve_notify_fields_from(&on_disk);
     save_settings(&incoming)
+}
+
+/// Test-only, per-thread override of where `settings.json` lives, so writer
+/// tests run against a temp file.
+#[cfg(test)]
+pub mod test_settings_path {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    thread_local! {
+        static PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    pub fn get() -> Option<PathBuf> {
+        PATH.with(|p| p.borrow().clone())
+    }
+    pub fn set(p: Option<PathBuf>) {
+        PATH.with(|c| *c.borrow_mut() = p);
+    }
 }
 
 /// Test-only, per-thread override of [`sync_opted_in`] so gating tests never
@@ -374,25 +663,22 @@ pub fn get_issue_tracker_config() -> Option<crate::issue_tracker::jira::JiraConf
 
 /// Persist the issue tracker configuration.
 pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.issue_tracker = Some(config);
-    save_settings(&settings)
+    update_settings(|s| s.issue_tracker = Some(config))
 }
 
-/// Persist git credentials for a host.  NOTE: save_settings does a full-file
-/// overwrite (last-write-wins). Callers must read-modify-write to avoid
-/// clobbering fields they don't own. Not safe for concurrent writers, but the
-/// app is single-window so that's acceptable.
+/// Persist git credentials for a host. Goes through [`update_settings`], so it
+/// is a read-modify-write under the settings write lock and can't clobber a
+/// concurrent writer's fields.
 pub fn save_git_credentials(host: &str, username: &str, token: &str) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.git_credentials.insert(
-        host.to_string(),
-        GitCredentialEntry {
-            username: username.to_string(),
-            token: token.to_string(),
-        },
-    );
-    save_settings(&settings)
+    update_settings(|s| {
+        s.git_credentials.insert(
+            host.to_string(),
+            GitCredentialEntry {
+                username: username.to_string(),
+                token: token.to_string(),
+            },
+        );
+    })
 }
 
 #[cfg(test)]
@@ -470,6 +756,213 @@ mod tests {
         assert_eq!(settings.claude_hooks_enabled, Some(true));
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""claudeHooksEnabled":true"#), "{json}");
+    }
+
+    #[test]
+    fn quiet_claude_code_round_trips_and_defaults_to_off() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.quiet_claude_code);
+        let settings: AppSettings = serde_json::from_str(r#"{"quietClaudeCode":true}"#).unwrap();
+        assert!(settings.quiet_claude_code);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""quietClaudeCode":true"#), "{json}");
+    }
+
+    #[test]
+    fn quiet_claude_code_reads_the_file_fresh_and_fails_to_off() {
+        // The detached worker reads the same file per stage, so this is what
+        // a toggle flipped mid-crew reaches.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+        assert!(!quiet_claude_code(), "missing file ⇒ off");
+        std::fs::write(&path, r#"{"quietClaudeCode":true}"#).unwrap();
+        assert!(quiet_claude_code());
+        std::fs::write(&path, r#"{"quietClaudeCode":false}"#).unwrap();
+        assert!(!quiet_claude_code());
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(!quiet_claude_code(), "unparseable ⇒ off");
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn notify_elsewhere_defaults_off_and_only_its_writer_changes_it() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.notify_elsewhere_enabled, "off for every older file");
+        assert_eq!(settings.notify_elsewhere_url, None);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("notifyElsewhereUrl"), "no URL key until one is saved: {json}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+        set_notify_elsewhere(true, Some("https://ntfy.sh/t".into())).unwrap();
+        let on_disk = load_settings().unwrap();
+        assert!(on_disk.notify_elsewhere_enabled);
+        assert_eq!(on_disk.notify_elsewhere_url.as_deref(), Some("https://ntfy.sh/t"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains(r#""notifyElsewhereEnabled": true"#));
+
+        // A whole-file save from a pane (stale, or crafted) can't flip it or
+        // slip in an unvalidated URL.
+        let stale = AppSettings { notify_elsewhere_url: Some("http://example.com/x".into()), ..Default::default() };
+        save_settings_from_ui(stale).unwrap();
+        let after = load_settings().unwrap();
+        assert!(after.notify_elsewhere_enabled);
+        assert_eq!(after.notify_elsewhere_url.as_deref(), Some("https://ntfy.sh/t"));
+
+        set_notify_elsewhere(false, None).unwrap();
+        let off = load_settings().unwrap();
+        assert!(!off.notify_elsewhere_enabled);
+        assert_eq!(off.notify_elsewhere_url, None);
+        test_settings_path::set(None);
+    }
+
+    /// A settings file with every kind of key, and `updateChannel` set to
+    /// `channel` (any JSON value).
+    fn file_with_update_channel(channel: serde_json::Value) -> String {
+        serde_json::json!({
+            "providerKeys": {"anthropic": "sk-ant-keep"},
+            "providerBaseUrls": {"ollama": "http://localhost:11434"},
+            "gitCredentials": {"github.com": {"username": "u", "token": "t"}},
+            "issueTracker": {
+                "baseUrl": "https://example.invalid",
+                "email": "dev@example.invalid",
+                "apiToken": "jira-keep"
+            },
+            "editorCommand": "code",
+            "quietClaudeCode": true,
+            "secretGuardEnabled": false,
+            "updateChannel": channel,
+            "skippedUpdateVersion": "9.9.9"
+        })
+        .to_string()
+    }
+
+    fn assert_other_keys_intact(s: &AppSettings) {
+        assert_eq!(s.provider_keys.get("anthropic").map(String::as_str), Some("sk-ant-keep"));
+        assert_eq!(
+            s.provider_base_urls.get("ollama").map(String::as_str),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(s.git_credentials.get("github.com").map(|c| c.token.as_str()), Some("t"));
+        assert_eq!(s.issue_tracker.as_ref().map(|j| j.api_token.as_str()), Some("jira-keep"));
+        assert_eq!(s.editor_command.as_deref(), Some("code"));
+        assert!(s.quiet_claude_code);
+        assert_eq!(s.secret_guard_enabled, Some(false));
+        assert_eq!(s.skipped_update_version.as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn a_known_update_channel_still_reads_as_written() {
+        let s: AppSettings =
+            serde_json::from_str(&file_with_update_channel(serde_json::json!("beta"))).unwrap();
+        assert_eq!(s.update_channel, crate::updater::UpdateChannel::Beta);
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.update_channel, crate::updater::UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn an_unknown_update_channel_reads_as_the_default_and_the_file_can_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+
+        // A variant from a newer build, and values of the wrong shape.
+        for unknown in [
+            serde_json::json!("nightly"),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!({"name": "beta"}),
+        ] {
+            std::fs::write(&path, file_with_update_channel(unknown.clone())).unwrap();
+
+            // The read side keeps every other key instead of showing defaults.
+            let loaded = load_settings().unwrap();
+            assert_eq!(
+                loaded.update_channel,
+                crate::updater::UpdateChannel::Stable,
+                "{unknown} falls back to the default"
+            );
+            assert_other_keys_intact(&loaded);
+            assert_eq!(update_channel(), crate::updater::UpdateChannel::Stable);
+            assert!(unreadable_settings_path().is_none(), "the file counts as readable");
+
+            // Every kind of writer goes through, and nothing else is lost.
+            update_settings(|s| s.editor_command = Some("code".into())).unwrap();
+            save_settings_from_ui(loaded.clone()).unwrap();
+            let on_disk: AppSettings =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_other_keys_intact(&on_disk);
+            assert_eq!(on_disk.update_channel, crate::updater::UpdateChannel::Stable);
+
+            // The channel itself can be chosen again.
+            set_update_channel(crate::updater::UpdateChannel::Beta).unwrap();
+            assert_eq!(update_channel(), crate::updater::UpdateChannel::Beta);
+            assert_other_keys_intact(&load_settings().unwrap());
+        }
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn malformed_json_inside_an_enum_field_still_fails_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+
+        // Broken syntax inside the lenient field's own value, with and
+        // without keys after it.
+        for corrupt in [
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":[1,}"#,
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":{"name":},"editorCommand":"code"}"#,
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":bet"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AppSettings>(corrupt).is_err(),
+                "not read leniently: {corrupt}"
+            );
+            std::fs::write(&path, corrupt).unwrap();
+            assert_eq!(
+                unreadable_settings_path(),
+                Some(path.to_string_lossy().into_owned()),
+                "reported as unparseable"
+            );
+            // Every writer refuses, and the bytes stay as they were.
+            assert!(update_settings(|s| s.editor_command = Some("x".into())).is_err());
+            assert!(save_settings_from_ui(AppSettings::default()).is_err());
+            assert!(set_update_channel(crate::updater::UpdateChannel::Beta).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        }
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn a_file_that_still_fails_to_parse_is_named_and_the_save_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+
+        assert!(unreadable_settings_path().is_none(), "a missing file is not a problem");
+        std::fs::write(&path, r#"{"providerKeys":{"anthropic":"sk-ant-keep"}}"#).unwrap();
+        assert!(unreadable_settings_path().is_none(), "nor is a readable one");
+
+        for corrupt in ["{ not json", r#"{"quietClaudeCode":"yes"}"#] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert_eq!(
+                unreadable_settings_path(),
+                Some(path.to_string_lossy().into_owned())
+            );
+            let err = update_settings(|s| s.editor_command = Some("x".into()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(
+                    "Your change wasn't saved: settings.json couldn't be read, so it was left unchanged."
+                ),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt, "left as it was");
+        }
+        test_settings_path::set(None);
     }
 
     #[test]

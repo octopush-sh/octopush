@@ -71,6 +71,12 @@ with `scenario:` (default: `default`).
 | `empty` | Fresh install — no projects (Welcome screen), signed out, free plan. |
 | `run-two-sessions` | `default` with two sessions (`zsh`, `claude`) in the active workspace, so Run offers Open beside. |
 | `run-four-sessions` | `default` with four sessions (`zsh`, `claude`, `tests`, `dev`) in the active workspace, so Run can show three and four panes. |
+| `rail-groups` | `default` with eight missions and two mission groups in the rail ("Vulnerability fixes", "PR reviews"), a loose mission before them and one after. |
+| `rail-project-groups` | `default` with seven projects in the rail: the pinned `octopush`, two project groups ("Client work" with three projects, "Side projects" with two) and a loose project after them. Moves, pins and reorders last until the page reloads. |
+| `rail-groups-everywhere` | `default` with a project group ("Client work": `acme-api`, `acme-web`), a mission group ("Fixes") in `acme-api`, a crew at work in one of its missions (Mission Control reads `Fixes · fix-json-parser`) and an archived mission of the group. Moves and new groups last until the page reloads. |
+| `direct-running` | `default` with a crew at work in the active workspace (`run-history-sync`): its Implement stage runs on Claude Code (the CLI substrate) with a context reading of 142k / 200k (`ctx 71%`), and no effort, escalation or ran-on note, so the run card keeps the reading on its meta line. |
+| `talk-work` | `default` with a longer Talk thread in the active workspace: an ask, narration and two rounds of tool calls (the second, six calls, folds into one summary row), a long answer with code and a list, then a short follow-up and its answer. Turn times are minutes before the page loads. |
+| `talk-mcp` | `default` with three MCP servers in the Companion's "can use" row: `docs-server` connected with 12 tools, `example-remote` failed to start, `issue-tracker` not started yet and off in the open conversation. Toggles last until the page reloads. |
 
 Adding one: create `scenarios/<name>.ts` exporting a `Scenario` (`types.ts`), register
 it in `scenarios/index.ts`, and run a recording with `--verbose` to see which commands

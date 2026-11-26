@@ -4,6 +4,7 @@ import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
 import type { ModelInfo } from "../lib/types";
 import { AUTO_MODEL } from "../lib/policy";
+import { formatContextTokens, formatUsd } from "../lib/cost";
 import { useProvidersStore } from "../stores/providersStore";
 
 /** localStorage key for the recently-used model ids (most-recent first). */
@@ -48,15 +49,11 @@ function providerColor(name: string): string {
 // Format cost as "$X.XX" trimming trailing zeros.
 function formatCost(perM: number): string {
   if (perM === 0) return "free";
-  if (perM < 1) return `$${perM.toFixed(2)}`;
+  if (perM < 1) return formatUsd(perM);
   return `$${perM % 1 === 0 ? perM.toFixed(0) : perM.toFixed(1)}`;
 }
 
 // Format context window: "200k", "1M", etc.
-function formatCtx(maxContext: number): string {
-  if (maxContext >= 1_000_000) return `${maxContext / 1_000_000}M`;
-  return `${Math.round(maxContext / 1000)}k`;
-}
 
 interface Props {
   activeModel: string;
@@ -508,7 +505,7 @@ function ModelRow({
   // comparing providers, not a live cost estimator. The inline preview
   // below the chat input handles "what does THIS prompt cost?" because
   // there you can edit text and see the number update in place.
-  const meta = `${formatCost(model.inputCostPerM)}/${formatCost(model.outputCostPerM)} · ${formatCtx(model.maxContext)} ctx`;
+  const meta = `${formatCost(model.inputCostPerM)}/${formatCost(model.outputCostPerM)} · ${formatContextTokens(model.maxContext)} ctx`;
 
   return (
     <button

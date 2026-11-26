@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { MissionCreator } from "./MissionCreator";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
@@ -12,14 +12,21 @@ vi.mock("../lib/ipc", () => ({
     updateWorkspaceLink: vi.fn().mockResolvedValue(undefined),
     createWorkspace: vi.fn(),
     setProjectSetupScript: vi.fn().mockResolvedValue(undefined),
+    conductorSetupScript: vi.fn().mockResolvedValue(null),
+    shareWithMissions: vi.fn(),
+    setShareWithMissions: vi.fn().mockResolvedValue(undefined),
     listBranches: vi.fn(),
     listPrs: vi.fn(),
     ensurePrBranch: vi.fn(),
   },
 }));
 
-const { mockPushToast } = vi.hoisted(() => ({ mockPushToast: vi.fn() }));
+const { mockPushToast, mockMoveToGroup } = vi.hoisted(() => ({
+  mockPushToast: vi.fn(),
+  mockMoveToGroup: vi.fn().mockResolvedValue(true),
+}));
 vi.mock("./Toasts", () => ({ pushToast: mockPushToast }));
+vi.mock("../lib/groupActions", () => ({ moveMissionToGroup: mockMoveToGroup }));
 
 // Mock workspaceStore
 vi.mock("../stores/workspaceStore", () => {
@@ -70,10 +77,116 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   useCompanionPrefs.setState({ setupScriptByProject: {} });
+  vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue(null);
+  vi.mocked(ipcModule.ipc.shareWithMissions).mockResolvedValue({
+    saved: { link: [], copy: [] },
+    available: { link: [], copy: [] },
+  });
+  vi.mocked(ipcModule.ipc.setShareWithMissions).mockResolvedValue(undefined);
   vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
   vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({
     local: ["main", "release/1.0"],
     remote: ["origin/dev"],
+  });
+});
+
+describe("MissionCreator · Share with new missions", () => {
+  function offer() {
+    vi.mocked(ipcModule.ipc.shareWithMissions).mockResolvedValue({
+      saved: { link: [], copy: [] },
+      available: { link: ["node_modules"], copy: [".env"] },
+    });
+  }
+
+  it("shows nothing when the main checkout has nothing to share", async () => {
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    await screen.findByText("Begin the mission");
+    expect(screen.queryByText("SHARE WITH NEW MISSIONS")).not.toBeInTheDocument();
+  });
+
+  it("offers what the checkout has, all off, and saves the choice before the worktree is made", async () => {
+    offer();
+    const order: string[] = [];
+    vi.mocked(ipcModule.ipc.setShareWithMissions).mockImplementation(async () => {
+      order.push("save");
+    });
+    const mockCreate = vi.fn().mockImplementation(async () => {
+      order.push("create");
+      return mockWorkspace;
+    });
+    vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    const link = await screen.findByRole("switch", { name: "Link node_modules into new missions" });
+    const copy = screen.getByRole("switch", { name: "Copy .env into new missions" });
+    expect(link).toHaveAttribute("aria-checked", "false");
+    expect(copy).toHaveAttribute("aria-checked", "false");
+    const copyText = screen.getByText(/A linked folder is the main checkout's own folder, not a copy/);
+    expect(copyText).toHaveTextContent(
+      "an install or a clean run inside a mission changes it for the main checkout and for every other mission",
+    );
+    expect(copyText).toHaveTextContent("so agents in the mission can read it");
+    expect(copyText).toHaveTextContent("Routines and workspaces created over MCP don't share.");
+    expect(screen.getByText("copied into the worktree, readable by the mission's agents")).toBeInTheDocument();
+    fireEvent.click(link);
+    fireEvent.click(screen.getByText("Begin the mission"));
+    await waitFor(() => expect(mockCreate).toHaveBeenCalled());
+    expect(ipcModule.ipc.setShareWithMissions).toHaveBeenCalledWith("proj-1", { link: ["node_modules"], copy: [] });
+    expect(order).toEqual(["save", "create"]);
+  });
+
+  it("warns when a folder is linked and the setup script installs or cleans", async () => {
+    offer();
+    useCompanionPrefs.setState({ setupScriptByProject: { "proj-1": "npm ci\nnpm run build" } });
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    const link = await screen.findByRole("switch", { name: "Link node_modules into new missions" });
+    // Nothing is linked yet, so there is nothing to warn about.
+    expect(screen.queryByText(/This setup script runs/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "Copy .env into new missions" }));
+    expect(screen.queryByText(/This setup script runs/)).not.toBeInTheDocument();
+    fireEvent.click(link);
+    expect(
+      screen.getByText(
+        "This setup script runs npm ci. With node_modules linked, that changes the main checkout's folder, for the main checkout and for every other mission.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(link);
+    expect(screen.queryByText(/This setup script runs/)).not.toBeInTheDocument();
+  });
+
+  it("doesn't write an unchanged list", async () => {
+    vi.mocked(ipcModule.ipc.shareWithMissions).mockResolvedValue({
+      saved: { link: [], copy: [".env"] },
+      available: { link: [], copy: [".env"] },
+    });
+    const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+    vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    expect(await screen.findByRole("switch", { name: "Copy .env into new missions" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByText("Begin the mission"));
+    await waitFor(() => expect(mockCreate).toHaveBeenCalled());
+    expect(ipcModule.ipc.setShareWithMissions).not.toHaveBeenCalled();
+  });
+
+  it("a failed save stops before the mission is created", async () => {
+    offer();
+    vi.mocked(ipcModule.ipc.setShareWithMissions).mockRejectedValue("db locked");
+    const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+    vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("switch", { name: "Copy .env into new missions" }));
+    fireEvent.click(screen.getByText("Begin the mission"));
+    expect(await screen.findByText(/Couldn't save what this project shares with new missions: db locked/)).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
   });
 });
 
@@ -131,6 +244,39 @@ describe("MissionCreator", () => {
     await beginMission();
     await waitFor(() => expect(onCreated).toHaveBeenCalled());
     expect(vi.mocked(ipcModule.ipc.updateWorkspaceLink)).not.toHaveBeenCalled();
+  });
+
+  it("puts the new mission in the group it was started from", async () => {
+    vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
+    const onCreated = vi.fn();
+    render(
+      <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" groupId="group-7" />,
+    );
+    await gotoTask();
+    await beginMission();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(mockMoveToGroup).toHaveBeenCalledWith("ws-new-1", "group-7");
+  });
+
+  it("leaves groups alone without a target group, and never steals an adopted workspace from its group", async () => {
+    const onCreated = vi.fn();
+    const { unmount } = render(
+      <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />,
+    );
+    await gotoTask();
+    await beginMission();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
+    unmount();
+
+    // The branch already had a workspace, and it sits in another group.
+    vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue({ ...mockWorkspace, groupId: "group-1" }));
+    render(
+      <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" groupId="group-7" />,
+    );
+    await gotoTask();
+    await beginMission();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(2));
+    expect(mockMoveToGroup).not.toHaveBeenCalled();
   });
 
   // ─── Step 1: intent ────────────────────────────────────────────────
@@ -620,6 +766,108 @@ describe("MissionCreator", () => {
       fireEvent.click(screen.getByText("Begin the mission"));
       await screen.findByText(/boom/);
       expect(useCompanionPrefs.getState().setupScriptByProject["proj-1"]).toBeUndefined();
+    });
+  });
+
+  describe("Conductor setup prefill", () => {
+    const CONDUCTOR_LINE = "From .conductor/settings.toml · edit before it runs";
+
+    async function gotoSetup() {
+      const taskInput = await gotoTask();
+      fireEvent.keyDown(taskInput, { key: "Enter" });
+      return (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+    }
+
+    it("prefills from .conductor/settings.toml when the project has no template, and says so", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("cp \"$CONDUCTOR_ROOT_PATH/.env\" .env\nnpm install");
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await waitFor(() => expect(textarea.value).toBe("cp \"$CONDUCTOR_ROOT_PATH/.env\" .env\nnpm install"));
+      expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalledWith("proj-1");
+      const line = screen.getByText(CONDUCTOR_LINE);
+      expect(line).toHaveAttribute("data-tour", "mission-setup-conductor");
+      expect(line.className).toContain("font-mono");
+      expect(line.className).toContain("octo-rise-in");
+      // Only a prefill: nothing was created or saved.
+      expect(mockCreate).not.toHaveBeenCalled();
+      expect(ipcModule.ipc.setProjectSetupScript).not.toHaveBeenCalled();
+    });
+
+    it("counts the lines of a script taller than the field", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue(Array(9).fill("echo ok").join("\n"));
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      await gotoSetup();
+      expect(await screen.findByText(`${CONDUCTOR_LINE} · 9 lines`)).toBeInTheDocument();
+    });
+
+    it("notes CONDUCTOR_PORT when the script reads it", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm run dev -- --port $CONDUCTOR_PORT");
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      await gotoSetup();
+      expect(await screen.findByText(`${CONDUCTOR_LINE} · CONDUCTOR_PORT isn't set in Octopush`)).toBeInTheDocument();
+    });
+
+    it("never asks when the project has a remembered template", async () => {
+      useCompanionPrefs.setState({ setupScriptByProject: { "proj-1": "npm ci" } });
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm install");
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      expect(textarea.value).toBe("npm ci");
+      expect(ipcModule.ipc.conductorSetupScript).not.toHaveBeenCalled();
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("stays empty and quiet without a Conductor script", async () => {
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await waitFor(() => expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalled());
+      expect(textarea.value).toBe("");
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("stays empty when the lookup fails", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockRejectedValue(new Error("no such command"));
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await waitFor(() => expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalled());
+      expect(textarea.value).toBe("");
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("never overwrites what the user already typed", async () => {
+      let resolve: (v: string | null) => void = () => {};
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockReturnValue(new Promise((r) => (resolve = r)));
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      fireEvent.change(textarea, { target: { value: "make setup" } });
+      // The late answer is flushed (effects and state) before the assertions.
+      await act(async () => {
+        resolve("npm install");
+      });
+      expect(textarea.value).toBe("make setup");
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("hides the line once the field no longer holds what was read, and saves the edited script as the template", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm install");
+      const onCreated = vi.fn();
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await screen.findByText(CONDUCTOR_LINE);
+      fireEvent.change(textarea, { target: { value: "npm install && make" } });
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+      fireEvent.change(textarea, { target: { value: "" } });
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+      // Back to exactly what the file says: the source is true again.
+      fireEvent.change(textarea, { target: { value: "npm install" } });
+      expect(screen.getByText(CONDUCTOR_LINE)).toBeInTheDocument();
+      fireEvent.change(textarea, { target: { value: "pnpm i" } });
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+      fireEvent.click(screen.getByText("Begin the mission"));
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(ipcModule.ipc.setProjectSetupScript).toHaveBeenCalledWith("proj-1", "pnpm i");
     });
   });
 

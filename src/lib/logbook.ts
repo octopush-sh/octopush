@@ -1,4 +1,5 @@
 import type { LogbookMissionRow } from "./types";
+import { formatUsd } from "./cost";
 
 /** Compact worked-time formatting: `45s` · `12m` · `3h 20m`. Shared by the
  *  Companion Logbook card and the Logbook Room. */
@@ -78,8 +79,8 @@ export function logbookToMarkdown(
   lines.push(`_${opts.periodLabel}_`);
   lines.push("");
   lines.push(
-    `**Total:** ${fmtHours(t.hoursSecs)} worked · $${t.costUsd.toFixed(2)} spent · ` +
-      `saved $${t.savingsUsd.toFixed(2)} across ${t.missions} mission${t.missions === 1 ? "" : "s"}`,
+    `**Total:** ${fmtHours(t.hoursSecs)} worked · ${formatUsd(t.costUsd)} spent · ` +
+      `saved ${formatUsd(t.savingsUsd)} across ${t.missions} mission${t.missions === 1 ? "" : "s"}`,
   );
   lines.push("");
   lines.push("| Mission | Intent | Worked | Spent | Saved | Runs | Messages |");
@@ -88,8 +89,8 @@ export function logbookToMarkdown(
     // Guard the pipe so a mission title can't break the table.
     const title = r.title.replace(/\|/g, "\\|");
     lines.push(
-      `| ${title} | ${r.intent} | ${fmtHours(r.hoursSecs)} | $${r.costUsd.toFixed(2)} | ` +
-        `$${r.savingsUsd.toFixed(2)} | ${r.runsCount} | ${r.messagesCount} |`,
+      `| ${title} | ${r.intent} | ${fmtHours(r.hoursSecs)} | ${formatUsd(r.costUsd)} | ` +
+        `${formatUsd(r.savingsUsd)} | ${r.runsCount} | ${r.messagesCount} |`,
     );
   }
   lines.push("");

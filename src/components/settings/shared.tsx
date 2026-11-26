@@ -3,6 +3,7 @@
 // hook. Kept in one small module so panes stay focused on their own concern.
 import { useEffect, useState } from "react";
 import { useThemeStore } from "../../stores/themeStore";
+import { formatUsd } from "../../lib/cost";
 
 // ─── Headers ──────────────────────────────────────────────────────────
 
@@ -45,24 +46,30 @@ export function ToggleRow({
   onChange,
   testId,
   disabled = false,
+  busy = false,
   title,
 }: {
   label: string;
-  description?: string;
+  /** Plain copy, or copy with inline code (e.g. an env-var chip). */
+  description?: React.ReactNode;
   checked: boolean;
   onChange: (v: boolean) => void;
   testId?: string;
   /** Not actionable right now (e.g. a Pro-only setting on Free) — dimmed,
    *  the switch ignores clicks; pair with `title` to say why. */
   disabled?: boolean;
+  /** A write is in flight: the switch ignores clicks, but the row stays at
+   *  full ink — it isn't unavailable, so it must not read as disabled. */
+  busy?: boolean;
   title?: string;
 }) {
   return (
     <label
       title={title}
       aria-disabled={disabled || undefined}
+      aria-busy={busy || undefined}
       className={`flex items-start justify-between gap-4 rounded-lg px-4 py-3 transition-opacity duration-[var(--dur-quick)] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
-        disabled ? "cursor-default opacity-55" : "cursor-pointer"
+        disabled ? "cursor-default opacity-55" : busy ? "cursor-progress" : "cursor-pointer"
       }`}
       style={{
         border: "1px solid var(--color-octo-hairline)",
@@ -83,7 +90,7 @@ export function ToggleRow({
         checked={checked}
         onChange={onChange}
         testId={testId}
-        disabled={disabled}
+        disabled={disabled || busy}
         ariaLabel={label}
         title={title}
       />
@@ -280,10 +287,18 @@ export function Row({ label, value }: { label: string; value: React.ReactNode })
   );
 }
 
+const WHOLE_USD = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 0,
+});
+
 /** A dollar figure at the page's precision: cents under $100, whole
- *  dollars from there — one rule for every Usage figure. */
+ *  dollars from there, thousands grouped ("$12,843") — one rule for every
+ *  Usage figure. */
 export function usd(n: number): string {
-  return `$${n.toFixed(n >= 100 ? 0 : 2)}`;
+  return n >= 100 ? WHOLE_USD.format(n) : formatUsd(n);
 }
 
 export function formatTokens(n: number): string {

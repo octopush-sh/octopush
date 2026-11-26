@@ -10,9 +10,12 @@ import { PipelineBuilder } from "./PipelineBuilder";
 import { RunFlow } from "./RunFlow";
 import { StageFocus } from "./StageFocus";
 import { RunControlBar } from "./RunControlBar";
+import { isPlanWaiting, pickBlockedStage } from "../lib/planWait";
+import { sendBackGate } from "../lib/reviewComments";
 import { RunLedger } from "./RunLedger";
 import { BriefModal } from "./BriefModal";
 import { FadeSwap } from "./primitives/FadeSwap";
+import { nextStages } from "../lib/gateComments";
 
 interface Props {
   active: boolean;
@@ -33,6 +36,8 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const begin = useRunsStore((s) => s.begin);
   const start = useRunsStore((s) => s.start);
   const resolve = useRunsStore((s) => s.resolve);
+  const approveWithComments = useRunsStore((s) => s.approveWithComments);
+  const resolveGate = useRunsStore((s) => s.resolveGate);
   const answerBlocker = useRunsStore((s) => s.answerBlocker);
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
@@ -54,7 +59,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
 
   const run = detail?.run;
   const stages = detail?.stages ?? [];
-  const blockedStage = stages.find((s) => s.status === "awaiting_checkpoint" || s.status === "failed") ?? null;
+  // A sibling's gate, halt or question beats a plan-limited stage: the
+  // decision shows (with the beacon) even while the plan wait is scheduled.
+  const blockedStage = pickBlockedStage(stages);
 
   // D4 — focus follows the action. When the MANUALLY selected stage transitions
   // out of "running" (→ done / failed / awaiting_checkpoint), release the pin so
@@ -115,21 +122,21 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
 
     const runningStage = stages.find((s) => s.status === "running") ?? null;
     // Law 2 — one beacon per canvas: decision CTA → running card → calm.
-    const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false });
+    const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false, planWaiting: !!run && isPlanWaiting(run) });
 
     // Loop props (unchanged logic, but computed off blockedStage)
-    let loopTargetRole: string | null = null;
-    let loopState: { iteration: number; max: number } | null = null;
     // A budget-parked stage (never started) offers no send-back — it has produced
     // nothing to send. Approve overrides the budget once; Reject re-parks.
-    const budgetParked = blockedStage !== null && blockedStage.startedAt === null && blockedStage.artifact === null;
-    if (blockedStage && !budgetParked && blockedStage.loopMode === "gated" && blockedStage.loopTargetPosition !== null && blockedStage.status === "awaiting_checkpoint") {
-      const targetStage = stages.find((s) => s.position === blockedStage.loopTargetPosition);
-      if (targetStage) {
-        loopTargetRole = labelForRole(targetStage.role);
-        loopState = { iteration: blockedStage.loopIterations, max: blockedStage.loopMaxIterations };
-      }
-    }
+    const gate = sendBackGate(blockedStage, stages);
+    const loopTargetRole: string | null = gate ? labelForRole(gate.target.role) : null;
+    const loopState: { iteration: number; max: number } | null = gate ? { iteration: gate.iteration, max: gate.max } : null;
+
+    // Where an approve with comments hands them (#957).
+    const followers = blockedStage ? nextStages(stages, blockedStage) : [];
+    const nextLabel =
+      followers.length === 0 ? null
+      : followers.length === 1 ? labelForRole(followers[0].role)
+      : `${followers.length} stages`;
 
     const doneCount = stages.filter((s) => s.status === "done").length;
     const onRunAgain = () => {
@@ -194,6 +201,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
             stages={stages}
             selectedStageId={shownStageId}
             beaconStageId={anchor?.kind === "stage" ? anchor.stageId : null}
+            runAborted={run.status === "aborted"}
             onSelectStage={(id) => selectStage(run.id, id)}
           />
         </div>
@@ -216,11 +224,32 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onPause={() => void pauseRun(run.id)}
           onStopStage={() => void stopStage(run.id)}
           onAbort={() => void abort(run.id)}
-          onApprove={() => void resolve(run.id, "approve")}
-          onReject={(fb, maxTurns) => void resolve(run.id, "reject", fb || undefined, undefined, maxTurns)}
-          onResume={(maxTurns) => void resolve(run.id, "resume", undefined, undefined, maxTurns)}
-          onDiscard={() => void resolve(run.id, "discard")}
-          onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
+          // Every decision names the stage its bar shows, so the backend never
+          // resolves another stage of the run: if that stage was decided
+          // elsewhere meanwhile, it refuses, the store toasts the refusal and
+          // the refresh shows what is waiting now. No stage shown, no decision.
+          nextStageLabel={nextLabel}
+          onApprove={(comments) => {
+            // Always through the store's gate approve: with no comments it
+            // still takes out guidance an earlier pass of this gate left on
+            // the next stage, and it clears the comments only on success.
+            if (blockedStage) void approveWithComments(run.id, blockedStage.id, Array.isArray(comments) ? comments : []);
+          }}
+          onReject={(fb, maxTurns) => {
+            if (blockedStage) void resolveGate(run.id, blockedStage.id, "reject", { feedback: fb || undefined, maxTurnsOverride: maxTurns });
+          }}
+          onResume={(maxTurns) => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "resume", { maxTurnsOverride: maxTurns });
+          }}
+          onDropCall={(maxTurns) => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "drop_call", { maxTurnsOverride: maxTurns });
+          }}
+          onDiscard={() => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "discard");
+          }}
+          onSendBack={(fb) => {
+            if (blockedStage) void resolveGate(run.id, blockedStage.id, "send_back", { feedback: fb || undefined });
+          }}
           onAnswerBlocker={(answers) => {
             if (blockedStage) void answerBlocker(run.id, blockedStage.id, answers);
           }}

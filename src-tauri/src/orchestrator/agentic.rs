@@ -87,6 +87,10 @@ pub struct AgenticResult {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// The loop's own spend at `model`'s rate, priced request by request
+    /// (`token_engine::request_cost_for`) so a request over a long-prompt
+    /// threshold pays its own tier. Excludes `peer_cost_usd`.
+    pub cost_usd: f64,
     pub tool_calls: Vec<ToolCallLog>,
     /// False when the loop exhausted `max_iterations` without a final answer.
     /// Callers must not treat an unfinished result as a successful stage.
@@ -428,7 +432,7 @@ async fn answer_ask_stage(
     .await
     {
         Ok(resp) => {
-            let cost = crate::orchestrator::cost::stage_cost(
+            let cost = crate::token_engine::request_cost_for(
                 &peer.model,
                 resp.input_tokens,
                 resp.output_tokens,
@@ -474,6 +478,8 @@ fn message_chars(m: &LlmMessage) -> usize {
             // when the guard matters most.
             if raw.is_empty() {
                 text.len() + tool_uses.iter().map(|u| u.input.to_string().len()).sum::<usize>()
+            } else if crate::providers::openai_compat::is_responses_raw(raw) {
+                crate::providers::openai_compat::responses_raw_chars(raw)
             } else {
                 raw.iter().map(|v| v.to_string().len()).sum()
             }
@@ -836,10 +842,7 @@ pub async fn run_agentic_loop(
             &mut on_retry,
         )
         .await?;
-        out.input_tokens += resp.input_tokens;
-        out.output_tokens += resp.output_tokens;
-        out.cache_read_tokens += resp.cache_read_tokens;
-        out.cache_creation_tokens += resp.cache_creation_tokens;
+        add_request_usage(&mut out, model, &resp);
         // Pace the next call if this response says the window is nearly spent.
         pending_throttle = compute_throttle(&resp);
 
@@ -951,17 +954,11 @@ pub async fn run_agentic_loop(
         // stage ends with a real summary instead of ploughing further past
         // the cap. Final answers and blocks above are never disturbed.
         if let Some(limit) = spend_limit {
-            let spent = crate::orchestrator::cost::stage_cost(
-                model,
-                out.input_tokens,
-                out.output_tokens,
-                out.cache_read_tokens,
-                out.cache_creation_tokens,
-            );
-            let spent = spent + out.peer_cost_usd;
+            let spent = out.cost_usd + out.peer_cost_usd;
             if spent >= limit {
                 emitter.notice(&format!(
-                    "run budget reached mid-stage (${spent:.2} spent by this stage) — closing with what it has"
+                    "run budget reached mid-stage ({} spent by this stage) — closing with what it has",
+                    crate::token_engine::format_usd(spent)
                 ));
                 let voided: Vec<LlmToolResult> = resp
                     .tool_uses
@@ -1172,10 +1169,7 @@ pub async fn run_agentic_loop(
         .await
         {
             Ok(resp) => {
-                out.input_tokens += resp.input_tokens;
-                out.output_tokens += resp.output_tokens;
-                out.cache_read_tokens += resp.cache_read_tokens;
-                out.cache_creation_tokens += resp.cache_creation_tokens;
+                add_request_usage(&mut out, model, &resp);
                 let text = resp.text.trim().to_string();
                 if !text.is_empty() {
                     out.text = text;
@@ -1197,6 +1191,22 @@ pub async fn run_agentic_loop(
     out.transcript = resume_point.clone();
     out.blocked_transcript = Some(BlockedTranscript { messages: resume_point, ask_tool_use_id: String::new() });
     Ok(out)
+}
+
+/// Add one provider response's usage to `out`, and its cost at `model`'s
+/// rate priced as ONE request (its own prompt size picks the tier).
+fn add_request_usage(out: &mut AgenticResult, model: &str, resp: &LlmResponse) {
+    out.input_tokens += resp.input_tokens;
+    out.output_tokens += resp.output_tokens;
+    out.cache_read_tokens += resp.cache_read_tokens;
+    out.cache_creation_tokens += resp.cache_creation_tokens;
+    out.cost_usd += crate::token_engine::request_cost_for(
+        model,
+        resp.input_tokens,
+        resp.output_tokens,
+        resp.cache_read_tokens,
+        resp.cache_creation_tokens,
+    );
 }
 
 /// The conversation plus the model's final answer as an assistant turn, so

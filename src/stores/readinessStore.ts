@@ -12,7 +12,9 @@ interface ReadinessState {
   loading: boolean;
   /** The command itself failed (not a check). */
   error: string | null;
-  check: () => Promise<void>;
+  /** `explicit`: the user asked (Check again), so `claude auth status` runs
+   *  too; the automatic pass never runs it. */
+  check: (opts?: { explicit?: boolean }) => Promise<void>;
 }
 
 export const useReadinessStore = create<ReadinessState>()((set, get) => ({
@@ -21,11 +23,11 @@ export const useReadinessStore = create<ReadinessState>()((set, get) => ({
   loading: false,
   error: null,
 
-  check: async () => {
+  check: async (opts) => {
     if (get().loading) return;
     set({ loading: true, error: null });
     try {
-      const result: unknown = await ipc.readinessCheck();
+      const result: unknown = await ipc.readinessCheck(opts?.explicit === true);
       // A backend that answers with anything but a list reports no checks
       // rather than leaving the card blank.
       const checks = Array.isArray(result) ? (result as ReadinessCheck[]) : [];

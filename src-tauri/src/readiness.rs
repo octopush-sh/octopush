@@ -1,20 +1,30 @@
 //! "Is this Mac ready for a crew?" — the Settings › General readiness card.
 //! Each check runs one local command (Ollama: a TCP connect to a loopback
 //! port; disk space: the footer's volume reading) within 3 s, in parallel,
-//! never cached and with no telemetry.
+//! never cached and with no telemetry. On an explicit Check again,
+//! `claude auth status` runs too, with up to 15 s (it may refresh the OAuth
+//! token, which must not be cut short). The Codex CLI row shows only when a
+//! saved crew or Routine has a Codex CLI stage; `codex --version` runs on
+//! every pass, `codex login status` on an explicit Check again only, and only
+//! its exit code is read.
 
-use crate::agent_adapter::{parse_claude_version, ClaudeCliVersion, TESTED_CLAUDE_FLOOR};
+use crate::agent_adapter::{
+    claude_recommended_fixes, codex_security_notice, parse_claude_version, parse_codex_version, version_below, ClaudeCliVersion, ClaudeLoginProbe,
+    RecommendedFix, CLAUDE_LOGIN_END_SINCE, CLAUDE_RECOMMENDED_FIXES, TESTED_CLAUDE_FLOOR,
+};
 use serde::Serialize;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// After a probed command exits, how long its output may still take to
-/// arrive, before and after what it left running is killed.
+/// arrive (only something that left its group can hold it open that long).
 const DRAIN_FLOOR: Duration = Duration::from_millis(250);
+/// What a probe keeps of each stream; the rest is read and dropped.
+const OUTPUT_CAP: usize = 64 * 1024;
 pub const INSTALL_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code";
 pub const UPDATE_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code@latest";
 
@@ -31,7 +41,7 @@ pub enum CheckStatus {
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadinessCheck {
-    /// `claude` | `auth` | `git` | `gh` | `disk` | `ollama`.
+    /// `claude` | `auth` | `codex` | `git` | `gh` | `disk` | `ollama`.
     pub id: String,
     pub label: String,
     pub status: CheckStatus,
@@ -42,17 +52,21 @@ pub struct ReadinessCheck {
     /// A copyable command that fixes it.
     pub command: Option<String>,
     pub timed_out: bool,
+    /// Recommendations that are no verdict, whatever the status: the Claude
+    /// Code row's missing [`crate::agent_adapter::CLAUDE_RECOMMENDED_FIXES`]
+    /// rows, oldest first. The card decides, by audience, which show.
+    pub recommended: Vec<RecommendedFix>,
 }
 
 impl ReadinessCheck {
     fn ok(id: &str, label: &str, value: impl Into<String>) -> Self {
         let (id, label, value) = (id.into(), label.into(), value.into());
-        Self { id, label, status: CheckStatus::Ok, value, fix: None, command: None, timed_out: false }
+        Self { id, label, status: CheckStatus::Ok, value, fix: None, command: None, timed_out: false, recommended: vec![] }
     }
 
     fn not_ok(id: &str, label: &str, status: CheckStatus, value: &str, fix: &str, command: Option<&str>) -> Self {
         let (id, label, value, fix) = (id.into(), label.into(), value.into(), Some(fix.into()));
-        Self { id, label, status, value, fix, command: command.map(Into::into), timed_out: false }
+        Self { id, label, status, value, fix, command: command.map(Into::into), timed_out: false, recommended: vec![] }
     }
 
     fn timed_out(id: &str, label: &str, command: &str) -> Self {
@@ -75,22 +89,74 @@ pub enum Probe {
     Exited { success: bool, output: String },
 }
 
-/// Run `cmd` within `timeout`, joining stdout and stderr. At the timeout its
-/// whole process group is killed, so whatever it spawned dies with it; so is
-/// anything it leaves running that still holds its output open after it exits.
+/// What `kill_in_flight` does at quit to a probe that is still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnQuit {
+    /// Killed at once, with its group.
+    Kill,
+    /// Given up to [`QUIT_GRACE`] to finish, then killed: a `claude mcp add`
+    /// killed after its `remove` succeeded leaves Connect unregistered.
+    Finish,
+    /// Neither killed nor waited for: it outlives the app in its own group
+    /// and finishes on its own. For `claude auth status`, which may be
+    /// refreshing the OAuth token: a kill then can sign the user out.
+    /// Its stdout and stderr go to unlinked files rather than pipes, so a
+    /// write after the app exits can't fail.
+    Leave,
+}
+
+/// How long quitting waits for an [`OnQuit::Finish`] probe.
+pub const QUIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Run `cmd` within `timeout`, joining stdout and stderr (the first
+/// [`OUTPUT_CAP`] bytes of each). Its whole process group is killed at the
+/// timeout or when it exits, so whatever it spawned dies with it unless it
+/// left the group.
 pub fn run_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
-    probe_with(cmd, timeout, true)
+    run_probe_on_quit(cmd, timeout, OnQuit::Kill)
+}
+
+/// [`run_probe`], with what quitting does to it while it runs.
+pub fn run_probe_on_quit(cmd: Option<Command>, timeout: Duration, on_quit: OnQuit) -> Probe {
+    probe_with(cmd, timeout, true, on_quit, None)
+}
+
+/// [`run_probe_on_quit`], but at the timeout its group gets SIGTERM first
+/// and up to `term_grace` to exit before the SIGKILL: for a command that may
+/// be saving something it must not lose halfway (`claude auth status`
+/// refreshing the OAuth token). Still [`Probe::TimedOut`] either way.
+pub fn run_probe_terminating(cmd: Option<Command>, timeout: Duration, term_grace: Duration, on_quit: OnQuit) -> Probe {
+    probe_with(cmd, timeout, true, on_quit, Some(term_grace))
 }
 
 /// Like [`run_probe`], but output goes to `/dev/null` and is never read.
 pub fn run_status_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
-    probe_with(cmd, timeout, false)
+    probe_with(cmd, timeout, false, OnQuit::Kill, None)
 }
 
-fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
+/// [`run_probe_terminating`] with output to `/dev/null`, never read: only
+/// the exit status counts (`codex login status`).
+pub fn run_status_probe_terminating(cmd: Option<Command>, timeout: Duration, term_grace: Duration, on_quit: OnQuit) -> Probe {
+    probe_with(cmd, timeout, false, on_quit, Some(term_grace))
+}
+
+fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: OnQuit, term_grace: Option<Duration>) -> Probe {
     let Some(mut cmd) = cmd else { return Probe::Missing };
     let io = || if capture { Stdio::piped() } else { Stdio::null() };
-    cmd.stdin(Stdio::null()).stdout(io()).stderr(io());
+    cmd.stdin(Stdio::null());
+    // An [`OnQuit::Leave`] probe outlives the app: on a pipe, a write after
+    // quit would hit a closed read end and could kill it mid-save. It writes
+    // to unlinked files instead, read once it exits.
+    let spool = match (capture && on_quit == OnQuit::Leave).then(spool_files).flatten() {
+        Some((files, [out, err])) => {
+            cmd.stdout(out).stderr(err);
+            Some(files)
+        }
+        None => {
+            cmd.stdout(io()).stderr(io());
+            None
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -99,7 +165,8 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
     let Ok(mut child) = cmd.spawn() else {
         return Probe::Missing;
     };
-    track(child.id());
+    let pid = child.id();
+    IN_FLIGHT.track(pid, on_quit);
     // Read while it runs: a reply bigger than the pipe buffer would otherwise
     // block the command until the timeout.
     let mut pipes: Vec<Pipe> = [child.stdout.take().map(Pipe::read), child.stderr.take().map(Pipe::read)]
@@ -107,65 +174,244 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
         .flatten()
         .collect();
     let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                untrack(child.id());
-                // What it printed is already in the pipes; the floor gives
-                // the readers time to take it.
-                collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
-                // A pipe still open means something it left running holds it,
-                // alive and in its group: kill the group so the pipe closes
-                // and nothing outlives the probe.
-                if pipes.iter().any(|p| p.open) {
-                    kill_group(child.id());
-                    collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
-                }
-                let output = pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect();
-                return Probe::Exited { success: status.success(), output };
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            _ => {
-                untrack(child.id());
-                kill_process_group(&mut child);
-                return Probe::TimedOut;
-            }
+    let reaped = loop {
+        match exit_status(&mut child) {
+            Exit::Running => {}
+            Exit::Unreaped => break false,
+            Exit::Reaped => break true,
         }
+        if Instant::now() >= deadline {
+            // Still running, so not reaped: the pid and group id are its own.
+            if let Some(grace) = term_grace {
+                if terminate_within(&mut child, grace) == Exit::Reaped {
+                    // Reaped and untracked by the fallback: its pid may be
+                    // another process's already, so nothing signals it.
+                    return Probe::TimedOut;
+                }
+            }
+            IN_FLIGHT.untrack(pid);
+            kill_process_group(&mut child);
+            return Probe::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    if !reaped {
+        // Not reaped yet, so its zombie still holds the pid and with it the
+        // group id: kill what it left in its group (holding its output or
+        // not) before the reap, when neither can belong to another process
+        // yet. Untracked first, so `kill_in_flight` can't signal it after the
+        // reap either. A reaped one was untracked as it was reaped, and its
+        // pid may already be another process's: nothing signals it.
+        kill_group(pid);
+        IN_FLIGHT.untrack(pid);
+    }
+    let success = child.wait().is_ok_and(|s| s.success());
+    // What it printed is already in the pipes; the floor gives the readers
+    // time to take it.
+    collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
+    let output = match spool {
+        Some(files) => files.iter().map(read_spooled).collect(),
+        None => pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect(),
+    };
+    Probe::Exited { success, output }
+}
+
+/// Two unlinked temporary files for a probe's stdout and stderr, with the
+/// handles the child gets; `None` when they can't be made (it uses pipes).
+fn spool_files() -> Option<([std::fs::File; 2], [Stdio; 2])> {
+    let (out, err) = (tempfile::tempfile().ok()?, tempfile::tempfile().ok()?);
+    let child = [Stdio::from(out.try_clone().ok()?), Stdio::from(err.try_clone().ok()?)];
+    Some(([out, err], child))
+}
+
+/// The first [`OUTPUT_CAP`] bytes a probe wrote to a spool file.
+fn read_spooled(mut file: &std::fs::File) -> String {
+    use std::io::{Seek, SeekFrom};
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(0)).is_ok() {
+        let _ = file.take(OUTPUT_CAP as u64).read_to_end(&mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// SIGTERM `child`'s group, then wait up to `grace` for it to exit. Only
+/// called while it is running (not reaped). Whatever it left in its group is
+/// SIGKILLed by the caller afterwards unless it was reaped meanwhile.
+fn terminate_within(child: &mut Child, grace: Duration) -> Exit {
+    signal_group(child.id(), TERM);
+    let until = Instant::now() + grace;
+    loop {
+        let st = exit_status(child);
+        if st != Exit::Running || Instant::now() >= until {
+            return st;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
+/// Where a probed command stands.
+#[derive(Debug, PartialEq, Eq)]
+enum Exit {
+    Running,
+    /// Exited, not reaped: its zombie still holds the pid and group id.
+    Unreaped,
+    /// Exited and reaped by the fallback, and untracked in the same step.
+    Reaped,
+}
+
+fn exit_status(child: &mut Child) -> Exit {
+    match exited_unreaped(child) {
+        Some(true) => Exit::Unreaped,
+        Some(false) => Exit::Running,
+        None => reap_untracked(&IN_FLIGHT, child),
+    }
+}
+
+/// The fallback when `waitid` can't tell: `try_wait`, which reaps. It runs
+/// under the tracker's lock and the pid is untracked before the lock is let
+/// go, so `kill_in_flight` never signals a pid that may have been reused.
+fn reap_untracked(in_flight: &InFlight, child: &mut Child) -> Exit {
+    let pid = child.id();
+    if in_flight.untrack_if(pid, || !matches!(child.try_wait(), Ok(None))) {
+        Exit::Reaped
+    } else {
+        Exit::Running
+    }
+}
+
+/// Whether `child` has exited, without reaping it; `None` when that can't be
+/// told this way.
+#[cfg(unix)]
+fn exited_unreaped(child: &Child) -> Option<bool> {
+    // `si_code` values, the same on macOS and Linux.
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    // SAFETY: a zeroed siginfo_t is valid; waitid only writes into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
+    // SAFETY: `info` is a live, writable siginfo_t; WNOWAIT leaves the child waitable.
+    let rc = unsafe { libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, flags) };
+    if rc == 0 {
+        // Still zeroed when nothing changed; macOS also reports a stopped
+        // child despite WEXITED, so only an exit counts.
+        return Some(matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED));
+    }
+    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+        return Some(false);
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn exited_unreaped(_child: &Child) -> Option<bool> {
+    None
+}
+
+/// How often a reader with nothing to read checks whether the probe returned.
+const READER_POLL: Duration = Duration::from_millis(50);
+
+/// A pipe a reader can wait on without blocking in `read`.
+trait Pollable: Read + Send + 'static {
+    /// Whether a `read` won't block, waiting up to `timeout` for it.
+    fn ready(&self, timeout: Duration) -> std::io::Result<bool>;
+}
+
+impl Pollable for std::process::ChildStdout {
+    fn ready(&self, timeout: Duration) -> std::io::Result<bool> {
+        readable(self, timeout)
+    }
+}
+
+impl Pollable for std::process::ChildStderr {
+    fn ready(&self, timeout: Duration) -> std::io::Result<bool> {
+        readable(self, timeout)
+    }
+}
+
+/// `poll` for input, end of file or an error on `fd`.
+#[cfg(unix)]
+fn readable(fd: &impl std::os::fd::AsRawFd, timeout: Duration) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: one live pollfd on this stack frame; poll only writes `revents`.
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(rc > 0)
+}
+
+#[cfg(not(unix))]
+fn readable<T>(_fd: &T, _timeout: Duration) -> std::io::Result<bool> {
+    Ok(true)
+}
+
 /// One stdout/stderr pipe, read on its own thread: chunks arrive as they are
-/// read, so whatever came before a kill is kept.
+/// read, so whatever came before a kill is kept. Only the first
+/// [`OUTPUT_CAP`] bytes are sent; the reader drains the rest so the command
+/// never blocks on a full pipe. It only reads once `poll` says that won't
+/// block, so it stops once the probe has returned even while something that
+/// left the group (`setsid`) still holds the pipe open; the reader closes its
+/// end itself, so the fd can't be reused under it.
 struct Pipe {
     rx: mpsc::Receiver<Vec<u8>>,
     bytes: Vec<u8>,
     /// False once the reader hit end of file.
     open: bool,
+    /// Dropped with the pipe: tells the reader to stop.
+    _alive: Arc<()>,
 }
 
 impl Pipe {
-    fn read(mut pipe: impl Read + Send + 'static) -> Self {
+    fn read(mut pipe: impl Pollable) -> Self {
         let (tx, rx) = mpsc::channel();
+        let alive = Arc::new(());
+        let watch = Arc::downgrade(&alive);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
-            loop {
+            let mut room = OUTPUT_CAP;
+            while watch.strong_count() > 0 {
+                match pipe.ready(READER_POLL) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
                 match pipe.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) if tx.send(buf[..n].to_vec()).is_ok() => {}
+                    Ok(n) if room > 0 => {
+                        let keep = n.min(room);
+                        if tx.send(buf[..keep].to_vec()).is_err() {
+                            break;
+                        }
+                        room -= keep;
+                    }
+                    Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    _ => break,
+                    Err(_) => break,
                 }
             }
         });
-        Self { rx, bytes: Vec::new(), open: true }
+        Self { rx, bytes: Vec::new(), open: true, _alive: alive }
     }
 }
 
-/// Take what each pipe delivers until it closes or `until` passes.
+/// Take what each pipe delivers until it closes or `until` passes; after
+/// `until`, only what has already arrived (at most [`OUTPUT_CAP`]).
 fn collect(pipes: &mut [Pipe], until: Instant) {
     for pipe in pipes {
         while pipe.open {
-            match pipe.rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            let left = until.saturating_duration_since(Instant::now());
+            let next = if left.is_zero() {
+                pipe.rx.try_recv().map_err(|e| match e {
+                    mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+                    mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+                })
+            } else {
+                pipe.rx.recv_timeout(left)
+            };
+            match next {
                 Ok(chunk) => pipe.bytes.extend(chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => pipe.open = false,
@@ -177,32 +423,157 @@ fn collect(pipes: &mut [Pipe], until: Instant) {
 /// The process groups of the probes running right now. Each has its own
 /// group, so quitting doesn't take them down: `kill_in_flight` (on
 /// `RunEvent::Exit`) does.
-static IN_FLIGHT: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static IN_FLIGHT: InFlight = InFlight::new();
 
-fn track(pid: u32) {
-    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+struct InFlight {
+    probes: Mutex<Tracked>,
+    /// Notified whenever a probe is tracked or untracked, or a [`Finishing`]
+    /// mark ends.
+    untracked: Condvar,
 }
 
-/// Called the moment the child is reaped or about to be killed, so
-/// `kill_in_flight` never signals a pid that may be handed out again.
-fn untrack(pid: u32) {
-    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).retain(|&p| p != pid);
+struct Tracked {
+    probes: Vec<(u32, OnQuit)>,
+    /// Live [`Finishing`] marks: work between probes that quitting waits for.
+    finishing: usize,
+    /// Set once `kill_all` has started.
+    quitting: bool,
 }
 
-/// SIGKILL every probe still running, with what it spawned (the app is quitting).
-pub fn kill_in_flight() {
-    for pid in std::mem::take(&mut *IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())) {
-        kill_group(pid);
+/// Held while work quitting should let finish is under way, between its
+/// probes too (`mcp_setup::connect`: after `remove`, before `add` spawns).
+/// `kill_all` waits for it within the same grace as an [`OnQuit::Finish`]
+/// probe; dropping it ends the mark.
+pub struct Finishing(&'static InFlight);
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        self.0.end_finishing();
     }
 }
+
+/// Mark work quitting should wait for (see [`Finishing`]).
+pub fn finish_before_quit() -> Finishing {
+    IN_FLIGHT.begin_finishing()
+}
+
+/// The app is quitting (`kill_in_flight` has started): start nothing new.
+pub fn quitting() -> bool {
+    IN_FLIGHT.lock().quitting
+}
+
+impl InFlight {
+    const fn new() -> Self {
+        let tracked = Tracked { probes: Vec::new(), finishing: 0, quitting: false };
+        Self { probes: Mutex::new(tracked), untracked: Condvar::new() }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Tracked> {
+        self.probes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn track(&self, pid: u32, on_quit: OnQuit) {
+        self.lock().probes.push((pid, on_quit));
+        // A quit waiting on a mark kills a new `Kill` probe at once.
+        self.untracked.notify_all();
+    }
+
+    fn begin_finishing(&'static self) -> Finishing {
+        self.lock().finishing += 1;
+        Finishing(self)
+    }
+
+    fn end_finishing(&self) {
+        let mut tracked = self.lock();
+        tracked.finishing = tracked.finishing.saturating_sub(1);
+        drop(tracked);
+        self.untracked.notify_all();
+    }
+
+    /// Called before the child is reaped. `kill_all` signals under the same
+    /// lock, so it either sees the pid while the unreaped child still holds
+    /// it, or not at all: never a pid that may have been handed out again.
+    fn untrack(&self, pid: u32) {
+        self.untrack_if(pid, || true);
+    }
+
+    /// Runs `reaped` under the lock and, when it says the child is gone,
+    /// untracks `pid` before the lock is let go.
+    fn untrack_if(&self, pid: u32, reaped: impl FnOnce() -> bool) -> bool {
+        let mut tracked = self.lock();
+        let done = reaped();
+        if done {
+            tracked.probes.retain(|&(p, _)| p != pid);
+        }
+        drop(tracked);
+        if done {
+            self.untracked.notify_all();
+        }
+        done
+    }
+
+    #[cfg(test)]
+    fn tracked(&self, pid: u32) -> Option<OnQuit> {
+        self.lock().probes.iter().find(|&&(p, _)| p == pid).map(|&(_, on_quit)| on_quit)
+    }
+
+    /// `kill` every tracked probe under the lock: an [`OnQuit::Kill`] one at
+    /// once, an [`OnQuit::Finish`] one once `grace` has passed without it
+    /// untracking itself; an [`OnQuit::Leave`] one is untracked unsignalled.
+    /// A live [`Finishing`] mark is waited for within the same `grace`,
+    /// handling each probe started meanwhile by the same rule. Waiting lets
+    /// go of the lock, so a probe that finishes can untrack.
+    fn kill_all(&self, grace: Duration, mut kill: impl FnMut(u32)) {
+        let deadline = Instant::now() + grace;
+        let mut tracked = self.lock();
+        tracked.quitting = true;
+        loop {
+            tracked.probes.retain(|&(pid, on_quit)| {
+                if on_quit == OnQuit::Kill {
+                    kill(pid);
+                }
+                on_quit == OnQuit::Finish
+            });
+            let left = deadline.saturating_duration_since(Instant::now());
+            if (tracked.probes.is_empty() && tracked.finishing == 0) || left.is_zero() {
+                break;
+            }
+            tracked = self.untracked.wait_timeout(tracked, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        for (pid, _) in tracked.probes.drain(..) {
+            kill(pid);
+        }
+    }
+}
+
+/// SIGKILL every probe still running, with what it spawned (the app is
+/// quitting); one that should finish first, and a [`Finishing`] mark, get
+/// [`QUIT_GRACE`]; an [`OnQuit::Leave`] one is left running.
+pub fn kill_in_flight() {
+    IN_FLIGHT.kill_all(QUIT_GRACE, kill_group);
+}
+
+#[cfg(unix)]
+const TERM: i32 = libc::SIGTERM;
+#[cfg(not(unix))]
+const TERM: i32 = 15;
+
+/// Send `sig` to the process group `process_group(0)` gave the child `pid`.
+#[cfg(unix)]
+fn signal_group(pid: u32, sig: i32) {
+    // SAFETY: kill(-pid, sig) only sends a signal; it touches no memory.
+    unsafe {
+        libc::kill(-(pid as i32), sig);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _sig: i32) {}
 
 /// SIGKILL the process group `process_group(0)` gave the child `pid`.
 #[cfg(unix)]
 fn kill_group(pid: u32) {
-    // SAFETY: kill(-pid, SIGKILL) only sends a signal; it touches no memory.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
+    signal_group(pid, libc::SIGKILL);
 }
 
 #[cfg(not(unix))]
@@ -227,17 +598,20 @@ pub fn claude_check(probe: Probe, floor: &str) -> ReadinessCheck {
             let version = if success { parse_claude_version(&output) } else { None };
             let info = ClaudeCliVersion::new(version, floor);
             let (unknown, old) = ("claude --version didn't print a version. Reinstalling usually fixes it.", "older releases can record wrong token usage.");
-            match info.version.as_deref() {
+            let row = match info.version.as_deref() {
                 None => not_ok(CheckStatus::Warn, "Version unknown", unknown, INSTALL_CLAUDE),
                 Some(v) if info.below_floor => {
                     let fix = format!("Update to {} or newer; {old}", info.recommended);
                     not_ok(CheckStatus::Warn, &format!("{v} · tested with {floor}"), &fix, UPDATE_CLAUDE)
                 }
-                Some(v) => match info.security_notice() {
-                    Some(note) => not_ok(CheckStatus::Warn, v, &format!("{note}."), UPDATE_CLAUDE),
-                    None => ReadinessCheck::ok(ID, LABEL, v),
+                Some(v) => match (info.security_notice(), info.known_bad_notice()) {
+                    (Some(note), _) => not_ok(CheckStatus::Warn, v, &format!("{note}."), UPDATE_CLAUDE),
+                    (None, Some(note)) => not_ok(CheckStatus::Warn, v, &format!("{note}. Update Claude Code."), UPDATE_CLAUDE),
+                    (None, None) => ReadinessCheck::ok(ID, LABEL, v),
                 },
-            }
+            };
+            let recommended = info.version.as_deref().map_or_else(Vec::new, |v| claude_recommended_fixes(v, CLAUDE_RECOMMENDED_FIXES));
+            ReadinessCheck { recommended, ..row }
         }
     }
 }
@@ -272,6 +646,76 @@ pub fn gh_check(probe: Probe) -> ReadinessCheck {
     }
 }
 
+pub const INSTALL_CODEX: &str = "npm i -g @openai/codex";
+pub const CODEX_LOGIN: &str = "codex login";
+/// Exits 0 when credentials are present; what it prints (the auth mode) is
+/// never read: it runs under [`run_status_probe_terminating`].
+pub const CODEX_LOGIN_STATUS_ARGS: [&str; 2] = ["login", "status"];
+pub const CODEX_LOGIN_STATUS: &str = "codex login status";
+/// SIGTERM before SIGKILL at the timeout, and left running at quit: like
+/// `claude auth status`, it may be refreshing a token.
+pub const CODEX_TERM_GRACE: Duration = Duration::from_secs(1);
+pub const CODEX_LOGIN_STATUS_ON_QUIT: OnQuit = OnQuit::Leave;
+
+/// Whether a stage with this substrate and model runs `codex`.
+pub fn stage_runs_codex(substrate: &str, model: &str) -> bool {
+    use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+    use crate::orchestrator::AgentSubstrate;
+    matches!(AgentSubstrate::from_db(substrate), Some(AgentSubstrate::Cli)) && dialect_for_model(model) == CliDialect::Codex
+}
+
+/// Whether a run of this pipeline, with a Routine's per-position model
+/// `overrides` (none for a plain crew), has a Codex CLI stage: its model,
+/// overridden or not, or its escalation model.
+pub fn pipeline_runs_codex(stages: &[crate::db::PipelineStageRow], overrides: &[(i64, String)]) -> bool {
+    stages.iter().any(|s| {
+        let model = overrides.iter().find(|(pos, _)| *pos == s.position).map_or(s.agent_model.as_str(), |(_, m)| m.as_str());
+        stage_runs_codex(&s.substrate, model) || s.escalate_model.as_deref().is_some_and(|m| stage_runs_codex(&s.substrate, m))
+    })
+}
+
+/// Whether the Codex CLI row shows: a saved pipeline, or a Routine with its
+/// model overrides, has a Codex CLI stage. A db error hides the row.
+pub fn wants_codex(db: &crate::db::Db) -> bool {
+    let crews = db.list_pipelines().unwrap_or_default();
+    let routines = db.list_routines().unwrap_or_default();
+    let stages = |id: &str| db.get_pipeline_stages(id).unwrap_or_default();
+    crews.iter().any(|p| pipeline_runs_codex(&stages(&p.id), &[]))
+        || routines.iter().any(|r| {
+            let overrides = crate::routines::parse_stage_overrides(r.stage_overrides.as_deref());
+            !overrides.is_empty() && pipeline_runs_codex(&stages(&r.pipeline_id), &overrides)
+        })
+}
+
+/// `codex` on the login-shell PATH (`found`), what `codex login status`
+/// said (`login`; `None` when not asked): its exit code only, and the
+/// version `codex --version` printed (`None`: unknown, which never warns).
+/// A version below the newest [`crate::agent_adapter::CODEX_SECURITY_FIXES`]
+/// row warns.
+pub fn codex_check(found: bool, login: Option<Probe>, version: Option<&str>) -> ReadinessCheck {
+    const ID: &str = "codex";
+    const LABEL: &str = "Codex CLI";
+    let warn = |value: &str, fix: &str, command| ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, value, fix, Some(command));
+    let missing = || warn("Not found", "Codex CLI stages run codex. Install it, then check again.", INSTALL_CODEX);
+    if !found {
+        return missing();
+    }
+    let state = match login {
+        None => "Found",
+        Some(Probe::Missing) => return missing(),
+        Some(Probe::TimedOut) => return ReadinessCheck::timed_out(ID, LABEL, CODEX_LOGIN_STATUS),
+        Some(Probe::Exited { success: true, .. }) => "Signed in",
+        Some(Probe::Exited { success: false, .. }) => {
+            return warn("Not signed in", "Sign Codex in so its stages don't fail mid-run.", CODEX_LOGIN)
+        }
+    };
+    let value = format!("{state} · {}", version.unwrap_or("version unknown"));
+    match version.and_then(codex_security_notice) {
+        Some(note) => warn(&value, &format!("{note}."), INSTALL_CODEX),
+        None => ReadinessCheck::ok(ID, LABEL, value),
+    }
+}
+
 pub const CLAUDE_LOGIN: &str = "claude auth login";
 
 /// `12 Dec` in the Mac's time zone.
@@ -281,19 +725,31 @@ pub fn day_label(epoch_secs: i64) -> String {
         .unwrap_or_else(|| "an unknown date".into())
 }
 
-/// An Anthropic key (settings or `ANTHROPIC_API_KEY`) → API key; otherwise
-/// CLI stages run on the `claude` login and API stages can't run. With no
-/// key, `login_expires_at` (the sign-in end a CLI stage last reported, see
-/// `claude_login`) says how long that login lasts; without one the row
-/// stays as it was (older CLIs never report it). Never contacts the network.
+/// `login_expires_at` (the sign-in end [`login_end`] picked: what
+/// `claude auth status` just reported, else what a CLI stage last reported,
+/// see `claude_login`; an API-key session clears that) means CLI stages run
+/// on a stored claude.ai sign-in, so the
+/// row says how long it lasts, key or not: the Settings key never signs
+/// Claude Code in (`cli_runner` doesn't pass it). Without one, an Anthropic
+/// key (settings or `ANTHROPIC_API_KEY`) → API key; otherwise CLI stages run
+/// on the `claude` login and API stages can't run (older CLIs never report
+/// the end).
 pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i64) -> ReadinessCheck {
+    auth_check_on(has_anthropic_key, login_expires_at, now, None)
+}
+
+/// [`auth_check`], knowing the installed CLI's version (`claude --version`;
+/// `None` when unknown). On a CLI older than [`CLAUDE_LOGIN_END_SINCE`]
+/// `claude auth status` can't report a new end, so an ended sign-in's fix
+/// says to update Claude Code too: Check again alone would keep the old date.
+pub fn auth_check_on(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i64, cli_version: Option<&str>) -> ReadinessCheck {
     use crate::claude_login::{state, LoginState};
     const ID: &str = "auth";
     const LABEL: &str = "Claude auth";
-    if has_anthropic_key {
-        return ReadinessCheck::ok(ID, LABEL, "API key");
-    }
     let Some(ends) = login_expires_at else {
+        if has_anthropic_key {
+            return ReadinessCheck::ok(ID, LABEL, "API key");
+        }
         let fix = "CLI stages use your claude login. API stages need an Anthropic key in Settings › Models.";
         return ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, "Subscription", fix, None);
     };
@@ -305,8 +761,13 @@ pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, &format!("Sign-in ends {day}"), fix, Some(CLAUDE_LOGIN))
         }
         LoginState::Ended => {
-            let fix = "CLI stages and Routines can't run on it. Sign in again; this clears after the next Claude Code stage reports the new date.";
-            ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), fix, Some(CLAUDE_LOGIN))
+            let fix = match cli_version.filter(|v| version_below(v, CLAUDE_LOGIN_END_SINCE)) {
+                Some(_) => format!(
+                    "CLI stages and Routines can't run on it. Sign in again, and update Claude Code to {CLAUDE_LOGIN_END_SINCE} or newer so Check again can read the new date."
+                ),
+                None => "CLI stages and Routines can't run on it. Sign in again, then Check again.".into(),
+            };
+            ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), &fix, Some(CLAUDE_LOGIN))
         }
     }
 }
@@ -390,8 +851,9 @@ pub fn connect_any(addrs: &[SocketAddr], timeout: Duration, mut connect: impl Fn
     })
 }
 
-/// `name` resolved on the login-shell PATH the CLI stages use.
-fn local_command(name: &str, args: &[&str]) -> Option<Command> {
+/// `name` resolved on the login-shell PATH the CLI stages use, with the
+/// login shell's environment.
+pub(crate) fn local_command(name: &str, args: &[&str]) -> Option<Command> {
     use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
     let path_env = resolved_cli_path();
     let bin = resolve_executable(name, &path_env)?;
@@ -411,14 +873,58 @@ fn enabled_ollama_addr() -> Option<String> {
     loopback_addr(&base)
 }
 
-/// Every check, in card order. Blocking: call it off the async runtime.
-/// `login_expires_at` is the stored claude.ai sign-in end (`claude_login`).
-pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
+/// The sign-in end the auth row shows: what `claude auth status` just
+/// reported; none when it said signed out (the stored end no longer
+/// applies); else the stored one (`claude_login`), else none.
+pub fn login_end(probed: ClaudeLoginProbe, stored: Option<i64>) -> Option<i64> {
+    match probed {
+        ClaudeLoginProbe::SignedIn(e) => Some(e),
+        ClaudeLoginProbe::SignedOut => None,
+        ClaudeLoginProbe::Unknown => stored,
+    }
+}
+
+/// The auth row for what `claude auth status` said (`probed`), the stored
+/// end and the installed CLI's version.
+pub fn auth_row(has_anthropic_key: bool, probed: ClaudeLoginProbe, stored: Option<i64>, now: i64, cli_version: Option<&str>) -> ReadinessCheck {
+    auth_check_on(has_anthropic_key, login_end(probed, stored), now, cli_version)
+}
+
+/// Every check, in card order, and what `claude auth status` said
+/// ([`ClaudeLoginProbe::Unknown`] when not asked) for the caller to store or
+/// clear. Blocking: call it off the async runtime. `stored_login` is the
+/// stored claude.ai sign-in end (`claude_login`). `ask_claude` runs
+/// `claude auth status` too: only on an explicit Check again, since whether
+/// it contacts the network isn't known; `codex login status` likewise.
+/// `want_codex` ([`wants_codex`]) adds the Codex CLI row.
+pub fn run_all(stored_login: Option<i64>, ask_claude: bool, want_codex: bool) -> (Vec<ReadinessCheck>, ClaudeLoginProbe) {
+    let login = ask_claude.then(|| std::thread::spawn(crate::agent_adapter::probe_claude_login));
+    let codex = want_codex.then(|| {
+        std::thread::spawn(move || {
+            // Local and offline, so it runs on every pass, beside the login probe.
+            crate::agent_adapter::forget_codex_cli_version();
+            let version = std::thread::spawn(|| run_probe(local_command("codex", &["--version"]), CHECK_TIMEOUT));
+            let cmd = local_command("codex", &CODEX_LOGIN_STATUS_ARGS);
+            let found = cmd.is_some();
+            let login = (found && ask_claude)
+                .then(|| run_status_probe_terminating(cmd, CHECK_TIMEOUT, CODEX_TERM_GRACE, CODEX_LOGIN_STATUS_ON_QUIT));
+            let version = match version.join() {
+                Ok(Probe::Exited { success: true, output }) => parse_codex_version(&output),
+                _ => None,
+            };
+            codex_check(found, login, version.as_deref())
+        })
+    });
     let claude = std::thread::spawn(|| {
         // Its answer may be newer than the session's cached version (the
         // user just updated): the launcher and the next stage probe again.
         crate::agent_adapter::forget_claude_cli_version();
-        claude_check(run_probe(local_command("claude", &["--version"]), CHECK_TIMEOUT), TESTED_CLAUDE_FLOOR)
+        let probe = run_probe(local_command("claude", &["--version"]), CHECK_TIMEOUT);
+        let version = match &probe {
+            Probe::Exited { success: true, output } => parse_claude_version(output),
+            _ => None,
+        };
+        (claude_check(probe, TESTED_CLAUDE_FLOOR), version)
     });
     let git = std::thread::spawn(|| git_check(run_probe(local_command("git", &["--version"]), CHECK_TIMEOUT)));
     let gh = std::thread::spawn(|| {
@@ -431,22 +937,29 @@ pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
     });
     let ollama = std::thread::spawn(|| enabled_ollama_addr().map(|a| ollama_check(&a, CHECK_TIMEOUT)));
 
+    let probed = login.and_then(|t| t.join().ok()).unwrap_or(ClaudeLoginProbe::Unknown);
     let lost = ReadinessCheck::failed_to_run;
+    let (claude, cli_version) = claude.join().unwrap_or_else(|_| (lost("claude", "Claude Code"), None));
     let mut checks = vec![
-        claude.join().unwrap_or_else(|_| lost("claude", "Claude Code")),
-        auth_check(
+        claude,
+        auth_row(
             crate::claude_login::has_anthropic_key(),
-            login_expires_at,
+            probed,
+            stored_login,
             chrono::Utc::now().timestamp(),
+            cli_version.as_deref(),
         ),
+    ];
+    checks.extend(codex.map(|t| t.join().unwrap_or_else(|_| lost("codex", "Codex CLI"))));
+    checks.extend([
         git.join().unwrap_or_else(|_| lost("git", "git")),
         gh.join().unwrap_or_else(|_| lost("gh", "GitHub CLI")),
-    ];
+    ]);
     checks.extend(disk_check(&crate::perf::home_disk()));
     if let Ok(Some(c)) = ollama.join() {
         checks.push(c);
     }
-    checks
+    (checks, probed)
 }
 
 #[cfg(test)]
@@ -480,17 +993,126 @@ mod tests {
     }
 
     #[test]
-    fn output_past_the_pipe_buffer_is_read_while_the_command_runs() {
-        // 200 KB on each stream: read only after exit, the command would block
-        // on a full pipe and time out.
-        let big = "head -c 200000 /dev/zero | tr '\\0' o; head -c 200000 /dev/zero | tr '\\0' e >&2";
+    fn output_past_the_pipe_buffer_is_read_while_the_command_runs_and_capped() {
+        // 2 MB on each stream: read only after exit, the command would block
+        // on a full pipe and time out; kept whole, a chatty CLI grows without bound.
+        let big = "head -c 2000000 /dev/zero | tr '\\0' o; head -c 2000000 /dev/zero | tr '\\0' e >&2";
         let started = Instant::now();
-        let Probe::Exited { success: true, output } = run_probe(sh(big), Duration::from_secs(3)) else {
+        let Probe::Exited { success: true, output } = run_probe(sh(big), Duration::from_secs(5)) else {
             panic!("a large reply must not read as a timeout");
         };
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(output.len(), 400_000);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(output.len(), 2 * OUTPUT_CAP, "the first {OUTPUT_CAP} bytes of each stream");
         assert!(output.starts_with('o') && output.ends_with('e'), "stdout first, then stderr");
+    }
+
+    /// Issue #690: a probe left running at quit (`claude auth status`) writes
+    /// to files, never to a pipe the app's exit would close under it; its
+    /// output still reads the same, stdout first and capped.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_left_at_quit_writes_to_files_not_pipes() {
+        let streams = "[ -f /dev/stdout ] && [ -f /dev/stderr ] && echo files; [ -p /dev/stdout ] && echo pipe; echo err >&2";
+        let left = run_probe_on_quit(sh(streams), Duration::from_secs(5), OnQuit::Leave);
+        assert_eq!(left, Probe::Exited { success: true, output: "files\nerr\n".into() });
+        assert_eq!(probe(streams), Probe::Exited { success: true, output: "pipe\nerr\n".into() });
+
+        let big = "head -c 200000 /dev/zero | tr '\\0' o; head -c 200000 /dev/zero | tr '\\0' e >&2";
+        let Probe::Exited { success: true, output } = run_probe_on_quit(sh(big), Duration::from_secs(5), OnQuit::Leave) else {
+            panic!("a large reply must not read as a timeout");
+        };
+        assert_eq!(output.len(), 2 * OUTPUT_CAP);
+        assert!(output.starts_with('o') && output.ends_with('e'), "stdout first, then stderr");
+    }
+
+    /// Endless output until `stop` is set.
+    struct Endless(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(0);
+            }
+            buf.fill(b'y');
+            Ok(buf.len())
+        }
+    }
+
+    impl Pollable for Endless {
+        fn ready(&self, _timeout: Duration) -> std::io::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// A pipe that says when the reader has let go of it.
+    struct Watched<P>(P, Arc<std::sync::atomic::AtomicBool>);
+
+    impl<P: Read> Read for Watched<P> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl<P: Pollable> Pollable for Watched<P> {
+        fn ready(&self, timeout: Duration) -> std::io::Result<bool> {
+            self.0.ready(timeout)
+        }
+    }
+
+    impl<P> Drop for Watched<P> {
+        fn drop(&mut self) {
+            self.1.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_stops_once_the_probe_returns_while_a_leftover_holds_the_pipe() {
+        // `sleep` holds stdout open and never writes: a blocking `read` would
+        // wait for it to exit.
+        let mut leftover = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).stdout(Stdio::piped()).spawn().unwrap();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipe::read(Watched(leftover.stdout.take().unwrap(), released.clone()));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!released.load(std::sync::atomic::Ordering::Relaxed), "still reading while the probe runs");
+        drop(pipe);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !released.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "the reader must let go of the pipe once the probe returned");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = leftover.kill();
+        let _ = leftover.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_polled_reader_still_takes_what_arrives_and_sees_the_end() {
+        let mut child = Command::new("/bin/sh").args(["-c", "sleep 0.2; echo late"]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut pipes = [Pipe::read(child.stdout.take().unwrap())];
+        collect(&mut pipes, Instant::now() + Duration::from_secs(3));
+        assert_eq!(pipes[0].bytes, b"late\n");
+        assert!(!pipes[0].open, "end of file closes it");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn collecting_an_endless_stream_keeps_the_cap_and_stops_on_time() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pipes = [Pipe::read(Endless(stop.clone()))];
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        collect(&mut pipes, started + Duration::from_millis(200));
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(took < Duration::from_secs(1), "collect must return at `until`: {took:?}");
+        assert_eq!(pipes[0].bytes.len(), OUTPUT_CAP);
+        assert!(pipes[0].open, "the stream never ended");
+        // Already past `until`: takes nothing more, at once.
+        let started = Instant::now();
+        collect(&mut pipes, started);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(pipes[0].bytes.len(), OUTPUT_CAP);
     }
 
     #[cfg(unix)]
@@ -542,32 +1164,190 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_exit_kills_what_it_left_running_even_off_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        // Output to /dev/null: nothing keeps the probe's pipe open.
+        let pidfile = dir.path().join("detached.pid");
+        let script = format!("echo hi; sleep 30 >/dev/null 2>&1 & echo $! > '{}'", pidfile.display());
+        assert_eq!(run_probe(sh(&script), Duration::from_secs(5)), Probe::Exited { success: true, output: "hi\n".into() });
+        assert_dies(read_pid(&pidfile), "a leftover off the pipe must die with its group");
+
+        // The status probe has no pipes at all.
+        let pidfile = dir.path().join("status.pid");
+        let script = format!("sleep 30 & echo $! > '{}'", pidfile.display());
+        assert_eq!(run_status_probe(sh(&script), Duration::from_secs(5)), Probe::Exited { success: true, output: String::new() });
+        assert_dies(read_pid(&pidfile), "a status probe's leftover must die with its group");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_running_probe_is_tracked_for_kill_in_flight_until_it_returns() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("probe.pid");
         let script = format!("echo $$ > '{}'; sleep 30", pidfile.display());
         let running = std::thread::spawn(move || run_probe(sh(&script), Duration::from_secs(20)));
         let pid = read_pid(&pidfile);
-        assert!(IN_FLIGHT.lock().unwrap().contains(&pid));
+        // The shell can write its pid before the probe thread tracks it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while IN_FLIGHT.tracked(pid).is_none() {
+            assert!(Instant::now() < deadline, "the running probe must be tracked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(IN_FLIGHT.tracked(pid), Some(OnQuit::Kill));
         // What `kill_in_flight` does to each one (not called here: it would
         // kill the probes of tests running alongside).
         let started = Instant::now();
         kill_group(pid);
         assert!(matches!(running.join().unwrap(), Probe::Exited { success: false, .. }));
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(!IN_FLIGHT.lock().unwrap().contains(&pid));
+        assert_eq!(IN_FLIGHT.tracked(pid), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_can_ask_to_finish_on_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("add.pid");
+        let script = format!("echo $$ > '{}'; sleep 30", pidfile.display());
+        let running = std::thread::spawn(move || run_probe_on_quit(sh(&script), Duration::from_secs(20), OnQuit::Finish));
+        let pid = read_pid(&pidfile);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while IN_FLIGHT.tracked(pid).is_none() {
+            assert!(Instant::now() < deadline, "the running probe must be tracked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(IN_FLIGHT.tracked(pid), Some(OnQuit::Finish));
+        kill_group(pid);
+        running.join().unwrap();
+        assert_eq!(IN_FLIGHT.tracked(pid), None);
+    }
+
+    // `kill_all` on a tracker of its own with made-up pids: `kill` only
+    // records, nothing is signalled.
+    #[test]
+    fn quitting_kills_at_once_but_lets_a_finishing_probe_end_first() {
+        let in_flight = InFlight::new();
+        in_flight.track(101, OnQuit::Kill);
+        in_flight.track(102, OnQuit::Finish);
+        let killed = Mutex::new(Vec::new());
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                in_flight.untrack(102);
+            });
+            in_flight.kill_all(Duration::from_secs(2), |pid| killed.lock().unwrap().push((pid, started.elapsed())));
+        });
+        let took = started.elapsed();
+        let killed = killed.into_inner().unwrap();
+        assert_eq!(killed.iter().map(|&(p, _)| p).collect::<Vec<_>>(), [101], "the finished add is never killed");
+        assert!(killed[0].1 < Duration::from_millis(100), "a plain probe is killed at once: {:?}", killed[0].1);
+        assert!(took >= Duration::from_millis(150) && took < Duration::from_secs(1), "waits only until it ends: {took:?}");
+        assert_eq!(in_flight.tracked(102), None);
+    }
+
+    #[test]
+    fn quitting_leaves_a_left_probe_running_without_waiting_for_it() {
+        let in_flight = InFlight::new();
+        in_flight.track(401, OnQuit::Leave);
+        in_flight.track(402, OnQuit::Kill);
+        let mut killed = Vec::new();
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_secs(2), |pid| killed.push(pid));
+        assert_eq!(killed, [402], "a left probe is never signalled");
+        assert!(started.elapsed() < Duration::from_millis(100), "nor waited for: {:?}", started.elapsed());
+        assert_eq!(in_flight.tracked(401), None);
+    }
+
+    #[test]
+    fn quitting_kills_a_finishing_probe_once_the_grace_runs_out() {
+        let in_flight = InFlight::new();
+        in_flight.track(201, OnQuit::Finish);
+        let mut killed = Vec::new();
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_millis(200), |pid| killed.push(pid));
+        let took = started.elapsed();
+        assert_eq!(killed, [201]);
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(in_flight.tracked(201), None);
+
+        // Nothing to wait for: no wait at all.
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_secs(2), |_| panic!("nothing is tracked"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    // A tracker of its own, leaked so a mark can borrow it for `'static`.
+    #[test]
+    fn quitting_waits_for_a_finishing_mark_between_probes() {
+        let in_flight: &'static InFlight = Box::leak(Box::new(InFlight::new()));
+        let mark = in_flight.begin_finishing();
+        assert!(!in_flight.lock().quitting);
+        let killed = Mutex::new(Vec::new());
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // The gap before `add`: nothing is tracked yet…
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(in_flight.lock().quitting, "work under the mark sees the quit");
+                // …then the add starts, and a plain probe that started meanwhile is killed.
+                in_flight.track(301, OnQuit::Finish);
+                in_flight.track(302, OnQuit::Kill);
+                std::thread::sleep(Duration::from_millis(100));
+                in_flight.untrack(301);
+                drop(mark);
+            });
+            in_flight.kill_all(Duration::from_secs(2), |pid| killed.lock().unwrap().push(pid));
+        });
+        let took = started.elapsed();
+        assert_eq!(killed.into_inner().unwrap(), [302]);
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(1), "waits until the mark ends: {took:?}");
+        assert_eq!(in_flight.lock().finishing, 0);
+
+        // A mark that outlasts the grace doesn't hold the quit.
+        let _stuck = in_flight.begin_finishing();
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_millis(200), |_| panic!("nothing is tracked"));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(1), "{took:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_fallback_reports_a_reaped_child_and_untracks_it_as_it_reaps() {
+        let in_flight = InFlight::new();
+        let mut done = Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        in_flight.track(done.id(), OnQuit::Kill);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            match reap_untracked(&in_flight, &mut done) {
+                Exit::Running => assert!(Instant::now() < deadline, "the shell must exit"),
+                other => break other,
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Reaped: the caller must not signal its group, and quitting can't either.
+        assert_eq!(status, Exit::Reaped);
+        assert_eq!(in_flight.tracked(done.id()), None);
+
+        let mut running = Command::new("/bin/sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        in_flight.track(running.id(), OnQuit::Kill);
+        assert_eq!(reap_untracked(&in_flight, &mut running), Exit::Running);
+        assert_eq!(in_flight.tracked(running.id()), Some(OnQuit::Kill), "still running: still tracked");
+        let _ = running.kill();
+        let _ = running.wait();
     }
 
     #[test]
     fn claude_found_missing_old_timeout_and_broken() {
-        let ok = claude_check(probe("echo '2.1.319 (Claude Code)'"), "2.1.314");
-        assert_eq!((ok.status, ok.value.as_str(), ok.fix.as_deref()), (CheckStatus::Ok, "2.1.319", None));
+        let ok = claude_check(probe("echo '2.1.325 (Claude Code)'"), "2.1.314");
+        assert_eq!((ok.status, ok.value.as_str(), ok.fix.as_deref()), (CheckStatus::Ok, "2.1.325", None));
         // At the floor but without a security fix: amber, never blocked.
-        let unsafe_cli = claude_check(probe("echo '2.1.316 (Claude Code)'"), "2.1.314");
-        assert_eq!((unsafe_cli.status, unsafe_cli.value.as_str()), (CheckStatus::Warn, "2.1.316"));
+        let unsafe_cli = claude_check(probe("echo '2.1.319 (Claude Code)'"), "2.1.314");
+        assert_eq!((unsafe_cli.status, unsafe_cli.value.as_str()), (CheckStatus::Warn, "2.1.319"));
         assert_eq!(
             unsafe_cli.fix.as_deref(),
-            Some("Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree.")
+            Some("Update Claude Code: 2.1.325 fixes the Bash sandbox not fully protecting a worktree's settings, hooks and shared git folder.")
         );
         assert_eq!(unsafe_cli.command.as_deref(), Some(UPDATE_CLAUDE));
         let missing = claude_check(Probe::Missing, "2.1.314");
@@ -575,12 +1355,55 @@ mod tests {
         let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");
         assert_eq!((old.status, old.value.as_str()), (CheckStatus::Warn, "2.1.307 · tested with 2.1.314"));
         assert_eq!(old.command.as_deref(), Some(UPDATE_CLAUDE));
-        // 2.1.314 itself lacks the 2.1.319 fix: recommend the fix.
-        assert_eq!(old.fix.as_deref(), Some("Update to 2.1.319 or newer; older releases can record wrong token usage."));
+        // 2.1.314 itself lacks the 2.1.325 fix: recommend the fix.
+        assert_eq!(old.fix.as_deref(), Some("Update to 2.1.325 or newer; older releases can record wrong token usage."));
         let hung = claude_check(run_probe(sh("sleep 5"), Duration::from_millis(100)), "2.1.314");
         assert_eq!((hung.status, hung.timed_out), (CheckStatus::Warn, true));
         let broken = claude_check(probe("echo 2.1.316; exit 1"), "2.1.314");
         assert_eq!((broken.status, broken.value.as_str()), (CheckStatus::Warn, "Version unknown"));
+    }
+
+    #[test]
+    fn claude_check_names_a_known_bad_release_exactly() {
+        let bad = claude_check(probe("echo '2.1.329 (Claude Code)'"), "2.1.314");
+        assert_eq!((bad.status, bad.value.as_str()), (CheckStatus::Warn, "2.1.329"));
+        assert_eq!(
+            bad.fix.as_deref(),
+            Some(
+                "Claude Code 2.1.329 drops the retry gateway models need when a max_tokens error names a lower \
+                 limit; 2.1.330 restores it. Update Claude Code."
+            )
+        );
+        assert_eq!(bad.command.as_deref(), Some(UPDATE_CLAUDE));
+        for v in ["2.1.328", "2.1.330"] {
+            let ok = claude_check(probe(&format!("echo '{v} (Claude Code)'")), "2.1.314");
+            assert_eq!((ok.status, ok.fix), (CheckStatus::Ok, None), "{v}: only the exact release warns");
+        }
+    }
+
+    #[test]
+    fn claude_row_recommends_the_worktree_exit_fix_without_a_verdict() {
+        // #1002: a recommendation, not a security fix: the status stays as it was.
+        // #1065: every missing row, oldest first, not only the newest.
+        // A fn, not a closure: a closure can't tie its return's lifetime to its argument.
+        fn versions(c: &ReadinessCheck) -> Vec<&str> {
+            c.recommended.iter().map(|f| f.version.as_str()).collect()
+        }
+        let ok = claude_check(probe("echo '2.1.325 (Claude Code)'"), "2.1.314");
+        assert_eq!((ok.status, ok.fix.as_deref()), (CheckStatus::Ok, None));
+        assert_eq!(versions(&ok), ["2.1.330", "2.1.330", "2.1.331", "2.1.332"]);
+        assert!(ok.recommended[0].reason.contains("ExitWorktree"), "{:?}", ok.recommended);
+        let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");
+        assert_eq!((old.status, versions(&old).len()), (CheckStatus::Warn, 4));
+        let one_short = claude_check(probe("echo '2.1.331 (Claude Code)'"), "2.1.314");
+        assert_eq!((one_short.status, versions(&one_short)), (CheckStatus::Ok, vec!["2.1.332"]));
+        for current in ["2.1.332", "2.2.0"] {
+            let row = claude_check(probe(&format!("echo '{current} (Claude Code)'")), "2.1.314");
+            assert_eq!((row.status, row.recommended), (CheckStatus::Ok, vec![]), "{current}");
+        }
+        assert_eq!(claude_check(Probe::Missing, "2.1.314").recommended, vec![]);
+        assert_eq!(claude_check(probe("echo 2.1.316; exit 1"), "2.1.314").recommended, vec![], "an unknown version never recommends");
+        assert_eq!(git_check(probe("echo 'git version 2.39.3'")).recommended, vec![]);
     }
 
     #[test]
@@ -607,12 +1430,136 @@ mod tests {
         assert_eq!((hung.timed_out, hung.command.as_deref()), (true, Some(GH_PROBE)));
     }
 
+    fn stage(position: i64, substrate: &str, model: &str, escalate: Option<&str>) -> crate::db::PipelineStageRow {
+        crate::db::PipelineStageRow {
+            id: format!("s{position}"),
+            pipeline_id: "p".into(),
+            position,
+            role: "implement".into(),
+            agent_model: model.into(),
+            substrate: substrate.into(),
+            checkpoint: false,
+            loop_target_position: None,
+            loop_max_iterations: 0,
+            loop_mode: None,
+            max_iterations: 25,
+            pos_x: None,
+            pos_y: None,
+            parents: vec![],
+            tools: None,
+            custom_name: None,
+            instructions: None,
+            effort: None,
+            escalate_model: escalate.map(Into::into),
+            escalate_effort: None,
+        }
+    }
+
+    #[test]
+    fn the_codex_row_shows_only_for_a_codex_cli_stage() {
+        assert!(stage_runs_codex("cli", "gpt-6.1-terra"));
+        assert!(stage_runs_codex("cli", "gpt-5-codex"));
+        assert!(!stage_runs_codex("cli", "sonnet"), "a Claude Code stage");
+        assert!(!stage_runs_codex("api", "gpt-6.1-terra"), "an API stage never runs codex");
+
+        let claude = [stage(0, "cli", "sonnet", None), stage(1, "api", "gpt-6.1-terra", None)];
+        assert!(!pipeline_runs_codex(&claude, &[]));
+        let codex = [stage(0, "api", "claude-haiku-4-5", None), stage(1, "cli", "gpt-6.1-terra", None)];
+        assert!(pipeline_runs_codex(&codex, &[]));
+        // A stage escalating to a Codex model runs codex on the retry.
+        assert!(pipeline_runs_codex(&[stage(0, "cli", "sonnet", Some("gpt-6.1-terra"))], &[]));
+
+        // A Routine's override puts a CLI stage on Codex, or takes it off.
+        let over = |pos: i64, m: &str| vec![(pos, m.to_string())];
+        assert!(pipeline_runs_codex(&claude, &over(0, "gpt-6.1-terra")));
+        assert!(!pipeline_runs_codex(&claude, &over(1, "gpt-5.5")), "position 1 is an API stage");
+        assert!(!pipeline_runs_codex(&codex, &over(1, "sonnet")));
+        assert!(pipeline_runs_codex(&codex, &over(7, "sonnet")), "an override for no stage changes nothing");
+    }
+
+    #[test]
+    fn a_saved_codex_crew_adds_the_codex_row() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        assert!(!wants_codex(&db), "no built-in crew runs codex");
+        let draft = |substrate: &str, model: &str| crate::db::StageDraft {
+            role: "plan".into(), agent_model: model.into(), substrate: substrate.into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None, escalate_model: None, escalate_effort: None,
+        };
+        db.save_pipeline(None, "API only", "d", &[draft("api", "gpt-6.1-terra")]).unwrap();
+        assert!(!wants_codex(&db));
+        db.save_pipeline(None, "Codex build", "d", &[draft("cli", "gpt-6.1-terra")]).unwrap();
+        assert!(wants_codex(&db));
+    }
+
+    #[test]
+    fn codex_found_signed_in_signed_out_missing_and_timeout() {
+        // The automatic pass never asks: found is all it knows.
+        let found = codex_check(true, None, Some("0.170.0"));
+        assert_eq!((found.id.as_str(), found.label.as_str()), ("codex", "Codex CLI"));
+        assert_eq!((found.status, found.value.as_str(), found.fix), (CheckStatus::Ok, "Found · 0.170.0", None));
+
+        let missing = codex_check(false, None, None);
+        assert_eq!((missing.status, missing.value.as_str()), (CheckStatus::Warn, "Not found"));
+        assert_eq!(missing.command.as_deref(), Some(INSTALL_CODEX));
+        assert_eq!(INSTALL_CODEX, "npm i -g @openai/codex");
+
+        // Only the exit code counts; what it prints is never read.
+        let ask = |script: &str| run_status_probe_terminating(sh(script), CHECK_TIMEOUT, CODEX_TERM_GRACE, OnQuit::Kill);
+        let printed = ask("echo 'Logged in using ChatGPT'; exit 0");
+        assert_eq!(printed, Probe::Exited { success: true, output: String::new() });
+        let signed_in = codex_check(true, Some(printed), Some("0.171.0"));
+        assert_eq!((signed_in.status, signed_in.value.as_str(), signed_in.command), (CheckStatus::Ok, "Signed in · 0.171.0", None));
+
+        // Signing in comes before the version.
+        let signed_out = codex_check(true, Some(ask("echo 'Not logged in' >&2; exit 1")), Some("0.169.0"));
+        assert_eq!((signed_out.status, signed_out.value.as_str()), (CheckStatus::Warn, "Not signed in"));
+        assert_eq!(signed_out.command.as_deref(), Some(CODEX_LOGIN));
+
+        let hung = codex_check(true, Some(run_status_probe_terminating(sh("sleep 5"), Duration::from_millis(100), Duration::from_millis(100), OnQuit::Kill)), None);
+        assert_eq!((hung.status, hung.timed_out, hung.command.as_deref()), (CheckStatus::Warn, true, Some(CODEX_LOGIN_STATUS)));
+        assert_eq!(codex_check(true, Some(Probe::Missing), Some("0.170.0")).command.as_deref(), Some(INSTALL_CODEX));
+
+        assert_eq!(CODEX_LOGIN_STATUS, format!("codex {}", CODEX_LOGIN_STATUS_ARGS.join(" ")));
+        assert_eq!(CODEX_LOGIN_STATUS_ON_QUIT, OnQuit::Leave, "quitting must not cut a token refresh short");
+    }
+
+    #[test]
+    fn codex_below_the_sandbox_fix_warns_and_an_unknown_version_never_does() {
+        let old = codex_check(true, Some(Probe::Exited { success: true, output: String::new() }), Some("0.169.0"));
+        assert_eq!((old.status, old.value.as_str()), (CheckStatus::Warn, "Signed in · 0.169.0"));
+        assert_eq!(
+            old.fix.as_deref(),
+            Some("Update Codex: 0.170.0 fixes permission updates and child threads losing sandbox restrictions.")
+        );
+        assert_eq!(old.command.as_deref(), Some(INSTALL_CODEX));
+        // The automatic pass (no login probe) warns too.
+        assert_eq!(codex_check(true, None, Some("0.169.0")).status, CheckStatus::Warn);
+
+        let at_fix = codex_check(true, None, Some("0.170.0"));
+        assert_eq!((at_fix.status, at_fix.fix), (CheckStatus::Ok, None));
+
+        let unknown = codex_check(true, Some(Probe::Exited { success: true, output: String::new() }), None);
+        assert_eq!((unknown.status, unknown.value.as_str(), unknown.fix), (CheckStatus::Ok, "Signed in · version unknown", None));
+        assert_eq!(codex_check(true, None, None).value, "Found · version unknown");
+    }
+
     #[test]
     fn auth_mode_and_a_check_that_failed_to_run() {
         let now = 1_800_000_000;
         assert_eq!(auth_check(true, None, now).value, "API key");
-        // A key wins over a stored login, even an ended one.
-        assert_eq!(auth_check(true, Some(now - 1), now).status, CheckStatus::Ok);
+        // The key never signs Claude Code in: a stored sign-in end still shows.
+        let soon = now + 3 * 86_400;
+        let both = auth_check(true, Some(soon), now);
+        assert_eq!((both.status, both.value.clone()), (CheckStatus::Warn, format!("Sign-in ends {}", day_label(soon))));
+        assert_eq!(both.command.as_deref(), Some(CLAUDE_LOGIN));
+        assert_eq!(auth_check(true, Some(now - 1), now).status, CheckStatus::Fail);
+        let far = now + 30 * 86_400;
+        assert_eq!(auth_check(true, Some(far), now).value, format!("Signed in · until {}", day_label(far)));
         let sub = auth_check(false, None, now);
         assert_eq!((sub.status, sub.value.as_str(), sub.command), (CheckStatus::Warn, "Subscription", None));
 
@@ -641,13 +1588,125 @@ mod tests {
         let ended = auth_check(false, Some(gone), now);
         assert_eq!((ended.status, ended.value.clone()), (CheckStatus::Fail, format!("Sign-in ended {}", day_label(gone))));
         assert_eq!(ended.command.as_deref(), Some(CLAUDE_LOGIN));
-        // Check again only re-reads the stored date; it clears on the next report.
-        assert!(ended.fix.as_deref().is_some_and(|f| f.contains("clears after the next Claude Code stage") && !f.contains("check again")));
+        // Check again asks `claude auth status`, so it clears right after signing in.
+        assert_eq!(ended.fix.as_deref(), Some("CLI stages and Routines can't run on it. Sign in again, then Check again."));
 
         // `%-d %b`: a day number and a month, no leading zero.
         let label = day_label(far);
         let (d, m) = label.split_once(' ').unwrap();
         assert!(d.parse::<u32>().is_ok_and(|n| (1..=31).contains(&n)) && !d.starts_with('0') && m.len() == 3, "{label}");
+    }
+
+    #[test]
+    fn the_probed_sign_in_end_wins_over_the_stored_one() {
+        use ClaudeLoginProbe::*;
+        let now = 1_800_000_000;
+        let (stored, probed) = (now - 86_400, now + 30 * 86_400);
+        assert_eq!(login_end(SignedIn(probed), Some(stored)), Some(probed));
+        assert_eq!(login_end(Unknown, Some(stored)), Some(stored), "a failed probe or no field: the stored end");
+        assert_eq!(login_end(SignedIn(probed), None), Some(probed), "a fresh install, before any stage ran");
+        assert_eq!(login_end(Unknown, None), None);
+        // Signed out: the stored end no longer applies.
+        assert_eq!(login_end(SignedOut, Some(stored)), None);
+        assert_eq!(login_end(SignedOut, None), None);
+        // Signed in again: the row turns from rouge to verdigris on Check again.
+        assert_eq!(auth_check(false, login_end(Unknown, Some(stored)), now).status, CheckStatus::Fail);
+        assert_eq!(auth_check(false, login_end(SignedIn(probed), Some(stored)), now).status, CheckStatus::Ok);
+    }
+
+    /// The whole Check again path for a stored end that has passed:
+    /// `claude auth status --json` output → row → what is stored.
+    #[test]
+    fn check_again_signed_out_clears_the_stored_end_and_its_row() {
+        use crate::agent_adapter::parse_claude_auth_status;
+        use crate::claude_login::{apply_probe, load, record};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let now = 1_800_000_000;
+        let gone = now - 86_400;
+        record(&db, gone, "2026-11-01T00:00:00Z").unwrap();
+        let stored = load(&db).unwrap().map(|l| l.expires_at);
+
+        // Signed out: no "Sign-in ended" row from the stale date, the
+        // no-sign-in row instead (key or not), and the date is cleared with
+        // an event so the notes hide.
+        let out = parse_claude_auth_status(r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#);
+        assert_eq!(out, ClaudeLoginProbe::SignedOut);
+        let row = auth_row(false, out, stored, now, Some("2.1.319"));
+        assert_eq!((row.status, row.value.as_str()), (CheckStatus::Warn, "Subscription"));
+        assert_eq!(auth_row(true, out, stored, now, Some("2.1.319")).value, "API key");
+        assert_eq!(apply_probe(&db, out, "2026-11-09T00:00:00Z").unwrap(), Some(None));
+        assert_eq!(load(&db).unwrap(), None);
+        // Nothing stored: nothing to clear, no event.
+        assert_eq!(apply_probe(&db, out, "2026-11-09T00:00:00Z").unwrap(), None);
+
+        // Unknown (timed out, an older CLI): the stored end and its row stay.
+        record(&db, gone, "2026-11-01T00:00:00Z").unwrap();
+        let older = parse_claude_auth_status(r#"{"loggedIn":true,"authMethod":"claude.ai"}"#);
+        assert_eq!(older, ClaudeLoginProbe::Unknown);
+        assert_eq!(auth_row(false, older, Some(gone), now, Some("2.1.319")).status, CheckStatus::Fail);
+        assert_eq!(apply_probe(&db, older, "2026-11-09T00:00:00Z").unwrap(), None);
+        assert_eq!(load(&db).unwrap().map(|l| l.expires_at), Some(gone));
+
+        // Signed in again with a new date: stored, row verdigris.
+        let far = now + 30 * 86_400;
+        let back = ClaudeLoginProbe::SignedIn(far);
+        assert_eq!(auth_row(false, back, Some(gone), now, Some("2.1.319")).status, CheckStatus::Ok);
+        assert_eq!(apply_probe(&db, back, "2026-11-09T00:00:00Z").unwrap(), Some(Some(far)));
+        assert_eq!(load(&db).unwrap().map(|l| l.expires_at), Some(far));
+    }
+
+    #[test]
+    fn an_ended_sign_in_on_an_older_cli_says_to_update_claude_code() {
+        let now = 1_800_000_000;
+        let gone = Some(now - 86_400);
+        let old = auth_check_on(false, gone, now, Some("2.1.317"));
+        assert_eq!((old.status, old.command.as_deref()), (CheckStatus::Fail, Some(CLAUDE_LOGIN)));
+        assert_eq!(
+            old.fix.as_deref(),
+            Some("CLI stages and Routines can't run on it. Sign in again, and update Claude Code to 2.1.318 or newer so Check again can read the new date.")
+        );
+        let fresh = "CLI stages and Routines can't run on it. Sign in again, then Check again.";
+        for v in [Some("2.1.318"), Some("2.1.319"), None, Some("not a version")] {
+            assert_eq!(auth_check_on(false, gone, now, v).fix.as_deref(), Some(fresh), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn claude_auth_status_asks_for_json_with_room_to_refresh() {
+        use crate::agent_adapter::{CLAUDE_AUTH_STATUS_ARGS, CLAUDE_AUTH_STATUS_ON_QUIT, CLAUDE_AUTH_STATUS_TIMEOUT};
+        assert_eq!(CLAUDE_AUTH_STATUS_ARGS, ["auth", "status", "--json"]);
+        assert_eq!(CLAUDE_AUTH_STATUS_ON_QUIT, OnQuit::Leave, "quitting must not cut a token refresh short");
+        assert!(CLAUDE_AUTH_STATUS_TIMEOUT >= Duration::from_secs(15) && CLAUDE_AUTH_STATUS_TIMEOUT > CHECK_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminating_probe_gets_sigterm_before_sigkill() {
+        let dir = tempfile::tempdir().unwrap();
+        // It saves what it was writing on SIGTERM.
+        let saved = dir.path().join("saved");
+        let script = format!("trap 'echo saved > \"{}\"; exit 0' TERM; while :; do sleep 0.05; done", saved.display());
+        let r = run_probe_terminating(sh(&script), Duration::from_millis(300), Duration::from_secs(3), OnQuit::Finish);
+        assert_eq!(r, Probe::TimedOut);
+        assert_eq!(std::fs::read_to_string(&saved).unwrap_or_default().trim(), "saved", "SIGTERM came first");
+
+        // The plain probe is unchanged: straight to SIGKILL, no SIGTERM.
+        let plain = dir.path().join("plain");
+        let script = format!("trap 'echo saved > \"{}\"; exit 0' TERM; while :; do sleep 0.05; done", plain.display());
+        assert_eq!(run_probe(sh(&script), Duration::from_millis(300)), Probe::TimedOut);
+        assert!(!plain.exists(), "run_probe must not send SIGTERM");
+
+        // One that ignores SIGTERM is SIGKILLed once the grace has passed.
+        let pidfile = dir.path().join("stubborn.pid");
+        let script = format!("trap '' TERM; echo $$ > '{}'; while :; do sleep 0.05; done", pidfile.display());
+        let started = Instant::now();
+        let grace = Duration::from_millis(500);
+        let r = run_probe_terminating(sh(&script), Duration::from_millis(300), grace, OnQuit::Finish);
+        let took = started.elapsed();
+        assert_eq!(r, Probe::TimedOut);
+        assert!(took >= Duration::from_millis(800) && took < Duration::from_secs(3), "{took:?}");
+        assert_dies(read_pid(&pidfile), "SIGKILL after the grace");
     }
 
     #[test]

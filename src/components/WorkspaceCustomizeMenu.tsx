@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { TINTS, TINT_NAMES } from "../lib/monogram";
+import { TINTS, TINT_NAMES, normalizeGlyph } from "../lib/monogram";
 import type { TintName } from "../lib/types";
 
 interface Props {
@@ -37,7 +37,9 @@ export function WorkspaceCustomizeMenu({
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    const normalized = glyph.trim().charAt(0) || defaultGlyph;
+    // The same normalization the rail and ⌘K render through, so what is saved
+    // is exactly what shows (an unusable glyph such as ß saves as the default).
+    const normalized = normalizeGlyph(glyph) ?? defaultGlyph;
     const glyphOut = normalized === defaultGlyph ? null : normalized;
     const tintOut = tint === "brass" && initialTint === null ? null : tint;
     onSubmit(glyphOut, tintOut);

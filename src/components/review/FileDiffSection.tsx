@@ -2,11 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { HunkRail } from "./HunkRail";
 import { DiffLines } from "./DiffLines";
+import { HunkCommentComposer, HunkCommentList } from "./HunkComments";
 import { MidTruncate } from "../primitives/MidTruncate";
 import { useReviewPrefs } from "../../stores/reviewPrefsStore";
 import { ipc } from "../../lib/ipc";
 import { diffGrammarReady, highlightFile, loadDiffGrammar } from "../../lib/diffSyntax";
-import type { DiffFile } from "../../lib/diffParser";
+import { hunkFingerprint, type DiffFile } from "../../lib/diffParser";
+import { commentLocation, type CommentDraft, type ReviewComment } from "../../lib/reviewComments";
 
 /** Larger files are highlighted hunk by hunk, without the rest of the file. */
 const MAX_CONTEXT_BYTES = 1_000_000;
@@ -21,11 +23,26 @@ interface Props {
   collapsed: boolean;
   /** This file changed after it was marked viewed (cleared on re-mark). */
   changedSinceViewed?: boolean;
+  /** Committed changes (#851): the hunk rails carry no Accept / Reject. */
+  readOnly?: boolean;
   onAccept: (hunkIdx: number) => void;
   onReject: (hunkIdx: number) => void;
   onWhy: (hunkIdx: number) => void;
   onToggleViewed: () => void;
   onToggleCollapsed: () => void;
+  /** Review comments (#956), working tree only. The draft comment open on
+   *  this file (its hunk, rows and note); this file's comments, shown under
+   *  their hunk. */
+  draft?: CommentDraft | null;
+  comments?: ReviewComment[];
+  /** Open a draft on a hunk, or on one of its rows (`extend` = shift-click). */
+  onStartComment?: (hunkIdx: number, rowIdx?: number, extend?: boolean) => void;
+  onDraftNote?: (note: string) => void;
+  /** The draft's keyboard line picking: move its line, or extend its range. */
+  onMovePick?: (dir: -1 | 1, extend: boolean) => void;
+  onSubmitComment?: () => void;
+  onCancelComment?: () => void;
+  onRemoveComment?: (id: string) => void;
 }
 
 export function FileDiffSection({
@@ -35,11 +52,20 @@ export function FileDiffSection({
   viewed,
   collapsed,
   changedSinceViewed = false,
+  readOnly = false,
   onAccept,
   onReject,
   onWhy,
   onToggleViewed,
   onToggleCollapsed,
+  draft = null,
+  comments = [],
+  onStartComment,
+  onDraftNote,
+  onMovePick,
+  onSubmitComment,
+  onCancelComment,
+  onRemoveComment,
 }: Props) {
   const mode = useReviewPrefs((s) => s.readingMode);
 
@@ -96,7 +122,10 @@ export function FileDiffSection({
       {/* ── File header row ─────────────────────────────────────────── */}
       {/* The path is the only elastic item (middle-truncated, tail pinned);
           every other atom is flex-none + nowrap, and the hunk count is the
-          first to go when the column narrows (`.octo-filehead`, styles.css). */}
+          first to go when the column narrows (`.octo-filehead`, styles.css).
+          Its cell is `flex-1 min-w-0`, so the box elides into a DEFINITE
+          width (design-system E1): a cell sized from its own text left
+          WebKit cutting the path's head with no ellipsis (#868). */}
       <div className="octo-filehead flex items-center gap-2 border-b border-octo-hairline pb-1.5">
         <span
           className={`flex-none whitespace-nowrap font-mono text-[9px] font-semibold uppercase tracking-[0.2em] ${typeColor}`}
@@ -106,7 +135,7 @@ export function FileDiffSection({
         <span className="flex-none text-octo-hairline">·</span>
         <span
           title={file.filePath}
-          className="flex min-w-0 font-mono text-[12.5px] text-octo-ivory"
+          className="flex min-w-0 flex-1 font-mono text-[12.5px] text-octo-ivory"
         >
           <MidTruncate text={file.filePath} tail={pathTail(file.filePath)} />
         </span>
@@ -168,11 +197,37 @@ export function FileDiffSection({
                 deletions={hunk.deletions}
                 focused={focusedHunk === i}
                 staged={false}
+                readOnly={readOnly}
                 onAccept={() => onAccept(i)}
                 onReject={() => onReject(i)}
                 onWhy={() => onWhy(i)}
+                onComment={onStartComment && (() => onStartComment(i))}
               />
-              <DiffLines rows={hunk.rows} filePath={file.filePath} mode={mode} tokens={tokens[i]} />
+              <DiffLines
+                rows={hunk.rows}
+                filePath={file.filePath}
+                mode={mode}
+                tokens={tokens[i]}
+                selected={draft?.hunkIdx === i ? draft.rows : undefined}
+                onRowClick={onStartComment && ((r, extend) => onStartComment(i, r, extend))}
+              />
+              {onRemoveComment && (
+                <HunkCommentList
+                  comments={comments.filter((c) => c.fingerprint === hunkFingerprint(hunk))}
+                  onRemove={onRemoveComment}
+                />
+              )}
+              {draft?.hunkIdx === i && onDraftNote && onSubmitComment && onCancelComment && (
+                <HunkCommentComposer
+                  location={commentLocation(draft.anchor)}
+                  note={draft.note}
+                  stale={draft.stale}
+                  onNoteChange={onDraftNote}
+                  onSubmit={onSubmitComment}
+                  onCancel={onCancelComment}
+                  onMovePick={onMovePick}
+                />
+              )}
             </div>
           ))}
         </div>

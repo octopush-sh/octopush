@@ -1,0 +1,26 @@
+{
+  "items": [
+    {
+      "kind": "role",
+      "item_id": "fixture-role",
+      "updated_at": "2026-11-02T12:00:00+00:00",
+      "deleted": false,
+      "data": {
+        "key": "fixture-role",
+        "label": "Fixture role, edited",
+        "description": "A custom role used only by tests",
+        "promptBody": "Do the fixture thing, again.",
+        "artifactKind": "note",
+        "environment": "worktree",
+        "canLoop": false,
+        "defaultTools": ["read_file"],
+        "defaultSubstrate": "api",
+        "defaultCheckpoint": false,
+        "tokenEstIn": 1000,
+        "tokenEstOut": 500,
+        "isBuiltin": false
+      }
+    }
+  ],
+  "next_since": "2026-11-17T09:55:00.000Z"
+}

@@ -18,6 +18,7 @@
 //! | `SKILL.md` / `.claude/agents/*.md` frontmatter (incl. `effort:`) | `skills`, `skills::agents` |
 //! | `claude mcp add octopush …` argv | `mcp_setup` |
 //! | `Notification` / `Stop` hook stdin payloads | `agent_adapter::parse_hook_event`, `claude_hooks::record_hook` |
+//! | `claude auth status --json` (`loggedIn`, `loginExpiresAt`) | `agent_adapter::parse_claude_auth_status` |
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -25,11 +26,12 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
-    build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event, parse_cli_result,
-    plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth, CliDialect, ReadEnd,
-    ReadLimits,
+    apply_stage_env, build_cli_args, build_cli_args_resume, context_window_env, is_builtin_claude_model, DISABLE_1M_CONTEXT_ENV,
+    MAX_CONTEXT_TOKENS_ENV, SIMPLE_SYSTEM_PROMPT_ENV, system_prompt_env, cli_auth_from_init, is_result_event,
+    parse_cli_result, plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth,
+    CliDialect, CodexWriteScope, OpenTools, ReadEnd, ReadLimits, QUIET_TRAFFIC_ENV,
 };
-use crate::orchestrator::live::{entries_from_stream_event, RetryThrottle};
+use crate::orchestrator::live::{api_retry_delay, entries_from_stream_event, RetryThrottle};
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
 
 // ─── Fixture helpers ──────────────────────────────────────────────────────
@@ -85,14 +87,16 @@ fn semver_key(v: &str) -> Vec<u64> {
 }
 
 /// All recorded versions, oldest first. Every directory under the fixture
-/// root is a recording: one without a `VERSION` file, or whose `VERSION`
-/// disagrees with its name, is a broken recording and fails here.
+/// root is a recording, except a synthetic-only one (a `SYNTHETIC` file in
+/// place of `VERSION`, see [`synthesized`]): one without a `VERSION` file, or
+/// whose `VERSION` disagrees with its name, is a broken recording and fails here.
 fn recordings() -> Vec<Rec> {
     let root = fixture_root();
     let mut out: Vec<Rec> = std::fs::read_dir(&root)
         .unwrap_or_else(|e| panic!("fixture root {} unreadable: {e}", root.display()))
         .flatten()
         .filter(|e| e.path().is_dir())
+        .filter(|e| !e.path().join("SYNTHETIC").exists() || e.path().join("VERSION").exists())
         .map(|e| {
             let dir = e.path();
             let name = e.file_name().to_string_lossy().to_string();
@@ -115,6 +119,18 @@ fn recording(version: &str) -> Rec {
         .into_iter()
         .find(|r| r.version == version)
         .unwrap_or_else(|| panic!("[claude-code/{version}] recording not found"))
+}
+
+/// Hand-written fixtures for a CLI version with no recording yet:
+/// `tests/fixtures/claude-code/<version>/` holding a `SYNTHETIC` file (its
+/// content the version) instead of `VERSION`. Only tests that name a file
+/// read them; the recording suite skips the directory.
+fn synthesized(version: &str) -> Rec {
+    let dir = fixture_root().join(version);
+    let marker = std::fs::read_to_string(dir.join("SYNTHETIC"))
+        .unwrap_or_else(|_| panic!("[claude-code/{version}] has no SYNTHETIC file"));
+    assert_eq!(marker.trim(), version, "[claude-code/{version}/SYNTHETIC] names another version");
+    Rec { dir, version: version.to_string() }
 }
 
 #[test]
@@ -205,10 +221,12 @@ fn check_stream_shape(fixture: &str, events: &[Value]) {
         for f in USAGE_FIELDS {
             require_u64(fixture, a, &format!("message.usage.{f}"));
         }
-        assert!(
-            usage_from_stream_event(a).is_some(),
-            "[{fixture}] usage_from_stream_event returned None for an assistant event"
-        );
+        // A stopped stage prices each message at the model that answered it
+        // (a subagent may run on another model than the stage).
+        let model = require_str(fixture, a, "message.model");
+        let (_, u) = usage_from_stream_event(a)
+            .unwrap_or_else(|| panic!("[{fixture}] usage_from_stream_event returned None for an assistant event"));
+        assert_eq!(u.model.as_deref(), Some(model), "[{fixture}] usage_from_stream_event lost `message.model`");
     }
     let result = result_event(fixture, events);
     for f in ["subtype", "is_error", "result", "session_id", "total_cost_usd"] {
@@ -291,6 +309,17 @@ fn stream_json_tool_use_journals_the_call_and_its_result() {
             .unwrap_or_else(|| panic!("[{fx}] no user tool_result block"));
         require(&fx, &tool_result, "tool_use_id");
         require(&fx, &tool_result, "content");
+
+        // The idle clock pairs each call with its result by id
+        // (`OpenTools`): a recorded call opens, and its result closes it.
+        let mut open = OpenTools::default();
+        let mut was_open = false;
+        for e in &events {
+            open.observe(e);
+            was_open |= open.latest().is_some_and(|t| t.name == "Read");
+        }
+        assert!(was_open, "[{fx}] the Read tool_use never registered as an open call");
+        assert_eq!(open.latest(), None, "[{fx}] a call stayed open after its tool_result");
 
         let (entries, usage_by_msg, outcome) = replay(&fx, &events);
         let tools = kind_entries(&entries, "tool");
@@ -390,12 +419,534 @@ fn stream_json_api_error_with_exit_1_still_carries_the_cli_message() {
     }
 }
 
+const DEFERRED_VERSION: &str = "2.1.319";
+const TOOL_DEFERRED_REL: &str = "stream-json/tool-deferred.jsonl";
+const DEFERRED_UNAVAILABLE_REL: &str = "stream-json/resume-deferred-tool-unavailable.jsonl";
+
+/// A deferred-tool result line through `parse_cli_result` at its exit code.
+fn deferred_outcome(rel: &str, exit_success: bool) -> (String, Value, crate::orchestrator::types::StageOutcome) {
+    let rec = synthesized(DEFERRED_VERSION);
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    let r = result_event(&fx, &events).clone();
+    for f in [
+        "subtype",
+        "is_error",
+        "result",
+        "session_id",
+        "total_cost_usd",
+        "terminal_reason",
+        "deferred_tool_use.id",
+        "deferred_tool_use.name",
+        "deferred_tool_use.input",
+    ] {
+        require(&fx, &r, f);
+    }
+    let line = serde_json::to_string(&r).unwrap();
+    let outcome = parse_cli_result(&line, exit_success, ArtifactKind::Diff, "")
+        .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+    (fx, r, outcome)
+}
+
+#[test]
+fn stream_json_hook_deferred_tool_is_a_halt_not_an_empty_success() {
+    use crate::orchestrator::cli_runner::{
+        is_budget_stop, is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred, TOOL_DEFERRED,
+    };
+    // Claude Code 2.1.319: a PreToolUse hook's `defer` ends the run as a clean
+    // `success` with no text, exit 0 — the deferred tool never ran.
+    let (fx, r, outcome) = deferred_outcome(TOOL_DEFERRED_REL, true);
+    assert_eq!(require_str(&fx, &r, "terminal_reason"), TOOL_DEFERRED, "[{fx}]");
+    assert_eq!(require(&fx, &r, "is_error"), &Value::Bool(false), "[{fx}]");
+    assert_eq!(outcome.status, StageStatus::Failed, "[{fx}] a deferred tool call is not a finished stage");
+    let err = outcome.error.as_deref().unwrap_or_default();
+    assert!(is_tool_deferred(err), "[{fx}] {err}");
+    assert!(!is_deferred_tool_unavailable(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+    assert!(
+        err.starts_with("A hook paused echo (MCP server fixture-srv) · hi before it ran. Resume once it may run, or re-run the stage."),
+        "[{fx}] {err}"
+    );
+    // The paused call's input (`deferred_tool_use.input`) is what the halt previews.
+    assert_eq!(require_str(&fx, &r, "deferred_tool_use.input.text"), "hi", "[{fx}]");
+    assert_eq!(outcome.session_id.as_deref(), Some(require_str(&fx, &r, "session_id")), "[{fx}] Resume needs the session");
+    assert!(outcome.artifact.text.is_empty(), "[{fx}]");
+    assert!(outcome.cost_usd > 0.0, "[{fx}] the spend stays on the meter");
+}
+
+#[test]
+fn stream_json_resume_with_its_deferred_tool_gone_names_the_tool() {
+    use crate::orchestrator::cli_runner::{
+        is_budget_stop, is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred, DEFERRED_TOOL_UNAVAILABLE,
+    };
+    // Claude Code 2.1.319: `--resume` with a prompt on a session that ended on
+    // a deferred call whose tool is no longer available exits 1 — with a
+    // `success` subtype and text, the shape of an unsaved session.
+    let (fx, r, outcome) = deferred_outcome(DEFERRED_UNAVAILABLE_REL, false);
+    assert_eq!(require_str(&fx, &r, "terminal_reason"), DEFERRED_TOOL_UNAVAILABLE, "[{fx}]");
+    assert_eq!(require_str(&fx, &r, "subtype"), "success", "[{fx}]");
+    assert_eq!(outcome.status, StageStatus::Failed, "[{fx}]");
+    let err = outcome.error.as_deref().unwrap_or_default();
+    assert!(is_deferred_tool_unavailable(err), "[{fx}] {err}");
+    assert!(!is_tool_deferred(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+    assert!(
+        err.starts_with(
+            "The resumed session was waiting to run echo (MCP server fixture-srv) · hi, which isn't available anymore. \
+             Reconnect it and resume, drop the call and continue, or re-run the stage fresh."
+        ),
+        "[{fx}] {err}"
+    );
+    // The CLI's own notice names the drop Octopush offers.
+    assert!(
+        require_str(&fx, &r, "result").contains(crate::orchestrator::cli_runner::DROP_DEFERRED_TOOL_ENV),
+        "[{fx}]"
+    );
+    assert_eq!(outcome.session_id.as_deref(), Some(require_str(&fx, &r, "session_id")), "[{fx}] Resume needs the session");
+    assert!(outcome.artifact.text.is_empty(), "[{fx}] the CLI's notice is not the stage's work");
+    // Even had it exited 0, the reason decides.
+    let (_, _, exit_0) = deferred_outcome(DEFERRED_UNAVAILABLE_REL, true);
+    assert!(is_deferred_tool_unavailable(exit_0.error.as_deref().unwrap_or_default()), "[{fx}]");
+}
+
+const SETTINGS_REFUSED_VERSION: &str = "2.1.326";
+const SETTINGS_REFUSED_REL: &str = "stream-json/settings-refused.jsonl";
+const SETTINGS_REFUSED_STDERR_REL: &str = "stream-json/settings-refused.stderr.txt";
+
+#[test]
+fn stream_json_refused_settings_name_the_setting() {
+    use crate::orchestrator::cli_runner::{is_budget_stop, is_session_not_saved, is_settings_refused, SETTINGS_REFUSED};
+    // Claude Code 2.1.323: `--settings` that turn the sandbox on and fail
+    // validation stop `claude -p` at start-up, naming the invalid setting.
+    let rec = synthesized(SETTINGS_REFUSED_VERSION);
+    let fx = rec.label(SETTINGS_REFUSED_REL);
+    let events = rec.jsonl(SETTINGS_REFUSED_REL);
+    let r = result_event(&fx, &events).clone();
+    for f in ["subtype", "is_error", "errors.0", "session_id"] {
+        require(&fx, &r, f);
+    }
+    assert_eq!(require_str(&fx, &r, "subtype"), "error_during_execution", "[{fx}]");
+    let stderr = rec.text(SETTINGS_REFUSED_STDERR_REL);
+    let line = serde_json::to_string(&r).unwrap();
+    let named = "(permissions.blockWritesOutsideWorkingDirectories: Expected boolean, but received string)";
+    for err_text in [stderr.as_str(), ""] {
+        let outcome = parse_cli_result(&line, false, ArtifactKind::Diff, err_text)
+            .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+        assert_eq!(outcome.status, StageStatus::Failed, "[{fx}]");
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(err.starts_with(&format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: ")), "[{fx}] {err}");
+        assert!(err.lines().next().unwrap().contains(named), "[{fx}] the first line names the setting: {err}");
+        assert!(!err.contains("error_during_execution"), "[{fx}] not the generic stop: {err}");
+        assert!(is_settings_refused(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+        assert_eq!(outcome.session_id, None, "[{fx}] the session never ran: nothing to resume");
+        assert!(outcome.artifact.text.is_empty(), "[{fx}]");
+    }
+    // stderr alone (no `errors` field) still names it.
+    let mut bare = r.clone();
+    bare.as_object_mut().unwrap().remove("errors");
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, &stderr).unwrap();
+    let err = outcome.error.as_deref().unwrap_or_default();
+    assert!(err.starts_with(&format!("{SETTINGS_REFUSED}: sandbox required but unavailable: ")), "[{fx}] {err}");
+    assert!(err.lines().next().unwrap().contains(named), "[{fx}] {err}");
+    // The machine-readable reason alone (no `errors`, no stderr) still reads
+    // as refused settings; with the reason gone and only an unrelated
+    // "failed validation" line, it does not.
+    require(&fx, &r, "startup_failure_reason");
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, "").unwrap();
+    assert!(is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
+    bare.as_object_mut().unwrap().remove("startup_failure_reason");
+    let unrelated = "[Bootstrap] Gateway /v1/models failed validation: expected a list";
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, unrelated).unwrap();
+    assert!(!is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
+}
+
+const INIT_ONLY_VERSION: &str = "2.1.326";
+const INIT_ONLY_REL: &str = "stream-json/init-only.jsonl";
+
+#[tokio::test]
+async fn stream_json_a_hang_before_the_first_request_is_named() {
+    use crate::orchestrator::cli_runner::{idle_timeout_message, shows_a_request, CLAUDE_FIRST_REQUEST_HANG_FIX};
+    use tokio::io::AsyncReadExt;
+    // Synthetic (see the 2.1.326 README): `system/init`, then silence on an
+    // open stdout — the hang Claude Code 2.1.327 fixed.
+    let rec = synthesized(INIT_ONLY_VERSION);
+    let fx = rec.label(INIT_ONLY_REL);
+    let events = rec.jsonl(INIT_ONLY_REL);
+    let init = events.first().unwrap_or_else(|| panic!("[{fx}] empty"));
+    assert_eq!(require_str(&fx, init, "subtype"), "init", "[{fx}] the stream opens with system/init");
+    assert!(!events.iter().any(shows_a_request), "[{fx}] nothing shows a request went out");
+    let limits = ReadLimits { idle: std::time::Duration::from_millis(200), ..TEST_LIMITS };
+    let (_still_open, rx) = tokio::io::duplex(64);
+    let stream = stdout_bytes(&rec, INIT_ONLY_REL).chain(rx);
+    let read = read_stream(stream, CliDialect::Claude, limits, |_| {}, |_| {});
+    let end = tokio::time::timeout(std::time::Duration::from_secs(10), read).await.expect("read_stream never stalled");
+    let ReadEnd::Idle(None, _, stall) = end else { panic!("[{fx}] expected an idle stall, got {end:?}") };
+    assert!(stall.before_first_request, "[{fx}] {stall:?}");
+    let version = require_str(&fx, init, "claude_code_version");
+    let msg = idle_timeout_message(&stall, Some(version));
+    assert!(msg.starts_with("timed out — Claude Code sent no request in 1 minute; "), "[{fx}] {msg}");
+    assert!(msg.ends_with("Update Claude Code"), "[{fx}] the CLI that hung names the update: {msg}");
+    assert_eq!(
+        idle_timeout_message(&stall, Some(CLAUDE_FIRST_REQUEST_HANG_FIX)),
+        "timed out — Claude Code sent no request in 1 minute",
+        "[{fx}]"
+    );
+}
+
+const EMPTY_RESUME_VERSION: &str = "2.1.329";
+const EMPTY_RESUME_REL: &str = "stream-json/resume-empty.jsonl";
+
+#[test]
+fn stream_json_a_resume_that_came_back_empty_is_named() {
+    use crate::orchestrator::cli_runner::{empty_resume_notice, EmptyResume, ResumeWatch, CLAUDE_EMPTY_RESUME_FIX};
+    // Synthetic (see the 2.1.329 README): `--resume …0001` answered on a new,
+    // empty session — the bug Claude Code 2.1.330 fixed.
+    let rec = synthesized(EMPTY_RESUME_VERSION);
+    let fx = rec.label(EMPTY_RESUME_REL);
+    let events = rec.jsonl(EMPTY_RESUME_REL);
+    let init = events.first().unwrap_or_else(|| panic!("[{fx}] empty"));
+    assert_eq!(require_str(&fx, init, "subtype"), "init", "[{fx}] the stream opens with system/init");
+    let got = require_str(&fx, init, "session_id");
+    let reply = *of_type(&events, "assistant").first().unwrap_or_else(|| panic!("[{fx}] no assistant event"));
+    let tokens: u64 = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .map(|f| require_u64(&fx, reply, &format!("message.usage.{f}")))
+        .sum();
+    assert_eq!(tokens, 14_063, "[{fx}] the first reply read only the system prompt");
+
+    // (a) `system/init` names another session than the one passed to --resume.
+    let requested = "aaaaaaaa-0000-4000-8000-000000000001";
+    let mut watch = ResumeWatch::new(requested, Some(120_000));
+    let found: Vec<EmptyResume> = events.iter().filter_map(|e| watch.observe(e)).collect();
+    assert_eq!(
+        found,
+        vec![EmptyResume::OtherSession { requested: requested.into(), got: got.into() }],
+        "[{fx}] decided once, on the init"
+    );
+    // (b) The same id, but a first reply under 15% of the session's last context.
+    let mut watch = ResumeWatch::new(got, Some(120_000));
+    let small: Vec<EmptyResume> = events.iter().filter_map(|e| watch.observe(e)).collect();
+    assert_eq!(small, vec![EmptyResume::SmallContext { tokens, floor: 18_000 }], "[{fx}]");
+
+    // The CLI that did it names the update; a fixed or unknown one never does.
+    let version = require_str(&fx, init, "claude_code_version");
+    for why in [&found[0], &small[0]] {
+        let n = empty_resume_notice(why, Some(version), false);
+        assert!(n.starts_with("resume came back empty: Claude Code opened a new conversation ("), "[{fx}] {n}");
+        assert!(
+            n.ends_with(
+                "The stage runs fresh, with its full input. \
+                 Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."
+            ),
+            "[{fx}] {n}"
+        );
+        for v in [Some(CLAUDE_EMPTY_RESUME_FIX), Some("2.2.0"), None] {
+            let plain = empty_resume_notice(why, v, false);
+            assert!(!plain.contains("update Claude Code"), "[{fx}] {v:?}: {plain}");
+            assert!(plain.ends_with("The stage runs fresh, with its full input."), "[{fx}] {plain}");
+            let answered = empty_resume_notice(why, v, true);
+            assert!(answered.ends_with("The stage runs fresh, with its full input and your answers."), "[{fx}] {answered}");
+        }
+    }
+}
+
+#[test]
+fn stream_json_a_real_resume_is_never_taken_for_an_empty_one() {
+    use crate::orchestrator::cli_runner::ResumeWatch;
+    for rec in recordings() {
+        let fx = rec.label("stream-json/resume.jsonl");
+        let events = rec.jsonl("stream-json/resume.jsonl");
+        let init = events
+            .iter()
+            .find(|e| e["type"] == "system" && e["subtype"] == "init")
+            .unwrap_or_else(|| panic!("[{fx}] no system/init"));
+        let sid = require_str(&fx, init, "session_id");
+        for prior in [None, Some(14_000), Some(60_000)] {
+            let mut watch = ResumeWatch::new(sid, prior);
+            assert!(events.iter().all(|e| watch.observe(e).is_none()), "[{fx}] prior context {prior:?}");
+        }
+    }
+}
+
+const DENIALS_VERSION: &str = "2.1.326";
+const DENIALS_REL: &str = "stream-json/result-with-denials.jsonl";
+
+#[test]
+fn stream_json_permission_denials_are_journaled_and_handed_on() {
+    use crate::orchestrator::cli_runner::{refused_notice, refused_total};
+    // Synthetic fixture (see the README): Claude Code 2.1.326 refuses some
+    // calls in bypassPermissions mode and lists them on the `result` event.
+    let rec = synthesized(DENIALS_VERSION);
+    let fx = rec.label(DENIALS_REL);
+    let events = rec.jsonl(DENIALS_REL);
+    check_stream_shape(&fx, &events);
+    let r = result_event(&fx, &events);
+    for f in ["permission_denials.0.tool_name", "permission_denials.0.tool_use_id", "permission_denials.0.tool_input"] {
+        require(&fx, r, f);
+    }
+    let line = serde_json::to_string(r).unwrap();
+    let outcome = parse_cli_result(&line, true, ArtifactKind::Diff, "")
+        .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+    // A writer stage that otherwise succeeded still settles done.
+    assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
+    let notices: Vec<String> = outcome.cli.refused_calls.iter().map(refused_notice).collect();
+    assert_eq!(notices, [
+        "refused · Bash · git push origin octo/fix-parser ×2",
+        "refused · Bash · NPM_TOKEN=[redacted] npm publish --access public",
+        "refused · Write · /Users/dev/.zshrc",
+    ], "[{fx}]");
+    assert_eq!(refused_total(&outcome.cli.refused_calls), 4, "[{fx}]");
+    // Its hand-off names them, after the agent's own summary.
+    let text = &outcome.artifact.text;
+    assert!(text.starts_with("Fixed the parser. The push was refused."), "[{fx}] {text}");
+    assert!(text.contains("Claude Code refused these tool calls"), "[{fx}] {text}");
+    assert!(text.contains("- Bash: git push origin octo/fix-parser (×2)"), "[{fx}] {text}");
+    assert!(!text.contains("fixture-npm-value-0403"), "[{fx}] the token never reaches the next stage");
+    // A plan or review stage's artifact is left as the agent wrote it.
+    let note = parse_cli_result(&line, true, ArtifactKind::Review, "").unwrap();
+    assert_eq!(note.artifact.text, "Fixed the parser. The push was refused.", "[{fx}]");
+    assert_eq!(refused_total(&note.cli.refused_calls), 4, "[{fx}]");
+    // Every recorded result without the field reads as nothing refused.
+    for rec in recordings() {
+        let fx = rec.label("stream-json/simple.jsonl");
+        let events = rec.jsonl("stream-json/simple.jsonl");
+        let (_, _, outcome) = replay(&fx, &events);
+        assert!(outcome.cli.refused_calls.is_empty(), "[{fx}]");
+    }
+}
+
+#[test]
+fn recorded_failures_are_never_read_as_refused_settings() {
+    use crate::orchestrator::cli_runner::is_settings_refused;
+    for rec in recordings() {
+        let rel = "stream-json/error-unknown-model.jsonl";
+        let fx = rec.label(rel);
+        let events = rec.jsonl(rel);
+        let line = serde_json::to_string(result_event(&fx, &events)).unwrap();
+        let outcome = parse_cli_result(&line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(!is_settings_refused(err), "[{fx}] {err}");
+    }
+}
+
+#[test]
+fn recorded_results_without_a_terminal_reason_are_never_read_as_deferred() {
+    use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_tool_deferred};
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl", "stream-json/resume.jsonl", "stream-json/error-unknown-model.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            let r = result_event(&fx, &events);
+            if r.get("terminal_reason").is_some() {
+                continue; // a newer recording; the deferred fixtures cover the field
+            }
+            let line = serde_json::to_string(r).unwrap();
+            for exit_success in [true, false] {
+                let o = parse_cli_result(&line, exit_success, ArtifactKind::Diff, "").unwrap();
+                let err = o.error.as_deref().unwrap_or_default();
+                assert!(!is_tool_deferred(err) && !is_deferred_tool_unavailable(err), "[{fx}] {err}");
+            }
+        }
+    }
+}
+
+#[test]
+fn synthetic_fixture_directories_are_not_recordings() {
+    let names: Vec<String> = recordings().into_iter().map(|r| r.version).collect();
+    for v in [DEFERRED_VERSION, SUBAGENT_MODEL_VERSION] {
+        assert!(!names.iter().any(|n| n == v), "{names:?}");
+        assert_eq!(synthesized(v).version, v);
+    }
+}
+
+const SUBAGENT_MODEL_VERSION: &str = "2.1.325";
+
+#[test]
+#[serial_test::serial(pricing_catalog)]
+fn stream_json_synthetic_error_message_is_never_unpriced() {
+    use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_estimate, CliUsage};
+    let _cfg = crate::provider_router::TestConfigDir::new();
+    // Recorded: Claude Code's own model_not_found error message, stamped
+    // `message.model: "<synthetic>"` with zero usage.
+    let rec = recording("2.1.314");
+    let rel = "stream-json/error-unknown-model.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    let synthetic = of_type(&events, "assistant")
+        .into_iter()
+        .find(|e| e.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>"))
+        .unwrap_or_else(|| panic!("[{fx}] no <synthetic> assistant message"));
+    let (id, u) = usage_from_stream_event(synthetic).unwrap();
+    assert_eq!(u.model.as_deref(), Some("<synthetic>"), "[{fx}]");
+    // Alone, and beside a priced message of the stage's model.
+    let mut map: HashMap<String, CliUsage> = HashMap::new();
+    map.insert(id.unwrap(), u);
+    assert!(streamed_estimate("claude-opus-5", &map).unpriced.is_empty(), "[{fx}]");
+    let priced = CliUsage { input_tokens: 1_000, output_tokens: 100, model: Some("claude-opus-5".into()), ..Default::default() };
+    map.insert("msg_priced".into(), priced);
+    let est = streamed_estimate("claude-opus-5", &map);
+    assert!(est.unpriced.is_empty(), "[{fx}] {:?}", est.unpriced);
+    let out = stopped_stage(CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+    assert_eq!(out.error.as_deref(), Some("Stopped by the director"), "[{fx}]");
+    assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    // A token-less message on an unknown model is not unpriced either.
+    map.insert("msg_empty".into(), CliUsage { model: Some("claude-mystery-9".into()), ..Default::default() });
+    assert!(streamed_estimate("claude-opus-5", &map).unpriced.is_empty(), "[{fx}]");
+}
+
+#[test]
+#[serial_test::serial(pricing_catalog)]
+fn stream_json_stopped_stage_prices_a_subagent_at_its_own_model() {
+    use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_cost, CliUsage};
+    // Isolated catalog: never the owner's ~/.octopush/providers.json.
+    let _cfg = crate::provider_router::TestConfigDir::new();
+    // Synthetic (see the 2.1.325 README): an Opus stage stopped while its
+    // Haiku subagent was mid-message — no `result` event.
+    let rec = synthesized(SUBAGENT_MODEL_VERSION);
+    let rel = "stream-json/stopped-with-subagent.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    assert!(!events.iter().any(is_result_event), "[{fx}] a stopped stage has no result event");
+    // Latest usage per message id, exactly as `CliRunner::run` keeps it.
+    let mut map: HashMap<String, CliUsage> = HashMap::new();
+    for e in of_type(&events, "assistant") {
+        let model = require_str(&fx, e, "message.model");
+        let (id, u) = usage_from_stream_event(e).unwrap();
+        assert_eq!(u.model.as_deref(), Some(model), "[{fx}]");
+        map.insert(id.unwrap(), u);
+    }
+    assert_eq!(map.len(), 2, "[{fx}] two messages, one of them in two content blocks");
+    // Opus 5 at $5/$25 per M, Haiku 4.5 at $1/$5 per M, each on its own.
+    let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+    let haiku = (20_000.0 * 1.0 + 2_000.0 * 5.0) / 1e6;
+    let c = streamed_cost("claude-opus-5", &map);
+    assert!((c - (opus + haiku)).abs() < 1e-12, "[{fx}] {c}, not {}", opus + haiku);
+    let out = stopped_stage(CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+    assert_eq!(out.error.as_deref(), Some("Stopped by the director"), "[{fx}] every message was priced");
+    assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    assert_eq!((out.input_tokens, out.output_tokens), (21_000, 2_100), "[{fx}]");
+    assert!((out.cost_usd - (opus + haiku)).abs() < 1e-12, "[{fx}] {}", out.cost_usd);
+}
+
+/// #895: the Direct context meter's reading, folded from each recorded
+/// stream exactly as `CliRunner::run` does — input + cache read + cache
+/// write of the latest top-level assistant message, handed on once per
+/// message (the CLI repeats a message's usage on every content block).
+#[test]
+fn stream_json_context_reading_is_the_latest_main_message_prompt() {
+    use crate::orchestrator::cli_runner::ContextWatch;
+    for rec in recordings() {
+        let fx = rec.label("stream-json/tool-use.jsonl");
+        let events = rec.jsonl("stream-json/tool-use.jsonl");
+        let mut watch = ContextWatch::default();
+        let mut lookups: Vec<String> = Vec::new();
+        let mut readings = Vec::new();
+        for e in &events {
+            let window_of = |m: &str| {
+                lookups.push(m.to_string());
+                Some(200_000)
+            };
+            if let Some(r) = watch.observe(e, "claude-haiku-4-5", window_of) {
+                readings.push(r);
+            }
+        }
+        // One reading per distinct main-session message, the last one's prompt.
+        let mut expected: Vec<u64> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for e in of_type(&events, "assistant") {
+            if !e["parent_tool_use_id"].is_null() {
+                continue;
+            }
+            let id = require_str(&fx, e, "message.id").to_string();
+            let prompt = require_u64(&fx, e, "message.usage.input_tokens")
+                + require_u64(&fx, e, "message.usage.cache_read_input_tokens")
+                + require_u64(&fx, e, "message.usage.cache_creation_input_tokens");
+            if seen.insert(id) && expected.last() != Some(&prompt) {
+                expected.push(prompt);
+            }
+        }
+        assert!(!expected.is_empty(), "[{fx}] no main-session assistant message");
+        assert_eq!(readings.iter().map(|r| r.0).collect::<Vec<_>>(), expected, "[{fx}]");
+        assert!(readings.iter().all(|r| r.1 == Some(200_000)), "[{fx}] {readings:?}");
+        // The window is the stage model's, looked up once, never per event.
+        assert_eq!(lookups, vec!["claude-haiku-4-5".to_string()], "[{fx}]");
+    }
+}
+
+/// #895: a sub-agent's message is its own context, not the stage's; the
+/// CLI's synthetic notices and token-less messages read as no reading; a
+/// model the catalog doesn't list leaves the window unknown (the meter hides).
+#[test]
+fn stream_json_context_reading_skips_subagents_and_synthetic_messages() {
+    use crate::orchestrator::cli_runner::{context_from_stream_event, ContextWatch};
+    let rec = synthesized(SUBAGENT_MODEL_VERSION);
+    let rel = "stream-json/stopped-with-subagent.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    let mut watch = ContextWatch::default();
+    let readings: Vec<_> = events
+        .iter()
+        .filter_map(|e| watch.observe(e, "claude-opus-5", |m| (m == "claude-opus-5").then_some(1_000_000)))
+        .collect();
+    assert_eq!(readings, vec![(1_000, Some(1_000_000))], "[{fx}] the Haiku subagent's 20k prompt is not the stage's");
+
+    let synthetic = serde_json::json!({
+        "type": "assistant", "parent_tool_use_id": null,
+        "message": { "id": "m1", "model": "<synthetic>", "content": [],
+                     "usage": { "input_tokens": 5, "output_tokens": 0 } }
+    });
+    assert_eq!(context_from_stream_event(&synthetic), None);
+    let empty = serde_json::json!({
+        "type": "assistant", "message": { "id": "m2", "model": "claude-opus-5", "usage": { "input_tokens": 0 } }
+    });
+    assert_eq!(context_from_stream_event(&empty), None);
+    let unnamed = serde_json::json!({
+        "type": "assistant",
+        "message": { "id": "m3", "usage": { "input_tokens": 3, "cache_read_input_tokens": 40_000, "cache_creation_input_tokens": 2_000 } }
+    });
+    assert_eq!(context_from_stream_event(&unnamed), Some((42_003, None)));
+    let mut watch = ContextWatch::default();
+    assert_eq!(watch.observe(&unnamed, "gateway/unknown-model", |_| None), Some((42_003, None)));
+    assert_eq!(watch.observe(&unnamed, "gateway/unknown-model", |_| None), None, "unchanged: nothing to write");
+    let result = serde_json::json!({ "type": "result", "usage": { "input_tokens": 9 } });
+    assert_eq!(context_from_stream_event(&result), None);
+}
+
+/// #895: the window follows the stage's configured model. A `[1m]` stage is
+/// sized against 1M although its messages' `message.model` drops the suffix
+/// and the catalog lists the base id's window; any other id gets the
+/// catalog's, and an unlisted (or zero) window stays unknown.
+#[test]
+fn stream_json_context_window_follows_a_1m_stage_model() {
+    use crate::orchestrator::cli_runner::{stage_context_window, ContextWatch};
+    let catalog = |m: &str| (crate::token_engine::normalize_model_id(m) == "claude-opus-5-5").then_some(200_000);
+    assert_eq!(stage_context_window("claude-opus-5-5[1m]", catalog), Some(1_000_000));
+    assert_eq!(stage_context_window("sonnet[1M]", |_| None), Some(1_000_000));
+    assert_eq!(stage_context_window("claude-opus-5-5", catalog), Some(200_000));
+    assert_eq!(stage_context_window("claude-mystery-9", |_| None), None);
+    assert_eq!(stage_context_window("claude-zero", |_| Some(0)), None);
+    let message = serde_json::json!({
+        "type": "assistant", "parent_tool_use_id": null,
+        "message": { "id": "m1", "model": "claude-opus-5-5", "usage": { "input_tokens": 12, "cache_read_input_tokens": 399_988 } }
+    });
+    let mut watch = ContextWatch::default();
+    assert_eq!(
+        watch.observe(&message, "claude-opus-5-5[1m]", |m| stage_context_window(m, catalog)),
+        Some((400_000, Some(1_000_000))),
+        "a [1m] stage past 200k is not over its window"
+    );
+    let mut watch = ContextWatch::default();
+    assert_eq!(
+        watch.observe(&message, "claude-opus-5-5", |m| stage_context_window(m, catalog)),
+        Some((400_000, Some(200_000))),
+        "the app hides a reading over its window rather than showing 400k / 200k"
+    );
+}
+
 #[test]
 fn stream_json_argv_flags_are_all_known_to_the_cli() {
     for rec in recordings() {
         let fx = rec.label("cli-help.txt");
         let help = rec.text("cli-help.txt");
-        let effort = || CliDialect::Claude.effort_args(Some(crate::providers::Effort::High));
+        let effort = || CliDialect::Claude.effort_args("claude-haiku-4-5", Some(crate::providers::Effort::High));
         for argv in [
             [build_cli_args("claude-haiku-4-5", "system", 3, true), effort()].concat(),
             [build_cli_args_resume("claude-haiku-4-5", "aaaaaaaa-0000-4000-8000-000000000001", 3, true), effort()].concat(),
@@ -480,6 +1031,7 @@ fn stream_json_missing_fields_degrade_without_panicking() {
 /// Short limits so a settle is observable in a test; idle and cap far away.
 const TEST_LIMITS: ReadLimits = ReadLimits {
     idle: std::time::Duration::from_secs(20),
+    command_idle: std::time::Duration::from_secs(20),
     cap: std::time::Duration::from_secs(60),
     settle: std::time::Duration::from_millis(150),
 };
@@ -492,7 +1044,7 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(stream: R, dialect: CliDi
     let mut seen = 0usize;
     let end = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        read_stream(stream, dialect, TEST_LIMITS, |_| seen += 1),
+        read_stream(stream, dialect, TEST_LIMITS, |_| seen += 1, |_| {}),
     )
     .await
     .expect("read_stream did not settle — it is waiting for the process to exit");
@@ -588,6 +1140,445 @@ fn claude_stage_env_disables_fast_mode() {
     assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_DISABLE_FAST_MODE"));
 }
 
+#[test]
+fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
+    // 2.1.319 backgrounds MCP tasks right away; a stage settled on its
+    // `result` must not hand on work still running. `stage_env` takes no
+    // resume flag, so fresh and `--resume` spawns get the same pin.
+    let env = CliDialect::Claude.stage_env();
+    let pin = env
+        .iter()
+        .find(|(k, _)| *k == "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(pin, Some("1"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND"));
+}
+
+#[test]
+fn claude_stage_env_keeps_the_skills_the_stage_started_with() {
+    // 2.1.321 reloads `.claude/skills` in headless sessions when their files
+    // change; a stage writing its own worktree must not rewrite its own rules.
+    // `stage_env` takes no resume flag, so fresh and `--resume` spawns match.
+    let env = CliDialect::Claude.stage_env();
+    let pin = env.iter().find(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH").map(|(_, v)| v.as_str());
+    assert_eq!(pin, Some("0"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH"));
+}
+
+// ─── Gateway models' context window (#790) ──
+//
+// 2.1.323: "Changed the context window assumed for a model ID that Claude
+// Code doesn't recognize from 200K to 1M; use `/autocompact` to compact
+// earlier, or `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` to keep 200K" and "Changed
+// sessions on other vendors' models with a smaller window: once full, they
+// can fail every turn until `/clear`, so set `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`
+// before they fill". 2.1.325: "Changed `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to
+// also set the context window of unrecognized model IDs that start with
+// `claude-`, such as a gateway's `claude-sonnet-latest`".
+
+#[test]
+fn context_window_variables_are_the_documented_names() {
+    assert_eq!(MAX_CONTEXT_TOKENS_ENV, "CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+    assert_eq!(DISABLE_1M_CONTEXT_ENV, "CLAUDE_CODE_DISABLE_1M_CONTEXT");
+}
+
+#[test]
+fn a_builtin_claude_model_gets_no_context_window_variable() {
+    // Claude Code knows the builtin catalog's ids and their windows, also
+    // behind a gateway or Bedrock prefix (the builtin check normalizes).
+    for model in [
+        "claude-sonnet-5",
+        "claude-opus-5-5",
+        "claude-haiku-4-5",
+        "bedrock/claude-haiku-4-5",
+        "us.anthropic.claude-haiku-4-5-v1:0",
+    ] {
+        assert!(is_builtin_claude_model(model), "{model}");
+        let env = stage_spawn_env_for(model);
+        assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{model}: {env:?}");
+    }
+    assert!(!is_builtin_claude_model("claude-sonnet-latest"));
+    assert!(!is_builtin_claude_model("gpt-4o"));
+    assert!(context_window_env("claude-haiku-4-5", true, Some(200_000), None, |_| false).is_empty());
+}
+
+#[test]
+fn a_gateway_model_gets_the_variable_for_its_window() {
+    let none = |_: &str| false;
+    let max = |w: &str| (MAX_CONTEXT_TOKENS_ENV, w.to_string());
+    let disable = (DISABLE_1M_CONTEXT_ENV, "1".to_string());
+    // Ids that don't start with `claude-` already honoured the max-tokens
+    // variable before 2.1.325 (that entry says it "also" covers `claude-`
+    // ids): never the process-wide DISABLE_1M switch, whatever the CLI version.
+    for v in [None, Some("2.1.323"), Some("2.1.325")] {
+        assert_eq!(context_window_env("gpt-4o", false, Some(128_000), v, none), vec![max("128000")], "{v:?}");
+        assert_eq!(context_window_env("kimi-k3", false, Some(512_000), v, none), vec![max("512000")], "{v:?}");
+    }
+    // A `claude-` gateway id on 2.1.325+: the variable alone.
+    let new = Some("2.1.325");
+    assert_eq!(context_window_env("claude-sonnet-latest", false, Some(200_000), new, none), vec![max("200000")]);
+    assert_eq!(context_window_env("claude-internal-128k", false, Some(128_000), Some("2.2.0"), none), vec![max("128000")]);
+    assert_eq!(context_window_env("claude-gateway-512k", false, Some(512_000), new, none), vec![max("512000")]);
+    // Below 2.1.325 (or an unknown version) Claude Code ignores it for a
+    // `claude-` id, so a window up to 200K also keeps 200K; below 200K
+    // can't be expressed there, and 200K–1M gets only the ignored variable.
+    for old in [Some("2.1.323"), Some("2.1.324"), None] {
+        assert_eq!(
+            context_window_env("claude-sonnet-latest", false, Some(200_000), old, none),
+            vec![max("200000"), disable.clone()],
+            "{old:?}"
+        );
+        assert_eq!(
+            context_window_env("claude-internal-128k", false, Some(128_000), old, none),
+            vec![max("128000"), disable.clone()],
+            "{old:?}"
+        );
+        assert_eq!(context_window_env("claude-gateway-512k", false, Some(512_000), old, none), vec![max("512000")], "{old:?}");
+    }
+    // A 1M window and an unknown one: nothing.
+    assert!(context_window_env("claude-sonnet-latest", false, Some(1_000_000), new, none).is_empty());
+    assert!(context_window_env("gpt-4o", false, Some(1_000_000), new, none).is_empty());
+    assert!(context_window_env("claude-sonnet-latest", false, None, None, none).is_empty());
+    assert!(context_window_env("claude-sonnet-latest", false, Some(0), None, none).is_empty());
+}
+
+#[test]
+fn a_users_own_context_window_export_is_never_overridden() {
+    let set = |k: &str| k == MAX_CONTEXT_TOKENS_ENV;
+    assert!(context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.325"), set).is_empty());
+    assert!(context_window_env("gpt-4o", false, Some(128_000), None, set).is_empty());
+    // Only the variable the user set is left alone.
+    assert_eq!(
+        context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.323"), set),
+        vec![(DISABLE_1M_CONTEXT_ENV, "1".to_string())]
+    );
+    let set = |k: &str| k == DISABLE_1M_CONTEXT_ENV;
+    assert_eq!(
+        context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.323"), set),
+        vec![(MAX_CONTEXT_TOKENS_ENV, "200000".to_string())]
+    );
+}
+
+#[test]
+fn codex_stages_get_no_context_window_variable() {
+    let mut command = tokio::process::Command::new("codex");
+    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None);
+    let keys: Vec<String> = command.as_std().get_envs().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+    assert!(!keys.iter().any(|k| k == MAX_CONTEXT_TOKENS_ENV || k == DISABLE_1M_CONTEXT_ENV), "{keys:?}");
+}
+
+#[test]
+fn a_custom_gateway_model_reaches_the_spawn_with_its_catalog_window() {
+    // The user's own provider entry (a LiteLLM gateway) gives the window.
+    let cfg = crate::provider_router::TestConfigDir::new();
+    let model = |id: &str, ctx: u64| {
+        serde_json::json!({"id": id, "displayName": id, "inputCostPerM": 3.0, "outputCostPerM": 15.0, "maxContext": ctx})
+    };
+    let providers = serde_json::json!([{
+        "name": "gateway", "apiBase": "https://gateway.example", "apiKeyEnv": "GATEWAY_KEY", "enabled": true,
+        "models": [model("claude-sonnet-latest", 200_000), model("team-llama", 128_000), model("claude-sonnet-5", 100_000)],
+    }]);
+    std::fs::write(cfg.path().join("providers.json"), providers.to_string()).unwrap();
+    // (Whether DISABLE_1M joins it depends on the probed CLI version; the
+    // pure `context_window_env` tests pin that.)
+    let env = stage_spawn_env_for("claude-sonnet-latest");
+    assert_eq!(env.get(MAX_CONTEXT_TOKENS_ENV), Some(&Some("200000".to_string())), "{env:?}");
+    let env = stage_spawn_env_for("team-llama");
+    assert_eq!(env.get(MAX_CONTEXT_TOKENS_ENV), Some(&Some("128000".to_string())), "{env:?}");
+    assert!(!env.contains_key(DISABLE_1M_CONTEXT_ENV), "a non-`claude-` id never gets the process-wide switch");
+    // A builtin id stays untouched even when a custom entry repeats it.
+    let env = stage_spawn_env_for("claude-sonnet-5");
+    assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{env:?}");
+    // An id no catalog lists: nothing.
+    let env = stage_spawn_env_for("claude-unknown-gateway");
+    assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{env:?}");
+}
+
+// ─── Gateway-named Claude models keep the full prompt (#1003) ──
+//
+// 2.1.330: "Changed unrecognized model names containing \"sonnet\" or
+// \"haiku\" to use the shorter system prompt, like other unrecognized names;
+// `CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT=0` gives every model the full one".
+
+#[test]
+fn system_prompt_variable_is_the_documented_name() {
+    assert_eq!(SIMPLE_SYSTEM_PROMPT_ENV, "CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT");
+}
+
+#[test]
+fn a_canonical_claude_id_keeps_claude_codes_own_prompt_choice() {
+    let none = |_: &str| false;
+    for model in ["claude-sonnet-5-5", "claude-haiku-4-5", "claude-opus-4-8[1m]", "claude-sonnet-5-5-20261001", " claude-opus-5-5 "] {
+        assert!(system_prompt_env(model, is_builtin_claude_model, none).is_empty(), "{model}");
+        assert!(!stage_spawn_env_for(model).contains_key(SIMPLE_SYSTEM_PROMPT_ENV), "{model}");
+    }
+}
+
+#[test]
+fn a_gateway_named_claude_model_gets_the_full_prompt() {
+    let none = |_: &str| false;
+    let full = vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())];
+    for model in [
+        // dotted
+        "claude-sonnet-5.5",
+        "claude-haiku-4.5",
+        // prefixed
+        "anthropic/claude-sonnet-5.5",
+        "bedrock/claude-haiku-4-5",
+        "openrouter/anthropic/claude-haiku-5-5",
+        "us.anthropic.claude-sonnet-5-5-v1:0",
+    ] {
+        assert_eq!(system_prompt_env(model, is_builtin_claude_model, none), full, "{model}");
+    }
+    // Through the spawn, over whatever the stage inherited.
+    let env = stage_spawn_env_for("anthropic/claude-sonnet-5.5");
+    if std::env::var_os(SIMPLE_SYSTEM_PROMPT_ENV).is_none() {
+        assert_eq!(env.get(SIMPLE_SYSTEM_PROMPT_ENV), Some(&Some("0".to_string())), "{env:?}");
+    }
+    // Codex never gets it.
+    let mut command = tokio::process::Command::new("codex");
+    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None);
+    assert!(!command.as_std().get_envs().any(|(k, _)| k == SIMPLE_SYSTEM_PROMPT_ENV));
+}
+
+#[test]
+fn a_non_claude_gateway_model_keeps_the_short_prompt() {
+    let none = |_: &str| false;
+    for model in ["ollama/qwen2.5-coder:7b", "llama3.3:latest", "kimi-k3", "claude-sonnet-latest", "team-sonnet", "gpt-4o"] {
+        assert!(system_prompt_env(model, is_builtin_claude_model, none).is_empty(), "{model}");
+    }
+    assert!(!stage_spawn_env_for("ollama/qwen2.5-coder:7b").contains_key(SIMPLE_SYSTEM_PROMPT_ENV));
+}
+
+#[test]
+fn a_users_own_system_prompt_export_is_never_overridden() {
+    let set = |k: &str| k == SIMPLE_SYSTEM_PROMPT_ENV;
+    assert!(system_prompt_env("anthropic/claude-sonnet-5.5", is_builtin_claude_model, set).is_empty());
+    // Another variable set by the user doesn't count.
+    let other = |k: &str| k == MAX_CONTEXT_TOKENS_ENV;
+    assert_eq!(
+        system_prompt_env("anthropic/claude-sonnet-5.5", is_builtin_claude_model, other),
+        vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())]
+    );
+}
+
+/// [`stage_spawn_env`] for a Claude stage on `model`.
+fn stage_spawn_env_for(model: &str) -> HashMap<String, Option<String>> {
+    let mut command = tokio::process::Command::new("claude");
+    apply_stage_env(&mut command, CliDialect::Claude, model, None, false, None);
+    command
+        .as_std()
+        .get_envs()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+        .collect()
+}
+
+#[test]
+fn claude_stage_env_turns_off_subagent_progress_summaries() {
+    // 2.1.323: "Added `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES` (available
+    // since 2.1.318): set it to `1` to turn off subagent progress summaries and
+    // the requests that write them". No stage reads them (#722).
+    const KEY: &str = "CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES";
+    let env = CliDialect::Claude.stage_env();
+    assert_eq!(env.iter().find(|(k, _)| *k == KEY).map(|(_, v)| v.as_str()), Some("1"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == KEY));
+    // Set on the spawn whatever the quiet opt-in or effort, so a fresh and a
+    // `--resume` run (one `apply_stage_env`, no resume flag) both get it, over
+    // any inherited value; it's never removed.
+    for (effort, quiet) in [(None, false), (Some(crate::providers::Effort::High), true)] {
+        let spawn = stage_spawn_env(CliDialect::Claude, effort, quiet);
+        assert_eq!(spawn.get(KEY), Some(&Some("1".to_string())), "{spawn:?}");
+    }
+    assert!(!stage_spawn_env(CliDialect::Codex, None, true).contains_key(KEY));
+    // No stream event is read as a progress summary: a `task_summary`-style
+    // system event journals nothing.
+    let summary = serde_json::json!({"type": "system", "subtype": "task_summary", "summary": "Reading files"});
+    assert!(entries_from_stream_event(&summary).is_empty());
+}
+
+// ─── Quiet Claude Code (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, #703) ──
+
+/// The stage process's explicit env after [`apply_stage_env`]: `Some(v)` for a
+/// set variable, `None` for a removed one; absent keys are inherited.
+fn stage_spawn_env(
+    dialect: CliDialect,
+    effort: Option<crate::providers::Effort>,
+    quiet: bool,
+) -> HashMap<String, Option<String>> {
+    let mut command = tokio::process::Command::new("claude");
+    apply_stage_env(&mut command, dialect, "claude-sonnet-5", effort, quiet, None);
+    command
+        .as_std()
+        .get_envs()
+        .map(|(k, v)| {
+            (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+#[test]
+fn quiet_claude_code_sets_the_documented_variable_on_claude_stages_only() {
+    assert_eq!(QUIET_TRAFFIC_ENV, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC");
+    assert_eq!(CliDialect::Claude.stage_quiet_env(true), vec![(QUIET_TRAFFIC_ENV, "1".to_string())]);
+    // Off writes nothing: the docs say even `0`/`false` still disables the
+    // traffic, so the only off state is the variable left alone.
+    assert!(CliDialect::Claude.stage_quiet_env(false).is_empty());
+    assert!(CliDialect::Codex.stage_quiet_env(true).is_empty());
+    assert!(CliDialect::Codex.stage_quiet_env(false).is_empty());
+    // The quiet pin is its own opt-in, never part of the always-on pins.
+    assert!(!CliDialect::Claude.stage_env().iter().any(|(k, _)| *k == QUIET_TRAFFIC_ENV));
+}
+
+#[test]
+fn quiet_claude_code_reaches_a_fresh_stage_spawn() {
+    // A fresh stage: no session, usually no effort override.
+    for effort in [None, Some(crate::providers::Effort::Medium)] {
+        let on = stage_spawn_env(CliDialect::Claude, effort, true);
+        assert_eq!(on.get(QUIET_TRAFFIC_ENV), Some(&Some("1".to_string())), "fresh, effort {effort:?}: {on:?}");
+        let off = stage_spawn_env(CliDialect::Claude, effort, false);
+        assert!(!off.contains_key(QUIET_TRAFFIC_ENV), "fresh off must neither set nor remove it: {off:?}");
+        // The always-on pins ride along either way.
+        assert_eq!(on.get("CLAUDE_CODE_DISABLE_FAST_MODE"), Some(&Some("1".to_string())));
+        assert_eq!(off.get("CLAUDE_CODE_DISABLE_FAST_MODE"), Some(&Some("1".to_string())));
+    }
+}
+
+#[test]
+fn quiet_claude_code_reaches_a_resumed_stage_spawn() {
+    // A `--resume` run builds a different argv but spawns through the same
+    // `apply_stage_env`, which takes no resume flag: the env must match the
+    // fresh run's exactly, quiet pin included.
+    use crate::providers::Effort;
+    let fresh_args = build_cli_args("claude-sonnet-5", "sys", 25, false);
+    let resume_args = build_cli_args_resume("claude-sonnet-5", "sess-1", 25, false);
+    assert!(resume_args.iter().any(|a| a == "--resume"), "{resume_args:?}");
+    assert!(!fresh_args.iter().chain(&resume_args).any(|a| a.contains(QUIET_TRAFFIC_ENV)), "never an argv flag");
+    for effort in [None, Some(Effort::High)] {
+        let resumed = stage_spawn_env(CliDialect::Claude, effort, true);
+        assert_eq!(resumed.get(QUIET_TRAFFIC_ENV), Some(&Some("1".to_string())), "resumed, effort {effort:?}");
+        assert_eq!(resumed, stage_spawn_env(CliDialect::Claude, effort, true), "deterministic");
+        assert!(!stage_spawn_env(CliDialect::Claude, effort, false).contains_key(QUIET_TRAFFIC_ENV));
+    }
+    // The effort override still drops the user's inherited export beside it.
+    let resumed = stage_spawn_env(CliDialect::Claude, Some(Effort::High), true);
+    assert_eq!(resumed.get("CLAUDE_CODE_EFFORT_LEVEL"), Some(&None));
+}
+
+#[test]
+fn quiet_claude_code_never_reaches_a_codex_stage_spawn() {
+    for effort in [None, Some(crate::providers::Effort::High)] {
+        for quiet in [true, false] {
+            let env = stage_spawn_env(CliDialect::Codex, effort, quiet);
+            assert!(!env.contains_key(QUIET_TRAFFIC_ENV), "codex, quiet {quiet}: {env:?}");
+        }
+    }
+}
+
+// ─── Codex CLI effort (`-c model_reasoning_effort`) ──────────────────────
+
+/// A writer outside a sandboxed mission.
+const CODEX_WS: CodexWriteScope = CodexWriteScope::Workspace;
+
+#[test]
+fn codex_writer_runs_in_its_workspace_write_sandbox() {
+    use crate::providers::Effort;
+    let head = ["exec", "--json", "--skip-git-repo-check", "-m", "gpt-6.1-terra", "-C", "/ws"];
+    // Only `--sandbox` is a flag (the read-only path has always passed it);
+    // the rest are `-c` config overrides, which `codex exec` takes like the
+    // effort, rather than `--ask-for-approval`/`--add-dir`, which it may not.
+    let sandbox = [
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        "approval_policy=\"never\"",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
+    ];
+    let plain = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CODEX_WS, "/ws");
+    assert_eq!(plain, [&head[..], &sandbox[..], &["-"][..]].concat(), "{plain:?}");
+    assert!(!plain.iter().any(|a| a == "--ask-for-approval" || a == "--add-dir"), "{plain:?}");
+    // No extra writable roots: Codex can't deny a path inside one, so a
+    // worktree's git dir (its `commondir`, `config.worktree`) is never granted.
+    assert!(!plain.iter().any(|a| a.contains("writable_roots") || a.contains(".git")), "{plain:?}");
+    // The effort override sits after the sandbox settings, before the stdin marker.
+    let mut argv = plain.clone();
+    CliDialect::Codex.push_effort_args(&mut argv, "gpt-6.1-terra", Some(Effort::High));
+    let effort = ["-c", "model_reasoning_effort=\"high\""];
+    assert_eq!(argv, [&head[..], &sandbox[..], &effort[..], &["-"][..]].concat(), "{argv:?}");
+    // Inside a sandboxed mission the bypass flag stays (Seatbelt confines it).
+    let mission = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::MissionSandbox, "/ws");
+    assert_eq!(mission, [&head[..], &["--dangerously-bypass-approvals-and-sandbox", "-"][..]].concat(), "{mission:?}");
+    // Read-only is unchanged, in or out of a sandboxed mission (inside one the
+    // stage is refused before launch: Codex's sandbox can't nest there).
+    for scope in [CODEX_WS, CodexWriteScope::MissionSandbox] {
+        let ro = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, true, scope, "/ws");
+        assert_eq!(ro, [&head[..], &["--sandbox", "read-only", "-"][..]].concat(), "{ro:?}");
+    }
+}
+
+#[test]
+fn codex_argv_carries_the_effort_override_before_the_stdin_marker() {
+    use crate::providers::Effort;
+    for read_only in [false, true] {
+        let mut argv = CliDialect::Codex.argv("gpt-5.5", "system", 25, read_only, CODEX_WS, "/ws");
+        CliDialect::Codex.push_effort_args(&mut argv, "gpt-5.5", Some(Effort::High));
+        let n = argv.len();
+        assert_eq!(argv[n - 1], "-", "the prompt still comes from stdin: {argv:?}");
+        assert_eq!(argv[n - 3..n - 1], ["-c", "model_reasoning_effort=\"high\""], "{argv:?}");
+        assert_eq!(argv[..2], ["exec", "--json"], "{argv:?}");
+        // A one-off override, nothing in the environment.
+        assert!(CliDialect::Codex.stage_effort_env(Some(Effort::High)).is_empty());
+        assert!(CliDialect::Codex.stage_env_remove(Some(Effort::High)).is_empty());
+    }
+}
+
+#[test]
+fn codex_argv_without_an_effort_keeps_codexs_own_default() {
+    let plain = CliDialect::Codex.argv("gpt-5.5", "system", 25, false, CODEX_WS, "/ws");
+    let mut argv = plain.clone();
+    CliDialect::Codex.push_effort_args(&mut argv, "gpt-5.5", None);
+    assert_eq!(argv, plain);
+    assert!(!argv.iter().any(|a| a.contains("model_reasoning_effort")), "{argv:?}");
+}
+
+#[test]
+fn codex_argv_on_a_model_outside_the_catalog_carries_no_override() {
+    // Codex sends the level to the API unchanged, so on a model whose levels
+    // its catalog doesn't list (gpt-5-codex, o3, a non-reasoning model) the
+    // stage keeps Codex's default rather than risk a rejected level.
+    use crate::providers::Effort;
+    for model in ["gpt-5-codex", "o3", "o4-mini", "gpt-4o"] {
+        for effort in [Effort::Low, Effort::High, Effort::Xhigh, Effort::Max] {
+            let plain = CliDialect::Codex.argv(model, "system", 25, false, CODEX_WS, "/ws");
+            let mut argv = plain.clone();
+            CliDialect::Codex.push_effort_args(&mut argv, model, Some(effort));
+            assert_eq!(argv, plain, "[{model} {effort:?}]");
+            assert!(!argv.iter().any(|a| a.contains("model_reasoning_effort")), "{argv:?}");
+        }
+    }
+}
+
+#[test]
+fn codex_argv_maps_max_to_the_models_top_level() {
+    use crate::providers::Effort;
+    // Levels per Codex's catalog (models.json @ a7a9d82): gpt-5.5 tops out at
+    // xhigh; gpt-5.6-sol, gpt-6.1-terra and codex-auto-review list max.
+    for (model, level) in [("gpt-5.5", "xhigh"), ("gpt-6.1-terra", "max"), ("gpt-5.6-sol", "max"), ("codex-auto-review", "max")] {
+        let mut argv = CliDialect::Codex.argv(model, "system", 25, false, CODEX_WS, "/ws");
+        CliDialect::Codex.push_effort_args(&mut argv, model, Some(Effort::Max));
+        let want = format!("model_reasoning_effort=\"{level}\"");
+        assert!(argv.contains(&want), "[{model}] {argv:?}");
+    }
+}
+
+#[test]
+fn claude_argv_appends_the_effort_flag_at_the_end() {
+    use crate::providers::Effort;
+    let mut argv = build_cli_args_resume("claude-haiku-4-5", "aaaaaaaa-0000-4000-8000-000000000001", 3, false);
+    CliDialect::Claude.push_effort_args(&mut argv, "claude-haiku-4-5", Some(Effort::Low));
+    assert_eq!(argv[argv.len() - 2..], ["--effort", "low"], "{argv:?}");
+}
+
 // ─── `rate_limit_event` → Claude plan windows ────────────────────────────
 
 const SUBSCRIBER_REL: &str = "stream-json/subscriber-rate-limit.jsonl";
@@ -652,6 +1643,143 @@ fn rate_limit_event_without_unified_windows_uses_top_level_utilization() {
     assert_eq!(w[0].utilization, None);
     assert_eq!(w[0].status.as_deref(), Some("rejected"));
     assert!(w[0].using_overage);
+}
+
+// ─── A Claude plan wall (`rejected`) → plan-limit park (#731) ─────────────
+
+const REJECTED_REL: &str = "stream-json/subscriber-rate-limit-rejected.jsonl";
+
+/// Feed a fixture's events to the production plan-limit watch.
+fn plan_watch(events: &[Value]) -> crate::orchestrator::cli_runner::PlanLimitWatch {
+    let mut watch = crate::orchestrator::cli_runner::PlanLimitWatch::default();
+    for e in events {
+        watch.observe(e);
+    }
+    watch
+}
+
+#[test]
+fn a_rejected_plan_window_halts_the_stage_as_a_plan_limit() {
+    use crate::orchestrator::cli_runner::{apply_plan_limit, is_plan_limit, PlanLimit};
+    let rec = recording("2.1.314");
+    let fx = rec.label(REJECTED_REL);
+    let events = rec.jsonl(REJECTED_REL);
+    let init = events.iter().find(|e| e["subtype"] == "init").unwrap();
+    assert_eq!(cli_auth_from_init(init), Some(CliAuth::Subscription), "[{fx}]");
+    let rl = of_type(&events, "rate_limit_event");
+    for f in ["status", "resetsAt", "rateLimitType", "isUsingOverage"] {
+        require(&fx, rl[1], &format!("rate_limit_info.{f}"));
+    }
+    let notice = events.iter().find(|e| e["error"] == "rate_limit").expect("the CLI's limit notice");
+    assert_eq!(notice["message"]["model"], "<synthetic>", "[{fx}]");
+
+    let watch = plan_watch(&events);
+    assert_eq!(
+        watch.limit(),
+        Some(&PlanLimit { window: "five_hour".into(), resets_at: 1793551200 }),
+        "[{fx}] the rejected window and its reset"
+    );
+
+    let result = events.iter().find(|e| is_result_event(e)).unwrap().to_string();
+    let parsed = parse_cli_result(&result, true, ArtifactKind::Diff, "").unwrap();
+    let out = apply_plan_limit(parsed, &watch);
+    assert!(matches!(out.status, StageStatus::Failed), "[{fx}] {:?}", out.status);
+    let err = out.error.as_deref().unwrap();
+    assert!(is_plan_limit(err), "[{fx}] {err}");
+    assert!(err.starts_with("Paused by your Claude plan — the 5-hour window"), "[{fx}] {err}");
+    assert!(err.contains("You've hit your 5-hour limit"), "[{fx}] the CLI's own words follow: {err}");
+    assert_eq!(out.session_id.as_deref(), Some("aaaaaaaa-0000-4000-8000-000000000007"), "[{fx}] session kept for Resume");
+    assert_eq!(out.cost_usd, 0.0045, "[{fx}] spend kept");
+    assert_eq!(out.cli.plan_limit.as_ref().map(|l| l.resets_at), Some(1793551200));
+
+    // A success-shaped result (`is_error: false`) whose reply is the limit
+    // notice is the same stop, not finished work handed to the next stage.
+    let mut ok = events.iter().find(|e| is_result_event(e)).unwrap().clone();
+    ok["is_error"] = Value::Bool(false);
+    let parsed = parse_cli_result(&ok.to_string(), true, ArtifactKind::Diff, "").unwrap();
+    assert!(matches!(parsed.status, StageStatus::Done));
+    let out = apply_plan_limit(parsed, &watch);
+    assert!(matches!(out.status, StageStatus::Failed), "[{fx}] success-shaped stop");
+    assert!(out.artifact.text.is_empty(), "[{fx}] the notice is not an artifact");
+    assert!(out.cli.plan_limit.is_some());
+}
+
+#[test]
+fn a_rejected_window_whose_reset_is_past_still_reaches_the_park() {
+    // #1109: Claude Code before 2.1.332 can report a limit after it reset.
+    // The watch keeps the stale `resetsAt` as-is; `plan_wait` names it.
+    use crate::orchestrator::cli_runner::{apply_plan_limit, is_plan_limit};
+    use crate::orchestrator::plan_wait::{park_decision, stale_count, DirectorReason, ParkDecision};
+    let rec = recording("2.1.314");
+    let fx = rec.label(REJECTED_REL);
+    let past = 1_000_000_000_i64;
+    let events: Vec<Value> = rec
+        .jsonl(REJECTED_REL)
+        .into_iter()
+        .map(|mut e| {
+            if e["type"] == "rate_limit_event" && e["rate_limit_info"]["status"] == "rejected" {
+                e["rate_limit_info"]["resetsAt"] = Value::from(past);
+            }
+            e
+        })
+        .collect();
+    let watch = plan_watch(&events);
+    assert_eq!(watch.limit().map(|l| l.resets_at), Some(past), "[{fx}]");
+    let result = events.iter().find(|e| is_result_event(e)).unwrap().to_string();
+    let out = apply_plan_limit(parse_cli_result(&result, true, ArtifactKind::Diff, "").unwrap(), &watch);
+    assert!(is_plan_limit(out.error.as_deref().unwrap()), "[{fx}]");
+    let limit = out.cli.plan_limit.expect("parks");
+    let now = past + 600;
+    let first = stale_count(limit.resets_at, now, 0);
+    assert_eq!(park_decision(limit.resets_at, now, 0, first, false, 0), ParkDecision::Resume { at: now + 90 }, "[{fx}]");
+    let second = stale_count(limit.resets_at, now, first);
+    assert_eq!(park_decision(limit.resets_at, now, 0, second, false, 0), ParkDecision::Director(DirectorReason::StaleReport));
+}
+
+#[test]
+fn a_rejected_window_covered_by_extra_usage_is_not_a_plan_limit() {
+    // `subscriber-rate-limit.jsonl`'s third event: rejected, but
+    // `isUsingOverage: true` — extra usage serves the request.
+    let rec = recording("2.1.314");
+    let fx = rec.label(SUBSCRIBER_REL);
+    let events = rec.jsonl(SUBSCRIBER_REL);
+    let watch = plan_watch(&events);
+    assert_eq!(watch.limit(), None, "[{fx}]");
+    let result = events.iter().find(|e| is_result_event(e)).unwrap().to_string();
+    let parsed = parse_cli_result(&result, true, ArtifactKind::Note, "").unwrap();
+    let out = crate::orchestrator::cli_runner::apply_plan_limit(parsed, &watch);
+    assert!(matches!(out.status, StageStatus::Done), "[{fx}] finished work is untouched");
+    assert!(out.cli.plan_limit.is_none());
+}
+
+#[test]
+fn a_window_allowed_again_clears_the_wall_and_other_failures_keep_their_cause() {
+    use crate::orchestrator::cli_runner::apply_plan_limit;
+    let rec = recording("2.1.314");
+    let mut events = rec.jsonl(REJECTED_REL);
+    let mut allowed = of_type(&events, "rate_limit_event")[1].clone();
+    allowed["rate_limit_info"]["status"] = Value::from("allowed");
+    let result = events.pop().unwrap();
+    events.push(allowed);
+    assert_eq!(plan_watch(&events).limit(), None, "the same window allowed again");
+
+    // A budget stop during a rejected window stays a budget stop.
+    let watch = plan_watch(&rec.jsonl(REJECTED_REL));
+    let mut budget = result.clone();
+    budget["subtype"] = Value::from(crate::orchestrator::cli_runner::BUDGET_STOP_SUBTYPE);
+    let parsed = parse_cli_result(&budget.to_string(), true, ArtifactKind::Note, "").unwrap();
+    let out = apply_plan_limit(parsed, &watch);
+    assert!(crate::orchestrator::cli_runner::is_budget_stop(out.error.as_deref().unwrap()));
+    assert!(out.cli.plan_limit.is_none());
+
+    // The real API-key recordings never show a plan wall.
+    for r in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/api-retry.jsonl"] {
+            if r.dir.join(rel).exists() {
+                assert_eq!(plan_watch(&r.jsonl(rel)).limit(), None, "[{}]", r.label(rel));
+            }
+        }
+    }
 }
 
 #[test]
@@ -749,6 +1877,85 @@ fn result_without_credential_expires_at_reports_nothing() {
     }
 }
 
+// ─── `claude auth status` → `loginExpiresAt` (claude.ai sign-in end) ───────
+
+const AUTH_STATUS_VERSION: &str = "2.1.319";
+
+#[test]
+fn auth_status_signed_in_reports_the_sign_in_end() {
+    use crate::agent_adapter::{parse_claude_auth_status as parse, ClaudeLoginProbe::SignedIn};
+    // Synthetic fixture (see the 2.1.319 README).
+    let rec = synthesized(AUTH_STATUS_VERSION);
+    let rel = "auth-status/signed-in.json";
+    let fx = rec.label(rel);
+    let mut v = rec.json(rel);
+    require_str(&fx, &v, "loginExpiresAt");
+    let want = chrono::DateTime::parse_from_rfc3339("2026-12-12T09:00:00Z").unwrap().timestamp();
+    assert_eq!(parse(&rec.text(rel)), SignedIn(want), "[{fx}]");
+    // A warning on stderr (joined after stdout) doesn't hide it.
+    assert_eq!(parse(&format!("{}\nwarning: something\n", rec.text(rel))), SignedIn(want), "[{fx}]");
+
+    // Epoch seconds or milliseconds read as the same moment.
+    v["loginExpiresAt"] = Value::from(want);
+    assert_eq!(parse(&v.to_string()), SignedIn(want));
+    v["loginExpiresAt"] = Value::from(want * 1000);
+    assert_eq!(parse(&v.to_string()), SignedIn(want));
+}
+
+#[test]
+fn auth_status_signed_out_is_told_apart_from_unknown() {
+    use crate::agent_adapter::{parse_claude_auth_status as parse, ClaudeLoginProbe::*};
+    let rec = synthesized(AUTH_STATUS_VERSION);
+    for rel in ["auth-status/signed-out.json", "auth-status/no-login-expires-at.json"] {
+        let fx = rec.label(rel);
+        assert!(rec.json(rel).get("loggedIn").is_some_and(Value::is_boolean), "[{fx}] loggedIn");
+    }
+    assert_eq!(parse(&rec.text("auth-status/signed-out.json")), SignedOut);
+    // An older CLI (before 2.1.318) is signed in but never says until when.
+    assert_eq!(parse(&rec.text("auth-status/no-login-expires-at.json")), Unknown);
+
+    // Signed out: a leftover date is never read as a sign-in.
+    let mut out = rec.json("auth-status/signed-out.json");
+    out["loginExpiresAt"] = Value::from(1_797_000_000_i64);
+    assert_eq!(parse(&out.to_string()), SignedOut);
+
+    // An unreadable value, or output that isn't the object, is unknown, never a panic.
+    let mut v = rec.json("auth-status/signed-in.json");
+    for junk in [Value::Null, Value::from("next month"), Value::from(""), Value::from(true), serde_json::json!({}), Value::from(0)] {
+        v["loginExpiresAt"] = junk.clone();
+        assert_eq!(parse(&v.to_string()), Unknown, "{junk}");
+    }
+    for text in ["", "Logged in using claude.ai", "Not logged in", "error: unknown command 'auth'", "} {", "{not json}"] {
+        assert_eq!(parse(text), Unknown, "{text:?}");
+    }
+}
+
+// ─── `system/init` `model` → the model a stage ran on (#791) ──
+
+#[test]
+fn init_events_name_the_model_the_session_runs_on() {
+    // Every recorded init carries `model`, and a stage that asked for that
+    // model (or its family alias) reads as not substituted.
+    use crate::orchestrator::cli_runner::{init_model, substituted_model};
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            let init = events.iter().find(|e| e["subtype"] == "init").unwrap_or_else(|| panic!("[{fx}] no init"));
+            let model = init_model(init).unwrap_or_else(|| panic!("[{fx}] init without a model: {init}"));
+            assert_eq!(substituted_model(model, init), None, "[{fx}]");
+        }
+    }
+    // The 2.1.314 retry fixture's init: `claude-sonnet-4-5`.
+    let rec = recording("2.1.314");
+    let events = rec.jsonl(API_RETRY_REL);
+    let init = &events[0];
+    assert_eq!(init_model(init), Some("claude-sonnet-4-5"), "[{}]", rec.label(API_RETRY_REL));
+    assert_eq!(substituted_model("sonnet", init), None);
+    assert_eq!(substituted_model("claude-sonnet-4-5-20250929", init), None);
+    assert_eq!(substituted_model("claude-opus-5-5", init).as_deref(), Some("claude-sonnet-4-5"));
+}
+
 // ─── `system/api_retry`, `system/notification` and `system/init` load errors → journal notices ──
 
 const API_RETRY_REL: &str = "stream-json/api-retry.jsonl";
@@ -786,6 +1993,10 @@ fn api_retry_events_journal_a_throttled_retry_notice() {
         }
         require_str(&fx, r, "error");
     }
+    // The delay each retry waits out stretches the runner's idle window.
+    let delays: Vec<Option<u64>> = retries.iter().map(|r| api_retry_delay(r).map(|d| d.as_millis() as u64)).collect();
+    assert_eq!(delays, [Some(520), Some(1130), Some(30_000), Some(2000)], "[{fx}]");
+    assert!(events.iter().filter(|e| e["subtype"] != "api_retry").all(|e| api_retry_delay(e).is_none()), "[{fx}]");
     let (entries, _, outcome) = replay(&fx, &events);
     assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
     assert_eq!(notice_texts(&entries), [
@@ -834,6 +2045,78 @@ fn notification_events_journal_their_message() {
     let mut th = RetryThrottle::default();
     let t0 = std::time::Instant::now();
     assert!(notes.iter().all(|e| th.allow(e, t0) && th.allow(e, t0)), "[{fx}]");
+}
+
+/// The version whose `SessionStart` / `SessionEnd` payloads were recorded
+/// live (see its README).
+const SESSION_HOOKS_VERSION: &str = "2.1.327";
+
+/// The session hooks (`SessionStart`, `SessionEnd`) say which Claude Code
+/// session a Run terminal runs. Recorded payloads, through the hook binary's
+/// path and the poller's bookkeeping, in the order Claude Code fired them.
+#[test]
+fn session_hook_payloads_move_the_terminal_between_sessions() {
+    use crate::agent_adapter::{parse_hook_event, HookSignal};
+    use crate::claude_hooks::{record_hook_from, remember_sessions};
+    let rec = synthesized(SESSION_HOOKS_VERSION);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db = crate::db::Db::open(tmp.path()).unwrap();
+    let current = || db.terminal_claude_session("term-1").unwrap().map(|(s, _)| s);
+    let session_in = |rel: &str| {
+        let payload = rec.json(rel);
+        require_str(&rec.label(rel), &payload, "transcript_path");
+        require_str(&rec.label(rel), &payload, "cwd");
+        require_str(&rec.label(rel), &payload, "session_id").to_string()
+    };
+    // `claude` starts, `/clear`, `/exit`: the terminal UI (`cli`).
+    let steps = [
+        ("hooks/session-start-startup.json", HookSignal::SessionStarted, "source", "startup"),
+        ("hooks/session-end-clear.json", HookSignal::SessionEnded, "reason", "clear"),
+        ("hooks/session-start-clear.json", HookSignal::SessionStarted, "source", "clear"),
+        ("hooks/session-end-exit.json", HookSignal::SessionEnded, "reason", "prompt_input_exit"),
+    ];
+    let first = session_in(steps[0].0);
+    let second = session_in(steps[2].0);
+    assert_ne!(first, second, "`/clear` gives the process a new session id");
+    assert_eq!(session_in(steps[1].0), first, "the end names the session that ended");
+    let mut seen = Vec::new();
+    for (rel, want, field, value) in steps {
+        let fx = rec.label(rel);
+        let payload = rec.json(rel);
+        assert_eq!(payload[field], value, "[{fx}] {field}");
+        let event = parse_hook_event(&payload, None).unwrap_or_else(|| panic!("[{fx}] maps to no signal"));
+        assert_eq!(event.signal, want, "[{fx}]");
+        assert!(record_hook_from(&db, Some("term-1"), None, Some("cli"), &rec.text(rel)), "[{fx}]");
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1, "[{fx}]");
+        assert_eq!(rows[0].signal, want.as_str(), "[{fx}]");
+        remember_sessions(&db, &rows);
+        seen.push(current());
+    }
+    assert_eq!(seen, [Some(first), None, Some(second), None], "start · /clear (end, start) · /exit");
+
+    // Print mode fires both events too, and inherits the terminal's id when
+    // an agent runs it. Its hook's environment says `sdk-cli`: both are
+    // queued as an end of that session, which sets it aside (never the
+    // terminal's session, never a rival of it) and links nothing.
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    record_hook_from(&db, Some("term-1"), None, Some("cli"), &rec.text("hooks/session-start-startup.json"));
+    remember_sessions(&db, &db.drain_hook_signals().unwrap());
+    let nested = session_in("hooks/session-start-print.json");
+    for rel in ["hooks/session-start-print.json", "hooks/session-end-print.json"] {
+        let fx = rec.label(rel);
+        assert!(parse_hook_event(&rec.json(rel), None).is_some_and(|e| e.signal.is_session()), "[{fx}]");
+        assert!(record_hook_from(&db, Some("term-1"), None, Some("sdk-cli"), &rec.text(rel)), "[{fx}]");
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1, "[{fx}]");
+        assert_eq!(
+            (rows[0].signal.as_str(), rows[0].session_id.as_deref()),
+            (HookSignal::SessionEnded.as_str(), Some(nested.as_str())),
+            "[{fx}] print mode is set aside, not linked",
+        );
+        remember_sessions(&db, &rows);
+        assert_eq!(current(), Some(session_in("hooks/session-start-startup.json")), "[{fx}] the terminal keeps its own session");
+    }
 }
 
 #[test]
@@ -963,6 +2246,43 @@ fn transcript_jsonl_yields_one_ledger_row_per_api_call() {
         }
         // The recording's cwd maps to the directory name Claude Code uses.
         assert_eq!(crate::transcripts::project_dir_name("/Users/dev/project"), "-Users-dev-project");
+    }
+}
+
+/// The Run Companion's context meter reads a session's last main-thread
+/// prompt from the end of its transcript (`transcripts::last_prompt`): the
+/// recording's main-thread lines say `isSidechain: false`, and its last
+/// billed message is the one the reader returns.
+#[test]
+fn transcript_tail_gives_the_sessions_last_main_thread_prompt() {
+    for rec in recordings() {
+        let (rel, path) = transcript_file(&rec);
+        let fx = rec.label(&rel);
+        let lines = rec.jsonl(&rel);
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let mut expected: Option<u64> = None;
+        for l in of_type(&lines, "assistant") {
+            assert_eq!(l.get("isSidechain").and_then(Value::as_bool), Some(false), "[{fx}] a main-thread line says isSidechain: false");
+            let model = require_str(&fx, l, "message.model");
+            let total: u64 = USAGE_FIELDS.iter().map(|f| require_u64(&fx, l, &format!("message.usage.{f}"))).sum();
+            if model.starts_with('<') || total == 0 {
+                continue;
+            }
+            let prompt = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+                .iter()
+                .map(|f| require_u64(&fx, l, &format!("message.usage.{f}")))
+                .sum();
+            expected = Some(prompt);
+        }
+        // Laid out as Claude Code does: <projects>/<cwd, sanitized>/<session>.jsonl.
+        let root = tempfile::tempdir().unwrap();
+        let cwd = "/Users/dev/project";
+        let dir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&path, dir.join(format!("{stem}.jsonl"))).unwrap();
+        let got = crate::transcripts::last_prompt(root.path(), cwd, &stem);
+        assert_eq!(got.as_ref().map(|p| p.tokens), expected, "[{fx}] last prompt");
+        assert!(got.is_some_and(|p| p.model.starts_with("claude-")), "[{fx}] its model");
     }
 }
 

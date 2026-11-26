@@ -39,6 +39,17 @@ describe("ProjectContextMenu", () => {
     expect(screen.getByText(/Delete from disk/)).toBeInTheDocument();
   });
 
+  it("offers Archive merged missions… with its count only while there is one (#963)", () => {
+    const onArchiveMerged = vi.fn();
+    const { rerender } = render(<ProjectContextMenu {...baseProps} mergedCount={0} onArchiveMerged={onArchiveMerged} />);
+    expect(screen.queryByText("Archive merged missions…")).toBeNull();
+    rerender(<ProjectContextMenu {...baseProps} mergedCount={2} onArchiveMerged={onArchiveMerged} />);
+    const item = screen.getByRole("menuitem", { name: /Archive merged missions…/ });
+    expect(item).toHaveTextContent("2");
+    fireEvent.click(item);
+    expect(onArchiveMerged).toHaveBeenCalledTimes(1);
+  });
+
   it("does not render the dropped 'coming soon' stub items", () => {
     render(<ProjectContextMenu {...baseProps} />);
     expect(screen.queryByText(/Project settings/)).not.toBeInTheDocument();
@@ -190,5 +201,104 @@ describe("ProjectContextMenu", () => {
   it("does not render Set Jira project key item when prop is not provided", () => {
     render(<ProjectContextMenu {...baseProps} />);
     expect(screen.queryByText(/Set Jira project key/)).not.toBeInTheDocument();
+  });
+
+  it("offers New mission group only when wired, runs it and dismisses", () => {
+    const { unmount } = render(<ProjectContextMenu {...baseProps} />);
+    expect(screen.queryByRole("menuitem", { name: "New mission group" })).toBeNull();
+    unmount();
+    const onNewGroup = vi.fn();
+    const onDismiss = vi.fn();
+    render(<ProjectContextMenu {...baseProps} onNewGroup={onNewGroup} onDismiss={onDismiss} />);
+    fireEvent.click(screen.getByRole("menuitem", { name: "New mission group" }));
+    expect(onNewGroup).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  describe("Move to group (project groups)", () => {
+    const GROUPS = [
+      { id: "g-client", name: "Client work", tint: "verdigris" as const },
+      { id: "g-side", name: "Side projects", tint: null },
+    ];
+    const openSubmenu = () => {
+      fireEvent.click(screen.getByRole("menuitem", { name: /Move to group/ }));
+      return screen.getByRole("menu", { name: "Move to group" });
+    };
+
+    it("is drawn only when the move and the new-group flows are wired", () => {
+      render(<ProjectContextMenu {...baseProps} />);
+      expect(screen.queryByRole("menuitem", { name: /Move to group/ })).toBeNull();
+    });
+
+    it("lists the project groups with the current one checked, and moves the project", () => {
+      const onMoveToGroup = vi.fn();
+      const onDismiss = vi.fn();
+      render(
+        <ProjectContextMenu
+          {...baseProps}
+          projectGroups={GROUPS}
+          projectGroupId="g-client"
+          onMoveToGroup={onMoveToGroup}
+          onNewProjectGroup={vi.fn()}
+          onRemoveFromGroup={vi.fn()}
+          onDismiss={onDismiss}
+        />,
+      );
+      const submenu = openSubmenu();
+      const rows = submenu.querySelectorAll('[role="menuitemradio"]');
+      expect([...rows].map((r) => r.textContent)).toEqual(["Client work", "Side projects"]);
+      expect(rows[0]).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(rows[1]);
+      expect(onMoveToGroup).toHaveBeenCalledWith("g-side");
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    it("New group… and Remove from group run and dismiss; a loose project gets no Remove", () => {
+      const onNewProjectGroup = vi.fn();
+      const onRemoveFromGroup = vi.fn();
+      const props = {
+        ...baseProps,
+        projectGroups: GROUPS,
+        onMoveToGroup: vi.fn(),
+        onNewProjectGroup,
+        onRemoveFromGroup,
+      };
+      const first = render(<ProjectContextMenu {...props} projectGroupId={null} />);
+      const loose = openSubmenu();
+      expect(loose.textContent).not.toContain("Remove from group");
+      fireEvent.click(screen.getByRole("menuitem", { name: /New group…/ }));
+      expect(onNewProjectGroup).toHaveBeenCalledTimes(1);
+      first.unmount();
+
+      render(<ProjectContextMenu {...props} projectGroupId="g-side" />);
+      openSubmenu();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Remove from group" }));
+      expect(onRemoveFromGroup).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the mission-group item apart: by name, and a block away with the project's missions", () => {
+      render(
+        <ProjectContextMenu
+          {...baseProps}
+          onNewGroup={vi.fn()}
+          projectGroups={GROUPS}
+          onMoveToGroup={vi.fn()}
+          onNewProjectGroup={vi.fn()}
+        />,
+      );
+      // No row of the project's own menu reads plain "New group": that phrase
+      // belongs to "Move to group", which groups the project itself.
+      const rows = Array.from(
+        screen.getByRole("menu", { name: "Project actions" }).querySelectorAll<HTMLElement>(":scope > *"),
+      ).map((el) => (el.querySelector('[role="menuitem"]') ?? el).textContent?.trim() || "—");
+      expect(rows).not.toContain("New group");
+      const at = (label: string) => rows.findIndex((row) => row.startsWith(label));
+      // Move to group leads the block that places the project in the rail…
+      expect(at("Move to group")).toBe(at("Pin to top") - 1);
+      // …and the mission group is made in the missions block, past a separator.
+      expect(at("New mission group")).toBe(at("Archived workspaces") - 1);
+      expect(at("New mission group")).toBeGreaterThan(at("Move down"));
+      expect(rows.slice(at("Move to group"), at("New mission group"))).toContain("—");
+    });
   });
 });

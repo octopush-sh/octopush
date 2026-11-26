@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { Plus } from "lucide-react";
 import { useRunsStore } from "../stores/runsStore";
 import { runStatusMeta, aggregateSavings } from "../lib/runStatus";
+import { formatUsd } from "../lib/cost";
 import { CompanionCurrentRun } from "./CompanionCurrentRun";
 
 interface Props { workspaceId: string; }
@@ -38,7 +39,7 @@ export function CompanionRuns({ workspaceId }: Props) {
       <CompanionCurrentRun workspaceId={workspaceId} />
       {showLedger && (
         <div className="octo-rise-in px-3.5 py-2 font-mono text-[10px] text-octo-mute">
-          saved <span className="octo-tabular text-octo-verdigris">${totals.saved.toFixed(2)}</span> across {totals.n} run{totals.n === 1 ? "" : "s"}
+          saved <span className="octo-tabular text-octo-verdigris">{formatUsd(totals.saved)}</span> across {totals.n} run{totals.n === 1 ? "" : "s"}
         </div>
       )}
       {/* Empty state only once the first load has resolved — otherwise the
@@ -65,7 +66,7 @@ export function CompanionRuns({ workspaceId }: Props) {
               {/* Fixed glyph slot (S1) — the one and only status glyph on the row. */}
               <span className={`w-2 shrink-0 text-center ${meta.className}`}>{meta.glyph}</span>
               <span className={meta.className}>{meta.word}</span>
-              <span className="octo-tabular">· ${r.costUsd.toFixed(2)}</span>
+              <span className="octo-tabular">· {formatUsd(r.costUsd)}</span>
               {r.linkedIssueKey && <span>· {r.linkedIssueKey}</span>}
             </div>
           </button>

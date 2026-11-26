@@ -22,6 +22,7 @@ import {
   BookOpen,
   MoreHorizontal,
   Check,
+  Lock,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { ipc } from "../lib/ipc";
@@ -37,6 +38,7 @@ import { isMarkdownFile } from "../lib/isMarkdownFile";
 import { DiffView } from "./review/DiffView";
 import { AiReviewPanel } from "./review/AiReviewPanel";
 import { TestDrawer } from "./review/TestDrawer";
+import { baseName, commitCount, sinceBaseLabel, type ReviewSource } from "../lib/reviewSource";
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -65,7 +67,20 @@ interface Props {
   workspaceId: string;
   workspacePath: string;
   gitStatus: GitStatus | null;
+  /** The diff on screen: the working tree's, or the committed one when
+   *  `source` is "committed". */
   gitDiff: string;
+  /** The workspace the working diff was fetched for (null while none is),
+   *  so an open comment draft is not read against another workspace's diff. */
+  diffWorkspaceId?: string | null;
+  /** Which change the diff shows (#851). "committed" is read-only. */
+  source?: ReviewSource;
+  /** Commits since the base; the source toggle shows only when > 0. */
+  commitsAhead?: number;
+  /** The base branch and merge base (short SHA) the committed view diffs from. */
+  base?: string | null;
+  mergeBase?: string | null;
+  onSourceChange?: (source: ReviewSource) => void;
   /** Callback to request parent to re-fetch diff (after Accept/Reject). */
   onDiffChange?: () => void;
   /** Default test command (pre-fill before the user saves one). */
@@ -94,6 +109,12 @@ export function ReviewCanvas({
   workspacePath,
   gitStatus,
   gitDiff,
+  diffWorkspaceId,
+  source = "working",
+  commitsAhead = 0,
+  base = null,
+  mergeBase = null,
+  onSourceChange,
   onDiffChange,
   initialTestCommand,
   children,
@@ -232,9 +253,11 @@ export function ReviewCanvas({
   // When the last change is accepted/committed the toolbar's AI toggle hides
   // (it only shows with files to review); close the drawer so its state can't
   // disagree with a missing toggle.
+  const readOnly = source === "committed";
+  const fileCount = readOnly ? diffFiles.length : gitStatus?.changedFiles.length ?? 0;
   useEffect(() => {
-    if ((gitStatus?.changedFiles.length ?? 0) === 0) setAiOpen(false);
-  }, [gitStatus]);
+    if (fileCount === 0) setAiOpen(false);
+  }, [fileCount]);
 
   // Dismiss the test-command popover and the overflow menu on an outside
   // click. Their triggers count as inside: each toggles on its own click, and
@@ -358,7 +381,8 @@ export function ReviewCanvas({
     }
   };
 
-  const fileCount = gitStatus?.changedFiles.length ?? 0;
+  const workingCount = gitStatus?.changedFiles.length ?? 0;
+  const sinceTitle = `Commits since ${baseName(base)}${mergeBase ? ` (merge base ${mergeBase})` : ""} · read-only`;
 
   return (
     // `isolate` keeps the toolbar's z-index local to this canvas, so it never
@@ -371,6 +395,64 @@ export function ReviewCanvas({
           On a narrow canvas the secondary toggles shed into "More"
           (`.octo-reviewbar` ladder) so AI and Accept all stay whole. */}
       <header ref={toolbarRef} className="octo-reviewbar flex h-11 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel px-3">
+        {/* Source — Working tree / Since base (#851). Only once the workspace
+            has commits ahead of its base; the committed view is read-only. */}
+        {viewMode === "diff" && commitsAhead > 0 && (
+          <div className="octo-fade-in flex min-w-0 items-center gap-2">
+            <div
+              role="group"
+              aria-label="Diff source"
+              data-tour="review-diff-source"
+              className="flex shrink-0 items-center overflow-hidden rounded-md border border-octo-hairline"
+            >
+              <button
+                onClick={() => onSourceChange?.("working")}
+                aria-pressed={!readOnly}
+                title={
+                  workingCount > 0
+                    ? `Uncommitted changes · ${workingCount} file${workingCount === 1 ? "" : "s"}`
+                    : "Uncommitted changes · the working tree is clean"
+                }
+                className={`whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                  !readOnly ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+                }`}
+                style={!readOnly ? { background: "var(--brass-ghost)" } : undefined}
+              >
+                Working tree
+              </button>
+              <button
+                onClick={() => onSourceChange?.("committed")}
+                aria-pressed={readOnly}
+                // The count sheds on a narrow toolbar; the name keeps it.
+                aria-label={sinceBaseLabel(commitsAhead)}
+                title={sinceTitle}
+                className={`inline-flex items-center whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                  readOnly ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+                }`}
+                style={readOnly ? { background: "var(--brass-ghost)" } : undefined}
+              >
+                {/* The toolbar's first rung (≤ 600px, `.octo-reviewbar`): the
+                    commit count sheds, "Since base" is the floor; the count
+                    stays in the aria-label and the lock's tooltip. */}
+                Since base
+                <span className="octo-demote octo-demote-source-count" data-testid="review-source-count">
+                  {`\u00a0· ${commitCount(commitsAhead)}`}
+                </span>
+              </button>
+            </div>
+            {readOnly && (
+              <span
+                role="img"
+                aria-label="Read-only"
+                data-tour="review-diff-readonly"
+                title={`Read-only: ${commitCount(commitsAhead)} since ${baseName(base)}, already committed. Accept and Reject act on the working tree.`}
+                className="octo-pop-in flex shrink-0 items-center text-octo-mute"
+              >
+                <Lock size={12} aria-hidden />
+              </span>
+            )}
+          </div>
+        )}
         <div className="ml-auto flex items-center gap-2">
           {/* View toggle — Diff / Editor */}
           <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-octo-hairline">
@@ -607,6 +689,7 @@ export function ReviewCanvas({
                 )}
               </button>
 
+              {!readOnly && (
               <button
                 onClick={handleAcceptAll}
                 data-tour="review-accept-all"
@@ -621,6 +704,7 @@ export function ReviewCanvas({
                 <CheckSquare size={12} />
                 Accept all
               </button>
+              )}
             </>
           )}
         </div>
@@ -631,9 +715,19 @@ export function ReviewCanvas({
         {/* Diff view */}
         {viewMode === "diff" && (
           <DiffView
+            // A source switch is a different diff: its viewed/collapsed marks
+            // and focus start fresh rather than reading as "changed since viewed".
+            key={source}
             active={active}
             files={diffFiles}
             workspacePath={workspacePath}
+            workspaceId={workspaceId}
+            diffWorkspaceId={diffWorkspaceId}
+            readOnly={readOnly}
+            // The committed side matches the disk only while the tree is clean.
+            diskContext={!readOnly || workingCount === 0}
+            empty={{ source, commitsAhead, base, workingCount, ignoreWhitespace }}
+            onShowCommitted={() => onSourceChange?.("committed")}
             stagedCount={
               gitStatus?.changedFiles.filter((f) => f.staged).length ?? 0
             }

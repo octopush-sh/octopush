@@ -17,6 +17,7 @@ import { iconForRole } from "../../lib/roleIcons";
 import { lastActivity } from "../../lib/liveLine";
 import { formatDuration } from "../../lib/duration";
 import { fmtTokens } from "../../lib/stageMeta";
+import { formatUsd } from "../../lib/cost";
 import { prefersReducedMotion } from "../../lib/motion";
 import { formatTierMix, tierMix } from "../../lib/policy";
 import { StageDots } from "../direct/StageDots";
@@ -164,7 +165,7 @@ export function crewSummary(agents: CrewAgent[]): string {
   const tokens = agents.reduce((n, a) => n + (a.meta ? a.meta.inputTokens + a.meta.outputTokens : 0), 0);
   const cost = agents.reduce((n, a) => n + (a.meta?.costUsd ?? 0), 0);
   if (tokens > 0) parts.push(`${fmtTokens(tokens)} tokens`);
-  if (cost > 0) parts.push(`$${cost.toFixed(2)}`);
+  if (cost > 0) parts.push(formatUsd(cost));
   const mix = tierMix(
     agents.map((a) => ({ tier: a.meta?.tier ?? null, tokens: a.meta ? a.meta.inputTokens + a.meta.outputTokens : 0 })),
   );

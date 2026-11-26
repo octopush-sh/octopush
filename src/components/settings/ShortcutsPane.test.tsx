@@ -13,4 +13,27 @@ describe("ShortcutsPane", () => {
       expect(chip.className).not.toMatch(/brass/);
     }
   });
+
+  it("lists the modes in switcher order, numbered in that order", () => {
+    const { container } = render(<ShortcutsPane />);
+    const rows = Array.from(container.querySelectorAll("li"))
+      .map((li) => [li.querySelector("span")?.textContent, li.querySelector("kbd")?.textContent])
+      .filter(([desc]) => desc?.endsWith(" mode"));
+    expect(rows).toEqual([
+      ["Run mode", "⌘⇧1"],
+      ["Talk mode", "⌘⇧2"],
+      ["Review mode", "⌘⇧3"],
+      ["Direct mode", "⌘⇧D"],
+    ]);
+    expect(container.querySelector('[data-tour="settings-shortcuts-modes"]')).toHaveTextContent("Run mode");
+  });
+
+  it("shows each key exactly once, with no escape leaking into a label", () => {
+    const { container } = render(<ShortcutsPane />);
+    const labels = Array.from(container.querySelectorAll("kbd")).map((k) => k.textContent);
+    expect(labels).toContain("⌘\\");
+    for (const label of labels) {
+      expect(label).not.toContain("\\\\");
+    }
+  });
 });

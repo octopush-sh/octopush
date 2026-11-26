@@ -74,18 +74,28 @@ fn main() {
     }
 }
 
-/// The hook mode: always exits 0. Outside an Octopush terminal (no terminal
-/// id, e.g. a Direct stage's `claude -p`) it records nothing. Skips
-/// migrations: only an app that already created `hook_signals` installs it.
+/// The hook mode: always exits 0 and prints nothing (Claude Code adds a
+/// `SessionStart` hook's stdout to the conversation; the installed command
+/// discards it as well). Outside an Octopush terminal (no terminal id, e.g. a
+/// Direct stage's `claude -p`) it records nothing. Skips migrations: only an
+/// app that already created `hook_signals` installs it.
 fn run_hook() {
     use std::io::Read;
-    use octopush_lib::claude_hooks::{hook_kind, record_hook, MAX_PAYLOAD, TERMINAL_ENV};
+    use octopush_lib::agent_adapter::ENTRYPOINT_ENV;
+    use octopush_lib::claude_hooks::{hook_kind, record_hook_at, MAX_PAYLOAD, TERMINAL_ENV};
+    // When the hook fired, noted before anything that can wait (stdin, the
+    // database): rows are queued in the order they are written, and this is
+    // what orders a session's start against its end.
+    let fired = chrono::Utc::now();
     let mut payload = String::new();
     let _ = io::stdin().lock().take(MAX_PAYLOAD).read_to_string(&mut payload);
     let Ok(terminal) = std::env::var(TERMINAL_ENV) else { return };
+    // How Claude Code says the session was started: print mode and the SDKs
+    // are never the terminal's own session.
+    let entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
     let args: Vec<String> = std::env::args().collect();
     if let Ok(db) = Db::open_without_migrations(&Db::default_path()) {
-        record_hook(&db, Some(&terminal), hook_kind(&args), &payload);
+        record_hook_at(&db, Some(&terminal), hook_kind(&args), entrypoint.as_deref(), &payload, fired);
     }
 }
 

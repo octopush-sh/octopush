@@ -250,6 +250,11 @@ pub struct StageInput {
     /// blind to what iterations 1..N-1 tried and why they were closed — the
     /// setup for the classic review-loop oscillation between two answers.
     pub history: Option<String>,
+    /// Collision radar, phase 2 (#732): for a code-writing stage whose
+    /// workspace changes the same files as another live workspace of the
+    /// project, one line per peer naming it and the shared files
+    /// (`collisions::concurrent_work_note`). `None` when nothing overlaps.
+    pub concurrent_work: Option<String>,
 }
 
 /// A director's hot-edit riding along with a re-run: validated BEFORE any
@@ -296,11 +301,27 @@ pub struct StageSpec {
     pub instructions: Option<String>,
     /// CLI session to `--resume` on this run (set only by a Resume action).
     pub resume_session: Option<String>,
+    /// The director chose to drop the session's deferred call whose tool is
+    /// gone (set only by a Drop-the-call action): the `--resume` runs with
+    /// `cli_runner::DROP_DEFERRED_TOOL_ENV` and `cli_runner::DROP_DEFERRED_PROMPT`.
+    pub drop_deferred_call: bool,
     /// What the session being resumed had already reported spending (its last
     /// archived attempt's cost; `0.0` for a fresh run). A resumed Claude run
     /// reports the conversation's whole total, so its `--max-budget-usd` cap
     /// adds this on top of the remaining headroom.
     pub resume_prior_cost_usd: f64,
+    /// For a resumed Claude session: the context its last reply read (the
+    /// stage's context reading when the Resume or answer set `resume_pending`;
+    /// `None` when none was recorded, and on a fresh run). A resume whose
+    /// first reply reads far less came back on an empty conversation
+    /// (`cli_runner::ResumeWatch`).
+    pub resume_context_tokens: Option<u64>,
+    /// For a resumed Codex session: the token totals the session had reported
+    /// at the end of its last run. `codex exec resume` reports the THREAD's
+    /// running total on `turn.completed` (the earlier runs' tokens included),
+    /// so the runner subtracts this to count only the resumed run's own
+    /// tokens. `None` on a fresh run and on Claude.
+    pub resume_baseline: Option<SessionUsage>,
     /// Serialized [`BlockedTranscript`](crate::orchestrator::agentic::BlockedTranscript)
     /// of an answered `ask_director` block: the API runner continues that
     /// conversation (answer as tool_result) instead of re-running the stage
@@ -321,6 +342,65 @@ pub struct ToolCallLog {
     pub name: String,
     pub input: serde_json::Value,
     pub result: String,
+}
+
+/// Token totals a CLI session has reported, as stored on the stage row
+/// (`run_stages.session_usage`) and used as a resume baseline. The same split
+/// as [`StageOutcome`]: `input_tokens` excludes the cache reads and writes.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+impl SessionUsage {
+    /// `self` minus `earlier`, field by field — `None` when any field of
+    /// `self` is below `earlier`'s. A running total never shrinks, so a lower
+    /// field means `self` is not a continuation of `earlier` (another thread,
+    /// a reset or a changed report): subtracting would clamp to ~0 and
+    /// undercount, so the caller counts the raw usage instead.
+    pub fn since(&self, earlier: &SessionUsage) -> Option<SessionUsage> {
+        Some(SessionUsage {
+            input_tokens: self.input_tokens.checked_sub(earlier.input_tokens)?,
+            output_tokens: self.output_tokens.checked_sub(earlier.output_tokens)?,
+            cache_read_tokens: self.cache_read_tokens.checked_sub(earlier.cache_read_tokens)?,
+            cache_creation_tokens: self.cache_creation_tokens.checked_sub(earlier.cache_creation_tokens)?,
+        })
+    }
+}
+
+/// CLI-only facts about a stage attempt that the drive persists.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CliOutcomeMeta {
+    /// Part of this stage's spend is unknown (a Codex turn ended without its
+    /// `turn.completed`), even when the outcome itself is `Done` — e.g. a
+    /// failed `codex exec resume` followed by a fresh run that finished. The
+    /// drive flags the row `usage_unreported` (as it does for an error that
+    /// carries `cli_runner::USAGE_UNREPORTED`).
+    pub usage_unreported: bool,
+    /// Every cause of `usage_unreported` is already in the journal (a
+    /// `cli_runner::usage_drift_notice`), so the drive flags the row without
+    /// adding the generic `cli_runner::USAGE_UNREPORTED` line.
+    pub usage_unreported_journaled: bool,
+    /// The session's reported running total at the end of this attempt
+    /// (Codex), kept as the next resume's baseline. `None` when the last turn
+    /// never completed, so the total is unknown and the session isn't resumed.
+    pub session_usage: Option<SessionUsage>,
+    /// A Claude plan window stopped this attempt (`cli_runner::apply_plan_limit`):
+    /// the drive parks the run until the window resets.
+    pub plan_limit: Option<crate::orchestrator::cli_runner::PlanLimit>,
+    /// The model a Claude stage ran on when its `system/init` named another
+    /// than the one it asked for (`cli_runner::substituted_model`); `None`
+    /// when they match or the init didn't say. The drive records it on the
+    /// stage, so its spend is attributed and priced to what ran.
+    pub ran_model: Option<String>,
+    /// The tool calls Claude Code refused in this attempt, from its result
+    /// event's `permission_denials` (`cli_runner::refused_calls`), repeats
+    /// collapsed. The runner journals each; the drive records the total so
+    /// the stage reads "N tool calls refused".
+    pub refused_calls: Vec<crate::orchestrator::cli_runner::RefusedCall>,
 }
 
 /// What a runner returns for one stage.
@@ -354,6 +434,8 @@ pub struct StageOutcome {
     /// only): persisted on the stage row so the answered re-run continues the
     /// same conversation instead of starting over.
     pub blocked_transcript: Option<String>,
+    /// CLI-only bookkeeping (Codex resume baseline, unknown spend).
+    pub cli: CliOutcomeMeta,
 }
 
 /// What the user chose at a checkpoint.
@@ -374,6 +456,13 @@ pub enum CheckpointAction {
     /// `--resume`s that session; otherwise it is a fresh re-run (worktree
     /// preserved). `max_turns_override` raises the tool-turn budget.
     Resume {
+        max_turns_override: Option<i64>,
+    },
+    /// Resume a stage whose resumed session was waiting on a deferred call
+    /// whose tool is gone (`cli_runner::is_deferred_tool_unavailable`),
+    /// dropping that call: Claude gets an error as its result and carries on.
+    /// Refused on any other stage.
+    DropDeferredCall {
         max_turns_override: Option<i64>,
     },
     /// Revert the worktree to the failed stage's baseline (drop only this

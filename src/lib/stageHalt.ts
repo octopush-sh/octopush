@@ -1,12 +1,56 @@
 export interface HaltCause {
   title: string;
   remedy?: string;
+  /** Re-run is the primary action even when the session can be resumed. */
+  preferRerun?: boolean;
+}
+
+/** The markers `parse_cli_result` (cli_runner.rs) puts on a hook-deferred tool call. */
+const DEFERRED_MARKERS = ["(terminal_reason: tool_deferred)", "(terminal_reason: tool_deferred_unavailable)"];
+
+/** Whether a stage error is a hook-deferred tool halt (either marker). */
+export function isDeferredToolHalt(error: string | null): boolean {
+  return !!error && DEFERRED_MARKERS.some((m) => error.includes(m));
+}
+
+/** Whether a stage error is a resumed session whose deferred tool is gone:
+ *  the halt that can drop the call (`drop_call`). */
+export function isDeferredToolUnavailable(error: string | null): boolean {
+  return !!error && error.includes(DEFERRED_MARKERS[1]);
 }
 
 /** Map a backend stage error string to a plain-English cause + remedy. */
 export function haltCause(error: string | null, maxIterations: number): HaltCause {
   const raw = (error ?? "").trim();
   if (!raw) return { title: "Stage halted" };
+  if (isDeferredToolHalt(raw)) {
+    // The backend's first line is the whole explanation: "<cause>. <remedy>"
+    // (the tool name can hold dots, the remedy can't).
+    const line = raw.split("\n")[0];
+    const cut = line.lastIndexOf(". ");
+    return cut < 0
+      ? { title: line, preferRerun: true }
+      : { title: line.slice(0, cut), remedy: line.slice(cut + 2), preferRerun: true };
+  }
+  // "Skip Claude Code 2.1.329 on a gateway model: it drops …; 2.1.330
+  // restores it. Update Claude Code, then resume or re-run." — the first line
+  // `agent_adapter::known_bad_stage_error` puts on a gateway max_tokens failure.
+  const knownBad = /^Skip Claude Code (\S+) on a gateway model: it (.+)\. (Update Claude Code, then resume or re-run\.)$/.exec(
+    raw.split("\n")[0],
+  );
+  if (knownBad) {
+    return {
+      title: `Claude Code ${knownBad[1]} is a release to skip on a gateway model`,
+      remedy: `It ${knownBad[2]}. ${knownBad[3]}`,
+    };
+  }
+  if (raw.includes("(plan_limit)")) {
+    return {
+      title: "Paused by your Claude plan",
+      remedy:
+        "The stage keeps its spend and its session. Resuming continues the same session once the plan's window resets; nothing you approved is skipped.",
+    };
+  }
   if (raw.includes("error_max_turns")) {
     return {
       title: `Claude stopped early — it reached the ${maxIterations}-turn limit`,
@@ -29,6 +73,34 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
   }
   if (raw.includes("error_during_execution")) {
     return { title: "Claude hit an execution error mid-run", remedy: "Resume or re-run to continue." };
+  }
+  // "claude timed out — Bash `npm test` gave no result for 11 minutes" (cli_runner.rs `idle_timeout_message`).
+  const stalled = /timed out — (.+) gave no result for (\d+ minutes?)/.exec(raw.split("\n")[0]);
+  if (stalled) {
+    return {
+      title: `${stalled[1]} gave no result for ${stalled[2]}`,
+      remedy: "Claude Code was still waiting on it. Check why it hangs, then resume or re-run.",
+    };
+  }
+  // "claude timed out — no output for 10 minutes after an API retry (overloaded)".
+  const retried = /no output for (\d+ minutes?) after an API retry(?: \(([^)]+)\))?/.exec(raw.split("\n")[0]);
+  if (retried) {
+    return {
+      title: `No answer for ${retried[1]} after an API retry${retried[2] ? ` (${retried[2]})` : ""}`,
+      remedy: "Claude Code waited out its retry delay and the API still didn't answer. Check the provider, then resume or re-run.",
+    };
+  }
+  // "claude timed out — Claude Code sent no request in 5 minutes", and on a CLI
+  // before 2.1.327 "; Claude Code 2.1.327 fixes a hang … Update Claude Code".
+  const noRequest = /timed out — Claude Code sent no request in (\d+ minutes?)(?:; (.+))?/.exec(raw.split("\n")[0]);
+  if (noRequest) {
+    return {
+      title: `Claude Code sent no request in ${noRequest[1]}`,
+      remedy: noRequest[2]
+        ? `${noRequest[2]}, then re-run.`
+        : "It stalled at start-up, before talking to the API. Check any proxy between Claude Code and the API, then re-run.",
+      preferRerun: true,
+    };
   }
   if (/no output for/i.test(raw)) {
     return { title: "Claude produced no output and timed out", remedy: "The CLI stalled — resume or re-run." };

@@ -106,7 +106,10 @@ describe("ScratchpadIcon - Integration Tests", () => {
     const { container } = render(<ScratchpadIcon onClick={vi.fn()} />);
 
     const button = container.querySelector("button");
-    expect(button).toHaveStyle("color: var(--color-octo-brass)");
+    // Assert the token the component sets inline. jsdom 31 resolves `var()` in
+    // getComputedStyle (which toHaveStyle reads), and the test DOM defines no
+    // --color-octo-* custom properties, so the computed color is not the token.
+    expect(button?.style.color).toBe("var(--color-octo-brass)");
   });
 
   it("CRITICAL: Icon transitions between states when store changes", () => {

@@ -123,11 +123,39 @@ export interface ProjectInfo {
   jiraProjectKey: string | null;
   pinned: boolean;
   tint: string | null;
+  /** The project-scope rail group this project sits in. Null (or absent, in
+   *  a row built before the backend answers) means ungrouped; so does an id
+   *  that matches no loaded group. */
+  groupId?: string | null;
 }
 
 // ─── Workspaces ───────────────────────────────────────────────────
 
 export type TintName = "brass" | "verdigris" | "rouge" | "indigo" | "lavender" | "smoke" | "bone";
+
+// ─── Rail groups ──────────────────────────────────────────────────
+
+/** What a rail group holds: projects (at the rail's top level) or one
+ *  project's workspaces. Also the `kind` of an item moved between groups. */
+export type GroupScope = "project" | "workspace";
+
+/** A rail group: a named, optionally tinted, one-level container. It outlives
+ *  its members: an emptied group stays until it is deleted. Membership is the
+ *  member's own `groupId` (`ProjectInfo.groupId`, `Workspace.groupId`), so an
+ *  item is in at most one group. Whether a group is folded is a UI preference
+ *  and is not stored here. */
+export interface Group {
+  id: string;
+  scope: GroupScope;
+  /** The owning project of a `workspace` group; null for a `project` group. */
+  projectId: string | null;
+  name: string;
+  tint: TintName | null;
+  /** Position among the groups of the same scope (and, for `workspace`
+   *  groups, the same project). Ascending; not necessarily dense. */
+  sortOrder: number;
+  createdAt: string;
+}
 
 export interface Workspace {
   id: string;
@@ -147,6 +175,10 @@ export interface Workspace {
   /** Resolved base branch this workspace was created from (null for rows
    *  predating the column and for the auto-created default-branch row). */
   fromBranch: string | null;
+  /** The workspace-scope rail group this workspace sits in, kept through
+   *  archive and restore. Null or absent means ungrouped; so does an id that
+   *  matches no loaded group. */
+  groupId?: string | null;
 }
 
 /** `create_workspace`'s response: the workspace, plus its `setup` terminal when
@@ -155,6 +187,32 @@ export interface CreatedWorkspace extends Workspace {
   setupTerminalId: string | null;
   /** Why the setup script couldn't be started; the workspace itself is fine. */
   setupError: string | null;
+  /** What the fresh worktree borrowed from the main checkout; null (or absent)
+   *  when the project shares nothing or the worktree wasn't fresh. */
+  shared?: ShareOutcome | null;
+}
+
+/** "Share with new missions" (#961): dependency folders to link from the main
+ *  checkout and local env files to copy, each a name at the repo root. */
+export interface ShareSpec {
+  link: string[];
+  copy: string[];
+}
+
+/** `share_with_missions`: what the project shares now, and what its main
+ *  checkout could share (present and git-ignored there). */
+export interface ShareOptions {
+  saved: ShareSpec;
+  available: ShareSpec;
+}
+
+/** What applying a project's ShareSpec did to a fresh worktree. */
+export interface ShareOutcome {
+  linked: string[];
+  copied: string[];
+  /** One sentence per entry left out ("node_modules: not linked in a sandboxed mission",
+   *  ".env: not copied into a sandboxed mission"). */
+  skipped: string[];
 }
 
 // ─── Missions ─────────────────────────────────────────────────────
@@ -181,6 +239,16 @@ export interface Mission {
   createdAt: string;
   updatedAt: string;
   archivedAt: string | null;
+}
+
+/** `update_mission`'s response: the mission, plus what "Share with new
+ *  missions" had given its worktree and was taken back because its Execution
+ *  became `sandbox`: links removed, env copies removed, and env copies kept
+ *  because they changed in the mission. */
+export interface UpdatedMission extends Mission {
+  unlinked?: string[];
+  uncopied?: string[];
+  keptCopies?: string[];
 }
 
 // ─── Logbook ──────────────────────────────────────────────────────
@@ -316,11 +384,58 @@ export interface McpToolInfo {
   description: string;
 }
 
+/** What Talk's MCP registry knows about one configured server
+ *  (`list_mcp_server_status`): running with N tools, not started yet (it
+ *  starts on first use), or failed with the first line of why. `tools` is
+ *  null while a call holds the connection. */
+export interface McpServerStatus {
+  name: string;
+  state: "connected" | "idle" | "failed";
+  tools: number | null;
+  reason: string | null;
+}
+
 /** A configured MCP server (stdio): the command to spawn + its args/env. */
 export interface McpServerConfig {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** Env names whose values live in the login Keychain; their `env` value
+   *  is "" and the secret itself never reaches the frontend. */
+  secret_env?: string[];
+  /** Env names that look secret but the user keeps in mcp.json. */
+  plain_env?: string[];
+  /** A remote server's choices; the backend builds the `mcp-remote` bridge
+   *  in command/args/env from them (`mcp::remote::apply_bridge`). */
+  remote?: McpRemoteConfig;
+  /** Any other key of the entry (`cwd`, `type`, `disabled`…), kept as it
+   *  was (the backend's `extra`). */
+  [extra: string]: unknown;
+}
+
+/** How a remote MCP server is reached (`mcp::remote::RemoteConfig`). */
+export interface McpRemoteConfig {
+  url: string;
+  /** Browser (OAuth), a bearer token, or the user's own headers. */
+  auth: "oauth" | "token" | "headers";
+  /** The custom headers' names (`auth: "headers"`). */
+  header_names?: string[];
+  transport: "auto" | "http-only" | "sse-only";
+  /** A pre-registered OAuth client (`auth: "oauth"`). */
+  client_id?: string;
+  /** More mcp-remote arguments, appended as given. */
+  extra_args?: string[];
+}
+
+/** Why Settings' Test or Reconnect failed (`mcp::classify_failure`), the
+ *  payload of an `AppError` with `kind: "McpFailure"`. */
+export interface McpFailure {
+  /** One short line: what went wrong. */
+  summary: string;
+  /** What to do about it, when Octopush knows. */
+  hint: string | null;
+  /** The whole reason and server output, redacted. */
+  detail: string;
 }
 
 export interface ChatMessage {
@@ -362,6 +477,69 @@ export interface ThreadCost {
   unpricedModels?: string[];
 }
 
+/** What the Claude Code session in one Run terminal has used
+ *  (`transcripts::SessionUsage`, `get_session_usage`): the Run Companion's
+ *  Context section. Octopush knows a terminal's session from Claude Code's
+ *  hooks; spend and cache share come from the ledger, the context size from
+ *  the session's own transcript. */
+export interface SessionUsage {
+  /** The session's last prompt: input + cache read + cache write. Null when
+   *  the transcript can't say (gone, or compacted with no message since). */
+  contextTokens: number | null;
+  /** The model's context window from the provider catalog; null for a model
+   *  the catalog doesn't list. */
+  maxContext: number | null;
+  /** Priced spend of the session's ledger rows. */
+  spentUsd: number;
+  /** Ledger rows (billed API calls) of the session. */
+  calls: number;
+  /** Those of `calls` on a model without a price, left out of `spentUsd`. */
+  unpricedCalls: number;
+  /** Share of the session's prompt tokens read from the cache, 0–100. */
+  cacheHitPct: number | null;
+  /** The model of the last prompt, else of the newest ledger row. */
+  model: string;
+  /** When that last message was written (RFC3339 UTC). */
+  asOf: string;
+}
+
+/** One thing a project's requests carry (`request_context::CarriedItem`).
+ *  Its `tokens` is always an estimate (bytes ÷ 4, fitted to the measured
+ *  total). */
+export interface CarriedItem {
+  /** A CLAUDE.md-chain file (or one it imports), the skill or agent
+   *  listings, or the measured total minus every other item. */
+  kind: "memory" | "skills" | "agents" | "by_difference";
+  /** `CLAUDE.md`, `~/.claude/CLAUDE.md`, `Skills`, `Agents`, or
+   *  `MCP and built-in tools, by difference`. */
+  label: string;
+  /** The file's full path, for a `memory` item. */
+  path: string | null;
+  /** Skills or agents counted; 1 for a file, 0 for `by_difference`. */
+  count: number;
+  bytes: number;
+  tokens: number;
+}
+
+/** What every request of a project carries (`get_request_context`, #959). */
+export interface RequestContext {
+  /** Measured: the smallest first-request prompt of the project's recent
+   *  sessions. Null with no transcript to read. */
+  measuredTokens: number | null;
+  sessionsMeasured: number;
+  /** The model of most first requests. */
+  model: string | null;
+  /** Share of the sampled sessions' prompt tokens read from cache, 0–100. */
+  cacheHitPct: number | null;
+  /** `measuredTokens` at the model's input price; null when unpriced. */
+  uncachedUsd: number | null;
+  /** `measuredTokens` at the input-side rate the model's requests actually
+   *  paid; null when unpriced. */
+  usualUsd: number | null;
+  /** Largest first; they add up to `measuredTokens` when it is known. */
+  items: CarriedItem[];
+}
+
 export interface ChatStreamEvent {
   workspaceId: string;
   threadId?: string;
@@ -388,6 +566,9 @@ export interface GitStatus {
   aheadBehindKnown: boolean;
   /** The in-progress multi-step operation, if any. */
   operation: "merge" | "rebase" | "cherry-pick" | null;
+  /** The commit HEAD points at (hex oid); null on an unborn branch. Optional
+   *  so fixtures written before it still type-check. */
+  head?: string | null;
 }
 
 /** Branches offered as a base for new workspaces. Locals come repo-default
@@ -421,6 +602,22 @@ export interface Pr {
   url: string;
   isDraft: boolean;
   state: PrState;
+  /** CI checks on the head commit (open/draft PRs). Absent when the PR has
+   *  none or they couldn't be read (no `gh`, no token). */
+  checks?: PrChecks;
+}
+
+export type ChecksState = "passing" | "pending" | "failing";
+
+export interface FailingCheck {
+  name: string;
+  /** The GitHub Actions run behind it, for `gh run view --log-failed`. */
+  runId: number | null;
+}
+
+export interface PrChecks {
+  state: ChecksState;
+  failing: FailingCheck[];
 }
 
 /** @deprecated Use `Pr` instead. */
@@ -467,6 +664,24 @@ export interface BranchPr {
   pr: Pr;
 }
 
+/** A mission whose PR was merged at its worktree's HEAD, with a clean
+ *  worktree (`merged_workspaces`, #963). `localFiles`: its git-ignored files
+ *  other than dependency and build folders, which archiving deletes. */
+export interface MergedWorkspace {
+  workspaceId: string;
+  pr: Pr;
+  localFiles: string[];
+}
+
+/** Why `archive_merged_workspaces` left a mission in place: re-checked when
+ *  it acts, the mission no longer passes. */
+export type ArchiveSkipReason = "busy" | "changed" | "moved" | "local-files" | "unverified" | "gone" | "failed";
+
+export interface MergedArchive {
+  archived: string[];
+  skipped: { workspaceId: string; reason: ArchiveSkipReason }[];
+}
+
 /** A single text-search hit (line-level match) within the workspace. */
 export interface SearchHit {
   /** Path relative to the workspace root. */
@@ -503,6 +718,42 @@ export interface SyncPrefs {
 
 export type SyncKind = "history" | "library";
 
+/** How the last push attempt for one sync kind ended. */
+export type SyncAttemptOutcome = "sent" | "failed";
+
+/** The last push attempt for one sync kind: time, outcome, count, HTTP status
+ *  — nothing else is kept (#518). */
+export interface SyncAttempt {
+  /** RFC3339 UTC. */
+  at: string;
+  outcome: SyncAttemptOutcome;
+  /** Runs (history) or library items in the attempt. */
+  count: number;
+  /** The non-2xx status of a failed request; absent for a network error. */
+  httpStatus?: number | null;
+}
+
+/** A library item still unsent because the sync service refused it (or this
+ *  Mac refused to send it for the same reason), #799. */
+export interface LibraryRejection {
+  kind: "pipeline" | "role" | string;
+  /** Pipeline id or role key. */
+  id: string;
+  /** The service's reason code: `oversize`, `bad_stamp`, `future_stamp`, … */
+  reason: string;
+  /** The item's local name (filled in by `get_sync_status`). */
+  name?: string | null;
+}
+
+/** The last attempt per kind (`get_sync_status`); `null` = nothing recorded,
+ *  or that sync doesn't apply to the signed-in account. */
+export interface SyncStatus {
+  history: SyncAttempt | null;
+  library: SyncAttempt | null;
+  /** Library items the service refused; empty or absent when none. */
+  libraryRejected?: LibraryRejection[];
+}
+
 export interface AppSettings {
   providerKeys: Record<string, string>;
   providerBaseUrls: Record<string, string>;
@@ -518,6 +769,18 @@ export interface AppSettings {
   /** Run-mode attention from Claude Code's lifecycle hooks instead of the
    *  terminal bell (#287). Unset/null → **on**; only `false` turns it off. */
   claudeHooksEnabled?: boolean | null;
+  /** Settings › Privacy › "Quiet Claude Code in crews and Routines" (#703):
+   *  crew stages and Routines start Claude Code with
+   *  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Unset → **off**. */
+  quietClaudeCode?: boolean;
+  /** Secret guard (#730): on unless saved `false`. */
+  secretGuardEnabled?: boolean | null;
+  /** Settings › General › Attention › "Notify me elsewhere" (#964). Unset →
+   *  **off**. Owned by `set_notify_elsewhere`: whole-file saves carry it and
+   *  the URL through untouched. */
+  notifyElsewhereEnabled?: boolean;
+  /** The webhook URL for "Notify me elsewhere" (validated before it is stored). */
+  notifyElsewhereUrl?: string | null;
   /** Tool-call rounds one sub-agent run may take. Unset/null → **no limit**
    *  (a sub-agent runs until it finishes or is stopped); a definition's
    *  `max-turns` applies under a set value. */
@@ -543,6 +806,28 @@ export interface AppSettings {
   openaiApiKey?: string | null;
 }
 
+/** "Notify me elsewhere" (#964) as saved: off, with no URL, by default. */
+export interface NotifyElsewhere {
+  enabled: boolean;
+  url: string;
+}
+
+/** The one body the webhook receives — exactly these five keys. */
+export interface NotifyElsewherePayload {
+  text: string;
+  content: string;
+  mission: string;
+  project: string;
+  event: string;
+}
+
+/** The Settings preview: the body's fields for a checkpoint gate (sample names)
+ *  and every `event` value with its label. */
+export interface NotifyElsewherePreview {
+  payload: NotifyElsewherePayload;
+  events: { event: string; label: string }[];
+}
+
 export interface EditorChoice {
   id: string;
   name: string;
@@ -555,6 +840,39 @@ export interface WorkspaceGitSummary {
   dirty: boolean;
   ahead: number;
   behind: number;
+}
+
+// ─── Collision radar (#732) ────────────────────────────────────────
+
+/** `lockfile`: only lockfiles overlap · `overlap`: the same file changes on
+ *  both sides · `conflict`: an in-memory merge confirmed a conflict. */
+export type CollisionSeverity = "lockfile" | "overlap" | "conflict";
+
+/** Two live workspaces of one project changing the same files. */
+export interface Collision {
+  a: string;
+  aName: string;
+  b: string;
+  bName: string;
+  /** The overlapping paths, sorted; at most 50 cross IPC. */
+  files: string[];
+  /** Overlapping paths left out of `files`. */
+  truncated: number;
+  /** The conflicting non-lockfile paths, sorted; at most 50. */
+  conflictingFiles: string[];
+  /** Conflicting paths left out of `conflictingFiles`. */
+  conflictingTruncated: number;
+  severity: CollisionSeverity;
+  confirmed: boolean;
+}
+
+export interface ProjectCollisions {
+  collisions: Collision[];
+  scanned: number;
+  /** The merge-confirmation pair cap was hit: some pairs are overlap only. */
+  capped: boolean;
+  /** A workspace's uncommitted set hit its 2000-path cap: overlaps past it may be missing. */
+  uncommittedCapped: boolean;
 }
 
 // ─── Usage report (Settings → Usage) ───────────────────────────────
@@ -761,6 +1079,9 @@ export interface ModelInfo {
   supportsTools: boolean;
   /** Curated short labels rendered next to the model name in the picker. */
   tags?: string[];
+  /** The builtin model that replaces this one (Fable 5.1 → Fable 5.2);
+   *  absent for every other model. The launcher offers the switch. */
+  supersededBy?: string | null;
 }
 
 export interface ModelWithProvider {

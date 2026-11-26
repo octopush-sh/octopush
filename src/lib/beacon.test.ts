@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { beaconAnchor } from "./beacon";
+import { nearestVisibleAncestor, beaconAnchor } from "./beacon";
 
 const running = { status: "running" } as any;
 
@@ -43,5 +43,40 @@ describe("beaconAnchor — exactly one brass beacon", () => {
     expect(
       beaconAnchor({ run: { status: "paused" } as any, blockedStage: null, runningStage: { id: "s3" } as any, launcherReady: false }),
     ).toEqual({ kind: "stage", stageId: "s3" });
+  });
+
+  it("a run waiting for its Claude plan to reset never takes the beacon", () => {
+    const run = { status: "paused" } as any;
+    const blocked = { id: "halted", error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
+    expect(beaconAnchor({ run, blockedStage: blocked, runningStage: null, launcherReady: false, planWaiting: true })).toBeNull();
+    // Once the director must resume it (cap reached, budget spent, resume off), it is a decision again.
+    expect(beaconAnchor({ run, blockedStage: blocked, runningStage: null, launcherReady: false, planWaiting: false })).toEqual({ kind: "decision" });
+  });
+
+  it("a sibling's real halt or gate beside a plan wait still takes the beacon", () => {
+    const run = { status: "paused" } as any;
+    const halt = { id: "halted", error: "the build broke" };
+    const gate = { id: "gate", error: null };
+    expect(beaconAnchor({ run, blockedStage: halt, runningStage: null, launcherReady: false, planWaiting: true })).toEqual({ kind: "decision" });
+    expect(beaconAnchor({ run, blockedStage: gate, runningStage: null, launcherReady: false, planWaiting: true })).toEqual({ kind: "decision" });
+  });
+});
+
+describe("nearestVisibleAncestor", () => {
+  const project = (folded: boolean) => ({ id: "project", folded });
+  const group = (folded: boolean) => ({ id: "group", folded });
+
+  it("is null when nothing is folded: the owner carries its own signal", () => {
+    expect(nearestVisibleAncestor([project(false), group(false)])).toBeNull();
+    expect(nearestVisibleAncestor([])).toBeNull();
+  });
+
+  it("is the folded group inside an open project", () => {
+    expect(nearestVisibleAncestor([project(false), group(true)])?.id).toBe("group");
+  });
+
+  it("is the outermost folded container, the only one still on screen", () => {
+    expect(nearestVisibleAncestor([project(true), group(true)])?.id).toBe("project");
+    expect(nearestVisibleAncestor([project(true), group(false)])?.id).toBe("project");
   });
 });

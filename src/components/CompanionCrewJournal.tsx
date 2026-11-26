@@ -11,6 +11,7 @@ import type { ChatMessage } from "../lib/types";
 import { iconForRole } from "../lib/roleIcons";
 import { fmtTokens } from "../lib/stageMeta";
 import { formatDuration } from "../lib/duration";
+import { formatUsd } from "../lib/cost";
 import { buildJournalItems } from "./direct/JournalItems";
 import { findCrewAgent, type CrewAgent } from "./chat/CrewCard";
 import { ChatMarkdown } from "./chat/ChatMarkdown";
@@ -152,7 +153,7 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
           {agent.effort && `effort ${agent.effort} · `}
           {statusWord}
           {tokens > 0 && ` · ${fmtTokens(tokens)} tokens`}
-          {agent.meta && agent.meta.costUsd > 0 && ` · $${agent.meta.costUsd.toFixed(2)}`}
+          {agent.meta && agent.meta.costUsd > 0 && ` · ${formatUsd(agent.meta.costUsd)}`}
           {agent.durationMs != null && ` · ${formatDuration(agent.durationMs)}`}
           {agent.meta?.continued && " · continued"}
         </div>

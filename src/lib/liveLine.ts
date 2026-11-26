@@ -1,4 +1,5 @@
 import type { LiveEntry } from "./ipc";
+import { isRefusedNotice } from "./refusedCalls";
 
 /** One-line "current activity" from the most recent meaningful live entry —
  *  the single ticker vocabulary shared by every live Direct surface (RunFlow
@@ -12,11 +13,12 @@ export function lastActivity(entries: LiveEntry[]): string {
   return "";
 }
 
-/** The latest verdict notice (for a finished review), or "". */
+/** The latest verdict notice (for a finished review), or "". A refused tool
+ *  call's notice is never the verdict: the stage's count says those. */
 export function lastNotice(entries: LiveEntry[]): string {
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
-    if (e.kind === "notice") return e.text;
+    if (e.kind === "notice" && !isRefusedNotice(e.text)) return e.text;
   }
   return "";
 }

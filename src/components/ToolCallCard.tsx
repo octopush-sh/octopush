@@ -1,6 +1,7 @@
 import { useState, useRef, useLayoutEffect, type CSSProperties } from "react";
 import { ipc } from "../lib/ipc";
 import { useCopyFeedback } from "../hooks/useCopyFeedback";
+import { ChevronRight, ExternalLink, FilePen, FolderOpen, Terminal } from "lucide-react";
 import { iconForTool } from "../lib/roleIcons";
 import type { ToolExecution } from "../stores/chatStore";
 
@@ -85,24 +86,18 @@ export function summarizeTool(
 // (commit d9c1517) proved Tailwind cascade can leak in this context — that
 // rationale is unchanged and load-bearing.
 //
-// What changed: the values are `var(--color-octo-*)` rather than atelier hex.
-// An inline style resolving a custom property is still an inline style, so it
-// is equally immune to the cascade leak — but it follows the active theme.
-// Hardcoded hex meant these cards rendered an onyx panel with ivory text no
-// matter the theme, so under vellum a tool call was a dark box on cream; it
-// also froze `MUTE` at the pre-AA #6d6354 (3.06:1 on onyx).
+// The values are `var(--…)` tokens, never literals: an inline style resolving
+// a custom property is still an inline style, so it is equally immune to the
+// cascade leak, and it follows the active theme. Colours and font stacks alike
+// (the fonts are the `@theme` families in styles.css).
 const BRASS = "var(--color-octo-brass)";
-const BRASS_DIM = "var(--brass-dim)";
-const BRASS_GHOST = "var(--brass-ghost)";
 const IVORY = "var(--color-octo-ivory)";
 const SAGE = "var(--color-octo-sage)";
 const MUTE = "var(--color-octo-mute)";
 const ONYX = "var(--color-octo-onyx)";
 const HAIRLINE = "var(--color-octo-hairline)";
-// Same load-bearing-inline rationale as the colors above: the mono stack must be
-// inline here (react-markdown cascade leak), but it lives in ONE const so the
-// new output controls don't scatter another copy of the literal.
-const MONO = "'JetBrains Mono', 'SF Mono', monospace";
+const MONO = "var(--font-mono)";
+const SANS = "var(--font-sans)";
 
 /** Keyboard activation for role="button" elements — Enter/Space fire the action,
  *  matching native button behavior (a11y: these were no-op onKeyDown before). */
@@ -115,45 +110,69 @@ function keyActivate(fn: () => void) {
   };
 }
 
-// Tool card has a FULL hairline-brass border (not just left), a slightly
-// more opaque brass-tinted background, and a subtle inset highlight so it
-// reads as a distinct surface against the onyx canvas. The previous
-// "border-left only + 8% bg" version was too subtle — cards were in the
-// DOM but looked like empty space (see ChatView.test.tsx "survives the
-// done event" — that test now also asserts visible-pixel presence).
-const cardStyle: CSSProperties = {
+// A resolved tool call is one quiet LEDGER ROW in the work block (the
+// hairline ChatCanvas hangs a turn's narration and tool calls from): icon,
+// label, summary, chevron, all mute and sage, no border, no fill. It used to
+// be a brass-bordered card, and a turn of seven calls put seven brass boxes
+// between the director's ask and the answer, louder than both. Brass now
+// stays with the director's turn; the row only says what the model did and
+// opens to the raw result.
+const rowStyle: CSSProperties = {
   display: "block",
   width: "100%",
   maxWidth: "100%",
-  margin: "10px 0",
-  borderRadius: 8,
-  border: `1px solid ${BRASS_DIM}`,
-  background: "rgba(212, 165, 116, 0.06)",
-  boxShadow: "inset 0 1px 0 rgba(212, 165, 116, 0.08)",
   fontSize: 12,
-  fontFamily: "-apple-system, 'Helvetica Neue', sans-serif",
+  fontFamily: SANS,
   color: SAGE,
   lineHeight: "1.4",
   boxSizing: "border-box" as const,
-  overflow: "hidden",
-  minHeight: 36,
+};
+
+// The row's line: icon · label · summary on the left, the row's actions and
+// its chevron on the right. Pulled into the hairline's gutter by its own
+// padding, so the hover wash has room around the text while the icon stays
+// aligned with the narration. The chevron is always the last column, so the
+// chevrons of a round line up whatever actions a row has.
+const lineStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  height: 24,
+  padding: "0 6px",
+  marginLeft: -6,
+  gap: 4,
+  borderRadius: 4,
 };
 
 const headerStyle: CSSProperties = {
   display: "flex",
   alignItems: "center",
-  width: "100%",
-  padding: "8px 12px",
+  flex: 1,
+  minWidth: 0,
+  height: "100%",
   gap: 10,
   cursor: "pointer",
-  background: "transparent",
-  border: "none",
+  borderRadius: 4,
   color: "inherit",
   fontSize: "inherit",
   fontFamily: "inherit",
   lineHeight: "inherit",
   textAlign: "left" as const,
   boxSizing: "border-box" as const,
+};
+
+// A row's actions (Send to terminal, Open in editor, Reveal in Finder, Open)
+// are 12px icons with a title, shown while the row is hovered or holds focus
+// (`.octo-ledger-actions`), mute until hovered, then brass.
+const actionStyle: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  width: 22,
+  height: 22,
+  color: MUTE,
+  borderRadius: 4,
+  cursor: "pointer",
+  flexShrink: 0,
 };
 
 export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTerminal }: Props) {
@@ -185,45 +204,50 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
     setOutputOverflows(el.scrollHeight > el.clientHeight + 4);
   }, [expanded, outputExpanded, tool.result]);
 
+  const toggle = () => setExpanded((v) => !v);
   return (
-    <div className="octo-selectable" style={cardStyle}>
-      <div style={{ display: "flex", alignItems: "center" }}>
+    <div data-role="tool" className="octo-selectable" style={rowStyle}>
+      <div className="octo-ledger" style={lineStyle}>
         <div
           role="button"
           tabIndex={0}
-          onClick={() => setExpanded((v) => !v)}
-          onKeyDown={(e) => e.key === "Enter" && setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          aria-label={`${label} ${summary}`.trim()}
+          onClick={toggle}
+          onKeyDown={keyActivate(toggle)}
+          className="octo-ledger-head"
           style={headerStyle}
         >
           <span
             title={tool.toolName}
-            style={{ display: "inline-flex", flexShrink: 0 }}
+            style={{ display: "inline-flex", flexShrink: 0, color: MUTE }}
           >
-            <ToolIcon size={12} color={BRASS} strokeWidth={1.75} />
+            <ToolIcon size={12} strokeWidth={1.75} />
           </span>
           <span
             style={{
-              fontSize: 10,
-              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+              fontSize: 9,
+              fontFamily: MONO,
               letterSpacing: "0.2em",
               textTransform: "uppercase",
-              color: BRASS,
+              color: MUTE,
               flexShrink: 0,
+              minWidth: 48,
             }}
           >
             {label}
           </span>
           <span
+            title={summary}
             style={{
               fontSize: 11,
-              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+              fontFamily: MONO,
               color: SAGE,
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
               minWidth: 0,
               flex: 1,
-              marginLeft: 4,
             }}
           >
             {summary}
@@ -246,152 +270,103 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
               {cwd}
             </span>
           )}
-          <span
-            style={{
-              fontSize: 10,
-              color: MUTE,
-              fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
-              transform: expanded ? "rotate(90deg)" : "none",
-              transition: "transform 150ms",
-              flexShrink: 0,
-            }}
-            aria-hidden
-          >
-            ▸
-          </span>
         </div>
 
-        {command && onRunInTerminal && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              onRunInTerminal(command);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
+        <span className="octo-ledger-actions" style={{ display: "inline-flex", alignItems: "center", flexShrink: 0 }}>
+          {command && onRunInTerminal && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
                 onRunInTerminal(command);
-              }
-            }}
-            title="Send to terminal (copies the command and switches to Run)"
-            aria-label="Send to terminal"
-            style={{
-              fontFamily: "system-ui, sans-serif",
-              fontSize: 11,
-              color: BRASS,
-              background: BRASS_GHOST,
-              border: `1px solid ${BRASS_DIM}`,
-              borderRadius: 4,
-              padding: "3px 10px",
-              cursor: "pointer",
-              marginRight: 10,
-              flexShrink: 0,
-            }}
-          >
-            Send to terminal
-          </div>
-        )}
-
-        {filePath && tool.toolName === "write_file" && onOpenInEditor && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenInEditor(filePath);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
+              }}
+              onKeyDown={keyActivate(() => onRunInTerminal(command))}
+              title="Send to terminal (copies the command and switches to Run)"
+              aria-label="Send to terminal"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <Terminal size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+          {filePath && tool.toolName === "write_file" && onOpenInEditor && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
                 onOpenInEditor(filePath);
-              }
-            }}
-            title="Open in editor"
-            style={{
-              fontFamily: "'Spectral', serif",
-              
-              fontSize: 11,
-              color: BRASS,
-              background: BRASS_GHOST,
-              border: `1px solid ${BRASS_DIM}`,
-              borderRadius: 4,
-              padding: "3px 10px",
-              cursor: "pointer",
-              marginRight: 6,
-              flexShrink: 0,
-            }}
-          >
-            Open in editor
-          </div>
-        )}
+              }}
+              onKeyDown={keyActivate(() => onOpenInEditor(filePath))}
+              title="Open in editor"
+              aria-label="Open in editor"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <FilePen size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+          {filePath && tool.toolName === "write_file" && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
+              }}
+              onKeyDown={keyActivate(() => {
+                if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
+              })}
+              title="Reveal in Finder"
+              aria-label="Reveal in Finder"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <FolderOpen size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+          {filePath && tool.toolName === "write_file" && isWebFile && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={() => {
+                if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
+              }}
+              onKeyDown={keyActivate(() => {
+                if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
+              })}
+              title="Open in the default browser"
+              aria-label="Open in the default browser"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <ExternalLink size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+        </span>
 
-        {filePath && tool.toolName === "write_file" && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
-            }}
-            onKeyDown={keyActivate(() => {
-              if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
-            })}
-            title="Reveal in Finder"
-            style={{
-              fontSize: 12,
-              color: MUTE,
-              background: "transparent",
-              border: "none",
-              padding: "4px 8px",
-              cursor: "pointer",
-              marginRight: 4,
-              flexShrink: 0,
-              fontFamily: "system-ui, sans-serif",
-              lineHeight: 1,
-            }}
-          >
-            ⊙
-          </div>
-        )}
-
-        {filePath && tool.toolName === "write_file" && isWebFile && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={() => {
-              if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
-            }}
-            onKeyDown={keyActivate(() => {
-              if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
-            })}
-            style={{
-              fontFamily: "'Spectral', serif",
-              
-              fontSize: 11,
-              color: BRASS,
-              background: BRASS_GHOST,
-              border: `1px solid ${BRASS_DIM}`,
-              borderRadius: 4,
-              padding: "3px 10px",
-              cursor: "pointer",
-              marginRight: 10,
-              flexShrink: 0,
-            }}
-          >
-            Open
-          </div>
-        )}
+        {/* The chevron is pointer decoration for the header's toggle, never
+            a second tab stop: always the last column, so chevrons align. */}
+        <span
+          aria-hidden
+          onClick={toggle}
+          style={{
+            display: "inline-flex",
+            flexShrink: 0,
+            width: 12,
+            cursor: "pointer",
+            color: MUTE,
+            transform: expanded ? "rotate(90deg)" : "none",
+            transition: "transform var(--dur-quick) var(--ease-octo)",
+          }}
+        >
+          <ChevronRight size={11} strokeWidth={1.75} />
+        </span>
       </div>
 
       {expanded && (
-        <div
-          style={{
-            borderTop: `1px solid ${HAIRLINE}`,
-            padding: "8px 12px 12px",
-          }}
-        >
+        <div style={{ padding: "4px 0 10px" }}>
           <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
             <span
               role="button"
@@ -400,7 +375,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
               onKeyDown={keyActivate(() => copy(tool.result))}
               style={{
                 fontSize: 9,
-                fontFamily: "'JetBrains Mono', 'SF Mono', monospace",
+                fontFamily: MONO,
                 letterSpacing: "0.2em",
                 textTransform: "uppercase",
                 color: copied ? "var(--color-octo-verdigris)" : MUTE,
@@ -445,7 +420,7 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
                   height: 36,
                   pointerEvents: "none",
                   borderRadius: "0 0 4px 4px",
-                  background: `linear-gradient(to bottom, rgba(12, 10, 8, 0), ${ONYX})`,
+                  background: `linear-gradient(to bottom, transparent, ${ONYX})`,
                 }}
               />
             )}

@@ -7,6 +7,21 @@ export const APP_REPO = `${OWNER}/octopush`;
 export const WEB_REPO = `${OWNER}/octopush-web`;
 export const API_REPO = `${OWNER}/octopush-api`;
 export const ALL_REPOS = [APP_REPO, API_REPO, WEB_REPO];
+/**
+ * Epiku: a PRIVATE repo with its own lane (epiku-build.yml, epiku-review.yml).
+ * Deliberately not in ALL_REPOS: the digest, the report and the audits walk
+ * that list and print titles in this public repo.
+ */
+export const EPIKU_REPO = `${OWNER}/epiku`;
+/**
+ * The repos the cycle reaches as the "Octopush Cycle" GitHub App, and the
+ * variable that carries each one's installation token. One variable per repo,
+ * so a step never holds a token for a repo it wasn't given.
+ */
+const APP_TOKEN_ENV = { [WEB_REPO]: "OCTOPUSH_WEB_TOKEN", [EPIKU_REPO]: "OCTOPUSH_EPIKU_TOKEN" };
+export const tokenEnvFor = (repo) => (Object.hasOwn(APP_TOKEN_ENV, repo) ? APP_TOKEN_ENV[repo] : null);
+/** Private repos: nothing but numbers and commit ids of theirs may reach this public repo's logs. */
+export const isPrivateLane = (repo) => repo === EPIKU_REPO;
 
 /** Default runner: `gh api ...` → stdout. Throws on non-zero exit. */
 export function ghRun(args, input, token) {
@@ -24,13 +39,18 @@ export const ghRunAs = (token) => (args, input) => ghRun(args, input, token);
 
 /**
  * The client for a repo. In GitHub Actions the workflow's GITHUB_TOKEN (GH_TOKEN)
- * only reaches the app repo; octopush-web is reached with a short-lived
- * installation token of the "Octopush Cycle" GitHub App (OCTOPUSH_WEB_TOKEN),
+ * only reaches the app repo; octopush-web and epiku are reached with a
+ * short-lived installation token of the "Octopush Cycle" GitHub App
+ * (OCTOPUSH_WEB_TOKEN, OCTOPUSH_EPIKU_TOKEN: one per repo, never shared),
  * which fixed workflow steps mint and never hand to an agent. Without it, the
  * default login is used (on a Mac, the owner's `gh` setup).
  */
 export function ghForRepo(repo, env = process.env) {
-  if (repo === WEB_REPO && env.OCTOPUSH_WEB_TOKEN) return makeGh(ghRunAs(env.OCTOPUSH_WEB_TOKEN));
+  const key = tokenEnvFor(repo);
+  if (key && env[key]) return makeGh(ghRunAs(env[key]));
+  // Epiku is private: in Actions the workflow's own token can't see it, and
+  // falling back to it would only turn a missing token into a confusing 404.
+  if (repo === EPIKU_REPO && env.GITHUB_ACTIONS === "true") throw new Error(`${key} is not set: ${EPIKU_REPO} is reached only with the Octopush Cycle App's installation token`);
   return makeGh();
 }
 /** Is octopush-web reachable with its own token in this process? */
@@ -40,6 +60,8 @@ export function makeGh(run = ghRun) {
   const parse = (out) => (out && out.trim() ? JSON.parse(out) : null);
   const gh = {
     get: (path) => parse(run([path])),
+    /** GET a non-JSON body as text (e.g. a job's log). */
+    raw: (path) => run([path]),
     /** GET every page of a list endpoint (per_page=100), up to `max` items. */
     list(path, max = 1000) {
       const sep = path.includes("?") ? "&" : "?";
@@ -89,12 +111,31 @@ export const labelsOf = (issueOrPr) => (issueOrPr.labels ?? []).map((l) => (type
 export const sanitize = (text) => String(text ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 
 /**
+ * Private lanes (epiku): an error's message is never printed. A failed command's
+ * message carries its command line and its stderr, a JSON parse error quotes
+ * the text it choked on — and this repo's log is public. Only a fixed reason
+ * code leaves: the HTTP status or exit status, or the text of an error made
+ * with `safeError` (written here, with nothing of the private repo in it).
+ * On for the whole process once a script learns its repo is private
+ * (`markPrivate`), or from the workflow (OCTOPUSH_QUIET_ERRORS=1).
+ */
+export const quietErrors = (env = process.env) => env.OCTOPUSH_QUIET_ERRORS === "1";
+export function markPrivate(repo, env = process.env) { if (isPrivateLane(repo)) env.OCTOPUSH_QUIET_ERRORS = "1"; }
+export const safeError = (msg) => Object.assign(new Error(msg), { safe: true });
+export function quietMessage(e) {
+  if (e?.safe === true) return String(e.message);
+  const http = /\(HTTP (\d{3})\)/.exec(String(e?.stderr ?? "") + String(e?.message ?? ""))?.[1];
+  const code = http ? `HTTP ${http}` : Number.isInteger(e?.status) ? `exit ${e.status}` : /^E[A-Z0-9]{2,12}$/.test(e?.code ?? "") ? e.code : "error";
+  return `failed (${code}); details withheld from this public log`;
+}
+
+/**
  * Report a script's fatal error. In GitHub Actions it is also an annotation,
  * which shows on the run's summary page (and through the checks API) without
  * opening the logs.
  */
 export function reportFatal(name, e) {
-  const msg = String(e?.message ?? e);
+  const msg = quietErrors() ? quietMessage(e) : String(e?.message ?? e);
   console.error(`${name}: ${msg}`);
   if (process.env.GITHUB_ACTIONS === "true") {
     const one = msg.slice(0, 1500).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");

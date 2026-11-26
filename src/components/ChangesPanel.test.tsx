@@ -13,6 +13,7 @@ const { ipcMock, pushToast } = vi.hoisted(() => ({
     resolveConflictTake: vi.fn(), markConflictResolved: vi.fn(),
     continueOperation: vi.fn(), abortOperation: vi.fn(),
     githubShipReadiness: vi.fn(), listBranches: vi.fn(), findPrForBranch: vi.fn(),
+    suggestModel: vi.fn(),
   },
   pushToast: vi.fn(),
 }));
@@ -36,6 +37,7 @@ vi.mock("./HistoryModal", () => ({
 
 import { ChangesPanel } from "./ChangesPanel";
 import { usePrStore } from "../stores/prStore";
+import { _resetHelperModelsForTests } from "../lib/helperModels";
 
 const STATUS = {
   branch: "main", ahead: 0, behind: 0, hasUpstream: true,
@@ -48,17 +50,21 @@ const STATUS = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  _resetHelperModelsForTests();
   ipcMock.getGitStatus.mockResolvedValue(STATUS);
 });
 
 describe("ChangesPanel G4", () => {
   it("Draft fills the message from the staged diff via aiComplete", async () => {
     ipcMock.getStagedDiff.mockResolvedValue("DIFF");
+    ipcMock.suggestModel.mockResolvedValueOnce({ modelId: "claude-sonnet-9", provider: "anthropic", reason: "", estimatedCostTier: "medium" });
     ipcMock.aiComplete.mockResolvedValue({ text: "feat: drafted", inputTokens: 1, outputTokens: 1, costUsd: 0 });
     render(<ChangesPanel projectPath="/repo" />);
     await screen.findByText("a.ts");
     await userEvent.click(screen.getByRole("button", { name: /draft/i }));
     await waitFor(() => expect(ipcMock.aiComplete).toHaveBeenCalled());
+    expect(ipcMock.suggestModel).toHaveBeenCalledWith("code_review");
+    expect(ipcMock.aiComplete.mock.calls[0][0]).toBe("claude-sonnet-9");
     expect(ipcMock.getStagedDiff).toHaveBeenCalledWith("/repo");
     expect((screen.getByPlaceholderText(/describe the change/i) as HTMLTextAreaElement).value).toBe("feat: drafted");
   });
@@ -342,7 +348,7 @@ describe("ChangesPanel G7 conflicts", () => {
     await screen.findByText(/2 conflicts · merge/i);
     await userEvent.click(screen.getAllByRole("button", { name: /resolve with ai/i })[0]);
     const modal = await screen.findByTestId("conflict-ai-modal");
-    expect(modal.textContent).toBe("src/a.ts:claude-sonnet-4-6");
+    expect(modal.textContent).toBe("src/a.ts:claude-sonnet-5-5");
   });
 
   it("Pencil routes through the panel's file-open path", async () => {
@@ -422,5 +428,70 @@ describe("ChangesPanel — Open a pull request", () => {
     await waitFor(() => expect(ipcMock.findPrForBranch).toHaveBeenCalledWith("/repo"));
     expect(await screen.findByRole("button", { name: "Open a pull request" })).toBeInTheDocument();
     expect(usePrStore.getState().byWorkspace["ws-1"]).toBeNull();
+  });
+  it("secret guard: a refused commit asks first, and the override commits this once", async () => {
+    const refusal = { kind: "SecretsFound", message: "possible secret", total: 1, partial: false, fingerprint: "fp-commit", findings: [
+      { file: "a.ts", line: 4, rule: "github-token", kind: "GitHub token", yours: false },
+    ] };
+    ipcMock.commitChanges.mockRejectedValueOnce(refusal).mockResolvedValueOnce("c0ffee1");
+    const onFileClick = vi.fn();
+    render(<ChangesPanel projectPath="/repo" onFileClick={onFileClick} />);
+    await screen.findByText("a.ts");
+    await userEvent.type(screen.getByPlaceholderText(/describe the change/i), "feat: x");
+    await userEvent.click(screen.getByRole("button", { name: /^commit$/i }));
+    expect(await screen.findByText("This change adds what looks like a GitHub token in a.ts:4.")).toBeInTheDocument();
+    expect(ipcMock.commitChanges).toHaveBeenCalledWith("/repo", "feat: x");
+    expect(pushToast).not.toHaveBeenCalledWith(expect.objectContaining({ title: "Commit failed" }));
+    await userEvent.click(screen.getByRole("button", { name: "Commit regardless" }));
+    await waitFor(() => expect(ipcMock.commitChanges).toHaveBeenLastCalledWith("/repo", "feat: x", "fp-commit"));
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Committed" }));
+  });
+
+  it("secret guard: Leave it out takes you to the file and commits nothing", async () => {
+    ipcMock.commitChanges.mockRejectedValueOnce({ kind: "SecretsFound", message: "m", total: 1, partial: false, fingerprint: "f", findings: [
+      { file: "a.ts", line: 4, rule: "github-token", kind: "GitHub token", yours: false },
+    ] });
+    const onFileClick = vi.fn();
+    render(<ChangesPanel projectPath="/repo" onFileClick={onFileClick} />);
+    await screen.findByText("a.ts");
+    await userEvent.type(screen.getByPlaceholderText(/describe the change/i), "feat: x");
+    await userEvent.click(screen.getByRole("button", { name: /^commit$/i }));
+    await userEvent.click(await screen.findByRole("button", { name: "Leave it out" }));
+    expect(onFileClick).toHaveBeenCalledWith("a.ts");
+    expect(ipcMock.commitChanges).toHaveBeenCalledTimes(1);
+  });
+
+  it("secret guard: a refused push asks first", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({ ...STATUS, branch: "feat/x", ahead: 1 });
+    ipcMock.pushBranch.mockRejectedValueOnce({ kind: "SecretsFound", message: "m", total: 1, partial: false, fingerprint: "fp-push", findings: [
+      { file: ".env", line: 2, rule: "env-credential", kind: "credential in a .env file (DB_PASSWORD)", yours: false },
+    ] }).mockResolvedValueOnce("done");
+    ipcMock.findPrForBranch.mockResolvedValue(null);
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /push to origin/i }));
+    await userEvent.click(await screen.findByRole("button", { name: "Push regardless" }));
+    await waitFor(() => expect(ipcMock.pushBranch).toHaveBeenLastCalledWith("/repo", "fp-push"));
+    expect(pushToast).not.toHaveBeenCalledWith(expect.objectContaining({ title: "Push failed" }));
+  });
+
+  it("secret guard: findings that changed after the dialog ask again with the new ones", async () => {
+    const first = { kind: "SecretsFound", message: "m", total: 1, partial: false, fingerprint: "fp-1", findings: [
+      { file: "a.ts", line: 4, rule: "github-token", kind: "GitHub token", yours: false },
+    ] };
+    const second = { kind: "SecretsFound", message: "m", total: 2, partial: false, fingerprint: "fp-2", findings: [
+      { file: "a.ts", line: 4, rule: "github-token", kind: "GitHub token", yours: false },
+      { file: "b.ts", line: 1, rule: "npm-token", kind: "npm token", yours: false },
+    ] };
+    ipcMock.commitChanges.mockRejectedValueOnce(first).mockRejectedValueOnce(second).mockResolvedValueOnce("c0ffee2");
+    render(<ChangesPanel projectPath="/repo" />);
+    await screen.findByText("a.ts");
+    await userEvent.type(screen.getByPlaceholderText(/describe the change/i), "feat: y");
+    await userEvent.click(screen.getByRole("button", { name: /^commit$/i }));
+    await userEvent.click(await screen.findByRole("button", { name: "Commit regardless" }));
+    expect(await screen.findByText("This change adds 2 things that look like secrets.")).toBeInTheDocument();
+    expect(ipcMock.commitChanges).toHaveBeenLastCalledWith("/repo", "feat: y", "fp-1");
+    await userEvent.click(screen.getByRole("button", { name: "Commit regardless" }));
+    await waitFor(() => expect(ipcMock.commitChanges).toHaveBeenLastCalledWith("/repo", "feat: y", "fp-2"));
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Committed" }));
   });
 });

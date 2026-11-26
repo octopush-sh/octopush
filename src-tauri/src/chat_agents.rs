@@ -21,7 +21,7 @@
 
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::chat_engine::{continuation_note, dangerous_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
+use crate::chat_engine::{continuation_note, dangerous_command, guard_agent_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
 use crate::orchestrator::agentic::resume_messages_for_continuation;
 use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
 use crate::orchestrator::events::EventSink;
@@ -711,6 +711,8 @@ impl EventSink for ChatAgentSink {
 /// call id (`<agent call id>:<n>`) because one sub-agent may ask more than
 /// once. A denial is fed back as an error tool_result; nothing else is
 /// gated (reads, searches and edits stay ungated, as in the parent loop).
+/// A `run_command` that commits or pushes meets the secret guard's card
+/// first, which the grant never answers (#819).
 pub struct SubagentGate {
     pub broker: Arc<ApprovalBroker>,
     pub app: AppHandle,
@@ -719,6 +721,8 @@ pub struct SubagentGate {
     pub call_id: String,
     /// The sub-agent's description, shown on the approval card.
     pub label: String,
+    /// The worktree the secret guard scans before a commit or push (#819).
+    pub workspace_path: String,
     /// MCP tools (namespaced) the server did not mark read-only: a call
     /// may change external state (create an issue, post a comment), so it
     /// asks the user first — nobody is watching a sub-agent otherwise.
@@ -735,6 +739,7 @@ impl SubagentGate {
             thread_id: spec.thread_id.clone(),
             call_id: spec.call_id.clone(),
             label: spec.call.description.clone(),
+            workspace_path: spec.workspace_path.clone(),
             mcp_writes: std::collections::HashSet::new(),
             seq: AtomicU64::new(1),
         }
@@ -777,6 +782,22 @@ impl ToolGate for SubagentGate {
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let (shown, card_reason, denial) = if name == "run_command" {
             let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            // The secret guard first (#819); the thread's grant never answers it.
+            let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+            if let Some(denial) = guard_agent_command(
+                &self.broker,
+                &self.app,
+                &self.workspace_id,
+                &self.thread_id,
+                &id,
+                command,
+                &self.workspace_path,
+                Some(self.label.as_str()),
+            )
+            .await
+            {
+                return Some(denial);
+            }
             let reason = dangerous_command(command)?;
             let (card_reason, denial) = gate_texts(&self.label, reason);
             (command.to_string(), card_reason, denial)
@@ -938,13 +959,7 @@ pub async fn run_subagent_core(
         output_tokens: out.output_tokens,
         cache_read_tokens: out.cache_read_tokens,
         cache_creation_tokens: out.cache_creation_tokens,
-        cost_usd: crate::token_engine::cost_for(
-            model,
-            out.input_tokens,
-            out.output_tokens,
-            out.cache_read_tokens,
-            out.cache_creation_tokens,
-        ),
+        cost_usd: out.cost_usd,
         duration_ms: started.elapsed().as_millis() as u64,
         tool_calls: out.tool_calls.len(),
         continued: spec.resume.is_some(),
@@ -958,17 +973,53 @@ pub async fn run_subagent_core(
 
 /// The workspace's MCP tools, discovered once per fan-out (off-thread,
 /// bounded — a hung server must not stall the crew); each sub-agent then
-/// sees the subset its definition grants.
-pub async fn discover_mcp_tools(mcp: Arc<crate::mcp::McpRegistry>, workspace_path: &str) -> Vec<crate::mcp::McpToolInfo> {
+/// sees the subset its definition grants. Servers switched off in the
+/// parent conversation (`off`, from [`thread_mcp_off`]) are left out, so a
+/// sub-agent never gets what its conversation turned off.
+pub async fn discover_mcp_tools(
+    mcp: Arc<crate::mcp::McpRegistry>,
+    workspace_path: &str,
+    off: std::collections::HashSet<String>,
+) -> Vec<crate::mcp::McpToolInfo> {
     let wp = std::path::PathBuf::from(workspace_path);
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        tokio::task::spawn_blocking(move || mcp.list_tools(&wp)),
+        tokio::task::spawn_blocking(move || mcp.list_tools_except(&wp, &off)),
     )
     .await
     .ok()
     .and_then(|r| r.ok())
     .unwrap_or_default()
+}
+
+/// The MCP servers a conversation switched off (the Companion's "can use"
+/// chips). A read error counts as none off: the default is every server.
+pub fn thread_mcp_off(db: &Mutex<Db>, thread_id: &str) -> std::collections::HashSet<String> {
+    db.lock().thread_mcp_disabled(thread_id).unwrap_or_default().into_iter().collect()
+}
+
+/// [`discover_mcp_tools`] for one conversation: its off list is read now.
+/// The one path a Talk turn, a sub-agent fan-out and a sub-agent
+/// continuation discover through. The list is fixed for what it offers: a
+/// running loop keeps the tools it started with.
+pub async fn discover_thread_mcp_tools(
+    mcp: Arc<crate::mcp::McpRegistry>,
+    db: &Mutex<Db>,
+    workspace_path: &str,
+    thread_id: &str,
+) -> Vec<crate::mcp::McpToolInfo> {
+    discover_mcp_tools(mcp, workspace_path, thread_mcp_off(db, thread_id)).await
+}
+
+/// Why a call to `tool` is refused, when it is an MCP tool whose server is in
+/// `off` (the conversation's list as it is at the call, so a server turned
+/// off or back on mid-turn counts from its next call). `None` lets it run.
+pub fn mcp_off_refusal(tool: &str, off: &std::collections::HashSet<String>) -> Option<String> {
+    let server = crate::mcp::server_of(tool).filter(|s| crate::mcp::is_mcp_tool(tool) && off.contains(s))?;
+    Some(format!(
+        "{server} is turned off in this conversation, so its tools are unavailable here. \
+         The user can turn it back on in the Companion's \"can use\" row."
+    ))
 }
 
 /// The configured model ids and the user's tier map, for definition/call
@@ -1001,7 +1052,11 @@ pub async fn run_subagents(
     // bounded — a hung server must not stall the crew); each sub-agent then
     // sees the subset its definition grants.
     let mcp_tools: Arc<Vec<crate::mcp::McpToolInfo>> = Arc::new(match specs.first() {
-        Some(first) => discover_mcp_tools(Arc::clone(&mcp), &first.workspace_path).await,
+        Some(first) => {
+            let found = discover_thread_mcp_tools(Arc::clone(&mcp), &db, &first.workspace_path, &first.thread_id).await;
+            let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
+            found
+        }
         None => Vec::new(),
     });
     let turnstiles = mcp_turnstiles(&mcp_tools);
@@ -2133,5 +2188,48 @@ mod tests {
         assert_eq!(entries[0]["stageId"], "call-1");
         let kinds: Vec<&str> = entries.iter().map(|p| p["entry"]["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
+    }
+
+    /// A sub-agent's `run_command` gets the PATH CLI stages spawn with (#1087).
+    /// Its commands run on a blocking thread, which the login-env stub doesn't
+    /// reach, so this compares with the real login shell's.
+    #[test]
+    #[serial_test::serial]
+    fn a_subagent_command_gets_the_login_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider {
+            turns: Mutex::new(VecDeque::from(vec![
+                resp(
+                    "checking the PATH",
+                    vec![LlmToolUse {
+                        id: "t1".into(),
+                        name: "run_command".into(),
+                        input: serde_json::json!({"command": "printf '%s' \"$PATH\" > path.txt"}),
+                    }],
+                    LlmStopReason::ToolUse,
+                ),
+                resp("Report: wrote path.txt.", vec![], LlmStopReason::EndTurn),
+            ])),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "PATH".into(), prompt: "Write the PATH.".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None, definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let client = reqwest::Client::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = rt
+            .block_on(run_subagent_core(&provider, "http://x", None, &client, "m", &spec, &cancel, &rec, None, None))
+            .unwrap();
+        assert!(out.ok && out.finished, "{}", out.report);
+        let seen = std::fs::read_to_string(dir.path().join("path.txt")).unwrap();
+        assert_eq!(seen, crate::orchestrator::cli_runner::resolved_cli_path());
     }
 }

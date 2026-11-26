@@ -66,4 +66,12 @@ describe("CompanionCurrentRun", () => {
     expect(tag.className).toContain("text-octo-verdigris");
     expect(tag.className).not.toContain("text-octo-brass");
   });
+
+  it("sets the run's cost in ivory, not brass", () => {
+    setState({ run, stages: [stage({ id: "s1", position: 0, status: "running" })] });
+    render(<CompanionCurrentRun workspaceId="w1" />);
+    const cost = screen.getByText("$0.42");
+    expect(cost).toHaveClass("octo-tabular", "text-octo-ivory");
+    expect(cost.className).not.toContain("brass");
+  });
 });

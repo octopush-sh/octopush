@@ -4,6 +4,7 @@
 // wording stays unit-testable.
 
 import type { WorkspaceMode } from "./modes";
+import { formatContextTokens } from "./cost";
 
 export interface DiffStat {
   added: number;
@@ -21,6 +22,9 @@ export interface ModeMetaInput {
   tokensLimit: number;
   /** Changed files in the worktree (Review). */
   changedCount: number;
+  /** `changedCount` is a floor: the 1 MiB cap truncated the diff it was
+   *  counted from, so the tail reads "N+ files" (#903). */
+  changedCountPartial?: boolean;
   /** Added/removed line counts of the working diff (Review). Zeroes outside
    *  review mode — App only fetches the diff there. */
   diffStat: DiffStat;
@@ -72,14 +76,6 @@ export function runTailState(
   return "settled";
 }
 
-/** Compact token count: 34120 → "34k", 980 → "980". Deliberately not
- *  `stageMeta.fmtTokens` — that one keeps a decimal ("34.1k") for the Direct
- *  surfaces and pulls the roles store in with it; the tail wants the shortest
- *  honest number and no store dependency. */
-function compactTokens(n: number): string {
-  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
-}
-
 /** The Review tail split into the atoms its demotion ladder sheds
  *  (`ReviewTail.tsx`): `files` is the floor ("2 files"), `verb` ("changed")
  *  goes first as the band narrows, then `stat` ("+2 −1", null with no line
@@ -91,10 +87,10 @@ export interface ReviewTailParts {
   stat: string | null;
 }
 
-export function reviewTailParts(changedCount: number, stat: DiffStat): ReviewTailParts | null {
+export function reviewTailParts(changedCount: number, stat: DiffStat, partial = false): ReviewTailParts | null {
   if (changedCount <= 0) return null;
   return {
-    files: changedCount === 1 ? "1 file" : `${changedCount} files`,
+    files: partial ? `${changedCount}+ files` : changedCount === 1 ? "1 file" : `${changedCount} files`,
     verb: "changed",
     stat: stat.added === 0 && stat.removed === 0 ? null : `+${stat.added} −${stat.removed}`,
   };
@@ -112,10 +108,10 @@ export function modeMetaLabel(mode: WorkspaceMode, input: ModeMetaInput): string
     case "talk": {
       // Before the first assistant turn there is no context to report.
       if (input.tokensUsed <= 0 || input.tokensLimit <= 0) return null;
-      return `${compactTokens(input.tokensUsed)} / ${compactTokens(input.tokensLimit)} context`;
+      return `${formatContextTokens(input.tokensUsed)} / ${formatContextTokens(input.tokensLimit)} context`;
     }
     case "review": {
-      const parts = reviewTailParts(input.changedCount, input.diffStat);
+      const parts = reviewTailParts(input.changedCount, input.diffStat, input.changedCountPartial);
       if (!parts) return "Nothing to review";
       const files = `${parts.files} ${parts.verb}`;
       return parts.stat ? `${files} · ${parts.stat}` : files;

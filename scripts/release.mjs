@@ -59,6 +59,8 @@ import {
   bumpVersionFiles,
   channelCreateArgs,
   ciPublishDecision,
+  notaryPreflightArgs,
+  notaryPreflightHint,
   pendingChangesets,
   parseChannel,
   releaseBody,
@@ -206,6 +208,25 @@ if (NOTARIZED) {
     "\x1b[33m▸\x1b[0m Unsigned build (no APPLE_SIGNING_IDENTITY). Users will need the `xattr` " +
       "unblock. To ship a Gatekeeper-clean release, see docs/gtm-legitimacy.md.",
   );
+}
+
+// Notarization runs at the very end of `tauri build`, so a credential or
+// account problem used to surface only after ~25 minutes of compiling (v0.4.122
+// and v0.4.123 both died there on Apple's HTTP 403 "A required agreement is
+// missing or has expired"). Ask notarytool first: it submits nothing and fails
+// the same way in seconds. Nothing has been tagged or published at this point.
+if (NOTARIZED) {
+  step("Checking the notarization credentials with Apple (notarytool history)");
+  const args = notaryPreflightArgs(process.env);
+  const r = spawnSync("xcrun", args, { cwd: REPO, encoding: "utf8", timeout: 120_000 });
+  if (r.error || r.status !== 0) {
+    const out = `${r.stdout ?? ""}\n${r.stderr ?? ""}\n${r.error?.message ?? ""}`.trim();
+    if (out) console.error(out);
+    const hint = notaryPreflightHint(out);
+    if (CI) console.log(`::error title=Notarization preflight failed::${hint}`);
+    die(`Notarization preflight failed before the build. ${hint}`);
+  }
+  ok("Apple accepts the notarization credentials");
 }
 
 // ── 1. Bump versions ──────────────────────────────────────────────

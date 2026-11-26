@@ -1,8 +1,11 @@
+import type { ReactNode } from "react";
 import { AUTO_MODEL } from "../lib/policy";
 import ReactMarkdown from "react-markdown";
 import { parseKeyPhrase } from "../lib/parseKeyPhrase";
 import { ChatMarkdown, REMARK_PLUGINS } from "./chat/ChatMarkdown";
 import { splitBySkillTokens } from "../lib/skillMentions";
+import { formatUsd } from "../lib/cost";
+import { tourId } from "../lib/tour/ids";
 
 interface MessageProps {
   role: "user" | "assistant" | "tool" | "error" | string;
@@ -14,6 +17,42 @@ interface MessageProps {
   cacheCreationTokens?: number | null;
   contextTokens?: number | null;
   costUsd?: number | null;
+  /** When the turn was sent (ISO). A user turn shows it in its header. */
+  createdAt?: string | null;
+}
+
+/** Turn times are UI copy, so they are English whatever the system locale
+ *  (CLAUDE.md rule 8), on a 24-hour clock: `14:02`, never `02:02 p. m.`. */
+const TURN_LOCALE = "en-US";
+const CLOCK: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+
+/** A turn's time for its header: the clock time today (`14:02`), with the
+ *  date in front on any other day (`Nov 23, 14:02`) and the year too in an
+ *  earlier year (`Dec 30, 2025, 14:02`), so a thread picked up later still
+ *  reads in order. Empty for a missing or bad date. (`chatTitle.formatRelTime`
+ *  drops the clock time past today, which a turn needs, so it isn't reused.) */
+export function turnTime(iso: string | null | undefined, now: Date = new Date()): string {
+  if (!iso) return "";
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return "";
+  const clock = then.toLocaleTimeString(TURN_LOCALE, CLOCK);
+  const sameDay =
+    then.getFullYear() === now.getFullYear() &&
+    then.getMonth() === now.getMonth() &&
+    then.getDate() === now.getDate();
+  if (sameDay) return clock;
+  const year = then.getFullYear() === now.getFullYear() ? undefined : "numeric";
+  return `${then.toLocaleDateString(TURN_LOCALE, { year, month: "short", day: "numeric" })}, ${clock}`;
+}
+
+/** The full date and time of a turn, for its time's tooltip:
+ *  `Tue, Nov 24, 2026, 14:02`. English and 24-hour, like `turnTime`. */
+export function turnTimeFull(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return "";
+  const date = then.toLocaleDateString(TURN_LOCALE, { weekday: "short", year: "numeric", month: "short", day: "numeric" });
+  return `${date}, ${then.toLocaleTimeString(TURN_LOCALE, CLOCK)}`;
 }
 
 /** The footer of an answer: `211k in · 94% cached · 2.1k out · $0.42`. The
@@ -31,7 +70,7 @@ export function usageFooter(m: MessageProps): string {
   const prompt = uncached + read + written;
   if (read > 0 && prompt > 0) parts.push(`${Math.round((read / prompt) * 100)}% cached`);
   if (m.outputTokens != null) parts.push(`${formatTokenCount(m.outputTokens)} out`);
-  if (m.costUsd != null && m.costUsd > 0) parts.push(`$${m.costUsd < 0.01 ? m.costUsd.toFixed(3) : m.costUsd.toFixed(2)}`);
+  if (m.costUsd != null && m.costUsd > 0) parts.push(m.costUsd < 0.01 ? `$${m.costUsd.toFixed(3)}` : formatUsd(m.costUsd));
   return parts.join(" · ");
 }
 
@@ -43,6 +82,10 @@ interface Props {
   /** The worktree's skill names: a user message's standalone `/name` tokens
    *  that match read as brass skill chips — the skills that rode with it. */
   skillNames?: string[];
+  /** The turn's actions. A user turn sets them in its header, between the
+   *  eyebrow and the time; an answer sets them last in its article (they
+   *  position themselves over its eyebrow line). */
+  actions?: ReactNode;
 }
 
 // Maps Anthropic / OpenAI model IDs to short display names. Falls back to
@@ -69,7 +112,7 @@ function modelDisplayName(model: string | null | undefined): string {
   return MODEL_DISPLAY[model] ?? model;
 }
 
-export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
+export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Props) {
   const { role, content, model, inputTokens, outputTokens } = message;
 
   if (!content || !content.trim()) return null;
@@ -93,10 +136,31 @@ export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
     // and `break-words` wraps an unbroken token (a digest, a long URL) instead
     // of overflowing. Deliberately NOT Markdown — a pasted log, stack trace or
     // snippet must not lose its `#`, `*`, `<tags>` or indented lines.
+    //
+    // The turn sits on the panel surface, the one filled surface in the thread
+    // that isn't code, so the director's words read apart from the model's at
+    // a glance however long the conversation gets. Brass goes to "— You": the
+    // model's eyebrow and its tool rows stay mute.
+    const time = turnTime(message.createdAt);
     return (
-      <div data-role="user" className="octo-selectable flex flex-col gap-1.5">
-        <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-          — You
+      <article
+        data-role="user"
+        data-tour={tourId("talk-turn-ask")}
+        aria-label={time ? `You, ${time}` : "You"}
+        className="octo-selectable rounded-md border border-octo-hairline bg-octo-panel px-4 pb-3 pt-2"
+      >
+        <div className="mb-1 flex h-6 items-center gap-2">
+          <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">— You</span>
+          {actions && <div className="ml-auto flex items-center">{actions}</div>}
+          {time && (
+            <time
+              dateTime={message.createdAt ?? undefined}
+              title={turnTimeFull(message.createdAt)}
+              className={`${actions ? "" : "ml-auto "}octo-tabular font-mono text-[9px] tracking-[0.15em] text-octo-mute`}
+            >
+              {time}
+            </time>
+          )}
         </div>
         <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">
           {skillNames && skillNames.length > 0
@@ -117,23 +181,34 @@ export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
               )
             : content}
         </div>
-      </div>
+      </article>
     );
   }
 
   // Assistant: parse key phrase + body, render eyebrow + lead + markdown body.
   const { keyPhrase, body } = parseKeyPhrase(content);
 
+  // The model's eyebrow is meta, so it is mute: brass marks the director's
+  // turns, and the serif key phrase is the answer's moment.
   return (
-    <div data-role="assistant" className="octo-selectable flex flex-col gap-2">
-      <div className="animate-keyfade-eyebrow font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+    <article
+      data-role="assistant"
+      aria-label={modelDisplayName(model)}
+      className="octo-selectable relative flex flex-col gap-2"
+    >
+      <div className="animate-keyfade-eyebrow font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
         — {modelDisplayName(model)}
       </div>
 
       {keyPhrase && (
         <div className="animate-keyfade-key">
+          {/* parseKeyPhrase only elevates plain prose and inline code; the
+              allow-list keeps any other element (a link, emphasis) out of the
+              serif line as its plain text, never as raw syntax. */}
           <ReactMarkdown
             remarkPlugins={REMARK_PLUGINS}
+            allowedElements={["p", "code"]}
+            unwrapDisallowed
             components={{
               code({ children }) {
                 return (
@@ -170,6 +245,7 @@ export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
           {usageFooter(message)}
         </div>
       )}
-    </div>
+      {actions}
+    </article>
   );
 }

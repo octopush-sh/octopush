@@ -9,6 +9,9 @@ import { ipc } from "../../lib/ipc";
 import { awaitProAfterCheckout } from "../../lib/awaitPro";
 import { pushToast } from "../Toasts";
 import { useSyncPrefsStore } from "../../stores/syncPrefsStore";
+import { syncStatusLine, syncUnsentLine, rejectionReason } from "../../lib/syncStatusLine";
+import { tourId } from "../../lib/tour/ids";
+import type { LibraryRejection, SyncAttempt, SyncKind } from "../../lib/types";
 import { PaneHeader, SectionLabel, ToggleRow } from "./shared";
 
 /** Toggle + helper copy for the two cloud syncs. Exported so the website and
@@ -26,6 +29,91 @@ export const SYNC_COPY = {
   offOnly: "Requires Pro to turn on. You can still turn it off.",
 } as const;
 
+/** How one Sync row renders. A row dims only when it is truly unavailable:
+ *  the account can't sync it (signed out, or no Pro entitlement) AND it is
+ *  off. Off-but-available rows stay at full ink, with the off state carried by
+ *  the switch alone. Turning OFF is always allowed (the backend agrees) — a
+ *  user who lost Pro or signed out must still be able to stop uploads. A write
+ *  in flight only blocks clicks (`busy`); it never dims. */
+export function syncRowState({
+  signedIn,
+  entitled,
+  on,
+  saving,
+}: {
+  signedIn: boolean;
+  entitled: boolean;
+  on: boolean;
+  saving: boolean;
+}): { disabled: boolean; busy: boolean; title: string | undefined } {
+  const available = signedIn && entitled;
+  const lockedTitle = signedIn ? SYNC_COPY.requiresPro : SYNC_COPY.requiresSignIn;
+  return {
+    disabled: !available && !on,
+    busy: saving,
+    title: available ? undefined : on ? SYNC_COPY.offOnly : lockedTitle,
+  };
+}
+
+/** The last-attempt line under one enabled Sync toggle (muted mono; amber
+ *  when the last attempt failed). Nothing when off. */
+export function SyncStatusNote({
+  kind,
+  enabled,
+  attempt,
+}: {
+  kind: SyncKind;
+  enabled: boolean;
+  attempt: SyncAttempt | null;
+}) {
+  const line = syncStatusLine(kind, enabled, attempt);
+  if (!line) return null;
+  return (
+    <p
+      key={line.text}
+      className={`octo-fade-in px-4 pt-1.5 font-mono text-[11px] leading-[1.5] ${
+        line.tone === "warning" ? "text-octo-warning" : "text-octo-mute"
+      }`}
+      data-testid={`sync-${kind}-status`}
+      data-tour={
+        kind === "history"
+          ? tourId("settings-account-sync-history-status")
+          : tourId("settings-account-sync-library-status")
+      }
+    >
+      {line.text}
+    </p>
+  );
+}
+
+/** The amber line under the library toggle naming the items the sync service
+ *  refused, and why (#799). Nothing when off or when everything was stored.
+ *  The tooltip lists every unsent item. */
+export function SyncUnsentNote({
+  enabled,
+  rejected,
+}: {
+  enabled: boolean;
+  rejected: LibraryRejection[] | null | undefined;
+}) {
+  const line = syncUnsentLine(enabled, rejected);
+  if (!line || !rejected) return null;
+  const title = rejected
+    .map((r) => `${r.kind === "role" ? "Role" : "Pipeline"} "${r.name?.trim() || r.id}": ${rejectionReason(r.reason)}`)
+    .join("\n");
+  return (
+    <p
+      key={line.text}
+      className="octo-fade-in px-4 pt-1 font-mono text-[11px] leading-[1.5] text-octo-warning"
+      title={title}
+      data-testid="sync-library-unsent"
+      data-tour="settings-account-sync-library-unsent"
+    >
+      {line.text}
+    </p>
+  );
+}
+
 export function AccountPane() {
   const { status, signingIn, error, signIn, cancelSignIn, signOut, refresh } = useAuth();
   const { plan, reload, hasFeature } = useEntitlement();
@@ -36,17 +124,28 @@ export function AccountPane() {
   const syncError = useSyncPrefsStore((s) => s.error);
   const loadSyncPrefs = useSyncPrefsStore((s) => s.load);
   const setSyncPref = useSyncPrefsStore((s) => s.setPref);
-  const canHistorySync = status.signedIn && hasFeature("history.sync");
-  const canLibrarySync = status.signedIn && hasFeature("library.sync");
-  const lockedTitle = status.signedIn ? SYNC_COPY.requiresPro : SYNC_COPY.requiresSignIn;
-  // Turning OFF is always allowed (the backend agrees) — a user who lost Pro or
-  // signed out must still be able to stop uploads before re-subscribing.
-  const titleFor = (can: boolean, on: boolean) =>
-    can ? undefined : on ? SYNC_COPY.offOnly : lockedTitle;
+  const syncStatus = useSyncPrefsStore((s) => s.status);
+  const loadSyncStatus = useSyncPrefsStore((s) => s.loadStatus);
+  const historyRow = syncRowState({
+    signedIn: status.signedIn,
+    entitled: hasFeature("history.sync"),
+    on: historySync,
+    saving: syncSaving === "history",
+  });
+  const libraryRow = syncRowState({
+    signedIn: status.signedIn,
+    entitled: hasFeature("library.sync"),
+    on: librarySync,
+    saving: syncSaving === "library",
+  });
 
   useEffect(() => {
     void loadSyncPrefs();
   }, [loadSyncPrefs, status.signedIn]);
+
+  useEffect(() => {
+    void loadSyncStatus();
+  }, [loadSyncStatus, status.signedIn, historySync, librarySync]);
 
   // On opening the pane while signed in, re-fetch identity (to pick up a plan
   // change after a just-completed checkout) and reload the entitlement.
@@ -87,7 +186,7 @@ export function AccountPane() {
         subtitle="Octopush is free and local-first. An account unlocks Pro — the multi-agent orchestration harness and optional sync across your Macs. Your provider keys never leave this device; your runs and library stay local unless you turn on sync."
       />
 
-      <div className="max-w-[640px] space-y-8">
+      <div className="space-y-8">
         {status.signedIn ? (
           <div className="space-y-4">
             <SectionLabel>Signed in</SectionLabel>
@@ -126,16 +225,16 @@ export function AccountPane() {
                 <button
                   type="button"
                   onClick={() => void openPortal()}
-                  className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:border-[var(--brass-dim)] hover:text-octo-brass"
+                  className="inline-flex items-center justify-center gap-1.5 rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory"
                 >
-                  Manage account ↗
+                  Manage your account ↗
                 </button>
                 <button
                   type="button"
                   onClick={() => void signOut()}
-                  className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:border-octo-rouge hover:text-octo-rouge"
+                  className="inline-flex items-center justify-center gap-1.5 rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-mute transition-colors duration-[180ms] hover:border-octo-rouge hover:text-octo-rouge"
                 >
-                  Sign out
+                  Sign out of Octopush
                 </button>
               </div>
             </div>
@@ -166,7 +265,7 @@ export function AccountPane() {
                 <button
                   type="button"
                   onClick={() => void cancelSignIn()}
-                  className="rounded-md border border-octo-hairline px-3 py-2 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:border-octo-rouge hover:text-octo-rouge"
+                  className="inline-flex items-center justify-center gap-1.5 rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-mute transition-colors duration-[180ms] hover:border-octo-rouge hover:text-octo-rouge"
                 >
                   Cancel
                 </button>
@@ -178,24 +277,33 @@ export function AccountPane() {
 
         <div className="space-y-2" data-testid="sync-section">
           <SectionLabel>Sync</SectionLabel>
-          <ToggleRow
-            label={SYNC_COPY.historyLabel}
-            description={SYNC_COPY.historyDescription}
-            checked={historySync}
-            disabled={(!canHistorySync && !historySync) || syncSaving === "history"}
-            title={titleFor(canHistorySync, historySync)}
-            onChange={(v) => void setSyncPref("history", v)}
-            testId="sync-history-toggle"
-          />
-          <ToggleRow
-            label={SYNC_COPY.libraryLabel}
-            description={SYNC_COPY.libraryDescription}
-            checked={librarySync}
-            disabled={(!canLibrarySync && !librarySync) || syncSaving === "library"}
-            title={titleFor(canLibrarySync, librarySync)}
-            onChange={(v) => void setSyncPref("library", v)}
-            testId="sync-library-toggle"
-          />
+          <div>
+            <ToggleRow
+              label={SYNC_COPY.historyLabel}
+              description={SYNC_COPY.historyDescription}
+              checked={historySync}
+              disabled={historyRow.disabled}
+              busy={historyRow.busy}
+              title={historyRow.title}
+              onChange={(v) => void setSyncPref("history", v)}
+              testId="sync-history-toggle"
+            />
+            <SyncStatusNote kind="history" enabled={historySync} attempt={syncStatus.history} />
+          </div>
+          <div>
+            <ToggleRow
+              label={SYNC_COPY.libraryLabel}
+              description={SYNC_COPY.libraryDescription}
+              checked={librarySync}
+              disabled={libraryRow.disabled}
+              busy={libraryRow.busy}
+              title={libraryRow.title}
+              onChange={(v) => void setSyncPref("library", v)}
+              testId="sync-library-toggle"
+            />
+            <SyncStatusNote kind="library" enabled={librarySync} attempt={syncStatus.library} />
+            <SyncUnsentNote enabled={librarySync} rejected={syncStatus.libraryRejected} />
+          </div>
           <p className="pt-1 text-[12px] leading-[1.55] text-octo-mute" data-testid="sync-note">
             {SYNC_COPY.note}
           </p>

@@ -5,6 +5,7 @@
 // validates server-side, then keys/base-URLs merge into settings.json.
 import { useEffect, useMemo, useState } from "react";
 import { Pencil, X, RefreshCw } from "lucide-react";
+import { formatContextTokens } from "../../lib/cost";
 import { ipc } from "../../lib/ipc";
 import { useProvidersStore } from "../../stores/providersStore";
 import type { ModelInfo, ProviderConfig } from "../../lib/types";
@@ -199,7 +200,7 @@ export function ModelsPane() {
         subtitle="API keys live on this machine in ~/.octopush/settings.json. They never leave the device except in requests to the providers themselves."
       />
 
-      <div className="grid max-w-[860px] grid-cols-[220px_1fr] gap-5">
+      <div className="grid grid-cols-[220px_1fr] gap-5">
         {/* ── Master: provider list ── */}
         <div className="flex flex-col gap-1">
           <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">Providers</div>
@@ -216,8 +217,7 @@ export function ModelsPane() {
             type="button"
             data-tour="settings-models-add-provider"
             onClick={() => setShowAddProvider(true)}
-            className="mt-2 flex items-center rounded-md px-3 py-2 font-serif text-[13px] text-octo-brass transition"
-            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+            className="mt-2 flex items-center rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[13px] text-octo-sage transition-colors hover:text-octo-ivory"
           >
             Connect another provider
           </button>
@@ -263,7 +263,7 @@ export function ModelsPane() {
       <ModelTiersSection />
 
       {/* ── Unsaved-changes bar ── */}
-      <div className="sticky bottom-0 mt-6 max-w-[860px]">
+      <div className="sticky bottom-0 mt-6">
         <Reveal open={dirty}>
           <div
             className="flex items-center gap-3 rounded-lg px-4 py-2.5"
@@ -498,8 +498,7 @@ function ProviderDetail({
             type="button"
             data-tour="settings-models-add-model"
             onClick={onAddModel}
-            className="flex items-center rounded-md px-2.5 py-1 font-serif text-[12px] text-octo-brass transition"
-            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+            className="flex items-center rounded-md border border-octo-border-strong px-2.5 py-1 font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory"
           >
             Bring in another model
           </button>
@@ -522,7 +521,7 @@ function ProviderDetail({
                     <span className="ml-2 font-sans text-[10px] text-octo-sage">{m.displayName}</span>
                   )}
                   <span className="octo-tabular ml-2 font-mono text-[9px] text-octo-mute">
-                    ${m.inputCostPerM}/{m.outputCostPerM} · {(m.maxContext / 1000).toFixed(0)}k ctx
+                    ${m.inputCostPerM}/{m.outputCostPerM} · {formatContextTokens(m.maxContext)} ctx
                   </span>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">

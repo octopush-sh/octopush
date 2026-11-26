@@ -11,22 +11,30 @@
 // acceptance is journaled); any other answer still opens the full form.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ChevronRight, Hammer, MessageSquare, Moon, Plus, Square, Terminal, X } from "lucide-react";
-import type { Run, RunStage } from "../lib/ipc";
+import { ArrowDownUp, ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Play, Plus, Square, Terminal, TimerOff, Hourglass, X } from "lucide-react";
+import type { DiffSize, Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
+import { useGroupsStore } from "../stores/groupsStore";
+import { missionGroupNameOf } from "../lib/railGroups";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { INTENT_ICON } from "../lib/missionIntent";
 import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
+import { isPlanWaiting, planLimitedStage, planWaitLine } from "../lib/planWait";
 import { lastActivity } from "../lib/liveLine";
 import { claudeWaitReason, claudeWaitingCopy, type ClaudeWaitReason } from "../lib/claudeWaiting";
 import { stageTitle } from "../lib/stageMeta";
+import { formatUsd } from "../lib/cost";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
 import { StageDots } from "./direct/StageDots";
 import { Reveal } from "./primitives/Reveal";
 import { ClaudeLoginNote } from "./ClaudeLoginNote";
 import { tourId } from "../lib/tour/ids";
+import { useCollisionStore } from "../stores/collisionStore";
+import { collisionSegment, collisionTooltip, worstSeverity } from "../lib/collisions";
+import { collisionTone, useWorkspaceCollisions } from "./CollisionMark";
+import { diffSizeKey, diffSizeLabel, diffSizeTitle, orderSettled, useDiffSizeStore } from "../stores/diffSizeStore";
 
 interface Props {
   open: boolean;
@@ -68,14 +76,21 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   const awayRunIds = useRunsStore((s) => s.awayRunIds);
   const flagsByWs = useAttentionStore((s) => s.flagsByWs);
   const missionByWorkspaceId = useMissionsStore((s) => s.missionByWorkspaceId);
+  // The Settled band only: oldest first (the default, today's order) or the
+  // smallest diff first, so the director can clear the quick reviews.
+  const [settledOrder, setSettledOrder] = useState<"oldest" | "smallest">("oldest");
+  const sizeByKey = useDiffSizeStore((s) => s.byKey);
+  const workspacesByProjectId = useWorkspaceStore((s) => s.workspacesByProjectId);
 
   // The board: paused runs + attention (chats/terminals waiting on you) in
   // "needs you", running runs in flight, and this session's settled
   // (undismissed). Attention items are always needs-you — a human is waiting.
   const board = useMemo(() => {
     const all = Object.values(runsByWs).flat();
-    const paused = all.filter((r) => r.status === "paused");
-    const running = all.filter((r) => r.status === "running");
+    // A run waiting for its Claude plan to reset, with an automatic resume
+    // scheduled, needs nobody: it stays in flight (#731).
+    const paused = all.filter((r) => r.status === "paused" && !isPlanWaiting(r));
+    const running = all.filter((r) => r.status === "running" || isPlanWaiting(r));
     const settled = all.filter((r) => r.id in settledAt);
     const runSince = (r: Run) => {
       if (statusSince[r.id] !== undefined) return statusSince[r.id];
@@ -115,6 +130,37 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   // detailByRun imperatively — subscribing to the whole map here would churn
   // this component on every stage event even while the room is closed.
   const boardIds = boardRuns.map((r) => r.id).join(",");
+
+  // Diff sizes of runs that left the board are dropped, never kept for good.
+  useEffect(() => {
+    useDiffSizeStore.getState().prune(boardIds ? boardIds.split(",") : []);
+  }, [boardIds]);
+
+  // Settled, in the chosen order. A card is measured only while its workspace
+  // is loaded (see CrewCard); one that can't be has nothing to show (`null`),
+  // one still measuring is `undefined`, which holds "Smallest first" at the
+  // oldest-first order until every visible size is in.
+  const settledItems = useMemo(
+    () =>
+      orderSettled(board.settled, settledOrder, (r) => {
+        if (findWorkspaceName(workspacesByProjectId, r.workspaceId) === null) return null;
+        const key = diffSizeKey(r.id, r.status, statusSince[r.id]);
+        return key in sizeByKey ? sizeByKey[key] : undefined;
+      }).map((r) => ({ kind: "run" as const, run: r })),
+    [board.settled, settledOrder, sizeByKey, statusSince, workspacesByProjectId],
+  );
+
+  // Collision radar (#732): opening the room rescans the projects its crews
+  // work in (throttled in the store, cached in the backend).
+  const boardWs = boardRuns.map((r) => r.workspaceId).join(",");
+  useEffect(() => {
+    if (!open || !boardWs) return;
+    const wanted = new Set(boardWs.split(","));
+    const byProject = useWorkspaceStore.getState().workspacesByProjectId;
+    for (const [projectId, list] of Object.entries(byProject)) {
+      if (list.some((w) => wanted.has(w.id))) void useCollisionStore.getState().refresh(projectId);
+    }
+  }, [open, boardWs]);
   useEffect(() => {
     if (!open) return;
     const detailByRun = useRunsStore.getState().detailByRun;
@@ -178,11 +224,11 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
               >
                 {baseline > 0 && (
                   <>
-                    <span className="octo-tabular text-octo-verdigris">saved ${saved.toFixed(2)}</span>
+                    <span className="octo-tabular text-octo-verdigris">saved {formatUsd(saved)}</span>
                     <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
                   </>
                 )}
-                <span className="octo-tabular text-octo-brass">spent ${spent.toFixed(2)}</span>
+                <span className="octo-tabular text-octo-ivory">spent {formatUsd(spent)}</span>
               </span>
             )}
             <button
@@ -227,7 +273,28 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
         <div className="flex-1 overflow-y-auto px-8 pb-8">
           <BandSection title="Needs you" items={board.needsYou} band="needs-you" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
           <BandSection title="In flight" items={board.inFlight.map((r) => ({ kind: "run" as const, run: r }))} band="in-flight" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
-          <BandSection title="Settled" items={board.settled.map((r) => ({ kind: "run" as const, run: r }))} band="settled" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
+          <BandSection
+            title="Settled"
+            items={settledItems}
+            band="settled"
+            onJumpToRun={onJumpToRun}
+            onJumpToAttention={onJumpToAttention}
+            control={
+              <button
+                type="button"
+                data-tour="mission-control-settled-order"
+                onClick={() => setSettledOrder((o) => (o === "oldest" ? "smallest" : "oldest"))}
+                aria-label={settledOrder === "oldest" ? "Order settled crews by smallest diff first" : "Order settled crews oldest first"}
+                title={settledOrder === "oldest" ? "Oldest first — click for smallest diff first" : "Smallest diff first — click for oldest first"}
+                className="flex items-center gap-1.5 rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                <ArrowDownUp size={11} aria-hidden />
+                <span key={settledOrder} className="octo-fade-in">
+                  {settledOrder === "oldest" ? "Oldest first" : "Smallest first"}
+                </span>
+              </button>
+            }
+          />
         </div>
       )}
     </OverlayRoom>
@@ -240,18 +307,22 @@ function BandSection({
   band,
   onJumpToRun,
   onJumpToAttention,
+  control,
 }: {
   title: string;
   items: BoardItem[];
   band: Band;
   onJumpToRun: (workspaceId: string) => void;
   onJumpToAttention: (workspaceId: string, kind: "chat" | "terminal") => void;
+  /** A quiet band-level control at the header's right end (Settled's order). */
+  control?: React.ReactNode;
 }) {
   if (items.length === 0) return null;
   return (
     <section>
-      <div className="flex h-11 items-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+      <div className="flex h-11 items-center justify-between font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
         {title}
+        {control}
       </div>
       <div className="grid grid-cols-[repeat(auto-fill,minmax(380px,1fr))] items-start gap-4">
         {items.map((item, i) =>
@@ -293,6 +364,7 @@ function AttentionCard({
   // Mirror CrewCard's guard: a workspace whose project is closed still shows,
   // but jump-to is disabled — we can't navigate to an unloaded workspace.
   const canJump = wsName !== null;
+
   const jump = () => onJump(item.workspaceId, item.flag);
   const jumpProps = canJump
     ? {
@@ -364,6 +436,7 @@ function CrewCard({
   const stages = useRunsStore((s) => s.detailByRun[run.id]?.stages ?? EMPTY_STAGES);
   const statusSinceMs = useRunsStore((s) => s.statusSince[run.id]);
   const wsName = useWorkspaceName(run.workspaceId);
+  const groupName = useWorkspaceGroupName(run.workspaceId);
   const missionIntent = useMissionsStore(
     (s) => s.missionByWorkspaceId[run.workspaceId]?.intent ?? null,
   );
@@ -371,6 +444,18 @@ function CrewCard({
   // and can be aborted — but jump-to is disabled: we can't navigate to an
   // unloaded workspace. (Same guard the old tray popover carried.)
   const canJump = wsName !== null;
+
+  // How much code waits for review — settled and needs-you cards only,
+  // measured once per run state (never on every render) and only while the
+  // workspace is loaded; nothing shows until (or unless) it is known.
+  const sized = canJump && (band === "settled" || band === "needs-you");
+  const ensureSize = useDiffSizeStore((s) => s.ensure);
+  const size = useDiffSizeStore((s) =>
+    sized ? s.byKey[diffSizeKey(run.id, run.status, statusSinceMs)] ?? null : null,
+  );
+  useEffect(() => {
+    if (sized) ensureSize(run.id, run.status, statusSinceMs, run.workspaceId);
+  }, [sized, ensureSize, run.id, run.status, statusSinceMs, run.workspaceId]);
 
   // Time-in-state — session-observed transition time, falling back to the
   // run's start for launch-hydrated rows. Fixed-width tabular slot (S2);
@@ -392,9 +477,19 @@ function CrewCard({
   const failedStage = stages.find((s) => s.status === "failed");
   const stalled = !!failedStage && isTransientHalt(failedStage.error);
   const runningStage = stages.find((s) => s.status === "running");
+  const planWaiting = isPlanWaiting(run);
 
-  const glyph =
-    band === "needs-you" && stalled
+  // A plan wait reuses the plan-limit bar's lucide `Hourglass` (with a
+  // tooltip), not a bespoke glyph.
+  const glyph: { label: React.ReactNode; cls: string; word: string; title?: string } =
+    planWaiting
+      ? {
+          label: <Hourglass size={10} strokeWidth={1.75} aria-hidden />,
+          cls: "inline-flex items-center text-octo-sage",
+          word: "waiting",
+          title: "Waiting for your Claude plan's window to reset",
+        }
+      : band === "needs-you" && stalled
       ? { label: "⟳", cls: "text-octo-warning", word: "stalled" }
       : band === "needs-you" && failedStage
         ? { label: "✕", cls: "text-octo-rouge", word: "halted" }
@@ -455,11 +550,26 @@ function CrewCard({
       {/* Row 1 — status glyph · word · workspace · time-in-state. The status
           word never truncates; the workspace name gives way first. */}
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
-        <span key={glyph.word} className={`octo-pop-in ${glyph.cls}`}>{glyph.label}</span>
+        <span key={glyph.word} className={`octo-pop-in ${glyph.cls}`} title={glyph.title}>{glyph.label}</span>
         <span className="shrink-0 uppercase tracking-[0.25em] text-octo-mute">{glyph.word}</span>
         {wsName && (
           <>
             <span aria-hidden className="shrink-0 text-octo-mute">·</span>
+            {/* `group · workspace` for a mission in a group: the group's name
+                first, and the first to give way (shrink-[100] against the
+                workspace's own). Nothing for a loose mission. */}
+            {groupName && (
+              <>
+                <span
+                  data-testid="mission-control-card-group"
+                  className="min-w-0 shrink-[100] truncate text-octo-mute"
+                  title={`Group: ${groupName}`}
+                >
+                  {groupName}
+                </span>
+                <span aria-hidden className="shrink-0 text-octo-mute">·</span>
+              </>
+            )}
             <span
               data-tour="mission-control-card-workspace"
               className="min-w-0 truncate text-octo-mute"
@@ -469,6 +579,7 @@ function CrewCard({
             </span>
           </>
         )}
+        {band !== "settled" && <CollisionSegment workspaceId={run.workspaceId} />}
         {run.detached && run.status === "running" && (
           <span
             title="Working detached — this crew keeps going even if you quit Octopush"
@@ -520,7 +631,7 @@ function CrewCard({
       )}
 
       {/* Row 5 — ledger foot + actions. */}
-      <CardFoot run={run} band={band} />
+      <CardFoot run={run} band={band} size={size} />
     </div>
   );
 }
@@ -564,7 +675,12 @@ function LiveSlot({
 
   let text = "";
   let cls = "text-octo-mute";
-  if (band === "in-flight") {
+  const planLine = planWaitLine(run, Date.now());
+  if (band === "in-flight" && planLine && isPlanWaiting(run)) {
+    // Waiting for the plan's window, not for you: a calm sage line.
+    text = planLine;
+    cls = "text-octo-sage";
+  } else if (band === "in-flight") {
     text = (entries && lastActivity(entries)) || (running ? `${stageTitle(running)} at work` : "");
     cls = "text-octo-sage";
   } else if (band === "needs-you") {
@@ -599,8 +715,15 @@ function LiveSlot({
     }
   }
 
+  const planTitle = planLine && isPlanWaiting(run)
+    ? "Paused by your Claude plan — it continues the same session once the window resets"
+    : undefined;
   return (
-    <span className={`block h-4 truncate font-mono text-[10px] leading-4 ${cls}`} title={text || undefined}>
+    <span
+      className={`block h-4 truncate font-mono text-[10px] leading-4 ${cls}`}
+      title={planTitle ?? (text || undefined)}
+      data-tour={planTitle ? "mission-control-plan-wait" : undefined}
+    >
       {text}
     </span>
   );
@@ -722,9 +845,13 @@ function AskPanel({
   );
 }
 
-function CardFoot({ run, band }: { run: Run; band: Band }) {
+function CardFoot({ run, band, size }: { run: Run; band: Band; size: DiffSize | null }) {
   const abort = useRunsStore((s) => s.abort);
+  const resolve = useRunsStore((s) => s.resolve);
+  const refreshDetail = useRunsStore((s) => s.refreshDetail);
+  const cancelPlanResume = useRunsStore((s) => s.cancelPlanResume);
   const dismissSettled = useRunsStore((s) => s.dismissSettled);
+  const planWaiting = isPlanWaiting(run);
   const [arming, setArming] = useState(false);
   const armTimer = useRef<number | null>(null);
   useEffect(
@@ -737,6 +864,20 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
   // A completed crew's foot gets the one sanctioned ceremony: a single brass
   // sweep as it settles (only when it JUST settled — not on later re-opens).
   const settledJustNow = band === "settled" && run.status === "completed" && recentlySettled(run.id);
+
+  // Resume names the plan-limited stage, never "the first waiting stage": a
+  // run can also hold a gate the director hasn't looked at. The detail is
+  // read fresh when the card has none yet; no plan-limited stage left means
+  // nothing to resume (the refresh already updated the card).
+  const onResumeNow = async () => {
+    const stageOf = () => planLimitedStage(useRunsStore.getState().detailByRun[run.id]?.stages ?? []);
+    let stage = stageOf();
+    if (!stage) {
+      await refreshDetail(run.id);
+      stage = stageOf();
+    }
+    if (stage) await resolve(run.id, stage.id, "resume");
+  };
 
   const onAbort = (e: React.MouseEvent) => {
     e.stopPropagation(); // don't trigger the card's jump
@@ -755,16 +896,54 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
       {settledJustNow && (
         <span aria-hidden className="octo-sweep absolute -top-1 left-0 h-px w-full bg-octo-brass" />
       )}
-      {/* Per-card spend is quiet; brass spend belongs to the header's fleet ledger. */}
+      {/* Per-card spend is quiet; the fleet total lives in the header's ledger. */}
       <span data-tour="mission-control-card-spent" className="octo-tabular text-octo-mute">
-        ${run.costUsd.toFixed(2)}
+        {formatUsd(run.costUsd)}
       </span>
+      {size && (
+        <span
+          data-tour="mission-control-card-size"
+          className="octo-pop-in octo-tabular min-w-0 truncate text-octo-mute"
+          title={diffSizeTitle(size)}
+        >
+          · {diffSizeLabel(size)}
+        </span>
+      )}
       {run.baselineUsd > run.costUsd && band !== "settled" && (
         <span className="octo-tabular text-octo-verdigris">
-          saved ${(run.baselineUsd - run.costUsd).toFixed(2)}
+          saved {formatUsd(run.baselineUsd - run.costUsd)}
         </span>
       )}
       <span className="relative z-10 ml-auto flex items-center gap-1 opacity-0 transition-opacity duration-[180ms] group-hover:opacity-100 group-focus-within:opacity-100">
+        {planWaiting && (
+          <>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation(); // don't trigger the card's jump
+                void onResumeNow().catch(console.error);
+              }}
+              aria-label="Resume now"
+              title="Resume now — continue the same session before the plan's window resets"
+              data-tour="mission-control-plan-resume-now"
+              className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              <Play size={11} />
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation(); // don't trigger the card's jump
+                void cancelPlanResume(run.id).catch(console.error);
+              }}
+              aria-label="Don't resume automatically"
+              title="Don't resume automatically — keep it parked until you resume it"
+              className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              <TimerOff size={11} />
+            </button>
+          </>
+        )}
         {band !== "settled" ? (
           <button
             type="button"
@@ -811,7 +990,7 @@ export function awayLine(settled: Run[], awayRunIds: string[]): { count: number;
   const priced = away.filter((r) => r.baselineUsd > 0);
   if (priced.length === 0) return { count: away.length, saved: "unpriced" };
   const saved = priced.reduce((sum, r) => sum + Math.max(0, r.baselineUsd - r.costUsd), 0);
-  return { count: away.length, saved: `saved $${saved.toFixed(2)}` };
+  return { count: away.length, saved: `saved ${formatUsd(saved)}` };
 }
 
 /** True while the run settled within the last few seconds — gates the one-shot
@@ -844,6 +1023,40 @@ function useTimeInState(sinceIso: string | null): string {
   const h = Math.floor(secs / 3600);
   const mm = Math.floor((secs % 3600) / 60).toString().padStart(2, "0");
   return `${h}h ${mm}m`;
+}
+
+/** Collision radar (#732): one meta segment — "overlaps auth-flow · 2 files"
+ *  — when another live workspace of the project changes the same files. Mute
+ *  text behind an amber/rouge glyph; never a needs-you item, never the beacon.
+ *  It gives way (truncates) before the status word and the time slot. */
+function CollisionSegment({ workspaceId }: { workspaceId: string }) {
+  const list = useWorkspaceCollisions(workspaceId);
+  const view = useMemo(() => {
+    const severity = worstSeverity(list);
+    const text = collisionSegment(list);
+    const tip = collisionTooltip(list);
+    return severity && text && tip ? { severity, text, tip } : null;
+  }, [list]);
+  if (!view) return null;
+  return (
+    <>
+      <span aria-hidden className="shrink-0 text-octo-mute">·</span>
+      <span
+        data-tour="mission-control-card-collision"
+        title={view.tip}
+        className="octo-pop-in flex min-w-0 items-center gap-1 text-octo-mute"
+      >
+        <GitCompareArrows size={11} aria-hidden className={`shrink-0 ${collisionTone(view.severity)}`} />
+        <span className="min-w-0 truncate">{view.text}</span>
+      </span>
+    </>
+  );
+}
+
+/** The name of the mission group the workspace sits in, or null. */
+function useWorkspaceGroupName(workspaceId: string): string | null {
+  const groups = useGroupsStore((s) => s.groups);
+  return useWorkspaceStore((s) => missionGroupNameOf(s.workspacesByProjectId, groups, workspaceId));
 }
 
 /** The workspace's display name — thin hook over the shared selector. */

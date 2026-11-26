@@ -1,4 +1,4 @@
-import { CheckCircle, XCircle, HelpCircle } from "lucide-react";
+import { CheckCircle, XCircle, HelpCircle, MessageSquarePlus } from "lucide-react";
 
 interface Props {
   range: string;
@@ -6,9 +6,14 @@ interface Props {
   deletions: number;
   focused: boolean;
   staged: boolean;
+  /** Committed changes (#851): Why? only — Accept and Reject act on the
+   *  working tree, which this hunk is not in. */
+  readOnly?: boolean;
   onAccept: () => void;
   onReject: () => void;
   onWhy: () => void;
+  /** "Ask for a change" (#956); absent in the committed view. */
+  onComment?: () => void;
 }
 
 export function HunkRail({
@@ -17,9 +22,11 @@ export function HunkRail({
   deletions,
   focused,
   staged,
+  readOnly = false,
   onAccept,
   onReject,
   onWhy,
+  onComment,
 }: Props) {
   return (
     <div
@@ -57,6 +64,19 @@ export function HunkRail({
             >
               <HelpCircle size={11} className="inline" /> Why?
             </button>
+            {!readOnly && (
+            <>
+            {onComment && (
+              <button
+                data-tour="review-hunk-comment"
+                onClick={onComment}
+                aria-label="Ask for a change"
+                title="Ask for a change (m)"
+                className="rounded px-1 py-0.5 text-octo-mute transition-colors hover:text-octo-sage focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                <MessageSquarePlus size={11} className="inline" />
+              </button>
+            )}
             <button
               onClick={onReject}
               aria-label="Reject hunk"
@@ -73,6 +93,8 @@ export function HunkRail({
             >
               <CheckCircle size={11} className="inline" /> Accept
             </button>
+            </>
+            )}
           </>
         )}
       </span>

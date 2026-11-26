@@ -7,75 +7,242 @@
  * I publish?* — context that isn't visible anywhere else on screen.
  *
  *   1. Readiness — a one-line verdict synthesised from the working-tree state.
+ *   1b. For the agent — the "Ask for a change" comments left on the diff, and
+ *      one action that sends them to the agent (only while there is one).
  *   2. Provenance — the agentic story of the diff: which agent turns shaped it,
  *      expandable to the turn's model + message. Octopush's signature.
- *   3. Branch & publish — upstream / ahead-behind / last commit at a glance.
+ *   3. Branch & publish — upstream / ahead-behind / last commit at a glance,
+ *      and the on-demand "Scan this branch's commits" for secrets.
  */
 
-import { useEffect, useMemo, useState } from "react";
-import { Sparkles, GitBranch, Loader2, ChevronDown, GitCommit } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit, GitCompare, ShieldAlert, ShieldCheck } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
 import type { GitStatus, FileEdit, ChatMessage } from "../lib/types";
+import { PARTIAL_NOTE, PREVIEW_TIP, branchScanSummary, findingLocation, previewSummary, type SecretPreview } from "../lib/secretGuard";
 import { formatRelTime } from "../lib/relTime";
+import { collisionTooltip, notable, shownCount } from "../lib/collisions";
+import { useCollisionStore } from "../stores/collisionStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useReviewSource } from "../stores/reviewSourceStore";
+import { baseName, commitCount } from "../lib/reviewSource";
+import { Reveal } from "./primitives/Reveal";
+import { collisionTone, useWorkspaceCollisions } from "./CollisionMark";
+import { CommentTray } from "./review/CommentTray";
 
 interface Props {
   workspaceId: string;
   workspacePath: string;
   gitStatus: GitStatus | null;
-  gitDiff: string;
   /** Jump to a file in the diff (scrolls + highlights). */
   onJump?: (file: string, line: number | null) => void;
 }
 
-export function CompanionReview({ workspaceId, workspacePath, gitStatus, gitDiff, onJump }: Props) {
+export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump }: Props) {
   const files = gitStatus?.changedFiles ?? [];
   const staged = files.filter((f) => f.staged).length;
   const conflicted = gitStatus?.conflicted ?? 0;
   const fileCount = files.length;
-
-  const { addCount, delCount } = useMemo(() => {
-    if (!gitDiff) return { addCount: 0, delCount: 0 };
-    let a = 0, d = 0;
-    for (const l of gitDiff.split("\n")) {
-      if (l.startsWith("+") && !l.startsWith("+++")) a++;
-      else if (l.startsWith("-") && !l.startsWith("---")) d++;
-    }
-    return { addCount: a, delCount: d };
-  }, [gitDiff]);
+  const secret = useStagedSecretPreview(workspacePath, gitStatus);
+  const held = secret ? Math.max(secret.total, secret.findings.length) > 0 || secret.partial : false;
 
   // ── Verdict — deliberately AI-free; the AI review lives in the diff. ──
+  // The file count and +/− stat live once, in the mode band's tail; the
+  // verdict names its unit ("files") so it reads against the diff's hunks.
   const verdict =
     fileCount === 0
       ? { text: "Working tree is clean.", tone: "text-octo-mute" }
       : conflicted > 0
         ? { text: `Resolve ${conflicted} conflict${conflicted !== 1 ? "s" : ""} first.`, tone: "text-octo-rouge" }
-        : staged > 0
-          ? { text: `${staged} staged · ready to commit.`, tone: "text-octo-ivory" }
-          : { text: `${fileCount} change${fileCount !== 1 ? "s" : ""} to review.`, tone: "text-octo-ivory" };
+        : staged > 0 && held
+          ? { text: `${staged} staged · the secret guard will ask first.`, tone: "text-octo-rouge" }
+          : staged > 0
+            ? { text: `${staged} staged · ready to commit.`, tone: "text-octo-ivory" }
+            : { text: `${fileCount} file${fileCount !== 1 ? "s" : ""} to review.`, tone: "text-octo-ivory" };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
       {/* ── Readiness hero ──────────────────────────────────────── */}
       <div className="border-b border-octo-hairline px-4 py-3">
         <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Review</div>
-        <div className={`mt-1.5 font-serif text-[15px] leading-snug ${verdict.tone}`}>{verdict.text}</div>
-        {fileCount > 0 && (
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-octo-mute octo-tabular">
-            <span>{fileCount} file{fileCount !== 1 ? "s" : ""}</span>
-            {addCount > 0 && <span className="text-octo-verdigris">+{addCount}</span>}
-            {delCount > 0 && <span className="text-octo-rouge">−{delCount}</span>}
-            {staged > 0 && <span className="text-octo-sage">{staged} staged</span>}
-          </div>
-        )}
+        <div data-tour="review-companion-verdict" className={`mt-1.5 font-serif text-[15px] leading-snug ${verdict.tone}`}>{verdict.text}</div>
+        <SecretVerdict preview={staged > 0 && conflicted === 0 ? secret : null} onJump={onJump} />
+        <CollisionVerdict workspaceId={workspaceId} />
       </div>
+
+      {/* ── Comments for the agent (#956) ───────────────────────── */}
+      <CommentTray workspaceId={workspaceId} workspacePath={workspacePath} onJump={onJump} />
 
       {/* ── Provenance ──────────────────────────────────────────── */}
       <Provenance workspaceId={workspaceId} files={files} onJump={onJump} />
 
       {/* ── Branch & publish ────────────────────────────────────── */}
-      <BranchPublish workspacePath={workspacePath} gitStatus={gitStatus} />
+      <BranchPublish workspaceId={workspaceId} workspacePath={workspacePath} gitStatus={gitStatus} />
     </div>
+  );
+}
+
+// ─── Collision radar (#732) ───────────────────────────────────────
+
+/** One line under the verdict when another live workspace of the project
+ *  changes the same files — the moment the director decides what to land
+ *  first — with a jump to that workspace. Warn only: nothing is blocked.
+ *  Unfolds on the grid-rows Reveal; the last line stays mounted while it
+ *  folds away so the text doesn't vanish mid-motion. */
+export function CollisionVerdict({ workspaceId }: { workspaceId: string }) {
+  const list = useWorkspaceCollisions(workspaceId);
+  const projectId = useWorkspaceStore(
+    (s) => s.workspaces.find((w) => w.id === workspaceId)?.projectId ?? null,
+  );
+  useEffect(() => {
+    if (projectId) void useCollisionStore.getState().refresh(projectId);
+  }, [projectId, workspaceId]);
+
+  const current = useMemo(() => {
+    const top = notable(list)[0];
+    if (!top) return null;
+    const n = shownCount(top);
+    const files = `${n} file${n === 1 ? "" : "s"}`;
+    return {
+      top,
+      text:
+        top.severity === "conflict"
+          ? `Will conflict with ${top.otherName} in ${files}.`
+          : `Overlaps ${top.otherName} in ${files}.`,
+      tip: collisionTooltip(list) ?? "",
+    };
+  }, [list]);
+  const [shown, setShown] = useState(current);
+  useEffect(() => {
+    if (current) setShown(current);
+  }, [current]);
+  const view = current ?? shown;
+
+  return (
+    <Reveal open={!!current}>
+      {view && (
+        <div
+          data-tour="review-companion-collision"
+          className="mt-1.5 flex items-start gap-1.5 text-[12px] leading-snug text-octo-sage"
+        >
+          <GitCompareArrows
+            size={12}
+            aria-hidden
+            className={`mt-[2px] shrink-0 ${collisionTone(view.top.severity)}`}
+          />
+          <span className="min-w-0" title={view.tip}>
+            {view.text}{" "}
+            <button
+              type="button"
+              onClick={() => useWorkspaceStore.getState().select(view.top.otherId)}
+              title={`Open ${view.top.otherName}`}
+              className="font-serif text-octo-ivory underline decoration-octo-hairline underline-offset-2 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-brass hover:decoration-octo-brass-dim focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              Open {view.top.otherName}
+            </button>
+          </span>
+        </div>
+      )}
+    </Reveal>
+  );
+}
+
+// ─── Secret guard (#835) ──────────────────────────────────────────
+
+/** How often the preview rescans while something is staged, on top of every
+ *  new git status. Catches a hunk staged into an already-staged file (or an
+ *  agent's edit + re-add between two polls), which leaves the status as is. */
+export const SECRET_RESCAN_MS = 5_000;
+
+/** The guard's scan of the staged diff — what Commit would check — redone on
+ *  every new git status and every few seconds while something is staged. A
+ *  result that a newer scan has overtaken is dropped. `null` while nothing is
+ *  staged, with the guard off, or when the scan can't run (Commit still scans
+ *  on its own). */
+function useStagedSecretPreview(workspacePath: string, gitStatus: GitStatus | null): SecretPreview | null {
+  const hasStaged = (gitStatus?.changedFiles ?? []).some((f) => f.staged);
+  const [preview, setPreview] = useState<SecretPreview | null>(null);
+  const [tick, setTick] = useState(0);
+  const inFlight = useRef(0);
+
+  // Heartbeat: skipped while the window is hidden or a scan is still running.
+  useEffect(() => {
+    if (!hasStaged) return;
+    const id = setInterval(() => {
+      if (document.visibilityState !== "visible" || inFlight.current > 0) return;
+      setTick((t) => t + 1);
+    }, SECRET_RESCAN_MS);
+    return () => clearInterval(id);
+  }, [workspacePath, hasStaged]);
+
+  useEffect(() => {
+    if (!hasStaged) {
+      setPreview(null);
+      return;
+    }
+    let cancelled = false;
+    inFlight.current += 1;
+    Promise.resolve()
+      .then(() => ipc.secretScanStaged(workspacePath))
+      .then((p) => { if (!cancelled) setPreview(p ?? null); })
+      .catch(() => { if (!cancelled) setPreview(null); })
+      .finally(() => { inFlight.current -= 1; });
+    return () => { cancelled = true; };
+  }, [workspacePath, gitStatus, hasStaged, tick]);
+  return preview;
+}
+
+const SECRET_LINE_TIP = "Secret guard: Commit will ask before recording this";
+
+/** One line under the verdict when Commit would stop for a possible secret
+ *  ("possible secret · GitHub token in a.ts:3"), with a jump to the first
+ *  finding. Unfolds on the grid-rows Reveal; the last line stays mounted
+ *  while it folds away. */
+export function SecretVerdict({
+  preview,
+  onJump,
+}: {
+  preview: SecretPreview | null;
+  onJump?: (file: string, line: number | null) => void;
+}) {
+  const current = useMemo(() => {
+    const text = previewSummary(preview);
+    return text ? { text, first: preview?.findings[0] ?? null } : null;
+  }, [preview]);
+  const [shown, setShown] = useState(current);
+  useEffect(() => {
+    if (current) setShown(current);
+  }, [current]);
+  const view = current ?? shown;
+
+  return (
+    <Reveal open={!!current}>
+      {view && (
+        <div
+          data-tour="review-companion-secret"
+          className="mt-1.5 flex items-start gap-1.5 text-[12px] leading-snug text-octo-sage"
+        >
+          <ShieldAlert size={12} aria-hidden className="mt-[2px] shrink-0 text-octo-rouge" />
+          <span className="min-w-0 break-words" title={SECRET_LINE_TIP}>
+            {view.text}
+            {view.first && onJump && (
+              <>
+                {" "}
+                <button
+                  type="button"
+                  onClick={() => onJump(view.first!.file, view.first!.line)}
+                  title={`Jump to ${findingLocation(view.first)}`}
+                  className="font-serif text-octo-ivory underline decoration-octo-hairline underline-offset-2 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-brass hover:decoration-octo-brass-dim focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                >
+                  Show it
+                </button>
+              </>
+            )}
+          </span>
+        </div>
+      )}
+    </Reveal>
   );
 }
 
@@ -248,8 +415,20 @@ function ProvenanceTurn({ turn, onJump }: { turn: Turn; onJump?: (file: string, 
 
 // ─── Branch & publish ─────────────────────────────────────────────
 
-function BranchPublish({ workspacePath, gitStatus }: { workspacePath: string; gitStatus: GitStatus | null }) {
+function BranchPublish({
+  workspaceId,
+  workspacePath,
+  gitStatus,
+}: {
+  workspaceId: string;
+  workspacePath: string;
+  gitStatus: GitStatus | null;
+}) {
   const [lastCommit, setLastCommit] = useState<LastCommit | null>(null);
+  // Commits since the base (#851), from the committed view App fetches in
+  // Review — no IPC of its own.
+  const committed = useReviewSource((s) => s.committedByWs[workspaceId] ?? null);
+  const sinceBase = committed && committed.commits > 0 ? committed : null;
 
   const ahead = gitStatus?.ahead ?? 0;
   const behind = gitStatus?.behind ?? 0;
@@ -285,6 +464,26 @@ function BranchPublish({ workspacePath, gitStatus }: { workspacePath: string; gi
         <GitBranch size={12} className="shrink-0 text-octo-mute" aria-hidden />
         <span className={`octo-tabular ${sync.tone}`} title={"title" in sync ? sync.title : undefined}>{sync.text}</span>
       </div>
+      {sinceBase && (
+        <div
+          data-tour="review-companion-ahead"
+          className="octo-fade-in mt-1.5 flex items-center gap-1.5 font-mono text-[11px] text-octo-sage"
+          title={`Commits on this branch since ${baseName(sinceBase.base)}${sinceBase.mergeBase ? ` (merge base ${sinceBase.mergeBase})` : ""}`}
+        >
+          <GitCompare size={12} className="shrink-0 text-octo-mute" aria-hidden />
+          <span className="octo-tabular">
+            {commitCount(sinceBase.commits)} ahead of {baseName(sinceBase.base)}
+          </span>
+        </div>
+      )}
+      {sinceBase?.base && (
+        <BranchSecretScan
+          key={`${workspacePath}|${sinceBase.base}|${sinceBase.mergeBase ?? ""}|${sinceBase.head ?? ""}|${sinceBase.commits}`}
+          workspacePath={workspacePath}
+          base={sinceBase.base}
+          commits={sinceBase.commits}
+        />
+      )}
       {lastCommit && (
         <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-octo-sage">
           <GitCommit size={12} className="mt-0.5 shrink-0 text-octo-mute" aria-hidden />
@@ -295,6 +494,99 @@ function BranchPublish({ workspacePath, gitStatus }: { workspacePath: string; gi
         </div>
       )}
     </Section>
+  );
+}
+
+// ─── Branch secret scan (#820) ────────────────────────────────────
+
+const SCAN_SHOWN = 5;
+
+type BranchScan =
+  | { state: "idle" }
+  | { state: "scanning" }
+  | { state: "done"; result: SecretPreview }
+  | { state: "failed" };
+
+/** "Scan this branch's commits": the secret guard's rules over every commit
+ *  since the base, only when asked, never automatic. Read-only: it blocks
+ *  nothing. The caller keys it on the branch's commits and HEAD, so a new
+ *  commit or an amend drops a result that no longer covers the branch. */
+export function BranchSecretScan({ workspacePath, base, commits }: { workspacePath: string; base: string; commits: number }) {
+  const [scan, setScan] = useState<BranchScan>({ state: "idle" });
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+  const run = () => {
+    setScan({ state: "scanning" });
+    ipc.secretScanBranch(workspacePath, base)
+      .then((result) => { if (alive.current) setScan({ state: "done", result }); })
+      .catch(() => { if (alive.current) setScan({ state: "failed" }); });
+  };
+
+  return (
+    <div className="mt-1.5 text-[11px]">
+      {scan.state === "scanning" ? (
+        <div className="octo-fade-in flex items-center gap-1.5 font-mono text-octo-sage">
+          <Loader2 size={12} aria-hidden className="shrink-0 animate-spin text-octo-mute" />
+          Scanning {commitCount(commits)}…
+        </div>
+      ) : (
+        <button
+          type="button"
+          data-tour="review-companion-scan-branch"
+          onClick={run}
+          title={`Check every commit since ${baseName(base)} for possible secrets. Changes nothing.`}
+          className="flex items-center gap-1.5 font-serif text-[12px] text-octo-sage underline decoration-octo-hairline underline-offset-2 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-brass hover:decoration-octo-brass-dim focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        >
+          <ShieldCheck size={12} aria-hidden className="shrink-0 text-octo-mute" />
+          {scan.state === "idle" ? "Scan this branch's commits" : "Scan again"}
+        </button>
+      )}
+      {scan.state === "done" && <BranchScanResult result={scan.result} commits={commits} />}
+      {scan.state === "failed" && (
+        <p className="octo-fade-in mt-1 text-octo-mute">Couldn't read this branch's commits.</p>
+      )}
+    </div>
+  );
+}
+
+function BranchScanResult({ result, commits }: { result: SecretPreview; commits: number }) {
+  const total = Math.max(result.total, result.findings.length);
+  const shown = result.findings.slice(0, SCAN_SHOWN);
+  const more = total - shown.length;
+  return (
+    <div data-tour="review-companion-scan-result" className="octo-fade-in mt-1">
+      <div className="flex items-start gap-1.5 leading-snug text-octo-sage">
+        {total > 0 ? (
+          <ShieldAlert size={12} aria-hidden className="mt-[1px] shrink-0 text-octo-rouge" />
+        ) : (
+          <ShieldCheck size={12} aria-hidden className="mt-[1px] shrink-0 text-octo-verdigris" />
+        )}
+        <span className="min-w-0">{branchScanSummary(result, commits)}</span>
+      </div>
+      {total > 0 && (
+        <>
+          <ul aria-label="Found in this branch's commits" className="mt-1 space-y-0.5 pl-[18px]">
+            {shown.map((f, i) => (
+              <li key={`${f.file}:${f.line ?? 0}:${f.rule}:${i}`} className="flex min-w-0 items-baseline gap-2 font-mono text-[10px]">
+                <span className="shrink-0 text-octo-sage">{f.kind}</span>
+                <span className="min-w-0 truncate text-octo-mute" title={findingLocation(f)}>{findingLocation(f)}</span>
+                {f.preview && (
+                  <span className="ml-auto shrink-0 text-octo-mute" title={PREVIEW_TIP}>{f.preview}</span>
+                )}
+              </li>
+            ))}
+            {more > 0 && <li className="font-mono text-[10px] text-octo-mute">and {more} more</li>}
+          </ul>
+          {result.partial && <p className="mt-1 pl-[18px] text-octo-mute">{PARTIAL_NOTE}</p>}
+          <p className="mt-1 pl-[18px] leading-snug text-octo-mute">
+            A later commit that removes a key leaves it in the history: rotate a real one.
+          </p>
+        </>
+      )}
+    </div>
   );
 }
 

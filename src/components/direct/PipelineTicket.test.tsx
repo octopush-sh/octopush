@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
-import { PipelineTicket } from "./PipelineTicket";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+
+const crewMocks = vi.hoisted(() => ({ exportCrewFile: vi.fn(), copyCrewJson: vi.fn() }));
+vi.mock("../../lib/crew", () => crewMocks);
+
+const { PipelineTicket } = await import("./PipelineTicket");
 
 function mk(isBuiltin: boolean, name = "Feature Factory") {
   return {
@@ -13,6 +17,17 @@ function mk(isBuiltin: boolean, name = "Feature Factory") {
 }
 
 describe("PipelineTicket", () => {
+  it("right-click offers Export crew… and Copy crew as JSON for that pipeline", async () => {
+    render(<PipelineTicket pipeline={mk(false, "Relay")} selected={false} onSelect={vi.fn()} onEdit={vi.fn()} />);
+    fireEvent.contextMenu(screen.getByText("Relay"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Export crew…/ }));
+    expect(crewMocks.exportCrewFile).toHaveBeenCalledWith("p");
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+    fireEvent.contextMenu(screen.getByText("Relay"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Copy crew as JSON/ }));
+    expect(crewMocks.copyCrewJson).toHaveBeenCalledWith("p");
+  });
+
   it("shows the Octopush '&' seal only for builtins", () => {
     const { rerender } = render(
       <PipelineTicket pipeline={mk(true)} selected={false} onSelect={vi.fn()} onEdit={vi.fn()} />,

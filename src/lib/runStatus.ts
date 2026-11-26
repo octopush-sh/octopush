@@ -1,4 +1,14 @@
 import type { Run, RunStageStatus, RunStatus } from "./ipc";
+import { isDeferredToolHalt } from "./stageHalt";
+import { isPlanLimitHalt, isPlanWaiting } from "./planWait";
+
+const TERMINAL: ReadonlySet<string> = new Set(["completed", "aborted", "failed"]);
+
+/** A run that has ended: nothing in it waits for a decision any more, even
+ *  when a stage row still reads `awaiting_checkpoint` (an abort leaves the
+ *  parked stage as it was). The run bar and Review's comment tray both read
+ *  this, so they can't disagree. */
+export const isTerminalRun = (status: string): boolean => TERMINAL.has(status);
 
 export interface StatusMeta {
   label: string;
@@ -51,12 +61,46 @@ export function runStatusMeta(status: RunStatus | string): RunStatusMeta {
 
 /** Whether a run needs the director's attention right now. `paused` always
  *  means a human must act in this engine (gate / halted stage / budget park /
- *  director pause). The fleet chip (`RunsTray`) reads this predicate; Mission
+ *  director pause), except a Claude plan park with an automatic resume
+ *  scheduled (`isPlanWaiting`), which is in flight. The fleet chip (`RunsTray`) reads this predicate; Mission
  *  Control inlines the same `status === "paused"` check on the run side of its
  *  discriminated-union board (it also folds in non-run attention items), so keep
  *  the two definitions of "a paused run needs you" in lockstep. */
-export function needsYou(run: Pick<Run, "status">): boolean {
-  return run.status === "paused";
+export function needsYou(run: Pick<Run, "status" | "planWait">): boolean {
+  // A run waiting for its Claude plan to reset, with an automatic resume
+  // scheduled, needs nobody: it is in flight (#731).
+  return run.status === "paused" && !isPlanWaiting(run);
+}
+
+/** The fleet split the chip shows: runs that need you, and runs in flight
+ *  (running, nobody waiting). The Dock badge counts the same `needsYou` in
+ *  Rust (`fleet_status::derive`); `needsYou.fixtures.json` pins the two. */
+export function fleetCounts(runs: Pick<Run, "status" | "planWait">[]): { needsYou: number; inFlight: number } {
+  let needs = 0;
+  let inFlight = 0;
+  for (const r of runs) {
+    if (needsYou(r)) needs += 1;
+    else if (r.status === "running" || isPlanWaiting(r)) inFlight += 1;
+  }
+  return { needsYou: needs, inFlight };
+}
+
+/** The Settled band split the fleet chip shows (#845): runs that completed
+ *  (`done`) versus runs that ended any other way (`ended` — aborted or
+ *  failed). An aborted run is never "done". Front-end only: the Dock badge
+ *  counts needs-you alone, so there is no Rust twin to keep in parity. */
+export function settledCounts(
+  runs: Pick<Run, "id" | "status">[],
+  settledAt: Record<string, number>,
+): { done: number; ended: number } {
+  let done = 0;
+  let ended = 0;
+  for (const r of runs) {
+    if (!(r.id in settledAt)) continue;
+    if (r.status === "completed") done += 1;
+    else if (r.status === "aborted" || r.status === "failed") ended += 1;
+  }
+  return { done, ended };
 }
 
 /** Whether a halted stage's error is a *transient* substrate fault (rate
@@ -70,6 +114,11 @@ export function needsYou(run: Pick<Run, "status">): boolean {
  *  the right affordance rather than Re-run-from-scratch or accept-partial-work. */
 export function isTransientHalt(error: string | null): boolean {
   if (!error) return false;
+  // A hook-deferred tool halt is never transient, whatever its tool name or
+  // stderr tail says ("cloudflare-dns", "timed out"): re-run is the way on.
+  if (isDeferredToolHalt(error)) return false;
+  // A Claude plan limit is the clearest wait-and-resume there is.
+  if (isPlanLimitHalt(error)) return true;
   const e = error.toLowerCase();
   return (
     // Startup recovery stamps "interrupted — Octopush closed while…" on stages
@@ -82,9 +131,9 @@ export function isTransientHalt(error: string | null): boolean {
     // FATAL error as transient — hiding "Accept & continue" behind "Resume".
     /api error (429|529|50[0-4])\b/.test(e) ||
     // Connection-level failures (reqwest "request failed", timeouts, DNS).
-    /request failed/.test(e) ||
+    /\brequest failed\b/.test(e) ||
     /\btimed?\s?out\b|\btimeout\b/.test(e) ||
-    /connection (reset|closed|refused)|dns/.test(e)
+    /\bconnection (reset|closed|refused)\b|\bdns\b/.test(e)
   );
 }
 

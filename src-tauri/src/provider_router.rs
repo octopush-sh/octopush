@@ -67,6 +67,11 @@ pub struct ModelInfo {
     /// model picker UI rests on these to help users choose between options.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The builtin model that replaces this one, e.g. Fable 5.1 → Fable 5.2.
+    /// The Direct launcher offers the switch; nothing moves on its own.
+    /// Builtin metadata, re-applied on every load ([`backfill_superseded_by`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -188,6 +193,13 @@ impl ProviderRouter {
             // (left untouched when the user has edited them).
             migrate_stale_builtin_prices(&mut list, &defaults);
 
+            // Migration: builtins that shipped text-only and turned out to
+            // take image input (GPT-6.1 Terra, #664).
+            backfill_builtin_vision(&mut list);
+
+            // Builtin metadata: which model replaces which (Fable 5.1 → 5.2).
+            backfill_superseded_by(&mut list, &defaults);
+
             // Migration: backfill missing BUILTIN models into an existing
             // provider. The whole-provider append below only fires when the
             // provider is absent, so a pre-existing "anthropic" block would
@@ -306,27 +318,40 @@ impl ProviderRouter {
     }
 
     pub fn suggest_model(&self, task: &TaskType) -> ModelSuggestion {
-        match task {
-            TaskType::Architecture | TaskType::Debugging => ModelSuggestion {
-                model_id: "claude-opus-4-6".into(),
-                provider: "anthropic".into(),
-                reason: "Deep reasoning needed for complex analysis".into(),
-                estimated_cost_tier: CostTier::High,
-            },
-            TaskType::CodeReview | TaskType::Refactoring | TaskType::General => ModelSuggestion {
-                model_id: "claude-sonnet-4-6".into(),
-                provider: "anthropic".into(),
-                reason: "Fast, cost-effective for reviews and general work".into(),
-                estimated_cost_tier: CostTier::Medium,
-            },
-            TaskType::QuickFix | TaskType::Documentation | TaskType::Testing => ModelSuggestion {
-                model_id: "claude-haiku-4-5".into(),
-                provider: "anthropic".into(),
-                reason: "Simple task — minimize cost".into(),
-                estimated_cost_tier: CostTier::Low,
-            },
+        let (tag, reason, estimated_cost_tier) = match task {
+            TaskType::Architecture | TaskType::Debugging => {
+                ("best reasoning", "Deep reasoning needed for complex analysis", CostTier::High)
+            }
+            TaskType::CodeReview | TaskType::Refactoring | TaskType::General => {
+                ("balanced", "Fast, cost-effective for reviews and general work", CostTier::Medium)
+            }
+            TaskType::QuickFix | TaskType::Documentation | TaskType::Testing => {
+                ("fast", "Simple task — minimize cost", CostTier::Low)
+            }
+        };
+        ModelSuggestion {
+            model_id: builtin_anthropic_model_tagged(tag),
+            provider: "anthropic".into(),
+            reason: reason.into(),
+            estimated_cost_tier,
         }
     }
+}
+
+/// The first builtin Anthropic model carrying `tag`. The builtin list leads
+/// with the current lineup, so this follows it when a new generation ships.
+/// With no model so tagged it falls back to the first builtin Anthropic model,
+/// never to a hardcoded id that can go stale. The built-in crews seed from it
+/// too (`db::seed_builtin_pipelines`).
+pub(crate) fn builtin_anthropic_model_tagged(tag: &str) -> String {
+    let providers = builtin_providers();
+    let models = providers.get("anthropic").map(|p| p.models.as_slice()).unwrap_or_default();
+    models
+        .iter()
+        .find(|m| m.tags.iter().any(|t| t == tag))
+        .or_else(|| models.first())
+        .map(|m| m.id.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -463,6 +488,12 @@ pub(crate) const STALE_BUILTIN_PRICES: &[(&str, [f64; 4])] = &[
     // Sonnet 5 was priced like Sonnet 4.6 ($3/$15); it is $2/$10.
     ("claude-sonnet-5", [3.0, 15.0, 0.3, 3.75]),
     ("claude-sonnet-5", [3.0, 15.0, 0.2, 2.5]),
+    // GPT-4o and GPT-4o mini shipped with cached input at $0; it is billed.
+    ("gpt-4o", [2.5, 10.0, 0.0, 0.0]),
+    ("gpt-4o-mini", [0.15, 0.6, 0.0, 0.0]),
+    // GPT-6.1 Terra shipped (beta) with cache writes at the input price; they
+    // are $1.25 for the default 30-minute retention.
+    ("gpt-6.1-terra", [1.0, 5.0, 0.05, 1.0]),
 ];
 
 /// Reset models whose on-disk price is a known-stale builtin default (see
@@ -501,6 +532,47 @@ pub(crate) fn migrate_stale_builtin_prices(
     n
 }
 
+/// Builtin models an earlier release saved with `supports_vision: false`
+/// that do take image input, as `(provider, model id)`. GPT-6.1 Terra shipped
+/// text-only in #664; OpenAI's model page lists image input.
+pub(crate) const VISION_BACKFILL: &[(&str, &str)] = &[("openai", "gpt-6.1-terra")];
+
+/// Turn `supports_vision` on for a saved [`VISION_BACKFILL`] entry. Only
+/// that flag changes, so prices, tags, context and display name the user
+/// edited stay as saved; the Models dialog has no vision toggle, so this
+/// never overrides a user choice. Returns how many models changed.
+pub(crate) fn backfill_builtin_vision(list: &mut [ProviderConfig]) -> usize {
+    let mut n = 0;
+    for p in list.iter_mut() {
+        for m in &mut p.models {
+            if !m.supports_vision && VISION_BACKFILL.iter().any(|(prov, id)| *prov == p.name && *id == m.id) {
+                m.supports_vision = true;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Copy `superseded_by` from the builtins onto the saved models of the same
+/// provider and id. It is builtin metadata the user can't edit, so the
+/// builtin value always wins (a file written before the field existed has
+/// none). Returns how many models changed.
+pub(crate) fn backfill_superseded_by(list: &mut [ProviderConfig], defaults: &HashMap<String, ProviderConfig>) -> usize {
+    let mut n = 0;
+    for p in list.iter_mut() {
+        let Some(def) = defaults.get(&p.name) else { continue };
+        for m in &mut p.models {
+            let builtin = def.models.iter().find(|x| x.id == m.id).and_then(|x| x.superseded_by.clone());
+            if m.superseded_by != builtin {
+                m.superseded_by = builtin;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
     let mut map = HashMap::new();
 
@@ -513,14 +585,17 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             models: vec![
                 // Current lineup (platform.claude.com model overview, fetched
                 // 2026-10-29): 1M-token context, 128K max output. Prices must
-                // match `token_engine::builtin_prices`.
+                // match `token_engine::builtin_prices`. Fable 5.2: pricing page
+                // fetched 2026-11-09. Mythos 5.2 is priced there but not listed
+                // here (limited availability).
                 ModelInfo {
-                    id: "claude-fable-5-1".into(),
-                    display_name: "Claude Fable 5.1".into(),
-                    input_cost_per_m: 10.0,
-                    output_cost_per_m: 50.0,
-                    cache_read_cost_per_m: 0.25,
-                    cache_creation_cost_per_m: 12.50,
+                    id: "claude-fable-5-2".into(),
+                    superseded_by: None,
+                    display_name: "Claude Fable 5.2".into(),
+                    input_cost_per_m: 8.0,
+                    output_cost_per_m: 40.0,
+                    cache_read_cost_per_m: 0.20,
+                    cache_creation_cost_per_m: 10.0,
                     max_context: 1_000_000,
                     supports_vision: true,
                     supports_tools: true,
@@ -528,6 +603,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-opus-5-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Opus 5.5".into(),
                     input_cost_per_m: 4.0,
                     output_cost_per_m: 20.0,
@@ -540,6 +616,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-5-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Sonnet 5.5".into(),
                     input_cost_per_m: 2.0,
                     output_cost_per_m: 10.0,
@@ -555,6 +632,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     // per-request paths apply the >100K tier
                     // (`token_engine::request_prices`).
                     id: "claude-haiku-5-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Haiku 5.5".into(),
                     input_cost_per_m: 0.10,
                     output_cost_per_m: 0.50,
@@ -566,7 +644,22 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     tags: vec!["fast".into(), "cheap".into()],
                 },
                 ModelInfo {
+                    id: "claude-fable-5-1".into(),
+                    // Same prices × 0.8 on every column (token_engine).
+                    superseded_by: Some("claude-fable-5-2".into()),
+                    display_name: "Claude Fable 5.1".into(),
+                    input_cost_per_m: 10.0,
+                    output_cost_per_m: 50.0,
+                    cache_read_cost_per_m: 0.25,
+                    cache_creation_cost_per_m: 12.50,
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["most capable".into(), "largest ctx".into()],
+                },
+                ModelInfo {
                     id: "claude-fable-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Fable 5".into(),
                     input_cost_per_m: 10.0,
                     output_cost_per_m: 50.0,
@@ -579,6 +672,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-opus-4-8".into(),
+                    superseded_by: None,
                     display_name: "Claude Opus 4.8".into(),
                     input_cost_per_m: 5.0,
                     output_cost_per_m: 25.0,
@@ -591,6 +685,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Sonnet 5".into(),
                     input_cost_per_m: 2.0,
                     output_cost_per_m: 10.0,
@@ -603,6 +698,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-haiku-4-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Haiku 4.5".into(),
                     input_cost_per_m: 1.0,
                     output_cost_per_m: 5.0,
@@ -616,6 +712,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // ── Legacy ids retained so historical runs still price correctly ──
                 ModelInfo {
                     id: "claude-opus-4-6".into(),
+                    superseded_by: None,
                     display_name: "Claude Opus 4.6".into(),
                     input_cost_per_m: 5.0,
                     output_cost_per_m: 25.0,
@@ -628,6 +725,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-4-6".into(),
+                    superseded_by: None,
                     display_name: "Claude Sonnet 4.6".into(),
                     input_cost_per_m: 3.0,
                     output_cost_per_m: 15.0,
@@ -656,13 +754,63 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             models: vec![
+                // OpenAI model and pricing pages (fetched 2026-11-17):
+                // 1,050,000-token context, 128,000 max output, short-context
+                // prices. Prices must match `token_engine::builtin_prices`.
+                // The per-request paths apply the >272K-input-token tier
+                // (`token_engine::request_prices`).
+                ModelInfo {
+                    id: "gpt-6.2-astra".into(),
+                    superseded_by: None,
+                    display_name: "GPT-6.2 Astra".into(),
+                    input_cost_per_m: 8.0,
+                    output_cost_per_m: 40.0,
+                    cache_read_cost_per_m: 0.40,
+                    cache_creation_cost_per_m: 10.0,
+                    max_context: 1_050_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                    tags: vec!["most capable".into()],
+                },
+                ModelInfo {
+                    id: "gpt-6.2-sol".into(),
+                    superseded_by: None,
+                    display_name: "GPT-6.2 Sol".into(),
+                    input_cost_per_m: 2.0,
+                    output_cost_per_m: 10.0,
+                    cache_read_cost_per_m: 0.10,
+                    cache_creation_cost_per_m: 2.50,
+                    max_context: 1_050_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                    tags: vec!["coding".into()],
+                },
+                // OpenAI model page (fetched 2026-11-10): 1,050,000-token
+                // context, image input, cached input $0.05, 30-minute cache
+                // writes $1.25. Prices must match `token_engine::builtin_prices`.
+                ModelInfo {
+                    id: "gpt-6.1-terra".into(),
+                    superseded_by: None,
+                    display_name: "GPT-6.1 Terra".into(),
+                    input_cost_per_m: 1.0,
+                    output_cost_per_m: 5.0,
+                    cache_read_cost_per_m: 0.05,
+                    cache_creation_cost_per_m: 1.25,
+                    max_context: 1_050_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["balanced".into()],
+                },
                 ModelInfo {
                     id: "gpt-4o".into(),
+                    superseded_by: None,
                     display_name: "GPT-4o".into(),
                     input_cost_per_m: 2.50,
                     output_cost_per_m: 10.0,
-                    cache_read_cost_per_m: 0.0,
-                    cache_creation_cost_per_m: 0.0,
+                    // OpenAI bills cached input at its own rate and has no
+                    // cache-write line: writes cost the input price.
+                    cache_read_cost_per_m: 1.25,
+                    cache_creation_cost_per_m: 2.50,
                     max_context: 128_000,
                     supports_vision: true,
                     supports_tools: true,
@@ -670,11 +818,12 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
+                    superseded_by: None,
                     display_name: "GPT-4o mini".into(),
                     input_cost_per_m: 0.15,
                     output_cost_per_m: 0.60,
-                    cache_read_cost_per_m: 0.0,
-                    cache_creation_cost_per_m: 0.0,
+                    cache_read_cost_per_m: 0.075,
+                    cache_creation_cost_per_m: 0.15,
                     max_context: 128_000,
                     supports_vision: true,
                     supports_tools: true,
@@ -697,6 +846,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             models: vec![
                 ModelInfo {
                     id: "deepseek-chat".into(),
+                    superseded_by: None,
                     display_name: "DeepSeek Chat".into(),
                     input_cost_per_m: 0.14,
                     output_cost_per_m: 0.28,
@@ -709,6 +859,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "deepseek-reasoner".into(),
+                    superseded_by: None,
                     display_name: "DeepSeek Reasoner".into(),
                     input_cost_per_m: 0.55,
                     output_cost_per_m: 2.19,
@@ -736,6 +887,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             models: vec![
                 ModelInfo {
                     id: "llama3.3".into(),
+                    superseded_by: None,
                     display_name: "Llama 3.3".into(),
                     input_cost_per_m: 0.0,
                     output_cost_per_m: 0.0,
@@ -748,6 +900,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "qwen2.5-coder".into(),
+                    superseded_by: None,
                     display_name: "Qwen 2.5 Coder".into(),
                     input_cost_per_m: 0.0,
                     output_cost_per_m: 0.0,
@@ -760,6 +913,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "deepseek-r1".into(),
+                    superseded_by: None,
                     display_name: "DeepSeek R1".into(),
                     input_cost_per_m: 0.0,
                     output_cost_per_m: 0.0,
@@ -791,35 +945,146 @@ mod tests {
         assert!(providers.contains_key("anthropic"));
         assert!(providers.contains_key("openai"));
         let anthropic = &providers["anthropic"];
-        // 4 current (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5) + 4 previous
-        // (fable-5, opus-4-8, sonnet-5, haiku-4-5) + 2 legacy (opus-4-6, sonnet-4-6).
-        assert_eq!(anthropic.models.len(), 10);
+        // 4 current (fable-5-2, opus-5-5, sonnet-5-5, haiku-5-5) + 5 previous
+        // (fable-5-1, fable-5, opus-4-8, sonnet-5, haiku-4-5) + 2 legacy
+        // (opus-4-6, sonnet-4-6).
+        assert_eq!(anthropic.models.len(), 11);
         assert!(anthropic.enabled);
         // Current-generation ids must be present and priced (regression F2).
         for id in [
-            "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
-            "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5",
+            "claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+            "claude-fable-5-1", "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5",
+            "claude-haiku-4-5",
         ] {
             assert!(anthropic.models.iter().any(|m| m.id == id), "missing {id}");
+        }
+        // Fable 5.2 leads the list (the newest Fable), Mythos stays out of it.
+        assert_eq!(anthropic.models[0].id, "claude-fable-5-2");
+        assert!(!anthropic.models.iter().any(|m| m.id.contains("mythos")));
+    }
+
+    #[test]
+    fn only_fable_5_1_is_superseded_and_by_a_cheaper_builtin() {
+        let providers = builtin_providers();
+        let superseded: Vec<(&str, &str)> = providers
+            .values()
+            .flat_map(|p| p.models.iter())
+            .filter_map(|m| m.superseded_by.as_deref().map(|to| (m.id.as_str(), to)))
+            .collect();
+        assert_eq!(superseded, vec![("claude-fable-5-1", "claude-fable-5-2")]);
+        let find = |id: &str| providers["anthropic"].models.iter().find(|m| m.id == id).unwrap().clone();
+        let (old, new) = (find("claude-fable-5-1"), find("claude-fable-5-2"));
+        // "about 20% cheaper per token" must stay true on every column.
+        for (a, b) in [
+            (old.input_cost_per_m, new.input_cost_per_m),
+            (old.output_cost_per_m, new.output_cost_per_m),
+            (old.cache_read_cost_per_m, new.cache_read_cost_per_m),
+            (old.cache_creation_cost_per_m, new.cache_creation_cost_per_m),
+        ] {
+            assert!((b - a * 0.8).abs() < 1e-9, "{b} is not 0.8 × {a}");
         }
     }
 
     #[test]
-    fn suggest_model_architecture() {
-        let router = ProviderRouter {
-            providers: builtin_providers(),
-        };
-        let suggestion = router.suggest_model(&TaskType::Architecture);
-        assert_eq!(suggestion.model_id, "claude-opus-4-6");
+    fn superseded_by_is_backfilled_from_the_builtins_and_omitted_when_none() {
+        let defaults = builtin_providers();
+        let mut saved = defaults["anthropic"].clone();
+        for m in &mut saved.models {
+            m.superseded_by = None;
+        }
+        // A model the builtins don't mark loses a stray value.
+        saved.models.iter_mut().find(|m| m.id == "claude-opus-5-5").unwrap().superseded_by = Some("x".into());
+        let mut list = vec![saved];
+        assert_eq!(backfill_superseded_by(&mut list, &defaults), 2);
+        let get = |id: &str| list[0].models.iter().find(|m| m.id == id).unwrap().superseded_by.clone();
+        assert_eq!(get("claude-fable-5-1").as_deref(), Some("claude-fable-5-2"));
+        assert_eq!(get("claude-opus-5-5"), None);
+        assert_eq!(backfill_superseded_by(&mut list, &defaults), 0);
+
+        // An older providers.json without the field still loads, and only a
+        // superseded model writes it.
+        let json = serde_json::to_value(&list[0].models).unwrap();
+        let with_field: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m.get("supersededBy").is_some())
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(with_field, vec!["claude-fable-5-1"]);
+        let old: ModelInfo = serde_json::from_str(
+            r#"{"id":"m","displayName":"M","inputCostPerM":1,"outputCostPerM":2,"maxContext":10}"#,
+        )
+        .unwrap();
+        assert_eq!(old.superseded_by, None);
     }
 
     #[test]
-    fn suggest_model_quick_fix() {
+    fn suggest_model_every_task_type() {
         let router = ProviderRouter {
             providers: builtin_providers(),
         };
-        let suggestion = router.suggest_model(&TaskType::QuickFix);
-        assert_eq!(suggestion.model_id, "claude-haiku-4-5");
+        for (task, expected) in [
+            (TaskType::Architecture, "claude-opus-5-5"),
+            (TaskType::Debugging, "claude-opus-5-5"),
+            (TaskType::CodeReview, "claude-sonnet-5-5"),
+            (TaskType::Refactoring, "claude-sonnet-5-5"),
+            (TaskType::General, "claude-sonnet-5-5"),
+            (TaskType::QuickFix, "claude-haiku-5-5"),
+            (TaskType::Documentation, "claude-haiku-5-5"),
+            (TaskType::Testing, "claude-haiku-5-5"),
+        ] {
+            assert_eq!(router.suggest_model(&task).model_id, expected, "{task:?}");
+        }
+    }
+
+    #[test]
+    fn untagged_suggestion_falls_back_to_first_anthropic_builtin() {
+        let first = builtin_providers()["anthropic"].models[0].id.clone();
+        assert_eq!(builtin_anthropic_model_tagged("no such tag"), first);
+    }
+
+    #[test]
+    fn every_suggested_model_is_a_builtin() {
+        const LEGACY: [&str; 3] = ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"];
+        let providers = builtin_providers();
+        let is_builtin = |id: &str| providers["anthropic"].models.iter().any(|m| m.id == id);
+        // The helper tiers (drafting, review, rename) and every seeded crew stage.
+        for tag in ["fast", "balanced"] {
+            let id = builtin_anthropic_model_tagged(tag);
+            assert!(is_builtin(&id), "{tag}: {id} is not a builtin");
+            assert!(!LEGACY.contains(&id.as_str()), "{tag}: resolved to the legacy {id}");
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        for p in db.list_pipelines().unwrap() {
+            for s in db.get_pipeline_stages(&p.id).unwrap() {
+                assert!(is_builtin(&s.agent_model), "{} · {}: {} is not a builtin", p.name, s.role, s.agent_model);
+                assert!(!LEGACY.contains(&s.agent_model.as_str()), "{} · {}: seeds the legacy {}", p.name, s.role, s.agent_model);
+            }
+        }
+
+        let router = ProviderRouter { providers: providers.clone() };
+        for task in [
+            TaskType::CodeReview,
+            TaskType::Architecture,
+            TaskType::QuickFix,
+            TaskType::Debugging,
+            TaskType::Documentation,
+            TaskType::Testing,
+            TaskType::Refactoring,
+            TaskType::General,
+        ] {
+            let s = router.suggest_model(&task);
+            let provider = providers.get(&s.provider).unwrap_or_else(|| panic!("{task:?}: no provider {}", s.provider));
+            assert!(
+                provider.models.iter().any(|m| m.id == s.model_id),
+                "{task:?}: suggested {} is not in builtin_providers()",
+                s.model_id
+            );
+            assert!(!LEGACY.contains(&s.model_id.as_str()), "{task:?}: suggested a legacy id");
+        }
     }
 
     #[test]

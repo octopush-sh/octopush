@@ -1,6 +1,6 @@
 /**
  * Tests for the ⌘⌥K session switcher — the palette that answers "which
- * session do I want" when the rail's icons aren't enough.
+ * session do I want" when the session line's icons aren't enough.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, screen, fireEvent } from "@testing-library/react";
@@ -315,6 +315,52 @@ describe("SessionSwitcher", () => {
     expect(mockIpc.deleteTerminal).toHaveBeenCalledTimes(1);
 
     resolve();
+  });
+
+  it("asks before ⌫ closes a session that is busy; Escape keeps it and the palette stays", async () => {
+    seed([
+      { id: "a", label: "agent", busy: true, command: "claude", role: "agent" },
+      { id: "b", label: "dev" },
+    ]);
+    mockIpc.deleteTerminal.mockResolvedValue(undefined);
+    const onClose = vi.fn();
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} />);
+    const input = screen.getByTestId("session-switcher-input");
+
+    fireEvent.keyDown(input, { key: "Backspace" });
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog", { name: "Confirm closing the session" });
+    expect(dialog).toHaveTextContent("claude is still running in agent.");
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Keep the session" }));
+
+    // Escape answers the question on top, not the palette under it.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Confirm closing the session" })).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    expect(screen.getByTestId("session-switcher-row-a")).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "Backspace" });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Close the session" }));
+    });
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("a");
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks before ⌫ closes a quiet session that waits on the user", () => {
+    seed([
+      { id: "a", label: "main" },
+      { id: "b", label: "agent", command: "claude", role: "agent" },
+    ]);
+    act(() => useAttentionStore.getState().ping(WS, "terminal", "b", "permission"));
+    render(<SessionSwitcher workspaceId={WS} onClose={vi.fn()} />);
+    // The waiting session lists first, so ⌫ means it.
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Backspace" });
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Confirm closing the session" })).toHaveTextContent(
+      "claude is waiting on permission in agent.",
+    );
   });
 
   it("opens a new session from the last row", () => {

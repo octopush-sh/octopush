@@ -16,7 +16,8 @@ import {
   type OnBeforeDelete,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Undo2, Redo2, Network, X } from "lucide-react";
+import { Undo2, Redo2, Network, X, Download, Copy } from "lucide-react";
+import { copyCrewJson, exportCrewFile, openDroppedCrew } from "../lib/crew";
 import type { PipelineWithStages, Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -27,6 +28,8 @@ import { FlowEdge, LoopEdge } from "./builder/edges";
 import { NodePalette, ARCHETYPE_DND_MIME } from "./builder/NodePalette";
 import { StageInspector, type LoopState } from "./builder/StageInspector";
 import { BuilderProvider } from "./builder/BuilderContext";
+import { FIT_PADDING, flowColorMode, NODE_DRAG_THRESHOLD } from "./builder/flowTheme";
+import { useThemeStore } from "../stores/themeStore";
 import {
   draftToGraph,
   graphToStageDrafts,
@@ -84,6 +87,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
     void useRolesStore.getState().load();
   }, []);
   const rf = useReactFlow<StageNodeT, StageEdge>();
+  const colorMode = flowColorMode(useThemeStore((s) => s.theme?.bg));
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(true);
   const [tidying, setTidying] = useState(false);
@@ -180,7 +184,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
     tidyTimer.current = window.setTimeout(() => {
       tidyTimer.current = null;
       setTidying(false);
-      void rf.fitView({ padding: 0.25, maxZoom: 1, duration: 280 });
+      void rf.fitView({ padding: FIT_PADDING, maxZoom: 1, duration: 280 });
     }, 300);
   }, [pushHistory, setNodes, rf]);
 
@@ -239,6 +243,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const onDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
+      // A dropped crew file opens the import review (never edits this graph).
+      if (openDroppedCrew(e)) return;
       const role = e.dataTransfer.getData(ARCHETYPE_DND_MIME);
       if (!role) return;
       addNode(role, rf.screenToFlowPosition({ x: e.clientX, y: e.clientY }));
@@ -463,6 +469,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
               onNodeClick={(_, n) => setSelectedId(n.id)}
               onPaneClick={() => setSelectedId(null)}
               onNodeDragStart={() => pushHistory()}
+              nodeDragThreshold={NODE_DRAG_THRESHOLD}
+              forceColorMode={colorMode}
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
               defaultEdgeOptions={defaultEdgeOptions}
@@ -470,7 +478,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               minZoom={0.4}
               maxZoom={1.75}
               fitView
-              fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+              fitViewOptions={{ padding: FIT_PADDING, maxZoom: 1 }}
               proOptions={{ hideAttribution: true }}
               className="bg-transparent"
             >
@@ -489,9 +497,6 @@ function BuilderInner({ pipeline, onClose }: Props) {
                 className={`octo-flow-minimap !m-4 transition-opacity duration-[220ms] ${
                   miniMapShown ? "" : "pointer-events-none opacity-0"
                 }`}
-                maskColor={`${tokens.onyx}b8`}
-                nodeColor={() => tokens.hairline}
-                nodeStrokeColor={() => tokens.brassDim}
               />
               <Panel position="top-left">
                 <NodePalette
@@ -533,6 +538,30 @@ function BuilderInner({ pipeline, onClose }: Props) {
                   >
                     <Network size={13} strokeWidth={1.75} />
                   </button>
+                  {pipeline && (
+                    <>
+                      <span aria-hidden className="mx-0.5 h-4 w-px bg-octo-hairline" />
+                      <button
+                        type="button"
+                        data-tour="builder-export-crew"
+                        aria-label="Export crew…"
+                        title="Export crew… — save the saved pipeline and its custom roles as a .octocrew.json file"
+                        onClick={() => void exportCrewFile(pipeline.pipeline.id)}
+                        className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
+                      >
+                        <Download size={13} strokeWidth={1.75} />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="Copy crew as JSON"
+                        title="Copy crew as JSON — the saved pipeline and its custom roles"
+                        onClick={() => void copyCrewJson(pipeline.pipeline.id)}
+                        className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
+                      >
+                        <Copy size={13} strokeWidth={1.75} />
+                      </button>
+                    </>
+                  )}
                 </div>
               </Panel>
               <Panel position="bottom-center" className="!mb-4">

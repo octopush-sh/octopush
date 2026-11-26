@@ -5,7 +5,7 @@
  * title.
  */
 import { describe, it, expect, vi, afterAll } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 import type { ModelWithProvider } from "../lib/types";
 
 const { model } = vi.hoisted(() => ({
@@ -18,7 +18,8 @@ const { model } = vi.hoisted(() => ({
   }),
 }));
 
-vi.mock("../lib/ipc", () => ({
+vi.mock("../lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/ipc")>()),
   ipc: {
     listModels: vi.fn().mockResolvedValue([
       model("opus-46", "Claude Opus 4.6", "anthropic"),
@@ -82,5 +83,141 @@ describe("CommandPalette · Models group", () => {
     const group = document.querySelector('[data-tour="palette-models"]');
     expect(group).not.toBeNull();
     expect(group).toHaveTextContent("Claude Opus 4.6");
+  });
+
+  it("previews three models with no query, then shows all on demand or while searching (#850)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValueOnce(many);
+    await renderPalette();
+    expect(screen.getByText("Llama 3")).toBeInTheDocument();
+    expect(screen.getByText("GPT-4o mini")).toBeInTheDocument();
+    expect(screen.queryByText("DeepSeek V3")).toBeNull();
+    expect(screen.getByText("Show all models")).toBeInTheDocument();
+    expect(screen.getByText("2 more")).toBeInTheDocument();
+    expect(document.querySelector('[data-tour="palette-models-more"]')).not.toBeNull();
+
+    // Typing searches every model, the hidden ones included.
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "deepseek" } });
+    });
+    expect(screen.getByText("DeepSeek V3")).toBeInTheDocument();
+    expect(screen.queryByText("Show all models")).toBeNull();
+
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "" } });
+    });
+    expect(screen.queryByText("DeepSeek V3")).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Show all models"));
+    });
+    expect(screen.getByText("DeepSeek V3")).toBeInTheDocument();
+    expect(screen.getByText("Mistral Large")).toBeInTheDocument();
+    expect(screen.queryByText("Show all models")).toBeNull();
+  });
+  it("keeps the selection on the first revealed model after Show all models (#897)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValueOnce(many);
+    await renderPalette();
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    // Walk the keyboard down to the "Show all models" row, then press Enter.
+    for (let n = 0; n < 20; n++) {
+      const sel = document.querySelector('[cmdk-item][aria-selected="true"]');
+      if (sel?.textContent?.includes("Show all models")) break;
+      await act(async () => {
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      });
+    }
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("Show all models");
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    await act(async () => {});
+    const sel = document.querySelector('[cmdk-item][aria-selected="true"]');
+    expect(sel).toHaveTextContent("DeepSeek V3");
+    // Assistive tech follows the same row: the combobox and the listbox point
+    // their aria-activedescendant at it, not at the removed "Show all" row.
+    expect(sel?.id).toBeTruthy();
+    expect(input).toHaveAttribute("aria-activedescendant", sel!.id);
+    expect(screen.getByRole("listbox")).toHaveAttribute("aria-activedescendant", sel!.id);
+    // The next keystroke moves on from there, not from the top.
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+    });
+    const next = document.querySelector('[cmdk-item][aria-selected="true"]');
+    expect(next).toHaveTextContent("Mistral Large");
+    expect(input).toHaveAttribute("aria-activedescendant", next!.id);
+  });
+
+  it("ignores a held Enter's repeats after Show all models (#908)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValueOnce(many);
+    const onClose = vi.fn();
+    await act(async () => {
+      render(<CommandPalette open onClose={onClose} onNewSession={vi.fn()} onToggleTokens={vi.fn()} />);
+    });
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    for (let n = 0; n < 20; n++) {
+      const sel = document.querySelector('[cmdk-item][aria-selected="true"]');
+      if (sel?.textContent?.includes("Show all models")) break;
+      await act(async () => {
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      });
+    }
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    await act(async () => {});
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("DeepSeek V3");
+    // The key is still down: its repeats must not run the revealed model.
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter", repeat: true });
+      fireEvent.keyDown(input, { key: "Enter", repeat: true });
+    });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("DeepSeek V3");
+    // A fresh press still picks it.
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets the query and the expanded list on close, before a reopen paints (#897)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValue(many);
+    const props = { onClose: vi.fn(), onNewSession: vi.fn(), onToggleTokens: vi.fn() };
+    let rerender!: (ui: React.ReactElement) => void;
+    await act(async () => {
+      ({ rerender } = render(<CommandPalette open {...props} />));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Show all models"));
+    });
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("Type a command, or search…"), { target: { value: "mistral" } });
+    });
+    await act(async () => {
+      rerender(<CommandPalette open={false} {...props} />);
+    });
+    // The first frame of the reopen, before any effect runs, is already clean.
+    rerender(<CommandPalette open {...props} />);
+    expect(screen.getByPlaceholderText("Type a command, or search…")).toHaveValue("");
+    expect(screen.queryByText("DeepSeek V3")).toBeNull();
+    expect(screen.getByText("Show all models")).toBeInTheDocument();
+    await act(async () => {});
+    vi.mocked(ipc.listModels).mockReset();
   });
 });

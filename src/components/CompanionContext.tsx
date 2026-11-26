@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Server, Maximize2 } from "lucide-react";
+import { Maximize2 } from "lucide-react";
 import type { Budget, BudgetPeriod, BudgetScope, SpendSnapshot, ThreadCost } from "../lib/types";
 import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
-import { unpricedTitle } from "../lib/cost";
+import { formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
+import { ContextMeter, contextTone } from "./ContextMeter";
+import { CompanionMcpScope } from "./CompanionMcpScope";
 
 interface Props {
   tokensUsed: number;
@@ -17,8 +19,8 @@ interface Props {
   workspaceId?: string;
   budgets?: Budget[];
   spend?: Record<string, SpendSnapshot>;
-  /** Connected MCP servers for the workspace (capabilities row). */
-  mcpServers?: string[];
+  /** The workspace's worktree: whose MCP servers the "can use" row lists. */
+  worktreePath?: string;
   /** Jump to Review mode (e.g. clicking the unstaged-changes row). */
   onReviewClick?: () => void;
   /** Open Settings (e.g. clicking a spending row to manage budgets). */
@@ -27,9 +29,10 @@ interface Props {
   onOpenLogbook?: () => void;
 }
 
-/** `$4.20` — three decimals under a cent so a cheap turn never reads as free. */
+/** `$4.20`, `$12,843.27` — three decimals under a cent so a cheap turn never
+ *  reads as free. */
 export function usd(n: number): string {
-  return `$${n > 0 && n < 0.01 ? n.toFixed(3) : n.toFixed(2)}`;
+  return n > 0 && n < 0.01 ? `$${n.toFixed(3)}` : formatUsd(n);
 }
 
 /** The cost lines of a conversation from its ledger figures. Pure so the
@@ -75,24 +78,18 @@ export function CompanionContext({
   workspaceId,
   budgets = [],
   spend = {},
-  mcpServers = [],
+  worktreePath,
   onReviewClick,
   onSettingsClick,
   onOpenLogbook,
 }: Props) {
-  const pct = tokensLimit > 0 ? Math.min(100, (tokensUsed / tokensLimit) * 100) : 0;
-  // Warn as the context window fills — amber past 80%, rouge past 95%.
-  const tokenColor =
-    pct >= 95
-      ? "var(--color-octo-rouge)"
-      : pct >= 80
-        ? "var(--color-octo-warning)"
-        : "var(--color-octo-brass)";
+  // The meter warns as the context window fills — amber past 80%, rouge
+  // past 95% (`ContextMeter`, shared with Run's Context section).
+  const { pct } = contextTone(tokensUsed, tokensLimit);
 
   const cost = useThreadCost(workspaceId ?? "");
   const logbook = useMissionLogbook(workspaceId ?? "");
   const spendingRows = buildSpendingRows(budgets, spend, workspaceId ?? "");
-  const hasCapabilities = mcpServers.length > 0;
   const lines = costLines(cost);
   const logbookHasWork = !!logbook.row && (logbook.row.hoursSecs > 0 || logbook.row.costUsd > 0);
 
@@ -100,22 +97,16 @@ export function CompanionContext({
     <CompanionSection title="Conversation" storageKey="conversation" testId="companion-conversation">
       <div className="px-4 pb-3 pt-1 text-[11px] text-octo-sage">
         {/* Context meter */}
-        <Row
+        <ContextMeter
           label="context"
-          value={`${formatThousands(tokensUsed)} / ${formatThousands(tokensLimit)}`}
-          valueColor={tokenColor}
+          used={tokensUsed}
+          limit={tokensLimit}
           title={
             pct >= 80
               ? `${Math.round(pct)}% of the context window used — consider a new conversation`
               : "The last prompt's size against the model's context window"
           }
         />
-        <div className="mt-1.5 h-[3px] rounded-sm" style={{ background: "var(--color-octo-hairline)" }}>
-          <div
-            className="h-full rounded-sm transition-[width] duration-[220ms]"
-            style={{ width: `${pct}%`, background: tokenColor }}
-          />
-        </div>
 
         {/* Cost — from the ledger, so it agrees with Settings › Usage. */}
         {lines.length > 0 && (
@@ -177,20 +168,11 @@ export function CompanionContext({
           )}
         </div>
 
-        {/* Capabilities — the MCP servers this conversation can use. Skills
-            are per message now (`/name` in the text), not a conversation
-            setting, so none is listed here. */}
-        {hasCapabilities && (
-          <div className="octo-rise-in mt-3 flex flex-wrap items-center gap-x-3 gap-y-1">
-            <span className="text-octo-sage">can use</span>
-            {mcpServers.map((s) => (
-              <span key={s} className="flex items-center gap-1 text-[10px]" title="MCP server">
-                <Server size={10} className="shrink-0 text-octo-brass" />
-                <span className="font-mono text-octo-ivory">{s}</span>
-              </span>
-            ))}
-          </div>
-        )}
+        {/* Capabilities — the MCP servers this conversation can use, each a
+            toggle for this conversation only. Skills are per message now
+            (`/name` in the text), not a conversation setting, so none is
+            listed here. */}
+        <CompanionMcpScope worktreePath={worktreePath} workspaceId={workspaceId} />
 
         {/* Budgets — only when one exists (an empty block earns no space). */}
         {spendingRows.length > 0 && (
@@ -306,7 +288,7 @@ function SpendRow({ row, onClick }: { row: SpendRowData; onClick?: () => void })
       <div className="flex items-baseline justify-between">
         <span className="text-octo-sage">{row.label}</span>
         <span className="octo-tabular font-mono text-[10px] text-octo-ivory">
-          ${row.costUsd.toFixed(2)} / ${row.limitUsd.toFixed(2)}
+          {formatUsd(row.costUsd)} / {formatUsd(row.limitUsd)}
         </span>
       </div>
       <div
@@ -382,13 +364,3 @@ function Row({
   );
 }
 
-function formatThousands(n: number): string {
-  // Millions branch matters: the target model has a 1M context window, which
-  // must read "1M", not "1000k".
-  if (n >= 1_000_000) {
-    const m = n / 1_000_000;
-    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
-  }
-  if (n >= 1000) return `${Math.round(n / 1000)}k`;
-  return String(n);
-}

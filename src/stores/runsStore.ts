@@ -5,14 +5,19 @@ import {
   RUN_EVENTS,
   type LiveEntry,
   type Run,
+  type RunStage,
   type RunDetail,
   type CheckpointActionName,
+  type CheckpointOptions,
   type RunStagePatch,
   type AnswerSource,
 } from "../lib/ipc";
 import { useUpgradeStore } from "./upgradeStore";
 import { isUpgradeRequired } from "../lib/upgradeError";
 import { pushToast } from "../components/Toasts";
+import { labelForRole } from "../lib/stageMeta";
+import { gateKey, nextStages, withGuidance, withoutGuidance, type GateComment } from "../lib/gateComments";
+import { useGateCommentsStore } from "./gateCommentsStore";
 
 export const EMPTY_RUNS: Run[] = [];
 const EMPTY_ENTRIES: LiveEntry[] = [];
@@ -32,6 +37,21 @@ export interface LauncherPrefill {
    *  prefill parked while another workspace's launcher mounts must never
    *  leak someone else's brief into it. Absent = any launcher (legacy). */
   workspaceId?: string;
+  /** When set, the task is added below whatever the launcher's brief already
+   *  holds instead of replacing it, so text the user typed is never lost.
+   *  Absent = replace (Run it again). */
+  append?: boolean;
+}
+
+/** The launcher brief after a prefill lands on `current`: the prefill's task,
+ *  or with `append`, `current` + a blank line + the task — unchanged when it
+ *  already ends with that task (the same prefill twice adds nothing). */
+export function prefilledTask(current: string, prefill: Pick<LauncherPrefill, "task" | "append">): string {
+  if (!prefill.append) return prefill.task;
+  const kept = current.trimEnd();
+  if (!kept) return prefill.task;
+  if (kept.endsWith(prefill.task.trimEnd())) return current;
+  return `${kept}\n\n${prefill.task}`;
 }
 
 const inflightDetail = new Set<string>();
@@ -50,6 +70,15 @@ interface RunsState {
   selectedRunIdByWs: Record<string, string | null>;
   /** Structured live activity entries per stage id, streamed from both substrates. */
   liveByStage: Record<string, LiveEntry[]>;
+  /** The newest `run://context` reading heard per stage id this session
+   *  (#895), a cleared one included. It wins over the stage row's (see
+   *  `currentContext`): a `get_run` refresh can land after a newer event.
+   *  A stage's restart (`clearLog`) forgets it. */
+  liveContextByStage: Record<string, { contextTokens: number | null; contextWindow: number | null }>;
+  /** The newest `run://error` heard per run this session, counted (`n`) so a
+   *  watcher can tell a new one from the one it already saw. A decision the
+   *  backend applies in the background reports its refusal this way. */
+  runErrors: Record<string, { n: number; error: string }>;
   /** One-shot launcher seed set by "Run it again"; consumed (and cleared) by
    *  PipelineSetup on its next mount. */
   launcherPrefill: LauncherPrefill | null;
@@ -109,10 +138,37 @@ interface RunsState {
   start: (runId: string) => Promise<void>;
   resolve: (
     runId: string,
+    /** The stage decided on (see `ipc.resolveCheckpoint`). A refusal is
+     *  toasted, never thrown, and the detail refreshes either way. Resolves
+     *  `false` on a refusal. */
+    stageId: string,
     action: CheckpointActionName,
-    feedback?: string,
-    modelOverride?: string,
-    maxTurnsOverride?: number,
+    opts?: CheckpointOptions,
+  ) => Promise<boolean>;
+  /** Approve a gate, with the director's comments if there are any (#957).
+   *  The comments go, as guidance for this one pass, into the instructions
+   *  of every stage the gate hands off to that hasn't begun; guidance the
+   *  gate left there on an earlier pass is replaced, or just taken out when
+   *  this approve carries none. Then it approves, and only an approve that
+   *  went through clears the comments. If a stage refuses the guidance, or
+   *  the approve itself is refused, and the gate is then still waiting on
+   *  the same attempt, the guidance is taken back out, the comments stay
+   *  and the refusal is toasted; a refusal because the gate was already
+   *  decided leaves the guidance in place. */
+  approveWithComments: (runId: string, stageId: string, comments: GateComment[]) => Promise<void>;
+  /** The gates (`runId:stageId`) whose approve is in flight: a second
+   *  `approveWithComments` on one is a no-op, and the decision bar disables
+   *  its Approve meanwhile. */
+  approvingGates: Record<string, true>;
+  /** Reject or send back a gate whose feedback carries the director's
+   *  comments (#957): `resolve`, then clear that gate's comments only once
+   *  the decision is applied (the gate's stage moved). A decision the run
+   *  accepts and then refuses in the background keeps them. */
+  resolveGate: (
+    runId: string,
+    stageId: string,
+    action: "reject" | "send_back",
+    opts?: CheckpointOptions,
   ) => Promise<void>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
@@ -120,6 +176,8 @@ interface RunsState {
    *  re-running stage. `source` names the answering surface for the journal. */
   answerBlocker: (runId: string, stageId: string, answers: string[], source?: AnswerSource) => Promise<void>;
   abort: (runId: string) => Promise<void>;
+  /** Turn off a plan-parked run's automatic resume (#731). */
+  cancelPlanResume: (runId: string) => Promise<void>;
   /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
   stopStage: (runId: string) => Promise<void>;
   /** Ask the run to pause at its next stage boundary (parks the next stage). */
@@ -144,6 +202,10 @@ interface RunsState {
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
+  /** Record a `run://error` for a run (see `runErrors`). */
+  noteRunError: (runId: string, error: string) => void;
+  /** Keep one stage's newest context reading (`run://context`, #895). */
+  applyContext: (runId: string, stageId: string, contextTokens: number | null, contextWindow: number | null) => void;
 }
 
 function replaceRunInList(list: Run[], run: Run): Run[] {
@@ -189,14 +251,146 @@ function trackTransition(
   }
 }
 
+/**
+ * An accepted decision is not yet an applied one: without detached runs the
+ * backend applies it in the background and reports a refusal ("run is already
+ * executing", say) as `run://error`, recorded in `runErrors`. Watch the run
+ * until the gate's stage moved off this attempt (`applied`) or an error newer
+ * than `errorsBefore` arrived while it still waits there (`refused`). With
+ * detached runs the decision is applied before `resolve` returns, so this
+ * settles at once.
+ */
+function confirmDecision(
+  get: () => RunsState,
+  runId: string,
+  from: Pick<RunStage, "id" | "finishedAt">,
+  errorsBefore: number,
+  applied: () => void,
+  refused: (error: string) => void,
+): void {
+  const settled = (): boolean => {
+    const s = get();
+    const now = s.detailByRun[runId]?.stages.find((x) => x.id === from.id);
+    if (!now || now.status !== "awaiting_checkpoint" || now.finishedAt !== from.finishedAt) {
+      applied();
+      return true;
+    }
+    const err = s.runErrors[runId];
+    if (!err || err.n <= errorsBefore) return false;
+    refused(err.error);
+    return true;
+  };
+  if (settled()) return;
+  const stop = useRunsStore.subscribe(() => {
+    if (!settled()) return;
+    stop();
+    confirming.delete(stop);
+  });
+  confirming.add(stop);
+}
+
+const confirming = new Set<() => void>();
+
+/** Stop watching every decision that is still unconfirmed (tests). */
+export function forgetPendingDecisions(): void {
+  confirming.forEach((stop) => stop());
+  confirming.clear();
+}
+
+/** The body of `approveWithComments`, behind its in-flight guard. */
+async function approveGate(get: () => RunsState, runId: string, stageId: string, comments: GateComment[]): Promise<void> {
+  const stages = get().detailByRun[runId]?.stages ?? [];
+  const from = stages.find((s) => s.id === stageId);
+  if (!from) {
+    await get().resolve(runId, stageId, "approve");
+    return;
+  }
+  const gate = gateKey(from);
+  // The gate is still undecided: parked, on the attempt the comments were
+  // written on. Read after a refresh, this tells a refusal that left the gate
+  // waiting from one that only says someone else decided it first.
+  const stillWaiting = () => {
+    const now = get().detailByRun[runId]?.stages.find((s) => s.id === stageId);
+    return !!now && now.status === "awaiting_checkpoint" && now.finishedAt === from.finishedAt;
+  };
+  // Every stage whose instructions were changed, with what they go back to
+  // if the gate turns out not to be approved.
+  const changed: { stage: (typeof stages)[number]; own: string }[] = [];
+  const takeBack = async () => {
+    for (const { stage, own } of changed) {
+      try {
+        await ipc.updateRunStage(runId, stage.id, { instructions: own || null });
+      } catch (e) {
+        pushToast({
+          level: "info",
+          title: `Your comments are still on ${labelForRole(stage.role)}`,
+          body: `They couldn't be taken out of its instructions: ${String(e).split("\n")[0]}`,
+        });
+      }
+    }
+  };
+  for (const next of nextStages(stages, from)) {
+    const own = withoutGuidance(next.instructions, from);
+    const stale = own !== (next.instructions ?? "");
+    if (comments.length === 0 && !stale) continue;
+    const instructions = comments.length > 0 ? withGuidance(next.instructions, comments, from, labelForRole(from.role)) : own;
+    try {
+      await ipc.updateRunStage(runId, next.id, { instructions: instructions || null });
+      if (comments.length > 0) changed.push({ stage: next, own });
+    } catch (e) {
+      await get().refreshDetail(runId);
+      if (!stillWaiting()) {
+        // The stage refused the edit because the gate was decided meanwhile
+        // (it has begun): nothing here is "not approved yet", and guidance
+        // already written belongs to the approve that went through.
+        pushToast({ level: "info", title: "Nothing changed", body: "This gate was already decided." });
+        return;
+      }
+      pushToast({
+        level: "info",
+        title: "Not approved yet",
+        body: `Your comments couldn't reach ${labelForRole(next.role)}: ${String(e).split("\n")[0]}`,
+      });
+      await takeBack();
+      await get().refreshDetail(runId);
+      return;
+    }
+  }
+  const errorsBefore = get().runErrors[runId]?.n ?? 0;
+  if (await get().resolve(runId, stageId, "approve")) {
+    // The comments are cleared once the approve is applied. If the run
+    // refuses it after accepting it, the gate still waits: the guidance
+    // comes back out and the comments stay, as for an outright refusal.
+    confirmDecision(
+      get, runId, from, errorsBefore,
+      () => useGateCommentsStore.getState().clear(gate),
+      () => {
+        if (changed.length > 0) void takeBack().then(() => get().refreshDetail(runId)).catch(() => {});
+      },
+    );
+    return;
+  }
+  // Refused. Only when the gate really still waits is the guidance taken
+  // back (its comments stay, to go with the next decision). A refusal that
+  // says the gate was already decided leaves the guidance where it is: the
+  // next stage is about to run with it.
+  if (changed.length > 0 && stillWaiting()) {
+    await takeBack();
+    await get().refreshDetail(runId);
+  }
+}
+
 export const useRunsStore = create<RunsState>((set, get) => ({
   runsByWs: {},
   loadedByWs: {},
   activeRunIdByWs: {},
   detailByRun: {},
+  approvingGates: {},
+  runErrors: {},
   selectedStageByRun: {},
   selectedRunIdByWs: {},
   liveByStage: {},
+  liveContextByStage: {},
   launcherPrefill: null,
   settledAt: {},
   statusSince: {},
@@ -426,9 +620,61 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     }
   },
 
-  resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride) => {
-    await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride);
+  resolve: async (runId, stageId, action, opts) => {
+    let ok = true;
+    try {
+      await ipc.resolveCheckpoint(runId, stageId, action, opts);
+    } catch (e) {
+      ok = false;
+      // A refusal (e.g. the stage was already decided elsewhere) is shown
+      // calmly — the callers fire-and-forget — and the refresh below brings
+      // the canvas up to what is actually waiting.
+      pushToast({
+        level: "info",
+        title: "Nothing changed",
+        body: String(e).split("\n")[0],
+      });
+    }
     await get().refreshDetail(runId);
+    return ok;
+  },
+
+  approveWithComments: async (runId, stageId, comments) => {
+    // One approve of a gate at a time: a second click while the first is in
+    // flight would write the guidance again, be refused as already decided,
+    // and then take the guidance of the approve that went through back out.
+    const key = `${runId}:${stageId}`;
+    if (get().approvingGates[key]) return;
+    set((s) => ({ approvingGates: { ...s.approvingGates, [key]: true } }));
+    try {
+      await approveGate(get, runId, stageId, comments);
+    } finally {
+      set((s) => {
+        const next = { ...s.approvingGates };
+        delete next[key];
+        return { approvingGates: next };
+      });
+    }
+  },
+
+  resolveGate: async (runId, stageId, action, opts) => {
+    // Read the gate before deciding: the refresh may show its next attempt.
+    const from = get().detailByRun[runId]?.stages.find((s) => s.id === stageId);
+    const errorsBefore = get().runErrors[runId]?.n ?? 0;
+    if (!(await get().resolve(runId, stageId, action, opts)) || !from) return;
+    // Clear the comments once the decision is applied, not just accepted: a
+    // refusal that arrives afterwards (`run://error`) leaves the gate waiting
+    // with its comments, and says so.
+    confirmDecision(
+      get, runId, from, errorsBefore,
+      () => useGateCommentsStore.getState().clear(gateKey(from)),
+      (error) =>
+        pushToast({
+          level: "info",
+          title: "Nothing changed",
+          body: `${error.split("\n")[0].replace(/[.\s]+$/, "")}. Your comments are still on the gate.`,
+        }),
+    );
   },
 
   answerBlocker: async (runId, stageId, answers, source) => {
@@ -438,6 +684,11 @@ export const useRunsStore = create<RunsState>((set, get) => ({
 
   abort: async (runId) => {
     await ipc.abortRun(runId);
+    await get().refreshDetail(runId);
+  },
+
+  cancelPlanResume: async (runId) => {
+    await ipc.cancelPlanResume(runId);
     await get().refreshDetail(runId);
   },
 
@@ -551,11 +802,29 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       return {};
     });
   },
+
+  noteRunError: (runId, error) =>
+    set((s) => ({ runErrors: { ...s.runErrors, [runId]: { n: (s.runErrors[runId]?.n ?? 0) + 1, error } } })),
+
+  applyContext: (_runId, stageId, contextTokens, contextWindow) => {
+    set((s) => {
+      const cur = s.liveContextByStage[stageId];
+      if (cur && cur.contextTokens === contextTokens && cur.contextWindow === contextWindow) return {};
+      return { liveContextByStage: { ...s.liveContextByStage, [stageId]: { contextTokens, contextWindow } } };
+    });
+  },
 }));
 
 void listen<{ runId: string; run: Run }>(RUN_EVENTS.stageUpdate, (ev) => {
   useRunsStore.getState().applyStageUpdate(ev.payload.runId, ev.payload.run);
 });
+void listen<{ runId: string; stageId: string; contextTokens: number | null; contextWindow: number | null }>(
+  RUN_EVENTS.context,
+  (ev) =>
+    useRunsStore
+      .getState()
+      .applyContext(ev.payload.runId, ev.payload.stageId, ev.payload.contextTokens, ev.payload.contextWindow),
+);
 void listen<{ runId: string; costUsd: number; baselineUsd: number }>(
   RUN_EVENTS.cost,
   (ev) =>
@@ -567,7 +836,14 @@ void listen<{ runId: string }>(RUN_EVENTS.checkpoint, (ev) => {
   void useRunsStore.getState().refreshDetail(ev.payload.runId);
 });
 void listen<{ runId: string; error: string }>(RUN_EVENTS.error, (ev) => {
-  void useRunsStore.getState().refreshDetail(ev.payload.runId);
+  // Refresh first, then record the error: whoever watches `runErrors` (the
+  // Review tray, after a send-back) reads stages that are already current.
+  const { runId, error } = ev.payload;
+  void useRunsStore
+    .getState()
+    .refreshDetail(runId)
+    .catch(() => {})
+    .finally(() => useRunsStore.getState().noteRunError(runId, error));
 });
 void listen<{ runId: string; stageId: string; entry?: LiveEntry; reset?: boolean }>(
   RUN_EVENTS.log,

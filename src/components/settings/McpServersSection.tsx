@@ -1,52 +1,86 @@
-import { useEffect, useState } from "react";
-import { Plus, Trash2, Loader2, Check, AlertTriangle } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  Plus,
+  Trash2,
+  Loader2,
+  Check,
+  AlertTriangle,
+  RefreshCw,
+  Pencil,
+  ChevronRight,
+  Copy,
+  Globe,
+} from "lucide-react";
 import { ipc } from "../../lib/ipc";
-import type { McpServerConfig } from "../../lib/types";
+import type { McpFailure, McpServerConfig } from "../../lib/types";
+import { tourId } from "../../lib/tour/ids";
+import { copyToClipboard } from "../../lib/clipboard";
 import { pushToast } from "../Toasts";
+import { Reveal } from "../primitives/Reveal";
+import { McpServerForm, iconButtonClass } from "./McpServerForm";
+import { configFromDraft, draftFrom, emptyDraft, type Draft } from "./mcpDraft";
+
+export { draftFrom } from "./mcpDraft";
 
 type TestState =
   | { kind: "idle" }
   | { kind: "testing" }
-  | { kind: "ok"; tools: number }
-  | { kind: "error"; message: string };
+  | { kind: "reconnecting" }
+  | { kind: "ok"; tools: number; reconnected: boolean }
+  | { kind: "error"; failure: McpFailure };
 
-const inputClass =
-  "w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:text-octo-mute focus:border-octo-brass";
-const labelClass =
-  "mb-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute";
+/** Which form is open: adding a server, or editing the one named `original`. */
+type FormState = { mode: "add" } | { mode: "edit"; original: string };
 
-/** Parse a "KEY=value" textarea into an env map (blank/##-comment lines skipped). */
-export function parseEnv(text: string): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (!t || t.startsWith("#")) continue;
-    const eq = t.indexOf("=");
-    if (eq > 0) env[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+/** A Test/Reconnect rejection as a failure to show. The backend sends a
+ *  classified `McpFailure`; anything else (an IPC error) is its own text. */
+export function mcpFailureFrom(e: unknown): McpFailure {
+  if (e && typeof e === "object") {
+    const o = e as Record<string, unknown>;
+    if (o["kind"] === "McpFailure" && typeof o["summary"] === "string") {
+      return {
+        summary: o["summary"],
+        hint: typeof o["hint"] === "string" ? o["hint"] : null,
+        detail: typeof o["detail"] === "string" ? o["detail"] : "",
+      };
+    }
   }
-  return env;
+  const text = (e instanceof Error ? e.message : String(e)).trim();
+  return { summary: text.split("\n")[0] || "The server failed to connect.", hint: null, detail: text };
 }
 
 /**
- * Settings UI for the stdio MCP servers Octopush connects to (their tools show
- * up in the TALK chat). Reads/writes `~/.claude/mcp.json` and offers a per-row
- * "Test connection" that spawns the server and lists its tools.
+ * Settings UI for the MCP servers Octopush connects to (their tools show up
+ * in the TALK chat): a local command, or a remote URL the backend reaches
+ * through the mcp-remote bridge it builds (`mcp::remote`). Reads/writes
+ * `~/.claude/mcp.json` (a save restarts every server whose entry changed for
+ * Talk) and offers per row a "Test connection" that spawns the server and
+ * lists its tools, a Reconnect that also drops Talk's cached connection, so
+ * its next call starts afresh, and an Edit that reopens the form on the saved
+ * entry. One form is open at a time.
  *
- * Remote servers (e.g. Atlassian) need a stdio bridge — use `npx mcp-remote
- * <url>` as the command. Project-level `.claude/mcp.json` in a repo is also
- * honored at runtime but is edited in the repo, not here.
+ * A failed Test or Reconnect shows the backend's classified failure
+ * (`McpFailure`): a summary and hint, with the redacted output behind a
+ * "Details" disclosure that can be selected and copied.
+ *
+ * Project-level `.claude/mcp.json` in a repo is also honored at runtime but
+ * is edited in the repo, not here.
  */
 export function McpServersSection() {
   const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
   const [loaded, setLoaded] = useState(false);
   const [tests, setTests] = useState<Record<string, TestState>>({});
-  const [adding, setAdding] = useState(false);
-
-  // Draft for a new server.
-  const [name, setName] = useState("");
-  const [command, setCommand] = useState("");
-  const [argsText, setArgsText] = useState("");
-  const [envText, setEnvText] = useState("");
+  const [form, setForm] = useState<FormState | null>(null);
+  const [draft, setDraft] = useState<Draft>(emptyDraft);
+  // Per server, bumped when its entry is saved, renamed or removed: a Test
+  // or Reconnect started before then reports on an entry that's gone, so
+  // its result is dropped.
+  const generations = useRef<Record<string, number>>({});
+  const saveSeq = useRef(0);
+  const generation = (key: string) => (Object.hasOwn(generations.current, key) ? generations.current[key] : 0);
+  const bump = (...keys: string[]) => {
+    for (const key of keys) generations.current[key] = generation(key) + 1;
+  };
 
   useEffect(() => {
     // Defensive: tolerate environments where the ipc method is absent.
@@ -56,89 +90,224 @@ export function McpServersSection() {
       .finally(() => setLoaded(true));
   }, []);
 
-  async function persist(next: Record<string, McpServerConfig>) {
+  /** Save the entries; `secrets` (server → env name → typed value) go to the
+   *  Keychain, `renamed` (new name → old) moves a renamed server's items and its
+   *  conversations' off-list entries. */
+  async function persist(
+    next: Record<string, McpServerConfig>,
+    secrets: Record<string, Record<string, string>> = {},
+    renamed: Record<string, string> = {},
+  ) {
+    // Only the latest save's answer is shown: an earlier one arriving late
+    // describes entries that were replaced since.
+    const seq = ++saveSeq.current;
+    const before = servers;
     setServers(next);
     try {
-      await ipc.saveMcpConfig(next);
+      // The entries as saved: a remote entry's bridge is built by the
+      // backend, and no secret value comes back.
+      const saved = await ipc.saveMcpConfig(next, secrets, renamed);
+      if (saved && seq === saveSeq.current) setServers(saved);
     } catch (e) {
       pushToast({ level: "error", title: "Save failed", body: String(e) });
+      // Show what is really saved: the optimistic list may hold "" for a
+      // value the Keychain refused, and a later save would write it.
+      let stored: Record<string, McpServerConfig> = before;
+      try {
+        stored = (await ipc.getMcpConfig()) ?? before;
+      } catch {
+        // Keep the list from before this save.
+      }
+      if (seq === saveSeq.current) setServers(stored);
     }
   }
 
-  function resetDraft() {
-    setName("");
-    setCommand("");
-    setArgsText("");
-    setEnvText("");
-    setAdding(false);
+  function closeForm() {
+    setForm(null);
+    setDraft(emptyDraft());
   }
 
-  async function addServer() {
-    const key = name.trim();
-    if (!key || !command.trim()) return;
-    const config: McpServerConfig = {
-      command: command.trim(),
-      args: argsText.split("\n").map((s) => s.trim()).filter(Boolean),
-      env: parseEnv(envText),
-    };
-    await persist({ ...servers, [key]: config });
-    resetDraft();
+  function openAdd() {
+    setDraft(emptyDraft());
+    setForm({ mode: "add" });
+  }
+
+  function openEdit(key: string) {
+    if (!Object.hasOwn(servers, key)) return;
+    const cfg = servers[key];
+    setDraft(draftFrom(key, cfg));
+    setForm({ mode: "edit", original: key });
+  }
+
+  /** Add the drafted server, or replace the edited one (a rename drops the
+   *  old name). The save resets every changed entry for Talk. */
+  async function saveForm() {
+    if (!form) return;
+    const key = draft.name.trim();
+    const original = form.mode === "edit" ? form.original : null;
+    if (!key || (key !== original && Object.hasOwn(servers, key))) return;
+    // Keeps any field the form doesn't show.
+    const { config, secrets } = configFromDraft(draft, original ? servers[original] : undefined);
+    const next = { ...servers };
+    if (original) delete next[original];
+    next[key] = config;
+    // An old result, or one still running, no longer describes the saved entry.
+    bump(key, ...(original ? [original] : []));
+    setTests((s) => {
+      const t = { ...s };
+      if (original) delete t[original];
+      delete t[key];
+      return t;
+    });
+    closeForm();
+    await persist(next, { [key]: secrets }, original && original !== key ? { [key]: original } : {});
+  }
+
+  async function clearSignIn(key: string) {
+    const config = servers[key];
+    if (!config) return;
+    try {
+      const removed = await ipc.clearMcpSignIn(key, config);
+      pushToast(
+        removed > 0
+          ? { level: "success", title: "Sign-in cleared", body: "The next connection opens your browser to sign in again." }
+          : { level: "info", title: "No saved sign-in for this server" },
+      );
+    } catch (e) {
+      pushToast({ level: "error", title: "Couldn't clear the sign-in", body: String(e) });
+    }
   }
 
   async function removeServer(key: string) {
     const next = { ...servers };
     delete next[key];
+    bump(key);
+    setTests((s) => {
+      const t = { ...s };
+      delete t[key];
+      return t;
+    });
     await persist(next);
   }
 
   async function testServer(key: string) {
     const config = servers[key];
     if (!config) return;
+    const gen = generation(key);
     setTests((s) => ({ ...s, [key]: { kind: "testing" } }));
+    let result: TestState;
     try {
       const tools = await ipc.testMcpServer(key, config);
-      setTests((s) => ({ ...s, [key]: { kind: "ok", tools: tools.length } }));
+      result = { kind: "ok", tools: tools.length, reconnected: false };
     } catch (e) {
-      setTests((s) => ({ ...s, [key]: { kind: "error", message: String(e) } }));
+      result = { kind: "error", failure: mcpFailureFrom(e) };
     }
+    if (generation(key) === gen) setTests((s) => ({ ...s, [key]: result }));
+  }
+
+  async function reconnectServer(key: string) {
+    const config = servers[key];
+    if (!config) return;
+    const gen = generation(key);
+    setTests((s) => ({ ...s, [key]: { kind: "reconnecting" } }));
+    let result: TestState;
+    try {
+      const tools = await ipc.reconnectMcpServer(key, config);
+      result = { kind: "ok", tools: tools.length, reconnected: true };
+    } catch (e) {
+      result = { kind: "error", failure: mcpFailureFrom(e) };
+    }
+    if (generation(key) === gen) setTests((s) => ({ ...s, [key]: result }));
   }
 
   if (!loaded) return null;
 
   const entries = Object.entries(servers).sort(([a], [b]) => a.localeCompare(b));
+  const formFor = (mode: FormState) => {
+    const original = mode.mode === "edit" ? mode.original : null;
+    const oauth = original !== null && servers[original]?.remote?.auth === "oauth";
+    return (
+      <McpServerForm
+        draft={draft}
+        onChange={setDraft}
+        original={original}
+        taken={(name) => name !== original && Object.hasOwn(servers, name)}
+        onSave={() => void saveForm()}
+        onCancel={closeForm}
+        onClearSignIn={oauth && original ? () => void clearSignIn(original) : undefined}
+      />
+    );
+  };
 
   return (
-    <div className="mt-10 max-w-[640px]">
+    <div className="mt-10">
       <SectionLabel>MCP Servers</SectionLabel>
       <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
-        Local (stdio) Model Context Protocol servers whose tools become available
-        to Talk. For a remote/OAuth server (e.g. Atlassian) use a bridge as the
-        command — <span className="font-mono text-octo-sage">npx mcp-remote &lt;url&gt;</span>.
+        Model Context Protocol servers whose tools become available to Talk: a
+        local command Octopush runs, or a remote URL it reaches through{" "}
+        <span className="font-mono text-octo-sage">mcp-remote</span>, which npx
+        fetches the first time (Node required). Tokens and other secrets stay on
+        this Mac, in your login Keychain.
       </p>
 
       <div className="space-y-2">
         {entries.length === 0 && (
           <p className="text-[12px] text-octo-mute">No MCP servers configured.</p>
         )}
-        {entries.map(([key, cfg]) => {
+        {entries.map(([key, cfg], i) => {
+          if (form?.mode === "edit" && form.original === key) {
+            return <div key={key}>{formFor(form)}</div>;
+          }
           const test = tests[key] ?? { kind: "idle" };
+          const busy = test.kind === "testing" || test.kind === "reconnecting";
           return (
             <div key={key} className="rounded-md border border-octo-hairline bg-octo-panel px-3 py-2.5">
               <div className="flex items-center gap-3">
                 <span className="font-mono text-[12px] text-octo-brass">{key}</span>
-                <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-mute">
-                  {cfg.command} {cfg.args.join(" ")}
-                </span>
+                {cfg.remote ? (
+                  <span className="flex min-w-0 flex-1 items-center gap-1.5 font-mono text-[11px] text-octo-mute">
+                    <span title="Remote server" className="flex shrink-0 items-center">
+                      <Globe size={11} aria-label="Remote server" />
+                    </span>
+                    <span className="truncate" title={cfg.remote.url}>{cfg.remote.url}</span>
+                  </span>
+                ) : (
+                  <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-mute">
+                    {cfg.command} {cfg.args.join(" ")}
+                  </span>
+                )}
                 <button
                   type="button"
                   onClick={() => testServer(key)}
-                  disabled={test.kind === "testing"}
+                  disabled={busy}
                   className="flex items-center gap-1.5 rounded border border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage transition-colors hover:border-[var(--brass-dim)] hover:text-octo-brass disabled:opacity-40"
                 >
                   {test.kind === "testing" ? (
                     <Loader2 size={11} className="animate-spin" />
                   ) : null}
                   Test
+                </button>
+                <button
+                  type="button"
+                  onClick={() => reconnectServer(key)}
+                  disabled={busy}
+                  aria-label={`Reconnect ${key}`}
+                  title="Reconnect: restart Talk's connection to this server, then test it"
+                  data-tour={i === 0 ? tourId("settings-mcp-reconnect") : undefined}
+                  className={iconButtonClass}
+                >
+                  <RefreshCw size={12} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openEdit(key)}
+                  disabled={form !== null || busy}
+                  aria-label={`Edit ${key}`}
+                  title={busy ? "Edit server (once its test finishes)" : "Edit server"}
+                  data-tour={i === 0 ? tourId("settings-mcp-edit") : undefined}
+                  className={iconButtonClass}
+                >
+                  <Pencil size={12} />
                 </button>
                 <button
                   type="button"
@@ -150,80 +319,87 @@ export function McpServersSection() {
                   <Trash2 size={13} />
                 </button>
               </div>
+              {test.kind === "reconnecting" && (
+                <div className="octo-fade-in mt-1.5 text-[11px] text-octo-mute">Reconnecting…</div>
+              )}
               {test.kind === "ok" && (
-                <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-octo-verdigris">
-                  <Check size={12} /> Connected · {test.tools} tool{test.tools === 1 ? "" : "s"}
+                <div className="octo-fade-in mt-1.5 flex items-center gap-1.5 text-[11px] text-octo-verdigris">
+                  <Check size={12} />{" "}
+                  {`${test.reconnected ? "Reconnected" : "Connected"} · ${test.tools} tool${test.tools === 1 ? "" : "s"}`}
                 </div>
               )}
-              {test.kind === "error" && (
-                <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-octo-rouge">
-                  <AlertTriangle size={12} className="mt-0.5 shrink-0" />
-                  <span className="break-all">{test.message}</span>
-                </div>
-              )}
+              {test.kind === "error" && <FailureLine failure={test.failure} />}
             </div>
           );
         })}
       </div>
 
-      {adding ? (
-        <div className="mt-3 space-y-3 rounded-md border border-octo-hairline bg-octo-panel p-3">
-          <div>
-            <div className={labelClass}>Name</div>
-            <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} placeholder="github" />
-          </div>
-          <div>
-            <div className={labelClass}>Command</div>
-            <input className={inputClass} value={command} onChange={(e) => setCommand(e.target.value)} placeholder="npx" />
-          </div>
-          <div>
-            <div className={labelClass}>Args (one per line)</div>
-            <textarea
-              className={`${inputClass} h-20 resize-none`}
-              value={argsText}
-              onChange={(e) => setArgsText(e.target.value)}
-              placeholder={"-y\n@modelcontextprotocol/server-github"}
-            />
-          </div>
-          <div>
-            <div className={labelClass}>Env (KEY=value, one per line)</div>
-            <textarea
-              className={`${inputClass} h-16 resize-none`}
-              value={envText}
-              onChange={(e) => setEnvText(e.target.value)}
-              placeholder="GITHUB_TOKEN=ghp_…"
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={addServer}
-              disabled={!name.trim() || !command.trim() || !!servers[name.trim()]}
-              title={servers[name.trim()] ? "A server with this name already exists" : undefined}
-              className="rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass transition-colors disabled:opacity-40"
-            >
-              Add server
-            </button>
-            {!!servers[name.trim()] && (
-              <span className="font-mono text-[10px] text-octo-rouge">name already exists</span>
-            )}
-            <button
-              type="button"
-              onClick={resetDraft}
-              className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage transition-colors hover:text-octo-ivory"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
+      {form?.mode === "add" ? (
+        <div className="mt-3">{formFor(form)}</div>
       ) : (
         <button
           type="button"
-          onClick={() => setAdding(true)}
-          className="mt-3 flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage transition-colors hover:border-[var(--brass-dim)] hover:text-octo-brass"
+          onClick={openAdd}
+          disabled={form !== null}
+          data-tour="settings-mcp-add"
+          className="mt-3 flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage transition-colors hover:border-[var(--brass-dim)] hover:text-octo-brass disabled:opacity-40"
         >
           <Plus size={12} /> Add MCP server
         </button>
+      )}
+    </div>
+  );
+}
+
+/** A failed Test/Reconnect: the summary and hint, then the full redacted
+ *  output behind "Details", selectable, scrollable and copyable. It mounts
+ *  afresh (details folded) with each result, since a run in flight hides it. */
+function FailureLine({ failure }: { failure: McpFailure }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="octo-fade-in mt-1.5 text-[11px] leading-[1.5]">
+      <div className="flex items-start gap-1.5 text-octo-rouge">
+        <AlertTriangle size={12} className="mt-0.5 shrink-0" aria-hidden />
+        <div className="octo-selectable min-w-0">
+          <div>{failure.summary}</div>
+          {failure.hint && <div>{failure.hint}</div>}
+        </div>
+      </div>
+      {failure.detail && (
+        <div className="mt-1 pl-[18px]">
+          <button
+            type="button"
+            aria-expanded={open}
+            onClick={() => setOpen((v) => !v)}
+            className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory"
+          >
+            <ChevronRight
+              size={12}
+              aria-hidden
+              className={`transition-transform duration-[var(--dur-quick)] ease-[var(--ease-octo)] ${open ? "rotate-90" : ""}`}
+            />
+            Details
+          </button>
+          <Reveal open={open}>
+            <div className="relative pt-1.5">
+              <pre
+                data-testid="mcp-failure-detail"
+                className="octo-selectable max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-octo-onyx py-2 pl-3 pr-8 font-mono text-[11px] leading-[1.55] text-octo-sage"
+              >
+                {failure.detail}
+              </pre>
+              <button
+                type="button"
+                onClick={() => void copyToClipboard(failure.detail, "Output copied")}
+                aria-label="Copy the full output"
+                title="Copy the full output"
+                className={`absolute right-1.5 top-3 ${iconButtonClass}`}
+              >
+                <Copy size={12} />
+              </button>
+            </div>
+          </Reveal>
+        </div>
       )}
     </div>
   );

@@ -1,4 +1,6 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
+import type { SecretHold, SecretPreview } from "./secretGuard";
+import type { RewindOutcome, RewindPreview, TalkCheckpoints } from "./talkRewind";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -39,14 +41,14 @@ export interface PipelineStage {
   role: string;
   agentModel: string;
   /** Per-stage reasoning effort; null/absent = off (no thinking) on the API,
-   *  Claude Code's own default on a Claude Code CLI stage; Codex ignores it. */
+   *  the CLI's own default (Claude Code or Codex) on a CLI stage. */
   effort?: Effort | null;
   /** Escalation policy — the stronger model to retry with if this stage fails.
    *  null/absent = no model swap on the retry. Either escalate field set = the
    *  stage has an escalation policy. */
   escalateModel?: string | null;
   /** Escalation policy — the effort to bump to on the failed-retry (API, or a
-   *  Claude Code CLI stage as `--effort`; Codex ignores it). null/absent =
+   *  CLI stage as Claude Code's `--effort` or Codex's `model_reasoning_effort`). null/absent =
    *  keep the base effort on the retry. */
   escalateEffort?: Effort | null;
   substrate: AgentSubstrate;
@@ -142,7 +144,8 @@ export interface FireOutcomeView {
     | "condition_error"
     | "workspace_unavailable"
     | "launch_refused"
-    | "setup_failed";
+    | "setup_failed"
+    | "plan_limit";
 }
 
 /** The phase a routine fire is in (`routine://phase`, `routines::PHASE_*`). */
@@ -157,13 +160,13 @@ export interface StageDraft {
   role: string;
   agentModel: string;
   /** Per-stage reasoning effort; null/absent = off (no thinking) on the API,
-   *  Claude Code's own default on a Claude Code CLI stage; Codex ignores it. */
+   *  the CLI's own default (Claude Code or Codex) on a CLI stage. */
   effort?: Effort | null;
   /** Escalation policy — the stronger model to retry with if this stage fails.
    *  null/absent = no model swap on the retry. */
   escalateModel?: string | null;
   /** Escalation policy — the effort to bump to on the failed-retry (API, or a
-   *  Claude Code CLI stage as `--effort`; Codex ignores it). */
+   *  CLI stage as Claude Code's `--effort` or Codex's `model_reasoning_effort`). */
   escalateEffort?: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
@@ -183,6 +186,64 @@ export interface StageDraft {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+}
+/** One stage of a crew import's review sheet (mirrors Rust `crew::CrewStagePreview`). */
+export interface CrewStagePreview {
+  position: number;
+  label: string;
+  /** The role key it will use (after any rename). */
+  role: string;
+  agentModel: string;
+  escalateModel: string | null;
+  substrate: AgentSubstrate;
+  /** The CLI a `cli` stage runs (by the model id); null on API. A CLI stage
+   *  gets a full shell: its tool list does not apply. */
+  cliDialect: "claude" | "codex" | null;
+  checkpoint: boolean;
+  /** False = the stage can change the worktree. */
+  readOnly: boolean;
+  /** The role may commit, push and run release commands. */
+  actionRole: boolean;
+  /** The tools an API stage gets; empty for a CLI stage. */
+  tools: string[];
+  instructions: string | null;
+  effort: Effort | null;
+  escalateEffort: Effort | null;
+  /** The earlier stage (0-based position) a review loops back to. */
+  loopTargetPosition: number | null;
+  loopMode: string | null;
+  loopMaxIterations: number;
+  unpricedModel: boolean;
+  unpricedEscalate: boolean;
+  /** Worth reading, not blocking (a tool list on a CLI stage). */
+  warnings: string[];
+  problem: string | null;
+}
+export interface CrewRolePreview {
+  key: string;
+  originalKey: string;
+  label: string;
+  promptBody: string;
+  /** new · renamed (its key was taken here) · existing (identical role reused) */
+  fate: "new" | "renamed" | "existing";
+}
+export interface CrewPreview {
+  name: string;
+  description: string;
+  stages: CrewStagePreview[];
+  roles: CrewRolePreview[];
+  /** Problems not tied to one stage. */
+  problems: string[];
+  ok: boolean;
+}
+/** A crew file committed in the repo (`.octopush/crews/*.octocrew.json`):
+ *  names and counts only; `readRepoCrew` reads its text on Fork. */
+export interface RepoCrew {
+  file: string;
+  name: string;
+  description: string;
+  stageCount: number;
+  problem: string | null;
 }
 export interface PipelineDraft {
   pipelineId: string | null; // null = create; a builtin id = fork; a custom id = update
@@ -208,6 +269,27 @@ export interface Run {
   /** True when the run executes in a detached segment worker (Pro) — the
    *  crew keeps working even if the app quits. */
   detached: boolean;
+  /** Set while a Claude plan limit parks the run (#731). Mirrors the Rust
+   *  `PlanWait`; times are epoch seconds. */
+  planWait?: PlanWait | null;
+}
+
+/** A run parked at a Claude plan limit. */
+export interface PlanWait {
+  /** The plan window that stopped the stage (`five_hour`, `seven_day`, …). */
+  window: string;
+  /** When that window resets (epoch seconds). */
+  resetsAt: number;
+  /** When the automatic resume is due (epoch seconds); null = the director resumes. */
+  resumeAt: number | null;
+  /** Automatic resumes since the director last acted or a stage finished. */
+  resumeCount: number;
+  /** Another stage also waits for the director (a real halt, a gate, a
+   *  question): the run needs you even with a resume scheduled. */
+  otherHold: boolean;
+  /** Reports in a row whose reset was already past (#1109): 1 resumes once,
+   *  uncounted; more waits for the director. Absent from older builds. */
+  staleCount?: number;
 }
 /** One question a blocked stage asks the director via `ask_director` — paired
  *  with the agent's own best guess so the director can accept it in one click.
@@ -254,6 +336,29 @@ export interface RunStage {
    *  reads "unpriced", is invisible to the run budget and never counts as
    *  saved. */
   unpricedModel?: boolean;
+  /** True when an attempt of this stage stopped before its CLI reported
+   *  usage (a Codex stage stopped before `turn.completed`; set by `get_run`):
+   *  its cost reads "usage not reported", never $0.00, and like an unpriced
+   *  stage it is invisible to the run budget. */
+  usageUnreported?: boolean;
+  /** The model the stage's last attempt actually ran on, when Claude Code's
+   *  `system/init` named another than `agentModel` (set by `get_run`; #791).
+   *  null/absent = it ran on the model it asked for. */
+  ranModel?: string | null;
+  /** How many tool calls Claude Code refused in the stage's last attempt
+   *  (its result event's `permission_denials`; set by `get_run`; #893).
+   *  0/absent = none. Each is in the stage's journal as "refused · …". */
+  refusedCalls?: number;
+  /** The context size of the stage's latest top-level assistant message —
+   *  input + cache read + cache write, Talk's `contextTokens` (set by
+   *  `get_run` and `run://context`; #895). Claude CLI stages only; null/absent
+   *  before the first message and for Codex/API stages. A finished stage
+   *  keeps its final value; a restart clears it. */
+  contextTokens?: number | null;
+  /** The context window of the model that answered that message, from the
+   *  provider catalog; null/absent when the catalog doesn't list it (the
+   *  meter is then hidden, never drawn against a guess). */
+  contextWindow?: number | null;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
@@ -284,6 +389,11 @@ export interface RunStage {
    *  awaiting_checkpoint stage as a question-block (answer form) rather than a
    *  normal gate (Approve/Reject). */
   blockedQuestions?: BlockedAsk | null;
+  /** Secret guard (#730): set when an Action stage (commit / push / PR /
+   *  merge / release) was held because the worktree holds a possible secret.
+   *  `acknowledged` once the director approved proceeding past exactly these
+   *  findings. Findings carry file, line and kind only — never the value. */
+  secretHold?: SecretHold | null;
 }
 export interface RunDetail {
   run: Run | null;
@@ -314,7 +424,16 @@ function stagePatchArgs(patch?: RunStagePatch) {
     loopMode: patch?.loopMode ?? null,
   };
 }
-export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "discard";
+/** `drop_call`: resume a stage whose deferred tool is gone, dropping that call
+ *  (Claude gets an error as its result and carries on). */
+export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "drop_call" | "discard";
+
+/** What a checkpoint decision carries besides its stage and action. */
+export interface CheckpointOptions {
+  feedback?: string;
+  modelOverride?: string;
+  maxTurnsOverride?: number;
+}
 
 /** An archived stage attempt — a snapshot taken just before a loop-back /
  *  reject reset wiped the live stage row (matches Rust `StageIterationRow`). */
@@ -362,6 +481,13 @@ export type FileReadResult =
   | { kind: "unsupportedEncoding"; size: number; mtime: number }
   | { kind: "tooLarge"; size: number };
 
+/** `read_file_lines` (#1046): the lines kept (`start > end` when the file
+ *  ends before `start`), the file's line count once the read reached its end. */
+export type LineRangeResult =
+  | { kind: "text"; content: string; start: number; end: number; total: number | null; cut: boolean }
+  | { kind: "binary" }
+  | { kind: "unsupportedEncoding" };
+
 /** Cheap stat for external-change detection. `null` = file no longer exists. */
 export interface FileMeta {
   mtimeMs: number;
@@ -393,6 +519,35 @@ export type ContinueKind = "ok" | "moreConflicts" | "error";
 export interface ContinueOutcome { kind: ContinueKind; output: string }
 
 export interface LastCommit { shortSha: string; subject: string; body: string }
+
+/** `git_ops::CommittedDiff`: what a workspace committed since its base —
+ *  the merge base → HEAD tree diff Review shows as "Since base" (#851). */
+export interface CommittedDiff {
+  base: string | null;
+  /** Short SHA of the merge base, when one resolved. */
+  mergeBase: string | null;
+  /** Short SHA of HEAD, when there is one: an amend that keeps the count and
+   *  merge base still moves it. */
+  head: string | null;
+  /** Commits on HEAD since the merge base. */
+  commits: number;
+  /** Unified diff; "" when there are no commits ahead. */
+  diff: string;
+}
+
+/** `git_ops::DiffSize`: files and lines from the merge base with `base` to
+ *  the working tree (commits, edits and untracked files). `base` is null when
+ *  the workspace has none that resolves: the size is then the uncommitted
+ *  changes against HEAD. */
+export interface DiffSize {
+  files: number;
+  added: number;
+  removed: number;
+  base: string | null;
+  /** Untracked entries counted as files but not line-counted (a large
+   *  untracked directory, or past the read budget). */
+  untrackedSkipped: number;
+}
 
 /** One line of per-line blame (G7 slice III). Lines are 1-based and refer
  *  to the committed (HEAD) version of the file. */
@@ -428,14 +583,19 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type {
   AdapterInfo,
   AppSettings,
+  NotifyElsewhere,
+  NotifyElsewherePreview,
   SyncPrefs,
   SyncKind,
+  SyncStatus,
   Budget,
   BudgetPeriod,
   BudgetScope,
   BudgetStatus,
   BranchList,
   BranchPr,
+  MergedArchive,
+  MergedWorkspace,
   EditorChoice,
   ChatMessage,
   ChatThread,
@@ -443,6 +603,7 @@ import type {
   Attachment,
   McpToolInfo,
   McpServerConfig,
+  McpServerStatus,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -450,10 +611,13 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  UpdatedMission,
   LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
   GhIssue,
+  Group,
+  GroupScope,
   Pr,
   PrInfo,
   ShipReadiness,
@@ -464,6 +628,9 @@ import type {
   PtySession,
   RefreshPricingResult,
   ThreadCost,
+  SessionUsage,
+  RequestContext,
+  PtySettledEvent,
   Session,
   SessionRecap,
   SearchHit,
@@ -481,8 +648,11 @@ import type {
   GatewayReconciliation,
   Workspace,
   CreatedWorkspace,
+  ShareOptions,
+  ShareSpec,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
+  ProjectCollisions,
 } from "./types";
 
 // ─── Entitlement (premium scaffolding — P0) ───────────────────────
@@ -516,6 +686,10 @@ export interface SyncedRunStage {
   model: string | null;
   status: string;
   cost_usd: number;
+  /** Only on the summary stage that stands in for stages cut to fit the sync
+   *  size limit: one of them was unpriced on the Mac that ran it (#978).
+   *  Absent (false) on every other stage and on older payloads. */
+  includes_unpriced?: boolean;
 }
 export interface SyncedRunStageDetail {
   position: number;
@@ -674,6 +848,48 @@ export const ipc = {
     invoke<void>("set_project_pinned", { projectId, pinned }),
   setProjectOrder: (ids: string[]) => invoke<void>("set_project_order", { ids }),
 
+  // ─── Rail groups ────────────────────────────────────────────────
+  /** Every group, both scopes: project groups, then each project's workspace
+   *  groups, each run in `sortOrder`. */
+  listGroups: () => invoke<Group[]>("list_groups"),
+  /** Create a group and move `memberIds` into it in one step. It takes the
+   *  place of its first member in rail order, or goes last when it has none.
+   *  `projectId` is required for a `workspace` group and refused for a
+   *  `project` group. */
+  createGroup: (args: {
+    scope: GroupScope;
+    projectId?: string | null;
+    name: string;
+    tint?: TintName | null;
+    memberIds?: string[];
+  }) =>
+    invoke<Group>("create_group", {
+      scope: args.scope,
+      projectId: args.projectId ?? null,
+      name: args.name,
+      tint: args.tint ?? null,
+      memberIds: args.memberIds ?? [],
+    }),
+  /** The backend trims the name and refuses an empty one. */
+  renameGroup: (groupId: string, name: string) =>
+    invoke<void>("rename_group", { groupId, name }),
+  setGroupTint: (groupId: string, tint: TintName | null) =>
+    invoke<void>("set_group_tint", { groupId, tint }),
+  /** Persist the order of sibling groups (same scope, same project): each id
+   *  gets its index as `sortOrder`, like `setProjectOrder`. */
+  setGroupOrder: (ids: string[]) => invoke<void>("set_group_order", { ids }),
+  /** Delete a group. Its members stay, ungrouped. */
+  deleteGroup: (groupId: string) => invoke<void>("delete_group", { groupId }),
+  /** Move a project or workspace into a group, or out of any group (`null`).
+   *  Refused for a group of the other scope, and for a workspace group of
+   *  another project. */
+  setItemGroup: (kind: GroupScope, itemId: string, groupId: string | null) =>
+    invoke<void>("set_item_group", { kind, itemId, groupId }),
+  /** Move several items of one kind the same way, in one transaction: one
+   *  refusal leaves them all where they were. */
+  setItemsGroup: (kind: GroupScope, itemIds: string[], groupId: string | null) =>
+    invoke<void>("set_items_group", { kind, itemIds, groupId }),
+
   // ─── Workspaces ─────────────────────────────────────────────────
   createWorkspace: (projectId: string, projectPath: string, name: string, task: string,
                     branch: string, fromBranch: string, setupScript: string,
@@ -683,6 +899,19 @@ export const ipc = {
   /** Remember the project's setup-script template (read by Routines). */
   setProjectSetupScript: (projectId: string, script: string) =>
     invoke<void>("set_project_setup_script", { projectId, script }),
+  /** The setup script the repo declares in `.conductor/settings.toml` (with
+   *  `settings.local.toml` on top), or null — also null once the project has a
+   *  saved setup template. The backend reads the project's own path from the
+   *  DB. Reading it never runs it. */
+  conductorSetupScript: (projectId: string) =>
+    invoke<string | null>("conductor_setup_script", { projectId }),
+  /** The project's "Share with new missions" list, and what its main checkout
+   *  could share. The backend reads the project's own path from the DB. */
+  shareWithMissions: (projectId: string) =>
+    invoke<ShareOptions>("share_with_missions", { projectId }),
+  /** Remember what the project shares with new missions (sanitized server-side). */
+  setShareWithMissions: (projectId: string, spec: ShareSpec) =>
+    invoke<void>("set_share_with_missions", { projectId, spec }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────
@@ -699,7 +928,7 @@ export const ipc = {
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
     execIsolation: string | null = null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
+  ) => invoke<UpdatedMission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   // ─── Logbook ────────────────────────────────────────────────────
@@ -709,6 +938,11 @@ export const ipc = {
 
   workspacesGitSummary: (projectId: string) =>
     invoke<WorkspaceGitSummary[]>("workspaces_git_summary", { projectId }),
+  /** Collision radar (#732): live workspaces of a project changing the same
+   *  files. Read-only; the backend reuses a report for a few seconds unless
+   *  `force` (or a workspace's HEAD moved). */
+  projectCollisions: (projectId: string, force = false) =>
+    invoke<ProjectCollisions>("project_collisions", { projectId, force }),
   deleteWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>
     invoke<void>("delete_workspace", { workspaceId, projectPath, branch, worktreePath }),
   archiveWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>
@@ -744,6 +978,16 @@ export const ipc = {
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
   /** What the thread has cost so far, from the ledger (Companion). */
   getThreadCost: (threadId: string) => invoke<ThreadCost>("get_thread_cost", { threadId }),
+  /** What the Claude Code session in a Run terminal has used (context size,
+   *  spend, cache share, model). Null for a terminal with no known Claude
+   *  Code session or no ledger row yet. Read-only. */
+  getSessionUsage: (terminalId: string) =>
+    invoke<SessionUsage | null>("get_session_usage", { terminalId }),
+  /** What every request of a project carries: the measured fixed context,
+   *  its price at the project's usual model and cache rate, and the files
+   *  that make it up as ranked estimates. Read-only. */
+  getRequestContext: (projectId: string) =>
+    invoke<RequestContext>("get_request_context", { projectId }),
   /** Give a finished sub-agent more turns, optionally with a message from the
    *  user. Resolves when the continuation ends; the report row is rewritten
    *  via `chat://message-updated`. */
@@ -769,12 +1013,16 @@ export const ipc = {
   respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
     invoke<void>("respond_approval", { callId, decision }),
   /** Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
-   *  command + output into the conversation; returns cwd/exit for the badge. */
+   *  command + output into the conversation; returns cwd/exit for the badge.
+   *  Secret guard (#819): a command that commits, pushes or opens a PR
+   *  rejects with `SecretsFound` (see `lib/secretGuard`) before it runs;
+   *  `allowFindings` echoes the confirm's fingerprint for this one run. */
   runShellCommand: (request: {
     workspaceId: string;
     threadId: string;
     workspacePath: string;
     command: string;
+    allowFindings?: string;
   }) =>
     invoke<{
       output: string;
@@ -809,6 +1057,23 @@ export const ipc = {
   deleteChatThread: (threadId: string) =>
     invoke<void>("delete_chat_thread", { threadId }),
 
+  // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+  // The backend resolves the thread's worktree itself; no path is passed.
+  /** The turns of a thread that can be rewound, the ones without a checkpoint, and whether an undo is on offer. */
+  listTalkCheckpoints: (threadId: string) =>
+    invoke<TalkCheckpoints>("list_talk_checkpoints", { threadId }),
+  /** What rewinding to a turn would change (nothing is written). */
+  previewTalkRewind: (threadId: string, messageId: number) =>
+    invoke<RewindPreview>("preview_talk_rewind", { threadId, messageId }),
+  /** Rewind to a turn; `expected` is the confirmed preview's `current`. */
+  rewindTalkFiles: (threadId: string, messageId: number, expected: string) =>
+    invoke<RewindOutcome>("rewind_talk_files", { threadId, messageId, expected }),
+  undoTalkRewind: (threadId: string) =>
+    invoke<RewindOutcome>("undo_talk_rewind", { threadId }),
+  /** A new thread with the history before a user turn; the turn becomes its draft. */
+  forkChatThread: (threadId: string, messageId: number) =>
+    invoke<{ thread: ChatThread; draft: string }>("fork_chat_thread", { threadId, messageId }),
+
   // ─── Skills ──────────────────────────────────────────────────────
   listSkills: (workspacePath: string) =>
     invoke<SkillMeta[]>("list_skills", { workspacePath }),
@@ -823,13 +1088,52 @@ export const ipc = {
   // ─── MCP ─────────────────────────────────────────────────────────
   listMcpTools: (workspacePath: string) =>
     invoke<McpToolInfo[]>("list_mcp_tools", { workspacePath }),
-  listMcpServers: (workspacePath: string) =>
-    invoke<string[]>("list_mcp_servers", { workspacePath }),
+  /** Every server configured for the worktree (user ∪ project config) with
+   *  Talk's live status for it. Spawns nothing. */
+  listMcpServerStatus: (workspacePath: string) =>
+    invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The MCP servers switched off in one Talk conversation (none by default). */
+  getThreadMcpDisabled: (threadId: string) => invoke<string[]>("get_thread_mcp_disabled", { threadId }),
+  /** Turn one server off (or back on) in a conversation; resolves to its new
+   *  off list. The backend reads and writes the list under one lock. */
+  setThreadMcpServer: (threadId: string, server: string, off: boolean) =>
+    invoke<string[]>("set_thread_mcp_server", { threadId, server, off }),
+  /** Settings saved the MCP config, Reconnect restarted a server, or Talk's
+   *  discovery started (or failed to start) servers. If either subscription
+   *  fails, the other is dropped and the promise rejects. */
+  onMcpChanged: async (handler: () => void) => {
+    const subs = await Promise.allSettled([
+      listen("mcp://config-changed", () => handler()),
+      listen("mcp://status-changed", () => handler()),
+    ]);
+    const offs = subs.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+    const failed = subs.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failed) {
+      offs.forEach((off) => off());
+      throw failed.reason;
+    }
+    return () => offs.forEach((off) => off());
+  },
   getMcpConfig: () => invoke<Record<string, McpServerConfig>>("get_mcp_config"),
-  saveMcpConfig: (servers: Record<string, McpServerConfig>) =>
-    invoke<void>("save_mcp_config", { servers }),
+  /** Save the user-level servers; returns them as saved (remote bridges
+   *  rebuilt, no secret value). `secrets` (server → env name → typed value)
+   *  go to the login Keychain, never to mcp.json; `renamed` (new name → old)
+   *  moves a renamed server's Keychain items and carries the rename over to
+   *  the conversations that had the old name switched off. */
+  saveMcpConfig: (
+    servers: Record<string, McpServerConfig>,
+    secrets: Record<string, Record<string, string>> = {},
+    renamed: Record<string, string> = {},
+  ) => invoke<Record<string, McpServerConfig>>("save_mcp_config", { servers, secrets, renamed }),
   testMcpServer: (name: string, config: McpServerConfig) =>
     invoke<McpToolInfo[]>("test_mcp_server", { name, config }),
+  /** Stop Talk's cached connection to the server, then run the same smoke test as Test. */
+  reconnectMcpServer: (name: string, config: McpServerConfig) =>
+    invoke<McpToolInfo[]>("reconnect_mcp_server", { name, config }),
+  /** Delete mcp-remote's saved browser sign-in for a remote server and stop
+   *  Talk's connection to it; returns how many files went. */
+  clearMcpSignIn: (name: string, config: McpServerConfig) =>
+    invoke<number>("clear_mcp_sign_in", { name, config }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),
@@ -838,6 +1142,14 @@ export const ipc = {
   listBranches: (path: string) => invoke<BranchList>("list_branches", { path }),
   getGitDiff: (path: string, ignoreWhitespace?: boolean) =>
     invoke<string>("get_git_diff", { path, ignoreWhitespace }),
+  /** The workspace's diff size against its base (Mission Control cards);
+   *  null when the workspace or its worktree is gone. */
+  workspaceDiffSize: (workspaceId: string) =>
+    invoke<DiffSize | null>("workspace_diff_size", { workspaceId }),
+  /** What the workspace committed since its base (Review's "Since base");
+   *  null when the worktree is gone or git timed out. */
+  getCommittedDiff: (workspaceId: string, ignoreWhitespace?: boolean) =>
+    invoke<CommittedDiff | null>("get_committed_diff", { workspaceId, ignoreWhitespace }),
 
   // ─── File operations ───────────────────────────────────────────
   openFileInSystem: (path: string) => invoke<void>("open_file_in_system", { path }),
@@ -848,6 +1160,11 @@ export const ipc = {
   readFile: (path: string) => invoke<string>("read_file", { path }),
   readFileChecked: (path: string, maxBytes?: number) =>
     invoke<FileReadResult>("read_file_checked", { path, maxBytes }),
+  /** Lines `start..end` of a file, streamed: stops after `end`, so a range of
+   *  a large file never reads all of it. `total` only when the read reached
+   *  the file's end; `cut` when the range ran past `maxBytes`. */
+  readFileLines: (path: string, start: number, end: number, maxBytes: number) =>
+    invoke<LineRangeResult>("read_file_lines", { path, start, end, maxBytes }),
   writeFile: (path: string, content: string) =>
     invoke<{ mtime: number }>("write_file", { path, content }),
   fileMeta: (path: string) => invoke<FileMeta | null>("file_meta", { path }),
@@ -886,6 +1203,19 @@ export const ipc = {
   /** Rust asks this window to confirm closing (an app quit hit unsaved edits). */
   onConfirmCloseRequest: (handler: () => void) =>
     listen("octo://confirm-close", () => handler()),
+  /** Claude Code's `Stop` hook fired in a Run terminal: its turn is over.
+   *  The handler gets the terminal's id. */
+  onPtySettled: (handler: (terminalId: string) => void) =>
+    listen<PtySettledEvent>("pty://settled", (ev) => handler(ev.payload.sessionId)),
+  /** Claude Code's `SessionStart` or `SessionEnd` hook fired in a Run
+   *  terminal: the Claude Code session it runs started, changed (`/clear`,
+   *  a resume) or ended. The handler gets the terminal's id. */
+  onClaudeSessionChanged: (handler: (terminalId: string) => void) =>
+    listen<PtySettledEvent>("pty://claude-session", (ev) => handler(ev.payload.sessionId)),
+  /** A transcript ingest pass changed the spend ledger (rows added or
+   *  Direct-session duplicates removed). */
+  onSpendIngested: (handler: () => void) =>
+    listen("octo://spend-ingested", () => handler()),
   /** Theme changes cross windows (the DOM `octo:theme` event does not). */
   broadcastTheme: (theme: ThemeConfig) => emit("octo://theme", theme),
   onThemeBroadcast: (handler: (theme: ThemeConfig) => void) =>
@@ -942,6 +1272,22 @@ export const ipc = {
     invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) =>
     invoke<void>("save_settings", { settings }),
+  /** The path of `settings.json` when it exists but can't be parsed (the app
+   *  then shows defaults and refuses every save), else null. */
+  unreadableSettingsPath: () =>
+    invoke<string | null>("unreadable_settings_path"),
+  // ─── Notify me elsewhere (#964) ────────────────────────────────
+  /** The saved switch and webhook URL (off, no URL, by default). */
+  getNotifyElsewhere: () => invoke<NotifyElsewhere>("get_notify_elsewhere"),
+  /** Save both (the only writer). Rejects an invalid URL (https, or http to
+   *  this Mac only) and turning on without one; returns what was stored. */
+  setNotifyElsewhere: (enabled: boolean, url: string) =>
+    invoke<NotifyElsewhere>("set_notify_elsewhere", { enabled, url }),
+  /** "Send a test": the test message to `url` (saved or not), once. Rejects
+   *  with the cause, never the URL. */
+  notifyElsewhereTest: (url: string) => invoke<void>("notify_elsewhere_test", { url }),
+  /** The body's fields for a checkpoint gate, and every `event` value. */
+  notifyElsewherePreview: () => invoke<NotifyElsewherePreview>("notify_elsewhere_preview"),
   // ─── Updater (channels + launch alert) ─────────────────────────
   /** The persisted update channel (`stable` by default). */
   getUpdateChannel: () => invoke<UpdateChannel>("get_update_channel"),
@@ -972,6 +1318,9 @@ export const ipc = {
     invoke<TerminalRecord>("create_terminal", { workspaceId, label }),
   renameTerminal: (id: string, label: string) =>
     invoke<void>("rename_terminal", { id, label }),
+  /** Persist the session line's order: `ids[i]` takes position `i`. */
+  reorderTerminals: (workspaceId: string, ids: string[]) =>
+    invoke<void>("reorder_terminals", { workspaceId, ids }),
   deleteTerminal: (id: string) =>
     invoke<void>("delete_terminal", { id }),
 
@@ -1006,12 +1355,34 @@ export const ipc = {
     invoke<void>("unstage_all_changes", { workspacePath }),
 
   /** Returns the new short SHA on success. */
-  commitChanges: (workspacePath: string, message: string) =>
-    invoke<string>("commit_changes", { workspacePath, message }),
+  /** Secret guard (#730): rejects with `SecretsFound` (see `lib/secretGuard`)
+   *  on a possible credential in the staged diff (or a partial scan), unless
+   *  `allowFindings` is the refusal's `fingerprint` — the user's confirm of
+   *  exactly what the dialog showed. The core rescans every time. */
+  commitChanges: (workspacePath: string, message: string, allowFindings?: string) =>
+    invoke<string>("commit_changes", { workspacePath, message, allowFindings: allowFindings ?? null }),
+
+  /** Secret guard (#835): what Commit's scan of the staged diff would find,
+   *  for the Review Companion's verdict. `null` when the guard is off. Never
+   *  blocks anything and carries no fingerprint: Commit rescans and asks. */
+  secretScanStaged: (workspacePath: string) =>
+    invoke<SecretPreview | null>("secret_scan_staged", { workspacePath }),
+
+  /** "Scan this branch's commits" (#820): the guard's rules over every commit
+   *  since the merge base with `base`, on demand, guard switch on or off.
+   *  Read-only; rejects when no merge base resolves. */
+  secretScanBranch: (workspacePath: string, base: string) =>
+    invoke<SecretPreview>("secret_scan_branch", { workspacePath, base }),
+
+  /** Secret guard (#1046): the guard's rules over the context blocks a Talk
+   *  message is about to attach. `null` when the guard is off. A finding's
+   *  `file` is the block's `label`; its line counts from `firstLine`. */
+  secretScanText: (blocks: { label: string; text: string; firstLine?: number; wholeFile?: boolean }[]) =>
+    invoke<SecretPreview | null>("secret_scan_text", { blocks }),
 
   getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
-  amendCommit: (workspacePath: string, message: string) =>
-    invoke<string>("amend_commit", { workspacePath, message }),
+  amendCommit: (workspacePath: string, message: string, allowFindings?: string) =>
+    invoke<string>("amend_commit", { workspacePath, message, allowFindings: allowFindings ?? null }),
   getLastCommit: (workspacePath: string) =>
     invoke<LastCommit | null>("get_last_commit", { workspacePath }),
   /** Newest-first commit page from HEAD; `skip` offsets for pagination. */
@@ -1108,9 +1479,12 @@ export const ipc = {
   /** All tag names, alphabetical. */
   listTags: (workspacePath: string) => invoke<string[]>("list_tags", { workspacePath }),
 
-  /** Returns the trimmed git-push output (combined stdout+stderr). */
-  pushBranch: (workspacePath: string) =>
-    invoke<string>("push_branch", { workspacePath }),
+  /** Returns the trimmed git-push output (combined stdout+stderr). Secret
+   *  guard (#730): rejects with `SecretsFound` on a possible credential in the
+   *  commits being pushed, unless `allowFindings` is the fingerprint the
+   *  dialog showed and the fresh scan still matches it. */
+  pushBranch: (workspacePath: string, allowFindings?: string) =>
+    invoke<string>("push_branch", { workspacePath, allowFindings: allowFindings ?? null }),
 
   /** Workspace-wide file listing (respects .gitignore). Returns paths
    *  relative to the workspace root. Capped at 20k entries. */
@@ -1145,8 +1519,31 @@ export const ipc = {
   findPrForBranch: (workspacePath: string) =>
     invoke<Pr | null>("find_pr_for_branch", { workspacePath }),
 
+  /** The tail of these Actions runs' failed-step logs (`gh run view
+   *  --log-failed`), capped at 8k chars. Empty without `gh`. */
+  prFailedCheckLogs: (workspacePath: string, runIds: number[]) =>
+    invoke<string>("pr_failed_check_logs", { workspacePath, runIds }),
+
   openPrsForProject: (projectPath: string) =>
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
+
+  /** The project's missions whose PR was merged at their worktree's HEAD,
+   *  with nothing changed in the worktree (never the project root). Rejects
+   *  when the merged PRs can't be read (no `gh`, not on GitHub). */
+  mergedWorkspaces: (projectId: string, projectPath: string) =>
+    invoke<MergedWorkspace[]>("merged_workspaces", { projectId, projectPath }),
+
+  /** Archive those of `workspaceIds` that still pass when it acts (merged at
+   *  HEAD, clean, no Talk turn or Direct run active, and no local files but
+   *  the ones `localFilesOk` names for it, the paths its confirm showed);
+   *  says which were skipped and why. */
+  archiveMergedWorkspaces: (
+    projectId: string,
+    projectPath: string,
+    workspaceIds: string[],
+    localFilesOk: Record<string, string[]>,
+  ) =>
+    invoke<MergedArchive>("archive_merged_workspaces", { projectId, projectPath, workspaceIds, localFilesOk }),
 
   /** Open pull requests for the project, for "start a workspace from a PR".
    *  Rejects with a friendly message when the GitHub CLI is missing or not
@@ -1161,9 +1558,11 @@ export const ipc = {
   prDraftContext: (workspacePath: string, base: string) =>
     invoke<PrDraftContext>("pr_draft_context", { workspacePath, base }),
   /** `gh pr create` from the current branch (body passed via a file). The
-   *  branch must already be published. Resolves to the new PR. */
-  createPullRequest: (workspacePath: string, base: string, title: string, body: string, draft: boolean) =>
-    invoke<Pr>("create_pull_request", { workspacePath, base, title, body, draft }),
+   *  branch must already be published. Resolves to the new PR. Secret guard
+   *  (#730): the PR's own scan, separate from the push's; `allowFindings`
+   *  confirms only the fingerprint the PR dialog showed. */
+  createPullRequest: (workspacePath: string, base: string, title: string, body: string, draft: boolean, allowFindings?: string) =>
+    invoke<Pr>("create_pull_request", { workspacePath, base, title, body, draft, allowFindings: allowFindings ?? null }),
 
   /** Fetch a PR's head ref as a local branch (no-op if it already exists),
    *  so it can serve as the base of a new workspace. */
@@ -1230,6 +1629,23 @@ export const ipc = {
   deletePipeline: (pipelineId: string) =>
     invoke<void>("delete_pipeline", { pipelineId }),
 
+  // ─── Portable crews (.octocrew.json) ──────────────────────────────
+  /** A saved pipeline (plus the custom roles it uses) as crew-file text. */
+  exportCrew: (pipelineId: string) => invoke<string>("export_crew", { pipelineId }),
+  /** Native save dialog, then the file. Resolves to the path, or null if cancelled. */
+  saveCrewFile: (pipelineId: string) => invoke<string | null>("save_crew_file", { pipelineId }),
+  readCrewFile: (path: string) => invoke<string>("read_crew_file", { path }),
+  /** What an import would save. Writes nothing. `modelSwaps`: [from, to] pairs. */
+  previewCrew: (text: string, modelSwaps?: [string, string][]) =>
+    invoke<CrewPreview>("preview_crew", { text, modelSwaps: modelSwaps ?? null }),
+  /** Save a reviewed crew as a new custom pipeline; never starts a run. Returns its id. */
+  importCrew: (text: string, modelSwaps?: [string, string][]) =>
+    invoke<string>("import_crew", { text, modelSwaps: modelSwaps ?? null }),
+  /** Crews committed under `<worktree>/.octopush/crews/`, re-read on every call. */
+  listRepoCrews: (workspacePath: string) => invoke<RepoCrew[]>("list_repo_crews", { workspacePath }),
+  /** One repo crew's text (never through a symlink), for Fork. */
+  readRepoCrew: (workspacePath: string, file: string) => invoke<string>("read_repo_crew", { workspacePath, file }),
+
   // ─── Routines (scheduled crews — Pro) ─────────────────────────────
   listRoutines: () => invoke<Routine[]>("list_routines"),
   createRoutine: (input: RoutineInput) => invoke<string>("create_routine", { input }),
@@ -1283,17 +1699,23 @@ export const ipc = {
 
   resolveCheckpoint: (
     runId: string,
+    /** The stage the director decided on. Required: a run can hold several
+     *  (a plan limit beside a gate), and the director decides on the one
+     *  they looked at, never "the first". A named stage that is no longer
+     *  waiting (decided elsewhere) is refused with "This stage was already
+     *  decided — refresh to see what's waiting.", never redirected to
+     *  another stage (Abort always goes through). */
+    stageId: string,
     action: CheckpointActionName,
-    feedback?: string,
-    modelOverride?: string,
-    maxTurnsOverride?: number,
+    opts: CheckpointOptions = {},
   ) =>
     invoke<void>("resolve_checkpoint", {
       runId,
       action,
-      feedback: feedback ?? null,
-      modelOverride: modelOverride ?? null,
-      maxTurnsOverride: maxTurnsOverride ?? null,
+      feedback: opts.feedback ?? null,
+      modelOverride: opts.modelOverride ?? null,
+      maxTurnsOverride: opts.maxTurnsOverride ?? null,
+      stageId,
     }),
 
   /** Answer a stage that parked itself via the `ask_director` escape valve.
@@ -1307,6 +1729,12 @@ export const ipc = {
 
   abortRun: (runId: string) =>
     invoke<void>("abort_run", { runId }),
+
+  /** Turn off a plan-parked run's automatic resume: it waits for a manual
+   *  Resume. ("Resume now" is `resolveCheckpoint(runId, stageId, "resume")`
+   *  on the plan-limited stage.) */
+  cancelPlanResume: (runId: string) =>
+    invoke<void>("cancel_plan_resume", { runId }),
 
   /** Stop the run's in-flight stage (real cancellation). The stage lands in
    *  the normal failed/decision-strip recovery flow; the run itself survives. */
@@ -1366,6 +1794,9 @@ export const ipc = {
   // ─── Cross-machine run history (Pro-real Part B / B1) ──────────
   /** The user's cloud-sync opt-ins (both off by default). Local read. */
   getSyncPrefs: () => invoke<SyncPrefs>("get_sync_prefs"),
+  /** The last push attempt per sync kind, for the line under each toggle.
+   *  Local read. */
+  getSyncStatus: () => invoke<SyncStatus>("get_sync_status"),
   /** Turn one cloud sync on/off; returns the new pair. Turning on is Pro-gated
    *  (throws `UpgradeRequired` for Free). Off never deletes server data. */
   setSyncPref: (kind: SyncKind, enabled: boolean) =>
@@ -1379,6 +1810,9 @@ export const ipc = {
    *  demand (B2). Null when the server has no detail for that run. Pro-gated. */
   historyRunDetail: (runId: string) =>
     invoke<SyncedRunDetail | null>("history_run_detail", { runId }),
+  /** The models among `models` this Mac has no price for (deduplicated). The
+   *  History sheet marks their synced stages "unpriced" instead of "$0.00". */
+  unpricedModels: (models: string[]) => invoke<string[]>("unpriced_models", { models }),
 
   // ─── Library sync (Pro): custom pipelines + roles follow the user ──
   /** Push the whole custom library (launch heal; idempotent LWW upserts). */
@@ -1440,14 +1874,36 @@ export const ipc = {
   /** Installed Claude Code CLI version vs the tested floor (cached per app session). */
   claudeCliVersion: () =>
     invoke<ClaudeCliVersion>("claude_cli_version"),
-  /** Settings › General readiness card: local checks, each bounded at 3 s, never cached. */
-  readinessCheck: () =>
-    invoke<ReadinessCheck[]>("readiness_check"),
+  /** Direct launcher: the one model among `models` the installed Claude Code
+   *  is too old to launch (`agent_adapter::CLAUDE_MODEL_FLOORS`), read from the
+   *  cached version without probing; null when none or the version is unknown. */
+  claudeModelFloorNote: (models: string[]) =>
+    invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
+  /** Direct launcher: the line naming a Claude Code release to skip
+   *  (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) when one of `models` is a
+   *  gateway model, read from the cached version without probing; null otherwise. */
+  claudeKnownBadNote: (models: string[]) =>
+    invoke<string | null>("claude_known_bad_note", { models }),
+  /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
+  codexTrustNote: (workspacePath: string) =>
+    invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
+  /** The hooks and MCP servers the repo's own Claude Code config runs, or null. Read-only. */
+  repoHooksNotice: (workspacePath: string) =>
+    invoke<RepoHooksNotice | null>("repo_hooks_notice", { workspacePath }),
+  /** The models among `models` with a published retirement date
+   *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
+  modelRetirements: (models: string[]) =>
+    invoke<ModelRetirement[]>("model_retirements", { models }),
+  /** Settings › General readiness card: local checks, each bounded at 3 s, never cached.
+   *  `askClaude` (an explicit Check again) also runs `claude auth status`. */
+  readinessCheck: (askClaude = false) =>
+    invoke<ReadinessCheck[]>("readiness_check", { askClaude }),
 };
 
 /** One row of the readiness card (mirrors Rust `readiness::ReadinessCheck`). */
 export interface ReadinessCheck {
-  id: "claude" | "auth" | "git" | "gh" | "disk" | "ollama";
+  /** `models` is built in the frontend (`modelRetirement.readinessRetirementCheck`), not by the backend. */
+  id: "claude" | "auth" | "codex" | "git" | "gh" | "disk" | "ollama" | "models";
   label: string;
   status: "ok" | "warn" | "fail";
   /** The live value: a version, "Token found", "No answer in 3 s"… */
@@ -1456,6 +1912,20 @@ export interface ReadinessCheck {
   /** A copyable command that fixes it, when there is one. */
   command: string | null;
   timedOut: boolean;
+  /** Recommendations that are no verdict: the Claude Code row's missing
+   *  `agent_adapter::CLAUDE_RECOMMENDED_FIXES` rows, oldest first; the card
+   *  decides by audience which show. */
+  recommended?: RecommendedFix[];
+}
+
+/** A Claude Code fix worth updating for (mirrors Rust `agent_adapter::RecommendedFix`).
+ *  `run`: shown while a Run-mode session runs Claude Code; `any`: shown to
+ *  anyone on an older Claude Code. */
+export interface RecommendedFix {
+  version: string;
+  /** "fixes …", one line. */
+  reason: string;
+  audience: "run" | "any";
 }
 
 /** A DIRECT-mode role definition (mirrors Rust `RoleDef`). */
@@ -1523,6 +1993,51 @@ export interface ClaudeCliVersion {
   securityFix?: { version: string; reason: string } | null;
   /** The version to update to: the higher of the floor and `securityFix`. */
   recommended?: string;
+  /** The release to skip (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) the
+   *  known version is exactly; null for any other version or an unknown one. */
+  knownBad?: { version: string; reason: string; scope: "gatewayStages" } | null;
+}
+
+/** Codex will skip the repo's `.codex/` config: the project is marked
+ *  untrusted in Codex, or has no trust decision saved
+ *  (`commands::codex_trust_note`). */
+export interface CodexTrustNote {
+  line: string;
+  /** How the user can trust it themselves; differs between the two states. */
+  how: string;
+}
+
+/** What a worktree's committed `.claude/settings.json` (hooks, status line)
+ *  and `.mcp.json` (servers) run in a Claude Code stage
+ *  (`commands::repo_hooks_notice`). */
+export interface RepoHooksNotice {
+  hooks: { event: string; matcher: string | null; kind: "command" | "http" | "mcp_tool" | "status_line"; runs: string }[];
+  servers: { name: string; runs: string }[];
+  /** SHA-256 over the canonical JSON of every entry. */
+  hash: string;
+}
+
+/** A crew model the installed Claude Code is too old for (mirrors Rust
+ *  `agent_adapter::ClaudeModelFloorNote`). */
+export interface ClaudeModelFloorNote {
+  /** Display name, e.g. "Fable 5.2". */
+  label: string;
+  /** The oldest Claude Code that runs it. */
+  needs: string;
+  installed: string;
+}
+
+/** A crew model with a published retirement date (mirrors Rust
+ *  `token_engine::ModelRetirement`). */
+export interface ModelRetirement {
+  /** The id as the stage names it, e.g. "claude-sonnet-4-5-20250929". */
+  model: string;
+  /** Display name, e.g. "Sonnet 4.5". */
+  label: string;
+  /** `YYYY-MM-DD`; requests fail after this day. */
+  retires: string;
+  replacement: string;
+  replacementLabel: string;
 }
 
 /** Result of a one-click "Connect to Claude Code". */
@@ -1579,4 +2094,8 @@ export const RUN_EVENTS = {
   /** Live per-stage activity, streamed by both substrates. Payload:
    *  `{ runId, stageId, entry: LiveEntry }` or `{ runId, stageId, reset: true }`. */
   log: "run://log",
+  /** A Claude CLI stage's latest context reading (#895), kept on its stage
+   *  row and re-emitted by the detached bridge. Payload:
+   *  `{ runId, stageId, contextTokens: number | null, contextWindow: number | null }`. */
+  context: "run://context",
 } as const;

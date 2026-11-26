@@ -2,7 +2,7 @@
 import type { Scenario } from "./types";
 import type { AuthStatus, Entitlement } from "../../../src/lib/ipc";
 import type { AppSettings, PerfStats, SyncPrefs, TokenReport } from "../../../src/lib/types";
-import { ATELIER } from "./shared";
+import { ATELIER, BUILTIN_THEMES } from "./shared";
 
 const MB = 1024 * 1024;
 
@@ -11,10 +11,11 @@ export const empty: Scenario = {
   description: "Fresh install — no projects, signed out, free plan.",
   commands: {
     get_theme: ATELIER,
-    list_themes: [ATELIER],
+    list_themes: BUILTIN_THEMES,
     list_recent_projects: [],
     list_closed_projects: [],
     get_settings: { providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} } satisfies AppSettings,
+    unreadable_settings_path: null,
     auth_status: { signedIn: false, email: null, name: null } satisfies AuthStatus,
     auth_refresh: { signedIn: false, email: null, name: null } satisfies AuthStatus,
     detect_editors: [],

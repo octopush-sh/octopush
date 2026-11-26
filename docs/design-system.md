@@ -106,6 +106,8 @@ A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, n
 - **Spacing scale (base 4):** `4 · 8 · 12 · 16 · 24 · 32 · 48`. Default gaps: 12 / 16 / 24. Premium breath: 24 / 32.
 - **Radii:** `sm: 6px` (buttons, pills), `md: 10px` (panels, inputs), `lg: 14px` (large canvases). **No pill-shaped controls by default.**
 - **Layout minimums (Talk's terminal seat):** `--talk-chat-min: 44rem` (the conversation keeps the composer at its natural width), `--talk-seat-min: 21rem` (about 40 terminal columns), `--talk-chat-floor: 18rem` (the narrowest the conversation goes, its composer bar wrapped). Mirrored in `tokens.ts` as `talkSeat`.
+- **Shell spacing (2026-11-18):** `--shell-gutter: 8px` (`<main>`'s inset from the rail and from the Companion), `--shell-stack: 8px` (above the ContextHeader, header to mode band, mode band to canvas), `--shell-foot: 8px` (the canvas column's bottom padding). Mirrored in `tokens.ts` as `shell`. The gaps between the app's standing surfaces go through these three, never through a spacing class of their own. See section 8, "Shell spacing".
+- **Settings content column (2026-11-24, #1018):** `--settings-content: 720px`, the one max width every Settings pane renders in. Mirrored in `tokens.ts` as `settingsContent`. See section 8, "Full-screen rooms".
 - **Hairline:** 1px in `--hairline`. Brass hairline: 1px in `--brass-dim` for active borders.
 - **Brass rule: fully deleted (2026-07-11).** The 28px gradient divider (`linear-gradient(90deg, var(--brass), transparent)`), `.animate-brass-grow`, and `@keyframes brassgrow` are **removed from the codebase**, not just retired-for-new-surfaces — there is no legacy allowance left; `grep -rn "linear-gradient" src` returns only non-divider uses (a repeating-stripe running-bar texture, a scrim fade behind tool output, and `mask-image` edge-fades — none of them a rule/line). Use `--hairline` borders or spacing for visual separation; use the solid `--brass-line` token where an *active* connector is needed (see §6, §8).
 
@@ -143,19 +145,58 @@ A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, n
 </p>
 ```
 
-### Tool call card
+### Talk turns: the ask, the work, the answer (2026-11-24)
+
+A long Talk thread reads in three registers, so whose turn is whose shows at a glance:
+
+| Register | Treatment | Brass |
+|---|---|---|
+| **The ask** (the director's turn) | `panel` inset, hairline border, 6px radius; header = eyebrow, hover/focus actions, time | the `— You` eyebrow, nothing else |
+| **The work** (narration + tool calls) | one hairline on the left; narration lines and one ledger row per call hang from it; a round of more than five calls folds into one summary row | none |
+| **The answer** | flush on the canvas; mute eyebrow, serif key phrase, sage body, mute usage footer | inline code only, as in any prose |
+
+The ask is the one filled surface in the thread that isn't code. Brass goes to the director's eyebrow because the human directs (VISION §3.1); the model's eyebrow is meta, so it is mute.
+
 ```tsx
-<div className="border-l border-octo-brass-dim bg-octo-brass-ghost
-                rounded-r-md px-3 py-2 flex items-center gap-3">
-  <span className="flex items-center gap-1.5 font-mono text-[9px] tracking-[0.2em] uppercase text-octo-brass">
-    <Eye size={12} strokeWidth={1.75} title="Read" /> READ
-  </span>
-  <span className="font-mono text-[11px] text-octo-sage ml-auto">
-    auth/middleware.ts
-  </span>
+{/* The ask — ChatMessage, user branch */}
+<article data-role="user" aria-label="You, 14:02"
+         className="rounded-md border border-octo-hairline bg-octo-panel px-4 pb-3 pt-2">
+  <div className="mb-1 flex h-6 items-center gap-2">
+    <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">— You</span>
+    <div className="ml-auto flex items-center">{/* RowActions, opacity-0 until hover/focus */}</div>
+    {/* turnTime / turnTimeFull: English and 24-hour, never the system locale */}
+    <time dateTime={iso} title={turnTimeFull(iso)}
+          className="octo-tabular font-mono text-[9px] tracking-[0.15em] text-octo-mute">14:02</time>
+  </div>
+  <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">{text}</div>
+</article>
+
+{/* The thread is <section aria-label="Conversation">; each turn is an <article>.
+    An answer's actions sit last inside its own article. */}
+{/* The work — chat/WorkBlock.tsx */}
+<article aria-label="Work, 3 tool calls" className="flex flex-col gap-0.5 border-l border-octo-hairline pl-3">
+  <div className="py-1 text-[12.5px] leading-[1.55] text-octo-sage">Let me find where …</div>
+  <div role="group" aria-label="3 tool calls">
+    {/* one ToolCallCard ledger row per call */}
+  </div>
+</article>
+```
+
+### Tool call (a ledger row)
+A resolved call is a row, never a card: no border, no fill, 24px high, on the work block's hairline. The chevron is always the last column, so a round's chevrons line up.
+```tsx
+<div className="octo-ledger flex h-6 items-center gap-1 rounded px-1.5 -ml-1.5">
+  <div role="button" aria-expanded={open} aria-label="READ auth/middleware.ts"
+       className="octo-ledger-head flex min-w-0 flex-1 items-center gap-2.5">
+    <Eye size={12} strokeWidth={1.75} className="text-octo-mute" />            {/* iconForTool, with a title */}
+    <span className="min-w-12 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">READ</span>
+    <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">auth/middleware.ts</span>
+  </div>
+  <span className="octo-ledger-actions">{/* 12px icons with a title, shown on row hover/focus */}</span>
+  <ChevronRight size={11} aria-hidden className="text-octo-mute" />
 </div>
 ```
-The `§` prefix is retired — the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
+`ToolCallCard` writes this with inline styles (it renders beside react-markdown, where Tailwind's cascade leaked once), and they hold tokens only: `var(--color-octo-*)` and `var(--font-mono)` / `var(--font-sans)`, never a literal. The whole-row hover wash, the actions' reveal and the inset focus rings live in `styles.css` (`.octo-ledger`, `.octo-ledger-head`, `.octo-ledger-actions`, `.octo-ledger-action`). The row's actions (Send to terminal, Open in editor, Reveal in Finder) are titled icons that keep their room while hidden, so nothing moves; they turn brass on hover. A **running** call (`LiveToolCard`) is the same row with a 6px verdigris status dot sitting on the hairline, pulsing on `.octo-stage-pulse` + `.octo-stage-pulse-running` (static halo under reduced motion; running work is never brass), placed exactly where its resolved row will land, so it settles in place. A round of more than five calls folds into one summary row once its turn has ended, never while it streams, and always as one tree (the rows stay under the same `Reveal`). The `§` prefix is retired: the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same icon recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
 
 ### Input with serif placeholder
 ```tsx
@@ -284,9 +325,9 @@ The one way to point at a piece of the real UI (What's new → **Show me**, and 
 | Roman numerals | **RETIRED (app-wide, 2026-07-11)** | Was: multi-step wizards (`I · II`), Direct run-track stage numbers, Mission Control's micro-track. All wizards (`NewProjectFlow`, `WorkspaceCreator`, `AddProviderDialog`) now render plain arabic (`STEP 1 OF 2`, `1 · 2`); run-track/Mission-Control position numbers are arabic in the mono meta line (`3 · sonnet · api`); the miniature run shape is `StageDots` (below), not numerals at all. |
 | `⟶`           | **RETIRED as ornament and as the Direct connector/Mission-Control micro-track glyph.** Sanctioned structural survivors (exactly three, nowhere else): Composer's send-button glyph, `InlineTicketPicker`'s input prompt, `HunkRail`'s focus marker. | Do not add anywhere else. Flow between stages is now drawn as a **solid 1px line** (`--brass-line` traversed / `--hairline` pending) — see §6, §8. |
 | Gradient lines | **BANNED — solid ink only.** Any `linear-gradient` used *as a rule, divider, or connector* is forbidden, full stop (not just "retired for new surfaces"). `.animate-brass-grow`/`@keyframes brassgrow` are deleted; the completion sweep (`.octo-sweep`) is a solid brass line, not a gradient streak. Radial/mask washes (`OverlayRoom`, `WelcomeScreen` background, `WorkContextPanel` edge-fades) are surfaces, not lines — untouched. | n/a |
-| `StageDots` + the single beacon | **Active — the new signature mechanics.** `StageDots` (`src/components/direct/StageDots.tsx`) is the universal micro-track (5px dots, one per stage) replacing every bespoke shape line and the roman-numeral track. Exactly one brass-pulsing element per attention scope at a time (`lib/beacon.ts`'s `beaconAnchor`; fleet scope = the longest-waiting needs-you card, FIFO by `statusSince`) — see §6. | Launcher tickets, Companion, Mission Control. |
+| `StageDots` + the single beacon | **Active — the new signature mechanics.** `StageDots` (`src/components/direct/StageDots.tsx`) is the universal micro-track (5px dots, one per stage) replacing every bespoke shape line and the roman-numeral track. Dot colours: done verdigris, running verdigris + faint `--verdigris-strong` halo, awaiting gate brass, failed rouge, stalled amber, pending hairline — a running stage is never brass, so five busy crews put no brass on screen. `tone="shape"` (launcher tickets) paints every dot sage; `tone="pager"` (What's new modal page indicator, statuses `seen` / `current` / `upcoming`) paints seen pages verdigris, the current page brass (the active mark) and upcoming pages hairline — never pass a run status to mark a page. Exactly one pulsing element per attention scope at a time (brass for needs-you anchors, amber on an amber halt's Resume, verdigris while a stage runs) (`lib/beacon.ts`'s `beaconAnchor`; fleet scope = the longest-waiting needs-you card, FIFO by `statusSince`) — see §6. | Launcher tickets, Companion, Mission Control, run history, Talk crew cards, What's new pager. |
 | Italic phrases| Active — **upright only** | CTAs and placeholders use upright serif phrases (italics banned app-wide; see §9) |
-| `⟳` in **amber** (`--color-octo-warning`) | Active | Direct mode transient halt — awaits **Resume**. Amber = caution, never brass. |
+| `⟳` in **amber** (`--color-octo-warning`) | Active | Direct mode transient halt — awaits **Resume**. Amber = caution, never brass — its Resume pulses amber when it holds the beacon (`.octo-stage-pulse-warning`, §6). |
 | Substrate pills | Active | Direct mode only — `API` in `--color-octo-state-blue`, `CLI` in `--color-octo-state-purple` |
 | `✦` flourish  | **RETIRED** | Never use. Not in any existing surface; do not introduce. |
 | `◈`           | **RETIRED (2026-08-21)** | Was: the ContextHeader's active-ticket marker. Dropped with the eyebrow-and-name redesign — the type-tinted ticket key already marks the ticket, so the diamond was a second badge for one fact. `grep -rn "◈" src` should only match tests asserting its absence. |
@@ -363,7 +404,7 @@ in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
 | `.octo-rise-in` | list rows appearing | fade+rise 4px · --dur-standard |
 | `<FadeSwap swapKey>` | mutually exclusive view swaps (canvas states, pane modes) | exit fade 120ms → `.octo-fade-in` (`src/components/primitives/FadeSwap.tsx`) |
 | `<Reveal open>` | expanding/collapsing regions (decision strips, sub-panels) | grid-rows 0fr↔1fr · --dur-standard (`src/components/primitives/Reveal.tsx`) |
-| `<MidTruncate text tail lead?>` | identifiers whose head AND tail disambiguate (branch names, paths) | CSS `.octo-midtrunc` — head ellipsizes, tail pinned; optional `lead` glyph inside the box (`src/components/primitives/MidTruncate.tsx`) |
+| `<MidTruncate text tail lead?>` | identifiers whose head AND tail disambiguate (branch names, paths) | CSS `.octo-midtrunc` — head ellipsizes, tail pinned, `…` seated flush by one shared observer; optional `lead` glyph inside the box (`src/components/primitives/MidTruncate.tsx`) |
 | `.octo-demote*` / `.octo-status-*` | the demotion ladder — shedding meta as a band narrows | `@container` + animated `max-width`/`opacity` |
 | `.octo-prov-pop` | hover/focus disclosure anchored to a chip (branch provenance) | fade+scale, kept mounted, `:focus-within` |
 | `.octo-tabular` | every live numeric value (cost, %, mm:ss, counters) | `font-variant-numeric: tabular-nums` |
@@ -373,12 +414,12 @@ in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
 
 Two mechanics for any band that mixes elastic text with atoms that must stay whole. Reach for them before inventing a one-off.
 
-**E1 — Middle truncation for identifiers.** `truncate` keeps the head and throws away exactly the part that tells two similar strings apart: `…-per-shard-copy` and `…-per-shard-guard` both render as `intermittent-component-not-…`. `<MidTruncate>` keeps both ends and elides the middle instead. It is pure CSS (`.octo-midtrunc`) — the head ellipsizes into whatever room is left and the tail is pinned — so the elision point tracks the container with no measurement and no resize listener, and the full string stays in the DOM (selectable, copyable). **Always pair it with a `title`.** Use it for branch names, file paths, run ids; NOT for prose, where the head is the meaning and plain `truncate` is right.
+**E1 — Middle truncation for identifiers.** `truncate` keeps the head and throws away exactly the part that tells two similar strings apart: `…-per-shard-copy` and `…-per-shard-guard` both render as `intermittent-component-not-…`. `<MidTruncate>` keeps both ends and elides the middle instead. CSS does the layout (`.octo-midtrunc`, `white-space: nowrap`) — the head ellipsizes into whatever room is left and the tail is pinned — and one measured pass then seats the `…` flush against the tail (`seatEllipsis`, #750): once the head overflows it is cut at the last grapheme boundary that fits beside the `…` (trailing whitespace dropped; when the whole head fits there is no cut and no `…`), and the head's `max-width` becomes those glyphs plus the `…`'s measured width (+0.5px against layout rounding), so the head's **own** `text-overflow: ellipsis` lands right after the last kept glyph and the box ends with it. The head is never held at `clip` once cut (#864): a clipped head beside a separately drawn `…` is, to WebKit and the visual audit's `text-cut` check, text cut with no ellipsis. Nor is it held there after a pass that fails (#865): a box whose measurement throws keeps the plain CSS ellipsis, and every other box in the shared pass is still released and cut. The `…` is measured on a ruler, `<span class="octo-midtrunc-ell" aria-hidden="true">…</span>`, laid out in the box's font but zero-width, invisible and unselectable — never shown. The read holds the head at `text-overflow: clip` for that frame only (#833): WebKit clips Range rects at its own ellipsis point, so measuring under `ellipsis` would cap the search at the engine's cut, trailing space included. The hold is the head's **own inline style**, set and cleared in the same pass, never a stylesheet rule keyed on the box (#872): with `.octo-midtrunc[data-measuring] .octo-midtrunc-head`, releasing the hold restyled the head only once the box's attribute change reached it, and Safari left the Review file header's `src-tauri` head cut with no ellipsis. `data-measuring` on the box only marks the pass; no rule in `styles.css` clips the head. The accessible name and a copy stay the full string, which never leaves the DOM. The pass re-runs when the **nearest ancestor with a definite width** resizes (`widthAnchor` skips any parent sized by its own content, which shrinks with the cut and would never grow back), through **one** shared `ResizeObserver` and one animation frame for every instance — reset all, read all, write all — and a resize under 1px from the width of the last re-cut doesn't re-cut (sub-pixel steps still add up). Right-to-left text keeps the plain CSS ellipsis. A line break, tab, form feed, vertical tab or Unicode line/paragraph separator (U+2028/U+2029) in the string renders as a space (the caller's `title` keeps the original); the `lead` is tracked by presence, not identity, so an inline `lead={<GitBranch/>}` doesn't re-cut on every render; a space at the head/tail seam starts the tail, which alone is `white-space: pre`, since `nowrap` would collapse it at the head's edge — it stays a plain space, so a copy and the accessible name are the string exactly. **Always pair it with a `title`.** Use it for branch names, file paths, run ids; NOT for prose, where the head is the meaning and plain `truncate` is right.
 
 Two traps, both paid for once already:
 
 - **A bare string inside a flex box is an anonymous flex item, and it wraps.** The short-name path renders through `.octo-midtrunc-whole` — a plain block with `white-space: nowrap` and a real `text-overflow: ellipsis` — never the flex box the split path uses. When the short path shared `.octo-midtrunc`, `check-in` broke at its hyphen into two lines inside a 14px row, and `main`, having no break opportunity at all, was hard-cut to `mai`.
-- **Give the box a definite width, never a percentage `max-width`.** Inside a shrink-to-fit chain a percentage is a cyclic reference, and it resolved *below the text's own width* with 1200px of room to spare. Sizing the box from its own text is no better: WebKit then hard-cuts it with no ellipsis (the ContextHeader branch lost its tail with 130px of the band still empty, #400). The shape that works, proven in the rail and now in the ContextHeader: every wrapper between the band and the `.octo-midtrunc` box is `flex-1 min-w-0`, so the box elides into the room the band leaves. When those grown wrappers are interactive, make them `pointer-events-none` with no wash or ring of their own and put the wash, hover colour and focus ring (`group-focus-visible:ring-1`) on the MidTruncate box, which opts back in with `pointer-events-auto` — blank space then does nothing and the wash stays the size of the text. A glyph that belongs to the chip goes in through `lead`, so it sits inside that box. Atoms that used to follow the chip (the base branch) move to the band's right end, outside the grown box. `ContextHeader.test.tsx` fails if a percentage `max-width` comes back anywhere in the chain.
+- **Give the box a definite width, never a percentage `max-width`.** Inside a shrink-to-fit chain a percentage is a cyclic reference, and it resolved *below the text's own width* with 1200px of room to spare. Sizing the box from its own text is no better: WebKit then hard-cuts it with no ellipsis (the ContextHeader branch lost its tail with 130px of the band still empty, #400). The shape that works, proven in the rail and now in the ContextHeader: every wrapper between the band and the `.octo-midtrunc` box is `flex-1 min-w-0`, so the box elides into the room the band leaves. The wrapper that directly holds the box must itself be a **flex** container (`flex min-w-0 flex-1`), not a block: inside a block the inline-flex box is sized from its own unbreakable text, spills past its column and is hard-cut by whatever sits beside it (Settings → Project links ran under the key input, #757). When those grown wrappers are interactive, make them `pointer-events-none` with no wash or ring of their own and put the wash, hover colour and focus ring (`group-focus-visible:ring-1`) on the MidTruncate box, which opts back in with `pointer-events-auto` — blank space then does nothing and the wash stays the size of the text. A glyph that belongs to the chip goes in through `lead`, so it sits inside that box. Atoms that used to follow the chip (the base branch) move to the band's right end, outside the grown box. `ContextHeader.test.tsx` fails if a percentage `max-width` comes back anywhere in the chain.
 
 **E2 — Truncation is not enough; shed on a stated ladder.** Below a certain width the *fixed* atoms stop fitting and start overlapping — no amount of truncating the elastic ones saves the row. So declare an order in which meta is shed, and animate each step's width instead of unmounting it (§6: nothing appears or disappears abruptly). The ContextHeader's ladder, and the shape to copy:
 
@@ -402,6 +443,18 @@ The dot-for-label swap at the last rung is §9's "a state shown by a dot does no
 
 **Shedding by measured width (2026-11-03; born in the Review status tail).** A fixed container breakpoint only works when the rungs have fixed widths. The Review tail's rungs hold counts ("changed", then "· +2 −1"; floor "2 files"), so `ReviewTail.tsx` measures each rung's natural width against the track's and sheds through `.octo-demote-shed` (`rungsToShed`). The motion is the same. This only works when the measured box is sized by its parent (a grid track) and never by the content it sheds, so shedding can't feed back into the measurement.
 
+**The mode band's ladder (2026-11-18; born with Run's session line).** The band (`.octo-modeband`, `ModeBand.tsx`) is its own `@container`. Its switcher is centred and its tail sits in the right track, so on a narrow canvas the two want the same pixels, and what gives way is declared:
+
+| Rung | Sheds | Where it survives |
+|------|-------|-------------------|
+| ≤ 720px, in every mode | the **inactive** modes' labels → their icon | each segment's `title` (`Review (⌘⇧3)`) and accessible name |
+| ≤ 334px | a control tail's floor: its track keeps only the last rung (`tailLastMin`; Run: the session line's `⌘⌥K` list button alone, `LINE_LAST_PX`), and the control sheds down to it, so nothing is clipped | the list button: `⌘⌥K` switches, opens and closes sessions |
+| floor | *nothing more* — the switcher, and the **active** mode's label: the band never stops naming where you are | — |
+
+A redundant word goes before a session's cell does: the labels buy Run's session line about 73px, six cells instead of a fold. The rung is the same in every mode on purpose. If Talk, Review and Direct kept their labels longer than Run, the switcher would change width as the mode changed, and the segment under the pointer would become another mode mid-click. The label is a rung inside a button (`.octo-demote-mode-label`): no gap or focus-ring room of its own, a negative margin that eats the button's icon gap, and a `max-width` cap near its own width (`calc(7 * (1ch + 0.2em))`, not the generic 40ch), because a collapse tweens from the cap and a far one makes it lag. The switcher's indicator re-measures as the segments resize.
+
+The right track also has a **floor of its own** when the tail is a control: `ModeBand`'s `tailMin` (the session line's `LINE_FLOOR_PX`, 119px: the fold button, the focused session's cell, `+`, the hairline and the layout button). The grid is `minmax(0,1fr) auto minmax(tailMin,1fr)`, so when room runs short the empty left track gives up its share first and the switcher slides off centre rather than the control losing a button. At 334px and under the floor gives way to `tailLastMin` (`--modeband-tail-last`): reserving 119px for a line that can't show would only push the switcher. The container (`.octo-modeband`) wraps the grid (`.octo-modeband-grid`) for this, since a container query styles only what is inside the container. A read-out tail (Talk, Review, Direct) has no floor and truncates in its track as before, with more room than it had.
+
 ### Stability doctrine (binding for live surfaces; born in Direct)
 
 - **S1 — Fixed-slot live text.** Text that changes while something runs lives in a fixed-height truncating slot that exists in every state — content changes never resize the container.
@@ -415,16 +468,18 @@ Collapsible regions use the **grid-rows `0fr↔1fr`** idiom (see `WorkContextPan
 
 ### The single beacon (Direct beauty redesign, binding for live surfaces)
 
-At any moment there is **exactly one** brass-accented *live* element per attention scope — never two pulses at once. `src/lib/beacon.ts`'s `beaconAnchor()` is the pure priority selector (decision strip CTA → running stage card → ready launcher CTA → calm/`null`); components only ask "am I the anchor?" via the id it returns. Fleet scope (Mission Control / the `RunsTray` chip) has its own rule: only the **longest-waiting** needs-you card pulses (FIFO by `statusSince`), and the top-bar chip pulses only when at least one run needs the director.
+At any moment there is **exactly one** pulsing *live* element per attention scope — never two pulses at once. Its colour says why it holds the beacon: **brass** for a needs-you anchor (a decision strip CTA — gate, halt, draft launch — or the ready launcher CTA), **amber** when that CTA is an amber halt's Resume (a transient fault or a Claude plan limit), **verdigris** while the anchor is a running stage. `src/lib/beacon.ts`'s `beaconAnchor()` is the pure priority selector (decision strip CTA → running stage card → ready launcher CTA → calm/`null`); components only ask "am I the anchor?" via the id it returns. Fleet scope (Mission Control / the `RunsTray` chip) has its own rule: only the **longest-waiting** needs-you card pulses (FIFO by `statusSince`), and the top-bar chip pulses only when at least one run needs the director.
 
-- The pulse itself is `.octo-stage-pulse` — a 2.4s looping `box-shadow` keyframe (`0%,100% → 0 0 0 0 transparent`, `50% → 0 0 0 3px var(--brass-ghost)`), never `infinite`-scaling or springy.
+- The pulse itself is `.octo-stage-pulse` — a 2.4s looping `box-shadow` keyframe (`0%,100% → 0 0 0 0 transparent`, `50% → 0 0 0 3px var(--pulse-ink, var(--brass-ghost))`), never `infinite`-scaling or springy. Two custom properties carry its colour: `--pulse-ink` (the animated ring, brass-ghost by default) and `--pulse-halo` (the reduced-motion halo, brass-dim by default).
+- **A running stage is never brass, even as the beacon.** When the anchor is a running run-track card, `RunFlow` adds `.octo-stage-pulse-running`, which swaps the pulse ink to `--verdigris-ghost` and the reduced-motion halo to `--verdigris-strong`. Without it the PRM halo drew a 1px brass ring on top of the verdigris border, and a working card read exactly like an awaiting-gate one (#749). Brass pulses stay with *needs-you* anchors (gates, halts, ready CTAs).
+- **An amber halt is never brass, even as the beacon.** The amber "Resume the stage" of a transient halt (`⟳ awaiting retry`) and of a Claude plan-limit wait carries `.octo-stage-pulse-warning` beside the pulse (`RunControlBar`'s `AMBER_BEACON`), which swaps the ink to `--warning-ghost` and the reduced-motion halo to `--warning-border`, so the pulse matches the button's amber border (#818).
 - The workspace rail's beacon is its own older primitive, `.animate-attention-pulse` (a 1.4s ring on the monogram), governed by the same law: `resolveAttention()` in `WorkspaceRail.tsx` lets exactly one row pulse and dots the rest.
-- **Under `prefers-reduced-motion`:** the pulse animation is disabled and replaced with a **static halo** — a permanent `0 0 0 1px var(--brass-dim)` box-shadow — so the anchor is still legible without motion.
+- **Under `prefers-reduced-motion`:** the pulse animation is disabled and replaced with a **static halo** — a permanent `0 0 0 1px var(--pulse-halo, var(--brass-dim))` box-shadow — so the anchor is still legible without motion. The halo follows `--pulse-halo`: brass-dim for a needs-you anchor, `--warning-border` on an amber halt (`.octo-stage-pulse-warning`), `--verdigris-strong` on a running stage (`.octo-stage-pulse-running`).
 - PRM handling lives at the CSS layer (the class's own `@media (prefers-reduced-motion: reduce)` block), not in `beacon.ts` — the selector is presentation-agnostic; only the visual expression of "this is the anchor" changes under PRM.
 
 ### Entrance keyframes are from-only — do not add a `to{}` block
 
-`octo-enter-fade` / `octo-enter-pop` / `octo-enter-rise` (backing `.octo-fade-in` / `.octo-pop-in` / `.octo-rise-in` / `.octo-overlay-enter` / `.octo-modal-enter` / `.octo-menu-enter`) declare **only a `from{}` block** — no `to{}`. This is a fixed bug, not a stylistic choice: a `to{}` block combined with `animation-fill-mode: both` pins the element's opacity/transform at the animation's end state *forever*, silently overriding whatever utility opacity the element should settle into (e.g. an essence card's `opacity-[0.38]` or a settled row's `opacity-45`) — the depth-of-field dimming never actually rendered while the bug was in place. From-only keyframes animate *to the element's own underlying computed style* and then hand control back to it, so `0 → 0.38` (or whatever the resting opacity is) applies correctly and hover/focus opacity bumps keep working. `animation-fill-mode: both` still back-fills the `from` state during a stagger `animation-delay`, so there's no flash-of-unstyled-content. The one exception is `.octo-rise-in`, which fills `backwards` only: its forward fill is a visual no-op, but an animation still in effect on `transform` makes the row the containing block for its `fixed` descendants (the Run session rail's flyout landed under the terminal because of it), and `backwards` keeps the stagger back-fill.
+`octo-enter-fade` / `octo-enter-pop` / `octo-enter-rise` (backing `.octo-fade-in` / `.octo-pop-in` / `.octo-rise-in` / `.octo-overlay-enter` / `.octo-modal-enter` / `.octo-menu-enter`) declare **only a `from{}` block** — no `to{}`. This is a fixed bug, not a stylistic choice: a `to{}` block combined with `animation-fill-mode: both` pins the element's opacity/transform at the animation's end state *forever*, silently overriding whatever utility opacity the element should settle into (e.g. an essence card's `opacity-[0.38]` or a settled row's `opacity-45`) — the depth-of-field dimming never actually rendered while the bug was in place. From-only keyframes animate *to the element's own underlying computed style* and then hand control back to it, so `0 → 0.38` (or whatever the resting opacity is) applies correctly and hover/focus opacity bumps keep working. `animation-fill-mode: both` still back-fills the `from` state during a stagger `animation-delay`, so there's no flash-of-unstyled-content. The one exception is `.octo-rise-in`, which fills `backwards` only: its forward fill is a visual no-op, but an animation still in effect on `transform` makes the row the containing block for its `fixed` descendants (the flyout of Run's former session rail landed under the terminal because of it), and `backwards` keeps the stagger back-fill.
 
 **Exception:** genuine one-shot animations with a defined terminal state — `octo-exit-fade` (fades **to** 0, an exit), `octo-sweep` (width **to** 100%, a ceremony), `octo-flash` (a flash-and-settle) — legitimately keep both `from{}` and `to{}`. The from-only rule applies specifically to *entrance* keyframes that hand off into a resting, possibly-dimmed state.
 
@@ -480,31 +535,53 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 
 | Surface       | Width | Notes |
 |---------------|-------|-------|
-| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it borrows the Run session rail's geometry. See "Workspace rail — the index" below. |
-| ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. |
-| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track. |
-| ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
-| Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
-| Companion     | 280px | Per-mode panels: Context+History · the active session's detail · Changed+commit · Runs+Jira. |
+| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it is the slim rail (44px, 32px cells). See "Workspace rail — the index" below. Groups (project sections and mission folders) are in the rail: see "Rail groups" below. |
+| ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. Pads 12px inline and 6px block; `--shell-stack` above and below it. |
+| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; `--shell-stack` below it. In Run that track holds a control, the **session line** (see "Run mode — session navigation"), and keeps a floor for it. The band is its own `@container` and ladder: narrow, the switcher's inactive modes shed their labels (see "The mode band's ladder" under the elision doctrine). |
+| ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most; only a narrow band sheds them, and only on the inactive modes, which keep icon, tooltip and name. |
+| Canvas        | flex  | Active mode content (chat / terminal panes, each under its caption / diff / pipeline track+focus pane). Ends `--shell-foot` above the status bar. |
+| Companion     | 280px | Per-mode panels, under one grammar (see "Companion grammar" below): Context+History · Context · Changes · Mission · Changed+commit · Runs+Jira. |
 | Input bar     | flex  | Serif placeholder, ⌘K kbd hint. |
 
 **Mode canvases at a glance:**
 - **Talk** — chat timeline. Companion: Context + History.
-- **Run** — session rail (44px, canvas-left) + terminal. Companion: the active session's detail.
-- **Review** — unified diff. Companion: Changed + commit.
-- **Direct** — horizontal assembly-line track + focus pane. Companion: Runs + Jira. The 4th mode is per-workspace and optional; the trinity is always present.
+- **Run** — terminal panes, each under its caption; the band's right track is the session line. Companion: context · changes · mission.
+- **Review** — unified diff. Companion: how the change was built + branch & publish.
+- **Direct** — horizontal assembly-line track + focus pane. Companion: runs + logbook. The 4th mode is per-workspace and optional; the trinity is always present.
 
 Don't add chrome outside these surfaces. If a feature needs something new, propose extending the grammar in the spec — don't add it ad-hoc.
+
+### Shell spacing (2026-11-18)
+
+The air between the standing surfaces is three tokens (section 3), all 8px, on the 4px scale. Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`, Part 5.
+
+| Gap | Token | Where it is applied |
+|-----|-------|---------------------|
+| Rail to `<main>`, `<main>` to Companion | `--shell-gutter` | `<main>` in `App.tsx` (`mx-[var(--shell-gutter)]`) |
+| Above the ContextHeader, header to mode band | `--shell-stack` | `ContextHeader.tsx` (`my-[var(--shell-stack)]`) |
+| Mode band to canvas | `--shell-stack` | `ModeBand.tsx` (`mb-[var(--shell-stack)]`) |
+| Canvas foot, above the status bar | `--shell-foot` | the canvas column in `App.tsx` (`pb-[var(--shell-foot)]`) |
+
+Three rules:
+
+1. **The shell is shared.** The same gaps hold in Run, Talk, Review and Direct, and with the rail or the Companion folded. A mode never adds its own outer margin to the canvas. If one mode needs air, it pads inside its own canvas.
+2. **Change the token, not the class.** A surface that sits in the shell reads these tokens; it doesn't restate `8px` or reach for `mx-4`. `shellSpacing.test.ts` checks that the CSS and TypeScript values agree and that these four elements read the tokens.
+3. **Inner spacing is the surface's own.** The tokens govern the gaps *between* surfaces. The rail's rows, the ContextHeader's padding (12px inline, 6px block) and the Companion's sections keep their own scale values.
 
 ### Workspace rail — the index (2026-09-20)
 
 The left rail lists projects and their missions as a **typeset index**, not a
 file explorer. Spec: `docs/superpowers/specs/2026-09-20-workspace-rail-index-redesign-design.md`.
-Seven rules, each a direct consequence of §1, §6 and §9:
+Seven rules, each a direct consequence of §1, §6 and §9 (rail groups, below, add their own):
 
 1. **One surface.** No project cards, no bordered monograms, no chips. The rail
    is `panel` with one right hairline; hierarchy is carried by type (a 28px
    Spectral project line over 32px sans rows) and space (12px between projects).
+   A mission group adds one more cue of the same kind, an indent beside a 1px
+   guide (see "Rail groups" below): a line beside the rows, never a box
+   around them. A project group adds a hairline across the rail above its
+   eyebrow, and a loose project right after a group takes one to close it: a
+   line between blocks, never a card around them.
 2. **The edge speaks of state, never identity.** A reserved 2px slot at the
    row's left: brass on the active row, `.rail-bar-running` marching segments
    while the workspace works (brass on the active row, **sage** elsewhere —
@@ -512,14 +589,17 @@ Seven rules, each a direct consequence of §1, §6 and §9:
    colours the edge.
 3. **The glyph is the one carrier of the tint.** A bare 20px Spectral glyph in
    the tint accent — no border, no fill. Customisation (glyph + tint) gains
-   visibility because nothing else on the row is coloured.
+   visibility because nothing else on the row is coloured. A mission group's
+   tint sits on the group's own two marks (its chevron and its guide), beside
+   the rows and never on one: a member's glyph keeps its own tint.
 4. **Meta is unboxed mono.** Ticket in sage, `↑N`/`↓N` in mute, PR in
    verdigris, uncommitted changes as a glyph; `.octo-tabular`; every glyph with
    a `title`. Header aggregates (`N missions · dirty · PRs`) appear only while
    the project is **folded** — a count visible in the list is never repeated in
    its header.
 5. **The project line is quiet.** Hexagon mark in mute (the project's tint only
-   when the user chose one, so N projects never mean N brass hexagons), name in
+   when the user chose one, so N projects never mean N brass hexagons; in a
+   tinted project group an untinted project's hexagon takes the group's tint), name in
    Spectral 13 (ivory for the project holding the active workspace), actions
    revealed on hover/focus (new mission · grip · chevron).
 6. **One beacon.** `resolveAttention()` gives the pulse to the flagged workspace
@@ -527,31 +607,277 @@ Seven rules, each a direct consequence of §1, §6 and §9:
    latest `at`) and a static 5px brass dot to every other; the active
    workspace and a running one never signal (the marching edge owns that row).
    `.animate-attention-pulse` falls back to a static `--brass-dim` halo under
-   `prefers-reduced-motion`.
-7. **Collapsed, it is the Run session rail.** 44px, 32px cells, the same
-   reserved edge, one cluster per project headed by its mark, and a `fixed`
+   `prefers-reduced-motion`. When a fold hides the flagged workspace, the
+   signal walks up to its **nearest visible ancestor**
+   (`nearestVisibleAncestor` in `lib/beacon.ts`, `resolveAttentionCarriers`):
+   the project group's header when that group is folded (its chevron pulses),
+   else the project line when the project is folded (its mark pulses), else
+   the mission-group header (its chevron pulses). A container hiding several
+   signals shows the strongest: the pulse, otherwise one static dot. Still
+   exactly one beacon.
+7. **Collapsed, it is the slim rail.** 44px (the geometry of Review's
+   collapsed navigator), 32px cells, the same reserved edge, one cluster per
+   project headed by its mark (a project group's clusters stand together
+   between two hairlines that span the rail), and a `fixed`
    hover/focus flyout in the MenuSurface chrome (project · name · status ·
-   `⌘N`) instead of a native title.
+   `⌘N`; the eyebrow names the groups too, outermost first:
+   `project group · project · mission group`) instead of a native
+   title.
 
 The search line is the rail's only chrome: a borderless `Search` icon with an
 upright-serif placeholder whose bottom hairline turns brass on focus, and the
 one `+` icon button (Add project) beside it. Hits are washed with the
-found-match tokens (§4). Nothing else in the rail carries a border.
+found-match tokens (§4). Nothing else in the rail carries a border around
+anything: a mission group's guide is a 1px line beside its rows, and a
+project group's hairline is a 1px line between blocks.
 
-### Run mode — session navigation
+#### Rail groups (2026-11-18 · mission groups, project groups and groups everywhere else shipped)
 
-Terminal navigation lives on the canvas, never in the Companion: the Companion
-collapses, and a collapse must not remove the only way to change session. Three
-rules, reusable wherever a set of live things needs a compact switcher:
+Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`,
+Part 1. **Both are in the rail**: mission groups (`RailMissionGroup.tsx`) and
+project groups (`RailProjectSection.tsx`; in the code a project group is a
+"section", because `ProjectGroup` already names a project with its missions).
+Beyond the rail they show in ⌘K, Mission Control and the archived-workspaces
+modal, and the rail adds `⌘⌥G` **Move to group…** and a multi-selection of
+missions: see "Groups beyond the rail, as built" below.
 
-- **The icon is the identity; the number is the address.** A 32px cell (in a
-  44px rail) holds one glyph well and two badly, so it carries the session's
-  **role icon** at rest and flips to its `⌘⌥N` number while **⌥** is held
-  (`useModifierPeek` — ⌥ only, or every plain ⌘ shortcut would flash the rail
-  on its way past).
+A **group** is a named, optionally tinted, foldable run of items: one
+membership per item, no nesting, and it survives being emptied (it reads
+`empty` until the user removes it). It adds two row types, so the rail has
+four levels with **one signature each**:
+
+| Level | Signature |
+|-------|-----------|
+| Project group (a section) · *shipped* | A hairline above, then a caps eyebrow: 26px, mono 9px, tracking 0.25em, mute. Its projects are not indented. Fold chevron on hover, focus or while folded. |
+| Project | Hexagon + serif name (rule 5, unchanged). |
+| Mission group (a folder) · *shipped* | A 28px header: an always-visible chevron in the monogram column, the name in mono 11px, normal case, sage. Its members are indented 14px beside a 1px guide that stops at the last member. |
+| Mission | Glyph + sans name (rule 3, unchanged). |
+
+Each cue means one thing: a hairline with an eyebrow is always a section of
+projects; indentation with a guide is always one group of missions. Neither
+is used for anything else in the rail.
+
+**The tint rule.** A group's tint is drawn on its own two marks only: its
+chevron and its guide (the guide at 50% opacity). **Monograms are never
+recoloured**, so rule 3 stands. A project's hexagon may take its
+section's tint, and only when the project has no tint of its own. The palette
+is the seven `TINTS` of `lib/monogram.ts` plus None; no new hues, and brass
+is never a group's default. The name always carries the meaning; the tint is
+a secondary cue (WCAG 1.4.1).
+
+**The mission group, as built.** Keep these when touching it:
+
+- **Geometry.** The chevron is a 12px lucide `ChevronDown` centred in the
+  20px monogram column (so it stands exactly over the guide), in the group's
+  tint, mute when untinted; it rotates −90° when folded and is never hidden.
+  Members are the normal 32px rows with `pl-7` instead of `pl-3.5` (14px in).
+  The guide is 1px at 24px from the rail's edge, from the top of the first
+  member to 5px above the foot of the last, in the tint at 50% opacity
+  (`--color-octo-border-strong` when untinted), drawn over the rows' hover and
+  active grounds. 2px above the group and 6px below it.
+- **The edge stays outside.** Member rows keep their full width, so the brass
+  active bar and the marching edge (rule 2) remain at the rail's left edge,
+  left of the guide.
+- **Counts under rule 4.** The header shows its member count, a verdigris PR
+  glyph and the attention dot **only while folded**. `empty` (mute) is the one
+  exception: an empty group has no list to read it from. A folded header never
+  marches; state stays on rows.
+- **Folded over the active mission**, the name reads in ivory, the cue the
+  project line gives (rule 5). Open, it stays sage: the active row is in
+  sight and says it. No new colour, and never brass.
+- **One tab stop.** The header is a button with `aria-expanded`: click folds,
+  `←`/`→` fold and unfold, double-click or `F2` renames in place, `⇧F10` or
+  the context-menu key opens its menu. Its hover `+` is not a tab stop (the
+  menu carries the same action for the keyboard).
+- **Folds** use the grid-rows idiom and persist in localStorage
+  (`railGroupCollapsed`), like the project fold; a live filter unfolds
+  everything without touching the stored state.
+- **Placement.** A group stands where its first member stands; loose missions
+  never move for it (`layoutMissions` in `lib/railGroups.ts`).
+- **Collapsed (44px).** The guide stays as a 1px tinted line beside the
+  group's monograms, under a 12px tinted chevron titled with the group's name
+  that folds it; 6px of air above and below the group.
+- **Drag.** A mission dropped on a group joins it; dropped on the project's
+  loose area it leaves; a header dropped on a sibling takes its place. The
+  accepting header takes a `--brass-ghost` wash, the one new use of brass here
+  and an active state by §7.
+
+**The project group, as built.** Keep these when touching it:
+
+- **Geometry.** A 1px `--color-octo-hairline` across the rail, 6px of air,
+  then a 26px header padded like a project line (`pl-3.5 pr-2`). The name is
+  the eyebrow: mono 9px caps, tracking 0.25em, mute, sage on hover. Its
+  projects are the normal project lines at the outer alignment: no indent, no
+  guide. A group that opens the rail has no hairline above it. 10px separate
+  a loose project's last row from the hairline of a group below it.
+- **Where it ends.** A section has no closing mark of its own. The next
+  group's hairline ends it, or the hairline a **loose project takes when it
+  comes right after a group** (2px, the hairline, 10px, then its line). A
+  bare hairline therefore always reads "a group ended here"; nothing else in
+  the rail draws one.
+- **The chevron** is a 12px `ChevronDown` at the right end of the header, in
+  the group's tint (mute when untinted). It shows on hover, on focus and
+  while folded, where it rotates −90°. It is `aria-hidden` pointer
+  decoration; the eyebrow button is the one tab stop (`aria-expanded`), with
+  the mission group's keys: `←`/`→`, `F2`, `⇧F10` or the context-menu key.
+- **Tint.** On the chevron, and on the hexagon of each project that has no
+  tint of its own (`projectMarkColor`). No guide, so no tinted line. A
+  mission's monogram is never recoloured.
+- **Counts under rule 4.** `N projects` and the attention dot only while
+  folded; `empty` always. Folded over the active mission the eyebrow reads in
+  ivory, the project line's cue; never brass.
+- **Placement, and pinned projects.** `layoutProjects` never reorders
+  projects (pinned first, then the manual order). A group stands where its
+  first project stands and gathers the rest under it. **A pinned project
+  stays in its group**, leads it, and brings the group up into the pinned run;
+  pinning takes no project out of its group and moves no other group. The
+  groups' own `sortOrder` is not a law between them here (projects have a
+  manual order, missions don't): it only orders the empty groups, which stand
+  last.
+- **Drag.** The pointer says which container a dragged project is over; the
+  block's centre only picks a place inside it (a block is tall and is held by
+  a grip at its top, so its centre is far from where the user points). Over
+  another group, anywhere on it, the project **joins as that group's last
+  project**, always, and that group's header takes the `--brass-ghost` wash.
+  Over its own group it is reordered. Anywhere else it is on the ungrouped
+  top level and leaves its group: beside the nearest top-level block, or last
+  when dropped on the ungrouped area under the rail's last block, which draws
+  nothing. A group dragged by its header moves as one unit, by the sortable
+  list's own transform: **no `<DragOverlay>`** for a project or a group (it
+  would stop the dragged block following the pointer).
+- **The drop cue is on the dragged block,** where the eye is: the opaque
+  block covers the target's eyebrow, so its wash alone can go unseen. While
+  a project drag would change membership, the block's top line shows,
+  right-aligned in the eyebrow type, `Into {group}` in brass (the drop would
+  join that group: an active state) or `Out of {group}` in mute (it would
+  leave its group). Nothing for a reorder, nothing for a group dragged as a
+  whole. It sits over the line's end on the block's own ground, so the block
+  never resizes; a long name ends in an ellipsis; it crossfades with
+  `octo-fade-in` when the target changes. The cue, the target's wash and the
+  drop are one resolution (`resolveTopDropWithCue`), so the label cannot
+  disagree with the result. The target eyebrow keeps its wash.
+- **A dragged block is a lifted surface.** The block itself moves (there
+  is no overlay), across other blocks and other groups' eyebrows, so while
+  it is dragged it wears `DRAGGED_BLOCK` (`lib/railDnd.ts`): the menus' own
+  ground and lift (`LIFTED_GROUND` in `lib/menuStyles.ts`: `bg-octo-panel`
+  and their shadow), a hairline ring (so it keeps its size), `rounded-md`,
+  and `z-10`. It is opaque and its content keeps full opacity: the thing
+  under the pointer is never dimmed. The ground is `panel`, never `panel_2`,
+  because `panel_2` recesses in Vellum (§1.1, rule 5) and would read as a
+  slab. A group holding its own dragged project is raised to `z-10` as
+  well: its filled `octo-fade-in` entrance makes it a stacking context,
+  which would otherwise trap the project under every later block.
+- **A dragged block is moved, never scaled.** Only the translation of
+  dnd-kit's transform is written (`blockShift` in `lib/railDnd.ts`); written
+  whole, it scales the block to the size of what it is over and pulls it off
+  the pointer. Over a target outside its own list the block follows the
+  pointer by the drag's delta (`useFollowPointer`), so it never snaps back
+  mid-drag; a group lifts its fold's clipping while one of its own projects
+  is dragged, so the block never vanishes at the group's edge; the list's
+  scroll is held to its own room for the length of the drag. Keyboard: a
+  project's grip steps through projects in any group; a group moves with its
+  menu's **Move up** / **Move down**, each offered only when the step would
+  show (never one the pinned-first order would undo). An empty group has no
+  project to drag: its **Move up** / **Move down** trade places with its
+  neighbour among the empty groups at the foot, and it never steps above a
+  group with projects (`stepEmptySection`).
+- **A move draws once.** A project's new group and its new place reach the
+  rail in one update, before the backend answers: the group never jumps to
+  an in-between layout. A refused move puts both back with one toast,
+  `Couldn't move {project}` / `Your rail is back as it was.`; nothing fails
+  silently.
+- **One meaning for "New group" per menu.** In a project's menu the group
+  action is **Move to group ›**, about project groups, and its **New group…**
+  makes a group that already holds the project. The mission-group action in
+  that menu reads **New mission group** (`FolderPlus`) and sits with the
+  project's missions, a block away. A group made from an item never starts
+  empty.
+- **Escape takes a new group back.** A group made from a project, a mission
+  or a selection opens with its name in edit; Escape there deletes it and
+  returns each member to where it was, so the gesture leaves no trace. Once
+  that first name is in, Escape on a rename only keeps the old name.
+- **Collapsed (44px).** A sub-cluster: the group's project clusters between
+  two hairlines that span the rail (`w-full`), where the hairline between two
+  projects is 20px. No name, no fold and no header control at this width; a
+  project's mark is titled `group · project` and the flyout's eyebrow starts
+  with the group. Hexagons keep the inherited tint.
+
+**Groups beyond the rail, as built.** Keep these when touching them:
+
+- **⌘K, a Groups section.** One row per group, in the rail's reading order
+  (`paletteGroups`). The glyph box holds the group's own mark, the 12px
+  chevron in its tint (mute untinted): the palette borrows the rail's sign
+  for "this holds things and folds" rather than inventing a glyph. Name over
+  a mono meta line (`acme-api · 3 missions`, `2 projects`, `empty`), the
+  Workspaces row's two-line recipe. Choosing it **reveals** the group:
+  every fold above it opens, a filter that hides it is cleared, the slim
+  rail opens, and the header takes the focus. The palette is navigation
+  only; it has no sub-steps or text entry, so renaming and moving stay with
+  the header's own keys and menus. A mission row's meta reads
+  `project · group · branch`, outermost first like the slim rail's flyout.
+- **Mission Control, `group · workspace`.** The card's workspace atom gains
+  the mission group's name before it, in the same mute mono with a `·`; the
+  group truncates first (`shrink-[100]`). Nothing when ungrouped. No tint
+  (the tint lives on the rail's chevron and guide), no chip, no new band.
+- **The archived-workspaces modal** names a mission's group before its
+  branch (mute mono, `Fixes ·`). Restoring returns the mission to that group
+  if it still exists, else it comes back loose; a group that is gone shows
+  nothing, so the modal never promises a return it cannot make.
+- **The keyboard's Move to group (`⌘⌥G`).** Rail-scoped: the rail's own
+  `keydown` hears it only on a focused mission row or project line. The
+  editor's and the scratchpad's `⌘⌥G` (go to line) are CodeMirror keymaps
+  that only hear keys pressed in them, so the chord means one thing wherever
+  the focus is, and no global binding is spent. It opens the submenu's
+  choices as a menu of their own at the row (`MoveToGroupMenu`, MenuSurface
+  chrome, `octo-menu-enter`; `⌘⌥G` on a Mac only, never Ctrl+Option, which
+  is VoiceOver's; Ctrl+Alt+G elsewhere), with a mono header `Move to group` (`Move N missions to group` for a selection), the
+  current group focused first and type-ahead on the group names. A mission
+  row now also answers `⇧F10` and the context-menu key, like a project line
+  and a group header, so every rail row has a keyboard path to its menu.
+- **The selected row.** A multi-selection of missions (`⌘`-click on a Mac,
+  Ctrl-click elsewhere; `⇧`-click; one project) has no colour of its own.
+  A selected row that is neither active nor working takes a **static 2px
+  sage bar in the identity edge's reserved slot** (`IdentityEdge`'s
+  `selected`), and holds the hover ground (`bg-octo-panel-2`) and an ivory
+  name. The edge is what tells it apart from a hovered row, which changes
+  only its ground and name: in Onyx `panel_2` on the rail is about 1.06:1,
+  too close to read alone. Sage, because the edge already speaks sage for
+  "working" elsewhere in the rail and never brass for a status (§7); static,
+  because marching is the working edge's. The active row keeps its brass
+  edge and brass-ghost ground even when selected, and a working row keeps
+  its marching edge, so brass still marks the one place you are. The
+  selection holds only rows the rail draws: a row archived or deleted away,
+  or folded out of sight (its group, project or project group), leaves it,
+  so the menu's count always matches what is on screen.
+  The selection's menu (`Group N missions…`, `Move N missions to group ›`,
+  `Clear selection`) is plain MenuSurface rows. Missions only: projects have
+  no multi-select.
+
+### Run mode — session navigation (shipped 2026-11-18)
+
+Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`,
+Parts 2 and 3. Terminal navigation lives in the mode band, never in the
+Companion: the Companion collapses, and a collapse must not remove the only
+way to change session. Two surfaces, each with one job:
+
+- **The session line switches.** The band's right track holds one 24px cell per
+  session, in session order, then `+`, a hairline and the layout button. It
+  costs no chrome of its own. (It replaced a 44px rail on the canvas's left
+  and a one-session anchor in the band.)
+- **The pane caption is the session's one home.** Name, rename, what it is
+  doing, the waiting state, the Restored badge, its `⌘⌥N` and its actions are
+  on the caption of the pane that shows it, and nowhere else. Every pane has
+  one, a lone pane too. A fact with two homes drifts.
+
+The rules, reusable wherever a set of live things needs a compact switcher:
+
+- **The icon is the identity; the number is the address.** A 24px cell holds
+  one glyph well and two badly, so it carries the session's **role icon** at
+  rest and flips to its `⌘⌥N` number while **⌥** is held (`useModifierPeek` —
+  ⌥ only, or every plain ⌘ shortcut would flash the line on its way past).
   The hint arrives when the hand is already on the modifier — and nothing lives
-  only behind the gesture: the number is permanent in the hover flyout, the
-  Companion inspector and the `⌘⌥K` switcher.
+  only behind the gesture: the number is also in the instant label, on the pane
+  caption and in the `⌘⌥K` switcher.
 - **An icon must encode difference.** A terminal glyph on every session says
   "this is a terminal" once per session — information the user already has. The
   session icon names what is *running* instead (`lib/sessionRole.ts` →
@@ -560,21 +886,135 @@ rules, reusable wherever a set of live things needs a compact switcher:
   editor `PenLine` · unclassified `Terminal`. Roles are **sticky** — only a
   placeable command replaces one — so identity survives the quiet between
   rebuilds (S1: slots hold their meaning while things run).
-- **One glyph, two facts.** The icon carries identity, its colour carries state
-  (verdigris idle, brass busy); the cell's reserved edge carries selection
-  (solid brass) and activity (`.rail-bar-running` marching segments, the
-  workspace rail's own idiom). §7's "no status in brass" holds: the marching
-  edge is **brass only on the active cell and sage everywhere else**, exactly
-  as the workspace rail tints a non-active row — five busy sessions must not
-  put five brass marks on screen. The one brass exception is *attention*, which
-  the app already spends brass on: the per-session "this one rang" marker. It
-  is a **static** dot, not a second pulse, because the mode switcher's pulse
-  owns that signal at the scope above (Law 2).
+- **One channel per fact.** Two facts on one channel fight: a focused session
+  that was busy could only show one of them. So:
+  - the icon's **ink is presence** — ivory in a pane, mute off screen. Never
+    brass: five busy sessions must not put five brass icons on screen (§7,
+    "no status in brass");
+  - the underline's **colour is focus** — a reserved 2px slot under the icon,
+    brass on the focused pane's session and nowhere else;
+  - the underline's **motion is work** — it marches while a command runs
+    (`.rail-bar-running-x`, the workspace rail's idiom laid horizontally): sage,
+    or brass on the focused session, which is focus and work at once. Reduced
+    motion shows a solid bar.
+  - a **static 5px brass dot** is attention, which the app already spends brass
+    on: the session rang, or Claude Code waits on the user there, while it is
+    not the one in focus. Static, not a second pulse, because the mode
+    switcher's pulse owns that signal at the scope above (Law 2).
+- **The label is instant and has no actions.** Hovering a cell, or focusing it
+  from the keyboard, opens a label under it with no delay: the name in sans,
+  then what the session is doing and its `⌘⌥N` in mono. It is the name the
+  icon alone can't give — a native `title` takes about a second, and six of
+  eight sessions can share one glyph. It carries nothing to click (actions
+  have one home, the caption), it is `aria-hidden` (the cell's accessible name
+  is the same text), and it enters and leaves with `.octo-fade-in` /
+  `.octo-fade-out`.
+- **A pane has no `×`.** Taking a pane off screen keeps its session running,
+  and `×` reads as "close" everywhere else: a session that looks closed while
+  its agent keeps spending is the worst outcome here. Leaving the view is a
+  **minus** (*Leave the view · the session keeps running*), in a split view
+  only; Talk's terminal seat closes with the same minus. Closing is by name, in the caption's `⋯` menu, sage until hovered
+  (`MENU_ITEM_ROUGE`).
+- **The layout button shows the layout.** Its glyph is the panes on screen
+  (`PaneLayoutIcon`: one frame and its dividers, a single family for one to
+  four panes). Pane count and orientation are chosen there, not in a pane's
+  menu: they belong to the view, not to a session.
+- **Narrow, it sheds whole atoms, down to a floor** (E2). The cells fold from
+  the left into one `N sessions` button that opens `⌘⌥K`; narrower still that
+  button is a list icon. The fold button, the focused session's cell, `+` and
+  the layout button are the floor and never go: the mode band reserves their
+  width (`tailMin`) and sheds the switcher's inactive labels to make room
+  (see "The mode band's ladder" under the elision doctrine). Past eight
+  sessions the last cell reads `+N`.
+- **A menu's button toggles it, and gets the focus back.** A press on `⋯` or
+  on the layout button while its menu is open closes it and does not open it
+  again; when the menu closes (Escape, a press elsewhere, a pick), keyboard
+  focus returns to the button (`useAnchoredMenu`). A destructive row is rouge
+  on keyboard focus as well as on hover.
+- **Closing asks only when something would be lost mid-flight.** An idle
+  session closes at once. A busy one (an agent or a command running in it)
+  opens a confirm on `ModalShell`, like the Abort confirm: a short question,
+  *Keep the session* focused, an upright-serif rouge *Close the session*,
+  Escape keeps it. The menu row carries its ellipsis only in that case, and
+  `⌘⌥K`'s `⌫` follows the same rule (`useCloseSession`).
+- **The focus line needs something to tell apart.** The `border-strong` line
+  under the focused pane's caption is drawn only in a split view; alone, a
+  caption keeps its hairline.
 
 The band's status tail may become a **control** when the mode has one worth
-having — in Run it is the session anchor (`ModeBand` takes a `ReactNode`), which
-is what makes a keyboard-only palette discoverable. It stays compact: identity,
-the running command, and anything still waiting.
+having — in Run it is the session line (`ModeBand` takes a `ReactNode`). A
+keyboard-only switcher is a switcher nobody finds.
+
+**Where the shipped work differs from the spec**, each because of what the
+code can do today:
+
+- **Close has no Undo.** A closed session's shell and scrollback are gone
+  (`delete_terminal` removes the row and kills the PTY), so there is nothing
+  to restore and no toast to offer it. Instead a busy session asks before it
+  closes, and an idle one closes at once, as it always did.
+- **Cells can't be dragged to reorder.** `terminals.position` is stored, but
+  no command changes it. Reordering needs that command first.
+- **`+` names no shortcut.** No key is bound to "new session". (`⌘T` was only
+  a hint in the command palette, never a binding; the hint is gone.)
+- **The attention dot keeps the rule it had:** a session that rang, or waits,
+  and is *not the one in focus* (the spec says "off screen"). A session put on
+  screen in an unfocused pane keeps its dot until it is answered.
+- **The layout menu has one more row.** With two or three panes it adds
+  *Automatic orientation*: the way back to the 72-column rule once a two-pane
+  row has set an override. A layout that needs more panes than the workspace
+  has sessions (plus the one empty seat) is disabled rather than filled with
+  several empty seats, and a smaller layout never takes the focused session's
+  pane off screen.
+- **The floor costs the switcher its centre and its inactive labels.** The
+  spec's floor (the focused cell, `+` and the layout button always stay) did
+  not fit a small window with the rail and the Companion both open while the
+  switcher stayed centred and fully labelled. The band's ladder pays for it:
+  the labels shed, and below that the switcher slides left.
+
+### Companion grammar (2026-11-18)
+
+Three rules for the Companion in every mode. Talk, Review and Direct already
+follow rules 1 and 2; new Companion work follows all three.
+
+1. **The Companion never repeats the canvas.** It shows what surrounds the
+   work on the canvas: what the canvas can't say about itself.
+2. **It follows the focus.** Its content describes the focused thing (the open
+   chat, the focused pane, the selected run), and says which one when more
+   than one is on screen.
+3. **A section that doesn't apply is not drawn.** When a section has no
+   meaning for the focused thing (a context meter for a plain shell), it folds
+   away through the grid-rows idiom; nothing is invented to fill it. A section
+   that applies but is empty keeps its one calm line ("No runs yet", "The
+   working tree is clean."); those empty states stay.
+
+| Mode | Canvas | The Companion answers |
+|------|--------|-----------------------|
+| Talk | The conversation | Which chats; how full the context is and what it cost |
+| Review | The diff | How the change was built; where the branch stands |
+| Direct | The run | The runs and the logbook |
+| Run | Terminals | **Context** (the focused pane's Claude Code session: context meter, spend, cache share and model; not drawn for anything else in the pane, or when Octopush can't tell the figures are that pane's current session's) · **Changes** (the workspace's uncommitted files, each row opening Review) · **Mission** (the mission's worked time, spend and savings) |
+
+Run's three sections (`CompanionRun`) follow the spec
+`docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`, Part 4.
+What they share, for any Companion section built after them:
+
+- **One chrome.** Sections hang on `CompanionSection`: one eyebrow each, one
+  hairline between them, no framed cards inside the panel. A section that
+  folds away as a whole carries the hairline below it, so the rule leaves
+  with it and never doubles under the panel header.
+- **The eyebrow's `meta` says which one.** A section about one thing (a
+  session) or one figure (`3 files · +84 −12`) puts it at the right of its
+  eyebrow: mute, in its own case, and the part that truncates.
+- **Figures stay with their owner.** A section that follows the focus is
+  cleared when the focus moves and shows the newly focused thing's figures
+  only once its own answer arrives; an empty or failed read clears it too.
+  While it folds away it keeps what it showed until it has left. Where the
+  owner can't be established (Run's Context: see `docs/FEATURES.md`,
+  "Session usage"), the section is not drawn.
+- **Label and value rows** are a mono grid: a caps mute label, a sage value.
+- **Brass is spent twice in Run:** the context meter's fill and the serif
+  link into Review. A file path keeps its file name whole (`MidTruncate`,
+  the tail pinned to the name).
 
 ### Direct mode — canvas patterns
 
@@ -597,8 +1037,8 @@ Pills share the same geometry as the existing status pills (mono uppercase, `sm`
 
 - Each stage is a **two-geometry card**: the **subject** (running / awaiting-checkpoint / failed / selected) renders at full ink, 210px wide — gate mark (if any) + role icon (`iconForRole`) + serif title + status glyph, then status word + a fixed-width `5ch` tabular timer, one fixed-height live line (running activity / done verdict / idle tokens, S1), and a meta line (arabic position · model · substrate pill), plus a loop badge (`⟲ {iter}/{max}`, brass) when the stage loops back. Every other stage recedes to a dimmed **essence** — 150px, `opacity-[0.38]` rising to `opacity-70` on hover/focus (180ms) — role icon + title + status glyph + arabic position · cost · tokens only. Nothing is dropped; full detail is one click away in the focus pane.
 - Stages connect left-to-right with **solid 1px drawn lines**, not glyphs: `--brass-line` (55% alpha brass) once the stage to the left is done, `--hairline` ahead — progress visibly fills in as solid ink, never a gradient. The `⟜` gate mark renders on the gated card's own header, not on the connector.
-- Only the card matching the single beacon (`beaconStageId`, from `lib/beacon.ts`) carries `octo-stage-pulse`; a card's own status color (running verdigris border, awaiting brass, failed rouge, stalled amber) is independent of whether it currently holds the beacon.
-- The track scrolls horizontally (`RunFlowNav` chevrons appear only on overflow); the focus pane below is always visible.
+- Only the card matching the single beacon (`beaconStageId`, from `lib/beacon.ts`) carries `octo-stage-pulse`; a card's own status color (running verdigris border, awaiting brass, failed rouge, stalled amber) is independent of whether it currently holds the beacon — and the pulse follows that color: a running beacon pulses verdigris (`.octo-stage-pulse-running`), never brass.
+- The track scrolls horizontally (`RunFlowNav` chevrons appear only on overflow: "Earlier stages" at the track's left edge, "Later stages" at its right, each beside the stages it brings back); the focus pane below is always visible. An edge that hides stages fades out with a 32px `mask-image` edge-fade (`railEdgeFade`), so a connector whose stage is scrolled away never reads as a broken line.
 
 **Focus pane (`StageFocus`)** — the lower half of the Direct canvas.
 
@@ -615,8 +1055,8 @@ Pills share the same geometry as the existing status pills (mono uppercase, `sm`
 
 **Ledger strip (`RunLedger`)** — a single calm line at the canvas bottom, **savings-first** (the differentiator leads).
 
-- Format: `saved $0.089 · 86% under all-premium · spent $0.014 · budget $0.50` — verdigris saved value, brass spent value, mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
-- A 2px progress inset beneath (solid brass fill = cost as % of baseline) glides with `--dur-standard`; clicking the strip unfolds the per-stage breakdown via `<Reveal>`.
+- Format: `saved $0.089 · 86% under all-premium · spent $0.014 · budget $0.50` — verdigris saved value, ivory spent value (a cost is data, never brass), mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
+- No progress bar beneath: the printed `N% under all-premium` is the one encoding of the savings share (a bar's width restating a printed percentage reads as a second, opposite number, and would put a metric in brass). Clicking the strip unfolds the per-stage breakdown via `<Reveal>`.
 - **Completion moment:** when a run completes, a one-shot **solid** brass line (`.octo-sweep`, no gradient) crosses the strip and a serif phrase restates the savings. The one ceremony in Direct; failed/aborted runs get none.
 
 **The launcher ("The Commission", `PipelineSetup`)** — a composition surface, not a wizard: no step numbering anywhere (the old `I · The brief / II · The ensemble` framing is gone). Reading order is ceremony header (serif "Direct the work" + one sans line) → **the brief** (Spectral serif, 15px/1.5, on `--panel` inside a hairline card, linked-issue chip + `⌘⏎ to begin` hint in its footer) → **the ensemble** (`PipelineTicket` cards under Law 1: selected = full ink + `--brass-dim` border + `StageDots`; others `opacity-[0.38]`→`0.70` hover; a "Compose a new one" dashed ticket opens the builder) → the selected ticket's crew line (`StageFlow`: role icon + name + model in mute, solid hairline connectors, `⟜` before a gated role, pencil-icon edit) → **the foot**, the same ledger grammar as the run (`est. saves ~$0.31 · 78% under all-premium · N runs left` — the retired standalone `DirectRunsMeter` folds its quota fragment into this line — + a budget input + **Begin the run**, ghost until brief + quota + concurrency are satisfied, then solid brass carrying the beacon).
@@ -637,6 +1077,12 @@ frames a destination, not an interruption. Rules:
   `<RoomClose>` is the canonical `ESC · CLOSE` affordance.
 - Header: the Settings recipe — mono eyebrow + serif title (or app-scoped live
   meta) + right-aligned quiet actions + RoomClose.
+- Settings panes share one content column: `Settings.tsx` renders every pane
+  inside `max-w-[var(--settings-content)]`, so cards and notes end at the same
+  x on every tab. A pane never sets a width of its own; one that needs two
+  columns (Models, Integrations' issue tracking) splits inside the column.
+  `settings/contentWidth.test.ts` fails if a pane brings back a pixel
+  `max-w-[…]` (a ModalShell panel is not pane content and is exempt).
 - A room is **entered from existing chrome** (top bar, shortcut) and never
   persistent — it adds zero standing pixels. One room per concept (§9).
 - Current residents: **Settings** (`⌘,`) and **Mission Control** (`⌘⇧M`) — the
@@ -651,7 +1097,8 @@ frames a destination, not an interruption. Rules:
   savings-first fleet ledger. Law 2's fleet scope: only the **longest-waiting**
   needs-you card pulses (FIFO by `statusSince`); every other needs-you card
   keeps a static brass border. The header shows a combined live-cost figure
-  (`saved $X · Y% under all-premium · spent $Z`) over active runs only — this
+  (`saved $X · Y% under all-premium · spent $Z`; saved verdigris, spent ivory)
+  over active runs only — this
   figure is Mission-Control-only; the top-bar `RunsTray` chip dropped it (see
   §9/FEATURES for the chip's own vocabulary).
 
