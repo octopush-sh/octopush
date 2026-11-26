@@ -1025,6 +1025,8 @@ export const ipc = {
     invoke<void>("truncate_chat_after", { threadId, messageId }),
   /** Stop the in-flight agentic turn for this thread. */
   cancelChat: (threadId: string) => invoke<void>("cancel_chat", { threadId }),
+  /** The workspace's conversations with a director turn running now. */
+  listRunningThreads: (workspaceId: string) => invoke<string[]>("list_running_threads", { workspaceId }),
   /** Answer a turn-limit card: extra turns for the paused writing sub-agent,
    *  or null to accept its partial report. */
   respondSubagentCap: (callId: string, extraTurns: number | null) =>

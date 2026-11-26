@@ -1809,7 +1809,7 @@ pub async fn truncate_chat_after(
     thread_id: String,
     message_id: i64,
 ) -> AppResult<()> {
-    state.db.lock().truncate_chat_after(&thread_id, message_id)
+    state.chat.truncate_after(&thread_id, message_id)
 }
 
 /// Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
@@ -1875,6 +1875,14 @@ pub async fn list_chat_messages(
     thread_id: String,
 ) -> AppResult<Vec<crate::db::ChatMessageRow>> {
     state.db.lock().list_chat_messages(&thread_id)
+}
+
+/// The workspace's conversations with a director turn running now, so a
+/// reloaded view shows them as running (and offers Stop) again.
+#[tauri::command]
+pub async fn list_running_threads(state: State<'_, AppState>, workspace_id: String) -> AppResult<Vec<String>> {
+    let threads = state.db.lock().chat_thread_ids(&workspace_id)?;
+    Ok(state.chat.running_turns(&threads))
 }
 
 /// Request that the in-flight agentic turn for this thread stop. The loop

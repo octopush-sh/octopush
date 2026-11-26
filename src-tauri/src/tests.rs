@@ -1371,10 +1371,32 @@ mod workspace_tests {
         // Scoped per thread: another thread's rows are untouched by a truncate
         // that targets only this one.
         let t2 = db.create_chat_thread("ws", "T2").unwrap();
-        db.insert_chat_message("ws", &t2.id, "user", "other", None, None, None, None).unwrap();
-        db.truncate_chat_after(&t2.id, 0).unwrap(); // id >= 0 clears t2 only
+        let first = db.insert_chat_message("ws", &t2.id, "user", "other", None, None, None, None).unwrap();
+        db.truncate_chat_after(&t2.id, first).unwrap(); // from its first row clears t2 only
         assert_eq!(db.list_chat_messages(&t2.id).unwrap().len(), 0);
         assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn truncate_refuses_message_from_other_thread() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let a = db.create_chat_thread("ws", "A").unwrap();
+        let b = db.create_chat_thread("ws", "B").unwrap();
+        db.insert_chat_message("ws", &a.id, "user", "a1", None, None, None, None).unwrap();
+        let from_b = db.insert_chat_message("ws", &b.id, "user", "b1", None, None, None, None).unwrap();
+        db.insert_chat_message("ws", &a.id, "assistant", "a2", None, None, None, None).unwrap();
+        db.insert_chat_message("ws", &a.id, "user", "a3", None, None, None, None).unwrap();
+
+        // B's id falls inside A's history: `id >= from_b` alone would cut a2 and a3.
+        let err = db.truncate_chat_after(&a.id, from_b).unwrap_err();
+        assert!(err.to_string().contains("nothing was deleted"), "{err}");
+        assert_eq!(db.list_chat_messages(&a.id).unwrap().len(), 3, "A keeps every row");
+        assert_eq!(db.list_chat_messages(&b.id).unwrap().len(), 1, "B is untouched");
+        // An id that is no longer anywhere is refused the same way.
+        assert!(db.truncate_chat_after(&a.id, from_b + 1_000).is_err());
+        assert_eq!(db.list_chat_messages(&a.id).unwrap().len(), 3);
     }
 
     #[test]

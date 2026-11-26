@@ -31,6 +31,7 @@ vi.mock("../lib/ipc", () => ({
     truncateChatAfter: vi.fn().mockResolvedValue(undefined),
     listChatMessages: vi.fn().mockResolvedValue([]),
     cancelChat: vi.fn().mockResolvedValue(undefined),
+    listRunningThreads: vi.fn().mockResolvedValue([]),
     listChatThreads: vi.fn().mockResolvedValue([]),
     createChatThread: vi.fn().mockResolvedValue({
       id: "t1", workspaceId: "ws-1", title: "New conversation",
@@ -62,7 +63,7 @@ function resetStore() {
     liveToolsByWs: {},
     threadsByWs: {},
     activeThreadByWs: {},
-    streamingThreadByWs: {},
+    streamingThreadsByWs: {},
     skillNamesByWs: {},
     attachmentsByWs: {},
   });
@@ -1123,5 +1124,139 @@ describe("chatStore — turn-limit cards survive a reload", () => {
     useChatStore.setState({ threadsByWs: { "ws-1": [] }, activeThreadByWs: { "ws-1": "t2" } });
     await useChatStore.getState().deleteThread("ws-1", "t1");
     expect(useChatStore.getState().getPendingCaps("ws-1").map((c) => c.callId)).toEqual(["c2"]);
+  });
+});
+
+describe("chatStore — one running turn per thread", () => {
+  const mocked = (f: unknown) => f as ReturnType<typeof vi.fn>;
+  const row = (id: number, content: string) => ({
+    id, workspaceId: "ws-1", role: "user", content,
+    model: null, inputTokens: null, outputTokens: null, costUsd: null,
+    createdAt: "2026-11-26T10:00:00Z",
+  });
+  const done = (threadId: string) =>
+    emit("chat://stream", { workspaceId: "ws-1", threadId, delta: "", done: true, inputTokens: null, outputTokens: null });
+  const thread = (id: string) => ({
+    id, workspaceId: "ws-1", title: id, createdAt: "2026-11-26T09:00:00Z", updatedAt: "2026-11-26T09:00:00Z",
+  });
+
+  beforeEach(() => {
+    resetStore();
+    vi.clearAllMocks();
+    mocked(ipc.listChatMessages).mockResolvedValue([]);
+    mocked(ipc.listRunningThreads).mockResolvedValue([]);
+  });
+
+  it("select_back_to_running_thread_shows_streaming", async () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" } });
+    await useChatStore.getState().runTurn("ws-1", "/r", "A", { userMessage: "first" });
+    // Open B (a new conversation) and send there while A still runs.
+    await useChatStore.getState().newThread("ws-1");
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+    await useChatStore.getState().runTurn("ws-1", "/r", "t1", { userMessage: "second" });
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+
+    await useChatStore.getState().selectThread("ws-1", "A");
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+    useChatStore.getState().stop("ws-1");
+    expect(ipc.cancelChat).toHaveBeenCalledWith("A");
+  });
+
+  it("done_for_one_thread_keeps_other_streaming", async () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" } });
+    await useChatStore.getState().runTurn("ws-1", "/r", "A", { userMessage: "a" });
+    await useChatStore.getState().runTurn("ws-1", "/r", "B", { userMessage: "b" });
+
+    done("B");
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+    await useChatStore.getState().selectThread("ws-1", "B");
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+    await useChatStore.getState().selectThread("ws-1", "A");
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+    done("A");
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+  });
+
+  it("reload_rehydrates_running_threads", async () => {
+    mocked(ipc.listChatThreads).mockResolvedValueOnce([thread("A"), thread("B")]);
+    mocked(ipc.listRunningThreads).mockResolvedValueOnce(["A"]);
+    await useChatStore.getState().loadHistory("ws-1");
+    await vi.waitFor(() => expect(useChatStore.getState().getStreaming("ws-1")).toBe(true));
+    expect(ipc.listRunningThreads).toHaveBeenCalledWith("ws-1");
+
+    // An answer read before the turn ended can't mark it running again.
+    let answer: (ids: string[]) => void = () => {};
+    mocked(ipc.listRunningThreads).mockReturnValueOnce(new Promise((r) => { answer = r; }));
+    await useChatStore.getState().selectThread("ws-1", "A");
+    done("A");
+    answer(["A"]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+    expect(useChatStore.getState().streamingThreadsByWs["ws-1"]).toEqual([]);
+  });
+
+  it("stale_select_thread_result_is_dropped", async () => {
+    let releaseB: (rows: unknown[]) => void = () => {};
+    mocked(ipc.listChatMessages).mockImplementation((t: string) =>
+      t === "B" ? new Promise((r) => { releaseB = r; }) : Promise.resolve([row(1, "from A")]),
+    );
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" } });
+    // A → B → A, B's read answering last.
+    const toB = useChatStore.getState().selectThread("ws-1", "B");
+    await useChatStore.getState().selectThread("ws-1", "A");
+    releaseB([row(2, "from B")]);
+    await toB;
+    expect(useChatStore.getState().getActiveThread("ws-1")).toBe("A");
+    expect(useChatStore.getState().getMessages("ws-1").map((m) => m.content)).toEqual(["from A"]);
+  });
+
+  it("continuation_marks_its_thread_running", async () => {
+    // The crew row of call c1 sits in thread A, on screen.
+    const crewRow = { ...row(3, JSON.stringify({ callId: "c1", toolName: "Agent" })), role: "tool" };
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" }, messagesByWs: { "ws-1": [crewRow as never] } });
+    let finish: () => void = () => {};
+    Object.assign(ipc, { continueSubagent: vi.fn().mockReturnValueOnce(new Promise<void>((r) => { finish = r; })) });
+    const running = useChatStore.getState().continueSubagent("c1", "go on", null);
+    // Running: Stop shows and the composer waits; Stop reaches thread A.
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+    useChatStore.getState().stop("ws-1");
+    expect(ipc.cancelChat).toHaveBeenCalledWith("A");
+    expect(useChatStore.getState().stopRequestedByThread.A).toBe(true);
+    done("A");
+    finish();
+    await running;
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+
+    // Refused (a turn runs there, or nothing to continue): no `done` will
+    // come, so the mark comes off with the error.
+    Object.assign(ipc, { continueSubagent: vi.fn().mockRejectedValueOnce("This sub-agent is already being continued.") });
+    await useChatStore.getState().continueSubagent("c1", null, null);
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+  });
+
+  it("refused_send_reports_the_refusal", async () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" } });
+    const onRefused = vi.fn();
+    mocked(ipc.sendChatMessage).mockRejectedValueOnce("other: A turn is already running in this conversation.");
+    expect(await useChatStore.getState().send("ws-1", "/r", "again", undefined, { onRefused })).toBe(false);
+    expect(onRefused).toHaveBeenCalledTimes(1);
+    // A turn that started and then failed saved its ask: nothing to give back.
+    mocked(ipc.sendChatMessage).mockRejectedValueOnce("Anthropic API error 401");
+    await useChatStore.getState().send("ws-1", "/r", "again", undefined, { onRefused });
+    expect(onRefused).toHaveBeenCalledTimes(1);
+  });
+
+  it("message_added_during_load_is_kept", async () => {
+    let release: (rows: unknown[]) => void = () => {};
+    mocked(ipc.listChatMessages).mockReturnValueOnce(new Promise((r) => { release = r; }));
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" } });
+    const loading = useChatStore.getState().selectThread("ws-1", "A");
+    // Saved after the read, but announced before it answered.
+    emit("chat://message-added", makeMsg({ threadId: "A", id: 7, role: "assistant", content: "late" }));
+    emit("chat://message-added", makeMsg({ threadId: "A", id: 6, role: "user", content: "ask" }));
+    release([row(5, "earlier"), row(6, "ask")]);
+    await loading;
+    expect(useChatStore.getState().getMessages("ws-1").map((m) => m.id)).toEqual([5, 6, 7]);
   });
 });

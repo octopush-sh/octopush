@@ -80,7 +80,7 @@ beforeEach(() => {
     threadsByWs: {},
     activeThreadByWs: {},
     streamingByWs: {},
-    streamingThreadByWs: {},
+    streamingThreadsByWs: {},
     composerSeedByWs: {},
   });
 });

@@ -74,7 +74,7 @@ function resetStore() {
     liveToolsByWs: {},
     threadsByWs: {},
     activeThreadByWs: {},
-    streamingThreadByWs: {},
+    streamingThreadsByWs: {},
     attachmentsByWs: {},
     composerSeedByWs: {},
   });
@@ -773,6 +773,28 @@ describe("ChatView — arrow-key prompt history", () => {
 
     await sendMessage(ta, "hello");
     expect(ta.value).toBe("");
+  });
+
+  it("refused_send_keeps_the_draft", async () => {
+    // The backend refuses a second turn on a running thread: nothing of it
+    // was saved, so the draft comes back instead of vanishing.
+    const busy = "other: A turn is already running in this conversation.";
+    vi.mocked(ipcMock.sendChatMessage).mockRejectedValueOnce(busy);
+    const runShellCommand = vi.fn().mockRejectedValue(busy);
+    Object.assign(ipcMock, { runShellCommand });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+
+    const ta = getTextarea();
+    for (const draft of ["keep me", "$ git status"]) {
+      await act(async () => {
+        fireEvent.change(ta, { target: { value: draft } });
+        fireEvent.keyDown(ta, { key: "Enter" });
+      });
+      await waitFor(() => expect(ta.value).toBe(draft));
+      fireEvent.change(ta, { target: { value: "" } });
+    }
+    expect(runShellCommand).toHaveBeenCalledTimes(1);
   });
 
   it("ArrowUp on empty input recalls the last sent message", async () => {

@@ -1331,9 +1331,9 @@ function App() {
   const activeChatId = activeWorkspaceId;
   const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
   const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
-  // The thread currently running a turn (for the live pulse in the chat list).
-  const streamingThreadId = useChatStore((s) =>
-    activeWorkspaceId ? (s.streamingThreadByWs[activeWorkspaceId] ?? null) : null,
+  // The threads running a turn (for the live pulse in the chat list).
+  const streamingThreadIds = useChatStore((s) =>
+    activeWorkspaceId ? s.streamingThreadsByWs[activeWorkspaceId] : undefined,
   );
   // Count tool calls live from the active chat's messages — chatStore is
   // updated on every `chat://message-added` event the backend emits, so the
@@ -1559,7 +1559,7 @@ function App() {
         onRenameChat: handleRenameChat,
         onExportChat: handleExportChat,
         onPinChat: handlePinChat,
-        streamingChatId: streamingThreadId,
+        streamingChatIds: streamingThreadIds,
       };
     },
     [
@@ -1571,7 +1571,7 @@ function App() {
       handleRenameChat,
       handleExportChat,
       handlePinChat,
-      streamingThreadId,
+      streamingThreadIds,
       activeWsPrimaryMessages,
       tickerNow,
     ],
