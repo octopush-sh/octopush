@@ -9,11 +9,13 @@
 //!   `~/.claude/CLAUDE.md`, then from the top directory down to the
 //!   workspace each one's `CLAUDE.md`, `.claude/CLAUDE.md` and
 //!   `CLAUDE.local.md`, each followed by the files it `@imports`. The
-//!   user's files (`~/.claude/CLAUDE.md` and those of the directories above
-//!   the workspace) may import from anywhere. The repository is the
-//!   untrusted part: a file that resolves inside the workspace, and what it
-//!   imports or links to, must stay inside it, or it is listed as skipped
-//!   and never read. A file over 4 MiB is skipped too.
+//!   repository is the untrusted part: every directory from the workspace up
+//!   to the outermost git work tree enclosing it, and every file that
+//!   resolves in there, is confined to the nearest work tree around it; an
+//!   import or symlink that leaves it is listed as skipped and never read.
+//!   The user's files (`~/.claude/CLAUDE.md` and those of the directories
+//!   above every enclosing work tree) may import from anywhere. A file over
+//!   4 MiB is skipped too.
 //! - **`AGENTS.md` is the fallback.** A project that keeps both usually
 //!   mirrors one into the other (often with a line changed, so a content
 //!   dedupe misses it). So the workspace's `AGENTS.md` and `CONVENTIONS.md`
@@ -35,7 +37,7 @@
 
 use crate::orchestrator::runner::{cap_to, SECTION_CAP_CHARS};
 use crate::request_context::{
-    estimate_tokens, memory_chain, read_memory_file, untrusted_root, MemoryChain, MemoryFile, MAX_LISTED_SKIPS,
+    estimate_tokens, memory_chain, nearest_work_tree, read_memory_file, MemoryChain, MemoryFile, MAX_LISTED_SKIPS,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -100,11 +102,12 @@ fn instruction_files(workspace: &Path, home: Option<&Path>) -> MemoryChain {
     if has_own {
         return out;
     }
-    let untrusted = untrusted_root(&root);
+    // The worktree's own files stay in its own work tree.
+    let reach = nearest_work_tree(&root, &root);
     let mut seen: HashSet<PathBuf> = out.files.iter().filter_map(|f| f.real.clone()).collect();
     for name in FALLBACK_FILES {
         let path = root.join(name);
-        let file = match read_memory_file(&path, Some(&untrusted)) {
+        let file = match read_memory_file(&path, Some(&reach)) {
             Ok(None) => continue,
             Ok(Some((real, raw))) => {
                 if !seen.insert(real.clone()) {

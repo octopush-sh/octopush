@@ -28887,14 +28887,17 @@ mod request_context_tests {
         let key = chain.files.iter().find(|f| f.label == "~/.ssh/key").expect("listed");
         assert_eq!(key.skipped, Some(MemorySkip::OutsideProject));
 
-        // A submodule: its own `.git` is a file; the outermost tree wins.
+        // A submodule: its own `.git` is a file. The superproject is
+        // untrusted too, but the submodule's files reach only the submodule.
         let sub = mono.join("vendor/sub");
         write(&sub.join(".git"), "gitdir: ../../.git/modules/sub");
-        write(&sub.join("CLAUDE.md"), "sub rules");
+        write(&sub.join("CLAUDE.md"), "sub rules @../../mono-only.md");
+        write(&mono.join("mono-only.md"), "MONO-ONLY");
         assert_eq!(untrusted_root(&canon(&sub)), canon(&mono));
         let chain = memory_chain(&sub, Some(home.path()));
         let read = read_of(&chain);
         assert!(read.contains("sub rules") && read.contains("mono rules") && !read.contains("SSH-SECRET"), "{chain:?}");
+        assert!(!read.contains("MONO-ONLY"), "the submodule reached its superproject: {chain:?}");
 
         // A worktree under `.octopus-worktrees/`, beside its checkout: the
         // directories above it hold no `.git`, so they are the user's.
@@ -28909,6 +28912,47 @@ mod request_context_tests {
         let read = read_of(&chain);
         assert!(read.contains("wt rules") && read.contains("code dir rules") && read.contains("team rules"), "{chain:?}");
         assert!(!read.contains("SSH-SECRET"), "{chain:?}");
+    }
+
+    /// A `.git` higher up (a dotfiles repo in home, a repo around the folder
+    /// of clones) makes those directories untrusted, but never widens what a
+    /// cloned repo's files can reach: each untrusted file is confined to the
+    /// nearest work tree around it.
+    #[test]
+    fn an_outer_work_tree_never_widens_a_project_s_reach() {
+        // A dotfiles repo in home: `@~/.ssh/key` from the cloned repo is skipped.
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        write(&home.path().join(".ssh/key"), "SSH-SECRET");
+        write(&home.path().join("code/sibling/notes.md"), "SIBLING-SECRET");
+        let repo = home.path().join("code/repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write(&repo.join("CLAUDE.md"), "repo rules @~/.ssh/key @../sibling/notes.md");
+        assert_eq!(untrusted_root(&canon(&repo)), canon(home.path()));
+        let chain = memory_chain(&repo, Some(home.path()));
+        let read: String = chain.files.iter().map(|f| f.text.as_str()).collect();
+        assert!(read.contains("repo rules"), "{chain:?}");
+        assert!(!read.contains("SSH-SECRET") && !read.contains("SIBLING-SECRET"), "{chain:?}");
+        let key = chain.files.iter().find(|f| f.label == "~/.ssh/key").expect("listed");
+        assert_eq!(key.skipped, Some(MemorySkip::OutsideProject));
+
+        // A repo around the folder of clones: sibling repos are out of reach.
+        let elsewhere = TempDir::new().unwrap();
+        write(&elsewhere.path().join(".ssh/key"), "SSH-SECRET");
+        let tree = TempDir::new().unwrap();
+        let code = tree.path().join("code");
+        std::fs::create_dir_all(code.join(".git")).unwrap();
+        std::fs::create_dir_all(code.join("repo-a/.git")).unwrap();
+        write(&code.join("repo-b/secret.md"), "REPO-B-SECRET");
+        write(&code.join("repo-b/notes.md"), "repo-b notes");
+        write(&code.join("repo-a/CLAUDE.md"), "repo-a rules @../repo-b/secret.md");
+        // The outer repo's own file is confined to the outer repo: it may
+        // read inside it, never home.
+        write(&code.join("CLAUDE.md"), "outer rules @repo-b/notes.md @~/.ssh/key");
+        let chain = memory_chain(&code.join("repo-a"), Some(elsewhere.path()));
+        let read: String = chain.files.iter().map(|f| f.text.as_str()).collect();
+        assert!(read.contains("repo-a rules") && read.contains("outer rules") && read.contains("repo-b notes"), "{chain:?}");
+        assert!(!read.contains("REPO-B-SECRET") && !read.contains("SSH-SECRET"), "{chain:?}");
     }
 
     /// A project's files can't pull anything from outside it into a request:

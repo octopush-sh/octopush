@@ -259,18 +259,6 @@ pub struct MemoryFile {
     pub skipped: Option<MemorySkip>,
 }
 
-/// Whose file it is, which decides where it may point. The repository is
-/// the untrusted part: every directory from the project up to the outermost
-/// git work tree that encloses it, and every file that resolves inside that
-/// tree, is the project's, and may point only inside it. The user's files
-/// (`~/.claude/CLAUDE.md`, the files of the directories above every
-/// enclosing work tree, and what they import) may point anywhere.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Trust {
-    User,
-    Project,
-}
-
 /// How many skipped files a chain lists by name; the rest are counted.
 pub const MAX_LISTED_SKIPS: usize = 20;
 
@@ -282,22 +270,42 @@ pub struct MemoryChain {
     pub more_skipped: usize,
 }
 
-/// The untrusted root of a project: the outermost directory at or above its
-/// resolved root that holds a `.git` entry (a repo, a worktree, a submodule
-/// or the repo enclosing a subfolder), else the project itself.
+/// Whether `dir` is the root of a git work tree: it holds a `.git` entry (a
+/// repo, a worktree or a submodule).
+fn is_work_tree_root(dir: &Path) -> bool {
+    dir.join(".git").symlink_metadata().is_ok()
+}
+
+/// The untrusted zone of a project: the outermost directory at or above its
+/// resolved root that is a git work tree root (a repo, a worktree, a
+/// submodule's superproject, the repo enclosing a subfolder), else the
+/// project itself. Every directory from the project up to it is the
+/// repository's, not the user's.
 pub fn untrusted_root(root: &Path) -> PathBuf {
-    root.ancestors()
-        .filter(|d| d.join(".git").symlink_metadata().is_ok())
-        .last()
-        .unwrap_or(root)
-        .to_path_buf()
+    root.ancestors().filter(|d| is_work_tree_root(d)).last().unwrap_or(root).to_path_buf()
+}
+
+/// Where an untrusted file in `dir` may reach: the nearest git work tree
+/// that encloses it, never a wider one, or `fallback` (the project itself,
+/// when it isn't in a work tree).
+pub fn nearest_work_tree(dir: &Path, fallback: &Path) -> PathBuf {
+    dir.ancestors().find(|d| is_work_tree_root(d)).unwrap_or(fallback).to_path_buf()
 }
 
 /// Walks the chain: the paths reached, so a file reached twice is read once.
+///
+/// Who is untrusted: every directory from the project up to the outermost
+/// work tree enclosing it ([`untrusted_root`]), and every file that resolves
+/// in there, however it was reached. Where such a file may reach: the
+/// nearest work tree that encloses it ([`nearest_work_tree`]), so the
+/// project's files stay in the project's own tree, and a `.git` in a parent
+/// folder or in home (a dotfiles repo) never widens what a cloned repo can
+/// import. The user's files (`~/.claude/CLAUDE.md`, the directories above
+/// the untrusted zone, and what they import outside it) may point anywhere.
 struct ChainWalk {
     /// The project dir, resolved; labels are relative to it.
     root: Option<PathBuf>,
-    /// [`untrusted_root`] of `root`: where the project's files may point.
+    /// [`untrusted_root`] of `root`.
     untrusted: Option<PathBuf>,
     /// The user's home as given (for `~/` imports) and resolved (for labels).
     home: Option<PathBuf>,
@@ -315,20 +323,25 @@ impl ChainWalk {
         }
     }
 
+    /// Where an untrusted file at `real` may reach, or `None` when `real` is
+    /// outside the untrusted zone (a user's file).
+    fn reach_of(&self, real: &Path) -> Option<PathBuf> {
+        let zone = self.untrusted.as_deref()?;
+        if !real.starts_with(zone) {
+            return None;
+        }
+        Some(nearest_work_tree(real.parent().unwrap_or(real), self.root.as_deref().unwrap_or(zone)))
+    }
+
     /// Add the memory file at `path` (when it is one not yet reached) and,
-    /// up to [`MAX_IMPORT_DEPTH`], the files it imports.
-    fn add(&mut self, path: &Path, trust: Trust, depth: usize) {
+    /// up to [`MAX_IMPORT_DEPTH`], the files it imports. `limit` is where
+    /// the file may resolve: `None` for a user's file, else the work tree
+    /// confining it.
+    fn add(&mut self, path: &Path, limit: Option<PathBuf>, depth: usize) {
         // Already read by another route (an import of an ancestor's file, say).
         if std::fs::canonicalize(path).is_ok_and(|r| self.seen.contains(&r)) {
             return;
         }
-        let limit = match trust {
-            Trust::User => None,
-            Trust::Project => match &self.untrusted {
-                Some(r) => Some(r.clone()),
-                None => return,
-            },
-        };
         let (real, raw) = match read_memory_file(path, limit.as_deref()) {
             Ok(Some(found)) => found,
             Ok(None) => return,
@@ -347,10 +360,10 @@ impl ChainWalk {
         if !self.seen.insert(real.clone()) {
             return;
         }
-        // A file inside the untrusted tree is the project's, whoever imported
-        // it or linked to it: an ancestor's file that resolves into the
-        // project can't let a project file's imports out.
-        let trust = if self.untrusted.as_deref().is_some_and(|r| real.starts_with(r)) { Trust::Project } else { trust };
+        // A file that resolves into the untrusted zone is the repository's,
+        // whoever imported it or linked to it, and its imports are confined
+        // to the nearest work tree around it; a user's file keeps its reach.
+        let reach = self.reach_of(&real).or(limit);
         let text = String::from_utf8_lossy(&raw).into_owned();
         let imports = if depth < MAX_IMPORT_DEPTH { memory_imports(&text) } else { Vec::new() };
         let label = self.label(&real);
@@ -358,7 +371,7 @@ impl ChainWalk {
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         for spec in imports {
             if let Some(target) = resolve_import(&spec, &base, self.home.as_deref()) {
-                self.add(&target, trust, depth + 1);
+                self.add(&target, reach.clone(), depth + 1);
             }
         }
     }
@@ -370,14 +383,14 @@ impl ChainWalk {
 /// `CLAUDE.local.md`, each followed by what it imports (an `AGENTS.md` counts
 /// only when imported). The directories from the project up to the
 /// outermost git work tree enclosing it ([`untrusted_root`]) are the
-/// repository's: their files, and anything that resolves into that tree,
-/// are read only when they resolve inside it, so an import of `~/…`, `../…`
-/// or an absolute path, or a symlink out of it, is listed as skipped
+/// repository's: each of their files, and anything that resolves into that
+/// zone, is read only when it resolves inside the nearest work tree around
+/// it ([`nearest_work_tree`]), so an import of `~/…`, `../…` or an absolute
+/// path, or a symlink, that leaves it is listed as skipped
 /// ([`MemorySkip::OutsideProject`]) and never read. The user's own file and
-/// the directories above every enclosing work tree are the user's, and their
-/// imports may point anywhere. Every file is size-capped
-/// ([`read_memory_file`]); skipped files past [`MAX_LISTED_SKIPS`] are
-/// counted, not listed.
+/// the directories above the zone are the user's, and their imports may
+/// point anywhere. Every file is size-capped ([`read_memory_file`]); skipped
+/// files past [`MAX_LISTED_SKIPS`] are counted, not listed.
 pub fn memory_chain(project: &Path, home: Option<&Path>) -> MemoryChain {
     let root = std::fs::canonicalize(project).ok();
     let mut walk = ChainWalk {
@@ -389,16 +402,16 @@ pub fn memory_chain(project: &Path, home: Option<&Path>) -> MemoryChain {
         chain: MemoryChain::default(),
     };
     if let Some(h) = home {
-        walk.add(&h.join(".claude").join("CLAUDE.md"), Trust::User, 0);
+        walk.add(&h.join(".claude").join("CLAUDE.md"), None, 0);
     }
     let (Some(root), Some(untrusted)) = (root, walk.untrusted.clone()) else { return walk.chain };
     // Every ancestor of the resolved root but the filesystem root, top down.
     let mut dirs: Vec<&Path> = root.ancestors().filter(|d| d.parent().is_some()).collect();
     dirs.reverse();
     for dir in dirs {
-        let trust = if dir.starts_with(&untrusted) { Trust::Project } else { Trust::User };
+        let limit = dir.starts_with(&untrusted).then(|| nearest_work_tree(dir, &root));
         for name in ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"] {
-            walk.add(&dir.join(name), trust, 0);
+            walk.add(&dir.join(name), limit.clone(), 0);
         }
     }
     walk.chain
