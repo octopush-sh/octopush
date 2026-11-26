@@ -40,7 +40,7 @@
 # Actions are pinned by commit. The Claude CLI is installed in a step that
 # holds no token.
 #
-# Scheduled on odd hours at :22, between the Epiku builder's runs, enabled
+# Scheduled on odd UTC hours at :22, between the Epiku builder's runs, enabled
 # 2026-11-26 after the first manual build, review and merge cycle worked.
 name: epiku-review
 

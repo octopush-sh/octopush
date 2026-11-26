@@ -42,7 +42,7 @@
 #
 # Merging is epiku-review.yml's job, never this one's.
 #
-# Scheduled on even hours at :22 (a slot no other lane uses), enabled
+# Scheduled on even UTC hours at :22 (a slot no other lane uses), enabled
 # 2026-11-26 after the first manual build, review and merge cycle worked.
 name: epiku-build
 
