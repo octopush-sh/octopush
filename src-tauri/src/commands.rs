@@ -2176,6 +2176,15 @@ pub async fn list_skills(workspace_path: String) -> AppResult<Vec<crate::skills:
     Ok(skills.iter().map(|s| s.meta()).collect())
 }
 
+/// The worktree's skill files left unread: a project skill that resolves
+/// outside the project, or one over 4 MiB. The slash menu lists them under
+/// the skills as "skipped: …".
+#[tauri::command]
+pub async fn list_skipped_skills(workspace_path: String) -> AppResult<Vec<crate::skills::SkippedDefinition>> {
+    let scan = crate::skills::scan_skills_in(std::path::Path::new(&workspace_path), dirs::home_dir().as_deref());
+    Ok(scan.skipped)
+}
+
 /// The workspace's `.claude/agents/*.md` definitions (project ∪ user) — the
 /// `subagent_type`s Talk's `Agent` tool can run under.
 #[tauri::command]

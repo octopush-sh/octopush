@@ -19,6 +19,9 @@
 //!   - `~/.claude/agents/*.md`           (user)
 //!   - `skills::builtin_agents`          (builtin — explorer, implementer, …)
 //!
+//! A project's files are read like its skills: only when they resolve inside
+//! the project's work tree, and bounded (`skills::definition_roots`).
+//!
 //! One extra frontmatter key Claude Code does not read: `escalate: <tier or
 //! model>` — retry once on that model when the report comes back failed,
 //! blocked, or cut off at the turn limit.
@@ -30,7 +33,7 @@
 //! An unknown `subagent_type` still works as a plain role hint — the same
 //! files that drive Claude Code drive Octopush, nothing else to set up.
 
-use super::{split_frontmatter, split_list};
+use super::{definition_roots, read_definition, split_frontmatter, split_list, DefinitionScan};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -305,19 +308,14 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, max_turns, effort, source: source.to_string() })
 }
 
-fn agent_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
-    let mut roots = vec![(worktree.join(".claude/agents"), "project")];
-    if let Some(home) = dirs::home_dir() {
-        roots.push((home.join(".claude/agents"), "user"));
-    }
-    roots
-}
-
 /// Discover every agent definition for a worktree (project ∪ user ∪
 /// builtin), project shadowing user shadowing builtin on a name clash,
-/// sorted by name.
+/// sorted by name. Skipped files go to the log (`skills::log_skipped`):
+/// agents have no list in the UI.
 pub fn scan_agent_definitions(worktree: &Path) -> Vec<AgentDefinition> {
-    let mut out = scan_agent_files(worktree);
+    let scan = scan_agent_files_in(worktree, dirs::home_dir().as_deref());
+    super::log_skipped("agent", &scan.skipped);
+    let mut out = scan.found;
     for def in super::builtin_agents::builtin_agent_definitions() {
         if !out.iter().any(|d| d.name.eq_ignore_ascii_case(&def.name)) {
             out.push(def);
@@ -327,11 +325,14 @@ pub fn scan_agent_definitions(worktree: &Path) -> Vec<AgentDefinition> {
     out
 }
 
-/// The on-disk definitions only (project ∪ user), project shadowing user.
-fn scan_agent_files(worktree: &Path) -> Vec<AgentDefinition> {
-    let mut out: Vec<AgentDefinition> = Vec::new();
-    for (root, source) in agent_roots(worktree) {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+/// The on-disk definitions only (project ∪ user), project shadowing user,
+/// with the user's home given, and the files left unread: a project file
+/// that resolves outside the project, or one over 4 MiB. Read the way a
+/// skill is (`skills::definition_roots`, `skills::read_definition`).
+pub fn scan_agent_files_in(worktree: &Path, home: Option<&Path>) -> DefinitionScan<AgentDefinition> {
+    let mut scan: DefinitionScan<AgentDefinition> = DefinitionScan::default();
+    for root in definition_roots(worktree, home, "agents") {
+        let Ok(entries) = std::fs::read_dir(&root.dir) else { continue };
         let mut files: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
@@ -339,16 +340,25 @@ fn scan_agent_files(worktree: &Path) -> Vec<AgentDefinition> {
             .collect();
         files.sort();
         for path in files {
-            let Ok(content) = std::fs::read_to_string(&path) else { continue };
-            if let Some(def) = parse_agent_definition(&content, source) {
-                if out.iter().any(|d| d.name == def.name) {
+            let content = match read_definition(&path, root.limit.as_deref()) {
+                Ok(Some(content)) => content,
+                Ok(None) => continue,
+                Err(why) => {
+                    let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    scan.skip(&root, &name, &file, &path, why);
                     continue;
                 }
-                out.push(def);
+            };
+            if let Some(def) = parse_agent_definition(&content, root.source) {
+                if scan.found.iter().any(|d| d.name == def.name) {
+                    continue;
+                }
+                scan.found.push(def);
             }
         }
     }
-    out
+    scan
 }
 
 /// Look one definition up by `subagent_type`. Case-sensitive on the name

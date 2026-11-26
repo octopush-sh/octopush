@@ -1,13 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
-const { mockListFiles, mockListSkills } = vi.hoisted(() => ({
+const { mockListFiles, mockListSkills, mockListSkippedSkills } = vi.hoisted(() => ({
   mockListFiles: vi.fn(),
   mockListSkills: vi.fn(),
+  mockListSkippedSkills: vi.fn(),
 }));
 
 vi.mock("../../lib/ipc", () => ({
-  ipc: { listWorkspaceFiles: mockListFiles, listSkills: mockListSkills },
+  ipc: { listWorkspaceFiles: mockListFiles, listSkills: mockListSkills, listSkippedSkills: mockListSkippedSkills },
 }));
 
 import { RichPromptTextarea } from "./RichPromptTextarea";
@@ -24,6 +25,7 @@ beforeEach(() => {
     { name: "code-review", description: "Review it", source: "project" },
     { name: "simplify", description: "Tidy it", source: "user" },
   ]);
+  mockListSkippedSkills.mockResolvedValue([]);
 });
 
 /** Types into the textarea the way the component reads it: value + caret. */

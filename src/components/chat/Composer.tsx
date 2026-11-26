@@ -5,7 +5,7 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useProvidersStore } from "../../stores/providersStore";
 import { estimateNextTurnTokens, estimatePerMessageCost } from "../../lib/cost";
 import { ipc } from "../../lib/ipc";
-import type { ModelInfo, SkillMeta } from "../../lib/types";
+import type { ModelInfo, SkillMeta, SkippedDefinition } from "../../lib/types";
 import { findActiveMention, applyMention } from "../../lib/mentions";
 import {
   blockTokens,
@@ -30,7 +30,7 @@ import { ContextChips } from "./ContextChips";
 import { ModelPicker } from "../ModelPicker";
 import { EffortSelector } from "./EffortSelector";
 import { MentionPopover } from "./MentionPopover";
-import { SlashMenu } from "./SlashMenu";
+import { SlashMenu, matchingSkipped } from "./SlashMenu";
 import { ComposerEstimate } from "./ComposerEstimate";
 import { CommandHistoryPopover } from "./CommandHistoryPopover";
 import { AttachmentTray } from "./AttachmentTray";
@@ -109,6 +109,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   // while drafting, and resolved by the backend when the turn runs. Nothing
   // is pinned to the conversation — the next message starts clean.
   const [skills, setSkills] = useState<SkillMeta[]>([]);
+  // Skill files the backend left unread, named under the menu's skills.
+  const [skippedSkills, setSkippedSkills] = useState<SkippedDefinition[]>([]);
   const skillNames = useMemo(() => skills.map((s) => s.name), [skills]);
   const [slash, setSlash] = useState<{ query: string; start: number; caret: number } | null>(null);
   const [slashIndex, setSlashIndex] = useState(0);
@@ -121,6 +123,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     const q = slash.query.toLowerCase();
     return q ? skills.filter((s) => s.name.toLowerCase().includes(q)) : skills;
   }, [slash, skills]);
+  const slashSkipped = useMemo(
+    () => (slash ? matchingSkipped(skippedSkills, slash.query) : []),
+    [slash, skippedSkills],
+  );
   // The backend rescans the worktree on every turn, so the composer's list
   // is refreshed whenever the menu opens (and once per workspace) — the
   // highlight is the user's only signal of what will be invoked.
@@ -134,6 +140,12 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         setSkills(s);
         // The thread's sent messages read their `/name` tokens as chips too.
         setSkillNames(workspaceId, s.map((k) => k.name));
+      })
+      .catch(() => {});
+    ipc
+      .listSkippedSkills(workspacePath)
+      .then((s) => {
+        if (req === skillsReqRef.current) setSkippedSkills(s);
       })
       .catch(() => {});
   }, [workspacePath, workspaceId, setSkillNames]);
@@ -837,6 +849,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         {slashOpen && (
           <SlashMenu
             items={slashItems}
+            skipped={slashSkipped}
             activeIndex={slashIndex}
             onSelect={selectSkill}
             onHover={setSlashIndex}

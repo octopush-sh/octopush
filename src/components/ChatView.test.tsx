@@ -52,6 +52,7 @@ vi.mock("../lib/ipc", () => ({
     renameChatThread: vi.fn().mockResolvedValue(undefined),
     deleteChatThread: vi.fn().mockResolvedValue(undefined),
     listSkills: vi.fn().mockResolvedValue([]),
+    listSkippedSkills: vi.fn().mockResolvedValue([]),
     readAttachment: vi.fn().mockResolvedValue({ mediaType: "image/png", data: "", name: "x.png" }),
   },
 }));
@@ -964,6 +965,7 @@ describe("ChatView — /skill menu and inline highlight", () => {
   beforeEach(() => {
     resetStore();
     vi.mocked(ipcMock.listSkills).mockResolvedValue(skills);
+    vi.mocked(ipcMock.listSkippedSkills).mockResolvedValue([]);
   });
 
   function getTextarea() {
@@ -1008,6 +1010,26 @@ describe("ChatView — /skill menu and inline highlight", () => {
     expect(await screen.findByRole("listbox", { name: "Skills" })).toBeInTheDocument();
     fireEvent.keyDown(ta, { key: "Escape" });
     expect(screen.queryByRole("listbox", { name: "Skills" })).toBeNull();
+  });
+
+  it("names a skipped skill file under the skills, muted and not selectable", async () => {
+    vi.mocked(ipcMock.listSkippedSkills).mockResolvedValue([
+      { name: "linked", label: ".claude/skills/linked/SKILL.md", path: "/tmp/.claude/skills/linked/SKILL.md", reason: "outside the project" },
+    ]);
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    type(ta, "/");
+    const menu = await screen.findByRole("listbox", { name: "Skills" });
+    await waitFor(() => expect(menu).toHaveTextContent("skipped: outside the project"));
+    const row = screen.getByTitle(".claude/skills/linked/SKILL.md · skipped: outside the project");
+    expect(row).toHaveAttribute("aria-disabled", "true");
+    // A query that names only real skills leaves it out; the keys move over skills only.
+    type(ta, "/rel");
+    expect(screen.getByRole("listbox", { name: "Skills" })).not.toHaveTextContent("skipped:");
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(ta.value).toBe("/release ");
   });
 
   it("sends the tokens as plain text — no skill field, nothing pinned for the next message", async () => {

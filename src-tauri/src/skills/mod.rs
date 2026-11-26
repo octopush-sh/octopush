@@ -16,14 +16,22 @@
 //!   - `<worktree>/.claude/skills/*/SKILL.md`  (project)
 //!   - `~/.claude/skills/*/SKILL.md`           (user)
 //!
+//! A project's files are the repository's, so they are read the way its
+//! `CLAUDE.md` is ([`definition_roots`], [`read_definition`]): only when they
+//! resolve inside the project's work tree, and bounded. The user's own files
+//! are trusted.
+//!
 //! The frontmatter is parsed by hand (the three fields we use are simple
 //! `key: value` lines) so we don't pull in a YAML dependency.
 
 pub mod agents;
 pub mod builtin_agents;
 
+use crate::request_context::{nearest_work_tree, read_memory_file, MemorySkip};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Lightweight skill descriptor for the picker (no body — keep the payload small).
 #[derive(Serialize, Clone, Debug)]
@@ -56,13 +64,110 @@ impl Skill {
     }
 }
 
-/// The two skill roots, project first (it shadows user skills of the same name).
-fn skill_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
-    let mut roots = vec![(worktree.join(".claude/skills"), "project")];
-    if let Some(home) = dirs::home_dir() {
-        roots.push((home.join(".claude/skills"), "user"));
+/// A skill or agent file that was found but never read, and why.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedDefinition {
+    /// What the user knows it by: the skill's directory, or the agent
+    /// file's name without `.md`.
+    pub name: String,
+    /// Where it was found: `.claude/skills/<name>/SKILL.md` in the project,
+    /// `~/.claude/…` for the user's.
+    pub label: String,
+    /// The full path where it was found (not where it resolves).
+    pub path: String,
+    /// `outside the project` or `over 4 MiB` ([`MemorySkip::as_str`]).
+    pub reason: String,
+}
+
+/// What a scan of the definition roots found: the definitions read, and
+/// the entries left unread.
+#[derive(Clone, Debug)]
+pub struct DefinitionScan<T> {
+    pub found: Vec<T>,
+    pub skipped: Vec<SkippedDefinition>,
+}
+
+impl<T> Default for DefinitionScan<T> {
+    fn default() -> Self {
+        Self { found: Vec::new(), skipped: Vec::new() }
+    }
+}
+
+impl<T> DefinitionScan<T> {
+    /// Note `path` (found under `root` as `rel`) as left unread.
+    fn skip(&mut self, root: &DefinitionRoot, name: &str, rel: &str, path: &Path, why: MemorySkip) {
+        self.skipped.push(SkippedDefinition {
+            name: name.to_string(),
+            label: format!("{}/{rel}", root.shown),
+            path: path.display().to_string(),
+            reason: why.as_str().to_string(),
+        });
+    }
+}
+
+/// One directory a scan reads definitions from.
+pub(crate) struct DefinitionRoot {
+    pub dir: PathBuf,
+    /// "project" or "user".
+    pub source: &'static str,
+    /// How `dir` is written in a skipped entry's label.
+    pub shown: String,
+    /// Where its files must resolve: the work tree confining a project's
+    /// files; `None` for the user's own directory, which is trusted.
+    pub limit: Option<PathBuf>,
+}
+
+/// The roots of `.claude/<kind>` (`skills` or `agents`), project first (it
+/// shadows the user's). The project's files are the repository's: each is
+/// read only when it resolves, symlinks included, inside the nearest git
+/// work tree around the worktree (`request_context::nearest_work_tree`, the
+/// same reach its `.claude/CLAUDE.md` has), so a link to a file elsewhere
+/// on the Mac, or into an outer repository, is never read. The user's
+/// `~/.claude/<kind>` is trusted; a project whose `.claude/<kind>` resolves
+/// to that very directory (home opened as a project) reads it as the user's.
+pub(crate) fn definition_roots(worktree: &Path, home: Option<&Path>, kind: &str) -> Vec<DefinitionRoot> {
+    let user = home.map(|h| h.join(".claude").join(kind));
+    let user_real = user.as_deref().and_then(|u| std::fs::canonicalize(u).ok());
+    let mut roots = Vec::new();
+    // Resolved first: containment compares resolved paths.
+    if let Ok(project) = std::fs::canonicalize(worktree) {
+        let dir = project.join(".claude").join(kind);
+        let own = user_real.is_some() && std::fs::canonicalize(&dir).ok() == user_real;
+        roots.push(DefinitionRoot {
+            limit: (!own).then(|| nearest_work_tree(&project, &project)),
+            dir,
+            source: "project",
+            shown: format!(".claude/{kind}"),
+        });
+    }
+    if let Some(dir) = user {
+        roots.push(DefinitionRoot { dir, source: "user", shown: format!("~/.claude/{kind}"), limit: None });
     }
     roots
+}
+
+/// Read one definition file the way every project file is read
+/// (`request_context::read_memory_file`): resolved, symlinks included, and
+/// refused when it leaves `limit`; opened non-blocking, a regular file, at
+/// most 4 MiB. `Ok(None)` when there is no regular file there, or it isn't
+/// UTF-8 (as before: such a file is not a definition).
+pub(crate) fn read_definition(path: &Path, limit: Option<&Path>) -> Result<Option<String>, MemorySkip> {
+    Ok(read_memory_file(path, limit)?.and_then(|(_, raw)| String::from_utf8(raw).ok()))
+}
+
+/// Log each skipped definition once per path and reason: the readers rescan
+/// on every turn, and agents have no list in the UI to show it in.
+pub(crate) fn log_skipped(kind: &str, skipped: &[SkippedDefinition]) {
+    static LOGGED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    // What one run remembers; past it, nothing more is logged.
+    const MAX_LOGGED: usize = 1024;
+    let mut logged = LOGGED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    for s in skipped {
+        if logged.len() < MAX_LOGGED && logged.insert((s.path.clone(), s.reason.clone())) {
+            tracing::warn!(path = %s.path, "{kind} {} skipped: {}", s.name, s.reason);
+        }
+    }
 }
 
 /// Split a Claude-Code-style markdown file into its frontmatter pairs and
@@ -144,29 +249,48 @@ pub fn parse_skill(content: &str, source: &str) -> Option<Skill> {
     })
 }
 
-/// Discover all skills for a worktree (project ∪ user), project shadowing user.
+/// Discover all skills for a worktree (project ∪ user), project shadowing
+/// user. Skipped entries go to the log ([`log_skipped`]).
 pub fn scan_skills(worktree: &Path) -> Vec<Skill> {
-    let mut out: Vec<Skill> = Vec::new();
-    for (root, source) in skill_roots(worktree) {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let md = entry.path().join("SKILL.md");
-            let Ok(content) = std::fs::read_to_string(&md) else { continue };
-            if let Some(skill) = parse_skill(&content, source) {
-                // Project shadows user: skip a user skill whose name a project
-                // skill already claimed.
-                if out.iter().any(|s| s.name == skill.name) {
+    let scan = scan_skills_in(worktree, dirs::home_dir().as_deref());
+    log_skipped("skill", &scan.skipped);
+    scan.found
+}
+
+/// [`scan_skills`] with the user's home given, and the entries left unread:
+/// a project skill whose `SKILL.md` resolves outside the project, or one
+/// over 4 MiB ([`definition_roots`], [`read_definition`]). A skill directory
+/// may be a link: where its `SKILL.md` resolves decides. Entries are read in
+/// name order, so which of two same-named skills in one root wins is stable.
+pub fn scan_skills_in(worktree: &Path, home: Option<&Path>) -> DefinitionScan<Skill> {
+    let mut scan: DefinitionScan<Skill> = DefinitionScan::default();
+    for root in definition_roots(worktree, home, "skills") {
+        let Ok(entries) = std::fs::read_dir(&root.dir) else { continue };
+        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let md = dir.join("SKILL.md");
+            let content = match read_definition(&md, root.limit.as_deref()) {
+                Ok(Some(content)) => content,
+                Ok(None) => continue,
+                Err(why) => {
+                    scan.skip(&root, &name, &format!("{name}/SKILL.md"), &md, why);
                     continue;
                 }
-                out.push(skill);
+            };
+            if let Some(skill) = parse_skill(&content, root.source) {
+                // Project shadows user: skip a user skill whose name a project
+                // skill already claimed.
+                if scan.found.iter().any(|s| s.name == skill.name) {
+                    continue;
+                }
+                scan.found.push(skill);
             }
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    scan.found.sort_by(|a, b| a.name.cmp(&b.name));
+    scan
 }
 
 /// Load a single skill by name for a worktree (project shadowing user).
