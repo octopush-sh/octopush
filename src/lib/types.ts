@@ -775,6 +775,9 @@ export interface AppSettings {
   quietClaudeCode?: boolean;
   /** Secret guard (#730): on unless saved `false`. */
   secretGuardEnabled?: boolean | null;
+  /** The menu bar Octo (#718, Settings › General › "Show in menu bar"): on
+   *  unless saved `false`. */
+  menuBarEnabled?: boolean | null;
   /** Settings › General › Attention › "Notify me elsewhere" (#964). Unset →
    *  **off**. Owned by `set_notify_elsewhere`: whole-file saves carry it and
    *  the URL through untouched. */

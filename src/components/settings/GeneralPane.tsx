@@ -94,6 +94,7 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
             onChange={setCrewNotifications}
           />
           <NotifyElsewhereRow />
+          <MenuBarRow />
           <ClaudeHooksRow />
         </div>
       </div>
@@ -131,6 +132,41 @@ function ClaudeHooksRow() {
         checked={enabled}
         onChange={(on) => void persist(on)}
         testId="claude-hooks-switch"
+      />
+    </div>
+  );
+}
+
+/** `menuBarEnabled` — **on unless saved as `false`** (#718). Saving it shows
+ *  or hides the Octo in the macOS menu bar at once (`save_settings`). */
+function MenuBarRow() {
+  const [enabled, setEnabled] = useState(true);
+
+  useEffect(() => {
+    ipc
+      .getSettings()
+      .then((s) => setEnabled(s.menuBarEnabled ?? true))
+      .catch(() => {});
+  }, []);
+
+  async function persist(on: boolean) {
+    setEnabled(on);
+    try {
+      const s = await ipc.getSettings();
+      await ipc.saveSettings({ ...s, menuBarEnabled: on });
+    } catch {
+      // Leave the switch where the user put it; the next change retries.
+    }
+  }
+
+  return (
+    <div data-tour="settings-menu-bar">
+      <ToggleRow
+        label="Show in menu bar"
+        description="The Octo sits in the macOS menu bar with the number of crews that need you. Its menu lists them, the longest-waiting first; choose one to open it, even with the window closed. Nothing it shows leaves this Mac."
+        checked={enabled}
+        onChange={(on) => void persist(on)}
+        testId="menu-bar-switch"
       />
     </div>
   );

@@ -3,6 +3,7 @@ import { fleetCounts, isTransientHalt, needsYou, settledCounts } from "./runStat
 import type { RunStatus } from "./ipc";
 import { isPlanWaiting } from "./planWait";
 import fixtures from "./needsYou.fixtures.json";
+import transientFixtures from "./transientHalt.fixtures.json";
 
 /** A plan park with (`true`) or without (`false`) a scheduled resume. */
 function planWaitFor(scheduled: boolean) {
@@ -60,74 +61,29 @@ describe("needsYou", () => {
   });
 });
 
-describe("isTransientHalt", () => {
-  it("flags rate-limit / overload / server / network faults as transient", () => {
-    const transient = [
-      "Anthropic API error 429 Too Many Requests: rate_limit_error",
-      "Anthropic API error 529: overloaded_error",
-      "OpenAI-compat API error 503 Service Unavailable",
-      "Anthropic API error 500: internal_server_error",
-      "Anthropic API error 502 Bad Gateway",
-      "Anthropic request failed: connection reset by peer",
-      "request timed out after 60s",
-      "dns error: failed to lookup host",
-      // Startup recovery stamp for stages orphaned by a crash/quit.
-      "interrupted — Octopush closed while this stage was in flight; the work on disk is preserved, resume the stage to continue",
-    ];
-    for (const e of transient) {
+describe("isTransientHalt parity with the menu bar (Rust fleet_status)", () => {
+  // Rate limit, overload, 5xx, network, the relaunch's "interrupted" stamp and
+  // a Claude plan limit are transient; standing faults, a hook-deferred tool
+  // halt (whatever its tail says), network words inside other words and bare
+  // numbers in prose are not. Rust's `is_transient_halt` reads the same file.
+  it("flags every transient case of the shared fixture", () => {
+    for (const e of transientFixtures.transient) {
       expect(isTransientHalt(e), e).toBe(true);
     }
   });
 
-  it("does NOT flag standing faults or non-API halts as transient", () => {
-    const fatal = [
-      null,
-      "",
-      "agentic loop hit 25 iterations without finishing — review the work journal",
-      "stopped by the director — review the work journal, then accept, re-run, or abort",
-      "Anthropic API error 401: authentication_error",
-      "Anthropic API error 400: invalid_request_error",
-      "unknown substrate 'foo'",
-      "workspace has no worktree_path",
-    ];
-    for (const e of fatal) {
+  it("flags none of its standing cases", () => {
+    for (const e of transientFixtures.notTransient) {
       expect(isTransientHalt(e), String(e)).toBe(false);
     }
   });
 
-  it("never flags a hook-deferred tool halt, whatever its tool name or stderr tail says", () => {
-    const deferred = [
-      "A hook paused mcp__cloudflare-dns__create_record before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)",
-      "The resumed session was waiting to run echo (MCP server srv), which isn't available anymore. Reconnect it and resume, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)\n— stderr —\nrequest timed out; connection refused",
-    ];
-    for (const e of deferred) {
-      expect(isTransientHalt(e), e).toBe(false);
-    }
-  });
-
-  it("matches the network patterns on word boundaries only", () => {
-    for (const e of ["tool mcp__cloudflare-dns__create_record crashed", "wrote dnsmasq.conf", "subrequest failedover"]) {
-      expect(isTransientHalt(e), e).toBe(false);
-    }
-  });
-
-  it("does not false-positive on unrelated numbers in prose", () => {
-    // A bare line/column, byte, or token count must not read as an HTTP status —
-    // the code is only transient inside our "… API error <code> …" framing.
-    const notTransient = [
-      "edited 12 files, 4200 insertions",
-      "plan has 5000 steps",
-      "read 503 bytes from the file",
-      "wrote 500 lines",
-      "took 502 ms",
-      "line 429 column 3 of src/foo.ts",
-      "iteration 500 of 1000",
-      "context window: 12,500 tokens",
-      "TypeError at line 529",
-    ];
-    for (const e of notTransient) {
-      expect(isTransientHalt(e), e).toBe(false);
-    }
+  it("covers the edges it exists for", () => {
+    const all = [...transientFixtures.transient, ...transientFixtures.notTransient].map(String);
+    expect(all.some((e) => e.startsWith("interrupted"))).toBe(true);
+    expect(all.some((e) => e.includes("(terminal_reason: tool_deferred)"))).toBe(true);
+    expect(all.some((e) => e.includes("(plan_limit)"))).toBe(true);
+    expect(transientFixtures.notTransient).toContain(null);
   });
 });
 

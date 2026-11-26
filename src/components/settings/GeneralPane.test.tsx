@@ -111,6 +111,62 @@ describe("GeneralPane — Claude Code hooks (on by default)", () => {
   });
 });
 
+describe("GeneralPane — Show in menu bar (on by default, #718)", () => {
+  const toggle = () => screen.getByTestId("menu-bar-switch");
+
+  it("is on when nothing is saved, in the Attention section, with its tour anchor", async () => {
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    expect(toggle()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("switch", { name: "Show in menu bar" })).toBe(toggle());
+    const row = document.querySelector('[data-tour="settings-menu-bar"]');
+    expect(row).not.toBeNull();
+    expect(row?.contains(toggle())).toBe(true);
+    // After "Notify me elsewhere", with the other attention settings.
+    expect(document.querySelector('[data-tour="settings-notify-elsewhere"]')?.nextElementSibling).toBe(row);
+    expect(screen.getByText(/longest-waiting first/)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing it shows leaves this Mac\./)).toBeInTheDocument();
+  });
+
+  it("reads a saved false as off", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, menuBarEnabled: false });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await waitFor(() => expect(toggle()).toHaveAttribute("aria-checked", "false"));
+  });
+
+  it("switching off saves an explicit false, without clobbering other settings", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, editorCommand: "cursor", secretGuardEnabled: false });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ editorCommand: "cursor", secretGuardEnabled: false, menuBarEnabled: false }),
+    );
+    expect(toggle()).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("switching it back on saves true", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, menuBarEnabled: false });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await waitFor(() => expect(toggle()).toHaveAttribute("aria-checked", "false"));
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings).toHaveBeenLastCalledWith(expect.objectContaining({ menuBarEnabled: true }));
+    expect(toggle()).toHaveAttribute("aria-checked", "true");
+  });
+});
+
 describe("GeneralPane — secret guard (on by default)", () => {
   const toggle = () => screen.getByTestId("secret-guard-switch");
 

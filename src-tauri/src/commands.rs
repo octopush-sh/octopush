@@ -1756,6 +1756,7 @@ pub async fn update_workspace_customization(
 
 #[tauri::command]
 pub async fn rename_workspace(
+    app: AppHandle,
     state: State<'_, AppState>,
     workspace_id: String,
     name: String,
@@ -1764,7 +1765,10 @@ pub async fn rename_workspace(
     if name.is_empty() {
         return Err(AppError::Other("Workspace name cannot be empty".into()));
     }
-    state.db.lock().rename_workspace(&workspace_id, &name)
+    state.db.lock().rename_workspace(&workspace_id, &name)?;
+    // The menu bar names crews by workspace; a rename sends no run event.
+    crate::fleet_status::refresh_later(&app);
+    Ok(())
 }
 
 // ─── Chat commands ────────────────────────────────────────────────
@@ -5231,17 +5235,24 @@ pub async fn unreadable_settings_path() -> AppResult<Option<String>> {
 }
 
 #[tauri::command]
-pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
+pub async fn save_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: crate::settings::AppSettings,
+) -> AppResult<()> {
     // The sync opt-ins are owned by `set_sync_pref`; a stale read-modify-write
     // from a settings pane must never flip them — carried over from disk.
     let hooks_before = crate::settings::load_settings().ok().and_then(|s| s.claude_hooks_enabled);
     let hooks_flipped = crate::claude_hooks::toggled(hooks_before, settings.claude_hooks_enabled);
+    let menu_bar = crate::menu_bar::enabled(&settings);
     crate::settings::save_settings_from_ui(settings)?;
     // A key or base URL may have changed: re-detect gateways on the next read.
     state.gateways.invalidate();
     if hooks_flipped {
         sync_claude_hooks_later(&state.db);
     }
+    // "Show in menu bar" takes effect at once.
+    crate::menu_bar::apply_setting(&app, menu_bar);
     Ok(())
 }
 

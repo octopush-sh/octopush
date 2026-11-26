@@ -198,7 +198,8 @@ pub fn stalled(stages: &[crate::db::RunStageRow]) -> bool {
 }
 
 /// The drive's budget gate, exactly: a budget of `0` (or less) is no budget.
-fn budget_spent(run: &crate::db::RunRow) -> bool {
+/// The menu bar Octo reads it too, to say a crew stopped at its budget.
+pub(crate) fn budget_spent(run: &crate::db::RunRow) -> bool {
     run.budget_usd.is_some_and(|b| b > 0.0 && run.cost_usd >= b)
 }
 

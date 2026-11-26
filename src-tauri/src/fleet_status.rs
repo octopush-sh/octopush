@@ -1,7 +1,8 @@
-//! The fleet's needs-you count, derived in Rust so the Dock badge never depends
-//! on the webview (main may be hidden). Mirrors `needsYou` / `fleetCounts` in
-//! `src/lib/runStatus.ts`; `src/lib/needsYou.fixtures.json` pins the two, so
-//! the badge and the fleet chip can't disagree.
+//! The fleet's needs-you count, derived in Rust so the Dock badge and the menu
+//! bar Octo (`menu_bar.rs`) never depend on the webview (main may be hidden).
+//! Mirrors `needsYou` / `fleetCounts` in `src/lib/runStatus.ts`;
+//! `src/lib/needsYou.fixtures.json` pins the two, so the badge, the menu bar
+//! and the fleet chip can't disagree.
 
 use crate::state::AppState;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -60,6 +61,39 @@ pub fn calm_plan_wait(resume_at: Option<i64>, other_hold: bool) -> bool {
     resume_at.is_some() && !other_hold
 }
 
+/// Whether a halted stage's error is a *transient* fault that Resume answers
+/// (a rate limit, an overload, a 5xx inside an `API error` framing, a dropped
+/// connection or a time-out, the relaunch's `interrupted` stamp, a Claude plan
+/// limit) rather than a standing one: Mission Control's `stalled`. Never a
+/// hook-deferred tool halt, whatever its stderr tail says. Mirrors TS
+/// `isTransientHalt` (runStatus.ts); `src/lib/transientHalt.fixtures.json`
+/// pins the two. Word boundaries are ASCII, as in JavaScript.
+pub fn is_transient_halt(error: Option<&str>) -> bool {
+    use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_plan_limit, is_tool_deferred};
+    static TRANSIENT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?-u:\b)rate[\s_-]?limit",
+            r"|(?-u:\b)overloaded(?-u:\b)",
+            r"|api error (429|529|50[0-4])(?-u:\b)",
+            r"|(?-u:\b)request failed(?-u:\b)",
+            r"|(?-u:\b)timed?\s?out(?-u:\b)|(?-u:\b)timeout(?-u:\b)",
+            r"|(?-u:\b)connection (reset|closed|refused)(?-u:\b)|(?-u:\b)dns(?-u:\b)",
+        ))
+        .expect("transient halt pattern")
+    });
+    let Some(error) = error.filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    if is_tool_deferred(error) || is_deferred_tool_unavailable(error) {
+        return false;
+    }
+    if is_plan_limit(error) {
+        return true;
+    }
+    let e = error.to_lowercase();
+    e.starts_with("interrupted") || TRANSIENT.is_match(&e)
+}
+
 /// Run events after which a run's status may have changed.
 pub fn affects_badge(event: &str) -> bool {
     matches!(event, "run://checkpoint" | "run://stage-update" | "run://cost" | "run://error")
@@ -87,16 +121,38 @@ pub fn refresh_later(app: &AppHandle) {
 }
 
 /// Set the Dock badge to the needs-you count across every workspace (the same
-/// runs the fleet chip counts), clearing it at 0.
+/// runs the fleet chip counts), clearing it at 0, and hand the same read to
+/// the menu bar Octo (`menu_bar::update`), so the two can't disagree.
 pub fn refresh(app: &AppHandle) {
-    let runs = match app.state::<AppState>().db.lock().list_active_runs() {
-        Ok(runs) => runs,
-        Err(e) => {
-            tracing::warn!(error = %e, "fleet status: listing active runs failed");
-            return;
-        }
+    let (runs, parked) = {
+        let state = app.state::<AppState>();
+        let db = state.db.lock();
+        let runs = match db.list_active_runs() {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!(error = %e, "fleet status: listing active runs failed");
+                return;
+            }
+        };
+        // What each crew waits on, only while the menu bar shows it.
+        let detail = crate::menu_bar::wants_detail() && runs.iter().any(|r| needs_you(&r.status, plan_waiting(r)));
+        let parked = if detail {
+            db.list_parked_stages().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "fleet status: listing parked stages failed");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+        (runs, parked)
     };
-    let badge = derive(runs.iter().map(|r| (r.status.as_str(), plan_waiting(r)))).badge();
+    let fleet = derive(runs.iter().map(|r| (r.status.as_str(), plan_waiting(r))));
+    set_badge(app, fleet.badge());
+    crate::menu_bar::update(app, fleet, &runs, &parked);
+}
+
+/// The Dock badge, set only when the count changed.
+fn set_badge(app: &AppHandle, badge: Option<i64>) {
     let count = badge.unwrap_or(0);
     if SHOWN.load(Ordering::Acquire) == count {
         return;
@@ -169,6 +225,22 @@ mod tests {
             assert_eq!(fleet.needs_you, f["needsYou"].as_u64().unwrap() as u32, "{statuses:?}");
             assert_eq!(fleet.in_flight, f["inFlight"].as_u64().unwrap() as u32, "{statuses:?}");
             assert_eq!(fleet.badge(), f["badge"].as_i64(), "{statuses:?}");
+        }
+    }
+
+    #[test]
+    fn transient_halts_match_the_frontends_predicate_case_for_case() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/transientHalt.fixtures.json")).expect("fixtures");
+        let transient = fixtures["transient"].as_array().expect("transient");
+        let standing = fixtures["notTransient"].as_array().expect("notTransient");
+        assert!(transient.len() >= 10 && standing.len() >= 10, "both sides are covered");
+        for c in transient {
+            let e = c.as_str().unwrap();
+            assert!(is_transient_halt(Some(e)), "{e}");
+        }
+        for c in standing {
+            assert!(!is_transient_halt(c.as_str()), "{c}");
         }
     }
 
