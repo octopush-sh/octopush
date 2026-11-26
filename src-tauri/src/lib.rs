@@ -12,6 +12,7 @@ pub mod claude_login;
 pub mod claude_plan;
 pub mod codex_trust;
 mod commands;
+pub mod context;
 pub mod context_guard;
 pub mod crew;
 // `db` and `error` are public so the `octopush-mcp` binary (a sibling bin in
@@ -290,6 +291,7 @@ pub fn run() {
             commands::undo_talk_rewind,
             commands::fork_chat_thread,
             commands::list_skills,
+            commands::list_skipped_skills,
             commands::list_subagent_types,
             commands::read_attachment,
             commands::list_mcp_tools,

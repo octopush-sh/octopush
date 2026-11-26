@@ -1384,6 +1384,7 @@ mod retry {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
+            ..Default::default()
         }
     }
 
@@ -1526,6 +1527,7 @@ mod cancellable {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
+            ..Default::default()
         }
     }
 
@@ -1833,7 +1835,7 @@ mod streaming {
     use std::time::{Duration, Instant};
 
     /// A body in chunks; a `None` chunk goes silent for good.
-    struct Chunks(VecDeque<Option<Vec<u8>>>);
+    pub(super) struct Chunks(pub(super) VecDeque<Option<Vec<u8>>>);
 
     #[async_trait::async_trait]
     impl ByteSource for Chunks {
@@ -1849,12 +1851,12 @@ mod streaming {
         }
     }
 
-    fn chunks(text: &str, size: usize) -> Chunks {
+    pub(super) fn chunks(text: &str, size: usize) -> Chunks {
         Chunks(text.as_bytes().chunks(size).map(|c| Some(c.to_vec())).collect())
     }
 
     /// Events as the wire carries them: the event name is the data's `type`.
-    fn sse(events: &[Value]) -> String {
+    pub(super) fn sse(events: &[Value]) -> String {
         events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect()
     }
 
@@ -1922,7 +1924,7 @@ mod streaming {
         }))
     }
 
-    fn assert_same(got: &LlmResponse, want: &LlmResponse) {
+    pub(super) fn assert_same(got: &LlmResponse, want: &LlmResponse) {
         assert_eq!(got.text, want.text);
         assert_eq!(serde_json::to_value(&got.tool_uses).unwrap(), serde_json::to_value(&want.tool_uses).unwrap());
         assert_eq!(got.stop_reason, want.stop_reason);
@@ -1931,6 +1933,7 @@ mod streaming {
             (want.input_tokens, want.output_tokens, want.cache_read_tokens, want.cache_creation_tokens),
         );
         assert_eq!(got.raw_content, want.raw_content);
+        assert_eq!(got.usage_unreported, want.usage_unreported);
     }
 
     async fn read(source: Chunks) -> (AppResult<LlmResponse>, Vec<StreamEvent>) {
@@ -2118,5 +2121,465 @@ mod streaming {
         let resp = Whole.stream("https://api.test", None, &super::sample_request(), &reqwest::Client::new(), &mut sink).await.unwrap();
         assert_same(&resp, &whole_answer());
         assert_eq!(events, vec![StreamEvent::Text("Reading the config first.".into())]);
+    }
+}
+
+// ─── Streaming: OpenAI-compatible Chat Completions and Responses (A2) ───────────
+// Fixture transcripts follow the documented streaming formats (chunk and
+// event types and fields); their ids and text are made up.
+
+mod openai_streaming {
+    use super::super::openai_compat::{self, Api, OpenAICompatibleProvider};
+    use super::super::{stream_with_retry, Completion, LlmProvider, LlmRequest, LlmResponse, LlmStopReason, StreamEvent};
+    use super::streaming::{assert_same, chunks, sse, Chunks};
+    use crate::error::{AppError, AppResult, ProviderErrorKind};
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    fn chunk(choices: Value) -> Value {
+        json!({"id": "chatcmpl-fixture", "object": "chat.completion.chunk", "created": 1, "model": "gpt-test", "choices": choices, "usage": null})
+    }
+    fn delta(delta: Value) -> Value { chunk(json!([{"index": 0, "delta": delta, "finish_reason": null}])) }
+    fn finished(reason: &str) -> Value { chunk(json!([{"index": 0, "delta": {}, "finish_reason": reason}])) }
+    fn call(index: usize, id: &str, name: &str, arguments: &str) -> Value {
+        json!({"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
+    }
+    fn usage() -> Value {
+        json!({"prompt_tokens": 1200, "completion_tokens": 64, "total_tokens": 1264, "prompt_tokens_details": {"cached_tokens": 900, "cache_write_tokens": 100}})
+    }
+
+    /// Text, then two tool calls: the first in pieces, the second whole in
+    /// one piece (as some local servers send it), then the usage chunk.
+    fn chat_events() -> Vec<Value> {
+        let args = |partial: &str| delta(json!({"tool_calls": [{"index": 0, "function": {"arguments": partial}}]}));
+        let mut last = chunk(json!([]));
+        last["usage"] = usage();
+        vec![
+            delta(json!({"role": "assistant", "content": ""})),
+            delta(json!({"content": "Reading the"})),
+            delta(json!({"content": " config first."})),
+            delta(json!({"tool_calls": [call(0, "call_fixture_a", "read_file", "")]})),
+            args("{\"path\": \"src/con"),
+            args("fig.toml\", \"limit\": 4"),
+            args("0}"),
+            delta(json!({"tool_calls": [call(1, "call_fixture_b", "list_dir", "{\"path\": \"src\"}")]})),
+            finished("tool_calls"),
+            last,
+        ]
+    }
+
+    /// Chunks as the wire carries them, then `[DONE]` when `done`.
+    fn chat_sse(events: &[Value], done: bool) -> String {
+        let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+        if done { body + "data: [DONE]\n\n" } else { body }
+    }
+
+    /// The same answer as a request that doesn't stream returns it whole.
+    fn chat_whole() -> Value {
+        let calls = [
+            call(0, "call_fixture_a", "read_file", "{\"path\": \"src/config.toml\", \"limit\": 40}"),
+            call(1, "call_fixture_b", "list_dir", "{\"path\": \"src\"}"),
+        ];
+        json!({"id": "chatcmpl-fixture", "object": "chat.completion", "created": 1, "model": "gpt-test", "usage": usage(),
+            "choices": [{"index": 0, "finish_reason": "tool_calls",
+                "message": {"role": "assistant", "content": "Reading the config first.", "refusal": null, "tool_calls": calls}}]})
+    }
+
+    fn text(t: &str) -> StreamEvent { StreamEvent::Text(t.into()) }
+    fn start(index: usize, id: &str, name: &str) -> StreamEvent { StreamEvent::ToolStart { index, id: id.into(), name: name.into() } }
+    fn input(index: usize, partial: &str) -> StreamEvent { StreamEvent::ToolInput { index, partial: partial.into() } }
+
+    /// What the sink sees for `chat_events`: every call ends with the choice.
+    fn chat_stream() -> Vec<StreamEvent> {
+        vec![
+            text("Reading the"), text(" config first."),
+            start(0, "call_fixture_a", "read_file"), input(0, "{\"path\": \"src/con"), input(0, "fig.toml\", \"limit\": 4"), input(0, "0}"),
+            start(1, "call_fixture_b", "list_dir"), input(1, "{\"path\": \"src\"}"),
+            StreamEvent::ToolEnd { index: 0 }, StreamEvent::ToolEnd { index: 1 },
+        ]
+    }
+
+    const MODEL: &str = "gpt-6-sol";
+    const BASE: &str = "https://api.openai.com/v1";
+
+    fn responses_api() -> Api<'static> {
+        Api::Responses { model: MODEL, provider: "openai", api_base: BASE }
+    }
+    /// Reasoning (encrypted, so it is kept for replay), the message, the call.
+    fn items() -> [Value; 3] {
+        [
+            json!({"id": "rs_fixture", "type": "reasoning", "summary": [], "encrypted_content": "ZW5jcnlwdGVkLWZpeHR1cmU="}),
+            json!({"id": "msg_fixture", "type": "message", "status": "completed", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Reading the config first.", "annotations": []}]}),
+            json!({"id": "fc_fixture", "type": "function_call", "status": "completed", "call_id": "call_fixture", "name": "read_file",
+                "arguments": "{\"path\": \"src/config.toml\"}"}),
+        ]
+    }
+    fn final_response(output: &[Value]) -> Value {
+        json!({"id": "resp_fixture", "object": "response", "status": "completed", "model": MODEL, "output": output,
+            "usage": {"input_tokens": 1500, "input_tokens_details": {"cached_tokens": 1024}, "output_tokens": 80, "total_tokens": 1580}})
+    }
+    fn responses_whole() -> LlmResponse {
+        openai_compat::parse_responses_response(final_response(&items()), MODEL, "openai", BASE)
+    }
+
+    /// Reasoning, text, then a function call whose arguments arrive in pieces.
+    fn responses_events() -> Vec<Value> {
+        let ev = |kind: &str, mut fields: Value| {
+            fields["type"] = json!(kind);
+            fields
+        };
+        let [reasoning, message, function_call] = items();
+        let text_delta = |d: &str| ev("response.output_text.delta", json!({"item_id": "msg_fixture", "output_index": 1, "content_index": 0, "delta": d}));
+        let args = |d: &str| ev("response.function_call_arguments.delta", json!({"item_id": "fc_fixture", "output_index": 2, "delta": d}));
+        vec![
+            ev("response.created", json!({"response": {"id": "resp_fixture", "status": "in_progress", "output": []}})),
+            ev("response.output_item.added", json!({"output_index": 0, "item": {"id": "rs_fixture", "type": "reasoning", "summary": []}})),
+            ev("response.output_item.done", json!({"output_index": 0, "item": reasoning})),
+            ev("response.output_item.added", json!({"output_index": 1, "item": {"id": "msg_fixture", "type": "message", "role": "assistant", "content": []}})),
+            text_delta("Reading the"),
+            text_delta(" config first."),
+            ev("response.output_text.done", json!({"item_id": "msg_fixture", "output_index": 1, "content_index": 0, "text": "Reading the config first."})),
+            ev("response.output_item.done", json!({"output_index": 1, "item": message})),
+            ev("response.output_item.added", json!({"output_index": 2, "item": {"id": "fc_fixture", "type": "function_call",
+                "call_id": "call_fixture", "name": "read_file", "arguments": ""}})),
+            args("{\"path\": \"src/con"),
+            args("fig.toml\"}"),
+            ev("response.output_item.done", json!({"output_index": 2, "item": function_call})),
+            ev("response.completed", json!({"response": final_response(&items())})),
+        ]
+    }
+
+    async fn read(api: &Api<'_>, source: Chunks) -> (AppResult<LlmResponse>, Vec<StreamEvent>) {
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let out = openai_compat::read_stream(source, false, Some(Duration::from_secs(5)), api, &mut sink).await;
+        (out, events)
+    }
+
+    async fn failure(api: &Api<'_>, body: &str) -> AppError {
+        read(api, chunks(body, 4096)).await.0.expect_err("the stream fails")
+    }
+
+    fn kind_of(e: &AppError) -> Option<ProviderErrorKind> {
+        if let AppError::Provider { kind, .. } = e { Some(*kind) } else { None }
+    }
+
+    #[tokio::test]
+    async fn openai_sse_chat_text_tool_usage() {
+        let (out, events) = read(&Api::Chat, chunks(&chat_sse(&chat_events(), true), 4096)).await;
+        let resp = out.unwrap();
+        assert_eq!(resp.text, "Reading the config first.");
+        let calls: Vec<_> = resp.tool_uses.iter().map(|u| (u.id.as_str(), u.name.as_str(), u.input.clone())).collect();
+        assert_eq!(calls, [
+            ("call_fixture_a", "read_file", json!({"path": "src/config.toml", "limit": 40})),
+            ("call_fixture_b", "list_dir", json!({"path": "src"})),
+        ]);
+        assert_eq!(resp.stop_reason, LlmStopReason::ToolUse);
+        // From the usage chunk: the prompt count less its cached and written slices.
+        assert_eq!((resp.input_tokens, resp.cache_read_tokens, resp.cache_creation_tokens, resp.output_tokens), (200, 900, 100, 64));
+        assert!(!resp.usage_unreported);
+        assert_eq!(events, chat_stream());
+    }
+
+    #[tokio::test]
+    async fn openai_sse_parallel_calls_without_index() {
+        // Two parallel calls in one chunk, neither with an `index`: each is the
+        // call at its place in the array, never both call 0.
+        let bare = |id: &str, path: &str| json!({"id": id, "type": "function", "function": {"name": "read_file", "arguments": format!("{{\"path\": \"{path}\"}}")}});
+        let events = [delta(json!({"tool_calls": [bare("call_a", "a"), bare("call_b", "b")]})), finished("tool_calls")];
+        let (out, events) = read(&Api::Chat, chunks(&chat_sse(&events, true), 4096)).await;
+        let calls: Vec<_> = out.unwrap().tool_uses.iter().map(|u| (u.id.clone(), u.input.clone())).collect();
+        assert_eq!(calls, [("call_a".to_string(), json!({"path": "a"})), ("call_b".to_string(), json!({"path": "b"}))]);
+        let (a, b) = ("{\"path\": \"a\"}", "{\"path\": \"b\"}");
+        let ends = [StreamEvent::ToolEnd { index: 0 }, StreamEvent::ToolEnd { index: 1 }];
+        assert_eq!(events, [vec![start(0, "call_a", "read_file"), input(0, a), start(1, "call_b", "read_file"), input(1, b)], ends.to_vec()].concat());
+    }
+
+    #[tokio::test]
+    async fn openai_sse_missing_usage_is_unreported_not_free() {
+        // Finished, but without the usage chunk (a server that ignores
+        // `include_usage`): the cost is unknown, never $0.
+        let (out, _) = read(&Api::Chat, chunks(&chat_sse(&chat_events()[..9], true), 4096)).await;
+        let resp = out.unwrap();
+        assert_eq!((resp.usage_unreported, resp.input_tokens, resp.output_tokens), (true, 0, 0));
+        assert_eq!(resp.tool_uses.len(), 2, "the answer itself is whole");
+        // A Responses answer whose final response carries no usage, likewise.
+        let mut events = responses_events();
+        let last = events.len() - 1;
+        events[last]["response"].as_object_mut().unwrap().remove("usage");
+        assert!(read(&responses_api(), chunks(&sse(&events), 4096)).await.0.unwrap().usage_unreported);
+        assert!(!read(&responses_api(), chunks(&sse(&responses_events()), 4096)).await.0.unwrap().usage_unreported);
+    }
+
+    #[tokio::test]
+    async fn openai_sse_silence_is_final_after_its_adapter_bound() {
+        // OpenAI-compatible servers promise no keep-alive: ten minutes, where
+        // Anthropic (which pings) keeps one. A server on this Mac has none.
+        use super::super::{anthropic, stream_idle};
+        assert_eq!(stream_idle("https://api.openai.com/v1", openai_compat::STREAM_IDLE), Some(Duration::from_secs(600)));
+        assert_eq!(stream_idle("https://api.anthropic.com", anthropic::STREAM_IDLE), Some(Duration::from_secs(60)));
+        assert_eq!(stream_idle("http://127.0.0.1:11434/v1", openai_compat::STREAM_IDLE), None);
+        // Silent past the bound: final, never retried (#1181's rule).
+        let silent = Chunks(vec![Some(chat_sse(&chat_events()[..2], false).into_bytes()), None].into());
+        let mut sink = |_e: StreamEvent| {};
+        let idle = Some(Duration::from_millis(150));
+        let err = openai_compat::read_stream(silent, false, idle, &Api::Chat, &mut sink).await.expect_err("a silent stream fails");
+        assert!(err.transient_retry().is_none(), "{err}");
+        assert!(err.to_string().contains("the stream sent nothing for 150ms"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn openai_sse_chat_equals_complete_response() {
+        // One byte at a time, with CRLF line ends, after a comment and an empty keep-alive event.
+        let body = format!(": keep-alive\n\ndata:\n\n{}", chat_sse(&chat_events(), true)).replace('\n', "\r\n");
+        assert_same(&read(&Api::Chat, chunks(&body, 1)).await.0.unwrap(), &openai_compat::parse_response(chat_whole()));
+
+        // A refusal after some text is set apart as `complete` sets it, and
+        // the streamed text adds up to the answer's.
+        let refusal = [
+            delta(json!({"role": "assistant", "content": "I can read the config."})),
+            delta(json!({"refusal": "I can't share"})),
+            delta(json!({"refusal": " that key."})),
+            finished("stop"),
+            chat_events().pop().unwrap(),
+        ];
+        let whole = json!({"usage": usage(), "choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "I can read the config.", "refusal": "I can't share that key."}}]});
+        let (out, events) = read(&Api::Chat, chunks(&chat_sse(&refusal, true), 16)).await;
+        let resp = out.unwrap();
+        assert_same(&resp, &openai_compat::parse_response(whole));
+        assert_eq!(resp.stop_reason, LlmStopReason::Other("refusal".into()));
+        let streamed: String = events.iter().map(|e| if let StreamEvent::Text(t) = e { t.as_str() } else { "" }).collect();
+        assert_eq!(streamed, resp.text);
+    }
+
+    #[tokio::test]
+    async fn openai_sse_responses_equals_complete_response() {
+        let api = responses_api();
+        let (out, events) = read(&api, chunks(&sse(&responses_events()), 29)).await;
+        let resp = out.unwrap();
+        assert_same(&resp, &responses_whole());
+        // The encrypted reasoning is kept for replay, behind its origin item.
+        assert!(openai_compat::is_responses_raw(&resp.raw_content) && resp.raw_content.len() == 4);
+        assert_eq!((resp.input_tokens, resp.cache_read_tokens, resp.output_tokens), (476, 1024, 80));
+        assert_eq!(resp.stop_reason, LlmStopReason::ToolUse);
+        let call = [start(2, "call_fixture", "read_file"), input(2, "{\"path\": \"src/con"), input(2, "fig.toml\"}"), StreamEvent::ToolEnd { index: 2 }];
+        assert_eq!(events, [vec![text("Reading the"), text(" config first.")], call.to_vec()].concat());
+
+        // A final response that leaves its output out gets the items as they closed.
+        let mut events = responses_events();
+        let last = events.len() - 1;
+        events[last] = json!({"type": "response.completed", "response": final_response(&[])});
+        assert_same(&read(&api, chunks(&sse(&events), 4096)).await.0.unwrap(), &responses_whole());
+
+        // Cut at the output cap: `response.incomplete` stops as max tokens.
+        events[last] = json!({"type": "response.incomplete", "response": {"status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}, "output": &items()[..2]}});
+        let resp = read(&api, chunks(&sse(&events), 4096)).await.0.unwrap();
+        assert_eq!((resp.stop_reason, resp.tool_uses.len()), (LlmStopReason::MaxTokens, 0));
+    }
+
+    /// Streams scripted bodies through the real Chat Completions reader.
+    struct Scripted(Mutex<VecDeque<Chunks>>, AtomicU32);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Scripted {
+        async fn complete(&self, _b: &str, _k: Option<&str>, _r: &LlmRequest, _c: &reqwest::Client) -> AppResult<LlmResponse> {
+            unreachable!("only streamed here")
+        }
+
+        async fn stream(
+            &self,
+            _b: &str,
+            _k: Option<&str>,
+            _r: &LlmRequest,
+            _c: &reqwest::Client,
+            sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> AppResult<LlmResponse> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            let body = self.0.lock().unwrap().pop_front().expect("ran out of bodies");
+            openai_compat::read_stream(body, false, None, &Api::Chat, sink).await.map_err(|e| match e {
+                // No backoff wait in a test.
+                AppError::Provider { kind, message, .. } => AppError::Provider { kind, retry_after: Some(0), message },
+                other => other,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_sse_mid_stream_error_resets_and_retries() {
+        let error = json!({"message": "The server had an error.", "type": "server_error", "param": null, "code": null});
+        let failed = chat_sse(&[delta(json!({"content": "Half an ans"})), json!({"error": error})], false);
+        let bodies = [chunks(&failed, 4096), chunks(&chat_sse(&chat_events(), true), 4096)];
+        let p = Scripted(Mutex::new(bodies.into()), AtomicU32::new(0));
+        let (req, client, cancel) = (super::sample_request(), reqwest::Client::new(), AtomicBool::new(false));
+        let mut retries = Vec::new();
+        let mut on_retry = |a: u32, d: u64, k: ProviderErrorKind| retries.push((a, d, k));
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let out = stream_with_retry(&p, "https://api.test", Some("key"), &req, &client, &cancel, 5, &mut on_retry, &mut sink).await;
+        let resp = match out { Completion::Done(resp) => resp, other => panic!("expected an answer, got {other:?}") };
+        assert_same(&resp, &openai_compat::parse_response(chat_whole()));
+        assert_eq!((p.1.load(Ordering::SeqCst), retries), (2, vec![(1, 0, ProviderErrorKind::ServerError)]));
+        // The half answer, dropped by `Reset`, then the whole one.
+        assert_eq!(events, [vec![text("Half an ans"), StreamEvent::Reset], chat_stream()].concat());
+
+        // Each failure a stream reports is classified like its status: the
+        // transient ones retry, the rest are final.
+        let chat = |error: Value| chat_sse(&[delta(json!({"content": "Half"})), json!({"error": error})], false);
+        let gateway = failure(&Api::Chat, &chat(json!({"code": 502, "message": "Upstream error"}))).await;
+        assert_eq!(kind_of(&gateway), Some(ProviderErrorKind::ServerError));
+        let unknown = failure(&Api::Chat, &chat(json!({"code": "something_new", "message": "?"}))).await;
+        assert!(unknown.transient_retry().is_none(), "{unknown}");
+        let mut limited = responses_events()[..6].to_vec();
+        limited.push(json!({"type": "response.failed", "response": {"status": "failed", "error": {"code": "rate_limit_exceeded", "message": "Slow down."}}}));
+        assert_eq!(kind_of(&failure(&responses_api(), &sse(&limited)).await), Some(ProviderErrorKind::RateLimit));
+        let rejected = failure(&responses_api(), &sse(&[json!({"type": "error", "code": "invalid_prompt", "message": "Rejected."})])).await;
+        assert_eq!(kind_of(&rejected), Some(ProviderErrorKind::BadRequest));
+        assert!(rejected.to_string().contains("OpenAI-compat API error in the stream"), "{rejected}");
+    }
+
+    #[tokio::test]
+    async fn openai_sse_cut_off_is_final() {
+        // A Chat Completions body that ends before its choice finished, and a
+        // Responses body without its final event.
+        let events = responses_events();
+        for (api, body) in [(Api::Chat, chat_sse(&chat_events()[..6], false)), (responses_api(), sse(&events[..events.len() - 1]))] {
+            let cut = failure(&api, &body).await;
+            assert!(cut.transient_retry().is_none(), "{cut}");
+            assert!(cut.to_string().contains("the stream ended before the answer was complete"), "{cut}");
+        }
+        // One that finished and only left out `[DONE]` has answered in full.
+        let (out, _) = read(&Api::Chat, chunks(&chat_sse(&chat_events(), false), 4096)).await;
+        assert_same(&out.unwrap(), &openai_compat::parse_response(chat_whole()));
+    }
+
+    type Reply = (&'static str, &'static str, String);
+
+    fn ok(content_type: &'static str, body: String) -> Reply {
+        ("200 OK", content_type, body)
+    }
+
+    /// A local server that answers one request per reply, in order (status,
+    /// content type, body), then hands back the requests it read.
+    async fn serve(replies: Vec<Reply>) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, content_type, body) in replies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let (mut seen, mut buf) = (Vec::new(), [0u8; 8192]);
+                while !whole_request(&seen) {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = sock.write_all(format!("{head}{body}").as_bytes()).await;
+                let _ = sock.shutdown().await;
+                requests.push(String::from_utf8_lossy(&seen).into_owned());
+            }
+            let _ = tx.send(requests);
+        });
+        (addr, rx)
+    }
+
+    /// Whether `seen` holds a request's head and as much body as it announced.
+    fn whole_request(seen: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(seen);
+        let Some((head, body)) = text.split_once("\r\n\r\n") else { return false };
+        let length = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)));
+        body.len() >= length.unwrap_or(0)
+    }
+
+    fn request_json(seen: &str) -> Value {
+        serde_json::from_str(seen.split_once("\r\n\r\n").expect("a request").1).expect("a JSON body")
+    }
+
+    #[tokio::test]
+    async fn openai_sse_request_streams_and_asks_for_usage() {
+        // Chat Completions, here on a model server on this Mac.
+        let (addr, seen) = serve(vec![ok("text/event-stream", chat_sse(&chat_events(), true))]).await;
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let provider = OpenAICompatibleProvider { provider: "custom".into() };
+        let base = format!("http://127.0.0.1:{}/v1", addr.port());
+        let resp = provider.stream(&base, None, &super::sample_request(), &reqwest::Client::new(), &mut sink).await.unwrap();
+        assert_same(&resp, &openai_compat::parse_response(chat_whole()));
+        assert_eq!(events, chat_stream());
+        let seen = seen.await.unwrap().remove(0);
+        assert!(seen.starts_with("POST /v1/chat/completions "), "{seen}");
+        let body = request_json(&seen);
+        assert_eq!((&body["stream"], &body["stream_options"]), (&json!(true), &json!({"include_usage": true})));
+
+        // GPT-6 on OpenAI's own host goes to Responses, which reports usage unasked.
+        let (addr, seen) = serve(vec![ok("text/event-stream; charset=utf-8", sse(&responses_events()))]).await;
+        let client = reqwest::Client::builder().no_proxy().resolve("api.openai.com", addr).build().unwrap();
+        let mut req = super::sample_request();
+        req.model = MODEL.into();
+        let base = format!("http://api.openai.com:{}/v1", addr.port());
+        let mut sink = |_e: StreamEvent| {};
+        let provider = OpenAICompatibleProvider { provider: "openai".into() };
+        let resp = provider.stream(&base, Some("key"), &req, &client, &mut sink).await.unwrap();
+        assert_eq!((resp.text.as_str(), resp.tool_uses.len()), ("Reading the config first.", 1));
+        let seen = seen.await.unwrap().remove(0);
+        assert!(seen.starts_with("POST /v1/responses "), "{seen}");
+        assert!(seen.to_ascii_lowercase().contains("authorization: bearer key"), "{seen}");
+        let body = request_json(&seen);
+        assert_eq!(body["stream"], json!(true));
+        assert!(body.get("stream_options").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn openai_sse_refused_stream_options_is_asked_once_without() {
+        let refusal = json!({"error": {"message": "Unrecognized request argument supplied: stream_options",
+            "type": "invalid_request_error", "param": "stream_options", "code": null}});
+        let replies = vec![("400 Bad Request", "application/json", refusal.to_string()), ok("text/event-stream", chat_sse(&chat_events()[..9], true))];
+        let (addr, seen) = serve(replies).await;
+        let (provider, client) = (OpenAICompatibleProvider { provider: "custom".into() }, reqwest::Client::new());
+        let mut sink = |_e: StreamEvent| {};
+        let base = format!("http://127.0.0.1:{}/v1", addr.port());
+        let resp = provider.stream(&base, None, &super::sample_request(), &client, &mut sink).await.unwrap();
+        // Asked again without the field, the answer has no usage: unreported, never $0.
+        assert_eq!((resp.text.as_str(), resp.usage_unreported), ("Reading the config first.", true));
+        let asked: Vec<bool> = seen.await.unwrap().iter().map(|r| request_json(r).get("stream_options").is_some()).collect();
+        assert_eq!(asked, [true, false]);
+
+        // Any other 400 is never sent twice.
+        let invalid = json!({"error": {"message": "Invalid model.", "type": "invalid_request_error", "param": "model"}});
+        let (addr, seen) = serve(vec![("400 Bad Request", "application/json", invalid.to_string())]).await;
+        let base = format!("http://127.0.0.1:{}/v1", addr.port());
+        let err = provider.stream(&base, None, &super::sample_request(), &client, &mut sink).await.expect_err("a bad request");
+        assert_eq!((kind_of(&err), seen.await.unwrap().len()), (Some(ProviderErrorKind::BadRequest), 1));
+    }
+
+    #[tokio::test]
+    async fn provider_without_stream_falls_back() {
+        // A server that ignores `stream` and answers with the whole body.
+        let (addr, seen) = serve(vec![ok("application/json", chat_whole().to_string())]).await;
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let provider = OpenAICompatibleProvider { provider: "custom".into() };
+        let base = format!("http://127.0.0.1:{}/v1", addr.port());
+        let resp = provider.stream(&base, None, &super::sample_request(), &reqwest::Client::new(), &mut sink).await.unwrap();
+        assert_same(&resp, &openai_compat::parse_response(chat_whole()));
+        assert_eq!(events, [text("Reading the config first.")]);
+        assert_eq!(request_json(&seen.await.unwrap()[0])["stream"], json!(true));
+
+        // The same for a whole Responses body.
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let body = final_response(&items()).to_string();
+        let resp = openai_compat::read_stream(chunks(&body, 64), true, None, &responses_api(), &mut sink).await.unwrap();
+        assert_same(&resp, &responses_whole());
+        assert_eq!(events, [text("Reading the config first.")]);
     }
 }
