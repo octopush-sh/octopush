@@ -9,6 +9,10 @@
 //! { "mcpServers": { "<name>": { "command": "…", "args": [...], "env": {...} } } }
 //! ```
 //!
+//! A remote entry written as `{ "type": "http" | "sse", "url": …, "headers": {…} }`
+//! is read into the Remote form and runs through the bridge (`remote`); any
+//! other entry without a `command` is skipped, and a save keeps it as it was.
+//!
 //! Tools are surfaced to the model with namespaced names `mcp__<server>__<tool>`
 //! so the agentic loop can route a tool_use back to the right server. Servers
 //! are spawned lazily on first use and cached (killed on drop). A cached
@@ -99,17 +103,78 @@ pub(crate) fn sorted_server_configs(worktree: &Path) -> Vec<(String, McpServerCo
     cfgs
 }
 
-/// Parse `.claude/mcp.json` content into a name→config map. Tolerant: a missing
-/// or malformed file yields an empty map.
-pub fn parse_mcp_config(content: &str) -> HashMap<String, McpServerConfig> {
+/// The raw `mcpServers` entries of `.claude/mcp.json` content (empty when the
+/// file or the key is malformed).
+fn raw_entries(content: &str) -> serde_json::Map<String, Value> {
     #[derive(Deserialize)]
     struct File {
         #[serde(default, rename = "mcpServers")]
-        mcp_servers: HashMap<String, McpServerConfig>,
+        mcp_servers: serde_json::Map<String, Value>,
     }
-    serde_json::from_str::<File>(content)
-        .map(|f| f.mcp_servers)
-        .unwrap_or_default()
+    serde_json::from_str::<File>(content).map(|f| f.mcp_servers).unwrap_or_default()
+}
+
+/// One `mcpServers` entry as Octopush runs it: a local command, or a remote
+/// entry in the `{"type": "http" | "sse", "url": …, "headers": {…}}` shape
+/// other MCP clients write by hand, read into the Remote form's choices
+/// (custom headers when it has any, else browser sign-in) so it runs through
+/// the same bridge (`remote::apply_bridge`). `None` for an entry Octopush
+/// can't run.
+fn parse_entry(value: &Value) -> Option<McpServerConfig> {
+    if let Ok(cfg) = serde_json::from_value::<McpServerConfig>(value.clone()) {
+        return Some(cfg);
+    }
+    let mut obj = value.as_object()?.clone();
+    let transport = match obj.get("type")?.as_str()? {
+        "http" | "streamable-http" => "http-only",
+        "sse" => "sse-only",
+        _ => return None,
+    };
+    let url = obj.get("url")?.as_str()?.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    let headers: Vec<(String, String)> = match obj.get("headers") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(h) => h
+            .as_object()?
+            .iter()
+            .map(|(k, v)| Some((k.trim().to_string(), v.as_str()?.to_string())))
+            .collect::<Option<_>>()?,
+    };
+    // Now in `remote` and `env`: a save writes the bridge in their place.
+    for key in ["type", "url", "headers"] {
+        obj.remove(key);
+    }
+    obj.insert("command".into(), json!("npx"));
+    let mut cfg = serde_json::from_value::<McpServerConfig>(Value::Object(obj)).ok()?;
+    for (name, v) in &headers {
+        cfg.env.insert(remote::header_env(name), v.clone());
+    }
+    cfg.remote = Some(remote::RemoteConfig {
+        url,
+        auth: if headers.is_empty() { "oauth" } else { "headers" }.into(),
+        header_names: headers.into_iter().map(|(n, _)| n).collect(),
+        transport: transport.into(),
+        ..Default::default()
+    });
+    Some(cfg)
+}
+
+/// Parse `.claude/mcp.json` content into a name→config map. Tolerant: a missing
+/// or malformed file yields an empty map, and an entry Octopush can't run
+/// (`parse_entry`) is skipped without hiding the others.
+pub fn parse_mcp_config(content: &str) -> HashMap<String, McpServerConfig> {
+    raw_entries(content)
+        .iter()
+        .filter_map(|(name, v)| match parse_entry(v) {
+            Some(cfg) => Some((name.clone(), cfg)),
+            None => {
+                tracing::warn!(server = %name, "skipping an MCP server entry Octopush can't run");
+                None
+            }
+        })
+        .collect()
 }
 
 /// The user-level config path (`~/.claude/mcp.json`), if a home dir exists.
@@ -142,12 +207,23 @@ fn save_config_at(path: &Path, servers: &HashMap<String, McpServerConfig>) -> Re
     }
     // Preserve any sibling top-level keys the user keeps in mcp.json — only the
     // `mcpServers` object is ours to rewrite. (Comments aren't preserved; JSON.)
-    let mut root = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    let content = std::fs::read_to_string(path).ok();
+    let mut root = content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}));
-    root["mcpServers"] = serde_json::to_value(servers).map_err(|e| e.to_string())?;
+    let mut entries = serde_json::to_value(servers).map_err(|e| e.to_string())?;
+    // An entry Octopush can't run never reached Settings, so the save keeps
+    // it as it was (unless a server now has its name).
+    if let (Some(out), Some(c)) = (entries.as_object_mut(), content.as_deref()) {
+        for (name, v) in raw_entries(c) {
+            if parse_entry(&v).is_none() && !out.contains_key(&name) {
+                out.insert(name, v);
+            }
+        }
+    }
+    root["mcpServers"] = entries;
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     std::fs::write(path, pretty).map_err(|e| e.to_string())
 }
@@ -1364,6 +1440,63 @@ mod tests {
     fn malformed_config_is_empty() {
         assert!(parse_mcp_config("not json").is_empty());
         assert!(parse_mcp_config("{}").is_empty());
+    }
+
+    const MIXED: &str = r#"{"mcpServers":{
+        "local":{"command":"uvx","args":["example-server"]},
+        "web":{"type":"http","url":"https://mcp.example.com/mcp","headers":{"X-Api-Key":"k-123"},"disabled":false},
+        "stream":{"type":"sse","url":" https://mcp.example.com/sse "},
+        "odd":{"type":"websocket","url":"wss://mcp.example.com"},
+        "broken":{"args":["no-command"]}
+    }}"#;
+
+    #[test]
+    fn one_entry_octopush_cant_run_hides_no_other() {
+        let servers = parse_mcp_config(MIXED);
+        let mut names: Vec<&str> = servers.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, vec!["local", "stream", "web"], "only the entries it can't run are skipped");
+        assert_eq!(servers["local"].command, "uvx");
+
+        // `type: http` with headers reads into the Remote form's custom headers.
+        let web = &servers["web"];
+        let r = web.remote.as_ref().expect("a remote entry");
+        assert_eq!((r.url.as_str(), r.auth.as_str(), r.transport.as_str()), ("https://mcp.example.com/mcp", "headers", "http-only"));
+        assert_eq!(r.header_names, vec!["X-Api-Key"]);
+        assert_eq!(web.env["OCTOPUSH_MCP_H_X_API_KEY"], "k-123");
+        assert_eq!(web.extra.get("disabled"), Some(&json!(false)), "its other keys stay");
+        assert!(!web.extra.contains_key("type") && !web.extra.contains_key("headers"));
+        // `type: sse` without headers is a browser sign-in.
+        let r = servers["stream"].remote.as_ref().unwrap();
+        assert_eq!((r.url.as_str(), r.auth.as_str(), r.transport.as_str()), ("https://mcp.example.com/sse", "oauth", "sse-only"));
+
+        // And it runs through the bridge, the value only in its env.
+        let built = remote::with_bridges(servers);
+        let args = &built["web"].args;
+        assert_eq!(&args[1..], ["mcp-remote@^0.16", "https://mcp.example.com/mcp", "--header", "X-Api-Key:${OCTOPUSH_MCP_H_X_API_KEY}", "--transport", "http-only"]);
+        assert!(!args.iter().any(|a| a.contains("k-123")));
+    }
+
+    #[test]
+    fn a_save_keeps_the_entries_octopush_cant_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, MIXED).unwrap();
+        let store = secrets::MemoryStore::with(&[]);
+        let mut servers = load_config_at(&path);
+        servers.remove("local");
+        save_servers_at(&path, servers, HashMap::new(), &HashMap::new(), &store).unwrap();
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved = file["mcpServers"].as_object().unwrap();
+        assert!(!saved.contains_key("local"), "a removed server goes");
+        assert_eq!(saved["odd"], json!({"type":"websocket","url":"wss://mcp.example.com"}), "kept as it was");
+        assert_eq!(saved["broken"], json!({"args":["no-command"]}));
+        assert_eq!(saved["web"]["remote"]["url"], "https://mcp.example.com/mcp");
+        assert!(saved["web"]["command"].as_str().unwrap().ends_with("npx"));
+        // Read again: the two remote servers, still runnable.
+        let mut names: Vec<String> = load_config_at(&path).into_keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["stream", "web"]);
     }
 
     // A minimal MCP server (bash) that speaks just enough JSON-RPC to exercise

@@ -201,6 +201,7 @@ Current anchors:
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-headline` | Settings › Usage: the headline stats row (Cost · Per active day · Last 24 hours · Cache hit), also while the ledger is read | `settings/UsagePane.tsx` |
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |
+| `usage-managed-pricing` | Settings › Usage, under the headline: "Your organization set Claude Code's rates on this Mac (…)" (only while managed Claude Code settings carry a `modelPricing` table) | `settings/ManagedPricingNote.tsx` via `settings/UsagePane.tsx` |
 | `fleet-chip` | Top bar: the fleet chip (`2 needs you` · `1 in flight` · `✓ 3 done`; only while the board has something) | `RunsTray.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
 | `rail-collision` | Rail row meta: the `GitCompareArrows` collision mark, amber for a file overlap, rouge for a confirmed conflict (only while another live workspace of the project changes the same files) | `CollisionMark.tsx` via `WorkspaceRail.tsx` |

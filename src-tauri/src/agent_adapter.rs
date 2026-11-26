@@ -813,6 +813,189 @@ pub fn probe_claude_login() -> ClaudeLoginProbe {
     }
 }
 
+// ─── Managed `modelPricing` (#1111) ─────────────────────────────────────
+//
+// An organization can make Claude Code report spend at its own rates
+// (`modelPricing`, managed scope only, Claude Code 2.1.242+). Octopush only
+// reads the table, to say so in Settings › Usage. A finished Claude Code
+// stage is booked at Claude Code's `total_cost_usd` (those rates); Talk,
+// stopped stages and the savings baseline stay at list prices, so the ledger
+// can mix the two. Claude Code checks remote (server-managed)
+// settings before the sources below; Octopush can't see those.
+
+/// The macOS configuration profile Claude Code reads (domain
+/// `com.anthropic.claudecode`), delivered by MDM.
+pub const MANAGED_PREFERENCES_PLIST: &str = "/Library/Managed Preferences/com.anthropic.claudecode.plist";
+
+/// Claude Code's managed settings files on macOS: `managed-settings.json`,
+/// then `managed-settings.d/*.json`.
+pub const MANAGED_SETTINGS_DIR: &str = "/Library/Application Support/ClaudeCode";
+
+/// Keys that say how managed sources combine. They don't make a source count
+/// as one that sets policy.
+const NON_POLICY_KEYS: [&str; 2] = ["managedSourcesBehavior", "wslInheritsWindowsSettings"];
+
+/// `multiplier` is above 0 and at most this.
+const MAX_PRICE_MULTIPLIER: f64 = 10.0;
+
+/// Each override rate is 0 to this, in USD per million tokens.
+const MAX_OVERRIDE_RATE: f64 = 10_000.0;
+
+/// One `modelPricing.overrides` row, USD per million tokens. `cache_write`
+/// covers both 5-minute and 1-hour writes.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+/// The `modelPricing` table in effect: a `multiplier` Claude Code applies on
+/// top of every cost it computes (override rows included), and the rows by
+/// model ID. Rows that didn't read are already dropped.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPricing {
+    pub multiplier: Option<f64>,
+    pub overrides: std::collections::BTreeMap<String, ModelRates>,
+}
+
+fn parse_model_rates(row: &serde_json::Value) -> Option<ModelRates> {
+    let rate = |key: &str| row.get(key)?.as_f64().filter(|r| (0.0..=MAX_OVERRIDE_RATE).contains(r));
+    Some(ModelRates {
+        input: rate("input")?,
+        output: rate("output")?,
+        cache_read: rate("cacheRead")?,
+        cache_write: rate("cacheWrite")?,
+    })
+}
+
+/// Read a `modelPricing` value. A multiplier out of range and a row missing
+/// a rate or with one out of range are dropped; the rest is kept. `None`
+/// when nothing usable is left (or it isn't an object).
+pub fn parse_model_pricing(value: &serde_json::Value) -> Option<ModelPricing> {
+    let obj = value.as_object()?;
+    let multiplier = obj
+        .get("multiplier")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|m| *m > 0.0 && *m <= MAX_PRICE_MULTIPLIER);
+    let overrides: std::collections::BTreeMap<String, ModelRates> = obj
+        .get("overrides")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(id, _)| !id.trim().is_empty())
+        .filter_map(|(id, row)| Some((id.clone(), parse_model_rates(row)?)))
+        .collect();
+    (multiplier.is_some() || !overrides.is_empty()).then_some(ModelPricing { multiplier, overrides })
+}
+
+/// `next` laid over `base`: objects merge key by key, at every depth; any
+/// other value replaces.
+fn merge_settings(base: &mut serde_json::Value, next: &serde_json::Value) {
+    match (base.as_object_mut(), next.as_object()) {
+        (Some(b), Some(n)) => {
+            for (key, value) in n {
+                match b.get_mut(key) {
+                    Some(slot) => merge_settings(slot, value),
+                    None => {
+                        b.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        _ => *base = next.clone(),
+    }
+}
+
+/// The managed settings files as one document, in the order
+/// [`read_managed_settings_files`] returns them: a later file replaces a
+/// single value and merges into a nested block (so `overrides` merges per
+/// model ID). `None` with no file.
+pub fn merge_managed_files(docs: &[serde_json::Value]) -> Option<serde_json::Value> {
+    let mut docs = docs.iter().filter(|d| d.is_object());
+    let mut merged = docs.next()?.clone();
+    for doc in docs {
+        merge_settings(&mut merged, doc);
+    }
+    Some(merged)
+}
+
+/// The `modelPricing` table Claude Code would apply from the configuration
+/// profile (`mdm`) and the merged files (`files`), ranked in that order. By
+/// default (`managedSourcesBehavior: "first-wins"`) the first source that
+/// sets any policy key is the only one used, even when it sets no
+/// `modelPricing`; under `"merge"` the higher-ranked source's `modelPricing`
+/// applies. `managedSourcesBehavior` is read from the first source that sets
+/// it. Pure.
+pub fn managed_model_pricing(mdm: Option<&serde_json::Value>, files: Option<&serde_json::Value>) -> Option<ModelPricing> {
+    let sources: Vec<&serde_json::Map<String, serde_json::Value>> =
+        [mdm, files].into_iter().flatten().filter_map(serde_json::Value::as_object).collect();
+    let merge = sources
+        .iter()
+        .find_map(|s| s.get("managedSourcesBehavior"))
+        .and_then(serde_json::Value::as_str)
+        == Some("merge");
+    let pricing = if merge {
+        sources.iter().find_map(|s| s.get("modelPricing"))
+    } else {
+        sources
+            .iter()
+            .copied()
+            .find(|s| s.keys().any(|k| !NON_POLICY_KEYS.contains(&k.as_str())))?
+            .get("modelPricing")
+    };
+    parse_model_pricing(pricing?)
+}
+
+/// The JSON documents in a managed settings directory, in the order Claude
+/// Code applies them: `managed-settings.json`, then every
+/// `managed-settings.d/*.json` by file name. Hidden files, other extensions
+/// and files that aren't a JSON object are skipped. Empty when there are none.
+pub fn read_managed_settings_files(dir: &Path) -> Vec<serde_json::Value> {
+    let read = |p: &Path| {
+        std::fs::read_to_string(p)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .filter(serde_json::Value::is_object)
+    };
+    let mut docs: Vec<serde_json::Value> = read(dir.join("managed-settings.json").as_path()).into_iter().collect();
+    let mut drop_ins: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("managed-settings.d"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let visible = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !n.starts_with('.'));
+            visible && p.extension().is_some_and(|x| x == "json") && p.is_file()
+        })
+        .collect();
+    drop_ins.sort();
+    docs.extend(drop_ins.iter().filter_map(|p| read(p.as_path())));
+    docs
+}
+
+/// The configuration profile as JSON, through `plutil -convert json -o -`.
+/// `None` when it's absent or can't be converted.
+fn read_managed_preferences(path: &Path) -> Option<serde_json::Value> {
+    if !path.is_file() {
+        return None;
+    }
+    let mut cmd = Command::new("/usr/bin/plutil");
+    cmd.args(["-convert", "json", "-o", "-"]).arg(path);
+    serde_json::from_str(&run_bounded(cmd, VERSION_TIMEOUT)?).ok()
+}
+
+/// The managed `modelPricing` table on this Mac, read-only; `None` when no
+/// managed source sets one Octopush can see.
+pub fn read_managed_model_pricing() -> Option<ModelPricing> {
+    let mdm = read_managed_preferences(Path::new(MANAGED_PREFERENCES_PLIST));
+    let files = merge_managed_files(&read_managed_settings_files(Path::new(MANAGED_SETTINGS_DIR)));
+    managed_model_pricing(mdm.as_ref(), files.as_ref())
+}
+
 // ─── Claude Code hooks (Run-mode attention, #287) ─────────────────
 //
 // In a worktree Octopush created, `Notification` (`permission_prompt`,

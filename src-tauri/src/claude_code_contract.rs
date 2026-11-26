@@ -19,6 +19,7 @@
 //! | `claude mcp add octopush …` argv | `mcp_setup` |
 //! | `Notification` / `Stop` hook stdin payloads | `agent_adapter::parse_hook_event`, `claude_hooks::record_hook` |
 //! | `claude auth status --json` (`loggedIn`, `loginExpiresAt`) | `agent_adapter::parse_claude_auth_status` |
+//! | managed settings `modelPricing` (profile, `managed-settings.json`, `managed-settings.d/`) | `agent_adapter::managed_model_pricing`, `agent_adapter::read_managed_settings_files` |
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -751,7 +752,7 @@ fn recorded_results_without_a_terminal_reason_are_never_read_as_deferred() {
 #[test]
 fn synthetic_fixture_directories_are_not_recordings() {
     let names: Vec<String> = recordings().into_iter().map(|r| r.version).collect();
-    for v in [DEFERRED_VERSION, SUBAGENT_MODEL_VERSION] {
+    for v in [DEFERRED_VERSION, SUBAGENT_MODEL_VERSION, MODEL_PRICING_VERSION] {
         assert!(!names.iter().any(|n| n == v), "{names:?}");
         assert_eq!(synthesized(v).version, v);
     }
@@ -1928,6 +1929,134 @@ fn auth_status_signed_out_is_told_apart_from_unknown() {
     for text in ["", "Logged in using claude.ai", "Not logged in", "error: unknown command 'auth'", "} {", "{not json}"] {
         assert_eq!(parse(text), Unknown, "{text:?}");
     }
+}
+
+// ─── Managed `modelPricing` (an organization's rates, #1111) ───────────────
+
+const MODEL_PRICING_VERSION: &str = "2.1.242";
+
+fn rates(input: f64, output: f64, cache_read: f64, cache_write: f64) -> crate::agent_adapter::ModelRates {
+    crate::agent_adapter::ModelRates { input, output, cache_read, cache_write }
+}
+
+#[test]
+fn model_pricing_reads_the_documented_example() {
+    use crate::agent_adapter::{managed_model_pricing, parse_model_pricing};
+    // Copied exactly from the settings reference (see the 2.1.242 README).
+    let rec = synthesized(MODEL_PRICING_VERSION);
+    let rel = "managed-settings/docs-example.json";
+    let fx = rec.label(rel);
+    let doc = rec.json(rel);
+    let table = parse_model_pricing(require(&fx, &doc, "modelPricing")).expect("a table");
+    assert_eq!(table.multiplier, Some(0.85), "[{fx}]");
+    assert_eq!(table.overrides.len(), 1, "[{fx}]");
+    assert_eq!(table.overrides["claude-sonnet-4-6"], rates(2.4, 12.0, 0.24, 3.0), "[{fx}]");
+    assert_eq!(managed_model_pricing(None, Some(&doc)), Some(table.clone()));
+    assert_eq!(managed_model_pricing(Some(&doc), None), Some(table));
+
+    // Multiplier only.
+    let only = rec.json("managed-settings/multiplier-only.json");
+    let table = managed_model_pricing(None, Some(&only)).expect("a table");
+    assert_eq!(table.multiplier, Some(0.7));
+    assert!(table.overrides.is_empty());
+
+    // What the UI reads: camelCase rates under the model ID.
+    let wire = serde_json::to_value(parse_model_pricing(&doc["modelPricing"]).unwrap()).unwrap();
+    assert_eq!(wire["multiplier"], 0.85);
+    assert_eq!(wire["overrides"]["claude-sonnet-4-6"]["cacheRead"], 0.24);
+    assert_eq!(wire["overrides"]["claude-sonnet-4-6"]["cacheWrite"], 3.0);
+}
+
+#[test]
+fn model_pricing_drops_a_malformed_row_and_keeps_the_rest() {
+    use crate::agent_adapter::parse_model_pricing;
+    let rec = synthesized(MODEL_PRICING_VERSION);
+    let rel = "managed-settings/malformed-row.json";
+    let fx = rec.label(rel);
+    let table = parse_model_pricing(&rec.json(rel)["modelPricing"]).expect("the valid rows stay");
+    // Multiplier 0 is out of range: dropped, not read as "free".
+    assert_eq!(table.multiplier, None, "[{fx}]");
+    let ids: Vec<&str> = table.overrides.keys().map(String::as_str).collect();
+    assert_eq!(ids, ["claude-sonnet-4-6", "gateway-free"], "[{fx}]");
+    assert_eq!(table.overrides["gateway-free"], rates(0.0, 0.0, 0.0, 0.0), "[{fx}]");
+
+    // The multiplier's bounds: above 0, at most 10.
+    for (m, ok) in [(10.0, true), (10.01, false), (0.001, true), (-1.0, false)] {
+        let t = parse_model_pricing(&serde_json::json!({ "multiplier": m }));
+        assert_eq!(t.map(|t| t.multiplier), ok.then_some(Some(m)), "{m}");
+    }
+    // Nothing usable left, or not an object: no table.
+    for junk in [
+        serde_json::json!({}),
+        serde_json::json!({ "multiplier": "0.85" }),
+        serde_json::json!({ "overrides": { "claude-sonnet-4-6": { "input": 1 } } }),
+        serde_json::json!({ "overrides": [] }),
+        serde_json::json!({ "overrides": { "": { "input": 1, "output": 1, "cacheRead": 1, "cacheWrite": 1 } } }),
+        Value::Null,
+        Value::from(0.85),
+    ] {
+        assert_eq!(parse_model_pricing(&junk), None, "{junk}");
+    }
+}
+
+#[test]
+fn model_pricing_reads_managed_files_in_order() {
+    use crate::agent_adapter::{managed_model_pricing, merge_managed_files, read_managed_settings_files};
+    let rec = synthesized(MODEL_PRICING_VERSION);
+    let dir = rec.path("managed-dir");
+    // managed-settings.json, then 10-rates, then 20-markup; the hidden, .txt
+    // and unreadable files are skipped.
+    let docs = read_managed_settings_files(&dir);
+    assert_eq!(docs.len(), 3, "{docs:?}");
+    let table = managed_model_pricing(None, merge_managed_files(&docs).as_ref()).expect("a table");
+    // A later file's multiplier replaces the earlier one.
+    assert_eq!(table.multiplier, Some(1.1));
+    // `overrides` merges per model ID, and a row's fields merge too.
+    assert_eq!(table.overrides["claude-opus-4-6"], rates(4.0, 20.0, 0.4, 5.0));
+    assert_eq!(table.overrides["claude-sonnet-4-6"], rates(2.2, 12.0, 0.24, 3.0));
+    assert_eq!(table.overrides.len(), 2);
+
+    // No directory, no file: no table.
+    let missing = dir.join("no-such-dir");
+    assert!(read_managed_settings_files(&missing).is_empty());
+    assert_eq!(merge_managed_files(&[]), None);
+    assert_eq!(managed_model_pricing(None, None), None);
+}
+
+#[test]
+fn model_pricing_follows_managed_source_precedence() {
+    use crate::agent_adapter::managed_model_pricing;
+    let rec = synthesized(MODEL_PRICING_VERSION);
+    let files = rec.json("managed-settings/docs-example.json");
+    let mdm_pricing = rec.json("managed-settings/multiplier-only.json");
+    let mdm_other = rec.json("managed-settings/mdm-other-policy.json");
+    let mdm_behavior = rec.json("managed-settings/mdm-behavior-only.json");
+    let mdm_merge = rec.json("managed-settings/mdm-merge-other-policy.json");
+
+    // First-wins (the default): the profile sets policy, so the files are
+    // ignored, even though the profile sets no `modelPricing`.
+    assert_eq!(managed_model_pricing(Some(&mdm_other), Some(&files)), None);
+    // The profile's own table wins over the files'.
+    assert_eq!(managed_model_pricing(Some(&mdm_pricing), Some(&files)).unwrap().multiplier, Some(0.7));
+    // A profile with no policy key doesn't count: the files apply.
+    assert_eq!(managed_model_pricing(Some(&mdm_behavior), Some(&files)).unwrap().multiplier, Some(0.85));
+    // An explicit "first-wins" reads the same as the default.
+    let explicit = serde_json::json!({ "managedSourcesBehavior": "first-wins", "cleanupPeriodDays": 30 });
+    assert_eq!(managed_model_pricing(Some(&explicit), Some(&files)), None);
+
+    // Merge: per key, the profile's value would win, but it has no
+    // `modelPricing`, so the files' applies.
+    assert_eq!(managed_model_pricing(Some(&mdm_merge), Some(&files)).unwrap().multiplier, Some(0.85));
+    // Merge set in the files works too.
+    let mut files_merge = files.clone();
+    files_merge["managedSourcesBehavior"] = Value::from("merge");
+    assert_eq!(managed_model_pricing(Some(&mdm_other), Some(&files_merge)).unwrap().multiplier, Some(0.85));
+    // Merge with a table on both: the higher-ranked profile's wins whole.
+    let mut mdm_both = mdm_pricing.clone();
+    mdm_both["managedSourcesBehavior"] = Value::from("merge");
+    let table = managed_model_pricing(Some(&mdm_both), Some(&files)).unwrap();
+    assert_eq!(table.multiplier, Some(0.7));
+    assert!(table.overrides.is_empty());
 }
 
 // ─── `system/init` `model` → the model a stage ran on (#791) ──
