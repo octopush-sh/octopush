@@ -77,6 +77,7 @@ Current anchors:
 | `direct-launcher-brief` | Direct launcher: the brief | `PipelineSetup.tsx` |
 | `direct-launcher-begin` | Direct launcher: "Begin the run" | `PipelineSetup.tsx` |
 | `direct-launcher-estimate` | Direct launcher foot: the "est. $low–$high" range (hover for the per-stage breakdown; once the estimate arrives) | `PipelineSetup.tsx` |
+| `direct-launcher-suggestion` | Direct launcher foot, beside the estimate: "1 suggestion · Plan escalates in 7 of 10 runs", which opens the suggestions (only when this Mac's runs of the crew support one) | `direct/CrewSuggestionLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-model-floor` | Direct launcher: the amber "Fable 5.2 needs Claude Code 2.1.321 or newer" line (only when a Claude Code CLI stage's model or escalation model needs a newer CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-known-bad` | Direct launcher: the amber "Claude Code 2.1.329 drops the retry gateway models need … update Claude Code." line (only on that exact release, when a Claude Code CLI stage or its escalation runs a gateway model) | `PipelineSetup.tsx` |
@@ -103,6 +104,7 @@ Current anchors:
 | `crew-import-sheet` · `crew-import-add` | Crew import review sheet, while open: the sheet · "Add this crew to my library" | `CrewImportSheet.tsx` |
 | `palette-import-crew` | Command palette, Actions: "Import a crew…" | `CommandPalette.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
+| `builder-stage-track-record` | Pipeline builder, Stage inspector of a saved stage: the Track record section (its toggle, the record, the micro-history and suggestions) | `builder/TrackRecord.tsx` via `StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
 | `run-session-line` · `run-session-cell` | Run mode band, right track: the session line (session cells, `+`, the layout button) · the focused session's cell (hover or keyboard focus opens its instant label) | `run/SessionLine.tsx` |
 | `run-layout` · `run-layout-two` | Session line: the layout button · its menu's "Two, side by side" row (while the menu is open) | `run/SessionLine.tsx` |

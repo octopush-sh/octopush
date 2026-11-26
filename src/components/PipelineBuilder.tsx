@@ -18,7 +18,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Undo2, Redo2, Network, X, Download, Copy } from "lucide-react";
 import { copyCrewJson, exportCrewFile, openDroppedCrew } from "../lib/crew";
-import type { PipelineWithStages, Role } from "../lib/ipc";
+import { ipc, type CrewReport, type PipelineWithStages, type Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
 import { RoleEditor } from "./RoleEditor";
@@ -27,6 +27,7 @@ import { StageNode } from "./builder/StageNode";
 import { FlowEdge, LoopEdge } from "./builder/edges";
 import { NodePalette, ARCHETYPE_DND_MIME } from "./builder/NodePalette";
 import { StageInspector, type LoopState } from "./builder/StageInspector";
+import type { StageRecord } from "./builder/TrackRecord";
 import { BuilderProvider } from "./builder/BuilderContext";
 import { FIT_PADDING, flowColorMode, NODE_DRAG_THRESHOLD } from "./builder/flowTheme";
 import { useThemeStore } from "../stores/themeStore";
@@ -328,6 +329,45 @@ function BuilderInner({ pipeline, onClose }: Props) {
   }, [selectedNode]);
   const dockOpen = selectedNode !== null;
 
+  // The crew report card (#983) of the saved pipeline, read once per open.
+  const savedId = pipeline?.pipeline.id ?? null;
+  const [report, setReport] = useState<CrewReport | null>(null);
+  useEffect(() => {
+    if (!savedId) return;
+    let alive = true;
+    Promise.resolve()
+      .then(() => ipc.getCrewReport(savedId))
+      .then((r) => { if (alive) setReport(r ?? null); })
+      .catch(() => { if (alive) setReport(null); });
+    return () => { alive = false; };
+  }, [savedId]);
+  // Each node opened as the saved stage in its place (draftToGraph keeps
+  // position order); a node added since has no record.
+  const savedPosByNode = useMemo(() => {
+    const sorted = [...(pipeline?.stages ?? [])].sort((a, b) => a.position - b.position);
+    return new Map(initial.nodes.map((n, i) => [n.id, sorted[i]?.position]));
+  }, [initial, pipeline]);
+  const recordFor = (node: StageNodeT): StageRecord | null => {
+    const pos = savedPosByNode.get(node.id);
+    if (!report || pos === undefined) return null;
+    // A stage given another role starts a new record.
+    const outcome = report.stages.find((o) => o.position === pos && o.role === node.data.role) ?? null;
+    const nameAt = (p: number | null) => {
+      const n = nodes.find((x) => p !== null && savedPosByNode.get(x.id) === p);
+      return n ? stageLabel(n.data) : "";
+    };
+    return {
+      outcome,
+      minRuns: report.minRuns,
+      // A suggestion already applied in the draft has nothing left to offer.
+      suggestions: outcome
+        ? report.suggestions.filter((s) => s.position === pos && s.role === node.data.role && s.model !== node.data.agentModel)
+        : [],
+      name: stageLabel(node.data),
+      senderName: nameAt,
+    };
+  };
+
   // The selected review stage's loop, derived from its loop edge.
   const loopEdgeForSelected = selectedId
     ? edges.find((e) => e.data?.kind === "loop" && e.source === selectedId)
@@ -618,6 +658,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
                 ancestors={loopTargets}
                 loop={loopState}
                 issue={validation.byNode[dockNode.id]}
+                record={recordFor(dockNode)}
                 onPatch={(p) => patchData(dockNode.id, p)}
                 onSetLoop={setLoop}
                 onClose={() => setSelectedId(null)}

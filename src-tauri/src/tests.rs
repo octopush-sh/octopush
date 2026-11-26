@@ -30355,3 +30355,219 @@ mod skills_containment_tests {
         assert!(!section.contains("[Trimmed:") && !section.contains("[Left out:"));
     }
 }
+
+#[cfg(test)]
+mod crew_report_tests {
+    use crate::db::{Db, SpendEvent};
+    use crate::orchestrator::crew_report::{build_report, next_lighter_tier, CrewReport, CurrentStage, MIN_RUNS};
+    use crate::token_engine::ModelPrices;
+    use tempfile::NamedTempFile;
+
+    fn db_with_workspace() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main','/tmp',?1,?1)", [&now]).unwrap();
+        db
+    }
+
+    /// One `direct` ledger row for a stage: `(input, output)` tokens at `cost`.
+    fn spend(db: &Db, stage_id: &str, model: &str, cost: f64, tokens: (i64, i64), basis: &str) {
+        db.insert_spend_event(&SpendEvent {
+            ts_utc: chrono::Utc::now().to_rfc3339(),
+            surface: "direct".into(),
+            project_id: Some("p1".into()),
+            workspace_id: Some("w1".into()),
+            mission_id: None,
+            source_id: Some(stage_id.into()),
+            attempt: 1,
+            model_raw: model.into(),
+            model: model.into(),
+            input_tokens: tokens.0,
+            output_tokens: tokens.1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            provider_cost_usd: None,
+            computed_cost_usd: Some(cost),
+            cost_usd: cost,
+            cost_basis: basis.into(),
+            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+            thread_id: None,
+            origin: None,
+            speed: None,
+        })
+        .unwrap();
+    }
+
+    fn set_stage(db: &Db, stage_id: &str, status: &str, escalated: bool, loops: i64) {
+        db.conn_ref()
+            .execute(
+                "UPDATE run_stages SET status = ?2, escalated = ?3, loop_iterations = ?4 WHERE id = ?1",
+                rusqlite::params![stage_id, status, escalated as i64, loops],
+            )
+            .unwrap();
+    }
+
+    fn current(db: &Db, pid: &str) -> Vec<CurrentStage> {
+        db.get_pipeline_stages(pid)
+            .unwrap()
+            .into_iter()
+            .map(|s| CurrentStage { position: s.position, role: s.role, agent_model: s.agent_model, escalate_model: s.escalate_model })
+            .collect()
+    }
+
+    fn prices(input: f64, output: f64) -> ModelPrices {
+        ModelPrices { input_per_m: input, output_per_m: output, ..ModelPrices::FREE }
+    }
+
+    fn priced(m: &str) -> Option<ModelPrices> {
+        match m {
+            "claude-sonnet-5-5" => Some(prices(3.0, 15.0)),
+            "claude-opus-5-5" => Some(prices(5.0, 25.0)),
+            "claude-haiku-5-5" => Some(prices(1.0, 5.0)),
+            _ => None,
+        }
+    }
+
+    fn report(db: &Db, pid: &str) -> CrewReport {
+        let lighter = |m: &str| (m == "claude-sonnet-5-5").then(|| "claude-haiku-5-5".to_string());
+        build_report(&current(db, pid), &db.stage_outcomes(pid).unwrap(), &priced, &lighter, &|m: &str| m.to_string())
+    }
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-9)
+    }
+
+    #[test]
+    fn crew_report_charges_loops_to_the_target_and_reads_escalations() {
+        let db = db_with_workspace();
+        let pid = db.insert_pipeline("Crew", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5-5", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "claude-sonnet-5-5", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 2, "code_review", "claude-sonnet-5-5", "api", false, Some(1), 3, Some("auto"), 25).unwrap();
+        db.conn_ref()
+            .execute("UPDATE pipeline_stages SET escalate_model = 'claude-opus-5-5' WHERE pipeline_id = ?1 AND position = 0", [&pid])
+            .unwrap();
+        // Ten settled runs, oldest first: Plan escalates in the first seven,
+        // halted once and re-ran in the eighth; Code review sends Implement
+        // back twice in every one.
+        for i in 0..10 {
+            let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+            let st = db.list_run_stages(&run).unwrap();
+            let escalated = i < 7;
+            set_stage(&db, &st[0].id, "done", escalated, 0);
+            spend(&db, &st[0].id, "claude-sonnet-5-5", 0.10, (10_000, 1_000), "computed");
+            if escalated {
+                spend(&db, &st[0].id, "claude-opus-5-5", 0.30, (30_000, 3_000), "computed");
+            }
+            if i == 7 {
+                db.conn_ref()
+                    .execute(
+                        "INSERT INTO stage_iterations (id, run_id, stage_id, iteration, role, agent_model, status, created_at)
+                         VALUES ('it', ?1, ?2, 1, 'plan', 'claude-sonnet-5-5', 'failed', 'x')",
+                        rusqlite::params![run, st[0].id],
+                    )
+                    .unwrap();
+            }
+            set_stage(&db, &st[1].id, "done", false, 0);
+            spend(&db, &st[1].id, "claude-sonnet-5-5", 0.20, (20_000, 2_000), "computed");
+            set_stage(&db, &st[2].id, "done", false, 2);
+            spend(&db, &st[2].id, "claude-sonnet-5-5", 0.05, (10_000, 1_000), "computed");
+            db.set_run_status(&run, "completed", true).unwrap();
+        }
+        // The newest run was aborted mid-Implement: Plan's finished outcome
+        // counts, the cut-short Implement and the pending review don't.
+        let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        let st = db.list_run_stages(&run).unwrap();
+        set_stage(&db, &st[0].id, "done", false, 0);
+        spend(&db, &st[0].id, "claude-sonnet-5-5", 0.10, (10_000, 1_000), "computed");
+        set_stage(&db, &st[1].id, "failed", false, 0);
+        db.set_run_status(&run, "aborted", true).unwrap();
+        // A run still going is not settled yet.
+        let live = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        set_stage(&db, &db.list_run_stages(&live).unwrap()[0].id, "done", true, 0);
+
+        let r = report(&db, &pid);
+        let (plan, implement, review) = (&r.stages[0], &r.stages[1], &r.stages[2]);
+        assert_eq!((plan.runs, plan.escalated, plan.first_pass, plan.halted), (11, 7, 3, 0));
+        assert_eq!(plan.recent.len(), 10);
+        assert_eq!(&plan.recent[..4], &["pass", "pass", "pass", "rework"], "newest first; the halted-and-re-run attempt is rework");
+        assert!(close(plan.median_usd, 0.40));
+        let opus = plan.by_model.iter().find(|m| m.model == "claude-opus-5-5").unwrap();
+        assert_eq!(opus.runs, 7);
+        assert!(close(opus.median_usd, 0.30));
+
+        // Loop-backs land on the stage sent back, not on the reviewer.
+        assert_eq!((implement.runs, implement.loop_backs, implement.first_pass, implement.halted), (10, 20, 0, 0));
+        assert_eq!((review.runs, review.loop_backs, review.first_pass), (10, 0, 10));
+
+        let kinds: Vec<(&str, i64)> = r.suggestions.iter().map(|s| (s.kind, s.position)).collect();
+        assert_eq!(kinds, vec![("startStrong", 0), ("loopHotspot", 1), ("lighterTier", 2)]);
+        let strong = &r.suggestions[0];
+        assert_eq!((strong.count, strong.runs, strong.model.as_deref()), (7, 11, Some("claude-opus-5-5")));
+        // Actual median $0.40; on Opus from the start: $0.30 for an escalated
+        // run, the others' tokens at Opus prices ($0.075): median $0.30.
+        assert!(close(strong.saving_usd, 0.10));
+        let hotspot = &r.suggestions[1];
+        assert_eq!(hotspot.sender_position, Some(2));
+        assert!(close(hotspot.mean_loops, 2.0));
+        // A lighter tier keeps the current model as the escalation.
+        let lighter = &r.suggestions[2];
+        assert_eq!(lighter.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(lighter.escalate_model.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(close(lighter.saving_usd, 0.05 - 0.015));
+    }
+
+    #[test]
+    fn crew_report_keeps_unpriced_unpriced_and_says_nothing_below_the_floor() {
+        let db = db_with_workspace();
+        let pid = db.insert_pipeline("Crew", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-sonnet-5-5", "api", false, None, 0, None, 25).unwrap();
+        // Oldest: three runs, then two while position 0 held another role.
+        // Only the runs since the role came back count.
+        let mk = |role: &str, model: &str, cost: f64, basis: &str| {
+            let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+            let st = db.list_run_stages(&run).unwrap();
+            db.conn_ref().execute("UPDATE run_stages SET role = ?2 WHERE id = ?1", rusqlite::params![st[0].id, role]).unwrap();
+            set_stage(&db, &st[0].id, "done", false, 0);
+            spend(&db, &st[0].id, model, cost, (10_000, 1_000), basis);
+            db.set_run_status(&run, "completed", true).unwrap();
+        };
+        for _ in 0..3 {
+            mk("implement", "claude-sonnet-5-5", 0.05, "computed");
+        }
+        for _ in 0..2 {
+            mk("plan", "claude-sonnet-5-5", 0.05, "computed");
+        }
+        for _ in 0..MIN_RUNS - 1 {
+            mk("implement", "claude-sonnet-5-5", 0.05, "computed");
+        }
+        let r = report(&db, &pid);
+        assert_eq!(r.stages[0].runs, MIN_RUNS - 1, "the window restarts where the role changed");
+        assert!(r.suggestions.is_empty(), "below the floor, no rule speaks");
+
+        // One attempt the ledger couldn't price: no dollar figure anywhere,
+        // never $0, while the rule itself still fires.
+        mk("implement", "mystery-model", 0.0, "unpriced");
+        let r = report(&db, &pid);
+        let s = &r.stages[0];
+        assert_eq!((s.runs, s.first_pass), (MIN_RUNS, MIN_RUNS));
+        assert_eq!(s.median_usd, None);
+        assert_eq!(s.by_model.iter().find(|m| m.model == "mystery-model").unwrap().median_usd, None);
+        assert_eq!(r.suggestions.len(), 1);
+        assert_eq!((r.suggestions[0].kind, r.suggestions[0].saving_usd), ("lighterTier", None));
+    }
+
+    #[test]
+    fn next_lighter_tier_steps_down_within_the_provider_and_skips_legacy_ids() {
+        let router = crate::provider_router::ProviderRouter::from_map(crate::provider_router::builtin_providers());
+        assert_eq!(next_lighter_tier(&router, "claude-sonnet-5-5").as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(next_lighter_tier(&router, "claude-haiku-5-5"), None);
+        assert_eq!(next_lighter_tier(&router, "not-a-model"), None);
+    }
+}
