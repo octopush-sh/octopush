@@ -453,19 +453,20 @@ async fn answer_ask_stage(
 
 /// Fraction of the model's context window the request may fill before old
 /// tool results start being compacted.
-const CONTEXT_FILL_RATIO_PCT: usize = 70;
+pub(crate) const CONTEXT_FILL_RATIO_PCT: usize = 70;
 /// Context-window guess (tokens) for models the catalog doesn't know. Small
 /// local models are exactly the ones that die on an overgrown history, so the
 /// guess is deliberately conservative.
-const DEFAULT_CONTEXT_TOKENS: usize = 100_000;
+pub(crate) const DEFAULT_CONTEXT_TOKENS: usize = 100_000;
 /// What a compacted tool result is truncated to.
 const COMPACTED_RESULT_CHARS: usize = 500;
 /// The newest messages are never compacted — the model needs its recent
 /// working set intact.
 const COMPACTION_KEEP_TAIL: usize = 4;
 
-/// Rough size (chars) of one message's model-visible content.
-fn message_chars(m: &LlmMessage) -> usize {
+/// Rough size (chars) of one message's model-visible content (the
+/// director's context budget measures with it too).
+pub(crate) fn message_chars(m: &LlmMessage) -> usize {
     match &m.content {
         LlmContent::Text(t) => t.len(),
         LlmContent::Multimodal(blocks) => blocks

@@ -469,31 +469,17 @@ fn skipped_files(chain: &MemoryChain) -> Vec<SkippedFile> {
 
 /// The project's skills then the user's (a project skill shadows a user
 /// skill of the same name): Claude Code lists each one's name and
-/// description in context, never its body. `None` when there is none.
+/// description in context, never its body. Read by the skills reader
+/// itself (`skills::scan_skills_in`), so a project skill that resolves
+/// outside the project is not counted. `None` when there is none.
 pub fn skills_item(project: &Path, home: Option<&Path>) -> Option<CarriedItem> {
-    let mut roots = vec![project.join(".claude").join("skills")];
-    roots.extend(home.map(|h| h.join(".claude").join("skills")));
-    let mut names: Vec<String> = Vec::new();
-    let mut bytes = 0u64;
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
-        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        dirs.sort();
-        for dir in dirs {
-            let Ok(content) = std::fs::read_to_string(dir.join("SKILL.md")) else { continue };
-            let Some(skill) = crate::skills::parse_skill(&content, "") else { continue };
-            if names.contains(&skill.name) {
-                continue;
-            }
-            bytes += (skill.name.len() + skill.description.len()) as u64;
-            names.push(skill.name);
-        }
-    }
-    (!names.is_empty()).then(|| CarriedItem {
+    let skills = crate::skills::scan_skills_in(project, home).found;
+    let bytes: u64 = skills.iter().map(|s| (s.name.len() + s.description.len()) as u64).sum();
+    (!skills.is_empty()).then(|| CarriedItem {
         kind: "skills".into(),
         label: "Skills".into(),
         path: None,
-        count: names.len(),
+        count: skills.len(),
         bytes,
         tokens: 0,
     })
@@ -501,35 +487,16 @@ pub fn skills_item(project: &Path, home: Option<&Path>) -> Option<CarriedItem> {
 
 /// The project's agent definitions then the user's (project shadows user):
 /// Claude Code lists each one's name and description in its Task tool.
+/// Read by the agents reader itself (`skills::agents::scan_agent_files_in`).
 /// `None` when there is none.
 pub fn agents_item(project: &Path, home: Option<&Path>) -> Option<CarriedItem> {
-    let mut roots = vec![project.join(".claude").join("agents")];
-    roots.extend(home.map(|h| h.join(".claude").join("agents")));
-    let mut names: Vec<String> = Vec::new();
-    let mut bytes = 0u64;
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
-            .collect();
-        files.sort();
-        for file in files {
-            let Ok(content) = std::fs::read_to_string(&file) else { continue };
-            let Some(def) = crate::skills::agents::parse_agent_definition(&content, "") else { continue };
-            if names.contains(&def.name) {
-                continue;
-            }
-            bytes += (def.name.len() + def.description.len()) as u64;
-            names.push(def.name);
-        }
-    }
-    (!names.is_empty()).then(|| CarriedItem {
+    let defs = crate::skills::agents::scan_agent_files_in(project, home).found;
+    let bytes: u64 = defs.iter().map(|d| (d.name.len() + d.description.len()) as u64).sum();
+    (!defs.is_empty()).then(|| CarriedItem {
         kind: "agents".into(),
         label: "Agents".into(),
         path: None,
-        count: names.len(),
+        count: defs.len(),
         bytes,
         tokens: 0,
     })

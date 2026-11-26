@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { findActiveMention, rankFiles, applyMention } from "../../lib/mentions";
 import { MentionPopover } from "../chat/MentionPopover";
-import { SlashMenu } from "../chat/SlashMenu";
+import { SlashMenu, matchingSkipped } from "../chat/SlashMenu";
 import { ipc } from "../../lib/ipc";
-import type { SkillMeta } from "../../lib/types";
+import type { SkillMeta, SkippedDefinition } from "../../lib/types";
 
 interface Props {
   value: string;
@@ -49,6 +49,9 @@ export function RichPromptTextarea({
   // ── /skill ──
   const [skills, setSkills] = useState<SkillMeta[]>([]);
   const [slashItems, setSlashItems] = useState<SkillMeta[]>([]);
+  // Skill files the backend left unread, named under the menu's skills.
+  const [skipped, setSkipped] = useState<SkippedDefinition[]>([]);
+  const [slashSkipped, setSlashSkipped] = useState<SkippedDefinition[]>([]);
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashIndex, setSlashIndex] = useState(0);
   // Caret to restore after an insertion re-renders the textarea.
@@ -63,6 +66,10 @@ export function RichPromptTextarea({
     void ipc
       .listSkills(workspacePath)
       .then((s) => !cancelled && setSkills(s))
+      .catch(() => {});
+    void ipc
+      .listSkippedSkills(workspacePath)
+      .then((s) => !cancelled && setSkipped(s))
       .catch(() => {});
     return () => {
       cancelled = true;
@@ -82,7 +89,7 @@ export function RichPromptTextarea({
     // a list the user had just opened.
     refresh(ta.value, ta.selectionStart);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- catalogs only
-  }, [skills, files]);
+  }, [skills, skipped, files]);
 
   useEffect(() => {
     if (pendingCaret.current == null) return;
@@ -100,6 +107,7 @@ export function RichPromptTextarea({
     setMentionIndex(0);
     setSlashOpen(false);
     setSlashItems([]);
+    setSlashSkipped([]);
     setSlashIndex(0);
   }
 
@@ -117,11 +125,13 @@ export function RichPromptTextarea({
       setMentionItems([]);
       setSlashOpen(true);
       setSlashItems(items);
+      setSlashSkipped(matchingSkipped(skipped, q));
       setSlashIndex(0);
       return;
     }
     setSlashOpen(false);
     setSlashItems([]);
+    setSlashSkipped([]);
 
     const m = findActiveMention(next, caret);
     if (!m) {
@@ -155,11 +165,19 @@ export function RichPromptTextarea({
     closeAll();
   }
 
-  const popoverOpen = slashOpen ? slashItems.length > 0 : mentionItems.length > 0;
+  // The menu shows while it has a row: a skill, or a skipped skill file it
+  // names (as in TALK). Only skills are selectable.
+  const slashShown = slashItems.length > 0 || slashSkipped.length > 0;
+  const popoverOpen = slashOpen ? slashShown : mentionItems.length > 0;
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (popoverOpen) {
-      const size = slashOpen ? slashItems.length : mentionItems.length;
+    if (popoverOpen && e.key === "Escape") {
+      e.preventDefault();
+      closeAll();
+      return;
+    }
+    const size = slashOpen ? slashItems.length : mentionItems.length;
+    if (popoverOpen && size > 0) {
       const setIndex = slashOpen ? setSlashIndex : setMentionIndex;
       const index = slashOpen ? slashIndex : mentionIndex;
       if (e.key === "ArrowDown") {
@@ -178,11 +196,6 @@ export function RichPromptTextarea({
         else selectMention(mentionItems[mentionIndex]);
         return;
       }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        closeAll();
-        return;
-      }
     }
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && onSubmit) {
       e.preventDefault();
@@ -197,13 +210,16 @@ export function RichPromptTextarea({
           rather than scrolled to — the active row would be the first thing
           cut off. TALK keeps the upward default (its composer is at the
           bottom of the screen).
-          `slashItems.length > 0` is a guard, not a nicety: SlashMenu renders a
-          "No skills found" panel on an empty list, and since `popoverOpen` is
+          `slashShown` is a guard, not a nicety: SlashMenu renders a "No
+          skills found" panel on an empty list, and since `popoverOpen` is
           false there, Escape would not dismiss it — typing `/usr/local` mid-
-          brief would leave it stuck until the caret left the token. */}
-      {slashOpen && slashItems.length > 0 ? (
+          brief would leave it stuck until the caret left the token. A query
+          that matches only a skipped skill file shows the menu, and Escape
+          dismisses it. */}
+      {slashOpen && slashShown ? (
         <SlashMenu
           items={slashItems}
+          skipped={slashSkipped}
           activeIndex={slashIndex}
           onSelect={selectSkill}
           onHover={setSlashIndex}
