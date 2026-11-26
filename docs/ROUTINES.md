@@ -30,7 +30,7 @@ You approve ideas; everything else runs continuously (VISION.md §8–§9): the 
 | every 2 h (odd hours, :37) | [`web-build.yml`](../.github/workflows/web-build.yml) | the website's builder: one job per run — a web PR the web review sent back or whose CI is red, else the oldest `ready` octopush-web issue, else the oldest app-repo issue labelled `area:web` + `ready` (not `area:app`: that is app work) — built by a Claude agent in a checkout of octopush-web (its CLAUDE.md, checks via `octo-check build\|check\|consistency`, the app's stable `FEATURES.md` as the truth reference); the workflow opens or updates the PR in octopush-web (label `agent`) and, for an app-repo issue, comments the link there |
 | every 2 h (even hours, :47) | [`nightly-review.yml`](../.github/workflows/nightly-review.yml) | an independent Claude reviewer judges each green agent PR (up to 3); `automerge.mjs` re-checks every rule on that exact commit and merges the approved ones (retrying earlier approvals whose merge was skipped for a transient reason), or parks them as `needs-owner` |
 | every 2 h (even hours, :07) | [`web-review.yml`](../.github/workflows/web-review.yml) | an independent Claude reviewer judges each green web PR (up to 3) against octopush-web's CLAUDE.md, the truth rule (the app's `FEATURES.md` at its latest **stable** release), the design rules and the human-only areas, and posts the verdict. It never merges: approved web PRs are listed in the digest, for the PM to merge or for your `merge web#N` |
-| 05:13, 17:13 | [`nightly-release.yml`](../.github/workflows/nightly-release.yml) | if `main` moved and CI is green: notes (with any failed build's, carried), What's new tips, clips, version bump, release PR, CI, merge — only once the PR's head contains the current `main`, else it is cut again and re-tested — tag → `release.yml` publishes a **beta** (docs/RELEASING.md) |
+| 05:13, 17:13 | [`nightly-release.yml`](../.github/workflows/nightly-release.yml) | if `main` moved and CI is green: notes, What's new tips, clips, version bump, release PR, CI, merge, tag → `release.yml` publishes a **beta** |
 | 06:37 | [`ideas.yml`](../.github/workflows/ideas.yml) | a Claude agent researches; at least 5 ranked ideas across app, API and site are filed — app and API ones here (label `area:app\|api`), website ones in octopush-web — and one digest issue here lists them all |
 | 06:47 | [`social.yml`](../.github/workflows/social.yml) | the community routines for octopush-web's `marketing/` work, two jobs (see [Community routines](#community-routines)): `intel` — a Claude agent researches the market and competitors → issue **Market report YYYY-MM-DD**; then `drafts` (also when `intel` failed) — a Claude agent reads that report and the Reddit threads → issue **Social drafts YYYY-MM-DD** with comment drafts. Both issues land in **octopush-web**, label `social`, filed by the App's bot. Nothing is posted anywhere: you approve each draft in your PM chat |
 | any time | [`answers.yml`](../.github/workflows/answers.yml) | the moment you comment on the digest, your answers are applied and confirmed in a reply |
@@ -158,7 +158,10 @@ trusted:
   diff drivers.
 - **The nightly release runs no agent code:** no credentials persisted in the checkout,
   dependencies installed without scripts, and no clip recording in Actions (it would run the
-  frontend next to the token).
+  frontend next to the token). **It tags only a tree its CI tested:** the release PR merges only
+  while its head contains the current `main` (else it is cut again from the new `main` and
+  re-tested, once, then it stops), and the merge commit must have that head's exact tree. A
+  version whose tagged build failed is carried into the next release's notes (docs/RELEASING.md).
 - **Agents read GitHub only through `read.mjs`**, which shows text by you and the routines and
   never anyone else's — an outsider can edit their issue after you approve it, so when you mark an
   outsider's issue `ready`, restate the work in a comment of yours.
