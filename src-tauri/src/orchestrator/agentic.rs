@@ -19,7 +19,8 @@ const MAX_THROTTLE_SECS: u64 = 65;
 
 /// Cap (bytes) on a tool result fed back to the model. A single huge read can
 /// otherwise inflate every later turn's input tokens for the rest of the stage.
-const TOOL_RESULT_CAP_BYTES: usize = 24_000;
+/// Talk's director caps MCP results to the same size.
+pub(crate) const TOOL_RESULT_CAP_BYTES: usize = 24_000;
 
 /// The `max_tokens` floor for a stage given its effort. High-effort thinking
 /// spends its own tokens before the answer, so the output cap must clear that
@@ -27,7 +28,7 @@ const TOOL_RESULT_CAP_BYTES: usize = 24_000;
 /// already sent, so 64k is safe.) `None`/low/medium keep the historical 32768.
 pub fn max_tokens_for(effort: Option<Effort>) -> u32 {
     match effort {
-        None | Some(Effort::Low) | Some(Effort::Medium) => 32768,
+        None | Some(Effort::Least) | Some(Effort::Low) | Some(Effort::Medium) => 32768,
         Some(Effort::High) => 48000,
         Some(Effort::Xhigh) | Some(Effort::Max) => 64000,
     }
@@ -419,8 +420,8 @@ async fn answer_ask_stage(
         effort: None,
         cache: false,
     };
-    let mut on_retry = |attempt: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
-        emitter.notice(&retry_notice(attempt, delay, kind));
+    let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
+        emitter.notice(&retry_notice(attempt, of, delay, kind));
     };
     match complete_with_retry(
         provider.as_ref(),
@@ -826,8 +827,8 @@ pub async fn run_agentic_loop(
         // retried in place with backoff — the accumulated message history is
         // preserved, so a momentary blip never costs the stage its work or forces
         // a halt. Each wait is narrated into the journal.
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
-            emitter.notice(&retry_notice(attempt, delay, kind));
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
+            emitter.notice(&retry_notice(attempt, of, delay, kind));
         };
         let resp = complete_with_retry(
             provider,
@@ -1148,8 +1149,8 @@ pub async fn run_agentic_loop(
             effort,
             cache: true,
         };
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
-            emitter.notice(&retry_notice(attempt, delay, kind));
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
+            emitter.notice(&retry_notice(attempt, of, delay, kind));
         };
         match complete_with_retry(
             provider,

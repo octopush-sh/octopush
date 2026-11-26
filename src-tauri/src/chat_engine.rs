@@ -21,8 +21,8 @@ use crate::providers::{
     anthropic::AnthropicProvider,
     complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
-    retry_notice, Completion, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
-    LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
+    retry_notice, Completion, Effort, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
+    LlmRole, LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
 use crate::orchestrator::agentic::{
@@ -71,6 +71,129 @@ fn default_talk_system_prompt(workspace_path: &str) -> String {
          help the user; be concise and take action rather than just explaining \
          what to do."
     )
+}
+
+/// One request of a Talk turn: every round and the forced close carry the
+/// same model, output cap and reasoning effort (`ChatRequest::effort`), so
+/// the thinking config holds across the turn's tool loop (Anthropic requires
+/// one per loop) and the cached prefix with it.
+fn director_request(request: &ChatRequest, system: &str, messages: &[LlmMessage], tools: &[LlmTool]) -> LlmRequest {
+    LlmRequest {
+        model: request.model.clone(),
+        // Honor the caller's requested budget (the EffortSelector sets it)
+        // with a sane floor; the old code force-clamped to 32768, silently
+        // ignoring the request.
+        // FOLLOW-UP: some providers cap output below the Deep preset (e.g.
+        // gpt-4o at 16384) and will 400 on a larger value. A proper per-model
+        // ceiling needs a `max_output_tokens` field on ModelInfo; until then
+        // the budget is forwarded as-is (this was already the case
+        // pre-change, which force-sent 32768).
+        max_tokens: request.max_tokens.max(4096),
+        system: system.to_string(),
+        messages: messages.to_vec(),
+        tools: tools.to_vec(),
+        tool_choice: None,
+        // Swift's `low` runs as `Effort::Least`, so it never reasons more than
+        // Standard on any model; Standard sends nothing; Deep's `max` is
+        // clamped per model. A model without effort control gets nothing.
+        effort: request.effort.map(|e| if e == Effort::Low { Effort::Least } else { e }),
+        // Agentic loop + multi-turn chat: the system prompt, tool schemas and
+        // prior turns are re-sent every iteration, so cache them.
+        cache: true,
+    }
+}
+
+/// What the forced close tells the model once a configured tool-turn limit
+/// is spent.
+const CLOSE_INSTRUCTION: &str = "Your tool budget for this turn is exhausted — you cannot call any more tools. \
+     Write your final answer NOW with what you already know: what you found or \
+     accomplished, what remains undone, and what the user should do next. If you \
+     were reviewing, state your findings so far.";
+
+/// The forced close's one more request: [`CLOSE_INSTRUCTION`] appended to the
+/// last tool result (the loop always ends right after pushing tool results,
+/// and a separate consecutive user turn breaks role alternation on strict
+/// providers), with the turn's own settings, its effort included. The tool
+/// list rides along unchanged: a history with tool_use blocks and an empty
+/// `tools` array is a hard 400 on Anthropic, and keeping it preserves the
+/// prompt-cache prefix.
+fn forced_close_request(
+    request: &ChatRequest,
+    system: &str,
+    messages: &mut Vec<LlmMessage>,
+    tools: &[LlmTool],
+) -> LlmRequest {
+    match messages.last_mut() {
+        Some(LlmMessage { content: LlmContent::ToolResults(results), .. }) if !results.is_empty() => {
+            if let Some(last) = results.last_mut() {
+                last.content.push_str("\n\n[system] ");
+                last.content.push_str(CLOSE_INSTRUCTION);
+            }
+        }
+        _ => messages.push(LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(CLOSE_INSTRUCTION.to_string()),
+        }),
+    }
+    director_request(request, system, messages, tools)
+}
+
+/// The assistant turn a tool round leaves in the loop: the response's content
+/// blocks verbatim (as `run_agentic_loop` does), so a thinking block the
+/// round produced is replayed signed and in order on the next round, which
+/// the API requires while thinking is on.
+fn tool_round_turn(response: &LlmResponse) -> LlmMessage {
+    LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::AssistantWithTools {
+            raw: response.raw_content.clone(),
+            text: response.text.clone(),
+            tool_uses: response.tool_uses.clone(),
+        },
+    }
+}
+
+/// The leading complete thinking blocks of a response's content: signed
+/// `thinking` and `redacted_thinking` blocks, up to the first other block.
+/// Empty for an OpenAI Responses turn or a response without thinking.
+fn leading_signed_thinking(raw: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    if crate::providers::openai_compat::is_responses_raw(raw) {
+        return Vec::new();
+    }
+    let nonempty = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.is_empty());
+    raw.iter()
+        .take_while(|b| match b["type"].as_str() {
+            Some("thinking") => nonempty(&b["signature"]),
+            Some("redacted_thinking") => nonempty(&b["data"]),
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// The assistant turn of a round cut off at `max_tokens` mid-tool-use. It is
+/// rebuilt from its text and tool calls, since a cut-off turn can end in a
+/// partial block, but its leading signed thinking blocks are kept in front:
+/// with a thinking budget on, the API rejects a final assistant turn that
+/// doesn't start with one.
+fn truncated_round_turn(response: &LlmResponse) -> LlmMessage {
+    let mut raw = leading_signed_thinking(&response.raw_content);
+    if !raw.is_empty() {
+        if !response.text.is_empty() {
+            raw.push(serde_json::json!({ "type": "text", "text": response.text }));
+        }
+        for u in &response.tool_uses {
+            raw.push(serde_json::json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input }));
+        }
+    }
+    LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::AssistantWithTools {
+            raw,
+            text: response.text.clone(),
+            tool_uses: response.tool_uses.clone(),
+        },
+    }
 }
 
 fn recall_tool_definition() -> LlmTool {
@@ -181,6 +304,18 @@ pub struct ChatRequest {
     pub user_message: String,
     pub system: Option<String>,
     pub max_tokens: u32,
+    /// The reasoning effort of every request the turn makes. The composer's
+    /// Swift sends `low`, which the turn runs as `Effort::Least`: the least
+    /// the model takes, never more than Standard (effort lowered, thinking
+    /// never turned on; `none` on GPT-6 Sol, Luna and 6.1 Terra). Standard
+    /// sends none (`None`: no thinking params, so every model keeps its own
+    /// default, as before presets set effort). Deep sends `max`, which the
+    /// provider adapters (`anthropic::thinking_json`,
+    /// `openai_compat::build_request`) turn into the most the model takes
+    /// (`max`, `high`, or a thinking budget). A model without effort control
+    /// gets nothing.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Legacy: a skill name pinned to the conversation. The composer no
     /// longer sends one — skills are invoked per message as `/name` tokens in
     /// the text, resolved against the worktree's skills when the turn runs.
@@ -254,6 +389,61 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
         s.push_str(&not_found_note(output));
     }
     s
+}
+
+/// How a call ended, as the engine knows it, for its row (`stamp_outcome`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RowVerdict {
+    ok: bool,
+    /// Not run: the user denied its approval card or the secret guard's, or
+    /// the conversation has the tool's MCP server turned off.
+    denied: bool,
+    /// A shell's exit status, when it reported one.
+    exit_code: Option<i32>,
+    /// The engine itself stopped it: Stop on the turn interrupted the agent's
+    /// command, or the user stopped a `$` process.
+    stopped: bool,
+}
+
+/// Stamp how a call ended on its persisted `role="tool"` row, so the resolved
+/// ledger row can read as failed or denied instead of looking like a pass:
+/// `ok`, `outcome` (`ok` · `failed` · `denied`), `exitCode` when a shell
+/// reported one, and `reason: "stopped"` when the engine stopped it (so a
+/// stopped command reads as stopped, not as its SIGINT exit). Additive keys:
+/// rows written before them carry none, and the frontend reads their verdict
+/// from the result text instead (`lib/toolVerdict.ts`). A shell's `-1` is its
+/// "no status" sentinel (an interrupt, a busy shell), never an exit code, so
+/// it isn't recorded.
+fn stamp_outcome(record: &mut serde_json::Value, v: RowVerdict) {
+    let outcome = if v.denied {
+        "denied"
+    } else if v.ok {
+        "ok"
+    } else {
+        "failed"
+    };
+    record["ok"] = serde_json::json!(v.ok && !v.denied);
+    record["outcome"] = serde_json::json!(outcome);
+    if let Some(code) = v.exit_code.filter(|c| *c >= 0) {
+        record["exitCode"] = serde_json::json!(code);
+    }
+    if v.stopped && outcome == "failed" {
+        record["reason"] = serde_json::json!("stopped");
+    }
+}
+
+/// The persisted `role="tool"` row every call site writes: the call, what it
+/// returned, and how it ended. One builder, so what a row records is tested
+/// where it is made.
+fn tool_row(call_id: &str, tool_name: &str, tool_input: serde_json::Value, result: &str, v: RowVerdict) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "callId": call_id,
+        "toolName": tool_name,
+        "toolInput": tool_input,
+        "result": result,
+    });
+    stamp_outcome(&mut record, v);
+    record
 }
 
 /// The exit status bash gives a command it couldn't find.
@@ -620,6 +810,12 @@ impl ApprovalBroker {
     pub fn retire_workspace(&self, workspace_id: &str) {
         self.retired.lock().insert(workspace_id.to_string());
         self.deny_where(|r| r.workspace_id == workspace_id);
+    }
+
+    /// The workspace's deletion failed, so it stays: its conversations may
+    /// ask again.
+    pub fn reinstate_workspace(&self, workspace_id: &str) {
+        self.retired.lock().remove(workspace_id);
     }
 
     /// Whether a card from `workspace_id` may wait for an answer.
@@ -1994,6 +2190,9 @@ pub struct ChatEngine {
     continuing: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The turn-limit gate for writing sub-agents (see `CapGate`).
     pub cap_gate: Arc<CapGate>,
+    /// Threads whose live `$` process the user stopped (`stop_shell`), so its
+    /// row reads as stopped when it exits.
+    stopped_shells: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ChatEngine {
@@ -2010,7 +2209,15 @@ impl ChatEngine {
             approvals: Arc::new(ApprovalBroker::default()),
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
+            stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Stop a thread's live `$` process (SIGINT), remembering that the user
+    /// did, so its row reads as stopped rather than as exit 130.
+    pub fn stop_shell(&self, thread_id: &str) {
+        self.stopped_shells.lock().insert(thread_id.to_string());
+        self.talk_shell.interrupt(thread_id);
     }
 
     /// The approval broker, for a sub-agent gate that outlives a `&self` borrow.
@@ -2071,6 +2278,17 @@ impl ChatEngine {
             self.cancel(thread_id);
         }
         self.approvals.retire_workspace(workspace_id);
+    }
+
+    /// `delete_workspace` is done with the row: if removing it failed, the
+    /// workspace stays, so it is reinstated in the approval broker (its
+    /// cards would otherwise be denied, unseen, until a restart). Its turns
+    /// stay stopped, as after Stop. Returns `deleted` unchanged.
+    pub fn finish_workspace_delete<T>(&self, workspace_id: &str, deleted: AppResult<T>) -> AppResult<T> {
+        if deleted.is_err() {
+            self.approvals.reinstate_workspace(workspace_id);
+        }
+        deleted
     }
 
     /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
@@ -2172,14 +2390,16 @@ impl ChatEngine {
             }
             Err(e) => return (format!("Failed to load tool output: {e}"), false),
         };
-        let result = serde_json::from_str::<serde_json::Value>(&stored)
-            .ok()
-            .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_string))
-            .unwrap_or_default();
+        let original = self.db.lock().get_chat_tool_original(thread_id, message_id).ok().flatten();
+        let (result, cut) = crate::chat_history::recall_source(&stored, original);
         if result.is_empty() {
             return (format!("Tool output #{message_id} is empty"), true);
         }
-        (window_text(&result, offset, limit), true)
+        let window = window_text(&result, offset, limit);
+        match cut {
+            Some(note) => (format!("{window}\n{note}"), true),
+            None => (window, true),
+        }
     }
 
     /// Show `line` (a journal line, e.g. a retry or a rate-limit pause) on
@@ -2211,9 +2431,9 @@ impl ChatEngine {
         req: &LlmRequest,
         cancel: &AtomicBool,
     ) -> Completion {
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
             tracing::warn!(attempt, delay, kind = kind.label(), "Talk director: provider call failed; retrying");
-            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, delay, kind), delay);
+            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, of, delay, kind), delay);
         };
         complete_cancellable(provider, api_base, api_key, req, &self.client, cancel, DEFAULT_MAX_RETRIES, &mut on_retry)
             .await
@@ -2631,7 +2851,7 @@ impl ChatEngine {
                 // Hard failure (daemon down / spawn failed) — surface as a card.
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, false, started,
-                    &format!("Shell error: {e}"), "",
+                    &format!("Shell error: {e}"), "", None,
                 );
                 return Err(e);
             }
@@ -2651,6 +2871,7 @@ impl ChatEngine {
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, result.ok, started,
                     &format_command_output(&result.output, result.exit_code), &result.cwd,
+                    Some(result.exit_code),
                 );
                 // Compute the badge label once here (the single source) so the
                 // frontend renders it verbatim instead of re-deriving the rule.
@@ -2662,7 +2883,7 @@ impl ChatEngine {
                 let note = "A live process is already running in this conversation — \
                             stop it before running another command.";
                 self.resolve_shell_card(
-                    &app, &request, &call_id, &tool_input, false, started, note, "",
+                    &app, &request, &call_id, &tool_input, false, started, note, "", None,
                 );
                 Ok(ShellResult {
                     output: note.to_string(),
@@ -2710,6 +2931,7 @@ impl ChatEngine {
         started: std::time::Instant,
         result_str: &str,
         abs_cwd: &str,
+        exit_code: Option<i32>,
     ) {
         let _ = app.emit("chat://tool-end", &ToolEndEvent {
             workspace_id: request.workspace_id.clone(),
@@ -2718,12 +2940,13 @@ impl ChatEngine {
             ok,
             duration_ms: started.elapsed().as_millis() as u64,
         });
-        let record = serde_json::json!({
-            "callId": call_id,
-            "toolName": "run_command",
-            "toolInput": tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
-            "result": result_str,
-        });
+        let record = tool_row(
+            call_id,
+            "run_command",
+            tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
+            result_str,
+            RowVerdict { ok, exit_code, ..RowVerdict::default() },
+        );
         let _ = self.insert_and_emit_message(
             app, &request.workspace_id, &request.thread_id,
             "tool", &record.to_string(), None, None, None, None,
@@ -2743,6 +2966,9 @@ impl ChatEngine {
         live: crate::talk_shell::LiveRun,
     ) {
         let db = Arc::clone(&self.db);
+        let stopped_shells = Arc::clone(&self.stopped_shells);
+        // A Stop pressed before this process started isn't this process's.
+        stopped_shells.lock().remove(&request.thread_id);
         std::thread::Builder::new()
             .name(format!("talk-live-{call_id}"))
             .spawn(move || {
@@ -2774,12 +3000,16 @@ impl ChatEngine {
                     cwd_label: relativize_cwd(&exit.cwd, &request.workspace_path),
                 });
 
-                let record = serde_json::json!({
-                    "callId": call_id,
-                    "toolName": "run_command",
-                    "toolInput": tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
-                    "result": format_command_output(&exit.full_output, exit.exit_code),
-                });
+                // The user stopped it (`stop_shell`): it reads as stopped, not
+                // as the exit status SIGINT left it with.
+                let stopped = stopped_shells.lock().remove(&request.thread_id);
+                let record = tool_row(
+                    &call_id,
+                    "run_command",
+                    tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
+                    &format_command_output(&exit.full_output, exit.exit_code),
+                    RowVerdict { ok: exit.exit_code == 0, exit_code: Some(exit.exit_code), stopped, ..RowVerdict::default() },
+                );
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                 // The conversation may have been deleted while the process ran;
                 // don't leave an orphaned row (no FK from messages → threads).
@@ -3007,6 +3237,7 @@ impl ChatEngine {
 
         let mut system_prompt = request
             .system
+            .clone()
             .unwrap_or_else(|| default_talk_system_prompt(&request.workspace_path));
 
         if let Some(doctrine) = &doctrine {
@@ -3105,13 +3336,10 @@ impl ChatEngine {
             // Discovery may have started servers or seen one fail: the
             // Companion's chips re-read their status.
             let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
-            for t in discovered {
-                tools.push(LlmTool {
-                    name: t.namespaced,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                });
-            }
+            // In `mcp::sort_tools` order (server, then tool): the same config
+            // gives the same tool bytes on every turn, so the provider's
+            // prompt cache, which starts at the tool list, survives.
+            tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
         }
 
         let mut usage = TurnUsage::default();
@@ -3185,27 +3413,7 @@ impl ChatEngine {
                 }
             }
 
-            let llm_req = LlmRequest {
-                model: request.model.clone(),
-                // Honor the caller's requested budget (the EffortSelector sets
-                // it) with a sane floor; the old code force-clamped to 32768,
-                // silently ignoring the request.
-                // FOLLOW-UP: some providers cap output below the Deep preset
-                // (e.g. gpt-4o at 16384) and will 400 on a larger value. A
-                // proper per-model ceiling needs a `max_output_tokens` field on
-                // ModelInfo; until then the budget is forwarded as-is (this was
-                // already the case pre-change, which force-sent 32768).
-                max_tokens: request.max_tokens.max(4096),
-                system: system_prompt.clone(),
-                messages: messages.clone(),
-                tools: tools.clone(),
-                tool_choice: None,
-                // TALK doesn't drive per-request reasoning effort — behavior unchanged.
-                effort: None,
-                // Agentic loop + multi-turn chat: the system prompt, tool schemas
-                // and prior turns are re-sent every iteration, so cache them.
-                cache: true,
-            };
+            let llm_req = director_request(&request, &system_prompt, &messages, &tools);
 
             let response = match self
                 .director_call(
@@ -3267,15 +3475,9 @@ impl ChatEngine {
             // Handle max_tokens truncation during tool use.
             if matches!(response.stop_reason, LlmStopReason::MaxTokens) && !response.tool_uses.is_empty() {
                 tracing::warn!("Response truncated at max_tokens during tool_use — providing error tool_results and retrying");
-                // Add the truncated assistant message to history.
-                messages.push(LlmMessage {
-                    role: LlmRole::Assistant,
-                    content: LlmContent::AssistantWithTools {
-                        raw: vec![],
-                        text: response.text.clone(),
-                        tool_uses: response.tool_uses.clone(),
-                    },
-                });
+                // Add the truncated assistant message to history, its leading
+                // signed thinking kept.
+                messages.push(truncated_round_turn(&response));
                 // Provide error tool_results for each tool_use (API requires matching pairs).
                 let error_results: Vec<LlmToolResult> = response.tool_uses.iter().map(|u| LlmToolResult {
                     tool_use_id: u.id.clone(),
@@ -3359,15 +3561,9 @@ impl ChatEngine {
                 }
             };
 
-            // Add assistant message with tool_use content to conversation.
-            messages.push(LlmMessage {
-                role: LlmRole::Assistant,
-                content: LlmContent::AssistantWithTools {
-                    raw: vec![],
-                    text: response.text.clone(),
-                    tool_uses: response.tool_uses.clone(),
-                },
-            });
+            // Add assistant message with tool_use content to conversation,
+            // its content blocks verbatim (`tool_round_turn`).
+            messages.push(tool_round_turn(&response));
 
             // ── Sub-agents: fan out first ──────────────────────────
             // Every `Agent` call in this response runs CONCURRENTLY (that is
@@ -3566,6 +3762,12 @@ impl ChatEngine {
                 // Absolute cwd a run_command executed in (shared shell), captured
                 // so its card can show the cwd badge. Empty for other tools.
                 let mut run_command_cwd = String::new();
+                // The shared shell's exit status, for the row's verdict.
+                let mut run_command_exit: Option<i32> = None;
+                // Stop interrupted the command: it reads as stopped.
+                let mut interrupted = false;
+                // Not run: denied at its card, or its MCP server is off here.
+                let mut was_denied = denied.is_some();
 
                 // Route MCP tools (`mcp__server__tool`) to their server; all
                 // other names are built-in workspace tools. MCP calls run off
@@ -3574,6 +3776,9 @@ impl ChatEngine {
                 // A sub-agent's outcome was collected in the fan-out; its
                 // meta rides on the persisted tool row (`agent` key).
                 let mut agent_meta: Option<AgentOutcome> = None;
+                // An MCP result whose binary payloads the model reads as
+                // placeholders: the original, kept on the row for recall.
+                let mut mcp_original: Option<String> = None;
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
@@ -3594,7 +3799,9 @@ impl ChatEngine {
                     // The list as it is now, not at the turn's start: a server
                     // turned off mid-turn stops here, one turned back on runs.
                     // (A call to a server not offered this turn can still be
-                    // copied from an earlier turn's history.)
+                    // copied from an earlier turn's history.) The user's own
+                    // setting refused it: its row reads as denied.
+                    was_denied = true;
                     (refusal, false)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
                     // Bounded, and a timeout STOPS the server so the call can
@@ -3608,7 +3815,10 @@ impl ChatEngine {
                     )
                     .await
                     {
-                        Ok(out) => (out, true),
+                        Ok(out) => {
+                            mcp_original = out.original;
+                            (out.text, true)
+                        }
                         Err(e) => (e, false),
                     }
                 } else if u.name == "run_command" && self.talk_shell.available() && sandbox_roots.is_none() {
@@ -3642,6 +3852,7 @@ impl ChatEngine {
                             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                                 if cancel.load(Ordering::Relaxed) {
                                     self.talk_shell.interrupt(&request.thread_id);
+                                    interrupted = true;
                                 }
                             }
                         }
@@ -3651,6 +3862,7 @@ impl ChatEngine {
                             // Record where it ran (absolute) so the card shows the
                             // cwd badge, matching `$`-direct.
                             run_command_cwd = r.cwd.clone();
+                            run_command_exit = Some(r.exit_code);
                             // Keep the composer's cwd badge accurate if the agent
                             // `cd`'d the shared shell.
                             if !r.cwd.is_empty() {
@@ -3743,12 +3955,13 @@ impl ChatEngine {
                 } else {
                     input_for_display
                 };
-                let mut tool_record = serde_json::json!({
-                    "callId": u.id,
-                    "toolName": u.name,
-                    "toolInput": display_input,
-                    "result": result,
-                });
+                let mut tool_record = tool_row(
+                    &u.id,
+                    &u.name,
+                    display_input,
+                    &result,
+                    RowVerdict { ok, denied: was_denied, exit_code: run_command_exit, stopped: interrupted },
+                );
                 if let Some(meta) = &agent_meta {
                     // Report already sits in `result`; the meta is what the
                     // card's collapsed summary shows (tokens, cost, ending).
@@ -3766,6 +3979,7 @@ impl ChatEngine {
                     .lock()
                     .chat_thread_exists(&request.thread_id)
                     .unwrap_or(true);
+                let mut row_id: Option<i64> = None;
                 if thread_alive {
                     match self.insert_and_emit_message(
                         &app,
@@ -3778,20 +3992,34 @@ impl ChatEngine {
                         // The saved run points at its row so a continuation
                         // can rewrite the report in place.
                         Ok(id) if is_agent => {
+                            row_id = Some(id);
                             if let Err(e) = self.db.lock().set_chat_agent_run_message(&u.id, id) {
                                 tracing::warn!(error = %e, "failed to link sub-agent run to its row");
                             }
                         }
-                        Ok(_) => {}
+                        Ok(id) => {
+                            row_id = Some(id);
+                            // The row's `result` is what the model, the card
+                            // and later turns read. The original goes to its
+                            // own table, capped, for recall only: the webview
+                            // never receives it.
+                            if let Some(original) = mcp_original.take() {
+                                if let Err(e) = self.db.lock().set_chat_tool_original(id, &request.thread_id, &original) {
+                                    tracing::warn!(error = %e, "failed to keep the original MCP output for recall");
+                                }
+                            }
+                        }
                         Err(e) => {
                             tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
                         }
                     }
                 }
 
+                // The row keeps the whole result; an MCP result is capped
+                // in the copy the next round carries.
                 tool_results.push(LlmToolResult {
                     tool_use_id: u.id.clone(),
-                    content: result,
+                    content: crate::chat_history::tool_result_for_model(&u.name, result, row_id),
                     is_error: false,
                 });
             }
@@ -3864,39 +4092,7 @@ impl ChatEngine {
             self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
             return Ok(());
         }
-        const CLOSE_INSTRUCTION: &str =
-            "Your tool budget for this turn is exhausted — you cannot call any more tools. \
-             Write your final answer NOW with what you already know: what you found or \
-             accomplished, what remains undone, and what the user should do next. If you \
-             were reviewing, state your findings so far.";
-        // The loop always ends right after pushing tool results, so the
-        // instruction is APPENDED to the last tool result — a separate
-        // consecutive user turn breaks role alternation on strict providers.
-        // The tool list rides along unchanged: a history with tool_use blocks
-        // and an empty `tools` array is a hard 400 on Anthropic, and keeping it
-        // preserves the prompt-cache prefix.
-        match messages.last_mut() {
-            Some(LlmMessage { content: LlmContent::ToolResults(results), .. }) if !results.is_empty() => {
-                if let Some(last) = results.last_mut() {
-                    last.content.push_str("\n\n[system] ");
-                    last.content.push_str(CLOSE_INSTRUCTION);
-                }
-            }
-            _ => messages.push(LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Text(CLOSE_INSTRUCTION.to_string()),
-            }),
-        }
-        let close_req = LlmRequest {
-            model: request.model.clone(),
-            max_tokens: request.max_tokens.max(4096),
-            system: system_prompt.clone(),
-            messages: messages.clone(),
-            tools: tools.clone(),
-            tool_choice: None,
-            effort: None,
-            cache: true,
-        };
+        let close_req = forced_close_request(&request, &system_prompt, &mut messages, &tools);
         if let Some(wait) = pending_throttle.take() {
             self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &throttle_notice(wait), wait);
             if !interruptible_sleep(wait, &cancel).await {
@@ -4221,6 +4417,242 @@ mod continuation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Talk request as the composer sends it on `model`, with `effort` set
+    /// or absent.
+    fn chat_request_on(model: &str, effort: Option<&str>) -> ChatRequest {
+        let mut v = serde_json::json!({
+            "workspaceId": "w", "threadId": "t", "workspacePath": "/w", "model": model,
+            "userMessage": "hi", "system": null, "maxTokens": 64000,
+        });
+        if let Some(e) = effort {
+            v["effort"] = serde_json::json!(e);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The composer's presets as it sends them: Swift `low`, Standard nothing,
+    /// Deep `max`.
+    const SWIFT: Option<&str> = Some("low");
+    const STANDARD: Option<&str> = None;
+    const DEEP: Option<&str> = Some("max");
+
+    #[test]
+    fn swift_standard_and_deep_reach_every_director_request_as_effort() {
+        for (sent, asked, runs) in [
+            (SWIFT, Some(Effort::Low), Some(Effort::Least)),
+            (STANDARD, None, None),
+            (DEEP, Some(Effort::Max), Some(Effort::Max)),
+        ] {
+            let request = chat_request_on("m", sent);
+            assert_eq!(request.effort, asked);
+            let req = director_request(&request, "sys", &[], &[]);
+            assert_eq!((req.effort, req.max_tokens, req.cache), (runs, 64000, true));
+        }
+        // `least` is internal: a request can't ask for it.
+        assert!(serde_json::from_value::<Effort>(serde_json::json!("least")).is_err());
+    }
+
+    #[test]
+    fn standard_keeps_every_model_s_request_body_and_swift_and_deep_follow_each_model() {
+        use crate::providers::{anthropic, openai_compat};
+        let anthropic_body = |model: &str, preset: Option<&str>| {
+            anthropic::build_request(&director_request(&chat_request_on(model, preset), "sys", &[], &[]))
+        };
+        let openai_body = |model: &str, preset: Option<&str>| {
+            openai_compat::build_request(&director_request(&chat_request_on(model, preset), "sys", &[], &[]))
+        };
+        let thinks = |b: &serde_json::Value| b.get("thinking").is_some() || b.get("output_config").is_some();
+        let models = [
+            "claude-sonnet-5-5", "claude-opus-5", "claude-opus-4-6", "claude-opus-4-5", "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+        ];
+        // Standard: no effort and no thinking settings on any model.
+        for m in models {
+            assert!(!thinks(&anthropic_body(m, STANDARD)), "{m}: {}", anthropic_body(m, STANDARD));
+        }
+        for m in ["o3", "gpt-5", "gpt-4o"] {
+            assert!(openai_body(m, STANDARD).get("reasoning_effort").is_none(), "{m}");
+        }
+
+        let level = |model: &str, preset: Option<&str>| {
+            let b = anthropic_body(model, preset);
+            assert_eq!(b["thinking"]["type"], "adaptive", "{model}: {b}");
+            b["output_config"]["effort"].as_str().unwrap().to_string()
+        };
+        // Swift: low effort alone, thinking never turned on, where the model
+        // has effort control (the full check is
+        // `swift_never_reasons_more_than_standard_on_any_model`).
+        for m in ["claude-sonnet-5-5", "claude-opus-4-6"] {
+            let b = anthropic_body(m, SWIFT);
+            assert!(b.get("thinking").is_none(), "{m}: {b}");
+            assert_eq!(b["output_config"], serde_json::json!({ "effort": "low" }), "{m}: {b}");
+        }
+        for m in ["claude-opus-4-5", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"] {
+            assert!(!thinks(&anthropic_body(m, SWIFT)), "{m}: Swift sends nothing");
+        }
+        assert_eq!(openai_body("o3", SWIFT)["reasoning_effort"], "low");
+        assert_eq!(openai_body("gpt-6-sol", SWIFT)["reasoning_effort"], "none");
+        assert!(openai_body("gpt-4o", SWIFT).get("reasoning_effort").is_none());
+
+        // Deep: the highest the model takes.
+        assert_eq!(level("claude-sonnet-5-5", DEEP), "max");
+        assert_eq!(level("claude-opus-4-6", DEEP), "max");
+        // Opus 4.5 and Haiku 4.5 think only with a budget (`adaptive` would 400).
+        for m in ["claude-opus-4-5", "claude-opus-4-5-20251101", "claude-haiku-4-5-20251001"] {
+            let b = anthropic_body(m, DEEP);
+            assert_eq!(b["thinking"], serde_json::json!({ "type": "enabled", "budget_tokens": 24576 }), "{m}: {b}");
+            assert!(b.get("output_config").is_none(), "{m}: {b}");
+        }
+        assert!(!thinks(&anthropic_body("claude-3-5-sonnet-20241022", DEEP)));
+        assert_eq!(openai_body("o3", DEEP)["reasoning_effort"], "high", "o-series stops at high");
+        assert_eq!(openai_body("gpt-6-sol", DEEP)["reasoning_effort"], "max");
+        assert!(openai_body("gpt-4o", DEEP).get("reasoning_effort").is_none());
+    }
+
+    /// Where a reasoning level ranks: less reasoning ranks lower.
+    fn reasoning_rank(level: &str) -> usize {
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .position(|l| *l == level)
+            .unwrap_or_else(|| panic!("unknown level {level}"))
+    }
+
+    /// Swift never reasons more than Standard, on any model in the table:
+    /// it never turns thinking on where Standard leaves it to the model, and
+    /// its effort is never above the model's own default (which Standard,
+    /// sending nothing, keeps).
+    #[test]
+    fn swift_never_reasons_more_than_standard_on_any_model() {
+        use crate::providers::{anthropic, openai_compat};
+        let req = |model: &str, preset: Option<&str>| director_request(&chat_request_on(model, preset), "sys", &[], &[]);
+        for m in [
+            "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+            "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-0",
+            "claude-haiku-5-5", "claude-haiku-4-5", "claude-fable-5-2", "claude-fable-5", "claude-mythos-5-2",
+            "claude-mythos-5", "claude-mythos-preview", "claude-3-5-sonnet-20241022", "some-unknown-model",
+        ] {
+            let standard = anthropic::build_request(&req(m, STANDARD));
+            let swift = anthropic::build_request(&req(m, SWIFT));
+            assert!(standard.get("thinking").is_none() && standard.get("output_config").is_none(), "{m}: {standard}");
+            assert!(swift.get("thinking").is_none(), "{m}: Swift turned thinking on: {swift}");
+            if let Some(level) = swift["output_config"]["effort"].as_str() {
+                // Every effort model's default is `medium` or `high`.
+                assert!(reasoning_rank(level) < reasoning_rank("medium"), "{m}: {swift}");
+            }
+        }
+        // OpenAI: Chat Completions (any gateway) and the Responses API (GPT-6 on OpenAI).
+        let openai_models = [
+            "gpt-4o", "o1", "o3", "o4-mini", "gpt-5", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra", "gpt-6-astra",
+            "gpt-6.1-sol",
+        ];
+        for m in openai_models {
+            let standard = openai_compat::build_request(&req(m, STANDARD));
+            let swift = openai_compat::build_request(&req(m, SWIFT));
+            assert!(standard.get("reasoning_effort").is_none(), "{m}: {standard}");
+            if let Some(level) = swift["reasoning_effort"].as_str() {
+                // No `reasoning_effort` runs at the API default, `medium`.
+                assert!(reasoning_rank(level) < reasoning_rank("medium"), "{m}: {swift}");
+            }
+        }
+        let base = "https://api.openai.com/v1";
+        for &m in openai_models.iter().filter(|m| m.starts_with("gpt-6")) {
+            let level = |preset| {
+                let b = openai_compat::build_responses_request(&req(m, preset), "openai", base);
+                b["reasoning"]["effort"].as_str().map(str::to_string)
+            };
+            let standard = level(STANDARD).unwrap_or_else(|| "medium".into());
+            let swift = level(SWIFT).unwrap_or_else(|| "medium".into());
+            assert!(reasoning_rank(&swift) <= reasoning_rank(&standard), "{m}: Swift {swift} vs Standard {standard}");
+        }
+        // Where `none` is the model's lowest, Swift sends it.
+        for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"] {
+            assert_eq!(openai_compat::build_request(&req(m, SWIFT))["reasoning_effort"], "none", "{m}");
+            let b = openai_compat::build_responses_request(&req(m, SWIFT), "openai", base);
+            assert_eq!(b["reasoning"]["effort"], "none", "{m}: {b}");
+        }
+    }
+
+    /// A response that thought, said something, then called a tool.
+    fn tool_response(raw: Vec<serde_json::Value>, stop: LlmStopReason) -> LlmResponse {
+        LlmResponse {
+            text: "Checking.".into(),
+            tool_uses: vec![crate::providers::LlmToolUse {
+                id: "tu_1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": "a.rs" }),
+            }],
+            stop_reason: stop,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            rate_limit: None,
+            raw_content: raw,
+        }
+    }
+
+    /// The assistant turn as the Anthropic adapter sends it on the next round
+    /// (its tool results follow, and carry the cache breakpoint).
+    fn sent_turn(turn: LlmMessage) -> serde_json::Value {
+        let results = LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::ToolResults(vec![LlmToolResult { tool_use_id: "tu_1".into(), content: "ok".into(), is_error: false }]),
+        };
+        let req = director_request(&chat_request_on("claude-sonnet-5-5", DEEP), "sys", &[turn, results], &[]);
+        crate::providers::anthropic::build_request(&req)["messages"][0]["content"].clone()
+    }
+
+    #[test]
+    fn a_tool_round_is_replayed_with_its_signed_thinking_and_block_order() {
+        let raw = vec![
+            serde_json::json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
+            serde_json::json!({ "type": "text", "text": "Checking." }),
+            serde_json::json!({ "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a.rs" } }),
+        ];
+        let turn = tool_round_turn(&tool_response(raw.clone(), LlmStopReason::ToolUse));
+        assert_eq!(sent_turn(turn), serde_json::Value::Array(raw));
+    }
+
+    #[test]
+    fn a_truncated_round_keeps_its_leading_signed_thinking() {
+        let raw = vec![
+            serde_json::json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
+            serde_json::json!({ "type": "redacted_thinking", "data": "opaque" }),
+            serde_json::json!({ "type": "text", "text": "Checking." }),
+            serde_json::json!({ "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a.rs" } }),
+            // A block cut off mid-way is never replayed.
+            serde_json::json!({ "type": "thinking", "thinking": "half" }),
+        ];
+        let sent = sent_turn(truncated_round_turn(&tool_response(raw.clone(), LlmStopReason::MaxTokens)));
+        assert_eq!(sent, serde_json::Value::Array(raw[..4].to_vec()), "leading thinking, then text and tool calls");
+
+        // No thinking: rebuilt from the text and tool calls, as before.
+        let plain = sent_turn(truncated_round_turn(&tool_response(raw[2..].to_vec(), LlmStopReason::MaxTokens)));
+        assert_eq!(plain, serde_json::Value::Array(raw[2..4].to_vec()));
+        // An unsigned leading thinking block isn't kept either.
+        let unsigned = vec![serde_json::json!({ "type": "thinking", "thinking": "half" }), raw[2].clone()];
+        let sent = sent_turn(truncated_round_turn(&tool_response(unsigned, LlmStopReason::MaxTokens)));
+        assert_eq!(sent, serde_json::Value::Array(raw[2..4].to_vec()));
+    }
+
+    #[test]
+    fn the_forced_close_carries_the_turn_s_effort_and_instruction() {
+        for (preset, effort) in [(SWIFT, Some(Effort::Least)), (STANDARD, None), (DEEP, Some(Effort::Max))] {
+            let request = chat_request_on("claude-sonnet-5-5", preset);
+            let mut messages = vec![LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::ToolResults(vec![LlmToolResult { tool_use_id: "tu_1".into(), content: "ok".into(), is_error: false }]),
+            }];
+            let req = forced_close_request(&request, "sys", &mut messages, &[]);
+            assert_eq!(req.effort, effort, "{preset:?}");
+            match &messages[0].content {
+                LlmContent::ToolResults(r) => assert!(r[0].content.ends_with(CLOSE_INSTRUCTION), "{}", r[0].content),
+                _ => panic!("the instruction rides on the last tool result"),
+            }
+            assert_eq!(messages.len(), 1, "no extra user turn");
+        }
+    }
 
     #[test]
     fn talks_prompt_sends_mcp_problems_to_settings_not_the_cli() {
@@ -4689,6 +5121,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_workspace_delete_lets_its_conversations_ask_again() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+
+        engine.cancel_workspace("w1", &["t1".to_string()]);
+        assert!(!engine.approvals.admits("w1"));
+        let failed: AppResult<()> = Err(AppError::Other("database is locked".into()));
+        assert!(engine.finish_workspace_delete("w1", failed).is_err(), "the error still reaches the caller");
+        assert!(engine.approvals.admits("w1"), "the workspace stays, and so may its cards");
+
+        engine.cancel_workspace("w2", &[]);
+        assert!(engine.finish_workspace_delete("w2", Ok(())).is_ok());
+        assert!(!engine.approvals.admits("w2"), "a deleted workspace stays retired");
+    }
+
+    #[test]
     fn approval_decision_parse() {
         assert_eq!(ApprovalDecision::parse("approve"), ApprovalDecision::Approve);
         assert_eq!(ApprovalDecision::parse("always"), ApprovalDecision::ApproveAlways);
@@ -4844,6 +5293,83 @@ mod login_path_tests {
         assert_eq!(format_command_output("nope", 1), "nope\n(exit code 1)");
         assert_eq!(format_command_output("", 0), "(exit code 0)");
     }
+
+    #[test]
+    fn a_tool_row_records_how_the_call_ended() {
+        let row = || serde_json::json!({ "callId": "c1", "toolName": "run_command", "result": "x" });
+        let v = |ok, denied, exit_code, stopped| RowVerdict { ok, denied, exit_code, stopped };
+
+        let mut passed = row();
+        stamp_outcome(&mut passed, v(true, false, Some(0), false));
+        assert_eq!(passed["ok"], true);
+        assert_eq!(passed["outcome"], "ok");
+        assert_eq!(passed["exitCode"], 0);
+        assert!(passed.get("reason").is_none());
+
+        let mut failed = row();
+        stamp_outcome(&mut failed, v(false, false, Some(101), false));
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["outcome"], "failed");
+        assert_eq!(failed["exitCode"], 101);
+
+        // A denial is its own verdict, never a pass, whatever `ok` said.
+        let mut denied = row();
+        stamp_outcome(&mut denied, v(true, true, None, false));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["outcome"], "denied");
+        assert!(denied.get("exitCode").is_none());
+
+        // The shell's -1 means "no status" (an interrupt, a busy shell).
+        let mut interrupted = row();
+        stamp_outcome(&mut interrupted, v(false, false, Some(-1), false));
+        assert_eq!(interrupted["outcome"], "failed");
+        assert!(interrupted.get("exitCode").is_none());
+
+        // The keys are additive: the row keeps everything it had.
+        assert_eq!(interrupted["callId"], "c1");
+        assert_eq!(interrupted["result"], "x");
+    }
+
+    #[test]
+    fn what_each_call_site_persists_reads_its_verdict() {
+        // `$`-direct, stopped by the user while it ran: the row the live
+        // streamer writes reads as stopped, with SIGINT's 130 kept as data.
+        let input = serde_json::json!({ "command": "npm run dev", "cwd": "packages/api" });
+        let stopped = tool_row(
+            "shell-7",
+            "run_command",
+            input.clone(),
+            "ready on :3000\n^C\n(exit code 130)",
+            RowVerdict { ok: false, exit_code: Some(130), stopped: true, ..RowVerdict::default() },
+        );
+        assert_eq!(stopped["callId"], "shell-7");
+        assert_eq!(stopped["toolName"], "run_command");
+        assert_eq!(stopped["toolInput"], input, "the cwd badge's input is kept as is");
+        assert_eq!((stopped["outcome"].as_str(), stopped["reason"].as_str()), (Some("failed"), Some("stopped")));
+        assert_eq!(stopped["exitCode"], 130);
+
+        // The agent loop's MCP call to a server turned off in the conversation.
+        let refused = tool_row(
+            "toolu_1",
+            "mcp__docs__search",
+            serde_json::json!({ "q": "x" }),
+            &crate::chat_agents::mcp_off_refusal("mcp__docs__search", &["docs".to_string()].into_iter().collect()).unwrap(),
+            RowVerdict { denied: true, ..RowVerdict::default() },
+        );
+        assert_eq!(refused["outcome"], "denied");
+        assert!(refused.get("reason").is_none() && refused.get("exitCode").is_none());
+
+        // A command that passed carries no reason even if a stop raced it.
+        let passed = tool_row(
+            "toolu_2",
+            "run_command",
+            serde_json::json!({ "command": "true" }),
+            "(exit code 0)",
+            RowVerdict { ok: true, exit_code: Some(0), stopped: true, ..RowVerdict::default() },
+        );
+        assert_eq!(passed["outcome"], "ok");
+        assert!(passed.get("reason").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -4853,7 +5379,7 @@ mod director_reliability_tests {
     #[test]
     fn a_journal_line_becomes_a_player_label() {
         assert_eq!(
-            notice_label(&retry_notice(2, 4, ProviderErrorKind::RateLimit)),
+            notice_label(&retry_notice(2, 5, 4, ProviderErrorKind::RateLimit)),
             "Rate limit reached — retrying in 4s (retry 2 of 5)"
         );
         assert_eq!(

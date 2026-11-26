@@ -176,3 +176,94 @@ describe("ledger row actions", () => {
     expect(onRun).toHaveBeenCalledWith("npm test");
   });
 });
+
+describe("a resolved row's verdict", () => {
+  const failed: ToolExecution = {
+    toolName: "run_command",
+    toolInput: { command: "cargo test" },
+    result: "test sync::gate ... FAILED\n(exit code 101)",
+    ok: false,
+    outcome: "failed",
+    exitCode: 101,
+  };
+  const denied: ToolExecution = {
+    toolName: "run_command",
+    toolInput: { command: "git push --force" },
+    result: "Command not run — the user declined to approve it (flagged: force push). Ask the user how to proceed.",
+    ok: false,
+    outcome: "denied",
+  };
+  const passed: ToolExecution = { ...t("run_command", { command: "npm test" }), ok: true, outcome: "ok", exitCode: 0 };
+
+  const rowOf = (container: HTMLElement, i: number) => container.querySelectorAll<HTMLElement>('[data-role="tool"]')[i];
+
+  it("a failure gets a rouge dot on the hairline and its exit code, titled in words", () => {
+    const { container } = render(<WorkBlock calls={1} entries={[round(1, [failed])]} />);
+    const row = rowOf(container, 0);
+    expect(row).toHaveAttribute("data-outcome", "failed");
+    const dot = within(row).getByTestId("tool-verdict-dot");
+    expect(dot.style.background).toBe("var(--color-octo-rouge)");
+    expect(dot).toHaveAttribute("aria-hidden");
+    const meta = within(row).getByText("exit 101");
+    expect(meta).toHaveAttribute("title", "Exited with code 101");
+    expect(meta).toHaveAttribute("data-tour", "talk-tool-verdict");
+    expect(meta.style.color).toBe("var(--color-octo-rouge)");
+    // Said to assistive tech too, on the row's toggle.
+    expect(within(row).getByRole("button", { name: "RUN cargo test, Exited with code 101" })).toBeInTheDocument();
+  });
+
+  it("a denial gets a mute mark and says it was denied", () => {
+    const { container } = render(<WorkBlock calls={1} entries={[round(1, [denied])]} />);
+    const row = rowOf(container, 0);
+    expect(row).toHaveAttribute("data-outcome", "denied");
+    expect(within(row).getByTestId("tool-verdict-dot").style.background).toBe("var(--color-octo-mute)");
+    const meta = within(row).getByText("denied");
+    expect(meta.style.color).toBe("var(--color-octo-mute)");
+    expect(meta).toHaveAttribute("title", "Denied, not run: the user declined to approve it (flagged: force push)");
+    expect(row.outerHTML).not.toContain("--color-octo-rouge");
+  });
+
+  it("a pass carries nothing extra", () => {
+    const { container } = render(<WorkBlock calls={1} entries={[round(1, [passed])]} />);
+    const row = rowOf(container, 0);
+    expect(row).toHaveAttribute("data-outcome", "ok");
+    expect(within(row).queryByTestId("tool-verdict-dot")).toBeNull();
+    expect(row.querySelector('[data-tour="talk-tool-verdict"]')).toBeNull();
+    expect(within(row).getByRole("button", { name: "RUN npm test" })).toBeInTheDocument();
+  });
+
+  it("an older row with no verdict reads it from its exit line", () => {
+    const legacy: ToolExecution = { toolName: "run_command", toolInput: { command: "make" }, result: "boom\n(exit code 2)" };
+    const { container } = render(<WorkBlock calls={1} entries={[round(1, [legacy])]} />);
+    expect(rowOf(container, 0)).toHaveAttribute("data-outcome", "failed");
+    expect(within(rowOf(container, 0)).getByText("exit 2")).toBeInTheDocument();
+  });
+
+  it("the gutter the dot sits in is never clipped by the round's Reveal", () => {
+    const { container } = render(<WorkBlock calls={1} entries={[round(1, [failed])]} />);
+    const reveal = container.querySelector("div.grid[aria-hidden]")!;
+    // The Reveal reaches 16px into the gutter; the dot's left edge is 15.5px out.
+    expect(reveal.className).toContain("-ml-4");
+    expect(reveal.querySelector(".pl-4")).not.toBeNull();
+  });
+
+  it("a folded round counts its failures in rouge, and its denials", () => {
+    const reads = Array.from({ length: 4 }, (_, i) => ({ ...t("read_file", { path: `src/f${i}.ts` }), ok: true, outcome: "ok" as const }));
+    render(<WorkBlock calls={6} entries={[round(1, [...reads, failed, denied])]} />);
+    const fold = screen.getByRole("button", { name: /6 tool calls/ });
+    expect(within(fold).getByTestId("round-failed").textContent).toBe(" · 1 failed");
+    expect(within(fold).getByTestId("round-failed").className).toContain("text-octo-rouge");
+    expect(within(fold).getByTestId("round-denied").textContent).toBe(" · 1 denied");
+    expect(within(fold).getByTestId("round-denied").className).not.toContain("rouge");
+    expect(fold.getAttribute("title")).toMatch(/^Show the 6 tool calls \(1 failed, 1 denied\): /);
+  });
+
+  it("a folded round of passes says nothing extra", () => {
+    const reads = Array.from({ length: 6 }, (_, i) => t("read_file", { path: `src/f${i}.ts` }));
+    render(<WorkBlock calls={6} entries={[round(1, reads)]} />);
+    const fold = screen.getByRole("button", { name: /6 tool calls/ });
+    expect(within(fold).queryByTestId("round-failed")).toBeNull();
+    expect(within(fold).queryByTestId("round-denied")).toBeNull();
+    expect(fold.getAttribute("title")).toMatch(/^Show the 6 tool calls: /);
+  });
+});

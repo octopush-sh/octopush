@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
-import { ipc, type LiveEntry } from "../lib/ipc";
+import { ipc, type LiveEntry, type Effort as ReasoningEffort } from "../lib/ipc";
 import { isAgentToolName, CHAT_AGENT_LOG_EVENT } from "../lib/agentTools";
 import type { ChatMessage, ChatStreamEvent, ChatThread, Attachment } from "../lib/types";
 import { useWorkspaceStore } from "./workspaceStore";
@@ -20,6 +20,15 @@ export interface ToolExecution {
   result: string;
   /** Provider tool_use id — correlates the resolved card to its live card. */
   callId?: string;
+  /** How the call ended, stamped on rows the engine writes now
+   *  (`chat_engine::stamp_outcome`). Older rows carry none of the three, and
+   *  `lib/toolVerdict.ts` reads their verdict from `result` instead. */
+  ok?: boolean;
+  outcome?: "ok" | "failed" | "denied";
+  /** A shell command's exit status, when its shell reported one. */
+  exitCode?: number;
+  /** Why a failed call ended, when the engine knows: it stopped it. */
+  reason?: "stopped";
   /** Present on a resolved `Agent`/`Task` row: how the sub-agent ended and
    *  what it cost (the report itself is `result`). */
   agent?: AgentMeta;
@@ -127,8 +136,6 @@ interface ToolEndEvent {
   durationMs: number;
 }
 
-/** Generation effort presets — map to the output-token budget (and, later,
- *  thinking budget). Swift is cheap/snappy; Deep gives the model more room. */
 /** A promoted long-running `$`-direct process, rendered in a pinned terminal. */
 export interface LiveProcess {
   callId: string;
@@ -182,12 +189,33 @@ export interface PendingCap {
   turnsUsed: number;
 }
 
+/** Generation effort presets: each sets the turn's reasoning effort and its
+ *  output-token cap. Swift is cheap and quick; Deep thinks hardest and gives
+ *  the answer the most room. */
 export type Effort = "swift" | "standard" | "deep";
 
 export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
   swift: 8192,
   standard: 32768,
   deep: 64000,
+};
+
+/** The reasoning effort each preset sends with every request of the turn.
+ *  - Swift: `low`, which the backend runs as the least reasoning the model
+ *    takes and never more than Standard: a lower effort without turning
+ *    thinking on, `none` on GPT-6 Sol, Luna and 6.1 Terra, and nothing on a
+ *    model without effort control (a chat model, or one that thinks only
+ *    with a budget).
+ *  - Standard: none (`null`), so no effort or thinking setting is sent and
+ *    every model keeps its own default effort and thinking.
+ *  - Deep: `max`, which the backend's provider adapters turn into the
+ *    highest the model takes (`max`, or `high` where max isn't offered, or a
+ *    thinking budget on models that use one).
+ *  Sub-agents keep their own tier's effort either way. */
+export const EFFORT_REASONING: Record<Effort, ReasoningEffort | null> = {
+  swift: "low",
+  standard: null,
+  deep: "max",
 };
 
 /** A display item in the conversation — a regular message, a tool execution,
@@ -434,7 +462,8 @@ interface ChatState {
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
-  /** Global generation-effort preference (maps to the output-token budget). */
+  /** Global generation-effort preference (the turn's reasoning effort and
+   *  output-token budget). */
   effort: Effort;
 
   // Selectors (read-only, scoped by workspaceId)
@@ -1021,8 +1050,9 @@ export const useChatStore = create<ChatState>((set, get) => {
     answeredApprovals.delete(p.callId);
     // The card reaches the user: the workspace's needs-you flag (chiming
     // unless they are looking at this conversation), and a native
-    // notification while Octopush is in the background. Raised before the
-    // card lands, so the store sync below finds it raised and stays quiet.
+    // notification, which always fires (a locked screen looks focused; see
+    // `approvalNotifications.ts`). Raised before the card lands, so the
+    // store sync below finds it raised and stays quiet.
     const looking =
       focus.workspaceId === p.workspaceId &&
       focus.mode === "talk" &&
@@ -1341,6 +1371,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           userMessage: opts.userMessage,
           system: opts.systemPrompt,
           maxTokens: EFFORT_MAX_TOKENS[get().effort],
+          effort: EFFORT_REASONING[get().effort] ?? undefined,
           attachments: attachments.length
             ? attachments.map((a) => ({ mediaType: a.mediaType, data: a.data }))
             : undefined,
