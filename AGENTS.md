@@ -12,6 +12,27 @@ This file is a mirror of [`CLAUDE.md`](CLAUDE.md) for AI tools that read `AGENTS
 
 ---
 
+## Innovation and clean room — binding for every agent (owner's rule, 2026-11-26)
+
+Octopush exists to be the best tool for agentic developers, today and over the next decade. These rules bind every agent, whatever its role: builder, reviewer, auditor, ideas, social or PM.
+
+1. **Competitors show us our gaps. They are never the spec.** Study other tools only to find where we are weaker; the goal is to do it better, not the same. Where there really is one sensible way (a platform shortcut, a protocol, a file format), follow the convention and say so. Everywhere else, look for the version nobody has built yet.
+2. **Every proposal names its edge.** An issue for a capability other tools have ends with a **"Where we go further"** line: what Octopush will do that they don't. The edge usually comes from what only we have — crews, worktree workspaces, Review, checkpoints, the cost ledger, Mission Control, mixed-vendor stages. No edge → write **"Parity"** and say why parity is still worth building.
+3. **Complement the platforms. Don't race them.** The model labs build the models and their agents; Octopush makes those agents work together, under the developer's direction. Prefer open standards and official, documented surfaces (MCP, `AGENTS.md`, skills, the CLIs' documented flags), adopt new platform capabilities early, and build what a single vendor won't: crews that mix vendors, review discipline, honest cost.
+4. **Look ahead.** Ideas and designs consider where agentic development is going and leave room for it: longer autonomous runs, more agents per developer, cheaper and local models, stricter needs for review, provenance and compliance. Never present a roadmap as shipped (the truth rule still applies).
+5. **Clean room — we own everything we ship.**
+   - **Nothing copied.** Never copy another product's source code, prompts, UI copy, documentation, icons, illustrations, screenshots or distinctive visual design, even when it is public or open source. Describe observed behaviour in your own words, then design our own.
+   - **Dependencies, not pasted code.** Third-party code enters only as a declared dependency whose license is compatible with this repo (Elastic License 2.0), and the PR names it. Fine: MIT, BSD, ISC, Apache-2.0, MPL-2.0. Not fine: GPL, AGPL, SSPL, and code with no license.
+   - **Trademarks.** No other company's trademark in a feature, command or product name. Name a competitor only in a factual, sourced comparison; never use its logo or screenshots of its product, and never disparage it.
+   - **Public information only.** Never use or describe non-public information about another company's product (leaked prompts, decompiled code, private APIs).
+   - **When in doubt, stop** and ask in the issue or PR.
+
+**Reviewers request changes** when a diff copies third-party code, text or assets; adds a dependency whose license is incompatible or unknown; uses another company's trademark in a name; or makes an unsourced claim about a competitor.
+
+**Model use (PM and team).** Default: **Opus 5.5** for daily work — building, filing, docs and routine reviews. **Fable 5.2** only where it adds value: the design of a P1/P2 epic before it is built; the independent review of a high-risk PR (security, credentials, billing, stored-data migrations, the release and update channels, a breaking Epiku change); a hard problem after two failed attempts. The PM caps Fable use each week and reports it in the weekly report, so the week's budget lasts.
+
+---
+
 ## Feature map — the source of truth for what Octopush does
 
 [`docs/FEATURES.md`](docs/FEATURES.md) is the canonical, exhaustive catalogue of **every** Octopush feature and **how** it is implemented (Tauri commands, Zustand stores, components, mechanisms, data model). Read it to learn what already exists before you add or change behaviour — it is the fastest way to understand the product surface end-to-end.

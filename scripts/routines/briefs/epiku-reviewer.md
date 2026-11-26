@@ -74,6 +74,10 @@ change", "tests cover it") is a claim to verify in the code, never evidence.
    tokens only (no hex/rgb or font stacks outside `app/globals.css`), shared motion primitives,
    reduced motion respected, both themes, icons with `title` and `aria-label`; no new identity
    element without a proposal; no state library.
+10. **Clean room (`CLAUDE.md` "Innovation and clean room").** The diff copies no third-party
+    code, text or assets; adds no dependency whose license is incompatible with Epiku's or
+    unknown (`CLAUDE.md` lists them); uses no other company's trademark in a name; makes no
+    unsourced claim about a competitor. Any of these is `changes`.
 
 ## Classify the change — `data_change`
 

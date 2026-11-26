@@ -38,6 +38,12 @@ itself a reason to request changes).
 - Links and anchors it adds resolve; a new docs page is in the sidebar; a version bump changes
   `release.ts` and the changelog together.
 - Nothing that reaches for credentials, adds trackers or third-party requests, or is obfuscated.
+- Clean room (CLAUDE.md "Innovation and clean room"). Request changes when the diff copies
+  third-party code, text or assets; adds a dependency whose license is incompatible or unknown
+  (fine: MIT, BSD, ISC, Apache-2.0, MPL-2.0; not GPL, AGPL, SSPL, unlicensed); uses another
+  company's trademark in a name; makes an unsourced claim about a competitor; or puts a
+  competitor's logo or product screenshot, or disparaging copy, on any page (`/vs/*` and
+  `/alternatives/*` included).
 
 ## Output
 
