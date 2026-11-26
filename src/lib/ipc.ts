@@ -983,6 +983,8 @@ export const ipc = {
     regenerate?: boolean;
     /** Skip the backend budget gate for this turn (conscious per-turn override). */
     overrideBudget?: boolean;
+    /** Where the `@` context blocks sit in `userMessage` (`SentContextBlock[]` as JSON). */
+    contextJson?: string;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
   /** What the thread has cost so far, from the ledger (Companion). */

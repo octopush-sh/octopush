@@ -78,7 +78,9 @@ fn recall_tool_definition() -> LlmTool {
              context as `[Tool #<message_id>: …]`; when one says chars were omitted \
              and you need that part, call this with its message_id instead of \
              re-running the tool. Pass offset/limit (in characters) to page through \
-             a very long output."
+             a very long output. An `@` context block of an earlier user message \
+             that says chars were omitted comes back the same way: its message_id \
+             and block number."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -86,6 +88,10 @@ fn recall_tool_definition() -> LlmTool {
                 "message_id": {
                     "type": "integer",
                     "description": "The #id shown on the abridged tool summary"
+                },
+                "block": {
+                    "type": "integer",
+                    "description": "For an abridged @ context block: its block number"
                 },
                 "offset": {
                     "type": "integer",
@@ -192,6 +198,11 @@ pub struct ChatRequest {
     /// for this send (the user consciously chose "Override for this turn").
     #[serde(default)]
     pub override_budget: bool,
+    /// Where the `@` context blocks sit in `user_message` (#1150), saved on
+    /// the user row: the thread shows the ask as typed, and later turns
+    /// re-send the blocks abridged.
+    #[serde(default)]
+    pub context_json: Option<String>,
 }
 
 /// A base64 image attachment sent with a user turn.
@@ -2010,6 +2021,14 @@ impl ChatEngine {
             .map(|l| l as usize)
             .unwrap_or(RECALL_DEFAULT_LIMIT)
             .clamp(1, RECALL_MAX_LIMIT);
+        if let Some(block) = input.get("block").and_then(|v| v.as_u64()) {
+            let row = self.db.lock().get_chat_sent_context(thread_id, message_id).ok().flatten();
+            let text = row.as_ref().and_then(|(c, ctx)| crate::chat_history::context_block(c, ctx, block as usize));
+            return match text {
+                Some(t) => (window_text(t, offset, limit), true),
+                None => (format!("No context block {block} on message {message_id} in this conversation"), false),
+            };
+        }
         let stored = match self.db.lock().get_chat_tool_output(thread_id, message_id) {
             Ok(Some(c)) => c,
             Ok(None) => {
@@ -2695,7 +2714,7 @@ impl ChatEngine {
         // DB id. Skipped on regenerate: history already ends with the user turn
         // (the old assistant turn was truncated), so we just re-run the loop.
         if !request.regenerate {
-            self.insert_and_emit_message(
+            let id = self.insert_and_emit_message(
                 &app,
                 &request.workspace_id,
                 &request.thread_id,
@@ -2703,6 +2722,11 @@ impl ChatEngine {
                 &request.user_message,
                 None, None, None, None,
             )?;
+            if let Some(ctx) = request.context_json.as_deref() {
+                if crate::chat_history::context_spans(&request.user_message, ctx).is_some() {
+                    let _ = self.db.lock().set_chat_message_context(id, ctx);
+                }
+            }
         }
 
         // Build conversation history (this thread only) as normalized
@@ -2734,7 +2758,7 @@ impl ChatEngine {
 
         let rows: Vec<HistoryRow<'_>> = history
             .iter()
-            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str() })
+            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_json.as_deref() })
             .collect();
         let mut messages: Vec<LlmMessage> = build_history(&rows)
             .into_iter()

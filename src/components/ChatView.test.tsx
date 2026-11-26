@@ -42,6 +42,7 @@ vi.mock("../lib/ipc", () => ({
     getGitDiff: vi.fn().mockResolvedValue(""),
     getStagedDiff: vi.fn().mockResolvedValue(""),
     cancelChat: vi.fn().mockResolvedValue(undefined),
+    truncateChatAfter: vi.fn().mockResolvedValue(undefined),
     listChatThreads: vi.fn().mockResolvedValue([
       { id: "t1", workspaceId: "ws-1", title: "Conversation", createdAt: "2026-05-17T09:00:00Z", updatedAt: "2026-05-17T09:00:00Z" },
     ]),
@@ -1231,3 +1232,82 @@ describe("ChatView — context guard and limits (#1046)", () => {
     );
   });
 });
+
+describe("ChatView — the ask as typed, its context as chips (#1150)", () => {
+  const ASK = "explain @src/a.ts#L2-3";
+  const BLOCK = "\n\nsrc/a.ts · lines 2–3 of 5\n```\n2\n3\n```";
+  const span = (typed: string, block: string) => ({
+    token: "src/a.ts#L2-3", kind: "file", label: "a.ts#L2-3", tokens: Math.ceil(block.length / 4),
+    start: typed.length, end: typed.length + block.length,
+  });
+  const sentRow = {
+    id: 1, workspaceId: "ws-1", role: "user", content: ASK + BLOCK, contextJson: JSON.stringify([span(ASK, BLOCK)]),
+    model: null, inputTokens: null, outputTokens: null, costUsd: null, createdAt: "2026-11-26T10:00:00Z",
+  };
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipcMock.sendChatMessage).mockClear();
+    vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue(["src/a.ts"]);
+    vi.mocked(ipcMock.readFileLines).mockResolvedValue({ kind: "text", content: "2\n3", start: 2, end: 3, total: 5, cut: false });
+    vi.mocked(ipcMock.secretScanText).mockResolvedValue(null);
+  });
+
+  it("sends where each block sits, and shows the ask as typed with its chip", async () => {
+    vi.mocked(ipcMock.sendChatMessage).mockImplementationOnce(async (req) => {
+      emit("chat://message-added", { ...sentRow, contextJson: undefined, threadId: req.threadId, content: req.userMessage });
+    });
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = screen.getByPlaceholderText(/Ask anything/i);
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: ASK } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(ta, { key: "Enter" });
+    });
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls[0][0];
+    expect(req.userMessage).toBe(ASK + BLOCK);
+    expect(JSON.parse(req.contextJson!)).toEqual([span(ASK, BLOCK)]);
+    const ask = await screen.findByRole("article", { name: /^You/ });
+    expect(within(ask).getByText(ASK)).toBeInTheDocument();
+    expect(within(ask).getByRole("button", { name: /a\.ts#L2-3/ })).toBeInTheDocument();
+    expect(ask.textContent).not.toContain("lines 2–3 of 5");
+  });
+
+  it("copies the ask as typed, or with its context", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    // The row as the database returns it.
+    listChatMessagesMock.mockResolvedValueOnce([sentRow]);
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    fireEvent.click(await screen.findByLabelText("Copy message"));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(ASK));
+    fireEvent.click(screen.getByLabelText("Copy with context"));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(ASK + BLOCK));
+  });
+
+  it("edits the ask as typed, and resolves its tokens fresh on resend", async () => {
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [sentRow] as never },
+      activeThreadByWs: { "ws-1": "t1" },
+      streamingByWs: { "ws-1": false },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    fireEvent.click(screen.getByLabelText("Edit & resend"));
+    const editor = screen.getByDisplayValue(ASK);
+    vi.mocked(ipcMock.readFileLines).mockResolvedValue({ kind: "text", content: "2\n3!", start: 2, end: 3, total: 5, cut: false });
+    fireEvent.change(editor, { target: { value: `${ASK} again` } });
+    fireEvent.click(screen.getByRole("button", { name: "Resend" }));
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    expect(ipcMock.truncateChatAfter).toHaveBeenCalledWith("t1", 1);
+    const fresh = BLOCK.replace("3\n```", "3!\n```");
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls[0][0];
+    expect(req.userMessage).toBe(`${ASK} again${fresh}`);
+    expect(JSON.parse(req.contextJson!)).toEqual([span(`${ASK} again`, fresh)]);
+  });
+});
+

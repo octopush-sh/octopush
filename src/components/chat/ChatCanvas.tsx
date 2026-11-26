@@ -1,5 +1,5 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from "react";
-import { AlertTriangle, Settings, Copy, Check, ArrowDown, RefreshCw, Pencil, History, GitFork, CircleSlash } from "lucide-react";
+import { AlertTriangle, Settings, Copy, CopyPlus, Check, ArrowDown, RefreshCw, Pencil, History, GitFork, CircleSlash } from "lucide-react";
 import { useChatStore, buildTimeline, isAgentToolName, type ConversationItem } from "../../stores/chatStore";
 import { ipc } from "../../lib/ipc";
 import { rewindError, skippedLabel } from "../../lib/talkRewind";
@@ -10,6 +10,10 @@ import { useTourStore } from "../../stores/tourStore";
 import type { ChatMessage as StoredMessage } from "../../lib/types";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
+import { parseSentContext, typedText } from "../../lib/sentContext";
+import { expandDraft } from "../../lib/talkContextResolve";
+import { sessionRefs } from "../../lib/talkContext";
+import { useTerminalsStore } from "../../stores/terminalsStore";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
 import { OctoWatcher } from "./OctoWatcher";
@@ -137,6 +141,18 @@ export function ChatCanvas({
       live = false;
     };
   }, [activeThreadId, streaming, messages.length]);
+
+  // An ask sent with `@` context is edited as typed, so on resend its tokens
+  // resolve fresh, as from the composer (#1150).
+  const resendEdit = useCallback(
+    async (id: number, text: string, hadContext: boolean) => {
+      if (!hadContext) return editAndResend(workspaceId, workspacePath, id, text);
+      const sessions = sessionRefs(useTerminalsStore.getState().getTerminals(workspaceId));
+      const { content, context } = await expandDraft(text, workspacePath, sessions);
+      await editAndResend(workspaceId, workspacePath, id, content, undefined, context);
+    },
+    [editAndResend, workspaceId, workspacePath],
+  );
 
   const handleFork = useCallback(
     (messageId: number) => {
@@ -300,7 +316,7 @@ export function ChatCanvas({
                 }
                 onEdit={
                   item.message.role === "user" && item.message.id === lastUserId
-                    ? (id, content) => editAndResend(workspaceId, workspacePath, id, content)
+                    ? (id, content, hadContext) => void resendEdit(id, content, hadContext)
                     : undefined
                 }
                 onRewind={
@@ -465,7 +481,7 @@ function MessageRow({
   skillNames?: string[];
   onOpenInEditor?: (path: string) => void;
   onRegenerate?: (id: number) => void;
-  onEdit?: (id: number, newContent: string) => void;
+  onEdit?: (id: number, newContent: string, hadContext: boolean) => void;
   onRewind?: (id: number) => void;
   /** Set (to the reason, possibly empty) when the turn ran without a checkpoint. */
   noCheckpoint?: string;
@@ -473,27 +489,32 @@ function MessageRow({
   disabled?: boolean;
 }) {
   const { copied, copy } = useCopyFeedback();
+  const { copied: copiedAll, copy: copyAll } = useCopyFeedback();
   const ref = useRef<HTMLDivElement>(null);
   const actionsRef = useRef<HTMLDivElement>(null);
   const tourTarget = useTourStore((s) => s.target);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
+  // An ask sent with `@` context: what was typed, apart from its blocks.
+  const sent = message.role === "user" ? parseSentContext(message.contextJson, message.content) : null;
+  const typed = sent ? typedText(message.content, sent) : message.content;
+
   function handleCopy() {
-    // A user turn copies exactly what was sent; its header (eyebrow, time)
-    // is chrome. An answer copies its rendered text, as before.
-    copy(message.role === "user" ? message.content : (ref.current?.innerText ?? message.content));
+    // A user turn copies what was typed; its header (eyebrow, time) and its
+    // context chips are chrome. An answer copies its rendered text, as before.
+    copy(message.role === "user" ? typed : (ref.current?.innerText ?? message.content));
   }
 
   function startEdit() {
-    setDraft(message.content);
+    setDraft(typed);
     setEditing(true);
   }
 
   function saveEdit() {
     const next = draft.trim();
     setEditing(false);
-    if (next && next !== message.content) onEdit?.(message.id, next);
+    if (next && next !== typed) onEdit?.(message.id, next, sent !== null);
   }
 
   if (editing) {
@@ -599,6 +620,13 @@ function MessageRow({
           )
         }
       />
+      {sent && (
+        <RowAction
+          label={copiedAll ? "Copied" : "Copy with context"}
+          onClick={() => copyAll(message.content)}
+          icon={copiedAll ? <Check size={12} className="text-octo-verdigris" /> : <CopyPlus size={12} />}
+        />
+      )}
     </div>
   );
 

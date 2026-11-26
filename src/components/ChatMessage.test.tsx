@@ -10,7 +10,7 @@
  * never re-parsed as Markdown — a pasted log or snippet keeps its characters.
  */
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { ChatMessage, usageFooter, turnTime, turnTimeFull } from "./ChatMessage";
 
 const TABLE = [
@@ -271,6 +271,49 @@ describe("turnTime", () => {
     } finally {
       spy.mockRestore();
       spyDate.mockRestore();
+    }
+  });
+});
+
+describe("ChatMessage — an ask sent with @ context (#1150)", () => {
+  const ask = "compare @src/a.ts with @.env";
+  const a = `\n\nsrc/a.ts\n\`\`\`\n${Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n")}\n\`\`\``;
+  const env = "\n\n.env _(not included: possible secret)_";
+  const content = ask + a + env;
+  const contextJson = JSON.stringify([
+    { token: "src/a.ts", kind: "file", label: "a.ts", tokens: 1234, start: ask.length, end: ask.length + a.length },
+    { token: ".env", kind: "file", label: ".env", tokens: 9, start: ask.length + a.length, end: content.length, notIncluded: "possible secret" },
+  ]);
+
+  it("reads as typed, with chips that open a block in place", () => {
+    const { container } = render(<ChatMessage message={{ role: "user", content, contextJson }} />);
+    expect(screen.getByText(ask)).toBeInTheDocument();
+    expect(container.textContent).not.toContain("line 3");
+    const chip = screen.getByRole("button", { name: /a\.ts/ });
+    expect(chip).toHaveTextContent("≈ 1k");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(chip);
+    expect(chip).toHaveAttribute("aria-expanded", "true");
+    const region = screen.getByRole("region", { name: "@src/a.ts as sent" });
+    expect(region.textContent).toContain("line 19");
+    const pre = region.querySelector("pre")!;
+    expect(pre).toHaveClass("max-h-[256px]");
+    fireEvent.click(within(region).getByRole("button", { name: "Show full block" }));
+    expect(pre).not.toHaveClass("max-h-[256px]");
+    fireEvent.click(chip);
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("region")).toBeNull();
+    // The block the guard left out: a muted chip saying why, nothing to open.
+    expect(screen.getByTitle("Not included: possible secret · @.env")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /\.env/ })).toBeNull();
+  });
+
+  it("renders a row without a record, or with one that doesn't fit, as today", () => {
+    for (const record of [undefined, '[{"start": 0, "end": 99999}]']) {
+      const { container, unmount } = render(<ChatMessage message={{ role: "user", content, contextJson: record }} />);
+      expect(container.querySelector("[data-role='user'] .whitespace-pre-wrap")?.textContent).toBe(content);
+      expect(screen.queryByRole("group", { name: "Context sent with this message" })).toBeNull();
+      unmount();
     }
   });
 });
