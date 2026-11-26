@@ -207,6 +207,24 @@ pub enum LlmStopReason {
     Other(String),
 }
 
+/// One piece of a streamed answer, the same shape for every provider. Tool
+/// events carry the content-block `index`, which ties a tool's input pieces
+/// and its end to its start.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    /// More answer text.
+    Text(String),
+    /// A tool call opened; its input follows in pieces.
+    ToolStart { index: usize, id: String, name: String },
+    /// A piece of a tool call's input JSON, as sent (not valid JSON alone).
+    ToolInput { index: usize, partial: String },
+    /// A tool call's input is complete.
+    ToolEnd { index: usize },
+    /// The attempt failed and is being sent again: drop everything streamed
+    /// since the call began.
+    Reset,
+}
+
 // ─── Trait ────────────────────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
@@ -218,6 +236,26 @@ pub trait LlmProvider: Send + Sync {
         req: &LlmRequest,
         client: &reqwest::Client,
     ) -> AppResult<LlmResponse>;
+
+    /// Like `complete`, handing `sink` each piece of the answer as it is
+    /// generated, and returning the same assembled response (usage,
+    /// `raw_content`), so pricing and replay don't change. This default
+    /// doesn't stream: it calls `complete` and hands over the whole text as
+    /// one `Text`, so a provider without streaming of its own works as is.
+    async fn stream(
+        &self,
+        api_base: &str,
+        api_key: Option<&str>,
+        req: &LlmRequest,
+        client: &reqwest::Client,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> AppResult<LlmResponse> {
+        let resp = self.complete(api_base, api_key, req, client).await?;
+        if !resp.text.is_empty() {
+            sink(StreamEvent::Text(resp.text.clone()));
+        }
+        Ok(resp)
+    }
 }
 
 // ─── Transient-failure resilience ──────────────────────────────────────────────
@@ -440,6 +478,69 @@ pub async fn complete_cancellable(
     }
 }
 
+/// How long a streamed answer from a remote provider may send nothing at
+/// all (Anthropic sends `ping`s while it works) before the turn gives up on
+/// it. Final, never retried ([`silent_stream_error`]): the request was
+/// answered with a 200, so the provider may still be generating. A model
+/// server on this Mac has no such bound, as it has no read bound
+/// (`client_for`).
+pub const STREAM_IDLE: Duration = Duration::from_secs(60);
+
+/// The streamed counterpart of [`complete_cancellable`]: `provider.stream`
+/// with the same backoff, `retry-after` handling, `on_retry` narration and
+/// local-server rule, each attempt raced against `cancel`. When an attempt
+/// that already streamed something fails and is sent again, `sink` gets
+/// [`StreamEvent::Reset`] first, so the partial answer is dropped.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_with_retry(
+    provider: &dyn LlmProvider,
+    api_base: &str,
+    api_key: Option<&str>,
+    req: &LlmRequest,
+    client: &reqwest::Client,
+    cancel: &AtomicBool,
+    max_retries: u32,
+    on_retry: &mut (dyn FnMut(u32, u64, ProviderErrorKind) + Send),
+    sink: &mut (dyn FnMut(StreamEvent) + Send),
+) -> Completion {
+    let local = is_loopback_base(api_base);
+    let mut attempt: u32 = 0;
+    loop {
+        let mut streamed = false;
+        let outcome = {
+            let mut counted = |ev: StreamEvent| {
+                streamed = true;
+                sink(ev);
+            };
+            or_cancelled(provider.stream(api_base, api_key, req, client, &mut counted), cancel).await
+        };
+        let error = match outcome {
+            None => return Completion::Cancelled,
+            Some(Ok(resp)) => return Completion::Done(resp),
+            Some(Err(_)) if cancel.load(Ordering::Relaxed) => return Completion::Cancelled,
+            Some(Err(error)) => error,
+        };
+        let Some((kind, retry_after)) = error.transient_retry() else {
+            return Completion::Failed { error, retries: attempt };
+        };
+        attempt += 1;
+        let local_unreachable = local && kind == ProviderErrorKind::Network;
+        let budget = if local_unreachable { max_retries.min(LOCAL_CONNECT_RETRIES) } else { max_retries };
+        if attempt > budget {
+            let error = if local_unreachable { into_final(error) } else { error };
+            return Completion::Failed { error, retries: attempt - 1 };
+        }
+        if streamed {
+            sink(StreamEvent::Reset);
+        }
+        let delay = retry_after.unwrap_or_else(|| backoff_secs(attempt)).min(RETRY_MAX_DELAY_SECS);
+        on_retry(attempt, delay, kind);
+        if !interruptible_sleep(delay, cancel).await {
+            return Completion::Cancelled;
+        }
+    }
+}
+
 /// What the user reads when a provider call failed for good after `retries`
 /// retries: what happened, that nothing is lost and how to go on, then the
 /// provider's own message. An error that wasn't retried keeps the provider's
@@ -503,6 +604,19 @@ pub fn body_error(what: &str, e: &reqwest::Error) -> AppError {
     final_error(format!("{what}: the connection {how} while the answer was arriving ({detail}). {NOT_RETRIED}"))
 }
 
+/// The error for a stream that sent nothing for `idle` after its 200. Final,
+/// like a body that dropped: the provider may still be generating, and
+/// sending the request again could run (and bill) it twice.
+pub fn silent_stream_error(what: &str, idle: Duration) -> AppError {
+    final_error(format!("{what}: the stream sent nothing for {idle:?} while the answer was arriving. {NOT_RETRIED}"))
+}
+
+/// The error for a stream that ended before the provider said the answer
+/// was complete. Final, like a body cut off mid-answer.
+pub fn cut_off_error(what: &str) -> AppError {
+    final_error(format!("{what}: the stream ended before the answer was complete. {NOT_RETRIED}"))
+}
+
 /// A provider failure no retry is attempted for.
 fn final_error(message: String) -> AppError {
     AppError::Provider { kind: ProviderErrorKind::Other, retry_after: None, message }
@@ -532,6 +646,7 @@ pub fn network_error(message: impl Into<String>) -> AppError {
 
 pub mod anthropic;
 pub mod openai_compat;
+pub mod sse;
 
 #[cfg(test)]
 mod tests;
