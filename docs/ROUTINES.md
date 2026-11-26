@@ -34,8 +34,8 @@ You approve ideas; everything else runs continuously (VISION.md §8–§9): the 
 | 06:37 | [`ideas.yml`](../.github/workflows/ideas.yml) | a Claude agent researches; at least 5 ranked ideas across app, API and site are filed — app and API ones here (label `area:app\|api`), website ones in octopush-web — and one digest issue here lists them all |
 | 06:47 | [`social.yml`](../.github/workflows/social.yml) | the community routines for octopush-web's `marketing/` work, two jobs (see [Community routines](#community-routines)): `intel` — a Claude agent researches the market and competitors → issue **Market report YYYY-MM-DD**; then `drafts` (also when `intel` failed) — a Claude agent reads that report and the Reddit threads → issue **Social drafts YYYY-MM-DD** with comment drafts. Both issues land in **octopush-web**, label `social`, filed by the App's bot. Nothing is posted anywhere: you approve each draft in your PM chat |
 | any time | [`answers.yml`](../.github/workflows/answers.yml) | the moment you comment on the digest, your answers are applied and confirmed in a reply |
-| manual for now (planned: even hours, :22) | [`epiku-build.yml`](../.github/workflows/epiku-build.yml) | the builder for **Epiku** (`octopush-sh/epiku`, private): one job per run — an Epiku PR its review sent back or whose CI is red, else the oldest Epiku issue labelled `ready` — built by a Claude agent in a checkout of Epiku (its CLAUDE.md, checks via `octo-check typecheck\|test\|test-py\|agents`, run without network; Epiku's CI builds the PR); the workflow opens or updates the PR there (branch `agent/issue-<n>`, label `agent`). See [The Epiku lane](#the-epiku-lane) |
-| manual for now (planned: odd hours, :22) | [`epiku-review.yml`](../.github/workflows/epiku-review.yml) | an independent, **adversarial** Claude reviewer judges each green Epiku PR (up to 3) against Epiku's data-safety and tenant-isolation rules and classifies it `none` / `additive` / `breaking`; then, in a separate job on a fresh runner, `automerge.mjs --repo octopush-sh/epiku merge` re-checks every rule on that exact commit and merges it, or parks it as `needs-owner`. A dry run unless the repository variable `EPIKU_AUTOMERGE` is `true` |
+| odd hours, :22 | [`epiku-build.yml`](../.github/workflows/epiku-build.yml) | the builder for **Epiku** (`octopush-sh/epiku`, private): one job per run — an Epiku PR its review sent back or whose CI is red, else the oldest Epiku issue labelled `ready` — built by a Claude agent in a checkout of Epiku (its CLAUDE.md, checks via `octo-check typecheck\|test\|test-py\|agents`, run without network; Epiku's CI builds the PR); the workflow opens or updates the PR there (branch `agent/issue-<n>`, label `agent`). See [The Epiku lane](#the-epiku-lane) |
+| even hours, :22 | [`epiku-review.yml`](../.github/workflows/epiku-review.yml) | an independent, **adversarial** Claude reviewer judges each green Epiku PR (up to 3) against Epiku's data-safety and tenant-isolation rules and classifies it `none` / `additive` / `breaking`; then, in a separate job on a fresh runner, `automerge.mjs --repo octopush-sh/epiku merge` re-checks every rule on that exact commit and merges it, or parks it as `needs-owner`. A dry run unless the repository variable `EPIKU_AUTOMERGE` is `true` |
 
 Every workflow also has **Run workflow** (Actions tab) for a manual run. Schedules sit off the hour on purpose: GitHub delays (and sometimes drops) scheduled runs at :00 under load.
 
@@ -370,7 +370,7 @@ or Git → preview branch settings), or remove `KV_REST_API_URL`, `KV_REST_API_T
   runs only), and the merge job mints a **read-only** token and does a dry run — it prints what it
   would merge or refuse and writes nothing — unless the repository variable `EPIKU_AUTOMERGE` is
   exactly the string `true` (decided by a shell comparison, and checked twice; `TRUE` or `true `
-  is a dry run).
+  is a dry run). The schedule was turned on on 2026-11-26; auto-merge is still off.
 - **Accepted risks.**
   - *The publish token on the builder's runner* (as in the website lane). The agent runs as the
     runner's user, confined by Claude Code's permission rules rather than by the operating
@@ -429,7 +429,7 @@ Revoke it any time with `claude setup-token` → new token, or by deleting the s
    5. To go live: the repository variable `EPIKU_AUTOMERGE` = `true` — only once you know what a
       merge to Epiku's `main` deploys and how to roll it back, Epiku's `main` has a ruleset
       (required up-to-date CI, few people with write access) and there is a recent, tested backup
-      (Epiku `docs/DATA-SAFETY.md`). Then uncomment the `schedule` lines in both workflows.
+      (Epiku `docs/DATA-SAFETY.md`). The `schedule` lines in both workflows were turned on on 2026-11-26, with auto-merge still off; the PM merges approved Epiku PRs (VISION §8).
 
 Scheduled workflows in a public repo pause after 60 days without repository activity; the nightly
 cycle itself keeps the repo active.
