@@ -12,6 +12,7 @@ pub mod claude_login;
 pub mod claude_plan;
 pub mod codex_trust;
 mod commands;
+pub mod context;
 pub mod context_guard;
 pub mod crew;
 // `db` and `error` are public so the `octopush-mcp` binary (a sibling bin in

@@ -15,6 +15,7 @@ use crate::chat_agents::{
 use crate::chat_history::{
     build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
 };
+use crate::context::budget;
 use crate::db::Db;
 use crate::error::{AppError, AppResult, ProviderErrorKind};
 use crate::providers::{
@@ -633,6 +634,9 @@ pub struct ChatStreamEvent {
 /// persisted; the Player shows `text` for `delay_secs`, or until the turn
 /// moves on (a stream delta, a row, a tool start).
 pub const TURN_NOTICE_EVENT: &str = "chat://notice";
+/// How long the Player shows a context-budget line (stubs, a retry after a
+/// too-long prompt).
+const CONTEXT_NOTICE_SECS: u64 = 8;
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -2515,6 +2519,38 @@ impl ChatEngine {
         });
     }
 
+    /// The context guard at a round boundary (`context::budget`): older tool
+    /// results stubbed in the request past the soft threshold, said on the
+    /// Player.
+    fn guard_context(
+        &self,
+        app: &AppHandle,
+        request: &ChatRequest,
+        guard: &budget::ContextGuard,
+        messages: &mut [LlmMessage],
+        fixed_chars: usize,
+        rows: &HashMap<String, i64>,
+    ) {
+        let Some(stubbed) = guard.before_round(messages, fixed_chars, rows).filter(|s| s.results > 0) else {
+            return;
+        };
+        tracing::info!(
+            results = stubbed.results,
+            before = stubbed.before,
+            after = stubbed.after,
+            window = guard.budget().window,
+            "context budget: older tool results stubbed in the request"
+        );
+        self.emit_turn_notice(app, &request.workspace_id, &request.thread_id, &guard.stub_notice(&stubbed), CONTEXT_NOTICE_SECS);
+    }
+
+    /// Keep what the context guard learned about `model` in `app_meta`.
+    fn save_context_budget(&self, model: &str, learned: &budget::Learned) {
+        if let Err(e) = budget::save_learned(&self.db.lock(), model, learned) {
+            tracing::warn!(error = %e, "failed to keep the model's context budget");
+        }
+    }
+
     /// One director request: transient failures (429, 529, 5xx, a connection
     /// that couldn't be opened) are retried with the sub-agents' backoff and
     /// `retry-after` handling, each wait shown on the Player; a request that
@@ -3438,6 +3474,21 @@ impl ChatEngine {
 
         let mut usage = TurnUsage::default();
 
+        // ── Context budget ────────────────────────────────────────
+        // Every request of the turn stays inside the model's window
+        // (`context::budget`); system prompt and tools are fixed for the turn.
+        let fixed_chars = budget::fixed_chars(&system_prompt, &tools);
+        let mut context_guard = budget::ContextGuard::new(
+            budget::ContextBudget::for_model(
+                crate::orchestrator::cli_runner::catalog_context_window(&request.model),
+                request.max_tokens.max(4096),
+                request.effort,
+            ),
+            budget::load_learned(&self.db.lock(), &request.model),
+        );
+        // Each tool call's stored row, which a stub names for recall.
+        let mut tool_rows: HashMap<String, i64> = HashMap::new();
+
         // Snapshot files already modified before this turn started. Anything
         // present here was the user's own change — we won't credit it to the
         // agent even if a later iteration touches the same file.
@@ -3507,33 +3558,57 @@ impl ChatEngine {
                 }
             }
 
-            let llm_req = director_request(&request, &system_prompt, &messages, &tools);
+            // The round boundary: every tool_use has its result.
+            self.guard_context(&app, &request, &context_guard, &mut messages, fixed_chars, &tool_rows);
 
-            let response = match self
-                .director_call(
-                    &app,
-                    &request.workspace_id,
-                    &request.thread_id,
-                    provider.as_ref(),
-                    &api_base,
-                    api_key.as_deref(),
-                    &llm_req,
-                    &cancel,
-                )
-                .await
-            {
-                Completion::Done(r) => r,
-                // Stopped mid-request or mid-backoff: the same quiet ending as
-                // a stop between rounds. Every earlier round's rows are
-                // already persisted; the abandoned request left none.
-                Completion::Cancelled => {
-                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
-                    return Ok(());
-                }
-                Completion::Failed { error, retries } => {
-                    return Err(self.fail_turn(&app, &request.workspace_id, &request.thread_id, error, retries));
+            let response = loop {
+                let llm_req = director_request(&request, &system_prompt, &messages, &tools);
+                context_guard.sent(fixed_chars, &messages);
+                match self
+                    .director_call(
+                        &app,
+                        &request.workspace_id,
+                        &request.thread_id,
+                        provider.as_ref(),
+                        &api_base,
+                        api_key.as_deref(),
+                        &llm_req,
+                        &cancel,
+                    )
+                    .await
+                {
+                    Completion::Done(r) => break r,
+                    // Stopped mid-request or mid-backoff: the same quiet ending as
+                    // a stop between rounds. Every earlier round's rows are
+                    // already persisted; the abandoned request left none.
+                    Completion::Cancelled => {
+                        self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                        return Ok(());
+                    }
+                    Completion::Failed { error, retries } => {
+                        // Too long for the model: lower the window, stub the
+                        // request to fit and send it once more. A second
+                        // refusal, or nothing to stub, ends the turn as before.
+                        if let Some(recovery) = context_guard.on_overflow(&error, &mut messages, fixed_chars, &tool_rows) {
+                            self.save_context_budget(&request.model, context_guard.learned());
+                            if recovery.results > 0 {
+                                tracing::warn!(
+                                    window = recovery.window,
+                                    results = recovery.results,
+                                    "Talk director: prompt too long; compacted, retrying once"
+                                );
+                                let line = context_guard.recovery_notice(&recovery);
+                                self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &line, CONTEXT_NOTICE_SECS);
+                                continue;
+                            }
+                        }
+                        return Err(self.fail_turn(&app, &request.workspace_id, &request.thread_id, error, retries));
+                    }
                 }
             };
+            if context_guard.observed(&response) {
+                self.save_context_budget(&request.model, context_guard.learned());
+            }
 
             usage.add(&request.model, &response);
             self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
@@ -4100,6 +4175,9 @@ impl ChatEngine {
                     }
                 }
 
+                if let Some(id) = row_id {
+                    tool_rows.insert(u.id.clone(), id);
+                }
                 // The row keeps the whole result; an MCP result is capped
                 // in the copy the next round carries.
                 tool_results.push(LlmToolResult {
@@ -4177,6 +4255,7 @@ impl ChatEngine {
             self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
             return Ok(());
         }
+        self.guard_context(&app, &request, &context_guard, &mut messages, fixed_chars, &tool_rows);
         let close_req = forced_close_request(&request, &system_prompt, &mut messages, &tools);
         if let Some(wait) = pending_throttle.take() {
             self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &throttle_notice(wait), wait);
