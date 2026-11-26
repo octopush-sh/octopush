@@ -288,6 +288,7 @@ mod tests {
             workspace_id: "w".into(),
             thread_id: thread.into(),
             secret: false,
+            kind: None,
             since_ms,
         };
         // Oldest first, as the broker lists them: a sub-agent fan-out's two

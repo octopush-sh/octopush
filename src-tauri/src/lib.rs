@@ -45,6 +45,7 @@ pub mod skills;
 mod state;
 pub mod sync;
 pub mod talk_checkpoints;
+pub mod talk_guard;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
@@ -473,6 +474,7 @@ pub fn run() {
             commands::mcp_connection_status,
             commands::connect_claude_code,
             commands::claude_cli_version,
+            commands::managed_model_pricing,
             commands::claude_model_floor_note,
             commands::claude_known_bad_note,
             commands::codex_trust_note,

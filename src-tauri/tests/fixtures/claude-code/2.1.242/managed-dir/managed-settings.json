@@ -1,0 +1,1 @@
+{"modelPricing":{"multiplier":0.85,"overrides":{"claude-sonnet-4-6":{"input":2.4,"output":12,"cacheRead":0.24,"cacheWrite":3}}}}

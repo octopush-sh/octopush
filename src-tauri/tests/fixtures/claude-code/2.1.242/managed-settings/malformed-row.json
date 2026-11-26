@@ -1,0 +1,13 @@
+{
+  "modelPricing": {
+    "multiplier": 0,
+    "overrides": {
+      "claude-sonnet-4-6": { "input": 2.4, "output": 12, "cacheRead": 0.24, "cacheWrite": 3 },
+      "claude-opus-4-6": { "input": 4, "output": 20, "cacheRead": 0.4 },
+      "claude-haiku-4-5": { "input": 0.8, "output": 4, "cacheRead": 0.08, "cacheWrite": 20000 },
+      "gateway-sonnet": { "input": "2.4", "output": 12, "cacheRead": 0.24, "cacheWrite": 3 },
+      "gateway-opus": { "input": 4, "output": 20, "cacheRead": 0.4, "cacheWrite": -1 },
+      "gateway-free": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+    }
+  }
+}
