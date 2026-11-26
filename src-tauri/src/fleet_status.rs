@@ -2,7 +2,9 @@
 //! bar Octo (`menu_bar.rs`) never depend on the webview (main may be hidden).
 //! Mirrors `needsYou` / `fleetCounts` in `src/lib/runStatus.ts`;
 //! `src/lib/needsYou.fixtures.json` pins the two, so the badge, the menu bar
-//! and the fleet chip can't disagree.
+//! and the fleet chip can't disagree on crews. The badge and the menu bar
+//! also count Talk conversations whose approval card waits on you (the
+//! approval broker's `waiting`); the fleet chip stays the crews' own.
 
 use crate::state::AppState;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -23,16 +25,34 @@ pub fn needs_you(status: &str, plan_waiting: bool) -> bool {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FleetStatus {
+    /// Crews (Direct runs) that need you.
     pub needs_you: u32,
     /// Running, nobody waiting.
     pub in_flight: u32,
+    /// Talk conversations whose approval card waits on you (one per
+    /// conversation, however many cards it holds). Not part of [`derive`]:
+    /// `refresh` reads it from the approval broker.
+    pub talk: u32,
 }
 
 impl FleetStatus {
+    /// Everything that needs you: crews and Talk conversations.
+    pub fn waiting(&self) -> u32 {
+        self.needs_you + self.talk
+    }
+
     /// The Dock badge: the needs-you count, or none (cleared) at 0.
     pub fn badge(&self) -> Option<i64> {
-        (self.needs_you > 0).then_some(i64::from(self.needs_you))
+        let n = self.waiting();
+        (n > 0).then_some(i64::from(n))
     }
+}
+
+/// The conversations among Talk's waiting approval cards (oldest first in,
+/// oldest first out): one entry per thread, its oldest card.
+pub fn talk_conversations(waits: &[crate::chat_engine::ApprovalWait]) -> Vec<&crate::chat_engine::ApprovalWait> {
+    let mut seen = std::collections::HashSet::new();
+    waits.iter().filter(|w| seen.insert(w.thread_id.as_str())).collect()
 }
 
 /// The fleet split over `(status, plan_waiting)` pairs (see [`needs_you`]).
@@ -124,7 +144,11 @@ pub fn refresh_later(app: &AppHandle) {
 /// runs the fleet chip counts), clearing it at 0, and hand the same read to
 /// the menu bar Octo (`menu_bar::update`), so the two can't disagree.
 pub fn refresh(app: &AppHandle) {
-    let (runs, parked) = {
+    // Talk's approval cards waiting on you, read before the db lock (the
+    // broker never takes it while holding its own).
+    let approvals = app.state::<AppState>().chat.approvals().waiting();
+    let talk_waits = talk_conversations(&approvals);
+    let (runs, parked, talk) = {
         let state = app.state::<AppState>();
         let db = state.db.lock();
         let runs = match db.list_active_runs() {
@@ -144,11 +168,25 @@ pub fn refresh(app: &AppHandle) {
         } else {
             Vec::new()
         };
-        (runs, parked)
+        // Which workspace each waiting conversation is in, by name, only
+        // while the menu bar shows it.
+        let talk: Vec<crate::menu_bar::TalkWaiting> = if crate::menu_bar::wants_detail() {
+            talk_waits
+                .iter()
+                .map(|w| {
+                    let name = db.get_workspace(&w.workspace_id).ok().flatten().map(|ws| ws.name);
+                    crate::menu_bar::TalkWaiting::new(w, name)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (runs, parked, talk)
     };
-    let fleet = derive(runs.iter().map(|r| (r.status.as_str(), plan_waiting(r))));
+    let mut fleet = derive(runs.iter().map(|r| (r.status.as_str(), plan_waiting(r))));
+    fleet.talk = talk_waits.len() as u32;
     set_badge(app, fleet.badge());
-    crate::menu_bar::update(app, fleet, &runs, &parked);
+    crate::menu_bar::update(app, fleet, &runs, &parked, talk);
 }
 
 /// The Dock badge, set only when the count changed.
@@ -242,6 +280,30 @@ mod tests {
         for c in standing {
             assert!(!is_transient_halt(c.as_str()), "{c}");
         }
+    }
+
+    #[test]
+    fn a_talk_approval_counts_once_per_conversation_on_the_badge() {
+        let wait = |thread: &str, command: &str, since_ms: i64| crate::chat_engine::ApprovalWait {
+            workspace_id: "w".into(),
+            thread_id: thread.into(),
+            command: command.into(),
+            since_ms,
+        };
+        // Oldest first, as the broker lists them: a sub-agent fan-out's two
+        // cards in t1 are one conversation waiting on you.
+        let waits = vec![wait("t1", "git push -f", 1), wait("t2", "rm -rf build", 2), wait("t1", "git reset --hard", 3)];
+        let talk = talk_conversations(&waits);
+        let commands: Vec<&str> = talk.iter().map(|w| w.command.as_str()).collect();
+        assert_eq!(commands, ["git push -f", "rm -rf build"]);
+
+        let mut fleet = derive([("paused", false), ("running", false)]);
+        assert_eq!(fleet.badge(), Some(1));
+        fleet.talk = talk.len() as u32;
+        assert_eq!((fleet.waiting(), fleet.badge()), (3, Some(3)));
+        // Talk alone still badges; nothing waiting clears it.
+        assert_eq!(FleetStatus { talk: 1, ..FleetStatus::default() }.badge(), Some(1));
+        assert_eq!(FleetStatus::default().badge(), None);
     }
 
     #[test]

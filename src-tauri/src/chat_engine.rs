@@ -519,16 +519,39 @@ pub struct ApprovalRequestEvent {
     pub covers_uncommitted: bool,
 }
 
+/// A Talk approval card waiting on the user, as the Dock badge and the menu
+/// bar Octo count it (`fleet_status::refresh`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalWait {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub command: String,
+    /// When the card was raised (ms): the FIFO key.
+    pub since_ms: i64,
+}
+
+/// One card in flight: what it asked, when, and who answers it.
+struct ParkedApproval {
+    request: ApprovalRequestEvent,
+    since_ms: i64,
+    tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
 /// The one approval channel for dangerous agent commands in TALK: the parent
 /// loop and every sub-agent of the turn ask through it, the frontend answers
 /// by call id (`respond`), Stop denies a whole thread (`deny_thread`), and a
 /// "don't ask again" grant is per thread so a crew inherits it.
+///
+/// A card waits until it is answered: there is no timeout. Stop, deleting the
+/// conversation and deleting the workspace deny it; a reloaded webview shows
+/// it again (`pending_for_thread`); and while it waits it counts as needs-you
+/// on the Dock badge and the menu bar Octo (`waiting`).
 #[derive(Default)]
 pub(crate) struct ApprovalBroker {
-    /// In-flight requests keyed by the tool call id; the value carries the
-    /// thread id (so a thread's pending approvals can be resolved together)
-    /// + the responder.
-    approvals: Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<ApprovalDecision>)>>,
+    /// In-flight requests keyed by the tool call id: the request as the card
+    /// showed it (its thread, so a thread's pending approvals can be resolved
+    /// together), when it was raised, and the responder.
+    approvals: Mutex<HashMap<String, ParkedApproval>>,
     /// Threads where the user chose "don't ask again" — dangerous agent commands
     /// run without prompting (in-memory; resets on restart, by design).
     auto_approve: Mutex<std::collections::HashSet<String>>,
@@ -536,28 +559,81 @@ pub(crate) struct ApprovalBroker {
 
 impl ApprovalBroker {
     pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
-        if let Some((_thread, tx)) = self.approvals.lock().remove(call_id) {
-            let _ = tx.send(decision);
+        if let Some(parked) = self.approvals.lock().remove(call_id) {
+            let _ = parked.tx.send(decision);
         }
     }
 
     pub fn deny_thread(&self, thread_id: &str) {
+        self.deny_where(|r| r.thread_id == thread_id);
+    }
+
+    /// Deny every card of a workspace that is going away, so none outlives it
+    /// on the Dock badge or the menu bar.
+    pub fn deny_workspace(&self, workspace_id: &str) {
+        self.deny_where(|r| r.workspace_id == workspace_id);
+    }
+
+    fn deny_where(&self, matches: impl Fn(&ApprovalRequestEvent) -> bool) {
         let mut approvals = self.approvals.lock();
         let to_deny: Vec<String> = approvals
             .iter()
-            .filter(|(_, (tid, _))| tid == thread_id)
+            .filter(|(_, p)| matches(&p.request))
             .map(|(cid, _)| cid.clone())
             .collect();
         for cid in to_deny {
-            if let Some((_, tx)) = approvals.remove(&cid) {
-                let _ = tx.send(ApprovalDecision::Deny);
+            if let Some(parked) = approvals.remove(&cid) {
+                let _ = parked.tx.send(ApprovalDecision::Deny);
             }
         }
     }
 
+    /// The cards still waiting on a thread, oldest first — what a reloaded
+    /// webview needs to show again (its in-memory list is gone, the parked
+    /// turn is not).
+    pub fn pending_for_thread(&self, thread_id: &str) -> Vec<ApprovalRequestEvent> {
+        let approvals = self.approvals.lock();
+        let mut mine: Vec<&ParkedApproval> =
+            approvals.values().filter(|p| p.request.thread_id == thread_id).collect();
+        mine.sort_by(|a, b| a.since_ms.cmp(&b.since_ms).then_with(|| a.request.call_id.cmp(&b.request.call_id)));
+        mine.into_iter().map(|p| p.request.clone()).collect()
+    }
+
+    /// Every card waiting on the user, oldest first.
+    pub(crate) fn waiting(&self) -> Vec<ApprovalWait> {
+        let approvals = self.approvals.lock();
+        let mut all: Vec<(&String, ApprovalWait)> = approvals
+            .iter()
+            .map(|(cid, p)| {
+                (
+                    cid,
+                    ApprovalWait {
+                        workspace_id: p.request.workspace_id.clone(),
+                        thread_id: p.request.thread_id.clone(),
+                        command: p.request.command.clone(),
+                        since_ms: p.since_ms,
+                    },
+                )
+            })
+            .collect();
+        all.sort_by(|(ca, a), (cb, b)| a.since_ms.cmp(&b.since_ms).then_with(|| ca.cmp(cb)));
+        all.into_iter().map(|(_, w)| w).collect()
+    }
+
+    /// Park a card (no event, no wait): what `ask` does before it waits.
+    fn park(
+        &self,
+        request: ApprovalRequestEvent,
+        since_ms: i64,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.approvals.lock().insert(request.call_id.clone(), ParkedApproval { request, since_ms, tx });
+        rx
+    }
+
     /// Ask the user to approve a dangerous agent command and wait for the answer.
-    /// Auto-approved conversations skip the prompt. A forgotten card times out as
-    /// a denial (so a turn can't wedge forever).
+    /// Auto-approved conversations skip the prompt. The card waits as long as
+    /// it takes (see the type's doc): never a silent denial.
     pub async fn await_approval(
         &self,
         app: &AppHandle,
@@ -628,11 +704,7 @@ impl ApprovalBroker {
         reason: &str,
         secret: Option<bool>,
     ) -> ApprovalDecision {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.approvals
-            .lock()
-            .insert(call_id.to_string(), (thread_id.to_string(), tx));
-        let _ = app.emit("chat://approval-request", &ApprovalRequestEvent {
+        let request = ApprovalRequestEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
@@ -640,19 +712,22 @@ impl ApprovalBroker {
             reason: reason.to_string(),
             secret: secret.is_some(),
             covers_uncommitted: secret.unwrap_or(false),
-        });
-        let decision = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-            Ok(Ok(d)) => d,
-            _ => {
-                self.approvals.lock().remove(call_id);
-                ApprovalDecision::Deny
-            }
         };
+        let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
+        let _ = app.emit("chat://approval-request", &request);
+        // The Dock badge and the menu bar Octo count it while it waits.
+        crate::fleet_status::refresh_later(app);
+        // No timeout: a card left alone used to be denied after five minutes
+        // without a word. It now waits for its answer, Stop, or the
+        // conversation's (or workspace's) deletion, which all answer it. Only
+        // a responder dropped unanswered would end here, as a denial.
+        let decision = rx.await.unwrap_or(ApprovalDecision::Deny);
         let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
         });
+        crate::fleet_status::refresh_later(app);
         decision
     }
 }
@@ -4310,6 +4385,62 @@ mod tests {
         assert!(dangerous_command("dd if=/dev/zero of=/dev/sda").is_some());
         // New denylist entry: find -delete.
         assert!(dangerous_command("find . -name '*.tmp' -delete").is_some());
+    }
+
+    fn approval_request(workspace: &str, thread: &str, call: &str, command: &str) -> ApprovalRequestEvent {
+        ApprovalRequestEvent {
+            workspace_id: workspace.into(),
+            thread_id: thread.into(),
+            call_id: call.into(),
+            command: command.into(),
+            reason: "rewrites published history".into(),
+            secret: false,
+            covers_uncommitted: false,
+        }
+    }
+
+    #[test]
+    fn a_waiting_card_is_listed_oldest_first_until_it_is_answered() {
+        let broker = ApprovalBroker::default();
+        let mut push = broker.park(approval_request("w1", "t1", "c2", "git push --force"), 2_000);
+        let _reset = broker.park(approval_request("w2", "t2", "c1", "git reset --hard"), 1_000);
+        let _clean = broker.park(approval_request("w1", "t1", "c3", "git clean -fd"), 3_000);
+
+        // What the Dock badge and the menu bar count: every card, longest-waiting first.
+        let waits = broker.waiting();
+        let order: Vec<&str> = waits.iter().map(|w| w.command.as_str()).collect();
+        assert_eq!(order, ["git reset --hard", "git push --force", "git clean -fd"]);
+        assert_eq!((waits[0].workspace_id.as_str(), waits[0].thread_id.as_str(), waits[0].since_ms), ("w2", "t2", 1_000));
+
+        // What a reloaded webview shows again for one conversation.
+        let shown: Vec<String> = broker.pending_for_thread("t1").into_iter().map(|r| r.call_id).collect();
+        assert_eq!(shown, ["c2", "c3"]);
+        assert!(broker.pending_for_thread("t9").is_empty());
+
+        // Nothing answers a card on its own: it is still waiting.
+        assert!(matches!(push.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+
+        broker.respond("c2", ApprovalDecision::Approve);
+        assert_eq!(push.try_recv().ok(), Some(ApprovalDecision::Approve));
+        assert_eq!(broker.waiting().len(), 2, "an answered card stops counting");
+    }
+
+    #[test]
+    fn stop_and_a_deleted_workspace_deny_their_cards_and_nothing_else() {
+        let broker = ApprovalBroker::default();
+        let mut a = broker.park(approval_request("w1", "t1", "a", "rm -rf build"), 1);
+        let mut b = broker.park(approval_request("w1", "t2", "b", "git push -f"), 2);
+        let mut c = broker.park(approval_request("w2", "t3", "c", "sudo make install"), 3);
+
+        broker.deny_thread("t1");
+        assert_eq!(a.try_recv().ok(), Some(ApprovalDecision::Deny));
+        assert!(b.try_recv().is_err() && c.try_recv().is_err(), "other conversations still wait");
+
+        broker.deny_workspace("w1");
+        assert_eq!(b.try_recv().ok(), Some(ApprovalDecision::Deny));
+        assert!(c.try_recv().is_err(), "another workspace still waits");
+        let left: Vec<String> = broker.waiting().into_iter().map(|w| w.thread_id).collect();
+        assert_eq!(left, ["t3"]);
     }
 
     #[test]

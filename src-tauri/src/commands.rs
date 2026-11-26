@@ -1571,6 +1571,9 @@ pub async fn delete_workspace(
     branch: String,
     worktree_path: Option<String>,
 ) -> AppResult<()> {
+    // A Talk approval card in this workspace would wait for an answer that
+    // can no longer come, and keep counting on the Dock badge: deny it.
+    state.chat.approvals().deny_workspace(&workspace_id);
     let project_path = expand_tilde(&project_path);
     let is_main = worktree_path
         .as_deref()
@@ -5199,6 +5202,17 @@ pub async fn pending_subagent_caps(
     thread_id: String,
 ) -> AppResult<Vec<crate::chat_engine::SubagentCapEvent>> {
     Ok(state.chat.cap_gate.pending_for_thread(&thread_id))
+}
+
+/// The approval cards still waiting on a thread, oldest first — a reloaded
+/// webview asks for them when it opens the thread (the parked turn outlives
+/// the view, and a card no longer times out on its own).
+#[tauri::command]
+pub async fn pending_approvals(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<Vec<crate::chat_engine::ApprovalRequestEvent>> {
+    Ok(state.chat.approvals().pending_for_thread(&thread_id))
 }
 
 /// Give a finished sub-agent more turns (`extra_turns` `None` = no limit),

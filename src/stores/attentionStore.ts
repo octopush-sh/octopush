@@ -9,12 +9,15 @@
  *
  * Two kinds of attention triggers:
  *   - "chat":     a streaming agent reply finished in a workspace that
- *                 isn't currently focused.
+ *                 isn't currently focused, or a Talk approval card waits
+ *                 on the user (`reason: "approval"`, see `raiseApproval`).
  *   - "terminal": a PTY emitted a BEL (\x07) — the shell or running
  *                 program asked for the user's attention — while that
  *                 terminal wasn't visible.
  *
- * Flags clear automatically when the user switches to the workspace.
+ * Flags clear automatically when the user switches to the workspace, except
+ * an approval's: it is a state, not a ping, and lasts until the card is
+ * answered (`settleApproval`).
  * Sound is rate-limited (one chime per ~2s) so a burst of completions
  * doesn't ring the bell six times in a row.
  */
@@ -47,9 +50,19 @@ export interface AttentionFlag {
    * For terminal pings from `pty://attention`, why the terminal wants the user
    * (the event's `reason`): `permission` / `input` from Claude Code's hooks,
    * `idle` from the daemon. Null for chat pings and the xterm bell. The latest
-   * ping's reason wins, like `terminalId`.
+   * ping's reason wins, like `terminalId`. `approval` marks a chat flag raised
+   * by a Talk approval card waiting on the user (`raiseApproval`).
    */
-  reason?: PtyAttentionReason | null;
+  reason?: AttentionReason | null;
+  /** For an approval flag: the command its oldest card asks to run. */
+  detail?: string | null;
+}
+
+export type AttentionReason = PtyAttentionReason | "approval";
+
+/** True for the flag a waiting Talk approval card raised. */
+export function isApprovalFlag(flag: AttentionFlag | undefined): boolean {
+  return flag?.kind === "chat" && flag.reason === "approval";
 }
 
 /**
@@ -98,6 +111,15 @@ interface AttentionState {
     terminalId?: string | null,
     reason?: PtyAttentionReason | null,
   ) => void;
+  /** A Talk approval card waits on the user in `workspaceId`: raise its
+   *  needs-you flag (`kind: "chat"`, `reason: "approval"`), which no focus
+   *  clears and no later ping replaces until `settleApproval`. Its wait
+   *  starts at the first card (`since` is kept while one waits). Chimes
+   *  only when `chime` (the user isn't already looking at the card). */
+  raiseApproval: (workspaceId: string, command: string, chime: boolean) => void;
+  /** The workspace's last approval card was answered: drop its flag (and
+   *  only an approval flag). */
+  settleApproval: (workspaceId: string) => void;
   /** Clear the flag for a workspace (called when the user focuses it). */
   clear: (workspaceId: string) => void;
   /** Clear the flag only if it points at this terminal, and the terminal's
@@ -122,47 +144,10 @@ const readSoundPref = (): boolean => {
   return raw === null ? true : raw === "1";
 };
 
-export const useAttentionStore = create<AttentionState>((set, get) => ({
-  flagsByWs: {},
-  waitingByTerminal: {},
-  waitsByTerminal: {},
-  soundEnabled: readSoundPref(),
-  lastChimeAt: 0,
-
-  ping: (workspaceId, kind, terminalId, reason) => {
-    const now = Date.now();
-    set((s) => {
-      const existing = s.flagsByWs[workspaceId];
-      // Only Claude Code's own hook reasons open a per-session wait; a bell or
-      // the daemon's idle guess leaves any wait as it was.
-      const waitReason =
-        kind === "terminal" && terminalId && (reason === "permission" || reason === "input")
-          ? reason
-          : null;
-      const prevWait = terminalId ? s.waitsByTerminal[terminalId] : undefined;
-      return {
-        ...(waitReason && terminalId
-          ? {
-              waitsByTerminal: {
-                ...s.waitsByTerminal,
-                [terminalId]: { workspaceId, reason: waitReason, since: prevWait?.since ?? now },
-              },
-            }
-          : {}),
-        flagsByWs: {
-          ...s.flagsByWs,
-          [workspaceId]: {
-            kind,
-            at: now,
-            since: existing ? (existing.since ?? existing.at) : now,
-            terminalId: terminalId ?? null,
-            reason: reason ?? null,
-          },
-        },
-      };
-    });
-    // Sound, with cooldown so paired chat+terminal completions don't
-    // produce a double-chime within the same second.
+export const useAttentionStore = create<AttentionState>((set, get) => {
+  // Sound, with cooldown so paired chat+terminal completions don't
+  // produce a double-chime within the same second.
+  const chime = (now: number) => {
     const state = get();
     if (state.soundEnabled && now - state.lastChimeAt > CHIME_COOLDOWN_MS) {
       set({ lastChimeAt: now });
@@ -170,63 +155,142 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
         // Audio context may be locked until the user interacts; ignore.
       });
     }
-  },
+  };
+  return {
+    flagsByWs: {},
+    waitingByTerminal: {},
+    waitsByTerminal: {},
+    soundEnabled: readSoundPref(),
+    lastChimeAt: 0,
 
-  clear: (workspaceId) =>
-    set((s) => {
-      if (!(workspaceId in s.flagsByWs)) return s;
-      const next = { ...s.flagsByWs };
-      delete next[workspaceId];
-      return { flagsByWs: next };
-    }),
+    ping: (workspaceId, kind, terminalId, reason) => {
+      const now = Date.now();
+      set((s) => {
+        const existing = s.flagsByWs[workspaceId];
+        // Only Claude Code's own hook reasons open a per-session wait; a bell or
+        // the daemon's idle guess leaves any wait as it was.
+        const waitReason =
+          kind === "terminal" && terminalId && (reason === "permission" || reason === "input")
+            ? reason
+            : null;
+        const prevWait = terminalId ? s.waitsByTerminal[terminalId] : undefined;
+        // A waiting approval card outranks any ping: its flag stays until the
+        // card is answered (the per-session wait above is still kept).
+        const keepsApproval = isApprovalFlag(existing);
+        return {
+          ...(waitReason && terminalId
+            ? {
+                waitsByTerminal: {
+                  ...s.waitsByTerminal,
+                  [terminalId]: { workspaceId, reason: waitReason, since: prevWait?.since ?? now },
+                },
+              }
+            : {}),
+          flagsByWs: keepsApproval
+            ? s.flagsByWs
+            : {
+                ...s.flagsByWs,
+                [workspaceId]: {
+                  kind,
+                  at: now,
+                  since: existing ? (existing.since ?? existing.at) : now,
+                  terminalId: terminalId ?? null,
+                  reason: reason ?? null,
+                },
+              },
+        };
+      });
+      chime(now);
+    },
 
-  clearForTerminal: (workspaceId, terminalId) =>
-    set((s) => {
-      const flag = s.flagsByWs[workspaceId];
-      const ownsFlag = !!flag && flag.terminalId === terminalId;
-      if (!ownsFlag && !(terminalId in s.waitsByTerminal)) return s;
-      const flags = { ...s.flagsByWs };
-      if (ownsFlag) delete flags[workspaceId];
-      const waits = { ...s.waitsByTerminal };
-      delete waits[terminalId];
-      return { flagsByWs: flags, waitsByTerminal: waits };
-    }),
+    raiseApproval: (workspaceId, command, withChime) => {
+      const now = Date.now();
+      set((s) => {
+        const existing = s.flagsByWs[workspaceId];
+        // Already raised for an earlier card: the oldest card's command and
+        // time stand, so the beacon can't hop to a newer wait.
+        if (isApprovalFlag(existing)) return s;
+        return {
+          flagsByWs: {
+            ...s.flagsByWs,
+            [workspaceId]: {
+              kind: "chat",
+              at: now,
+              since: existing ? (existing.since ?? existing.at) : now,
+              terminalId: null,
+              reason: "approval",
+              detail: command,
+            },
+          },
+        };
+      });
+      if (withChime) chime(now);
+    },
 
-  clearWait: (terminalId) =>
-    set((s) => {
-      const wait = s.waitsByTerminal[terminalId];
-      if (!wait) return s;
-      const waits = { ...s.waitsByTerminal };
-      delete waits[terminalId];
-      // The workspace flag this same wait raised ends with it; a bell or idle
-      // ping that came later, or another session's, stays.
-      const flag = s.flagsByWs[wait.workspaceId];
-      const sameWait =
-        flag?.kind === "terminal" &&
-        flag.terminalId === terminalId &&
-        (flag.reason === "permission" || flag.reason === "input");
-      if (!sameWait) return { waitsByTerminal: waits };
-      const flags = { ...s.flagsByWs };
-      delete flags[wait.workspaceId];
-      return { waitsByTerminal: waits, flagsByWs: flags };
-    }),
+    settleApproval: (workspaceId) =>
+      set((s) => {
+        if (!isApprovalFlag(s.flagsByWs[workspaceId])) return s;
+        const next = { ...s.flagsByWs };
+        delete next[workspaceId];
+        return { flagsByWs: next };
+      }),
 
-  setShownWaiting: (terminalId, reason) =>
-    set((s) => {
-      if ((s.waitingByTerminal[terminalId] ?? null) === reason) return s;
-      const next = { ...s.waitingByTerminal };
-      if (reason) next[terminalId] = reason;
-      else delete next[terminalId];
-      return { waitingByTerminal: next };
-    }),
+    clear: (workspaceId) =>
+      set((s) => {
+        if (!(workspaceId in s.flagsByWs)) return s;
+        const next = { ...s.flagsByWs };
+        delete next[workspaceId];
+        return { flagsByWs: next };
+      }),
 
-  setSoundEnabled: (v) => {
-    if (typeof localStorage !== "undefined") {
-      localStorage.setItem(STORAGE_KEY, v ? "1" : "0");
-    }
-    set({ soundEnabled: v });
-  },
-}));
+    clearForTerminal: (workspaceId, terminalId) =>
+      set((s) => {
+        const flag = s.flagsByWs[workspaceId];
+        const ownsFlag = !!flag && flag.terminalId === terminalId;
+        if (!ownsFlag && !(terminalId in s.waitsByTerminal)) return s;
+        const flags = { ...s.flagsByWs };
+        if (ownsFlag) delete flags[workspaceId];
+        const waits = { ...s.waitsByTerminal };
+        delete waits[terminalId];
+        return { flagsByWs: flags, waitsByTerminal: waits };
+      }),
+
+    clearWait: (terminalId) =>
+      set((s) => {
+        const wait = s.waitsByTerminal[terminalId];
+        if (!wait) return s;
+        const waits = { ...s.waitsByTerminal };
+        delete waits[terminalId];
+        // The workspace flag this same wait raised ends with it; a bell or idle
+        // ping that came later, or another session's, stays.
+        const flag = s.flagsByWs[wait.workspaceId];
+        const sameWait =
+          flag?.kind === "terminal" &&
+          flag.terminalId === terminalId &&
+          (flag.reason === "permission" || flag.reason === "input");
+        if (!sameWait) return { waitsByTerminal: waits };
+        const flags = { ...s.flagsByWs };
+        delete flags[wait.workspaceId];
+        return { waitsByTerminal: waits, flagsByWs: flags };
+      }),
+
+    setShownWaiting: (terminalId, reason) =>
+      set((s) => {
+        if ((s.waitingByTerminal[terminalId] ?? null) === reason) return s;
+        const next = { ...s.waitingByTerminal };
+        if (reason) next[terminalId] = reason;
+        else delete next[terminalId];
+        return { waitingByTerminal: next };
+      }),
+
+    setSoundEnabled: (v) => {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(STORAGE_KEY, v ? "1" : "0");
+      }
+      set({ soundEnabled: v });
+    },
+  };
+});
 
 // ── Chime synthesis ────────────────────────────────────────────────
 //

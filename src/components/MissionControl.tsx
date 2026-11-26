@@ -17,7 +17,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
 import { useGroupsStore } from "../stores/groupsStore";
 import { missionGroupNameOf } from "../lib/railGroups";
-import { useAttentionStore } from "../stores/attentionStore";
+import { isApprovalFlag, useAttentionStore } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { INTENT_ICON } from "../lib/missionIntent";
 import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
@@ -60,6 +60,9 @@ type AttentionItem = {
   flag: "chat" | "terminal";
   /** For a terminal: what Claude Code is waiting on, when its hooks said. */
   waiting: ClaudeWaitReason | null;
+  /** For a chat flag: the command a Talk approval card waits on you to
+   *  approve; null for a finished conversation. */
+  approval: string | null;
   at: number;
 };
 /** The board renders a discriminated union so runs and attention surfaces share
@@ -102,7 +105,8 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
       workspaceId,
       missionTitle: missionByWorkspaceId[workspaceId]?.title ?? null,
       flag: flag.kind,
-      waiting: flag.kind === "terminal" ? claudeWaitReason(flag.reason) : null,
+      waiting: flag.kind === "terminal" && flag.reason !== "approval" ? claudeWaitReason(flag.reason) : null,
+      approval: isApprovalFlag(flag) ? (flag.detail ?? "") : null,
       at: flag.at,
     }));
     const itemSince = (it: BoardItem) => (it.kind === "run" ? runSince(it.run) : it.at);
@@ -416,7 +420,15 @@ function AttentionCard({
 /** An attention card's status word and brief. A terminal whose Claude Code
  *  hooks said what it waits on gets that copy; a bell or idle ping keeps the
  *  generic one. */
-export function attentionCopy(item: Pick<AttentionItem, "flag" | "waiting">): { word: string; brief: string } {
+export function attentionCopy(
+  item: Pick<AttentionItem, "flag" | "waiting"> & { approval?: string | null },
+): { word: string; brief: string } {
+  if (item.flag === "chat" && item.approval != null) {
+    return {
+      word: "approval in Talk",
+      brief: item.approval ? `Approve or deny: ${item.approval}` : "A command waits for your approval.",
+    };
+  }
   if (item.flag === "chat") return { word: "waiting in Talk", brief: "A conversation finished — your move." };
   if (item.waiting) return { word: claudeWaitingCopy(item.waiting), brief: `Claude Code is ${claudeWaitingCopy(item.waiting)}.` };
   return { word: "terminal bell", brief: "A terminal is asking for input." };

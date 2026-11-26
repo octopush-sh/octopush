@@ -89,7 +89,7 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
           />
           <ToggleRow
             label="Notify when a crew needs you"
-            description="A native notification when a crew needs a decision (gate, halt, budget) — always — or finishes while Octopush isn't focused, and when Claude Code in a terminal you can't see waits on permission or your input. So a fleet can work unattended."
+            description="A native notification when a crew needs a decision (gate, halt, budget) — always — or finishes while Octopush isn't focused, when Claude Code in a terminal you can't see waits on permission or your input, and when a command in Talk waits for your approval while you're in another app. So a fleet can work unattended."
             checked={crewNotifications}
             onChange={setCrewNotifications}
           />

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { useAttentionStore } from "./attentionStore";
+import { isApprovalFlag, useAttentionStore } from "./attentionStore";
 
 describe("attentionStore — how long a workspace has been waiting", () => {
   beforeEach(() => {
@@ -127,5 +127,53 @@ describe("attentionStore — why a terminal wants you", () => {
     expect(useAttentionStore.getState().flagsByWs["ws-a"].reason).toBeNull();
     ping("ws-b", "chat");
     expect(useAttentionStore.getState().flagsByWs["ws-b"].reason).toBeNull();
+  });
+});
+
+describe("attentionStore — a Talk approval card is a needs-you state", () => {
+  beforeEach(() => {
+    useAttentionStore.setState({ flagsByWs: {}, lastChimeAt: 0, soundEnabled: true });
+    vi.useRealTimers();
+  });
+
+  it("raises a chat flag marked as an approval, with the command, chiming only when asked", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    useAttentionStore.getState().raiseApproval("ws-a", "git push --force", false);
+    expect(useAttentionStore.getState().flagsByWs["ws-a"]).toMatchObject({
+      kind: "chat",
+      reason: "approval",
+      detail: "git push --force",
+      since: 10_000,
+    });
+    expect(isApprovalFlag(useAttentionStore.getState().flagsByWs["ws-a"])).toBe(true);
+    expect(useAttentionStore.getState().lastChimeAt).toBe(0);
+    useAttentionStore.getState().raiseApproval("ws-b", "rm -rf build", true);
+    expect(useAttentionStore.getState().lastChimeAt).toBe(10_000);
+    vi.useRealTimers();
+  });
+
+  it("keeps the oldest card's wait: a second card neither moves `since` nor the command", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    useAttentionStore.getState().raiseApproval("ws-a", "git push --force", false);
+    vi.setSystemTime(8_000);
+    useAttentionStore.getState().raiseApproval("ws-a", "git reset --hard", false);
+    expect(useAttentionStore.getState().flagsByWs["ws-a"]).toMatchObject({ since: 1_000, detail: "git push --force" });
+    vi.useRealTimers();
+  });
+
+  it("no later ping replaces it, and settling drops only an approval flag", () => {
+    useAttentionStore.getState().raiseApproval("ws-a", "git push --force", false);
+    useAttentionStore.getState().ping("ws-a", "terminal", "term-1", "permission");
+    expect(isApprovalFlag(useAttentionStore.getState().flagsByWs["ws-a"])).toBe(true);
+    // The session's own wait is still kept for Run's session line.
+    expect(useAttentionStore.getState().waitsByTerminal["term-1"]).toBeTruthy();
+    useAttentionStore.getState().settleApproval("ws-a");
+    expect(useAttentionStore.getState().flagsByWs["ws-a"]).toBeUndefined();
+
+    useAttentionStore.getState().ping("ws-b", "chat");
+    useAttentionStore.getState().settleApproval("ws-b");
+    expect(useAttentionStore.getState().flagsByWs["ws-b"]).toMatchObject({ kind: "chat" });
   });
 });

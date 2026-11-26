@@ -118,6 +118,7 @@ Current anchors:
 | `talk-turn-no-checkpoint` | Talk, on a message you sent whose checkpoint was skipped (in its hover/focus action row): the "This turn has no checkpoint" mark | `chat/ChatCanvas.tsx` |
 | `talk-turn-ask` | Talk: a message you sent, set on the panel surface with "— You" and the time (every such turn carries it; a tour finds the first) | `ChatMessage.tsx` |
 | `talk-work` · `talk-work-fold` | Talk: the model's work in a turn, its narration and tool calls on one hairline (only when a turn has some) · the summary row of a round of more than five calls (only when one has) | `chat/WorkBlock.tsx` |
+| `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focusable; Enter approves, Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
 | `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
 | `talk-context-cap` | Talk composer, at the end of the context chips: "10 at most · 2 more sent as text" (only while the draft names more than 10 mentions) | `chat/ContextChips.tsx` |

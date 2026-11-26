@@ -82,3 +82,13 @@ describe("nextShownWaiting", () => {
     }
   });
 });
+
+describe("shouldClearAttention — a waiting approval card", () => {
+  it("is never cleared by looking at it, in any mode: only an answer settles it", () => {
+    const flag: AttentionFlag = { kind: "chat", at: 1, since: 1, reason: "approval", detail: "git push --force" };
+    expect(shouldClearAttention(flag, "talk", null)).toBe(false);
+    expect(shouldClearAttention(flag, "run", "t1")).toBe(false);
+    // A finished conversation still clears in Talk, as before.
+    expect(shouldClearAttention({ kind: "chat", at: 1 }, "talk", null)).toBe(true);
+  });
+});
