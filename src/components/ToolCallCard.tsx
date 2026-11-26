@@ -3,6 +3,8 @@ import { ipc } from "../lib/ipc";
 import { useCopyFeedback } from "../hooks/useCopyFeedback";
 import { ChevronRight, ExternalLink, FilePen, FolderOpen, Terminal } from "lucide-react";
 import { iconForTool } from "../lib/roleIcons";
+import { tourId } from "../lib/tour/ids";
+import { toolVerdict } from "../lib/toolVerdict";
 import type { ToolExecution } from "../stores/chatStore";
 
 interface Props {
@@ -94,6 +96,7 @@ const BRASS = "var(--color-octo-brass)";
 const IVORY = "var(--color-octo-ivory)";
 const SAGE = "var(--color-octo-sage)";
 const MUTE = "var(--color-octo-mute)";
+const ROUGE = "var(--color-octo-rouge)";
 const ONYX = "var(--color-octo-onyx)";
 const HAIRLINE = "var(--color-octo-hairline)";
 const MONO = "var(--font-mono)";
@@ -118,6 +121,7 @@ function keyActivate(fn: () => void) {
 // stays with the director's turn; the row only says what the model did and
 // opens to the raw result.
 const rowStyle: CSSProperties = {
+  position: "relative",
   display: "block",
   width: "100%",
   maxWidth: "100%",
@@ -160,6 +164,31 @@ const headerStyle: CSSProperties = {
   boxSizing: "border-box" as const,
 };
 
+// A resolved row's verdict, when it isn't a pass: a 6px dot ON the work
+// hairline, exactly where the live row's status dot sat (the hairline is
+// 12px left of the row: its 1px border plus the block's 12px padding, so
+// the dot's centre lands on it), and a mono meta in the slot the live row's
+// timer had. Rouge for a failure, mute for a denial. A pass stays unmarked,
+// so a turn of twenty good calls carries no noise.
+const verdictDotStyle: CSSProperties = {
+  position: "absolute",
+  left: -15.5,
+  top: 9,
+  width: 6,
+  height: 6,
+  borderRadius: 999,
+};
+
+const verdictMetaStyle: CSSProperties = {
+  fontSize: 9,
+  fontFamily: MONO,
+  letterSpacing: "0.15em",
+  textTransform: "uppercase",
+  flexShrink: 0,
+  marginLeft: 6,
+  whiteSpace: "nowrap",
+};
+
 // A row's actions (Send to terminal, Open in editor, Reveal in Finder, Open)
 // are 12px icons with a title, shown while the row is hovered or holds focus
 // (`.octo-ledger-actions`), mute until hovered, then brass.
@@ -186,6 +215,8 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
 
   const label = toolLabel(tool.toolName);
   const summary = summarizeTool(tool.toolName, tool.toolInput);
+  const verdict = toolVerdict(tool);
+  const verdictInk = verdict.kind === "failed" ? ROUGE : MUTE;
   const ToolIcon = iconForTool(tool.toolName);
   const filePath = getFilePath(tool);
   const isWebFile = filePath ? /\.(html?|htm)$/i.test(filePath) : false;
@@ -206,13 +237,21 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
 
   const toggle = () => setExpanded((v) => !v);
   return (
-    <div data-role="tool" className="octo-selectable" style={rowStyle}>
+    <div data-role="tool" data-outcome={verdict.kind} className="octo-selectable" style={rowStyle}>
+      {verdict.kind !== "ok" && (
+        <span
+          aria-hidden
+          data-testid="tool-verdict-dot"
+          title={verdict.title}
+          style={{ ...verdictDotStyle, background: verdictInk }}
+        />
+      )}
       <div className="octo-ledger" style={lineStyle}>
         <div
           role="button"
           tabIndex={0}
           aria-expanded={expanded}
-          aria-label={`${label} ${summary}`.trim()}
+          aria-label={[`${label} ${summary}`.trim(), verdict.title].filter(Boolean).join(", ")}
           onClick={toggle}
           onKeyDown={keyActivate(toggle)}
           className="octo-ledger-head"
@@ -268,6 +307,16 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
               }}
             >
               {cwd}
+            </span>
+          )}
+          {verdict.kind !== "ok" && (
+            <span
+              title={verdict.title}
+              data-tour={tourId("talk-tool-verdict")}
+              className="octo-tabular"
+              style={{ ...verdictMetaStyle, color: verdictInk }}
+            >
+              {verdict.meta}
             </span>
           )}
         </div>

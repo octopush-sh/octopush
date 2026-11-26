@@ -12,6 +12,7 @@ import { railGroupsEverywhere } from "./rail-groups-everywhere";
 import { directRunning } from "./direct-running";
 import { talkWork } from "./talk-work";
 import { talkMcp } from "./talk-mcp";
+import { talkOutcomes } from "./talk-outcomes";
 import { talkApproval } from "./talk-approval";
 
 export const SCENARIOS: Record<string, Scenario> = {
@@ -26,5 +27,6 @@ export const SCENARIOS: Record<string, Scenario> = {
   "direct-running": directRunning,
   "talk-work": talkWork,
   "talk-mcp": talkMcp,
+  "talk-outcomes": talkOutcomes,
   "talk-approval": talkApproval,
 };

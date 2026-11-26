@@ -1828,7 +1828,7 @@ pub async fn run_shell_command(
 /// then sees the command exit and resolves its card.
 #[tauri::command]
 pub async fn stop_shell_command(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
-    state.chat.talk_shell.interrupt(&thread_id);
+    state.chat.stop_shell(&thread_id);
     Ok(())
 }
 
