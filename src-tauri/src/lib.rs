@@ -332,6 +332,7 @@ pub fn run() {
             commands::update_run_stage,
             commands::rerun_from_stage,
             commands::estimate_run_cost,
+            commands::get_crew_report,
             commands::get_stage_log,
             commands::get_chat_agent_log,
             commands::list_stage_iterations,

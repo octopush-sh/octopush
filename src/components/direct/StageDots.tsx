@@ -20,6 +20,14 @@ const DOT: Record<string, string> = {
   pending: "bg-octo-hairline",
 };
 
+// Outcome tone (a stage's track record): never brass, which means "a crew
+// waits on you"; a run that passed first time stays quiet.
+const OUTCOME: Record<string, string> = {
+  pass: "bg-octo-sage",
+  rework: "bg-octo-warning",
+  halt: "bg-octo-rouge",
+};
+
 // Page-indicator tone: the page you're on is the active (brass) dot.
 const PAGE: Record<string, string> = {
   seen: "bg-octo-verdigris",
@@ -41,8 +49,9 @@ export function StageDots({
   /** "status" colours by run state; "shape" is the launcher-ticket neutral —
    *  every dot sage, only the gate ring carries meaning; "pager" is a page
    *  indicator, not a run — statuses "seen" / "current" / "upcoming", and the
-   *  current page is the one brass (active) dot. */
-  tone?: "status" | "shape" | "pager";
+   *  current page is the one brass (active) dot; "outcome" is a stage's past
+   *  runs — statuses "pass" / "rework" / "halt", sage / amber / rouge. */
+  tone?: "status" | "shape" | "pager" | "outcome";
 }) {
   return (
     <span className={`flex items-center gap-1 ${className}`}>
@@ -54,7 +63,9 @@ export function StageDots({
             ? "bg-octo-sage"
             : tone === "pager"
               ? (PAGE[s.status] ?? PAGE.upcoming)
-              : stalled
+              : tone === "outcome"
+                ? (OUTCOME[s.status] ?? OUTCOME.pass)
+                : stalled
                 ? "bg-octo-warning"
                 : (DOT[s.status] ?? DOT.pending);
         const title =
@@ -62,7 +73,7 @@ export function StageDots({
             ? s.checkpoint
               ? "Pauses for your approval"
               : undefined
-            : tone === "pager"
+            : tone === "pager" || tone === "outcome"
               ? s.title
               : s.title
                 ? `${s.title} — ${word}`

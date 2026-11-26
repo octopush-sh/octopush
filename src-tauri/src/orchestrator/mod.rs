@@ -5,6 +5,7 @@ pub mod agentic;
 pub mod bridge;
 pub mod cli_runner;
 pub mod cost;
+pub mod crew_report;
 pub mod events;
 pub mod launch;
 pub mod git_baseline;
