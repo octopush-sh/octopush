@@ -122,27 +122,33 @@ fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
 /// Whether a model takes the GA `output_config.effort` + `thinking:{adaptive}`
 /// path. This is an ALLOWLIST, not "anything that isn't budget-only": a legacy
 /// id (`claude-3-5-sonnet`) or an unknown id must NOT get thinking params (it
-/// would 400) — it gets no thinking at all (see `thinking_json`).
+/// would 400) — it gets no thinking at all (see `thinking_json`). Every entry
+/// is a model Claude's thinking table lists as taking `adaptive` and the
+/// effort page lists as taking effort (Opus 4.6–5.5, Sonnet 4.6–5.5, Haiku
+/// 5.5, Fable 5–5.2, Mythos 5–5.2); an id that can't be checked against those
+/// tables stays out of every list.
 fn is_effort_model(id: &str) -> bool {
     [
-        "opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "opus-5",
+        "opus-4-6", "opus-4-7", "opus-4-8", "opus-5",
         "sonnet-4-6", "sonnet-5", "haiku-5", "fable-5", "mythos-5",
     ]
     .iter()
     .any(|m| id.contains(m))
 }
 
-/// Whether a model takes the legacy `thinking:{enabled, budget_tokens}` path —
-/// the thinking-but-not-effort models, which 400 on `output_config.effort`.
+/// Whether a model takes the legacy `thinking:{enabled, budget_tokens}` path:
+/// the models whose only thinking mode is that manual form and which reject
+/// `adaptive` with a 400 (Claude's thinking table: Opus 4.5, Haiku 4.5,
+/// Sonnet 4.5, and Sonnet 4). They get no `output_config`.
 fn is_budget_model(id: &str) -> bool {
-    ["haiku-4-5", "sonnet-4-5", "sonnet-4-0"]
+    ["opus-4-5", "haiku-4-5", "sonnet-4-5", "sonnet-4-0"]
         .iter()
         .any(|m| id.contains(m))
 }
 
 /// Whether a model accepts the top `xhigh` effort level. Only the newest
 /// families do (Opus 4.7/4.8, Sonnet 5, Haiku 5.5, Fable 5, Mythos 5); Opus 4.6 / Sonnet
-/// 4.6 cap at `max` (no `xhigh`), and Opus 4.5 caps at `high`.
+/// 4.6 cap at `max` (no `xhigh`).
 fn supports_xhigh(id: &str) -> bool {
     ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "haiku-5", "fable-5", "mythos-5"]
         .iter()
@@ -157,10 +163,10 @@ fn supports_max(id: &str) -> bool {
 
 /// Clamp a requested effort to the highest LEVEL a given effort-path model
 /// actually accepts, so we never 400 by sending `xhigh` to Sonnet 4.6 (the
-/// default) or `max` to Opus 4.5:
+/// default):
 /// - `xhigh`-capable (Opus 4.7/4.8, Sonnet 5, Haiku 5.5, Fable 5, Mythos 5) → pass as-is.
 /// - `max`-capable (Opus 4.6, Sonnet 4.6) → `xhigh` folds to `high`; `max` kept.
-/// - otherwise (Opus 4.5, unknown effort-path) → both `xhigh` and `max` fold to `high`.
+/// - otherwise (an unknown effort-path id) → both `xhigh` and `max` fold to `high`.
 pub fn effective_effort_level(model_id: &str, effort: Effort) -> &'static str {
     let id = model_id.to_ascii_lowercase();
     if supports_xhigh(&id) {
@@ -182,7 +188,7 @@ pub fn effective_effort_level(model_id: &str, effort: Effort) -> &'static str {
 /// 4.5). Only consulted for `is_budget_model` models.
 fn budget_for_effort(effort: Effort) -> u32 {
     match effort {
-        Effort::Low => 4096,
+        Effort::Least | Effort::Low => 4096,
         Effort::Medium => 8192,
         Effort::High => 16384,
         Effort::Xhigh | Effort::Max => 24576,
@@ -193,10 +199,13 @@ fn budget_for_effort(effort: Effort) -> u32 {
 /// model-capability matrix. Pure + unit-tested. Three-way, allowlist-based:
 ///
 /// - `None` effort ⇒ `(None, None)` — no thinking params at all.
-/// - Effort model (Opus 4.5–5, Sonnet 4.6/5, Haiku 5.5, Fable 5, Mythos 5) ⇒
+/// - `Least` (Talk's Swift) ⇒ `output_config:{effort:"low"}` alone on an
+///   effort model, so thinking stays at the model's default, and nothing on
+///   any other model.
+/// - Effort model (Opus 4.6–5, Sonnet 4.6/5, Haiku 5.5, Fable 5, Mythos 5) ⇒
 ///   `thinking:{type:"adaptive"}` + `output_config:{effort:"<level>"}`, the
 ///   level clamped per model (`effective_effort_level`).
-/// - Budget model (Haiku 4.5, Sonnet 4.5/4.0) ⇒
+/// - Budget model (Opus 4.5, Haiku 4.5, Sonnet 4.5/4.0) ⇒
 ///   `thinking:{type:"enabled", budget_tokens:N}` with N clamped to
 ///   `[1024, max_tokens-1]`, and no `output_config` (it would 400).
 /// - Otherwise (legacy `claude-3-5-*`, unknown id) ⇒ `(None, None)`: effort is
@@ -210,6 +219,12 @@ pub fn thinking_json(
         return (None, None);
     };
     let id = model_id.to_ascii_lowercase();
+    // Talk's Swift never reasons more than the model's default: lower the
+    // effort, never turn thinking on (Opus 4.6–4.8 and Sonnet 4.6 think only
+    // when asked). A budget-only or unknown model gets nothing.
+    if effort == Effort::Least {
+        return if is_effort_model(&id) { (None, Some(json!({ "effort": "low" }))) } else { (None, None) };
+    }
     if is_effort_model(&id) {
         (
             Some(json!({ "type": "adaptive" })),

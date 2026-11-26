@@ -43,7 +43,7 @@ vi.mock("../lib/ipc", () => ({
   },
 }));
 
-const { useChatStore, EFFORT_MAX_TOKENS } = await import("./chatStore");
+const { useChatStore, EFFORT_MAX_TOKENS, EFFORT_REASONING } = await import("./chatStore");
 const { ipc } = await import("../lib/ipc");
 
 function emit(eventName: string, payload: unknown) {
@@ -627,6 +627,19 @@ describe("chatStore — stop + effort (P3)", () => {
       expect(useChatStore.getState().getError("ws-1")).toBe("Could not start a conversation.");
     } finally {
       useChatStore.setState({ ensureThread });
+    }
+  });
+
+  it("send() sends the preset's reasoning effort: Swift low, Standard none, Deep max", async () => {
+    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: null, deep: "max" });
+    for (const [preset, effort] of [["swift", "low"], ["standard", undefined], ["deep", "max"]] as const) {
+      vi.clearAllMocks();
+      useChatStore.getState().setEffort(preset);
+      await useChatStore.getState().send("ws-1", "/tmp", "hi");
+      const req = (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      // Standard sends no effort at all, so the model keeps its own default.
+      expect(req.effort).toBe(effort);
+      expect(req.maxTokens).toBe(EFFORT_MAX_TOKENS[preset]);
     }
   });
 

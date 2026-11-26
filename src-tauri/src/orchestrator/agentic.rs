@@ -28,7 +28,7 @@ pub(crate) const TOOL_RESULT_CAP_BYTES: usize = 24_000;
 /// already sent, so 64k is safe.) `None`/low/medium keep the historical 32768.
 pub fn max_tokens_for(effort: Option<Effort>) -> u32 {
     match effort {
-        None | Some(Effort::Low) | Some(Effort::Medium) => 32768,
+        None | Some(Effort::Least) | Some(Effort::Low) | Some(Effort::Medium) => 32768,
         Some(Effort::High) => 48000,
         Some(Effort::Xhigh) | Some(Effort::Max) => 64000,
     }

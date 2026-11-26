@@ -24,6 +24,14 @@ pub enum Effort {
     High,
     Xhigh,
     Max,
+    /// Talk's Swift: the least reasoning the model takes, never more than its
+    /// own default. The adapters lower the effort without turning thinking on
+    /// (`low` effort alone on an Anthropic effort model, `none` on an OpenAI
+    /// model that accepts it, otherwise `low`) and send nothing to a model
+    /// without effort control. Internal: never stored, never read from a
+    /// request (`skip_deserializing`).
+    #[serde(skip_deserializing)]
+    Least,
 }
 
 impl Effort {
@@ -35,6 +43,8 @@ impl Effort {
             Effort::High => "high",
             Effort::Xhigh => "xhigh",
             Effort::Max => "max",
+            // As a level string it is the lowest common one.
+            Effort::Least => "low",
         }
     }
     /// Parse the DB/token form back into an `Effort`. `None` for an unknown or
