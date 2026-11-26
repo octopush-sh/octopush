@@ -304,12 +304,12 @@ describe("mission group: the rail filter", () => {
       target: { value: q },
     });
 
-  it("names groups in its placeholder", () => {
+  it("keeps a placeholder that fits and names groups in its title", () => {
     render(<Rail />);
-    expect(screen.getByRole("textbox", { name: "Find a project, group or mission" })).toHaveAttribute(
-      "placeholder",
-      "Find a project, group or mission",
-    );
+    const input = screen.getByRole("textbox", { name: "Find a project, group or mission" });
+    expect(input).toHaveAttribute("placeholder", "Find a project or mission");
+    expect(input).toHaveClass("text-ellipsis");
+    expect(input.closest("label")).toHaveAttribute("title", "Find a project, group or mission");
   });
 
   it("a group-name hit keeps all its members and washes the hit", () => {

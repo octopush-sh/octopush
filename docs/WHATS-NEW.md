@@ -62,7 +62,7 @@ Current anchors:
 | Id | Element | Where |
 |---|---|---|
 | `rail` | The workspace rail | `WorkspaceRail.tsx` |
-| `rail-search` | Rail search ("Find a project, group or mission") | `WorkspaceRail.tsx` |
+| `rail-search` | Rail search (placeholder "Find a project or mission"; title "Find a project, group or mission") | `WorkspaceRail.tsx` |
 | `rail-group-header` · `rail-group-members` | Rail, only in a project with a mission group: the first group's header line (chevron, name; folded, its count) · its run of indented missions beside the guide (only while the group has missions) | `RailMissionGroup.tsx` via `WorkspaceRail.tsx` |
 | `rail-section-header` · `rail-section-projects` | Rail, only with a project group: the first group's header line (the caps name; folded, its count) · its run of projects (only while the group has projects) | `RailProjectSection.tsx` via `WorkspaceRail.tsx` |
 | `rail-add-project` | Rail "Add project" button | `WorkspaceRail.tsx` |
