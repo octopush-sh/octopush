@@ -611,6 +611,12 @@ impl ApprovalBroker {
         self.deny_where(|r| r.workspace_id == workspace_id);
     }
 
+    /// The workspace's deletion failed, so it stays: its conversations may
+    /// ask again.
+    pub fn reinstate_workspace(&self, workspace_id: &str) {
+        self.retired.lock().remove(workspace_id);
+    }
+
     /// Whether a card from `workspace_id` may wait for an answer.
     fn admits(&self, workspace_id: &str) -> bool {
         !self.retired.lock().contains(workspace_id)
@@ -2060,6 +2066,17 @@ impl ChatEngine {
             self.cancel(thread_id);
         }
         self.approvals.retire_workspace(workspace_id);
+    }
+
+    /// `delete_workspace` is done with the row: if removing it failed, the
+    /// workspace stays, so it is reinstated in the approval broker (its
+    /// cards would otherwise be denied, unseen, until a restart). Its turns
+    /// stay stopped, as after Stop. Returns `deleted` unchanged.
+    pub fn finish_workspace_delete<T>(&self, workspace_id: &str, deleted: AppResult<T>) -> AppResult<T> {
+        if deleted.is_err() {
+            self.approvals.reinstate_workspace(workspace_id);
+        }
+        deleted
     }
 
     /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
@@ -4632,6 +4649,23 @@ mod tests {
         assert_eq!(card.try_recv().ok(), Some(ApprovalDecision::Deny));
         assert!(other.try_recv().is_err());
         assert!(!engine.approvals.admits("w1"));
+    }
+
+    #[test]
+    fn a_failed_workspace_delete_lets_its_conversations_ask_again() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+
+        engine.cancel_workspace("w1", &["t1".to_string()]);
+        assert!(!engine.approvals.admits("w1"));
+        let failed: AppResult<()> = Err(AppError::Other("database is locked".into()));
+        assert!(engine.finish_workspace_delete("w1", failed).is_err(), "the error still reaches the caller");
+        assert!(engine.approvals.admits("w1"), "the workspace stays, and so may its cards");
+
+        engine.cancel_workspace("w2", &[]);
+        assert!(engine.finish_workspace_delete("w2", Ok(())).is_ok());
+        assert!(!engine.approvals.admits("w2"), "a deleted workspace stays retired");
     }
 
     #[test]

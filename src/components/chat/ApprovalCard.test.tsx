@@ -44,8 +44,9 @@ describe("ApprovalCard at the keyboard", () => {
     expect(card).toHaveAttribute("title", "⌘↵ approves · Esc denies");
     expect(card).toHaveAttribute("aria-keyshortcuts", "Meta+Enter Escape");
     expect(card).toHaveAttribute("data-tour", "talk-approval");
-    expect(screen.getByRole("button", { name: "Approve" })).toHaveAttribute("title", "Approve (⌘↵)");
-    expect(screen.getByRole("button", { name: "Deny" })).toHaveAttribute("title", "Deny (Esc)");
+    // The keys answer the card's own focus, and the buttons say so.
+    expect(screen.getByRole("button", { name: "Approve" })).toHaveAttribute("title", "Approve (⌘↵ with the card focused)");
+    expect(screen.getByRole("button", { name: "Deny" })).toHaveAttribute("title", "Deny (Esc with the card focused)");
 
     fireEvent.keyDown(card, { key: "Enter", metaKey: true });
     expect(onRespond).toHaveBeenLastCalledWith("approve");
@@ -110,6 +111,9 @@ describe("ApprovalCard at the keyboard", () => {
     fireEvent.keyDown(card, { key: "Enter", metaKey: true });
     fireEvent.keyDown(card, { key: "Escape" });
     expect(onRespond.mock.calls).toEqual([["deny"], ["deny"], ["deny"]]);
-    expect(screen.getByRole("button", { name: "Leave it out" })).toHaveAttribute("title", "Leave it out (⌘↵, Enter or Esc)");
+    expect(screen.getByRole("button", { name: "Leave it out" })).toHaveAttribute(
+      "title",
+      "Leave it out (⌘↵, Enter or Esc with the card focused)",
+    );
   });
 });
