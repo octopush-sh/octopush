@@ -8305,6 +8305,19 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
         .map_err(|e| AppError::Other(format!("version task failed: {e}")))
 }
 
+/// Settings › Usage: the `modelPricing` table an organization set in Claude
+/// Code's managed settings on this Mac (read-only), or `None`. Nothing is
+/// re-priced: finished Claude Code stages are booked at Claude Code's own
+/// figure (its rates), everything else at list prices.
+#[tauri::command]
+pub async fn managed_model_pricing() -> AppResult<Option<crate::agent_adapter::ModelPricing>> {
+    // The configuration profile is read through `plutil`; keep it off the
+    // async runtime.
+    tokio::task::spawn_blocking(crate::agent_adapter::read_managed_model_pricing)
+        .await
+        .map_err(|e| AppError::Other(format!("pricing task failed: {e}")))
+}
+
 /// Direct launcher: the one crew model (Claude Code CLI stages and their
 /// escalation models) the installed CLI is too old to launch. Reads the cached
 /// version without waiting or probing, like stage escalation; `None` when

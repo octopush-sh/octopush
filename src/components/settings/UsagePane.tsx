@@ -10,12 +10,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import { Plus, RefreshCw, X } from "lucide-react";
 import { ipc } from "../../lib/ipc";
+import type { ManagedModelPricing } from "../../lib/ipc";
 import { useBudgetsStore } from "../../stores/budgetsStore";
 import type {
   Budget, BudgetPeriod, BudgetScope, GatewayReconciliation, SourceUsage, UsageBreakdown, UsageReport,
 } from "../../lib/types";
 import { GatewaySection } from "./GatewaySection";
 import { ClaudePlanCard } from "./ClaudePlanCard";
+import { ManagedPricingNote } from "./ManagedPricingNote";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
@@ -246,6 +248,22 @@ export function UsagePane() {
     loadBudgets();
   }, [loadBudgets]);
 
+  // An organization's Claude Code rates, read once: they change with a
+  // managed settings push, not with the period. A failure just hides the note.
+  const [managedPricing, setManagedPricing] = useState<ManagedModelPricing | null>(null);
+  useEffect(() => {
+    let live = true;
+    ipc
+      .managedModelPricing()
+      .then((p) => {
+        if (live) setManagedPricing(p ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
   // ── Pricing freshness ──
   const [refreshingPricing, setRefreshingPricing] = useState(false);
   async function handleRefreshPricing() {
@@ -458,6 +476,8 @@ export function UsagePane() {
               </button>
             </p>
           )}
+
+          <ManagedPricingNote pricing={managedPricing} />
 
           {/* ── By mode ── */}
           <div className={SECTION}>
