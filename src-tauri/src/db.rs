@@ -4860,13 +4860,24 @@ impl Db {
 
     /// Keep what the model was given for tool row `message_id`: the tool_use
     /// it answers and the capped text (`context::transcript::model_view`).
-    /// Written once, so a later rewrite of the row's `content` (a continued
-    /// sub-agent's report) never changes what replays.
+    /// Written once; only the context guard's stub replaces it, once
+    /// ([`Self::set_chat_tool_stub`]).
     pub fn set_chat_tool_view(&self, message_id: i64, tool_use_id: &str, model_view: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE chat_messages SET tool_use_id = ?2, model_view = ?3
              WHERE id = ?1 AND role = 'tool' AND model_view IS NULL",
             params![message_id, tool_use_id, model_view],
+        )?;
+        Ok(())
+    }
+
+    /// The context guard stubbed tool row `message_id`'s result in a v2
+    /// request: the stub becomes its model view, so later turns replay it
+    /// byte for byte. A stub is never stubbed again, so this happens once.
+    pub fn set_chat_tool_stub(&self, message_id: i64, stub: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET model_view = ?2 WHERE id = ?1 AND role = 'tool' AND model_view IS NOT NULL",
+            params![message_id, stub],
         )?;
         Ok(())
     }

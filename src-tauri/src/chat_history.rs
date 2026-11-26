@@ -284,7 +284,7 @@ pub const CONTEXT_BLOCK_SHORTEN_MIN: usize = 8_000;
 /// Chars a row's shortened `@` blocks count against the thread-wide tool
 /// budget, in every turn including their own, so the count doesn't move
 /// when they shorten.
-fn shortened_context_len(content: &str, context_blocks: &str) -> usize {
+pub(crate) fn shortened_context_len(content: &str, context_blocks: &str) -> usize {
     context_spans(content, context_blocks).map_or(0, |spans| {
         spans.iter().filter(|&&(s, e)| e - s >= CONTEXT_BLOCK_SHORTEN_MIN).count() * TOOL_RESULT_SETTLED
     })

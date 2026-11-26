@@ -12,26 +12,31 @@
 //! - A tool round's assistant turn is kept verbatim with its origin model
 //!   (`raw_json`, [`RoundRecord`]) and each result names its call
 //!   (`tool_use_id`), so a finished turn replays as the same tool_use and
-//!   tool_result pairs the loop sent. The verbatim blocks (signed thinking
-//!   among them) go only to the model that wrote them; after a model switch
-//!   the round is rebuilt from its text and tool calls.
+//!   tool_result pairs the loop sent, minus its thinking: a prior turn's
+//!   thinking isn't replayed (the loop sends the current turn's rounds with
+//!   theirs). Its blocks go only to the model that wrote them; after a model
+//!   switch the round is rebuilt from its text and tool calls.
 //! - A turn that can't replay as pairs renders as text, the way
-//!   `chat_history` does, with every tool row at the settled allowance: a
-//!   legacy row without these columns, a stopped or failed turn (no answer
-//!   closes its last round), or a round missing a column.
+//!   `chat_history` does: a legacy row without these columns, a stopped or
+//!   failed turn (no answer closes its last round), a fork's copies, or a
+//!   round missing a column. Those tool rows keep legacy's thread-wide bound
+//!   (the settled allowance, the oldest collapsing to stubs in blocks).
 //!
-//! The one accepted exception is an `@` block of 8k chars or more: it goes
-//! out whole in its own turn and shortened from the next turn on
-//! (`chat_history::abridge_context`), one change and byte-stable after it.
+//! Each row changes at most once more, and is byte-stable after it: an `@`
+//! block of 8k chars or more goes out whole in its own turn and shortened
+//! from the next turn on (`chat_history::abridge_context`), and a result
+//! the context guard stubs keeps its stub as its model view
+//! (`db::set_chat_tool_stub`). A prior turn's rounds lose their thinking
+//! once, when the turn ends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::chat_history::{
-    abridge_context, excerpt_head_tail, mark_untrusted, recall_hint, strip_tool_calls_suffix, summarize_tool_row,
-    TOOL_RESULT_SETTLED,
+    abridge_context, excerpt_head_tail, mark_untrusted, plan_tool_history_with, recall_hint, shortened_context_len,
+    strip_tool_calls_suffix, summarize_tool_row, TOOL_HISTORY_STUB,
 };
 use crate::context::budget::CHARS_PER_TOKEN;
 use crate::providers::{LlmContent, LlmMessage, LlmResponse, LlmRole, LlmToolResult, LlmToolUse};
@@ -98,10 +103,17 @@ impl RoundRecord {
         }
     }
 
-    /// The assistant turn the round replays as on `model`: verbatim to its
-    /// origin model, else rebuilt from its text and tool calls.
+    /// The assistant turn the round replays as in a later turn on `model`:
+    /// to its origin model, its blocks as they came minus thinking; else (or
+    /// for an OpenAI Responses round) rebuilt from its text and tool calls.
+    /// Thinking isn't re-sent across turns, so a round costs no thinking
+    /// tokens later and reads the same whether or not this turn thinks.
     fn turn(self, model: &str) -> LlmMessage {
-        let raw = if self.model == model { self.raw } else { Vec::new() };
+        let raw = if self.model != model || crate::providers::openai_compat::is_responses_raw(&self.raw) {
+            Vec::new()
+        } else {
+            self.raw.into_iter().filter(|b| !matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking"))).collect()
+        };
         LlmMessage {
             role: LlmRole::Assistant,
             content: LlmContent::AssistantWithTools { raw, text: self.text, tool_uses: self.tool_uses },
@@ -116,25 +128,30 @@ pub fn view_cap(window: u64) -> usize {
     (chars as usize).clamp(VIEW_MIN_CHARS, VIEW_MAX_CHARS)
 }
 
+/// Room a recall's own position line and cut note take past its window.
+const RECALL_SLACK: usize = 200;
+
+/// The most one `recall_tool_output` call returns on a v2 turn (chars):
+/// under [`view_cap`], so the recall's model view is never cut.
+pub fn recall_limit(window: u64) -> usize {
+    view_cap(window) - RECALL_SLACK
+}
+
 /// What the model is given for one tool result, decided once, when the
 /// result is written: at most [`view_cap`] (and the MCP cap for an MCP tool),
-/// head and tail, with the row that recalls the rest. A recall is already
-/// the model's own window onto a stored output (`offset`/`limit`), so it goes
-/// out as it came. `mark` is the tool the output came from: the capped text
-/// goes under its untrusted header, with forged records and marks in it
-/// neutralized (`chat_history::mark_untrusted`, #1147). `None` for a denial
-/// or refusal, which is Octopush's own text. A pure function of its inputs;
-/// the row keeps the result, mark and all, so the mark is byte-stable too.
+/// head and tail, with the row that recalls the rest. A recall is capped the
+/// same way; on a v2 turn its window fits ([`recall_limit`]). `mark` is the
+/// tool the output came from: the capped text goes under its untrusted
+/// header, with forged records and marks in it neutralized
+/// (`chat_history::mark_untrusted`, #1147). `None` for a denial or refusal,
+/// which is Octopush's own text. A pure function of its inputs; the row
+/// keeps the result, mark and all, so the mark is byte-stable too.
 pub fn model_view(tool: &str, result: &str, row: Option<i64>, window: u64, mark: Option<&str>) -> String {
-    let capped = if tool == crate::chat_engine::RECALL_TOOL_NAME {
-        result.to_string()
-    } else {
-        let mut cap = view_cap(window);
-        if crate::mcp::is_mcp_tool(tool) {
-            cap = cap.min(crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES);
-        }
-        excerpt_head_tail(result, cap, &row.map(recall_hint).unwrap_or_default())
-    };
+    let mut cap = view_cap(window);
+    if crate::mcp::is_mcp_tool(tool) {
+        cap = cap.min(crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES);
+    }
+    let capped = excerpt_head_tail(result, cap, &row.map(recall_hint).unwrap_or_default());
     match mark {
         Some(source) => mark_untrusted(source, &capped),
         None => capped,
@@ -153,6 +170,27 @@ pub fn tool_rows(rows: &[Row<'_>]) -> HashMap<String, i64> {
 /// alternate.
 pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
     let current = rows.iter().rposition(|r| r.role == "user");
+    // The turns that replay as pairs, by their ask's index. An empty ask
+    // (an image alone) renders as text, so pairs always follow a user message.
+    let mut pairs: HashMap<usize, (Vec<LlmMessage>, usize)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.role == "user" && !r.content.is_empty())
+        .filter_map(|(i, _)| Some((i, paired(rows, i + 1, model)?)))
+        .collect();
+    // Tool rows rendered as text keep legacy's thread-wide bound: the settled
+    // allowance, the oldest collapsing to stubs in blocks once the settled
+    // total (shortened `@` blocks counted) passes the budget. It only moves
+    // forward as rows are appended.
+    let covered: HashSet<usize> = pairs.iter().flat_map(|(&ask, (_, next))| ask + 1..*next).collect();
+    let text_tools: Vec<(usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .filter(|&(i, r)| r.role == "tool" && !covered.contains(&i))
+        .map(|(_, r)| (1, result_len(r.content)))
+        .collect();
+    let shortened: usize = rows.iter().filter(|r| r.role == "user").filter_map(|r| Some(shortened_context_len(r.content, r.context?))).sum();
+    let mut allowance = plan_tool_history_with(&text_tools, shortened).into_iter();
     let mut out: Vec<LlmMessage> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
     let mut i = 0;
@@ -166,8 +204,7 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
                     _ => row.content.to_string(),
                 };
                 push_text(&mut out, LlmRole::User, flush(&mut pending, &text));
-                let after_user = out.last().is_some_and(|m| m.role == LlmRole::User);
-                if let Some((turn, next)) = paired(rows, i, model).filter(|_| after_user) {
+                if let Some((turn, next)) = pairs.remove(&(i - 1)) {
                     out.extend(turn);
                     i = next;
                 }
@@ -178,7 +215,7 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
                     pending.push(lead.to_string());
                 }
             }
-            "tool" => pending.extend(summarize_tool_row(row.id, row.content, TOOL_RESULT_SETTLED)),
+            "tool" => pending.extend(summarize_tool_row(row.id, row.content, allowance.next().unwrap_or(TOOL_HISTORY_STUB))),
             "assistant" => push_text(&mut out, LlmRole::Assistant, flush(&mut pending, row.content.trim())),
             _ => {}
         }
@@ -220,6 +257,11 @@ fn paired(rows: &[Row<'_>], start: usize, model: &str) -> Option<(Vec<LlmMessage
     }
 }
 
+/// A stored tool row's result length, as `chat_history` plans it.
+fn result_len(content: &str) -> usize {
+    serde_json::from_str::<Value>(content).ok().and_then(|v| v.get("result")?.as_str().map(str::len)).unwrap_or(0)
+}
+
 /// `pending` (narration and tool summaries), then `tail`.
 fn flush(pending: &mut Vec<String>, tail: &str) -> String {
     let mut text = pending.join("\n");
@@ -248,10 +290,55 @@ fn push_text(out: &mut Vec<LlmMessage>, role: LlmRole, text: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_history::{build_history, HistoryRow, TOOL_RESULT_FRESH};
+    use crate::chat_history::{build_history, HistoryRole, HistoryRow, TOOL_RESULT_FRESH, TOOL_RESULT_SETTLED};
+    use crate::context::budget::{ContextBudget, ContextGuard, Learned, SOFT_PCT};
     use crate::db::Db;
-    use crate::providers::{anthropic, openai_compat, LlmRequest};
+    use crate::providers::{anthropic, openai_compat, Effort, LlmRequest};
     use serde_json::json;
+
+    /// A stored row, owned, for tests that build many.
+    #[derive(Default)]
+    struct Owned {
+        id: i64,
+        role: &'static str,
+        content: String,
+        raw_json: Option<String>,
+        tool_use_id: Option<String>,
+        model_view: Option<String>,
+    }
+
+    impl Owned {
+        fn row(&self) -> Row<'_> {
+            Row {
+                id: self.id,
+                role: self.role,
+                content: &self.content,
+                context: None,
+                raw_json: self.raw_json.as_deref(),
+                tool_use_id: self.tool_use_id.as_deref(),
+                model_view: self.model_view.as_deref(),
+            }
+        }
+    }
+
+    /// A finished v2 turn from id `base`: its ask, one round whose calls were
+    /// given `views`, and its answer.
+    fn v2_turn(base: i64, views: &[String]) -> Vec<Owned> {
+        let calls: Vec<LlmToolUse> =
+            (0..views.len()).map(|k| LlmToolUse { id: format!("tu_{base}_{k}"), name: "read_file".into(), input: json!({}) }).collect();
+        let raw = calls.iter().map(|u| json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input })).collect();
+        let record = RoundRecord { model: "m".into(), raw, text: String::new(), tool_uses: calls.clone() };
+        let mut rows = vec![
+            Owned { id: base, role: "user", content: format!("ask {base}"), ..Owned::default() },
+            Owned { id: base + 1, role: "assistant_tool_use", content: "[tool_calls: []]".into(), raw_json: serde_json::to_string(&record).ok(), ..Owned::default() },
+        ];
+        for (k, (u, view)) in calls.iter().zip(views).enumerate() {
+            let content = tool_record(&u.id, "read_file", view);
+            rows.push(Owned { id: base + 2 + k as i64, role: "tool", content, tool_use_id: Some(u.id.clone()), model_view: Some(view.clone()), ..Owned::default() });
+        }
+        rows.push(Owned { id: base + 2 + views.len() as i64, role: "assistant", content: "done".into(), ..Owned::default() });
+        rows
+    }
 
     fn text(m: &LlmMessage) -> &str {
         match &m.content {
@@ -266,6 +353,10 @@ mod tests {
 
     /// The messages of a request on `model` as a provider receives them.
     fn sent(model: &str, messages: &[LlmMessage], openai: bool) -> Value {
+        sent_at(model, messages, openai, None)
+    }
+
+    fn sent_at(model: &str, messages: &[LlmMessage], openai: bool, effort: Option<Effort>) -> Value {
         let req = LlmRequest {
             model: model.into(),
             max_tokens: 4096,
@@ -273,7 +364,7 @@ mod tests {
             messages: messages.to_vec(),
             tools: vec![],
             tool_choice: None,
-            effort: None,
+            effort,
             cache: false,
         };
         if openai { openai_compat::build_request(&req)["messages"].clone() } else { anthropic::build_request(&req)["messages"].clone() }
@@ -360,43 +451,113 @@ mod tests {
 
     #[test]
     fn raw_replayed_only_to_origin_model() {
+        // A round that thought between its calls, as the API returns it.
         let raw = vec![
             json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
             json!({ "type": "text", "text": "Checking." }),
             json!({ "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a.rs" } }),
+            json!({ "type": "redacted_thinking", "data": "opaque-2" }),
+            json!({ "type": "text", "text": "And its test." }),
+            json!({ "type": "tool_use", "id": "tu_2", "name": "read_file", "input": { "path": "a_test.rs" } }),
         ];
-        let round = serde_json::to_string(&RoundRecord {
-            model: "claude-opus-5-5".into(),
-            raw: raw.clone(),
-            text: "Checking.".into(),
-            tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({ "path": "a.rs" }) }],
-        })
-        .unwrap();
-        let record = tool_record("tu_1", "read_file", "fn main() {}");
+        let calls = vec![
+            LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({ "path": "a.rs" }) },
+            LlmToolUse { id: "tu_2".into(), name: "read_file".into(), input: json!({ "path": "a_test.rs" }) },
+        ];
+        let round = serde_json::to_string(&RoundRecord { model: "claude-opus-5-5".into(), raw: raw.clone(), text: "Checking.And its test.".into(), tool_uses: calls }).unwrap();
+        let (r1, r2) = (tool_record("tu_1", "read_file", "fn a() {}"), tool_record("tu_2", "read_file", "#[test] fn t() {}"));
         let rows = [
             Row { id: 1, role: "user", content: "read a.rs", ..Row::default() },
             Row { id: 2, role: "assistant_tool_use", content: "Checking.\n\n[tool_calls: []]", raw_json: Some(round.as_str()), ..Row::default() },
-            Row { id: 3, role: "tool", content: &record, tool_use_id: Some("tu_1"), model_view: Some("fn main() {}"), ..Row::default() },
-            Row { id: 4, role: "assistant", content: "It's empty.", ..Row::default() },
-            Row { id: 5, role: "user", content: "and now?", ..Row::default() },
+            Row { id: 3, role: "tool", content: &r1, tool_use_id: Some("tu_1"), model_view: Some("fn a() {}"), ..Row::default() },
+            Row { id: 4, role: "tool", content: &r2, tool_use_id: Some("tu_2"), model_view: Some("#[test] fn t() {}"), ..Row::default() },
+            Row { id: 5, role: "assistant", content: "Both fine.", ..Row::default() },
+            Row { id: 6, role: "user", content: "and now?", ..Row::default() },
         ];
-        // The origin model gets the blocks as they came, signed thinking first.
+        // The origin model gets the blocks as they came, in their order, but
+        // a prior turn's thinking is never replayed.
         let same = build(&rows, "claude-opus-5-5");
-        assert_eq!(sent("claude-opus-5-5", &same, false)[1]["content"], Value::Array(raw.clone()));
-        // Another model: rebuilt from the text and tool calls, no thinking,
-        // and every tool_use keeps its result.
+        let without_thinking: Vec<Value> = [1, 2, 4, 5].iter().map(|&i| raw[i].clone()).collect();
+        assert_eq!(sent("claude-opus-5-5", &same, false)[1]["content"], Value::Array(without_thinking));
+        // The same bytes whether this turn thinks (Deep) or effort turned
+        // thinking off (Swift): the round doesn't depend on it.
+        let deep = sent_at("claude-opus-5-5", &same, false, Some(Effort::Max));
+        assert_eq!(deep, sent_at("claude-opus-5-5", &same, false, Some(Effort::Least)));
+        assert!(!deep.to_string().contains("thinking") && !deep.to_string().contains("sig-1"), "{deep}");
+        // Another model: rebuilt from the text and tool calls, and every
+        // tool_use keeps its result.
         let other = build(&rows, "claude-sonnet-5-5");
         let LlmContent::AssistantWithTools { raw: replayed, text: t, tool_uses } = &other[1].content else { panic!("{other:?}") };
         assert!(replayed.is_empty());
-        assert_eq!((t.as_str(), tool_uses[0].id.as_str()), ("Checking.", "tu_1"));
-        assert_eq!(sent("claude-sonnet-5-5", &other, false)[1]["content"], Value::Array(raw[1..].to_vec()));
+        assert_eq!((t.as_str(), tool_uses.len()), ("Checking.And its test.", 2));
+        assert_eq!(sent("claude-sonnet-5-5", &other, false)[1]["content"][1]["id"], "tu_1");
         let openai = sent("gpt-6", &build(&rows, "gpt-6"), true);
-        assert_eq!(openai[2]["tool_calls"][0]["id"], "tu_1");
+        assert_eq!((openai[2]["tool_calls"][0]["id"].as_str(), openai[2]["tool_calls"][1]["id"].as_str()), (Some("tu_1"), Some("tu_2")));
         assert_eq!((openai[3]["role"].as_str(), openai[3]["tool_call_id"].as_str()), (Some("tool"), Some("tu_1")));
         assert!(!openai.to_string().contains("sig-1"));
         // A record that doesn't parse is no record: the turn renders as text.
-        let broken = [rows[0], Row { raw_json: Some("{"), ..rows[1] }, rows[2], rows[3], rows[4]];
+        let broken = [rows[0], Row { raw_json: Some("{"), ..rows[1] }, rows[2], rows[3], rows[4], rows[5]];
         assert!(build(&broken, "claude-opus-5-5").iter().all(|m| matches!(m.content, LlmContent::Text(_))));
+    }
+
+    #[test]
+    fn a_long_legacy_thread_keeps_legacys_bound() {
+        // 100 legacy turns with three 5k outputs each: 300 tool rows.
+        let record = tool_record("c", "run_command", &"o".repeat(5_000));
+        let mut owned = Vec::new();
+        for turn in 0..100 {
+            let b = turn * 10;
+            owned.push(Owned { id: b, role: "user", content: format!("ask {turn}"), ..Owned::default() });
+            owned.push(Owned { id: b + 1, role: "assistant_tool_use", content: "[tool_calls: []]".into(), ..Owned::default() });
+            owned.extend((2..5).map(|k| Owned { id: b + k, role: "tool", content: record.clone(), ..Owned::default() }));
+            owned.push(Owned { id: b + 5, role: "assistant", content: "ok".into(), ..Owned::default() });
+        }
+        owned.push(Owned { id: 10_000, role: "user", content: "next".into(), ..Owned::default() });
+        let rows: Vec<Row> = owned.iter().map(Owned::row).collect();
+        let v2 = build(&rows, "m");
+        let history: Vec<HistoryRow> = rows.iter().map(|r| HistoryRow { id: r.id, role: r.role, content: r.content, context: None }).collect();
+        let legacy: Vec<LlmMessage> = build_history(&history)
+            .into_iter()
+            .map(|h| LlmMessage { role: if h.role == HistoryRole::User { LlmRole::User } else { LlmRole::Assistant }, content: LlmContent::Text(h.text) })
+            .collect();
+        // At 1.5k a row they would be 450k chars, past a 100k window. They
+        // collapse as legacy's do, so v2 fits wherever legacy does.
+        let chars = |m: &[LlmMessage]| m.iter().map(|m| text(m).len()).sum::<usize>();
+        assert!(chars(&v2) <= chars(&legacy), "{} vs {}", chars(&v2), chars(&legacy));
+        let guard = ContextGuard::new(ContextBudget::for_model(Some(100_000), 4_096, None), Learned::default());
+        let soft = guard.budget().share(SOFT_PCT);
+        assert!(guard.estimate(0, &legacy) < soft && guard.estimate(0, &v2) < soft, "{} {}", guard.estimate(0, &v2), soft);
+        assert!(text(&v2[1]).contains(&format!("[Tool #2: run_command | Input: {{\"command\":\"npm test\"}} | Result: [untrusted output from run_command] {}\n…", "o".repeat(140))));
+    }
+
+    #[test]
+    fn the_guard_stubs_a_v2_transcript_and_names_its_rows() {
+        // Three finished v2 turns of two 10k results each, past the soft
+        // threshold of a small window.
+        let big = "x".repeat(10_000);
+        let mut owned: Vec<Owned> = [10, 20, 30].iter().flat_map(|&b| v2_turn(b, &[big.clone(), big.clone()])).collect();
+        owned.push(Owned { id: 40, role: "user", content: "next".into(), ..Owned::default() });
+        let rows: Vec<Row> = owned.iter().map(Owned::row).collect();
+        let mut messages = build(&rows, "m");
+        let ids = tool_rows(&rows);
+        let assistants = |m: &[LlmMessage]| format!("{:?}", m.iter().filter(|m| m.role == LlmRole::Assistant).collect::<Vec<_>>());
+        let before = assistants(&messages);
+        let guard = ContextGuard::new(ContextBudget::for_model(Some(20_000), 2_000, None), Learned::default());
+        let s = guard.before_round(&mut messages, 0, &ids).expect("past the soft threshold");
+        // The oldest turns' results, each naming its own row; the newest round
+        // and every assistant turn as they were.
+        assert_eq!(s.ids, ["tu_10_0", "tu_10_1", "tu_20_0", "tu_20_1"]);
+        for m in &messages {
+            let LlmContent::ToolResults(results) = &m.content else { continue };
+            for r in results {
+                if s.ids.contains(&r.tool_use_id) {
+                    assert!(r.content.len() < 1_000 && r.content.contains(&recall_hint(ids[&r.tool_use_id])), "{}", r.content);
+                } else {
+                    assert_eq!(r.content, big);
+                }
+            }
+        }
+        assert_eq!(assistants(&messages), before);
     }
 
     #[test]
@@ -409,9 +570,12 @@ mod tests {
         assert!(view.len() <= 35_000 + 120 && view.starts_with("HEAD") && view.ends_with("TAIL"), "{}", view.len());
         assert!(view.contains("chars omitted — call recall_tool_output with message_id 7 for the full output]"));
         assert_eq!(view, model_view("read_file", &big, Some(7), 200_000, None), "pure");
-        // An MCP result keeps the MCP cap; a recall goes out as it came.
+        // An MCP result keeps the MCP cap. A recall is capped like any
+        // result, and on a v2 turn its window fits under the cap.
         assert!(model_view("mcp__docs__search", &big, Some(7), 1_000_000, None).len() <= crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES + 120);
-        assert_eq!(model_view("recall_tool_output", &big, Some(7), 200_000, None), big);
+        assert!(model_view("recall_tool_output", &big, Some(7), 200_000, None).len() <= 35_000 + 120);
+        let window = format!("(chars 1-{0} of 200008)\n{1}", recall_limit(200_000), "r".repeat(recall_limit(200_000)));
+        assert_eq!(model_view("recall_tool_output", &window, Some(7), 200_000, None), window);
         assert_eq!(model_view("run_command", "ok", Some(7), 200_000, None), "ok");
     }
 }
