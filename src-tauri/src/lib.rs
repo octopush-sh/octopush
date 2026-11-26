@@ -472,6 +472,7 @@ pub fn run() {
             commands::mcp_connection_status,
             commands::connect_claude_code,
             commands::claude_cli_version,
+            commands::managed_model_pricing,
             commands::claude_model_floor_note,
             commands::claude_known_bad_note,
             commands::codex_trust_note,
