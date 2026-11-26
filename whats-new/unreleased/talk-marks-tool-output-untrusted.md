@@ -1,5 +1,5 @@
 ---
-title: Talk treats tool and MCP output as data, not instructions
+title: Talk marks tool and MCP output untrusted
 kind: fix
 area: app
 ---

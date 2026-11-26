@@ -304,8 +304,6 @@ impl AgentRunner for ApiRunner {
         // write tools and has its git writes refused (`read_only`).
         let read_only = crate::orchestrator::read_only::role_is_read_only(&stage.artifact_kind, stage.role_environment);
         let mut system = crate::orchestrator::roles::compose_stage_system_prompt(&stage.role_prompt, stage.role_environment, read_only, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
-        // Its tool results come marked untrusted, as Talk's do (#1147).
-        system.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
         // Repo conventions (CLAUDE.md/AGENTS.md/…): the CLI substrate reads
         // them itself; the API substrate must be handed them explicitly or a
         // non-Claude implementer works blind to the project's rules.
@@ -314,6 +312,9 @@ impl AgentRunner for ApiRunner {
         // literal `/slug` the agent would have to guess at — resolved here, at
         // the moment this role actually runs.
         system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
+        // Its tool results come marked untrusted, as Talk's do (#1147). Last,
+        // after the repo's conventions and skills, which are repo content.
+        system.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
         // An answered ask_director block CONTINUES its saved conversation —
         // the exploration that led to the question is not re-run or re-paid.
         // The director's decisions (already formatted into `feedback`) arrive

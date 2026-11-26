@@ -30025,7 +30025,7 @@ mod project_instructions_tests {
         write(&ws.path().join("CLAUDE.md"), "Never write italics.");
         let got = load(ws.path(), None);
         let p = director_system_prompt(None, "/repo", &got.section, Some("\n\nAUTO DOCTRINE"));
-        let at = positions(&p, &["helpful coding assistant", "[untrusted output from", "# Project instructions", "Never write italics.", "AUTO DOCTRINE"]);
+        let at = positions(&p, &["helpful coding assistant", "# Project instructions", "Never write italics.", "AUTO DOCTRINE", "[untrusted output from"]);
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{p}");
         // A request's own prompt is followed by them too.
         let own = director_system_prompt(Some("Custom.".into()), "/repo", &got.section, None);

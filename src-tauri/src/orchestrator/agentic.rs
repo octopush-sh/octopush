@@ -56,10 +56,6 @@ pub(crate) fn throttle_notice(wait: u64) -> String {
     format!("input-token budget low — pausing {wait}s for the rate-limit window to reset")
 }
 
-/// Cap an oversized tool result before it's fed back to the model. The FULL
-/// result is still kept in the work journal as evidence — only the copy sent
-/// back to the model is trimmed (head + tail), with a marker telling the model
-/// how to retrieve the omitted middle if it needs it.
 /// The copy of a tool's result the model reads: capped, and marked as
 /// untrusted output of its tool (`chat_history::mark_untrusted`, #1147)
 /// unless the gate denied the call, whose text is Octopush's own.
@@ -72,6 +68,10 @@ fn model_copy(tool: &str, result: &str, denied: bool) -> String {
     }
 }
 
+/// Cap an oversized tool result before it's fed back to the model. The FULL
+/// result is still kept in the work journal as evidence — only the copy sent
+/// back to the model is trimmed (head + tail), with a marker telling the model
+/// how to retrieve the omitted middle if it needs it.
 fn cap_tool_result(s: &str) -> String {
     if s.len() <= TOOL_RESULT_CAP_BYTES {
         return s.to_string();
@@ -540,7 +540,6 @@ fn compact_history(messages: &mut [LlmMessage], system_chars: usize, target_char
     compacted
 }
 
-/// Test-only re-export of [`compact_history`] (the fn itself stays private).
 #[cfg(test)]
 mod untrusted_tests {
     #[test]
@@ -553,6 +552,7 @@ mod untrusted_tests {
     }
 }
 
+/// Test-only re-export of [`compact_history`] (the fn itself stays private).
 #[cfg(test)]
 pub fn compact_history_for_tests(
     messages: &mut [LlmMessage],

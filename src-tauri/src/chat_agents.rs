@@ -183,13 +183,15 @@ pub fn subagent_system_prompt(
          then anything left undone.",
         description = call.description,
     );
-    prompt.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
     prompt.push_str(instructions);
     if let Some(d) = definition {
         if !d.body.is_empty() {
             prompt.push_str(&format!("\n\n# Agent: {}\n{}", d.name, d.body));
         }
     }
+    // Last (#1147): after the project's instructions and the definition,
+    // which can be the repository's text.
+    prompt.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
     prompt
 }
 
@@ -1514,7 +1516,8 @@ mod tests {
         let d = def("security-reviewer", None, None);
         let p = subagent_system_prompt("/w", &call, Some(&d), "");
         assert!(p.contains("Your role: security-reviewer."));
-        assert!(p.ends_with("# Agent: security-reviewer\nYou are the security-reviewer."), "{p}");
+        assert!(p.contains("# Agent: security-reviewer\nYou are the security-reviewer."), "{p}");
+        assert!(p.ends_with(crate::chat_history::UNTRUSTED_OUTPUT_NOTE), "the note comes after the repo's text: {p}");
     }
 
     #[test]
