@@ -578,7 +578,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     // next actual chat message instead of being dropped here.
     const shellCmd = parseShellCommand(trimmed);
     if (shellCmd) {
-      void runShell(workspaceId, workspacePath, shellCmd);
+      void runShell(workspaceId, workspacePath, shellCmd).then((ran) => {
+        if (!ran) giveBack(workspaceId, trimmed);
+      });
       return;
     }
 
@@ -596,7 +598,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     // for the confirm (#1046).
     const refs = capRefs(extractContextRefs(outgoing, catalog)).kept;
     if (refs.length === 0) {
-      send(workspaceId, workspacePath, outgoing);
+      send(workspaceId, workspacePath, outgoing, undefined, { onRefused: () => giveBack(workspaceId, trimmed) });
       return;
     }
     expandingRef.current = true;
@@ -617,7 +619,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           setContextGuard({ ...verdict, blocks, outgoing, draft: trimmed, workspaceId, workspacePath });
           return;
         }
-        sendWithContext(workspaceId, workspacePath, outgoing, blocks);
+        sendWithContext(workspaceId, workspacePath, outgoing, trimmed, blocks);
       } finally {
         if (!held) {
           expandingRef.current = false;
@@ -627,10 +629,25 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     })();
   }, [streaming, send, runShell, workspaceId, workspacePath, catalog, files]);
 
-  /** Send the typed text with its blocks, and where each one sits (#1150). */
-  function sendWithContext(wsId: string, wsPath: string, typed: string, blocks: ResolvedBlock[], leaveOut?: Set<number>, unchecked?: Set<number>) {
+  /** Send the typed text with its blocks, and where each one sits (#1150).
+   *  `draft` is what the composer held, given back if the send is refused. */
+  function sendWithContext(wsId: string, wsPath: string, typed: string, draft: string, blocks: ResolvedBlock[], leaveOut?: Set<number>, unchecked?: Set<number>) {
     const { content, context } = withContext(typed, blocks, leaveOut, unchecked);
-    send(wsId, wsPath, content, undefined, { context });
+    send(wsId, wsPath, content, undefined, { context, onRefused: () => giveBack(wsId, draft) });
+  }
+
+  /** A send refused before it ran (a turn already running in this
+   *  conversation, the budget cap) gives its draft back, before anything
+   *  typed since; to its own workspace's composer if the user moved on. */
+  function giveBack(wsId: string, draft: string) {
+    if (workspaceIdRef.current !== wsId) {
+      useChatStore.getState().seedComposer(wsId, draft);
+      return;
+    }
+    const typed = inputRef.current;
+    const text = typed.trim() ? `${draft}\n\n${typed}` : draft;
+    pendingCaretRef.current = text.length;
+    setInput(text);
   }
 
   /** The confirm's answer: send without the flagged blocks (each says it was
@@ -641,7 +658,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     setContextGuard(null);
     expandingRef.current = false;
     setExpanding(false);
-    sendWithContext(g.workspaceId, g.workspacePath, g.outgoing, g.blocks, sendAnyway ? undefined : g.flagged, g.unchecked);
+    sendWithContext(g.workspaceId, g.workspacePath, g.outgoing, g.draft, g.blocks, sendAnyway ? undefined : g.flagged, g.unchecked);
     textareaRef.current?.focus();
   }
 

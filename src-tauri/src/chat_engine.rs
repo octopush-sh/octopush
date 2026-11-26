@@ -2029,6 +2029,41 @@ fn running_in(cancels: &HashMap<String, Arc<AtomicBool>>, thread_id: &str) -> bo
     cancels.keys().any(|k| k == thread_id || k.starts_with(&prefix))
 }
 
+/// Ends a turn's (or a continuation's) claim on its thread, then announces
+/// `done`: in that order and once, on every exit path, so a view that reads
+/// `list_running_threads` when `done` lands never finds the thread listed
+/// (which would show a running turn nobody can stop). Without a claim (the
+/// turn was refused) nothing is announced: whatever runs there isn't over.
+struct TurnEnd {
+    claim: Option<CancelGuard>,
+    done: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for TurnEnd {
+    fn drop(&mut self) {
+        // Taking the claim drops it here: the thread is released first.
+        let began = self.claim.take().is_some();
+        if let Some(done) = self.done.take().filter(|_| began) {
+            done();
+        }
+    }
+}
+
+/// The `done` stream event for a thread, to fire once its claim is released.
+fn done_event(app: &AppHandle, workspace_id: &str, thread_id: &str) -> Box<dyn FnOnce() + Send> {
+    let (app, workspace_id, thread_id) = (app.clone(), workspace_id.to_string(), thread_id.to_string());
+    Box::new(move || {
+        let _ = app.emit("chat://stream", &ChatStreamEvent {
+            workspace_id,
+            thread_id,
+            delta: String::new(),
+            done: true,
+            input_tokens: None,
+            output_tokens: None,
+        });
+    })
+}
+
 /// Marks one sub-agent as being continued for the life of the guard, so
 /// two continuations of the same run can never race on its row.
 struct ContinuingGuard {
@@ -2186,12 +2221,29 @@ impl ChatEngine {
         Ok((Arc::clone(&flag), CancelGuard { cancels: Arc::clone(&self.cancels), key, flag }))
     }
 
-    /// Which of `thread_ids` have a director turn running, which ends with a
-    /// `done` stream event (a continuation sends none, so it isn't listed).
-    /// A reloaded view reads it to show those threads as running again.
+    /// Refuse when a turn (or a continuation) runs on `thread_id`: it owns
+    /// the thread's rows and shell.
+    fn ensure_idle(&self, thread_id: &str) -> AppResult<()> {
+        if self.is_running(thread_id) {
+            return Err(AppError::Other(TURN_BUSY.into()));
+        }
+        Ok(())
+    }
+
+    /// Delete a message and everything after it (Regenerate, Edit & resend),
+    /// unless a turn runs on the thread: the resend would be refused, and the
+    /// cut would take rows the turn is still writing.
+    pub fn truncate_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
+        self.ensure_idle(thread_id)?;
+        self.db.lock().truncate_chat_after(thread_id, message_id)
+    }
+
+    /// Which of `thread_ids` have a turn or a sub-agent continuation
+    /// running; each ends with a `done` stream event (`TurnEnd`). A reloaded
+    /// view reads it to show those threads as running again.
     pub fn running_turns(&self, thread_ids: &[String]) -> Vec<String> {
         let cancels = self.cancels.lock();
-        thread_ids.iter().filter(|t| cancels.contains_key(t.as_str())).cloned().collect()
+        thread_ids.iter().filter(|t| running_in(&cancels, t)).cloned().collect()
     }
 
     /// Whether a turn (or a sub-agent continuation) is running on any of
@@ -2403,8 +2455,8 @@ impl ChatEngine {
 
     /// Shared tail for the graceful turn-enders: persist a quiet `stopped`
     /// marker carrying `note` (never replayed to the model, rendered as a
-    /// system note) and emit the terminal `done` stream event with the turn's
-    /// token totals.
+    /// system note). `send_agentic` sends `done` once the turn's claim is
+    /// released.
     #[allow(clippy::too_many_arguments)]
     fn finish_with_note(
         &self,
@@ -2416,14 +2468,6 @@ impl ChatEngine {
         note: &str,
     ) -> AppResult<()> {
         self.insert_and_emit_priced(app, workspace_id, thread_id, "stopped", note, model, usage)?;
-        let _ = app.emit("chat://stream", &ChatStreamEvent {
-            workspace_id: workspace_id.to_string(),
-            thread_id: thread_id.to_string(),
-            delta: String::new(),
-            done: true,
-            input_tokens: Some(usage.input),
-            output_tokens: Some(usage.output),
-        });
         Ok(())
     }
 
@@ -2596,7 +2640,8 @@ impl ChatEngine {
         // flips every `<thread>#continue:<call>` flag too. Refused while
         // anything else runs on the thread.
         let key = format!("{}#continue:{}", run.thread_id, call_id);
-        let (cancel, _cancel_guard) = self.begin_turn(&run.thread_id, key)?;
+        let (cancel, claim) = self.begin_turn(&run.thread_id, key)?;
+        let _end = TurnEnd { claim: Some(claim), done: Some(done_event(&app, &run.workspace_id, &run.thread_id)) };
 
         let _ = app.emit("chat://tool-start", &ToolStartEvent {
             workspace_id: run.workspace_id.clone(),
@@ -2687,10 +2732,7 @@ impl ChatEngine {
         app: AppHandle,
         request: ShellRequest,
     ) -> AppResult<crate::talk_shell::ShellResult> {
-        // A running turn owns the thread's shell and rows.
-        if self.is_running(&request.thread_id) {
-            return Err(AppError::Other(TURN_BUSY.into()));
-        }
+        self.ensure_idle(&request.thread_id)?;
         // Secret guard (#819): a command that commits, pushes or opens a pull
         // request is refused with `SecretsFound` before anything is shown or
         // run, unless `allow_findings` is the fingerprint the confirm showed.
@@ -2953,28 +2995,17 @@ impl ChatEngine {
         app: AppHandle,
         request: ChatRequest,
     ) -> AppResult<()> {
-        let (workspace_id, thread_id) = (request.workspace_id.clone(), request.thread_id.clone());
+        let done = done_event(&app, &request.workspace_id, &request.thread_id);
         let mut held = TurnHold::default();
-        let result = self.run_agentic_turn(app.clone(), request, &mut held).await;
+        let result = self.run_agentic_turn(app, request, &mut held).await;
         // Talk checkpoint (#958): record how the turn left the tree, on every
         // exit path, while its cancel registration still marks it running.
         if let Some(after) = held.after.take() {
             after.record_off_runtime().await;
         }
-        let began = held.cancel.is_some();
-        drop(held);
-        // A turn that began and failed ends with `done` too, so a view that
-        // only knows it runs from `list_running_threads` (a reload) lets go.
-        if began && result.is_err() {
-            let _ = app.emit("chat://stream", &ChatStreamEvent {
-                workspace_id,
-                thread_id,
-                delta: String::new(),
-                done: true,
-                input_tokens: None,
-                output_tokens: None,
-            });
-        }
+        // Then release the thread and send the one `done`, whatever the
+        // outcome (an answer, a Stop, a cap, an error).
+        drop(TurnEnd { claim: held.cancel.take(), done: Some(done) });
         result
     }
 
@@ -3442,17 +3473,8 @@ impl ChatEngine {
                     )?;
                 }
 
-                // Emit done — pure metadata. The final assistant content was delivered
-                // via the chat://message-added event above.
-                let _ = app.emit("chat://stream", &ChatStreamEvent {
-                    workspace_id: request.workspace_id.clone(),
-                    thread_id: request.thread_id.clone(),
-                    delta: String::new(),
-                    done: true,
-                    input_tokens: Some(usage.input),
-                    output_tokens: Some(usage.output),
-                });
-
+                // `send_agentic` sends `done` (pure metadata) once the turn
+                // has released its thread; the answer went out above.
                 return Ok(());
             }
 
@@ -4869,18 +4891,73 @@ mod tests {
         engine.cancel("t1");
         assert!(first.load(Ordering::Relaxed), "Stop reaches the turn that runs");
 
-        // Another thread runs its own; a continuation also holds its thread,
-        // but sends no `done`, so it isn't listed as a running turn.
+        // Another thread runs its own; a continuation holds its thread too,
+        // and is listed like a turn (it ends with `done` as well).
         let (_t2, _g2) = engine.begin_turn("t2", "t2".into()).unwrap();
         let (_c3, _g3) = engine.begin_turn("t3", "t3#continue:c3".into()).unwrap();
         assert!(engine.begin_turn("t3", "t3".into()).is_err());
         let all = ["t1", "t2", "t3", "t4"].map(String::from);
-        assert_eq!(engine.running_turns(&all), ["t1", "t2"]);
+        assert_eq!(engine.running_turns(&all), ["t1", "t2", "t3"]);
 
         // Once the turn ends the thread takes the next one.
         drop(guard);
         assert!(!engine.is_running("t1"));
         assert!(engine.begin_turn("t1", "t1".into()).is_ok());
+    }
+
+    #[test]
+    fn done_comes_once_after_the_thread_is_released() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let engine = ChatEngine::new(Arc::new(Mutex::new(Db::open(tmp.path()).unwrap())), None);
+        // What a reload asking `list_running_threads` would read at each `done`.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let done = |thread: &'static str| -> Box<dyn FnOnce() + Send> {
+            let (cancels, seen) = (Arc::clone(&engine.cancels), Arc::clone(&seen));
+            Box::new(move || seen.lock().push((thread, running_in(&cancels.lock(), thread))))
+        };
+
+        // A turn that began, whatever its outcome (`send_agentic` ends every
+        // one this way): one `done`, and the thread is already free by then,
+        // so a reload in between can't list a turn that is over.
+        let (_flag, claim) = engine.begin_turn("t1", "t1".into()).unwrap();
+        drop(TurnEnd { claim: Some(claim), done: Some(done("t1")) });
+        assert_eq!(*seen.lock(), [("t1", false)]);
+
+        // A send refused because a turn runs there sends no `done`: the
+        // running turn stays running in every view.
+        let (_flag, _running) = engine.begin_turn("t2", "t2".into()).unwrap();
+        let refused = engine.begin_turn("t2", "t2".into()).ok().map(|(_, claim)| claim);
+        drop(TurnEnd { claim: refused, done: Some(done("t2")) });
+        assert_eq!(seen.lock().len(), 1, "no done for a refused send");
+        assert!(engine.is_running("t2"));
+    }
+
+    #[test]
+    fn truncate_and_shell_wait_for_the_running_turn() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let (thread, first) = {
+            let d = db.lock();
+            d.insert_project("p", "P", "/tmp/p").unwrap();
+            d.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+            let t = d.create_chat_thread("ws", "T").unwrap();
+            let first = d.insert_chat_message("ws", &t.id, "user", "ask", None, None, None, None).unwrap();
+            d.insert_chat_message("ws", &t.id, "assistant", "answer", None, None, None, None).unwrap();
+            (t.id, first)
+        };
+        let (_flag, claim) = engine.begin_turn(&thread, thread.clone()).unwrap();
+
+        // Regenerate / Edit & resend can't cut rows the running turn writes,
+        // and a `$` command can't take its shell.
+        let err = engine.truncate_after(&thread, first).unwrap_err();
+        assert!(err.to_string().contains(TURN_BUSY), "{err}");
+        assert_eq!(db.lock().list_chat_messages(&thread).unwrap().len(), 2, "nothing was cut");
+        assert!(engine.ensure_idle(&thread).is_err(), "run_shell_command refuses the same way");
+
+        drop(claim);
+        engine.truncate_after(&thread, first).unwrap();
+        assert!(db.lock().list_chat_messages(&thread).unwrap().is_empty());
     }
 
     #[test]

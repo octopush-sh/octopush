@@ -55,9 +55,10 @@ export function ChatCanvas({
   const streamBuffer = useChatStore((s) => s.getStreamBuffer(workspaceId));
   const error = useChatStore((s) => s.getError(workspaceId));
   const liveTools = useChatStore((s) => s.getLiveTools(workspaceId));
-  const stopRequested = useChatStore((s) => s.stopRequestedByWs[workspaceId] ?? false);
   const pendingApprovals = useChatStore((s) => s.getPendingApprovals(workspaceId));
   const activeThreadId = useChatStore((s) => s.activeThreadByWs[workspaceId]);
+  // Per thread: a Stop in one conversation says nothing about another's turn.
+  const stopRequested = useChatStore((s) => (activeThreadId ? s.stopRequestedByThread[activeThreadId] : false) ?? false);
   const turnNotice = useChatStore((s) =>
     activeThreadId ? (s.turnNoticeByThread[activeThreadId]?.text ?? null) : null,
   );

@@ -1809,12 +1809,7 @@ pub async fn truncate_chat_after(
     thread_id: String,
     message_id: i64,
 ) -> AppResult<()> {
-    // The resend it backs would be refused, and the cut would take rows the
-    // running turn is still writing.
-    if state.chat.is_running(&thread_id) {
-        return Err(AppError::Other(crate::chat_engine::TURN_BUSY.into()));
-    }
-    state.db.lock().truncate_chat_after(&thread_id, message_id)
+    state.chat.truncate_after(&thread_id, message_id)
 }
 
 /// Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the

@@ -1198,6 +1198,42 @@ describe("chatStore — one running turn per thread", () => {
     expect(useChatStore.getState().getMessages("ws-1").map((m) => m.content)).toEqual(["from A"]);
   });
 
+  it("continuation_marks_its_thread_running", async () => {
+    // The crew row of call c1 sits in thread A, on screen.
+    const crewRow = { ...row(3, JSON.stringify({ callId: "c1", toolName: "Agent" })), role: "tool" };
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" }, messagesByWs: { "ws-1": [crewRow as never] } });
+    let finish: () => void = () => {};
+    Object.assign(ipc, { continueSubagent: vi.fn().mockReturnValueOnce(new Promise<void>((r) => { finish = r; })) });
+    const running = useChatStore.getState().continueSubagent("c1", "go on", null);
+    // Running: Stop shows and the composer waits; Stop reaches thread A.
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+    useChatStore.getState().stop("ws-1");
+    expect(ipc.cancelChat).toHaveBeenCalledWith("A");
+    expect(useChatStore.getState().stopRequestedByThread.A).toBe(true);
+    done("A");
+    finish();
+    await running;
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+
+    // Refused (a turn runs there, or nothing to continue): no `done` will
+    // come, so the mark comes off with the error.
+    Object.assign(ipc, { continueSubagent: vi.fn().mockRejectedValueOnce("This sub-agent is already being continued.") });
+    await useChatStore.getState().continueSubagent("c1", null, null);
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(false);
+  });
+
+  it("refused_send_reports_the_refusal", async () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "A" } });
+    const onRefused = vi.fn();
+    mocked(ipc.sendChatMessage).mockRejectedValueOnce("other: A turn is already running in this conversation.");
+    expect(await useChatStore.getState().send("ws-1", "/r", "again", undefined, { onRefused })).toBe(false);
+    expect(onRefused).toHaveBeenCalledTimes(1);
+    // A turn that started and then failed saved its ask: nothing to give back.
+    mocked(ipc.sendChatMessage).mockRejectedValueOnce("Anthropic API error 401");
+    await useChatStore.getState().send("ws-1", "/r", "again", undefined, { onRefused });
+    expect(onRefused).toHaveBeenCalledTimes(1);
+  });
+
   it("message_added_during_load_is_kept", async () => {
     let release: (rows: unknown[]) => void = () => {};
     mocked(ipc.listChatMessages).mockReturnValueOnce(new Promise((r) => { release = r; }));

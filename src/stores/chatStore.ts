@@ -359,6 +359,33 @@ function isActiveThread(
 
 const EMPTY_THREAD_IDS: string[] = [];
 
+/** The backend's refusal of a second turn on a running thread
+ *  (`chat_engine::TURN_BUSY`). */
+export const TURN_BUSY_MSG = "A turn is already running in this conversation.";
+
+/** A send refused before it ran (nothing of it was saved): a busy thread or
+ *  the backend's budget gate. */
+function isRefusal(e: unknown): boolean {
+  return Boolean(isBudgetExceeded(e)) || String(e).includes(TURN_BUSY_MSG);
+}
+
+/** The workspace and shown thread whose rows hold sub-agent `callId`. */
+function threadOfCall(s: Pick<ChatState, "messagesByWs" | "activeThreadByWs">, callId: string) {
+  for (const [workspaceId, messages] of Object.entries(s.messagesByWs)) {
+    const threadId = s.activeThreadByWs[workspaceId];
+    const holds = messages.some((m) => {
+      if (m.role !== "tool" || !m.content.includes(callId)) return false;
+      try {
+        return (JSON.parse(m.content) as ToolExecution).callId === callId;
+      } catch {
+        return false;
+      }
+    });
+    if (threadId && holds) return { workspaceId, threadId };
+  }
+  return null;
+}
+
 function withThread(threads: string[] | undefined, threadId: string): string[] {
   const list = threads ?? EMPTY_THREAD_IDS;
   return list.includes(threadId) ? list : [...list, threadId];
@@ -406,7 +433,7 @@ interface ChatState {
   liveToolsByWs: Record<string, LiveTool[]>;
   /** True between the user pressing Stop and the next turn starting — lets
    *  the pinned mascot skip the ✓ celebration for a turn the user killed. */
-  stopRequestedByWs: Record<string, boolean>;
+  stopRequestedByThread: Record<string, boolean>;
 
   /** Conversation threads per workspace (most-recent-first). */
   threadsByWs: Record<string, ChatThread[]>;
@@ -513,6 +540,9 @@ interface ChatState {
    *  during the turn — each shown via `errorByWs`). `onDispatched` is called
    *  much earlier, once: the pre-flight checks passed (budget, a thread) and
    *  the turn has started; a refusal before that never calls it.
+   *  `onRefused` is called when the send was refused before anything of it
+   *  was saved (the budget cap, no thread, a turn already running there), so
+   *  the caller can give the draft back.
    *  `attachments: false` sends without the staged attachments and leaves
    *  them staged (Review's "Send to the agent", #956). */
   send: (
@@ -520,7 +550,7 @@ interface ChatState {
     workspacePath: string,
     content: string,
     systemPrompt?: string,
-    opts?: { attachments?: boolean; onDispatched?: () => void; context?: SentContextBlock[] },
+    opts?: { attachments?: boolean; onDispatched?: () => void; onRefused?: () => void; context?: SentContextBlock[] },
   ) => Promise<boolean>;
   /** Internal: dispatch one agentic turn (shared by send / regenerate).
    *  Resolves `false` when the IPC failed. */
@@ -537,6 +567,8 @@ interface ChatState {
       overrideBudget?: boolean;
       /** Where the `@` blocks sit in `userMessage` (#1150). */
       context?: SentContextBlock[];
+      /** Called when the backend refused the turn before saving any of it. */
+      onRefused?: () => void;
     },
   ) => Promise<boolean>;
   /** Internal: budget-gate, truncate from a cutoff message id, then dispatch.
@@ -574,13 +606,15 @@ interface ChatState {
     context?: SentContextBlock[],
   ) => Promise<void>;
   /** Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
-   *  The command + output are persisted into the conversation as context. */
+   *  The command + output are persisted into the conversation as context.
+   *  Resolves `false` when it was refused before it ran (no thread, or a
+   *  turn already running there), so the caller can give the draft back. */
   runShell: (
     workspaceId: string,
     workspacePath: string,
     command: string,
     allowFindings?: string,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   /** Answer the secret guard's confirm for a refused `$` command: leave it
    *  out (close), or run it regardless for exactly what was shown. */
   resolveShellSecret: (workspaceId: string, runRegardless: boolean) => Promise<void>;
@@ -1247,7 +1281,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     streamingByWs: {},
     streamSinceByWs: {},
     streamBufferByWs: {},
-    stopRequestedByWs: {},
+    stopRequestedByThread: {},
     errorByWs: {},
     liveToolsByWs: {},
     threadsByWs: {},
@@ -1352,6 +1386,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG },
         }));
+        sendOpts?.onRefused?.();
         return false;
       }
 
@@ -1362,6 +1397,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: "Could not start a conversation." },
         }));
+        sendOpts?.onRefused?.();
         return false;
       }
 
@@ -1396,6 +1432,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         attachments,
         overrideBudget: gate.overrode,
         context: sendOpts?.context,
+        onRefused: sendOpts?.onRefused,
       });
       sendOpts?.onDispatched?.();
       return turn;
@@ -1416,7 +1453,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
         },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
-        stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
+        stopRequestedByThread: { ...s.stopRequestedByThread, [threadId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
@@ -1445,6 +1482,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // a direct-IPC bypass) surfaces as the same cap message + override
         // affordance as the client gate.
         const errText = isBudgetExceeded(e) ? BUDGET_CAP_MSG : String(e);
+        if (isRefusal(e)) opts.onRefused?.();
         set((s) => ({
           ...(wasRunning ? {} : streamingPatch(s, workspaceId, withoutThread(s.streamingThreadsByWs[workspaceId], threadId))),
           streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
@@ -1559,7 +1597,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: "Could not start a conversation." },
         }));
-        return;
+        return false;
       }
 
       // Name an untouched thread after its first command, mirroring `send`.
@@ -1588,7 +1626,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           ...s.streamSinceByWs,
           [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
         },
-        stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
+        stopRequestedByThread: { ...s.stopRequestedByThread, [threadId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
@@ -1613,6 +1651,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         // Refresh the recall history so the just-run command surfaces.
         void get().loadShellHistory(workspaceId);
+        return true;
       } catch (e) {
         // The secret guard refused it before it ran: ask, don't error.
         const refusal = secretRefusal(e);
@@ -1623,6 +1662,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         } else {
           set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
         }
+        return !String(e).includes(TURN_BUSY_MSG);
       } finally {
         // Only this command's own mark: a turn the thread was already running
         // (the backend refuses the command then) and other threads' turns stay.
@@ -1739,10 +1779,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       // the streaming flag, so we don't optimistically flip it here. Cancel the
       // workspace's active thread (the one being shown).
       // Remember the kill so the mascot doesn't celebrate an aborted turn.
-      set((s) => ({
-        stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: true },
-      }));
       const threadId = get().activeThreadByWs[workspaceId];
+      if (threadId) set((s) => ({ stopRequestedByThread: { ...s.stopRequestedByThread, [threadId]: true } }));
       if (threadId) void ipc.cancelChat(threadId).catch(() => {});
       // Retire the cancelled thread's pending approval card immediately — the
       // backend also resolves it as Deny on cancel. Only this thread's cards are
@@ -1796,14 +1834,32 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
     continueSubagent: async (callId, instruction, extraTurns) => {
       if (get().continuingCalls[callId]) return;
+      // The continuation is its thread's running turn: Stop shows and the
+      // composer waits. Its `done` ends that, as a turn's does.
+      const owner = threadOfCall(get(), callId);
+      const marks =
+        owner !== null &&
+        !(get().streamingThreadsByWs[owner.workspaceId] ?? EMPTY_THREAD_IDS).includes(owner.threadId);
       set((s) => {
         const { [callId]: _gone, ...rest } = s.continueErrorByCall;
-        return { continuingCalls: { ...s.continuingCalls, [callId]: true }, continueErrorByCall: rest };
+        return {
+          continuingCalls: { ...s.continuingCalls, [callId]: true },
+          continueErrorByCall: rest,
+          ...(marks && owner
+            ? streamingPatch(s, owner.workspaceId, withThread(s.streamingThreadsByWs[owner.workspaceId], owner.threadId))
+            : {}),
+        };
       });
       try {
         await ipc.continueSubagent(callId, instruction, extraTurns);
       } catch (e) {
-        set((s) => ({ continueErrorByCall: { ...s.continueErrorByCall, [callId]: String(e) } }));
+        set((s) => ({
+          continueErrorByCall: { ...s.continueErrorByCall, [callId]: String(e) },
+          // Refused before it ran there's no `done` to clear the mark.
+          ...(marks && owner
+            ? streamingPatch(s, owner.workspaceId, withoutThread(s.streamingThreadsByWs[owner.workspaceId], owner.threadId))
+            : {}),
+        }));
       } finally {
         set((s) => {
           const { [callId]: _done, ...rest } = s.continuingCalls;
