@@ -176,7 +176,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       return;
     }
     const q = m.query.toLowerCase();
-    if (q && !skills.some((s) => s.name.toLowerCase().includes(q))) {
+    // A query that names only a skipped skill file keeps the menu open, so
+    // its "skipped" row says why there is no such skill.
+    if (q && !skills.some((s) => s.name.toLowerCase().includes(q)) && matchingSkipped(skippedSkills, q).length === 0) {
       closeSlash();
       return;
     }

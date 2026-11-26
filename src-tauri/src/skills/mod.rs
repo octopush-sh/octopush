@@ -124,8 +124,10 @@ pub(crate) struct DefinitionRoot {
 /// work tree around the worktree (`request_context::nearest_work_tree`, the
 /// same reach its `.claude/CLAUDE.md` has), so a link to a file elsewhere
 /// on the Mac, or into an outer repository, is never read. The user's
-/// `~/.claude/<kind>` is trusted; a project whose `.claude/<kind>` resolves
-/// to that very directory (home opened as a project) reads it as the user's.
+/// `~/.claude/<kind>` is trusted. A project whose `.claude/<kind>` resolves
+/// to that very directory (home opened as a project, or a `.claude` linked
+/// to `~/.claude`) has no root of its own: those files are the user's, and
+/// are read, labelled and sourced as the user's.
 pub(crate) fn definition_roots(worktree: &Path, home: Option<&Path>, kind: &str) -> Vec<DefinitionRoot> {
     let user = home.map(|h| h.join(".claude").join(kind));
     let user_real = user.as_deref().and_then(|u| std::fs::canonicalize(u).ok());
@@ -133,13 +135,15 @@ pub(crate) fn definition_roots(worktree: &Path, home: Option<&Path>, kind: &str)
     // Resolved first: containment compares resolved paths.
     if let Ok(project) = std::fs::canonicalize(worktree) {
         let dir = project.join(".claude").join(kind);
-        let own = user_real.is_some() && std::fs::canonicalize(&dir).ok() == user_real;
-        roots.push(DefinitionRoot {
-            limit: (!own).then(|| nearest_work_tree(&project, &project)),
-            dir,
-            source: "project",
-            shown: format!(".claude/{kind}"),
-        });
+        let users = user_real.is_some() && std::fs::canonicalize(&dir).ok() == user_real;
+        if !users {
+            roots.push(DefinitionRoot {
+                limit: Some(nearest_work_tree(&project, &project)),
+                dir,
+                source: "project",
+                shown: format!(".claude/{kind}"),
+            });
+        }
     }
     if let Some(dir) = user {
         roots.push(DefinitionRoot { dir, source: "user", shown: format!("~/.claude/{kind}"), limit: None });
@@ -383,13 +387,43 @@ fn mentions_skill(text: &str, name: &str) -> bool {
     false
 }
 
+/// The most bytes of skill bodies one Talk turn or Direct stage carries: the
+/// skills it names share it, in order. About 25k tokens, so ordinary skills
+/// always go whole, while a runaway file (each may be up to 4 MiB) can't
+/// fill the prompt or the bill.
+pub const SKILLS_CAP_BYTES: usize = 100_000;
+
+/// With less than this left, a skill is left out rather than trimmed.
+const MIN_TRIMMED_SKILL_BYTES: usize = 1_000;
+
 /// The section appended to a system prompt for each skill a message or brief
 /// named — the one shape TALK and DIRECT share, so an agent meets the
-/// instructions in the same form on both substrates.
+/// instructions in the same form on both substrates. The bodies share
+/// [`SKILLS_CAP_BYTES`]: a skill that fits what is left goes whole, a larger
+/// one is trimmed to it (beginning and end kept), or left out when under
+/// 1,000 bytes are left; either way the section says so, and so does the log.
 pub fn skill_prompt_section(skills: &[Skill]) -> String {
     let mut out = String::new();
+    let mut left = SKILLS_CAP_BYTES;
     for skill in skills {
-        out.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
+        let body = if skill.body.len() <= left {
+            skill.body.clone()
+        } else if left < MIN_TRIMMED_SKILL_BYTES {
+            tracing::warn!(skill = %skill.name, "skill left out: the invoked skills pass {SKILLS_CAP_BYTES} bytes");
+            format!(
+                "[Left out: the skills invoked here pass the {SKILLS_CAP_BYTES}-byte limit per turn. Ask the user to \
+                 invoke fewer skills at once if you need this one.]"
+            )
+        } else {
+            tracing::warn!(skill = %skill.name, "skill trimmed: the invoked skills pass {SKILLS_CAP_BYTES} bytes");
+            format!(
+                "[Trimmed: the skills invoked here pass the {SKILLS_CAP_BYTES}-byte limit per turn; the beginning \
+                 and end of this one are kept.]\n{}",
+                crate::orchestrator::runner::cap_to(&skill.body, left)
+            )
+        };
+        left = left.saturating_sub(body.len());
+        out.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, body));
     }
     out
 }

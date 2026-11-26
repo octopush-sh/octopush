@@ -165,11 +165,19 @@ export function RichPromptTextarea({
     closeAll();
   }
 
-  const popoverOpen = slashOpen ? slashItems.length > 0 : mentionItems.length > 0;
+  // The menu shows while it has a row: a skill, or a skipped skill file it
+  // names (as in TALK). Only skills are selectable.
+  const slashShown = slashItems.length > 0 || slashSkipped.length > 0;
+  const popoverOpen = slashOpen ? slashShown : mentionItems.length > 0;
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (popoverOpen) {
-      const size = slashOpen ? slashItems.length : mentionItems.length;
+    if (popoverOpen && e.key === "Escape") {
+      e.preventDefault();
+      closeAll();
+      return;
+    }
+    const size = slashOpen ? slashItems.length : mentionItems.length;
+    if (popoverOpen && size > 0) {
       const setIndex = slashOpen ? setSlashIndex : setMentionIndex;
       const index = slashOpen ? slashIndex : mentionIndex;
       if (e.key === "ArrowDown") {
@@ -188,11 +196,6 @@ export function RichPromptTextarea({
         else selectMention(mentionItems[mentionIndex]);
         return;
       }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        closeAll();
-        return;
-      }
     }
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter" && onSubmit) {
       e.preventDefault();
@@ -207,11 +210,13 @@ export function RichPromptTextarea({
           rather than scrolled to — the active row would be the first thing
           cut off. TALK keeps the upward default (its composer is at the
           bottom of the screen).
-          `slashItems.length > 0` is a guard, not a nicety: SlashMenu renders a
-          "No skills found" panel on an empty list, and since `popoverOpen` is
+          `slashShown` is a guard, not a nicety: SlashMenu renders a "No
+          skills found" panel on an empty list, and since `popoverOpen` is
           false there, Escape would not dismiss it — typing `/usr/local` mid-
-          brief would leave it stuck until the caret left the token. */}
-      {slashOpen && slashItems.length > 0 ? (
+          brief would leave it stuck until the caret left the token. A query
+          that matches only a skipped skill file shows the menu, and Escape
+          dismisses it. */}
+      {slashOpen && slashShown ? (
         <SlashMenu
           items={slashItems}
           skipped={slashSkipped}

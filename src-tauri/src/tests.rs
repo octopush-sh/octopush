@@ -30033,7 +30033,7 @@ mod skills_containment_tests {
     //! home: none reads the real `~/.claude`.
     use crate::request_context::{agents_item, skills_item, MAX_MEMORY_FILE_BYTES};
     use crate::skills::agents::scan_agent_files_in;
-    use crate::skills::{scan_skills_in, SkippedDefinition};
+    use crate::skills::{scan_skills_in, skill_prompt_section, Skill, SkippedDefinition, SKILLS_CAP_BYTES};
     use std::os::unix::fs::symlink;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -30077,9 +30077,11 @@ mod skills_containment_tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     }
 
-    fn oversized(path: &Path) {
-        mkdir(path.parent().unwrap());
-        std::fs::File::create(path).unwrap().set_len(MAX_MEMORY_FILE_BYTES + 1).unwrap();
+    /// A valid definition named `name`, padded past 4 MiB: only the size
+    /// check keeps it from loading.
+    fn oversized(path: &Path, name: &str) {
+        write(path, &skill(name));
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(MAX_MEMORY_FILE_BYTES + 1).unwrap();
     }
 
     #[test]
@@ -30128,6 +30130,29 @@ mod skills_containment_tests {
         assert_eq!(reasons(&scan.skipped), [(".claude/skills/kit/SKILL.md", "outside the project")]);
     }
 
+    /// Following a link that stays in the project never relaxes the check on
+    /// the file itself: the final `SKILL.md` must resolve inside too.
+    #[test]
+    fn a_skill_directory_inside_the_project_whose_skill_md_links_out_is_skipped_unread() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("notes.md"), &skill("outside"));
+        // A plain directory in the project, and one reached by an in-project link.
+        mkdir(&project.path().join(".claude/skills/plain"));
+        symlink(outside.path().join("notes.md"), project.path().join(".claude/skills/plain/SKILL.md")).unwrap();
+        mkdir(&project.path().join("shared/kit"));
+        symlink(outside.path().join("notes.md"), project.path().join("shared/kit/SKILL.md")).unwrap();
+        symlink(project.path().join("shared/kit"), project.path().join(".claude/skills/kit")).unwrap();
+
+        let scan = scan_skills_in(project.path(), Some(home.path()));
+        assert!(scan.found.is_empty(), "{:?}", scan.found);
+        assert_eq!(
+            reasons(&scan.skipped),
+            [(".claude/skills/kit/SKILL.md", "outside the project"), (".claude/skills/plain/SKILL.md", "outside the project")]
+        );
+    }
+
     #[test]
     fn a_symlinked_agent_file_that_leaves_the_project_is_skipped_unread() {
         let home = TempDir::new().unwrap();
@@ -30166,10 +30191,10 @@ mod skills_containment_tests {
     fn an_oversized_skill_or_agent_is_skipped_unread() {
         let home = TempDir::new().unwrap();
         let project = repo();
-        oversized(&project.path().join(".claude/skills/huge/SKILL.md"));
-        oversized(&project.path().join(".claude/agents/huge.md"));
+        oversized(&project.path().join(".claude/skills/huge/SKILL.md"), "huge");
+        oversized(&project.path().join(".claude/agents/huge.md"), "huge");
         // The user's own files are trusted, not unbounded.
-        oversized(&home.path().join(".claude/skills/mine/SKILL.md"));
+        oversized(&home.path().join(".claude/skills/mine/SKILL.md"), "mine");
 
         let skills = scan_skills_in(project.path(), Some(home.path()));
         assert!(skills.found.is_empty());
@@ -30241,9 +30266,42 @@ mod skills_containment_tests {
         assert_eq!(got, [("helper", "user"), ("linked-agent", "user")]);
         assert!(agents.skipped.is_empty(), "{:?}", agents.skipped);
 
-        // Home opened as a project: its `.claude` is the user's own.
-        let own = scan_skills_in(home.path(), Some(home.path()));
-        assert!(own.skipped.is_empty(), "{:?}", own.skipped);
-        assert!(own.found.iter().any(|s| s.name == "linked-kit"), "{:?}", own.found);
+        // Home opened as a project, or a repo whose `.claude` links to
+        // `~/.claude`: those files are the user's, labelled and sourced so.
+        oversized(&home.path().join(".claude/skills/big/SKILL.md"), "big");
+        let linked = repo();
+        symlink(home.path().join(".claude"), linked.path().join(".claude")).unwrap();
+        for project in [home.path(), linked.path()] {
+            let scan = scan_skills_in(project, Some(home.path()));
+            let got: Vec<(&str, &str)> = scan.found.iter().map(|s| (s.name.as_str(), s.source.as_str())).collect();
+            assert_eq!(got, [("linked-kit", "user"), ("mine", "user")], "{project:?}");
+            assert_eq!(reasons(&scan.skipped), [("~/.claude/skills/big/SKILL.md", "over 4 MiB")], "{project:?}");
+            let agents = scan_agent_files_in(project, Some(home.path()));
+            assert!(agents.found.iter().all(|d| d.source == "user"), "{:?}", agents.found);
+        }
+    }
+
+    fn named(name: &str, body: String) -> Skill {
+        Skill { name: name.into(), description: String::new(), body, allowed_tools: None, source: "project".into() }
+    }
+
+    /// The skill bodies one turn carries share a cap: what fits goes whole,
+    /// the next is trimmed with a note, and the rest are left out with one.
+    #[test]
+    fn the_skills_one_turn_carries_share_a_size_cap() {
+        let small = named("small", "Be brief.".into());
+        assert_eq!(skill_prompt_section(&[small.clone()]), "\n\n# Skill: small\nBe brief.");
+
+        let first = named("first", "a".repeat(SKILLS_CAP_BYTES - 20_000));
+        let second = named("second", format!("HEAD{}TAIL", "b".repeat(50_000)));
+        let third = named("third", "c".repeat(5_000));
+        let section = skill_prompt_section(&[first, second, third, small]);
+        assert!(section.len() < SKILLS_CAP_BYTES + 2_000, "{}", section.len());
+        assert!(section.contains(&"a".repeat(SKILLS_CAP_BYTES - 20_000)), "the first skill goes whole");
+        let second_part = &section[section.find("# Skill: second").unwrap()..section.find("# Skill: third").unwrap()];
+        assert!(second_part.contains("[Trimmed:") && second_part.contains("HEAD") && second_part.contains("TAIL"));
+        let rest = &section[section.find("# Skill: third").unwrap()..];
+        assert!(!rest.contains("ccc") && !rest.contains("Be brief."), "{rest}");
+        assert_eq!(rest.matches("[Left out:").count(), 2, "{rest}");
     }
 }

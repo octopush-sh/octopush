@@ -1025,6 +1025,9 @@ describe("ChatView — /skill menu and inline highlight", () => {
     await waitFor(() => expect(menu).toHaveTextContent("skipped: outside the project"));
     const row = screen.getByTitle(".claude/skills/linked/SKILL.md · skipped: outside the project");
     expect(row).toHaveAttribute("aria-disabled", "true");
+    // A query that names only the skipped file keeps the menu open on its row.
+    type(ta, "/link");
+    expect(screen.getByRole("listbox", { name: "Skills" })).toHaveTextContent("skipped: outside the project");
     // A query that names only real skills leaves it out; the keys move over skills only.
     type(ta, "/rel");
     expect(screen.getByRole("listbox", { name: "Skills" })).not.toHaveTextContent("skipped:");
