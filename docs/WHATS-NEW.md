@@ -196,6 +196,7 @@ Current anchors:
 | `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
 | `companion-run-context` · `companion-run-changes` · `companion-run-read-diff` · `companion-run-mission` | Run Companion: the Context section (only while the focused pane is an agent session Octopush has usage for) · the Changes section · its "Read the diff" link (only with something to read in Review) · the Mission section (only with a mission) | `CompanionRun.tsx` |
 | `companion-chats-list` | Companion › Chats: the conversation list | `CompanionHistory.tsx` |
+| `companion-follows` | Talk Companion › Conversation: the "follows" row, one name per instruction file Talk and its sub-agents follow (the CLAUDE.md chain, or AGENTS.md; only while the worktree has one) | `CompanionInstructions.tsx` via `CompanionContext.tsx` |
 | `companion-can-use` | Talk Companion › Conversation: the "can use" row, one toggle chip per MCP server (only while the workspace has one configured) | `CompanionMcpScope.tsx` via `CompanionContext.tsx` |
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-headline` | Settings › Usage: the headline stats row (Cost · Per active day · Last 24 hours · Cache hit), also while the ledger is read | `settings/UsagePane.tsx` |

@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod notify_elsewhere;
 pub mod provider_router;
 pub mod providers;
+pub mod project_instructions;
 pub mod pty_client;
 pub mod pty_daemon;
 mod pty_manager;
@@ -291,6 +292,7 @@ pub fn run() {
             commands::read_attachment,
             commands::list_mcp_tools,
             commands::list_mcp_server_status,
+            commands::list_project_instructions,
             commands::get_thread_mcp_disabled,
             commands::set_thread_mcp_server,
             commands::get_mcp_config,

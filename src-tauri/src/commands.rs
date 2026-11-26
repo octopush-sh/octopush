@@ -2259,6 +2259,21 @@ pub async fn list_mcp_server_status(
     Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
 }
 
+/// The instruction files Talk and its sub-agents follow in a worktree (its
+/// CLAUDE.md chain, or AGENTS.md), with the tokens each adds, for the
+/// Companion's "follows" row. Reads only.
+#[tauri::command]
+pub async fn list_project_instructions(
+    workspace_path: String,
+) -> AppResult<crate::project_instructions::InstructionList> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let got = crate::project_instructions::for_workspace(std::path::Path::new(&workspace_path));
+        crate::project_instructions::InstructionList { files: got.files, more_skipped: got.more_skipped }
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("project instructions: {e}")))
+}
+
 /// The MCP servers switched off in one Talk conversation (none by default).
 #[tauri::command]
 pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<String>> {

@@ -78,6 +78,11 @@ pub struct RequestContext {
     pub usual_usd: Option<f64>,
     /// Ranked, largest first; they add up to `measured_tokens` when it is known.
     pub items: Vec<CarriedItem>,
+    /// Memory files the chain named but never read (a project file pointing
+    /// outside the project, a file over 4 MiB), at most [`MAX_LISTED_SKIPS`].
+    pub skipped: Vec<SkippedFile>,
+    /// Skipped files past those, counted.
+    pub more_skipped: usize,
 }
 
 /// The token estimate of `bytes` of text: one token per 4 bytes, rounded up.
@@ -125,10 +130,13 @@ pub fn apportion(mut items: Vec<CarriedItem>, measured: Option<u64>) -> Vec<Carr
 // ─── The files ────────────────────────────────────────────────────
 
 /// `path` as the user knows it: relative to the project, `~/…` under home,
-/// else in full.
+/// else in full. Callers pass resolved paths, so the label says where the
+/// file really is. A project path that itself begins with `~` (a repo folder
+/// named `~`) is written `./~/…`, so it can't pass for a file under home.
 fn display_path(path: &Path, project: &Path, home: Option<&Path>) -> String {
     if let Ok(rel) = path.strip_prefix(project) {
-        return rel.display().to_string();
+        let rel = rel.display().to_string();
+        return if rel.starts_with('~') { format!("./{rel}") } else { rel };
     }
     if let Some(rest) = home.and_then(|h| path.strip_prefix(h).ok()) {
         return format!("~/{}", rest.display());
@@ -161,7 +169,8 @@ pub fn memory_imports(text: &str) -> Vec<String> {
 }
 
 /// Where an import points: `~/…` under home, an absolute path, else
-/// relative to the importing file's directory.
+/// relative to the importing file's directory. Where it is *allowed* to
+/// point is [`read_memory_file`]'s call.
 fn resolve_import(spec: &str, base: &Path, home: Option<&Path>) -> Option<PathBuf> {
     if let Some(rest) = spec.strip_prefix("~/") {
         return home.map(|h| h.join(rest));
@@ -170,63 +179,292 @@ fn resolve_import(spec: &str, base: &Path, home: Option<&Path>) -> Option<PathBu
     Some(if p.is_absolute() { p.to_path_buf() } else { base.join(p) })
 }
 
-/// Add the memory file at `path` (when it is a file not yet counted) and,
-/// up to [`MAX_IMPORT_DEPTH`], the files it imports.
-fn add_memory(
-    path: &Path,
-    project: &Path,
-    home: Option<&Path>,
-    depth: usize,
-    seen: &mut HashSet<PathBuf>,
-    out: &mut Vec<CarriedItem>,
-) {
-    if !path.is_file() {
-        return;
-    }
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !seen.insert(key) {
-        return;
-    }
-    let Ok(raw) = std::fs::read(path) else { return };
-    out.push(CarriedItem {
-        kind: "memory".into(),
-        label: display_path(path, project, home),
-        path: Some(path.display().to_string()),
-        count: 1,
-        bytes: raw.len() as u64,
-        tokens: 0,
-    });
-    if depth >= MAX_IMPORT_DEPTH {
-        return;
-    }
-    let base = path.parent().unwrap_or(project).to_path_buf();
-    for spec in memory_imports(&String::from_utf8_lossy(&raw)) {
-        if let Some(target) = resolve_import(&spec, &base, home) {
-            add_memory(&target, project, home, depth + 1, seen, out);
+/// A memory file larger than this is skipped, never read.
+pub const MAX_MEMORY_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Why a memory file was named but not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemorySkip {
+    /// A project file (or what it imports, or a symlink's target) resolves
+    /// outside the project.
+    OutsideProject,
+    /// Over [`MAX_MEMORY_FILE_BYTES`].
+    TooLarge,
+}
+
+impl MemorySkip {
+    /// What the Companion says after "skipped:".
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemorySkip::OutsideProject => "outside the project",
+            MemorySkip::TooLarge => "over 4 MiB",
         }
     }
 }
 
-/// The CLAUDE.md chain Claude Code loads in `project`: the user's
-/// `~/.claude/CLAUDE.md`, then from the top directory down to `project`
-/// each one's `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md`, each
-/// followed by what it imports. An `AGENTS.md` counts only when imported
-/// (Claude Code doesn't read it on its own).
-pub fn memory_files(project: &Path, home: Option<&Path>) -> Vec<CarriedItem> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    if let Some(h) = home {
-        add_memory(&h.join(".claude").join("CLAUDE.md"), project, home, 0, &mut seen, &mut out);
+/// Read one memory file the way every caller must. The path is resolved,
+/// symlinks included; with `root` (a canonical, untrusted dir) a target
+/// outside it is refused, so a repo's `CLAUDE.md` can't pull in `~/…`,
+/// `../…` or an absolute path, or be a symlink to one. The resolved path is
+/// opened first, non-blocking and without following a link swapped in since,
+/// and the open handle must be a regular file (`fstat`), so a FIFO or device
+/// put there can't hang the turn. Never more than [`MAX_MEMORY_FILE_BYTES`]
+/// is read. `Ok(None)` when there is no regular file there.
+pub fn read_memory_file(path: &Path, root: Option<&Path>) -> Result<Option<(PathBuf, Vec<u8>)>, MemorySkip> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(real) = std::fs::canonicalize(path) else { return Ok(None) };
+    if root.is_some_and(|r| !real.starts_with(r)) {
+        return Err(MemorySkip::OutsideProject);
     }
-    // Every ancestor but the filesystem root, top down.
-    let mut dirs: Vec<&Path> = project.ancestors().filter(|d| d.parent().is_some()).collect();
-    dirs.reverse();
-    for dir in dirs {
-        for name in ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"] {
-            add_memory(&dir.join(name), project, home, 0, &mut seen, &mut out);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(&real)
+    else {
+        return Ok(None);
+    };
+    let Ok(meta) = file.metadata() else { return Ok(None) };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_MEMORY_FILE_BYTES {
+        return Err(MemorySkip::TooLarge);
+    }
+    let mut raw = Vec::new();
+    if file.take(MAX_MEMORY_FILE_BYTES + 1).read_to_end(&mut raw).is_err() {
+        return Ok(None);
+    }
+    if raw.len() as u64 > MAX_MEMORY_FILE_BYTES {
+        return Err(MemorySkip::TooLarge);
+    }
+    Ok(Some((real, raw)))
+}
+
+/// One file of the chain, read once: [`memory_files`] counts it and
+/// `project_instructions` sends its text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryFile {
+    /// The path as the user knows it ([`display_path`]).
+    pub label: String,
+    /// The path as the chain named it.
+    pub path: PathBuf,
+    /// Where it resolved (symlinks followed); `None` when skipped.
+    pub real: Option<PathBuf>,
+    /// The file's text (lossy UTF-8); empty when skipped.
+    pub text: String,
+    /// Bytes read; 0 when skipped.
+    pub bytes: u64,
+    /// Named but not read, and why.
+    pub skipped: Option<MemorySkip>,
+}
+
+/// How many skipped files a chain lists by name; the rest are counted.
+pub const MAX_LISTED_SKIPS: usize = 20;
+
+/// The chain [`memory_chain`] walked: its files, each read once, and how
+/// many skipped files weren't listed past [`MAX_LISTED_SKIPS`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemoryChain {
+    pub files: Vec<MemoryFile>,
+    pub more_skipped: usize,
+}
+
+/// Whether `dir` is the root of a git work tree: it holds a `.git` entry (a
+/// repo, a worktree or a submodule).
+fn is_work_tree_root(dir: &Path) -> bool {
+    dir.join(".git").symlink_metadata().is_ok()
+}
+
+/// The untrusted zone of a project: the outermost directory at or above its
+/// resolved root that is a git work tree root (a repo, a worktree, a
+/// submodule's superproject, the repo enclosing a subfolder), else the
+/// project itself. Every directory from the project up to it is the
+/// repository's, not the user's.
+pub fn untrusted_root(root: &Path) -> PathBuf {
+    root.ancestors().filter(|d| is_work_tree_root(d)).last().unwrap_or(root).to_path_buf()
+}
+
+/// Where an untrusted file in `dir` may reach: the nearest git work tree
+/// that encloses it, never a wider one, or `fallback` (the project itself,
+/// when it isn't in a work tree).
+pub fn nearest_work_tree(dir: &Path, fallback: &Path) -> PathBuf {
+    dir.ancestors().find(|d| is_work_tree_root(d)).unwrap_or(fallback).to_path_buf()
+}
+
+/// Walks the chain: the paths reached, so a file reached twice is read once.
+///
+/// Who is untrusted: every directory from the project up to the outermost
+/// work tree enclosing it ([`untrusted_root`]), and every file that resolves
+/// in there, however it was reached. Where such a file may reach: the
+/// nearest work tree that encloses it ([`nearest_work_tree`]), so the
+/// project's files stay in the project's own tree, and a `.git` in a parent
+/// folder or in home (a dotfiles repo) never widens what a cloned repo can
+/// import. The user's files (`~/.claude/CLAUDE.md`, the directories above
+/// the untrusted zone, and what they import outside it) may point anywhere.
+struct ChainWalk {
+    /// The project dir, resolved; labels are relative to it.
+    root: Option<PathBuf>,
+    /// [`untrusted_root`] of `root`.
+    untrusted: Option<PathBuf>,
+    /// The user's home as given (for `~/` imports) and resolved (for labels).
+    home: Option<PathBuf>,
+    home_real: Option<PathBuf>,
+    seen: HashSet<PathBuf>,
+    chain: MemoryChain,
+}
+
+impl ChainWalk {
+    fn label(&self, path: &Path) -> String {
+        let shown = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        match &self.root {
+            Some(root) => display_path(&shown, root, self.home_real.as_deref()),
+            None => shown.display().to_string(),
         }
     }
-    out
+
+    /// Where an untrusted file at `real` may reach, or `None` when `real` is
+    /// outside the untrusted zone (a user's file).
+    fn reach_of(&self, real: &Path) -> Option<PathBuf> {
+        let zone = self.untrusted.as_deref()?;
+        if !real.starts_with(zone) {
+            return None;
+        }
+        Some(nearest_work_tree(real.parent().unwrap_or(real), self.root.as_deref().unwrap_or(zone)))
+    }
+
+    /// Add the memory file at `path` (when it is one not yet reached) and,
+    /// up to [`MAX_IMPORT_DEPTH`], the files it imports. `limit` is where
+    /// the file may resolve: `None` for a user's file, else the work tree
+    /// confining it.
+    fn add(&mut self, path: &Path, limit: Option<PathBuf>, depth: usize) {
+        // Already read by another route (an import of an ancestor's file, say).
+        if std::fs::canonicalize(path).is_ok_and(|r| self.seen.contains(&r)) {
+            return;
+        }
+        let (real, raw) = match read_memory_file(path, limit.as_deref()) {
+            Ok(Some(found)) => found,
+            Ok(None) => return,
+            Err(skip) => {
+                if self.seen.insert(path.to_path_buf()) {
+                    if self.chain.files.iter().filter(|f| f.skipped.is_some()).count() < MAX_LISTED_SKIPS {
+                        let label = self.label(path);
+                        self.chain.files.push(MemoryFile { label, path: path.to_path_buf(), real: None, text: String::new(), bytes: 0, skipped: Some(skip) });
+                    } else {
+                        self.chain.more_skipped += 1;
+                    }
+                }
+                return;
+            }
+        };
+        if !self.seen.insert(real.clone()) {
+            return;
+        }
+        // A file that resolves into the untrusted zone is the repository's,
+        // whoever imported it or linked to it, and its imports are confined
+        // to the nearest work tree around it; a user's file keeps its reach.
+        let reach = self.reach_of(&real).or(limit);
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let imports = if depth < MAX_IMPORT_DEPTH { memory_imports(&text) } else { Vec::new() };
+        let label = self.label(&real);
+        self.chain.files.push(MemoryFile { label, path: path.to_path_buf(), real: Some(real), bytes: raw.len() as u64, text, skipped: None });
+        let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        for spec in imports {
+            if let Some(target) = resolve_import(&spec, &base, self.home.as_deref()) {
+                self.add(&target, reach.clone(), depth + 1);
+            }
+        }
+    }
+}
+
+/// The CLAUDE.md chain of `project`, each file read once: the user's
+/// `~/.claude/CLAUDE.md`, then from the top directory down to the project's
+/// resolved root each one's `CLAUDE.md`, `.claude/CLAUDE.md` and
+/// `CLAUDE.local.md`, each followed by what it imports (an `AGENTS.md` counts
+/// only when imported). The directories from the project up to the
+/// outermost git work tree enclosing it ([`untrusted_root`]) are the
+/// repository's: each of their files, and anything that resolves into that
+/// zone, is read only when it resolves inside the nearest work tree around
+/// it ([`nearest_work_tree`]), so an import of `~/…`, `../…` or an absolute
+/// path, or a symlink, that leaves it is listed as skipped
+/// ([`MemorySkip::OutsideProject`]) and never read. The user's own file and
+/// the directories above the zone are the user's, and their imports may
+/// point anywhere. Every file is size-capped ([`read_memory_file`]); skipped
+/// files past [`MAX_LISTED_SKIPS`] are counted, not listed.
+pub fn memory_chain(project: &Path, home: Option<&Path>) -> MemoryChain {
+    let root = std::fs::canonicalize(project).ok();
+    let mut walk = ChainWalk {
+        untrusted: root.as_deref().map(untrusted_root),
+        root: root.clone(),
+        home: home.map(Path::to_path_buf),
+        home_real: home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())),
+        seen: HashSet::new(),
+        chain: MemoryChain::default(),
+    };
+    if let Some(h) = home {
+        walk.add(&h.join(".claude").join("CLAUDE.md"), None, 0);
+    }
+    let (Some(root), Some(untrusted)) = (root, walk.untrusted.clone()) else { return walk.chain };
+    // Every ancestor of the resolved root but the filesystem root, top down.
+    let mut dirs: Vec<&Path> = root.ancestors().filter(|d| d.parent().is_some()).collect();
+    dirs.reverse();
+    for dir in dirs {
+        let limit = dir.starts_with(&untrusted).then(|| nearest_work_tree(dir, &root));
+        for name in ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"] {
+            walk.add(&dir.join(name), limit.clone(), 0);
+        }
+    }
+    walk.chain
+}
+
+/// The files of a chain that were read, as request items.
+fn read_items(chain: &MemoryChain) -> Vec<CarriedItem> {
+    chain
+        .files
+        .iter()
+        .filter(|f| f.skipped.is_none())
+        .cloned()
+        .map(|f| CarriedItem {
+            kind: "memory".into(),
+            label: f.label,
+            path: Some(f.real.unwrap_or(f.path).display().to_string()),
+            count: 1,
+            bytes: f.bytes,
+            tokens: 0,
+        })
+        .collect()
+}
+
+/// The files of [`memory_chain`] that were read, as request items.
+pub fn memory_files(project: &Path, home: Option<&Path>) -> Vec<CarriedItem> {
+    read_items(&memory_chain(project, home))
+}
+
+/// A memory file the chain named but didn't read (`get_request_context`).
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedFile {
+    /// As [`CarriedItem::label`].
+    pub label: String,
+    /// The path as the chain named it.
+    pub path: String,
+    /// `outside the project` or `over 4 MiB`.
+    pub reason: String,
+}
+
+/// The skipped files of a chain, as `get_request_context` lists them.
+fn skipped_files(chain: &MemoryChain) -> Vec<SkippedFile> {
+    chain
+        .files
+        .iter()
+        .filter_map(|f| {
+            f.skipped.map(|why| SkippedFile {
+                label: f.label.clone(),
+                path: f.path.display().to_string(),
+                reason: why.as_str().to_string(),
+            })
+        })
+        .collect()
 }
 
 /// The project's skills then the user's (a project skill shadows a user
@@ -429,7 +667,8 @@ pub fn request_context(
         _ => (None, None),
     };
 
-    let mut items = memory_files(project, home);
+    let chain = memory_chain(project, home);
+    let mut items = read_items(&chain);
     items.extend(skills_item(project, home));
     items.extend(agents_item(project, home));
     RequestContext {
@@ -440,5 +679,7 @@ pub fn request_context(
         uncached_usd,
         usual_usd,
         items: apportion(items, measured_tokens),
+        skipped: skipped_files(&chain),
+        more_skipped: chain.more_skipped,
     }
 }

@@ -136,14 +136,20 @@ const CONVENTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md", "CONVENTIONS.md"];
 
 /// The project-conventions section appended to an API-substrate stage's system
 /// prompt: each convention file found at the workspace root, capped, deduped.
-/// Empty string when none exist.
+/// Empty string when none exist. Read the way Talk reads them
+/// (`request_context::read_memory_file`): a file that resolves outside the
+/// workspace (a symlink out of it) or is over 4 MiB is skipped.
 pub(crate) fn repo_conventions_section(workspace_path: &std::path::Path) -> String {
     let mut out = String::new();
     let mut seen: Vec<String> = Vec::new();
+    let Ok(root) = std::fs::canonicalize(workspace_path) else {
+        return out;
+    };
     for name in CONVENTION_FILES {
-        let Ok(content) = std::fs::read_to_string(workspace_path.join(name)) else {
+        let Ok(Some((_, raw))) = crate::request_context::read_memory_file(&workspace_path.join(name), Some(&root)) else {
             continue;
         };
+        let content = String::from_utf8_lossy(&raw);
         let trimmed = content.trim();
         if trimmed.is_empty() || seen.iter().any(|s| s == trimmed) {
             continue;

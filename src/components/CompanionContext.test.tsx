@@ -12,6 +12,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 const getThreadCost = vi.fn();
 const logbookSummary = vi.fn();
 const listMcpServerStatus = vi.fn();
+const listProjectInstructions = vi.fn();
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   return {
@@ -21,6 +22,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       getThreadCost: (...a: unknown[]) => getThreadCost(...a),
       logbookSummary: (...a: unknown[]) => logbookSummary(...a),
       listMcpServerStatus: (...a: unknown[]) => listMcpServerStatus(...a),
+      listProjectInstructions: (...a: unknown[]) => listProjectInstructions(...a),
       getThreadMcpDisabled: () => Promise.resolve([]),
     },
   };
@@ -44,6 +46,7 @@ beforeEach(() => {
   getThreadCost.mockReset().mockResolvedValue(cost());
   logbookSummary.mockReset().mockResolvedValue([]);
   listMcpServerStatus.mockReset().mockResolvedValue([]);
+  listProjectInstructions.mockReset().mockResolvedValue({ files: [], moreSkipped: 0 });
   useChatStore.setState({ activeThreadByWs: { ws: "t-1" }, messagesByWs: {}, streamingByWs: {}, continuingCalls: {} });
 });
 
@@ -198,6 +201,21 @@ describe("CompanionContext — budgets, capabilities, rows", () => {
       render(<CompanionContext {...baseProps} tokensUsed={250_000} tokensLimit={1_000_000} />);
     });
     expect(screen.getByText("250k / 1M")).toBeInTheDocument();
+  });
+
+  it("lists the instruction files the conversation follows, before the MCP servers", async () => {
+    listProjectInstructions.mockResolvedValue({
+      files: [{ label: "CLAUDE.md", path: "/wt/CLAUDE.md", tokens: 3100, trimmed: false }],
+      moreSkipped: 0,
+    });
+    listMcpServerStatus.mockResolvedValue([{ name: "docs-server", state: "connected", tools: 2, reason: null }]);
+    await act(async () => {
+      render(<CompanionContext {...baseProps} workspaceId="ws" worktreePath="/wt" />);
+    });
+    expect(listProjectInstructions).toHaveBeenCalledWith("/wt");
+    const follows = screen.getByTestId("companion-follows");
+    expect(follows).toHaveTextContent("followsCLAUDE.md");
+    expect(follows.compareDocumentPosition(screen.getByTestId("companion-can-use")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("omits the capabilities row when there is no MCP server", async () => {

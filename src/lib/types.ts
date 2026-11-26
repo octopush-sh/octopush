@@ -395,6 +395,28 @@ export interface McpServerStatus {
   reason: string | null;
 }
 
+/** One instruction file Talk and its sub-agents follow
+ *  (`list_project_instructions`): a file of the workspace's CLAUDE.md chain,
+ *  or its AGENTS.md when it has no CLAUDE.md. `label` is the path as the user
+ *  knows it (`CLAUDE.md`, `~/.claude/CLAUDE.md`); `tokens` estimates what the
+ *  file adds to each request; `trimmed` means it wasn't sent whole (with 0
+ *  tokens: left out, the section was full); `skipped` names why a file was
+ *  never read (`outside the project`, `over 4 MiB`). */
+export interface InstructionFile {
+  label: string;
+  path: string;
+  tokens: number;
+  trimmed: boolean;
+  skipped?: string | null;
+}
+
+/** What `list_project_instructions` answers: the files, and how many more
+ *  skipped files there were past the 20 listed. */
+export interface InstructionList {
+  files: InstructionFile[];
+  moreSkipped: number;
+}
+
 /** A configured MCP server (stdio): the command to spawn + its args/env. */
 export interface McpServerConfig {
   command: string;
@@ -541,6 +563,11 @@ export interface RequestContext {
   usualUsd: number | null;
   /** Largest first; they add up to `measuredTokens` when it is known. */
   items: CarriedItem[];
+  /** Memory files named but never read (a project file pointing outside the
+   *  project, a file over 4 MiB), at most 20. */
+  skipped: { label: string; path: string; reason: string }[];
+  /** Skipped files past those, counted. */
+  moreSkipped: number;
 }
 
 export interface ChatStreamEvent {
