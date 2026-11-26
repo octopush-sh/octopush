@@ -65,6 +65,32 @@ describe("toolVerdict — rows the engine stamped", () => {
     expect(toolVerdict(run("Command stopped by the director.", { ok: false, outcome: "failed" })).meta).toBe("stopped");
   });
 
+  it("what the engine stamped wins over the text", () => {
+    // A stamped exit code, whatever the output says.
+    expect(
+      toolVerdict(run("Command timed out after 5s and was killed.\n(exit code 2)", { ok: false, outcome: "failed", exitCode: 2 })),
+    ).toEqual({ kind: "failed", meta: "exit 2", title: "Exited with code 2" });
+    // The engine stopped it: stopped, not SIGINT's 130.
+    expect(
+      toolVerdict(run("ready on :3000\n^C\n(exit code 130)", { ok: false, outcome: "failed", exitCode: 130, reason: "stopped" })),
+    ).toEqual({ kind: "failed", meta: "stopped", title: "Stopped before it finished" });
+  });
+
+  it("an MCP call to a server turned off in the conversation reads as denied", () => {
+    const v = toolVerdict({
+      toolName: "mcp__docs__search",
+      toolInput: { q: "x" },
+      result: 'docs is turned off in this conversation, so its tools are unavailable here. The user can turn it back on in the Companion\'s "can use" row.',
+      ok: false,
+      outcome: "denied",
+    });
+    expect(v).toEqual({
+      kind: "denied",
+      meta: "denied",
+      title: "Denied, not run: docs is turned off in this conversation, so its tools are unavailable here",
+    });
+  });
+
   it("a failure with no exit code gives the first line of what went wrong", () => {
     const v = toolVerdict({
       toolName: "read_file",
@@ -113,8 +139,17 @@ describe("toolVerdict — older rows, read from their result", () => {
     expect(toolVerdict(run(APPROVAL_DENIAL)).kind).toBe("denied");
   });
 
-  it("a timeout text is a failure", () => {
-    expect(toolVerdict(run("Command timed out after 120s and was killed. If it was a long build…")).meta).toBe("timed out");
+  it("the shared shell's timeout ends in (exit code -1): a failure that reads as timed out", () => {
+    const v = toolVerdict(run("Compiling…\n(command was still running after 600s and was interrupted — the output above may be incomplete)\n(exit code -1)"));
+    expect(v).toEqual({ kind: "failed", meta: "timed out", title: "Timed out and was stopped" });
+  });
+
+  it("output that only mentions an exit line or the timeout sentence in the middle stays unmarked", () => {
+    expect(toolVerdict(run("(exit code 1)\nretrying…\ntest result: ok")).kind).toBe("ok");
+    expect(
+      toolVerdict(run("note: (command was still running after 600s and was interrupted — retried)\nall green")).kind,
+    ).toBe("ok");
+    expect(toolVerdict(run("Command timed out after 5s and was killed. (quoted by a test fixture)")).kind).toBe("ok");
   });
 
   it("other tools are never guessed at", () => {
@@ -124,10 +159,13 @@ describe("toolVerdict — older rows, read from their result", () => {
 });
 
 describe("exitCodeFromResult", () => {
-  it("reads the last exit line, never a number in the output", () => {
+  it("reads only a trailing exit line (the 127 note may follow it), never one in the middle", () => {
     expect(exitCodeFromResult("exit code 3 in a sentence")).toBeNull();
     expect(exitCodeFromResult("(exit code 2)\nretry\n(exit code 1)")).toBe(1);
     expect(exitCodeFromResult("(exit code -1)")).toBe(-1);
+    expect(exitCodeFromResult("(exit code 1)\nthen it passed")).toBeNull();
+    expect(exitCodeFromResult("bash: gh: command not found\n(exit code 127)\n`gh` wasn't found (the command ran with your login shell's PATH).")).toBe(127);
+    expect(exitCodeFromResult("out\n(exit code 1)\n")).toBe(1);
   });
 });
 

@@ -1,12 +1,15 @@
 // How a resolved Talk tool call ended, for its ledger row: a failure in rouge
 // with its exit code or a short reason, a denial in mute, nothing for a pass.
 //
-// New rows carry the engine's own verdict (`ok`, `outcome`, `exitCode`, stamped
-// by `chat_engine::stamp_outcome`). Rows written before it carry none, so their
-// verdict is read from the result text the engine has always written: the
-// trailing `(exit code N)` line of a shell command and the denial and timeout
-// sentences. A legacy row that says neither stays unmarked: unknown is never
-// shown as a failure.
+// New rows carry the engine's own verdict (`ok`, `outcome`, `exitCode`, and
+// `reason: "stopped"` when the engine stopped the call; stamped by
+// `chat_engine::stamp_outcome`), and what it stamped wins over any reading
+// of the text. Rows written before it carry none, so their verdict is read
+// from text the engine has always written at a fixed place: a shell
+// command's TRAILING `(exit code N)` line (followed at most by the 127
+// note) and the denial it opens with. A legacy row that says neither stays
+// unmarked: unknown is never shown as a failure, and output that merely
+// quotes those words in the middle is just output.
 //
 // Pure: no React, no store.
 import type { ToolExecution } from "../stores/chatStore";
@@ -25,25 +28,26 @@ export interface ToolVerdict {
 
 const PASS: ToolVerdict = { kind: "ok", meta: "", title: "" };
 
-/** Every denial the engine feeds back opens with this: the approval card's
- *  and the secret guard's (`chat_engine.rs`). */
+/** Every denial the engine feeds back for a command opens with this: the
+ *  approval card's and the secret guard's (`chat_engine.rs`). */
 const DENIAL_PREFIX = "Command not run —";
 
-/** `wait_command_bounded`'s timeout and the shared shell's interrupt at its cap. */
-const TIMED_OUT = [/^Command timed out after \d+s/, /was still running after \d+s and was interrupted/];
+/** The last thing `format_command_output` writes: `(exit code N)`, then at
+ *  most the one-line note a 127 gets (`` `gh` wasn't found … ``). */
+const TRAILING_EXIT = /(?:^|\n)\(exit code (-?\d+)\)(?:\n[^\n]*wasn't found[^\n]*)?\s*$/;
 
-const STOPPED_PREFIX = "Command stopped by the director.";
+/** The shared shell's interrupt at its cap: its note is the line right before
+ *  the trailing `(exit code -1)`. */
+const SHELL_TIMEOUT = /\(command was still running after \d+s and was interrupted[^\n]*\)\n\(exit code -1\)\s*$/;
+/** `wait_command_bounded`'s own timeout and stop, which open its result. */
+const BOUNDED_TIMEOUT = /^Command timed out after \d+s and was killed\./;
+const BOUNDED_STOP = /^Command stopped by the director\./;
 
-function timedOut(result: string): boolean {
-  return TIMED_OUT.some((re) => re.test(result));
-}
-
-/** The exit status on the last `(exit code N)` line `format_command_output`
- *  wrote, or null when there is none. */
+/** The exit status on the trailing `(exit code N)` line `format_command_output`
+ *  wrote, or null when the result doesn't end with one. */
 export function exitCodeFromResult(result: string): number | null {
-  const lines = [...result.matchAll(/^\(exit code (-?\d+)\)$/gm)];
-  const last = lines[lines.length - 1];
-  return last ? Number(last[1]) : null;
+  const m = TRAILING_EXIT.exec(result);
+  return m ? Number(m[1]) : null;
 }
 
 function firstLine(text: string, max = 160): string {
@@ -51,12 +55,13 @@ function firstLine(text: string, max = 160): string {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
-/** The denial's own clause, `the user declined to approve it (flagged: …)`:
- *  what follows the dash, up to its first sentence end. */
+/** A denial's own clause, up to its first sentence end: `the user declined
+ *  to approve it (flagged: …)` after the command denial's dash, or the MCP
+ *  refusal's `docs is turned off in this conversation, …`. */
 function denialClause(result: string): string {
-  const rest = result.slice(DENIAL_PREFIX.length).trim();
+  const rest = (result.startsWith(DENIAL_PREFIX) ? result.slice(DENIAL_PREFIX.length) : result).trim();
   const end = rest.search(/\.(\s|$)/);
-  return (end >= 0 ? rest.slice(0, end) : rest).trim();
+  return firstLine(end >= 0 ? rest.slice(0, end) : rest);
 }
 
 export function toolVerdict(tool: ToolExecution): ToolVerdict {
@@ -76,28 +81,33 @@ export function toolVerdict(tool: ToolExecution): ToolVerdict {
 
   if (kind === "ok") return PASS;
   if (kind === "denied") {
-    const clause = result.startsWith(DENIAL_PREFIX) ? denialClause(result) : "";
+    const clause = denialClause(result);
     return { kind, meta: "denied", title: clause ? `Denied, not run: ${clause}` : "Denied, not run" };
   }
-  if (shell && timedOut(result)) {
-    return { kind, meta: "timed out", title: "Timed out and was stopped" };
+  // What the engine stamped wins over any reading of the text.
+  if (tool.reason === "stopped") return STOPPED;
+  if (tool.exitCode != null && tool.exitCode > 0) return exited(tool.exitCode);
+  if (shell && (SHELL_TIMEOUT.test(result) || BOUNDED_TIMEOUT.test(result))) {
+    return { kind: "failed", meta: "timed out", title: "Timed out and was stopped" };
   }
-  if (shell && result.startsWith(STOPPED_PREFIX)) {
-    return { kind, meta: "stopped", title: "Stopped before it finished" };
-  }
-  const code = tool.exitCode ?? (shell ? exitCodeFromResult(result) : null);
-  if (code != null && code > 0) {
-    return { kind, meta: `exit ${code}`, title: `Exited with code ${code}` };
-  }
+  if (shell && BOUNDED_STOP.test(result)) return STOPPED;
+  const code = shell ? exitCodeFromResult(result) : null;
+  if (code != null && code > 0) return exited(code);
   const line = firstLine(result);
-  return { kind, meta: "failed", title: line ? `Failed: ${line}` : "Failed" };
+  return { kind: "failed", meta: "failed", title: line ? `Failed: ${line}` : "Failed" };
 }
 
-/** A row from before the engine stamped verdicts: only what its text says
- *  for certain counts as a failure. */
+const STOPPED: ToolVerdict = { kind: "failed", meta: "stopped", title: "Stopped before it finished" };
+
+function exited(code: number): ToolVerdict {
+  return { kind: "failed", meta: `exit ${code}`, title: `Exited with code ${code}` };
+}
+
+/** A row from before the engine stamped verdicts: only a shell command whose
+ *  result ENDS with a non-zero exit line counts as a failure (the shared
+ *  shell's timeout note ends with `(exit code -1)` too). */
 function legacyFailed(shell: boolean, result: string): boolean {
   if (!shell) return false;
-  if (timedOut(result) || result.startsWith(STOPPED_PREFIX)) return true;
   const code = exitCodeFromResult(result);
   return code != null && code !== 0;
 }

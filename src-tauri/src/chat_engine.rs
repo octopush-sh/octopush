@@ -242,26 +242,59 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
     s
 }
 
+/// How a call ended, as the engine knows it, for its row (`stamp_outcome`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RowVerdict {
+    ok: bool,
+    /// Not run: the user denied its approval card or the secret guard's, or
+    /// the conversation has the tool's MCP server turned off.
+    denied: bool,
+    /// A shell's exit status, when it reported one.
+    exit_code: Option<i32>,
+    /// The engine itself stopped it: Stop on the turn interrupted the agent's
+    /// command, or the user stopped a `$` process.
+    stopped: bool,
+}
+
 /// Stamp how a call ended on its persisted `role="tool"` row, so the resolved
 /// ledger row can read as failed or denied instead of looking like a pass:
-/// `ok`, `outcome` (`ok` · `failed` · `denied`) and, when a shell reported
-/// one, `exitCode`. Additive keys: rows written before them carry none, and
-/// the frontend reads their verdict from the result text instead
-/// (`lib/toolVerdict.ts`). A shell's `-1` is its "no status" sentinel (an
-/// interrupt, a busy shell), never an exit code, so it isn't recorded.
-fn stamp_outcome(record: &mut serde_json::Value, ok: bool, denied: bool, exit_code: Option<i32>) {
-    let outcome = if denied {
+/// `ok`, `outcome` (`ok` · `failed` · `denied`), `exitCode` when a shell
+/// reported one, and `reason: "stopped"` when the engine stopped it (so a
+/// stopped command reads as stopped, not as its SIGINT exit). Additive keys:
+/// rows written before them carry none, and the frontend reads their verdict
+/// from the result text instead (`lib/toolVerdict.ts`). A shell's `-1` is its
+/// "no status" sentinel (an interrupt, a busy shell), never an exit code, so
+/// it isn't recorded.
+fn stamp_outcome(record: &mut serde_json::Value, v: RowVerdict) {
+    let outcome = if v.denied {
         "denied"
-    } else if ok {
+    } else if v.ok {
         "ok"
     } else {
         "failed"
     };
-    record["ok"] = serde_json::json!(ok && !denied);
+    record["ok"] = serde_json::json!(v.ok && !v.denied);
     record["outcome"] = serde_json::json!(outcome);
-    if let Some(code) = exit_code.filter(|c| *c >= 0) {
+    if let Some(code) = v.exit_code.filter(|c| *c >= 0) {
         record["exitCode"] = serde_json::json!(code);
     }
+    if v.stopped && outcome == "failed" {
+        record["reason"] = serde_json::json!("stopped");
+    }
+}
+
+/// The persisted `role="tool"` row every call site writes: the call, what it
+/// returned, and how it ended. One builder, so what a row records is tested
+/// where it is made.
+fn tool_row(call_id: &str, tool_name: &str, tool_input: serde_json::Value, result: &str, v: RowVerdict) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "callId": call_id,
+        "toolName": tool_name,
+        "toolInput": tool_input,
+        "result": result,
+    });
+    stamp_outcome(&mut record, v);
+    record
 }
 
 /// The exit status bash gives a command it couldn't find.
@@ -1882,6 +1915,9 @@ pub struct ChatEngine {
     continuing: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The turn-limit gate for writing sub-agents (see `CapGate`).
     pub cap_gate: Arc<CapGate>,
+    /// Threads whose live `$` process the user stopped (`stop_shell`), so its
+    /// row reads as stopped when it exits.
+    stopped_shells: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ChatEngine {
@@ -1898,7 +1934,15 @@ impl ChatEngine {
             approvals: Arc::new(ApprovalBroker::default()),
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
+            stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Stop a thread's live `$` process (SIGINT), remembering that the user
+    /// did, so its row reads as stopped rather than as exit 130.
+    pub fn stop_shell(&self, thread_id: &str) {
+        self.stopped_shells.lock().insert(thread_id.to_string());
+        self.talk_shell.interrupt(thread_id);
     }
 
     /// The approval broker, for a sub-agent gate that outlives a `&self` borrow.
@@ -2528,13 +2572,13 @@ impl ChatEngine {
             ok,
             duration_ms: started.elapsed().as_millis() as u64,
         });
-        let mut record = serde_json::json!({
-            "callId": call_id,
-            "toolName": "run_command",
-            "toolInput": tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
-            "result": result_str,
-        });
-        stamp_outcome(&mut record, ok, false, exit_code);
+        let record = tool_row(
+            call_id,
+            "run_command",
+            tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
+            result_str,
+            RowVerdict { ok, exit_code, ..RowVerdict::default() },
+        );
         let _ = self.insert_and_emit_message(
             app, &request.workspace_id, &request.thread_id,
             "tool", &record.to_string(), None, None, None, None,
@@ -2554,6 +2598,9 @@ impl ChatEngine {
         live: crate::talk_shell::LiveRun,
     ) {
         let db = Arc::clone(&self.db);
+        let stopped_shells = Arc::clone(&self.stopped_shells);
+        // A Stop pressed before this process started isn't this process's.
+        stopped_shells.lock().remove(&request.thread_id);
         std::thread::Builder::new()
             .name(format!("talk-live-{call_id}"))
             .spawn(move || {
@@ -2585,13 +2632,16 @@ impl ChatEngine {
                     cwd_label: relativize_cwd(&exit.cwd, &request.workspace_path),
                 });
 
-                let mut record = serde_json::json!({
-                    "callId": call_id,
-                    "toolName": "run_command",
-                    "toolInput": tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
-                    "result": format_command_output(&exit.full_output, exit.exit_code),
-                });
-                stamp_outcome(&mut record, exit.exit_code == 0, false, Some(exit.exit_code));
+                // The user stopped it (`stop_shell`): it reads as stopped, not
+                // as the exit status SIGINT left it with.
+                let stopped = stopped_shells.lock().remove(&request.thread_id);
+                let record = tool_row(
+                    &call_id,
+                    "run_command",
+                    tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
+                    &format_command_output(&exit.full_output, exit.exit_code),
+                    RowVerdict { ok: exit.exit_code == 0, exit_code: Some(exit.exit_code), stopped, ..RowVerdict::default() },
+                );
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                 // The conversation may have been deleted while the process ran;
                 // don't leave an orphaned row (no FK from messages → threads).
@@ -3350,7 +3400,10 @@ impl ChatEngine {
                 let mut run_command_cwd = String::new();
                 // The shared shell's exit status, for the row's verdict.
                 let mut run_command_exit: Option<i32> = None;
-                let was_denied = denied.is_some();
+                // Stop interrupted the command: it reads as stopped.
+                let mut interrupted = false;
+                // Not run: denied at its card, or its MCP server is off here.
+                let mut was_denied = denied.is_some();
 
                 // Route MCP tools (`mcp__server__tool`) to their server; all
                 // other names are built-in workspace tools. MCP calls run off
@@ -3379,7 +3432,9 @@ impl ChatEngine {
                     // The list as it is now, not at the turn's start: a server
                     // turned off mid-turn stops here, one turned back on runs.
                     // (A call to a server not offered this turn can still be
-                    // copied from an earlier turn's history.)
+                    // copied from an earlier turn's history.) The user's own
+                    // setting refused it: its row reads as denied.
+                    was_denied = true;
                     (refusal, false)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
                     // Bounded, and a timeout STOPS the server so the call can
@@ -3427,6 +3482,7 @@ impl ChatEngine {
                             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                                 if cancel.load(Ordering::Relaxed) {
                                     self.talk_shell.interrupt(&request.thread_id);
+                                    interrupted = true;
                                 }
                             }
                         }
@@ -3529,13 +3585,13 @@ impl ChatEngine {
                 } else {
                     input_for_display
                 };
-                let mut tool_record = serde_json::json!({
-                    "callId": u.id,
-                    "toolName": u.name,
-                    "toolInput": display_input,
-                    "result": result,
-                });
-                stamp_outcome(&mut tool_record, ok, was_denied, run_command_exit);
+                let mut tool_record = tool_row(
+                    &u.id,
+                    &u.name,
+                    display_input,
+                    &result,
+                    RowVerdict { ok, denied: was_denied, exit_code: run_command_exit, stopped: interrupted },
+                );
                 if let Some(meta) = &agent_meta {
                     // Report already sits in `result`; the meta is what the
                     // card's collapsed summary shows (tokens, cost, ending).
@@ -4503,34 +4559,77 @@ mod login_path_tests {
     #[test]
     fn a_tool_row_records_how_the_call_ended() {
         let row = || serde_json::json!({ "callId": "c1", "toolName": "run_command", "result": "x" });
+        let v = |ok, denied, exit_code, stopped| RowVerdict { ok, denied, exit_code, stopped };
 
         let mut passed = row();
-        stamp_outcome(&mut passed, true, false, Some(0));
+        stamp_outcome(&mut passed, v(true, false, Some(0), false));
         assert_eq!(passed["ok"], true);
         assert_eq!(passed["outcome"], "ok");
         assert_eq!(passed["exitCode"], 0);
+        assert!(passed.get("reason").is_none());
 
         let mut failed = row();
-        stamp_outcome(&mut failed, false, false, Some(101));
+        stamp_outcome(&mut failed, v(false, false, Some(101), false));
         assert_eq!(failed["ok"], false);
         assert_eq!(failed["outcome"], "failed");
         assert_eq!(failed["exitCode"], 101);
 
         // A denial is its own verdict, never a pass, whatever `ok` said.
         let mut denied = row();
-        stamp_outcome(&mut denied, true, true, None);
+        stamp_outcome(&mut denied, v(true, true, None, false));
         assert_eq!(denied["ok"], false);
         assert_eq!(denied["outcome"], "denied");
         assert!(denied.get("exitCode").is_none());
 
         // The shell's -1 means "no status" (an interrupt, a busy shell).
         let mut interrupted = row();
-        stamp_outcome(&mut interrupted, false, false, Some(-1));
+        stamp_outcome(&mut interrupted, v(false, false, Some(-1), false));
         assert_eq!(interrupted["outcome"], "failed");
         assert!(interrupted.get("exitCode").is_none());
 
         // The keys are additive: the row keeps everything it had.
         assert_eq!(interrupted["callId"], "c1");
         assert_eq!(interrupted["result"], "x");
+    }
+
+    #[test]
+    fn what_each_call_site_persists_reads_its_verdict() {
+        // `$`-direct, stopped by the user while it ran: the row the live
+        // streamer writes reads as stopped, with SIGINT's 130 kept as data.
+        let input = serde_json::json!({ "command": "npm run dev", "cwd": "packages/api" });
+        let stopped = tool_row(
+            "shell-7",
+            "run_command",
+            input.clone(),
+            "ready on :3000\n^C\n(exit code 130)",
+            RowVerdict { ok: false, exit_code: Some(130), stopped: true, ..RowVerdict::default() },
+        );
+        assert_eq!(stopped["callId"], "shell-7");
+        assert_eq!(stopped["toolName"], "run_command");
+        assert_eq!(stopped["toolInput"], input, "the cwd badge's input is kept as is");
+        assert_eq!((stopped["outcome"].as_str(), stopped["reason"].as_str()), (Some("failed"), Some("stopped")));
+        assert_eq!(stopped["exitCode"], 130);
+
+        // The agent loop's MCP call to a server turned off in the conversation.
+        let refused = tool_row(
+            "toolu_1",
+            "mcp__docs__search",
+            serde_json::json!({ "q": "x" }),
+            &crate::chat_agents::mcp_off_refusal("mcp__docs__search", &["docs".to_string()].into_iter().collect()).unwrap(),
+            RowVerdict { denied: true, ..RowVerdict::default() },
+        );
+        assert_eq!(refused["outcome"], "denied");
+        assert!(refused.get("reason").is_none() && refused.get("exitCode").is_none());
+
+        // A command that passed carries no reason even if a stop raced it.
+        let passed = tool_row(
+            "toolu_2",
+            "run_command",
+            serde_json::json!({ "command": "true" }),
+            "(exit code 0)",
+            RowVerdict { ok: true, exit_code: Some(0), stopped: true, ..RowVerdict::default() },
+        );
+        assert_eq!(passed["outcome"], "ok");
+        assert!(passed.get("reason").is_none());
     }
 }

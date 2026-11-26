@@ -25,6 +25,8 @@ export interface ToolExecution {
   outcome?: "ok" | "failed" | "denied";
   /** A shell command's exit status, when its shell reported one. */
   exitCode?: number;
+  /** Why a failed call ended, when the engine knows: it stopped it. */
+  reason?: "stopped";
   /** Present on a resolved `Agent`/`Task` row: how the sub-agent ended and
    *  what it cost (the report itself is `result`). */
   agent?: AgentMeta;
