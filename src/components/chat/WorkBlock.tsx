@@ -6,6 +6,7 @@ import { memo, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import type { ToolExecution } from "../../stores/chatStore";
 import { ROUND_FOLD_AT, toolCallCount, type WorkEntry } from "../../lib/talkWork";
+import { verdictCounts } from "../../lib/toolVerdict";
 import { tourId } from "../../lib/tour/ids";
 import { ToolCallCard, toolLabel, summarizeTool } from "../ToolCallCard";
 import { ChatMarkdown } from "./ChatMarkdown";
@@ -124,6 +125,11 @@ function ToolRound({
   }
   const summary = foldable ? roundSummary(tools.map((t) => t.tool)) : [];
   const plain = summary.map((p) => `${p.verb} ${p.objects.join(", ")}`).join(" · ");
+  // A folded round hides its rows' verdicts, so its summary says them: a
+  // failure in rouge, a denial in mute, a round of passes nothing extra.
+  const { failed, denied } = foldable ? verdictCounts(tools.map((t) => t.tool)) : { failed: 0, denied: 0 };
+  const verdicts = [failed > 0 ? `${failed} failed` : "", denied > 0 ? `${denied} denied` : ""].filter(Boolean);
+  const counted = verdicts.length > 0 ? `${label} (${verdicts.join(", ")})` : label;
 
   // ONE tree for every size: the rows always live under the same Reveal with
   // stable keys, so a round growing from five to six calls (or folding when
@@ -138,7 +144,7 @@ function ToolRound({
           aria-expanded={open}
           onClick={() => setOpen((v) => !v)}
           data-tour={tourId("talk-work-fold")}
-          title={open ? `Fold the ${label}` : `Show the ${label}: ${plain}`}
+          title={open ? `Fold the ${counted}` : `Show the ${counted}: ${plain}`}
           className="octo-fade-in -ml-1.5 flex h-6 min-w-0 items-center gap-2.5 rounded px-1.5 text-left text-octo-mute transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:bg-[var(--brass-faint)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
         >
           <ChevronRight
@@ -148,7 +154,11 @@ function ToolRound({
             className="shrink-0 transition-transform duration-[var(--dur-quick)] ease-[var(--ease-octo)]"
             style={{ transform: open ? "rotate(90deg)" : undefined }}
           />
-          <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.2em]">{label}</span>
+          <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.2em]">
+            {label}
+            {failed > 0 && <span data-testid="round-failed" className="text-octo-rouge"> · {failed} failed</span>}
+            {denied > 0 && <span data-testid="round-denied"> · {denied} denied</span>}
+          </span>
           <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">
             {summary.map((p, i) => (
               <span key={i}>
@@ -160,11 +170,12 @@ function ToolRound({
           </span>
         </button>
       )}
-      {/* The Reveal clips its content, so it reaches 6px into the hairline's
+      {/* The Reveal clips its content, so it reaches 16px into the hairline's
           gutter and gives it back as padding: the rows' hover wash, which
-          pulls left by the same 6px, is never cut. */}
-      <Reveal open={!foldable || open} className="-ml-1.5">
-        <div className="flex flex-col pl-1.5">
+          pulls left by 6px, and a failed row's verdict dot, which sits on
+          the hairline 15.5px left of the row, are never cut. */}
+      <Reveal open={!foldable || open} className="-ml-4">
+        <div className="flex flex-col pl-4">
           {tools.map(({ id, tool }) => (
             <ToolCallCard
               key={`tool-${id}`}

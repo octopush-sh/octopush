@@ -242,6 +242,28 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
     s
 }
 
+/// Stamp how a call ended on its persisted `role="tool"` row, so the resolved
+/// ledger row can read as failed or denied instead of looking like a pass:
+/// `ok`, `outcome` (`ok` · `failed` · `denied`) and, when a shell reported
+/// one, `exitCode`. Additive keys: rows written before them carry none, and
+/// the frontend reads their verdict from the result text instead
+/// (`lib/toolVerdict.ts`). A shell's `-1` is its "no status" sentinel (an
+/// interrupt, a busy shell), never an exit code, so it isn't recorded.
+fn stamp_outcome(record: &mut serde_json::Value, ok: bool, denied: bool, exit_code: Option<i32>) {
+    let outcome = if denied {
+        "denied"
+    } else if ok {
+        "ok"
+    } else {
+        "failed"
+    };
+    record["ok"] = serde_json::json!(ok && !denied);
+    record["outcome"] = serde_json::json!(outcome);
+    if let Some(code) = exit_code.filter(|c| *c >= 0) {
+        record["exitCode"] = serde_json::json!(code);
+    }
+}
+
 /// The exit status bash gives a command it couldn't find.
 const NOT_FOUND_EXIT: i32 = 127;
 
@@ -2417,7 +2439,7 @@ impl ChatEngine {
                 // Hard failure (daemon down / spawn failed) — surface as a card.
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, false, started,
-                    &format!("Shell error: {e}"), "",
+                    &format!("Shell error: {e}"), "", None,
                 );
                 return Err(e);
             }
@@ -2437,6 +2459,7 @@ impl ChatEngine {
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, result.ok, started,
                     &format_command_output(&result.output, result.exit_code), &result.cwd,
+                    Some(result.exit_code),
                 );
                 // Compute the badge label once here (the single source) so the
                 // frontend renders it verbatim instead of re-deriving the rule.
@@ -2448,7 +2471,7 @@ impl ChatEngine {
                 let note = "A live process is already running in this conversation — \
                             stop it before running another command.";
                 self.resolve_shell_card(
-                    &app, &request, &call_id, &tool_input, false, started, note, "",
+                    &app, &request, &call_id, &tool_input, false, started, note, "", None,
                 );
                 Ok(ShellResult {
                     output: note.to_string(),
@@ -2496,6 +2519,7 @@ impl ChatEngine {
         started: std::time::Instant,
         result_str: &str,
         abs_cwd: &str,
+        exit_code: Option<i32>,
     ) {
         let _ = app.emit("chat://tool-end", &ToolEndEvent {
             workspace_id: request.workspace_id.clone(),
@@ -2504,12 +2528,13 @@ impl ChatEngine {
             ok,
             duration_ms: started.elapsed().as_millis() as u64,
         });
-        let record = serde_json::json!({
+        let mut record = serde_json::json!({
             "callId": call_id,
             "toolName": "run_command",
             "toolInput": tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
             "result": result_str,
         });
+        stamp_outcome(&mut record, ok, false, exit_code);
         let _ = self.insert_and_emit_message(
             app, &request.workspace_id, &request.thread_id,
             "tool", &record.to_string(), None, None, None, None,
@@ -2560,12 +2585,13 @@ impl ChatEngine {
                     cwd_label: relativize_cwd(&exit.cwd, &request.workspace_path),
                 });
 
-                let record = serde_json::json!({
+                let mut record = serde_json::json!({
                     "callId": call_id,
                     "toolName": "run_command",
                     "toolInput": tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
                     "result": format_command_output(&exit.full_output, exit.exit_code),
                 });
+                stamp_outcome(&mut record, exit.exit_code == 0, false, Some(exit.exit_code));
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                 // The conversation may have been deleted while the process ran;
                 // don't leave an orphaned row (no FK from messages → threads).
@@ -3322,6 +3348,9 @@ impl ChatEngine {
                 // Absolute cwd a run_command executed in (shared shell), captured
                 // so its card can show the cwd badge. Empty for other tools.
                 let mut run_command_cwd = String::new();
+                // The shared shell's exit status, for the row's verdict.
+                let mut run_command_exit: Option<i32> = None;
+                let was_denied = denied.is_some();
 
                 // Route MCP tools (`mcp__server__tool`) to their server; all
                 // other names are built-in workspace tools. MCP calls run off
@@ -3407,6 +3436,7 @@ impl ChatEngine {
                             // Record where it ran (absolute) so the card shows the
                             // cwd badge, matching `$`-direct.
                             run_command_cwd = r.cwd.clone();
+                            run_command_exit = Some(r.exit_code);
                             // Keep the composer's cwd badge accurate if the agent
                             // `cd`'d the shared shell.
                             if !r.cwd.is_empty() {
@@ -3505,6 +3535,7 @@ impl ChatEngine {
                     "toolInput": display_input,
                     "result": result,
                 });
+                stamp_outcome(&mut tool_record, ok, was_denied, run_command_exit);
                 if let Some(meta) = &agent_meta {
                     // Report already sits in `result`; the meta is what the
                     // card's collapsed summary shows (tokens, cost, ending).
@@ -4467,5 +4498,39 @@ mod login_path_tests {
         );
         assert_eq!(format_command_output("nope", 1), "nope\n(exit code 1)");
         assert_eq!(format_command_output("", 0), "(exit code 0)");
+    }
+
+    #[test]
+    fn a_tool_row_records_how_the_call_ended() {
+        let row = || serde_json::json!({ "callId": "c1", "toolName": "run_command", "result": "x" });
+
+        let mut passed = row();
+        stamp_outcome(&mut passed, true, false, Some(0));
+        assert_eq!(passed["ok"], true);
+        assert_eq!(passed["outcome"], "ok");
+        assert_eq!(passed["exitCode"], 0);
+
+        let mut failed = row();
+        stamp_outcome(&mut failed, false, false, Some(101));
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["outcome"], "failed");
+        assert_eq!(failed["exitCode"], 101);
+
+        // A denial is its own verdict, never a pass, whatever `ok` said.
+        let mut denied = row();
+        stamp_outcome(&mut denied, true, true, None);
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["outcome"], "denied");
+        assert!(denied.get("exitCode").is_none());
+
+        // The shell's -1 means "no status" (an interrupt, a busy shell).
+        let mut interrupted = row();
+        stamp_outcome(&mut interrupted, false, false, Some(-1));
+        assert_eq!(interrupted["outcome"], "failed");
+        assert!(interrupted.get("exitCode").is_none());
+
+        // The keys are additive: the row keeps everything it had.
+        assert_eq!(interrupted["callId"], "c1");
+        assert_eq!(interrupted["result"], "x");
     }
 }
