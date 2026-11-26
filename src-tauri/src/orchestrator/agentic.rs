@@ -6,9 +6,9 @@ use crate::chat_engine::{build_llm_tools, execute_tool_cancellable};
 use crate::error::{AppResult, ProviderErrorKind};
 use crate::orchestrator::types::{BlockedAsk, BlockedQuestion, ToolCallLog};
 use crate::providers::{
-    complete_with_retry, interruptible_sleep, Effort, LlmContent, LlmMessage, LlmProvider,
-    LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmTool, LlmToolResult, LlmToolUse,
-    DEFAULT_MAX_RETRIES,
+    complete_with_retry, interruptible_sleep, retry_notice, Effort, LlmContent, LlmMessage,
+    LlmProvider, LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmTool, LlmToolResult,
+    LlmToolUse, DEFAULT_MAX_RETRIES,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,8 +37,9 @@ pub fn max_tokens_for(effort: Option<Effort>) -> u32 {
 /// rate-limit headroom the provider just reported. Returns `Some(secs)` only
 /// when the remaining input-token budget is below what this turn consumed — the
 /// context only grows, so the next call would almost certainly 429 — and the
-/// window's reset delay is known. Bounded by [`MAX_THROTTLE_SECS`].
-fn compute_throttle(resp: &LlmResponse) -> Option<u64> {
+/// window's reset delay is known. Bounded by [`MAX_THROTTLE_SECS`]. Talk's
+/// director paces itself with the same rule.
+pub(crate) fn compute_throttle(resp: &LlmResponse) -> Option<u64> {
     let rl = resp.rate_limit.as_ref()?;
     let remaining = rl.input_tokens_remaining?;
     let reset = rl.reset_after_secs?;
@@ -47,6 +48,11 @@ fn compute_throttle(resp: &LlmResponse) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// The journal/turn line for a proactive rate-limit pause of `wait` seconds.
+pub(crate) fn throttle_notice(wait: u64) -> String {
+    format!("input-token budget low — pausing {wait}s for the rate-limit window to reset")
 }
 
 /// Cap an oversized tool result before it's fed back to the model. The FULL
@@ -414,10 +420,7 @@ async fn answer_ask_stage(
         cache: false,
     };
     let mut on_retry = |attempt: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
-        emitter.notice(&format!(
-            "{} — retrying in {delay}s (attempt {attempt} of {DEFAULT_MAX_RETRIES})",
-            kind.label()
-        ));
+        emitter.notice(&retry_notice(attempt, delay, kind));
     };
     match complete_with_retry(
         provider.as_ref(),
@@ -785,9 +788,7 @@ pub async fn run_agentic_loop(
         // Proactive throttle: ride out a nearly-spent input-token window instead
         // of charging into a guaranteed 429. Interruptible by a director stop.
         if let Some(wait) = pending_throttle.take() {
-            emitter.notice(&format!(
-                "input-token budget low — pausing {wait}s for the rate-limit window to reset"
-            ));
+            emitter.notice(&throttle_notice(wait));
             if !interruptible_sleep(wait, cancel).await {
                 emitter.notice("stopped by the director");
                 out.text = "(stopped by the director)".to_string();
@@ -821,15 +822,12 @@ pub async fn run_agentic_loop(
             // history are re-sent every iteration — cache the stable prefix.
             cache: true,
         };
-        // Transient failures (rate limit, overload, 5xx, dropped connection) are
+        // Transient failures (rate limit, overload, 5xx, a connection that never opened) are
         // retried in place with backoff — the accumulated message history is
         // preserved, so a momentary blip never costs the stage its work or forces
         // a halt. Each wait is narrated into the journal.
         let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
-            emitter.notice(&format!(
-                "{} — retrying in {delay}s (attempt {attempt} of {DEFAULT_MAX_RETRIES})",
-                kind.label()
-            ));
+            emitter.notice(&retry_notice(attempt, delay, kind));
         };
         let resp = complete_with_retry(
             provider,
@@ -1151,10 +1149,7 @@ pub async fn run_agentic_loop(
             cache: true,
         };
         let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
-            emitter.notice(&format!(
-                "{} — retrying in {delay}s (attempt {attempt} of {DEFAULT_MAX_RETRIES})",
-                kind.label()
-            ));
+            emitter.notice(&retry_notice(attempt, delay, kind));
         };
         match complete_with_retry(
             provider,

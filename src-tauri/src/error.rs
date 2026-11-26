@@ -4,10 +4,12 @@ use thiserror::Error;
 /// How a provider call failed, coarse enough to drive a retry decision.
 ///
 /// The split that matters is [`ProviderErrorKind::is_transient`]: a rate limit,
-/// an overloaded model, a 5xx, or a dropped connection are momentary — the work
-/// isn't wrong, the substrate was briefly unavailable, so the right response is
-/// to wait and try the SAME call again. Everything else (auth, bad request) is a
-/// standing fault that retrying can't fix.
+/// an overloaded model, a 5xx, or a connection that couldn't be opened are
+/// momentary — the work isn't wrong, the substrate was briefly unavailable, so
+/// the right response is to wait and try the SAME call again. Everything else
+/// is not retried: auth and bad requests are standing faults, and a request
+/// that went out but got no answer (`providers::request_error`) may still be
+/// running at the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderErrorKind {
@@ -17,7 +19,8 @@ pub enum ProviderErrorKind {
     Overloaded,
     /// HTTP 5xx (other than 529) — a transient server-side fault.
     ServerError,
-    /// The request never completed (connection reset, DNS, timeout).
+    /// The connection couldn't be opened (refused, DNS failure, connect
+    /// timeout): the request never reached the provider.
     Network,
     /// HTTP 401/403 — missing or invalid credentials.
     Auth,

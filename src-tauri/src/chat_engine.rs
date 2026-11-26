@@ -16,15 +16,18 @@ use crate::chat_history::{
     build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
 };
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ProviderErrorKind};
 use crate::providers::{
     anthropic::AnthropicProvider,
+    complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
-    LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
-    LlmStopReason, LlmTool, LlmToolResult,
+    retry_notice, Completion, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
+    LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
-use crate::orchestrator::agentic::{resume_messages_for_answered_block, resume_messages_for_continuation, BlockedTranscript};
+use crate::orchestrator::agentic::{
+    compute_throttle, resume_messages_for_answered_block, resume_messages_for_continuation, throttle_notice, BlockedTranscript,
+};
 use crate::token_engine;
 use parking_lot::Mutex;
 use reqwest::Client;
@@ -414,6 +417,31 @@ pub struct ChatStreamEvent {
     pub done: bool,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+}
+
+/// The director's live status line while it waits on the provider: a retry
+/// after a transient failure, or a pause for the rate-limit window. Not
+/// persisted; the Player shows `text` for `delay_secs`, or until the turn
+/// moves on (a stream delta, a row, a tool start).
+pub const TURN_NOTICE_EVENT: &str = "chat://notice";
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnNoticeEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub text: String,
+    pub delay_secs: u64,
+}
+
+/// A journal line ("model overloaded — retrying in 8s …") as the Player's
+/// label: the same words, starting with a capital.
+fn notice_label(line: &str) -> String {
+    let mut chars = line.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Emitted the moment a tool BEGINS executing — before the (potentially slow)
@@ -1687,12 +1715,15 @@ pub(crate) fn execute_tool_cancellable(
 /// connection pool behind an `Arc`, so cloning it shares the pool — every
 /// LLM caller (ChatEngine, `ai_complete`, orchestrator) should go through
 /// this instead of `Client::new()`, which would pay a fresh TLS handshake
-/// on every call. Built by `tls::client`, so it carries the compromised-key
-/// denylist like every other Octopush client.
+/// on every call. Built by `tls::llm_client`, so it carries the
+/// compromised-key denylist like every other Octopush client, plus a connect
+/// bound, an idle read bound and TCP keep-alive: a dropped connection fails
+/// instead of hanging a turn forever. (A model server on this Mac gets the
+/// loopback client instead: `providers::client_for`.)
 static SHARED_HTTP: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
 
 pub(crate) fn shared_http_client() -> &'static Client {
-    SHARED_HTTP.get_or_init(crate::tls::client)
+    SHARED_HTTP.get_or_init(crate::tls::llm_client)
 }
 
 /// Build the static tool list as normalized `LlmTool[]`.
@@ -2047,6 +2078,68 @@ impl ChatEngine {
             return (format!("Tool output #{message_id} is empty"), true);
         }
         (window_text(&result, offset, limit), true)
+    }
+
+    /// Show `line` (a journal line, e.g. a retry or a rate-limit pause) on
+    /// the turn's Player for `delay_secs`. Live only: nothing is persisted.
+    fn emit_turn_notice(&self, app: &AppHandle, workspace_id: &str, thread_id: &str, line: &str, delay_secs: u64) {
+        let _ = app.emit(TURN_NOTICE_EVENT, &TurnNoticeEvent {
+            workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
+            text: notice_label(line),
+            delay_secs,
+        });
+    }
+
+    /// One director request: transient failures (429, 529, 5xx, a connection
+    /// that couldn't be opened) are retried with the sub-agents' backoff and
+    /// `retry-after` handling, each wait shown on the Player; a request that
+    /// went out and got no answer is never sent again (`request_error`). The
+    /// whole call is raced against the turn's cancel flag, so Stop abandons
+    /// the request in flight instead of waiting for its answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn director_call(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        provider: &dyn LlmProvider,
+        api_base: &str,
+        api_key: Option<&str>,
+        req: &LlmRequest,
+        cancel: &AtomicBool,
+    ) -> Completion {
+        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+            tracing::warn!(attempt, delay, kind = kind.label(), "Talk director: provider call failed; retrying");
+            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, delay, kind), delay);
+        };
+        complete_cancellable(provider, api_base, api_key, req, &self.client, cancel, DEFAULT_MAX_RETRIES, &mut on_retry)
+            .await
+    }
+
+    /// End a turn on a provider failure: persist it as the turn's `error`
+    /// row and hand back the error the command rejects with. Both carry the
+    /// same text, so the frontend shows one card. After retries ran out, the
+    /// text says so and how to go on (`final_failure_text`); the thread is
+    /// untouched and takes the next message as usual.
+    fn fail_turn(&self, app: &AppHandle, workspace_id: &str, thread_id: &str, error: AppError, retries: u32) -> AppError {
+        let error = match error.transient_retry() {
+            Some((kind, retry_after)) if retries > 0 => {
+                AppError::Provider { kind, retry_after, message: final_failure_text(&error, retries) }
+            }
+            _ => error,
+        };
+        if let Err(persist_err) = self.insert_and_emit_message(
+            app,
+            workspace_id,
+            thread_id,
+            "error",
+            &error.to_string(),
+            None, None, None, None,
+        ) {
+            tracing::error!(error = %persist_err, "failed to persist error message");
+        }
+        error
     }
 
     /// Persist a brief "stopped" marker and emit the done event so the frontend
@@ -2942,10 +3035,17 @@ impl ChatEngine {
             saved_settings.as_ref().and_then(|s| s.subagent_max_turns),
         );
 
+        // How long to pause before the next request, from the previous
+        // response's rate-limit headroom (`compute_throttle`, the sub-agents'
+        // rule): riding out a nearly spent input-token window beats charging
+        // into a 429.
+        let mut pending_throttle: Option<u64> = None;
+
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
-            // Stop cleanly if the user cancelled this turn (checked here and
-            // after each tool — the in-flight request itself isn't aborted).
+            // Stop cleanly if the user cancelled this turn. Checked here and
+            // after each tool; a request in flight is abandoned by
+            // `director_call` itself.
             if cancel.load(Ordering::Relaxed) {
                 self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
                 return Ok(());
@@ -2967,6 +3067,14 @@ impl ChatEngine {
                 let verdict = self.db.lock().check_budget(Some(&request.workspace_id))?;
                 if should_stop_for_budget(iteration, request.override_budget, &verdict) {
                     self.finish_budget_capped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                    return Ok(());
+                }
+            }
+
+            if let Some(wait) = pending_throttle.take() {
+                self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &throttle_notice(wait), wait);
+                if !interruptible_sleep(wait, &cancel).await {
+                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
                     return Ok(());
                 }
             }
@@ -2993,29 +3101,35 @@ impl ChatEngine {
                 cache: true,
             };
 
-            let response = match provider
-                .complete(&api_base, api_key.as_deref(), &llm_req, &self.client)
+            let response = match self
+                .director_call(
+                    &app,
+                    &request.workspace_id,
+                    &request.thread_id,
+                    provider.as_ref(),
+                    &api_base,
+                    api_key.as_deref(),
+                    &llm_req,
+                    &cancel,
+                )
                 .await
             {
-                Ok(r) => r,
-                Err(e) => {
-                    let error_text = format!("{e}");
-                    if let Err(persist_err) = self.insert_and_emit_message(
-                        &app,
-                        &request.workspace_id,
-                        &request.thread_id,
-                        "error",
-                        &error_text,
-                        None, None, None, None,
-                    ) {
-                        tracing::error!(error = %persist_err, "failed to persist error message");
-                    }
-                    return Err(e);
+                Completion::Done(r) => r,
+                // Stopped mid-request or mid-backoff: the same quiet ending as
+                // a stop between rounds. Every earlier round's rows are
+                // already persisted; the abandoned request left none.
+                Completion::Cancelled => {
+                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                    return Ok(());
+                }
+                Completion::Failed { error, retries } => {
+                    return Err(self.fail_turn(&app, &request.workspace_id, &request.thread_id, error, retries));
                 }
             };
 
             usage.add(&request.model, &response);
             self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
+            pending_throttle = compute_throttle(&response);
 
             tracing::info!(
                 iteration = iteration,
@@ -3677,6 +3791,13 @@ impl ChatEngine {
             effort: None,
             cache: true,
         };
+        if let Some(wait) = pending_throttle.take() {
+            self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &throttle_notice(wait), wait);
+            if !interruptible_sleep(wait, &cancel).await {
+                self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                return Ok(());
+            }
+        }
         // Only reachable with a configured limit (an unlimited loop never
         // exhausts); the wording names it.
         let limit = match max_iterations {
@@ -3687,11 +3808,20 @@ impl ChatEngine {
             max_iterations = ?max_iterations,
             "agentic loop: iteration cap reached — asking the model to close with what it has"
         );
-        match provider
-            .complete(&api_base, api_key.as_deref(), &close_req, &self.client)
+        match self
+            .director_call(
+                &app,
+                &request.workspace_id,
+                &request.thread_id,
+                provider.as_ref(),
+                &api_base,
+                api_key.as_deref(),
+                &close_req,
+                &cancel,
+            )
             .await
         {
-            Ok(response) => {
+            Completion::Done(response) => {
                 usage.add(&request.model, &response);
                 self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
                 let final_text = response.text.trim().to_string();
@@ -3731,8 +3861,12 @@ impl ChatEngine {
                 }
                 tracing::warn!("forced close returned no text; surfacing the cap as an error");
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "forced close failed; surfacing the cap as an error");
+            Completion::Cancelled => {
+                self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                return Ok(());
+            }
+            Completion::Failed { error, .. } => {
+                tracing::warn!(error = %error, "forced close failed; surfacing the cap as an error");
             }
         }
 
@@ -4491,5 +4625,38 @@ mod login_path_tests {
         );
         assert_eq!(format_command_output("nope", 1), "nope\n(exit code 1)");
         assert_eq!(format_command_output("", 0), "(exit code 0)");
+    }
+}
+
+#[cfg(test)]
+mod director_reliability_tests {
+    use super::*;
+
+    #[test]
+    fn a_journal_line_becomes_a_player_label() {
+        assert_eq!(
+            notice_label(&retry_notice(2, 4, ProviderErrorKind::RateLimit)),
+            "Rate limit reached — retrying in 4s (retry 2 of 5)"
+        );
+        assert_eq!(
+            notice_label(&throttle_notice(20)),
+            "Input-token budget low — pausing 20s for the rate-limit window to reset"
+        );
+        assert_eq!(notice_label(""), "");
+    }
+
+    #[test]
+    fn the_notice_event_is_camel_case() {
+        let v = serde_json::to_value(TurnNoticeEvent {
+            workspace_id: "ws".into(),
+            thread_id: "t".into(),
+            text: "Model overloaded — retrying in 2s (retry 1 of 5)".into(),
+            delay_secs: 2,
+        })
+        .unwrap();
+        assert_eq!(v["workspaceId"], "ws");
+        assert_eq!(v["threadId"], "t");
+        assert_eq!(v["delaySecs"], 2);
+        assert_eq!(TURN_NOTICE_EVENT, "chat://notice");
     }
 }

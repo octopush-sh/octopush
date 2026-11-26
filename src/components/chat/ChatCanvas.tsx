@@ -58,6 +58,9 @@ export function ChatCanvas({
   const stopRequested = useChatStore((s) => s.stopRequestedByWs[workspaceId] ?? false);
   const pendingApprovals = useChatStore((s) => s.getPendingApprovals(workspaceId));
   const activeThreadId = useChatStore((s) => s.activeThreadByWs[workspaceId]);
+  const turnNotice = useChatStore((s) =>
+    activeThreadId ? (s.turnNoticeByThread[activeThreadId]?.text ?? null) : null,
+  );
   const respondApproval = useChatStore((s) => s.respondApproval);
   const pendingCaps = useChatStore((s) => s.getPendingCaps(workspaceId));
   const skillNames = useChatStore((s) => s.getSkillNames(workspaceId));
@@ -432,6 +435,7 @@ export function ChatCanvas({
         streamBuffer={streamBuffer}
         liveTools={liveTools}
         approvals={approvalsForThread.length}
+        notice={streaming ? turnNotice : null}
       />
       {showJump && (
         <button

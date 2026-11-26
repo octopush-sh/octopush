@@ -222,6 +222,44 @@ use std::time::Duration;
 /// brief overload, short enough not to strand a run.
 pub const DEFAULT_MAX_RETRIES: u32 = 5;
 
+/// Retries for a model server on this Mac (a loopback base: Ollama, LM
+/// Studio, a local gateway) that refuses the connection. One, because a
+/// server that isn't running won't start in the next minute, and waiting out
+/// the full backoff (about a minute) only delays the message that says so.
+pub const LOCAL_CONNECT_RETRIES: u32 = 1;
+
+/// Whether `api_base` points at this Mac: `localhost` (or a `*.localhost`
+/// name), `127.0.0.0/8` or `::1`. Decided on the URL alone, never by DNS.
+pub fn is_loopback_base(api_base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(api_base.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // An IPv6 host comes bracketed ("[::1]").
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    }
+}
+
+/// The client a request to `api_base` goes out on: `given` for a remote
+/// provider, the pooled loopback client (`tls::local_llm_client`: no read
+/// bound, no proxy) for a model server on this Mac, so a slow local model
+/// that takes an hour to answer is never cut off.
+pub fn client_for<'a>(api_base: &str, given: &'a reqwest::Client) -> &'a reqwest::Client {
+    if is_loopback_base(api_base) {
+        crate::tls::local_llm_client()
+    } else {
+        given
+    }
+}
+
 /// Base unit for exponential backoff. Delay for attempt N (1-indexed) is
 /// `BASE * 2^(N-1)`, capped at [`RETRY_MAX_DELAY_SECS`]: 2, 4, 8, 16, 32, …
 const RETRY_BASE_SECS: u64 = 2;
@@ -253,10 +291,14 @@ pub async fn interruptible_sleep(secs: u64, cancel: &AtomicBool) -> bool {
     !cancel.load(Ordering::Relaxed)
 }
 
-/// Call `provider.complete`, automatically retrying *transient* failures (rate
-/// limit, overload, 5xx, dropped connection) with capped exponential backoff
-/// that honors a server `retry-after`. Non-transient errors (auth, bad request)
-/// return immediately — retrying can't fix them. The backoff is interruptible:
+/// Call `provider.complete`, automatically retrying *transient* failures (429,
+/// 529, 5xx, a connection that couldn't be opened) with capped exponential
+/// backoff that honors a server `retry-after`. Everything else returns at
+/// once: auth and bad requests, which retrying can't fix, and a connection
+/// lost or timed out after the request was sent ([`request_error`]), which the
+/// provider may still be working on. A model server on this Mac that refuses
+/// the connection gets [`LOCAL_CONNECT_RETRIES`] retry, then fails with the
+/// message that it isn't reachable. The backoff is interruptible:
 /// a raised `cancel` aborts the wait and surfaces the last error so the stage
 /// lands in the normal halt/abort flow. `on_retry(attempt, delay_secs, kind)`
 /// is invoked before each wait so callers can narrate it into the run journal.
@@ -272,6 +314,7 @@ pub async fn complete_with_retry(
     on_retry: &mut (dyn FnMut(u32, u64, ProviderErrorKind) + Send),
 ) -> AppResult<LlmResponse> {
     let mut attempt: u32 = 0;
+    let local = is_loopback_base(api_base);
     loop {
         match provider.complete(api_base, api_key, req, client).await {
             Ok(resp) => return Ok(resp),
@@ -281,8 +324,12 @@ pub async fn complete_with_retry(
                     return Err(e);
                 };
                 attempt += 1;
-                if attempt > max_retries {
-                    return Err(e);
+                let local_unreachable = local && kind == ProviderErrorKind::Network;
+                let budget = if local_unreachable { max_retries.min(LOCAL_CONNECT_RETRIES) } else { max_retries };
+                if attempt > budget {
+                    // A local server that still refuses is a standing fault
+                    // now: the message already says it isn't reachable.
+                    return Err(if local_unreachable { into_final(e) } else { e });
                 }
                 // Prefer the server's advice; fall back to exponential backoff.
                 // Either way, never wait longer than the cap.
@@ -299,22 +346,170 @@ pub async fn complete_with_retry(
     }
 }
 
-/// Build an [`AppError::Provider`] for a `reqwest` send error, prefixed with
-/// `what`. Classified as [`network_error`] (transient: the retry layer rides
-/// it out) unless it is a TLS failure no retry can fix — a compromised-CA
-/// denylist refusal or a TLS version/suite mismatch — which surfaces at once
-/// as `ProviderErrorKind::Other`. The message carries the TLS reason.
-pub fn request_error(what: &str, e: &reqwest::Error) -> AppError {
-    let message = format!("{what}: {}", crate::tls::describe_request_error(e));
-    if crate::tls::is_permanent_tls_failure(e) {
-        AppError::Provider { kind: ProviderErrorKind::Other, retry_after: None, message }
-    } else {
-        network_error(message)
+/// The journal/turn line for one retry wait: the same words wherever a
+/// provider call is retried (sub-agents, Direct stages, the Talk director).
+pub fn retry_notice(attempt: u32, delay_secs: u64, kind: ProviderErrorKind) -> String {
+    format!(
+        "{} — retrying in {delay_secs}s (retry {attempt} of {DEFAULT_MAX_RETRIES})",
+        kind.label()
+    )
+}
+
+/// How often a request raced against a cancel flag looks at the flag: short
+/// enough that Stop reads as instant, long enough to cost nothing.
+const CANCEL_POLL_MS: u64 = 100;
+
+/// Resolve once `cancel` is raised. It polls because a turn's cancel is a
+/// plain `AtomicBool` shared with the tool loop, `run_command` and the
+/// sub-agents; a Stop is never more than [`CANCEL_POLL_MS`] late.
+pub async fn until_cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(CANCEL_POLL_MS)).await;
     }
 }
 
-/// Build an [`AppError::Provider`] for a request that never reached the server
-/// (connection reset, DNS failure, timeout). Always transient.
+/// Run `fut` unless `cancel` is raised first. `None` means the cancel won:
+/// `fut` is dropped where it stands, which for a provider call closes the
+/// HTTP connection, so the request in flight is abandoned instead of waited
+/// out (a backoff sleep inside it ends too).
+pub async fn or_cancelled<F: std::future::Future>(fut: F, cancel: &AtomicBool) -> Option<F::Output> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    tokio::select! {
+        out = fut => Some(out),
+        _ = until_cancelled(cancel) => None,
+    }
+}
+
+/// How a cancellable, retried provider call ended.
+#[derive(Debug)]
+pub enum Completion {
+    Done(LlmResponse),
+    /// The cancel flag was raised during the request (abandoned), during a
+    /// backoff wait, or as the last attempt failed. A stop, not a failure.
+    Cancelled,
+    /// The call failed for good. `retries` is how many retries ran first:
+    /// the full bound for a transient error that never cleared, 0 for one no
+    /// retry can fix.
+    Failed { error: AppError, retries: u32 },
+}
+
+/// [`complete_with_retry`] raced against `cancel` with [`or_cancelled`]: the
+/// same backoff, `retry-after` handling and `on_retry` narration, plus a Stop
+/// that ends the request in flight instead of waiting for its answer.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_cancellable(
+    provider: &dyn LlmProvider,
+    api_base: &str,
+    api_key: Option<&str>,
+    req: &LlmRequest,
+    client: &reqwest::Client,
+    cancel: &AtomicBool,
+    max_retries: u32,
+    on_retry: &mut (dyn FnMut(u32, u64, ProviderErrorKind) + Send),
+) -> Completion {
+    let mut retries = 0u32;
+    let outcome = {
+        let mut counting = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+            retries = attempt;
+            on_retry(attempt, delay, kind);
+        };
+        or_cancelled(
+            complete_with_retry(provider, api_base, api_key, req, client, cancel, max_retries, &mut counting),
+            cancel,
+        )
+        .await
+    };
+    match outcome {
+        Some(Ok(resp)) => Completion::Done(resp),
+        // A stop that interrupts a backoff surfaces the last error: it is
+        // still the user's stop.
+        Some(Err(error)) if !cancel.load(Ordering::Relaxed) => Completion::Failed { error, retries },
+        _ => Completion::Cancelled,
+    }
+}
+
+/// What the user reads when a provider call failed for good after `retries`
+/// retries: what happened, that nothing is lost and how to go on, then the
+/// provider's own message. An error that wasn't retried keeps the provider's
+/// message as it is (an auth error still names the API key).
+pub fn final_failure_text(error: &AppError, retries: u32) -> String {
+    match error.transient_retry() {
+        Some((kind, _)) if retries > 0 => {
+            let label = kind.label();
+            let (first, rest) = label.split_at(1);
+            format!(
+                "{}{rest}, still failing after {retries} {}. The conversation is saved: send \
+                 your message again, or say \"continue\", to pick up where it left off. ({error})",
+                first.to_ascii_uppercase(),
+                if retries == 1 { "retry" } else { "retries" },
+            )
+        }
+        _ => error.to_string(),
+    }
+}
+
+/// Why a request that was sent but not answered isn't sent again: the
+/// provider may already be generating the answer (and counting its tokens),
+/// so a retry could run the whole request a second time.
+const NOT_RETRIED: &str = "It was not retried: the provider may still be working on the request, and sending it again could run it twice. Send your message again to retry.";
+
+/// Build an [`AppError::Provider`] for a `reqwest` send error to `api_base`,
+/// prefixed with `what`:
+/// - a connection that couldn't be opened (refused, DNS, connect timeout,
+///   proxy): the request never reached the provider, so it is
+///   [`network_error`] (transient; the retry layer sends it again). For a
+///   model server on this Mac the message says it isn't reachable;
+/// - a TLS failure no retry can fix (a compromised-CA denylist refusal, a TLS
+///   version/suite mismatch): `ProviderErrorKind::Other`, with the reason;
+/// - anything after the request went out (the read timeout, a connection
+///   reset or closed while waiting): final, `ProviderErrorKind::Other`, and
+///   the message says why it wasn't retried ([`NOT_RETRIED`]).
+pub fn request_error(what: &str, api_base: &str, e: &reqwest::Error) -> AppError {
+    let detail = crate::tls::describe_request_error(e);
+    if crate::tls::is_permanent_tls_failure(e) {
+        return final_error(format!("{what}: {detail}"));
+    }
+    if e.is_connect() {
+        return network_error(if is_loopback_base(api_base) {
+            format!("The model server on this Mac at {} isn't reachable. Is it running? ({what}: {detail})", api_base.trim())
+        } else {
+            format!("{what}: {detail}")
+        });
+    }
+    if e.is_timeout() {
+        return final_error(format!("{what}: the provider sent no answer before the read timeout ({detail}). {NOT_RETRIED}"));
+    }
+    final_error(format!("{what}: the connection was lost after the request was sent ({detail}). {NOT_RETRIED}"))
+}
+
+/// Build the error for an answer whose body couldn't be read in full (the
+/// connection dropped or went silent mid-answer). Final, like a send that
+/// was cut off after the request went out: never reported as a JSON error.
+pub fn body_error(what: &str, e: &reqwest::Error) -> AppError {
+    let detail = crate::tls::describe_request_error(e);
+    let how = if e.is_timeout() { "went silent" } else { "was lost" };
+    final_error(format!("{what}: the connection {how} while the answer was arriving ({detail}). {NOT_RETRIED}"))
+}
+
+/// A provider failure no retry is attempted for.
+fn final_error(message: String) -> AppError {
+    AppError::Provider { kind: ProviderErrorKind::Other, retry_after: None, message }
+}
+
+/// `e` as a final error with the same text, for a failure the retry layer
+/// has given up on early (a model server on this Mac that isn't running).
+fn into_final(e: AppError) -> AppError {
+    match e {
+        AppError::Provider { message, .. } => final_error(message),
+        other => other,
+    }
+}
+
+/// Build an [`AppError::Provider`] for a request that never reached the
+/// server (the connection couldn't be opened). Always transient: sending it
+/// again is safe.
 pub fn network_error(message: impl Into<String>) -> AppError {
     AppError::Provider {
         kind: ProviderErrorKind::Network,
