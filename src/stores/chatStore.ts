@@ -20,6 +20,15 @@ export interface ToolExecution {
   result: string;
   /** Provider tool_use id — correlates the resolved card to its live card. */
   callId?: string;
+  /** How the call ended, stamped on rows the engine writes now
+   *  (`chat_engine::stamp_outcome`). Older rows carry none of the three, and
+   *  `lib/toolVerdict.ts` reads their verdict from `result` instead. */
+  ok?: boolean;
+  outcome?: "ok" | "failed" | "denied";
+  /** A shell command's exit status, when its shell reported one. */
+  exitCode?: number;
+  /** Why a failed call ended, when the engine knows: it stopped it. */
+  reason?: "stopped";
   /** Present on a resolved `Agent`/`Task` row: how the sub-agent ended and
    *  what it cost (the report itself is `result`). */
   agent?: AgentMeta;
