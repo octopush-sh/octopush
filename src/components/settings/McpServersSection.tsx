@@ -246,8 +246,10 @@ export function McpServersSection() {
         Model Context Protocol servers whose tools become available to Talk: a
         local command Octopush runs, or a remote URL it reaches through{" "}
         <span className="font-mono text-octo-sage">mcp-remote</span>, which npx
-        fetches the first time (Node required). Tokens and other secrets stay on
-        this Mac, in your login Keychain.
+        fetches the first time (Node required). A Token sign-in, an OAuth client
+        secret and the values you mark Keep in Keychain stay on this Mac, in your
+        login Keychain; a browser sign-in stays in{" "}
+        <span className="font-mono text-octo-sage">~/.mcp-auth</span>.
       </p>
 
       <div className="space-y-2">

@@ -86,7 +86,7 @@ describe("PrivacyPane", () => {
  *  the owner to approve at merge). */
 const APPROVED_INVENTORY = [
   "Stored on this Mac: projects, workspaces, chats, tool executions, Direct runs, token usage — in ~/Library/Application Support/octopush/octopush.db. Runs and custom pipelines leave it only if you turn on sync.",
-  "API keys: stored in ~/.octopush/settings.json. MCP servers: ~/.claude/mcp.json, with their tokens and the values you mark Keep in Keychain in the macOS Keychain. Your account session lives in the macOS Keychain too.",
+  "API keys: stored in ~/.octopush/settings.json. MCP servers you add in Settings: ~/.claude/mcp.json. A Token sign-in, an OAuth client secret and the values you mark Keep in Keychain go to the macOS Keychain, and mcp-remote keeps a browser sign-in in ~/.mcp-auth. A project's own .claude/mcp.json stays as written. Your account session lives in the macOS Keychain too.",
   "Outbound traffic, only to:" +
     "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models." +
     "Clerk for sign-in and Dodo Payments for checkout, when you use your account." +
@@ -163,7 +163,13 @@ describe("PrivacyPane — the data inventory is a real list (#875)", () => {
 describe("PrivacyPane — inline paths (#560)", () => {
   it("sets file paths in ivory mono on the code chip, never brass", () => {
     const { container } = render(<PrivacyPane />);
-    for (const path of ["~/Library/Application Support/octopush/octopush.db", "~/.octopush/settings.json"]) {
+    for (const path of [
+      "~/Library/Application Support/octopush/octopush.db",
+      "~/.octopush/settings.json",
+      "~/.claude/mcp.json",
+      "~/.mcp-auth",
+      ".claude/mcp.json",
+    ]) {
       const chip = screen.getByText(path);
       expect(chip.tagName).toBe("CODE");
       expect(chip).toHaveClass(...PATH_CHIP_CLASS.split(" "));
