@@ -576,9 +576,9 @@ describe("chatStore — stop + effort (P3)", () => {
     }
   });
 
-  it("send() sends the preset's reasoning effort: Swift low, Standard medium, Deep high", async () => {
-    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: "medium", deep: "high" });
-    for (const [preset, effort] of [["swift", "low"], ["standard", "medium"], ["deep", "high"]] as const) {
+  it("send() sends the preset's reasoning effort: Swift low, Standard high, Deep max", async () => {
+    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: "high", deep: "max" });
+    for (const [preset, effort] of [["swift", "low"], ["standard", "high"], ["deep", "max"]] as const) {
       vi.clearAllMocks();
       useChatStore.getState().setEffort(preset);
       await useChatStore.getState().send("ws-1", "/tmp", "hi");

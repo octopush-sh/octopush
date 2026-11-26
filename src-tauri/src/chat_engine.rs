@@ -209,11 +209,12 @@ pub struct ChatRequest {
     pub system: Option<String>,
     pub max_tokens: u32,
     /// The reasoning effort of every request the turn makes: the composer's
-    /// Swift / Standard / Deep send low / medium / high. The provider adapters
+    /// Swift / Standard / Deep send low / high / max. The provider adapters
     /// map it per model (`anthropic::thinking_json`,
-    /// `openai_compat::build_request`) and send nothing to a model without an
-    /// effort setting. `None` (no effort in the request) sends no thinking
-    /// params, as every turn did before.
+    /// `openai_compat::build_request`): `max` becomes the highest level the
+    /// model takes (`max` where supported, otherwise `high`), and a model
+    /// without an effort setting gets nothing. `None` (no effort in the
+    /// request) sends no thinking params, as every turn did before.
     #[serde(default)]
     pub effort: Option<Effort>,
     /// Legacy: a skill name pinned to the conversation. The composer no
@@ -3980,7 +3981,8 @@ mod tests {
 
     #[test]
     fn swift_standard_and_deep_reach_every_director_request_as_effort() {
-        for (sent, effort) in [("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High)] {
+        // Swift, Standard, Deep.
+        for (sent, effort) in [("low", Effort::Low), ("high", Effort::High), ("max", Effort::Max)] {
             let request = chat_request(Some(sent));
             assert_eq!(request.effort, Some(effort));
             let req = director_request(&request.model, request.max_tokens, request.effort, "sys", &[], &[]);
@@ -3993,29 +3995,40 @@ mod tests {
     }
 
     #[test]
-    fn talk_effort_is_sent_only_to_models_that_take_one() {
+    fn talk_effort_is_clamped_to_what_each_model_takes() {
         use crate::providers::{anthropic, openai_compat};
         let body = |model: &str, effort: Effort, max: u32| {
             anthropic::build_request(&director_request(model, max, Some(effort), "sys", &[], &[]))
         };
-        // An effort model: adaptive thinking at the preset's level.
-        for (effort, level) in [(Effort::Low, "low"), (Effort::Medium, "medium"), (Effort::High, "high")] {
-            let b = body("claude-sonnet-5-5", effort, 32768);
+        let level = |model: &str, effort: Effort| {
+            let b = body(model, effort, 64000);
             assert_eq!(b["thinking"]["type"], "adaptive", "{b}");
-            assert_eq!(b["output_config"]["effort"], level, "{b}");
-        }
-        // A thinking-budget model: Swift thinks not at all, Deep buys a budget.
+            b["output_config"]["effort"].as_str().unwrap().to_string()
+        };
+        // Swift, Standard, Deep on a model that takes every level.
+        assert_eq!(level("claude-sonnet-5-5", Effort::Low), "low");
+        assert_eq!(level("claude-sonnet-5-5", Effort::High), "high");
+        assert_eq!(level("claude-sonnet-5-5", Effort::Max), "max");
+        assert_eq!(level("claude-opus-4-6", Effort::Max), "max");
+        // Deep on an effort model without `max` runs at its highest, `high`.
+        assert_eq!(level("claude-opus-4-5", Effort::Max), "high");
+        // A thinking-budget model: Swift thinks not at all, Deep buys the
+        // largest budget.
         let swift = body("claude-haiku-4-5-20251001", Effort::Low, 8192);
         assert!(swift.get("thinking").is_none() && swift.get("output_config").is_none(), "{swift}");
-        let deep = body("claude-haiku-4-5-20251001", Effort::High, 64000);
-        assert_eq!(deep["thinking"]["type"], "enabled", "{deep}");
+        let deep = body("claude-haiku-4-5-20251001", Effort::Max, 64000);
+        assert_eq!(deep["thinking"], serde_json::json!({ "type": "enabled", "budget_tokens": 24576 }), "{deep}");
         // A model with no effort setting gets none.
-        let legacy = body("claude-3-5-sonnet-20241022", Effort::High, 64000);
+        let legacy = body("claude-3-5-sonnet-20241022", Effort::Max, 64000);
         assert!(legacy.get("thinking").is_none() && legacy.get("output_config").is_none(), "{legacy}");
-        let chat = openai_compat::build_request(&director_request("gpt-4o", 8192, Some(Effort::Low), "sys", &[], &[]));
+        let openai = |model: &str, effort: Effort| {
+            openai_compat::build_request(&director_request(model, 64000, Some(effort), "sys", &[], &[]))
+        };
+        let chat = openai("gpt-4o", Effort::Max);
         assert!(chat.get("reasoning_effort").is_none(), "{chat}");
-        let reasoning = openai_compat::build_request(&director_request("o3", 32768, Some(Effort::Medium), "sys", &[], &[]));
-        assert_eq!(reasoning["reasoning_effort"], "medium", "{reasoning}");
+        assert_eq!(openai("o3", Effort::High)["reasoning_effort"], "high");
+        assert_eq!(openai("o3", Effort::Max)["reasoning_effort"], "high", "o-series stops at high");
+        assert_eq!(openai("gpt-6-sol", Effort::Max)["reasoning_effort"], "max");
     }
 
     #[test]

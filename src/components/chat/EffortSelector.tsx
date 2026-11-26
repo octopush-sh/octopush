@@ -14,18 +14,19 @@ export const OPTIONS: { value: Effort; label: string; title: string }[] = [
   {
     value: "standard",
     label: "Standard",
-    title: `Standard · medium reasoning effort · up to 32K output tokens · balanced (default). ${NO_EFFORT_NOTE}`,
+    title: `Standard · high reasoning effort · up to 32K output tokens · balanced (default). ${NO_EFFORT_NOTE}`,
   },
   {
     value: "deep",
     label: "Deep",
-    title: `Deep · high reasoning effort · up to 64K output tokens · most thorough, slowest and costliest. ${NO_EFFORT_NOTE}`,
+    title: `Deep · the highest reasoning effort the model takes (max where supported, otherwise high) · up to 64K output tokens · most thorough, slowest and costliest. ${NO_EFFORT_NOTE}`,
   },
 ];
 
 /**
  * Generation-effort control for the composer: each preset sets the turn's
- * reasoning effort (Swift low · Standard medium · Deep high, `EFFORT_REASONING`)
+ * reasoning effort (Swift low · Standard high · Deep the model's highest,
+ * `EFFORT_REASONING`)
  * and its output-token cap (8k · 32k · 64k, `EFFORT_MAX_TOKENS`). Uses the
  * canonical SegmentedControl so it matches Direct-mode form controls; no
  * native select.

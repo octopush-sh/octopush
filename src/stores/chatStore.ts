@@ -164,12 +164,15 @@ export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
 };
 
 /** The reasoning effort each preset sends with every request of the turn.
- *  The backend's provider adapters map it per model, and a model without an
- *  effort setting gets none (only the output cap applies there). */
+ *  Standard is `high`, the level the API runs at when none is sent (Talk's
+ *  behaviour before presets set effort). Deep asks for `max`, which the
+ *  backend's provider adapters clamp to the highest level each model takes
+ *  (`max` where supported, otherwise `high`). A model without an effort
+ *  setting gets none, and only the output cap applies there. */
 export const EFFORT_REASONING: Record<Effort, ReasoningEffort> = {
   swift: "low",
-  standard: "medium",
-  deep: "high",
+  standard: "high",
+  deep: "max",
 };
 
 /** A display item in the conversation — a regular message, a tool execution,
