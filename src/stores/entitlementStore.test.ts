@@ -4,6 +4,7 @@
  * 1. load() fetches entitlement + usage and marks loaded
  * 2. hasFeature derives from the loaded entitlement
  * 3. load() degrades to Free (loaded, no throw) when IPC fails
+ * 4. an `entitlement-changed` event from Rust reloads the store (subscribed once)
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Entitlement, DirectRunUsage } from "../lib/ipc";
@@ -12,15 +13,21 @@ import type { Entitlement, DirectRunUsage } from "../lib/ipc";
 
 const getEntitlementMock = vi.fn<() => Promise<Entitlement>>();
 const directRunUsageMock = vi.fn<() => Promise<DirectRunUsage>>();
+let changedHandler: (() => void) | null = null;
+const onEntitlementChangedMock = vi.fn((h: () => void) => {
+  changedHandler = h;
+  return Promise.resolve(() => {});
+});
 
 vi.mock("../lib/ipc", () => ({
   ipc: {
     getEntitlement: getEntitlementMock,
     directRunUsage: directRunUsageMock,
+    onEntitlementChanged: onEntitlementChangedMock,
   },
 }));
 
-const { useEntitlementStore } = await import("./entitlementStore");
+const { useEntitlementStore, __resetEntitlementWatchForTests } = await import("./entitlementStore");
 
 beforeEach(() => {
   useEntitlementStore.setState({
@@ -30,6 +37,9 @@ beforeEach(() => {
   });
   getEntitlementMock.mockReset();
   directRunUsageMock.mockReset();
+  onEntitlementChangedMock.mockClear();
+  changedHandler = null;
+  __resetEntitlementWatchForTests();
 });
 
 describe("entitlementStore", () => {
@@ -76,5 +86,37 @@ describe("entitlementStore", () => {
     expect(s.loaded).toBe(true);
     expect(s.entitlement.plan).toBe("free");
     expect(s.usage).toBeNull();
+  });
+
+  it("reloads when Rust emits entitlement-changed, subscribing only once", async () => {
+    getEntitlementMock.mockResolvedValue({ plan: "free", features: [], directRunsPerMonth: 25 });
+    directRunUsageMock.mockResolvedValue({ used: 1, limit: 25, remaining: 24 });
+    await useEntitlementStore.getState().load();
+    await useEntitlementStore.getState().load();
+    expect(onEntitlementChangedMock).toHaveBeenCalledTimes(1);
+    expect(useEntitlementStore.getState().entitlement.plan).toBe("free");
+
+    // A background token refresh flipped the plan to Pro.
+    getEntitlementMock.mockResolvedValue({
+      plan: "pro",
+      features: ["direct.unlimited"],
+      directRunsPerMonth: null,
+    });
+    directRunUsageMock.mockResolvedValue({ used: 1, limit: null, remaining: null });
+    expect(changedHandler).not.toBeNull();
+    changedHandler!();
+    await vi.waitFor(() => expect(useEntitlementStore.getState().entitlement.plan).toBe("pro"));
+    expect(useEntitlementStore.getState().hasFeature("direct.unlimited")).toBe(true);
+    expect(onEntitlementChangedMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the subscription on the next load when listening fails", async () => {
+    getEntitlementMock.mockResolvedValue({ plan: "free", features: [], directRunsPerMonth: 25 });
+    directRunUsageMock.mockResolvedValue({ used: 0, limit: 25, remaining: 25 });
+    onEntitlementChangedMock.mockImplementationOnce(() => Promise.reject(new Error("no tauri")));
+    await useEntitlementStore.getState().load();
+    await Promise.resolve();
+    await useEntitlementStore.getState().load();
+    expect(onEntitlementChangedMock).toHaveBeenCalledTimes(2);
   });
 });

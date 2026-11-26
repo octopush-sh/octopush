@@ -10,9 +10,11 @@ Octopush maintains itself in two places:
   they read, comment or open a PR for you to review, never merge; kept there to dogfood Octopush.
 
 All of it follows [`VISION.md`](../VISION.md) §8: agents write code, reviews and ideas; fixed,
-tested scripts in `scripts/routines/` do every merge, release and GitHub write after re-checking
-the rules; human-only areas stay `proposal` issues. Production deploys of the website and API are
-separate routines in those repos (`scripts/deploy-if-ready.sh`, see their READMEs).
+tested scripts in `scripts/routines/` do every merge, release and GitHub write the routines make,
+after re-checking the rules; human-only areas stay `proposal` issues. Outside the routines, the PM
+(Claude in your PM conversation) may also merge any PR once CI is green and an independent review
+has approved its exact head (VISION.md §8), and you still can. Production deploys of the website
+and API are separate routines in those repos (`scripts/deploy-if-ready.sh`, see their READMEs).
 
 ---
 
@@ -27,7 +29,7 @@ You approve ideas; everything else runs continuously (VISION.md §8–§9): the 
 | every 2 h (odd hours, :07) | [`nightly-build.yml`](../.github/workflows/nightly-build.yml) | each run takes one job — the cycle's "main is red" issue while main's CI fails, else a PR the review sent back, whose CI is red or that conflicts with main, else the oldest `ready` issue — and a Claude agent builds it (first, CI runs whose jobs never got a macOS runner are re-run — `rerun-starved.sh`, also before each review — so they don't read as red, and so is the newest `release.yml` build, so a starved beta still ships; a PR job first gets main merged in, with any conflicts left for the agent to resolve, and the failed CI jobs' log excerpt — see [Fix rounds](#fix-rounds)); the workflow opens or updates the PR (label `agent`) and starts CI |
 | every 2 h (odd hours, :37) | [`web-build.yml`](../.github/workflows/web-build.yml) | the website's builder: one job per run — a web PR the web review sent back or whose CI is red, else the oldest `ready` octopush-web issue, else the oldest app-repo issue labelled `area:web` + `ready` (not `area:app`: that is app work) — built by a Claude agent in a checkout of octopush-web (its CLAUDE.md, checks via `octo-check build\|check\|consistency`, the app's stable `FEATURES.md` as the truth reference); the workflow opens or updates the PR in octopush-web (label `agent`) and, for an app-repo issue, comments the link there |
 | every 2 h (even hours, :47) | [`nightly-review.yml`](../.github/workflows/nightly-review.yml) | an independent Claude reviewer judges each green agent PR (up to 3) and says whether users will notice it (`user_visible`); `automerge.mjs` re-checks every rule on that exact commit and merges the approved ones (retrying earlier approvals whose merge was skipped for a transient reason or a pause — main red, a release PR open), or parks them as `needs-owner` |
-| every 2 h (even hours, :07) | [`web-review.yml`](../.github/workflows/web-review.yml) | an independent Claude reviewer judges each green web PR (up to 3) against octopush-web's CLAUDE.md, the truth rule (the app's `FEATURES.md` at its latest **stable** release), the design rules and the human-only areas, and posts the verdict. It never merges: approved web PRs are listed in the digest for your `merge web#N` |
+| every 2 h (even hours, :07) | [`web-review.yml`](../.github/workflows/web-review.yml) | an independent Claude reviewer judges each green web PR (up to 3) against octopush-web's CLAUDE.md, the truth rule (the app's `FEATURES.md` at its latest **stable** release), the design rules and the human-only areas, and posts the verdict. It never merges: approved web PRs are listed in the digest, for the PM to merge or for your `merge web#N` |
 | 05:13, 17:13 | [`nightly-release.yml`](../.github/workflows/nightly-release.yml) | if `main` moved and CI is green: notes, What's new tips, clips, version bump, release PR, CI, merge, tag → `release.yml` publishes a **beta** |
 | 06:37 | [`ideas.yml`](../.github/workflows/ideas.yml) | a Claude agent researches; at least 5 ranked ideas across app, API and site are filed — app and API ones here (label `area:app\|api`), website ones in octopush-web — and one digest issue here lists them all |
 | 06:47 | [`social.yml`](../.github/workflows/social.yml) | the community routines for octopush-web's `marketing/` work, two jobs (see [Community routines](#community-routines)): `intel` — a Claude agent researches the market and competitors → issue **Market report YYYY-MM-DD**; then `drafts` (also when `intel` failed) — a Claude agent reads that report and the Reddit threads → issue **Social drafts YYYY-MM-DD** with comment drafts. Both issues land in **octopush-web**, label `social`, filed by the App's bot. Nothing is posted anywhere: you approve each draft in your PM chat |
@@ -39,7 +41,7 @@ Every workflow also has **Run workflow** (Actions tab) for a manual run. Schedul
 
 ### Fix rounds
 
-The cycle parks a PR for you only for what it can't fix itself. Three things send a builder PR
+The cycle parks a PR (`needs-owner`) only for what it can't fix itself. Three things send a builder PR
 back to the builder instead (`jobs.mjs fixJobs`), and together they get `MAX_FIX_ROUNDS` (3)
 rounds before the PR is parked:
 
@@ -252,11 +254,11 @@ trusted:
   `update`, and the web audit files that as an issue for you) and scans for the push token as well as the Claude token;
   the push token reaches git through the environment, never its command line. Pushes made with an
   installation token start octopush-web's CI on their own (only `GITHUB_TOKEN` pushes don't), so
-  nothing is dispatched there. Website PRs never merge without your `merge web#N`; after the merge
-  the app-repo `area:web` issue it was built for is closed with a link (the App can't close
-  another repo's issue through a closing keyword). This repo is public: website PR titles, file
-  names in refusals, and the web audit's findings and screenshots (kept 3 days, never of the legal
-  pages) show up here.
+  nothing is dispatched there. Website PRs never auto-merge: the PM merges them (VISION.md §8), or
+  you do with `merge web#N`; after the merge the app-repo `area:web` issue it was built for is
+  closed with a link (the App can't close another repo's issue through a closing keyword). This
+  repo is public: website PR titles, file names in refusals, and the web audit's findings and
+  screenshots (kept 3 days, never of the legal pages) show up here.
 
 ### The Epiku lane
 

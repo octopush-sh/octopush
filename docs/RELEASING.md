@@ -77,8 +77,9 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
   that sets `src/data/release.ts` `VERSION` to the new stable and adds a changelog
   entry for every release since the landing's last version, written from the
   release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`). An
-  older `release/v*` PR still open is closed as superseded. The owner merges it
-  (`merge web#N`); until then the website's consistency gate fails for web builds.
+  older `release/v*` PR still open is closed as superseded. The PM merges it
+  (VISION.md §8), or the owner does with `merge web#N`; until then the website's
+  consistency gate fails for web builds.
   Its third job, `homebrew-tap`, renders `packaging/homebrew-tap/Casks/octopush.rb`
   with the version and the `Octopush.dmg` sha256, checks it with `brew style` +
   `brew audit`, and pushes it to `octopush-sh/homebrew-tap` (see

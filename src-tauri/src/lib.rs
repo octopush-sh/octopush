@@ -19,6 +19,7 @@ pub mod crew;
 // read-and-author surface over the same SQLite store the desktop app uses.
 pub mod db;
 pub mod entitlement;
+pub mod entitlement_token;
 pub mod error;
 mod file_open;
 mod fleet_status;
@@ -616,6 +617,13 @@ pub fn run() {
                 // Runs still parked from the last session badge the Dock now.
                 fleet_status::refresh_later(app.handle());
             }
+
+            // Signed entitlement token (#582): refresh it in the background so
+            // launch never waits on the network. No-op while no entitlement
+            // public key is compiled in, or when signed out; a failure keeps
+            // the cached token.
+            entitlement_token::set_app_handle(app.handle().clone());
+            entitlement_token::spawn_refresh();
 
             Ok(())
         })
