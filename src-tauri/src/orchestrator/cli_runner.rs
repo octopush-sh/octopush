@@ -2159,6 +2159,10 @@ impl CliDialect {
     /// `codex exec` may not take: approval `never` and network on (Octopush's
     /// Seatbelt profile confines writes only, too). The runner adds the
     /// build-cache root to the writable roots ([`codex_writable_root_args`]).
+    /// Codex runs in `workspace` (`-C`, the stage's worktree), named even
+    /// though the process already starts there, so a resumed thread can't
+    /// pick a saved directory instead (see [`CliDialect::resume_argv`]).
+    /// Claude Code takes its directory from the process only.
     pub fn argv(
         &self,
         model: &str,
@@ -2166,6 +2170,7 @@ impl CliDialect {
         max_turns: i64,
         read_only: bool,
         scope: CodexWriteScope,
+        workspace: &str,
     ) -> Vec<String> {
         match self {
             CliDialect::Claude => build_cli_args(model, system_prompt, max_turns, read_only),
@@ -2176,6 +2181,8 @@ impl CliDialect {
                     "--skip-git-repo-check".to_string(),
                     "-m".to_string(),
                     model.to_string(),
+                    "-C".to_string(),
+                    workspace.to_string(),
                 ];
                 match (read_only, scope) {
                     (true, _) => a.extend(["--sandbox".to_string(), "read-only".to_string()]),
@@ -2225,13 +2232,19 @@ impl CliDialect {
     /// pinned by the recorded `codex exec resume --help`
     /// (`tests/fixtures/codex/<version>/`). `resume` takes `SESSION_ID`,
     /// `PROMPT` (`-` = stdin), `-c`, `-m`, `--json` and
-    /// `--skip-git-repo-check`, but not `-s/--sandbox`, so every flag of the
-    /// fresh argv stays in front of the subcommand, where `codex exec` reads
-    /// them. A resumed thread takes this invocation's sandbox, approval policy
-    /// and model (openai/codex `exec/src/lib.rs`
-    /// `thread_resume_params_from_config`), so a read-only review stays
-    /// read-only and a writer keeps its `workspace-write` settings. The
-    /// effort and writable-root `-c` overrides go in before the trailing `-`
+    /// `--skip-git-repo-check`, but not `-s/--sandbox` or `-C/--cd`, so every
+    /// flag of the fresh argv stays in front of the subcommand, where
+    /// `codex exec` reads them. Since 0.172.0 (openai/codex #62194) a resume
+    /// restores the thread's saved sandbox permissions, working directory and
+    /// workspace roots by default, and explicit overrides win. So nothing is
+    /// left to the saved thread: `-C <workspace>` pins it to the stage's
+    /// worktree, `--sandbox` (or the mission's bypass flag) and the
+    /// `approval_policy` / network `-c` overrides pin its permissions, and
+    /// the runner's writable-root `-c` override pins its extra root. A
+    /// read-only review stays read-only and a writer keeps its
+    /// `workspace-write` settings, on 0.169.0 (which already took this
+    /// invocation's settings) and 0.172.0 alike. The effort and writable-root
+    /// `-c` overrides go in before the trailing `-`
     /// ([`CliDialect::push_flags`]), which `resume` accepts too.
     pub fn resume_argv(
         &self,
@@ -2240,11 +2253,12 @@ impl CliDialect {
         max_turns: i64,
         read_only: bool,
         scope: CodexWriteScope,
+        workspace: &str,
     ) -> Option<Vec<String>> {
         match self {
             CliDialect::Claude => Some(build_cli_args_resume(model, session_id, max_turns, read_only)),
             CliDialect::Codex => {
-                let mut a = self.argv(model, "", max_turns, read_only, scope);
+                let mut a = self.argv(model, "", max_turns, read_only, scope, workspace);
                 // The fresh argv ends with `-` (prompt on stdin); the resumed
                 // one ends `resume <id> -`.
                 if a.last().is_some_and(|x| x == "-") {
@@ -3629,11 +3643,10 @@ impl CliRunner {
         // A Codex writer outside a sandboxed mission runs in Codex's own
         // `workspace-write` sandbox, never the bypass flag — resumed or not.
         let write_scope = codex_write_scope(&ctx.exec_isolation);
-        let resume_args = stage
-            .resume_session
-            .as_deref()
-            .filter(|_| allow_resume)
-            .and_then(|sid| dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only, write_scope));
+        let workspace = ctx.workspace_path.to_string_lossy().into_owned();
+        let resume_args = stage.resume_session.as_deref().filter(|_| allow_resume).and_then(|sid| {
+            dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only, write_scope, &workspace)
+        });
         let resuming = resume_args.is_some();
         // A resumed Codex session reports the thread's running total: the
         // tokens it had already reported are subtracted (see `usage_since`).
@@ -3650,7 +3663,7 @@ impl CliRunner {
                 dialect.resume_stdin(stage.feedback.as_deref(), stage.drop_deferred_call),
             ),
             None => (
-                dialect.argv(&stage.agent_model, &system, stage.max_iterations, read_only, write_scope),
+                dialect.argv(&stage.agent_model, &system, stage.max_iterations, read_only, write_scope, &workspace),
                 dialect.stdin_payload(
                     &system,
                     &user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),

@@ -11763,7 +11763,7 @@ mod cli_args_tests {
             assert!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_none(), "{args:?}");
         }
         // Codex has no `--settings`; its argv is left alone even when sandboxed.
-        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox);
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox, "/ws");
         let mut swapped = codex.clone();
         assert!(!confine_reads_in_sandbox(CliDialect::Codex, "sandbox", &mut swapped));
         assert_eq!(swapped, codex);
@@ -11817,7 +11817,7 @@ mod cli_args_tests {
             }
         }
         // Codex has no `--settings`; its argv is left alone.
-        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox);
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox, "/ws");
         let mut same = codex.clone();
         assert!(!turn_off_inner_sandbox(CliDialect::Codex, "sandbox", &mut same));
         assert_eq!(same, codex);
@@ -12137,7 +12137,7 @@ mod cli_args_tests {
         use crate::orchestrator::cli_runner::{CliDialect, CodexWriteScope};
         for ro in [false, true] {
             for scope in [CodexWriteScope::Workspace, CodexWriteScope::MissionSandbox] {
-                let args = CliDialect::Codex.argv("gpt-5", "sys", 10, ro, scope);
+                let args = CliDialect::Codex.argv("gpt-5", "sys", 10, ro, scope, "/ws");
                 assert!(!args.contains(&"--settings".to_string()), "{args:?}");
             }
         }
@@ -12357,7 +12357,7 @@ mod cli_dialect_tests {
     fn a_codex_writer_outside_a_sandboxed_mission_never_bypasses_codexs_sandbox() {
         let ws = CodexWriteScope::Workspace;
         for model in ["gpt-5", "gpt-6.1-terra", "o3", "gpt-5-codex"] {
-            let argv = CliDialect::Codex.argv(model, "sys", 25, false, ws);
+            let argv = CliDialect::Codex.argv(model, "sys", 25, false, ws, "/ws");
             assert!(!argv.iter().any(|a| a.contains("dangerously")), "{argv:?}");
             let config = |v: &str| argv.windows(2).any(|w| w[0] == "-c" && w[1] == v);
             assert!(config("approval_policy=\"never\""), "{argv:?}");
@@ -12377,8 +12377,8 @@ mod cli_dialect_tests {
         assert_eq!(CliDialect::Claude.version_label(Some("0.169.0")), None);
         // Claude stages ignore the scope.
         assert_eq!(
-            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, ws),
-            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, CodexWriteScope::MissionSandbox)
+            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, ws, "/ws"),
+            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, CodexWriteScope::MissionSandbox, "/ws")
         );
     }
 
@@ -12396,10 +12396,10 @@ mod cli_dialect_tests {
         assert!(!guards_git_entry(CliDialect::Claude, false, "sandbox"));
         // End to end: an unsandboxed mission never bypasses Codex's sandbox,
         // a sandboxed one keeps the bypass under Seatbelt.
-        let none = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("none"));
+        let none = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("none"), "/ws");
         assert!(none.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{none:?}");
         assert!(!none.iter().any(|a| a.contains("dangerously")), "{none:?}");
-        let sandboxed = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("sandbox"));
+        let sandboxed = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("sandbox"), "/ws");
         assert!(sandboxed.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{sandboxed:?}");
     }
 
@@ -12417,7 +12417,7 @@ mod cli_dialect_tests {
         // A quote or backslash in the path stays inside one TOML string.
         let odd = codex_writable_root_args("/a \"b\\c");
         assert_eq!(odd[1], "sandbox_workspace_write.writable_roots=[\"/a \\\"b\\\\c\"]");
-        let mut argv = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::Workspace);
+        let mut argv = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::Workspace, "/ws");
         CliDialect::Codex.push_flags(&mut argv, flags.clone());
         assert_eq!(argv.last().map(String::as_str), Some("-"), "prompt still rides stdin");
         assert!(argv.windows(2).any(|w| w[0] == "-c" && w[1] == flags[1]), "{argv:?}");
@@ -12502,7 +12502,7 @@ mod cli_dialect_tests {
     #[test]
     fn codex_argv_maps_read_only_to_its_native_sandbox() {
         let ws = CodexWriteScope::Workspace;
-        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false, ws);
+        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false, ws, "/ws");
         assert_eq!(rw[0], "exec");
         assert!(rw.contains(&"--json".to_string()));
         assert!(rw.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{rw:?}");
@@ -12514,22 +12514,31 @@ mod cli_dialect_tests {
         // Read-only never bypasses Codex's sandbox (inside a sandboxed mission
         // such a stage is refused before launch, `codex_read_only_refusal`).
         for scope in [ws, CodexWriteScope::MissionSandbox] {
-            let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, scope);
+            let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, scope, "/ws");
             assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
             assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
             assert!(!ro.iter().any(|a| a.starts_with("sandbox_workspace_write.")), "{ro:?}");
         }
 
         // Inside a sandboxed mission, Octopush's Seatbelt profile confines it.
-        let mission = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::MissionSandbox);
+        let mission = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::MissionSandbox, "/ws");
         assert!(mission.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{mission:?}");
         assert!(!mission.contains(&"--sandbox".to_string()), "{mission:?}");
 
         // Codex resumes with `exec … resume <id> -` (#682; the argv shape is
         // pinned against the recorded help in `codex_contract.rs`).
-        let resumed = CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false, ws).unwrap();
+        let resumed = CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false, ws, "/ws").unwrap();
         assert_eq!(resumed[resumed.len() - 3..], ["resume", "sess", "-"]);
-        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false, ws).is_some());
+        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false, ws, "/ws").is_some());
+
+        // Both name the stage's worktree (`-C`), so a resume on Codex 0.172.0+
+        // never runs in the thread's saved directory (#1110).
+        for argv in [&rw, &mission, &resumed] {
+            assert!(argv.windows(2).any(|w| w[0] == "-C" && w[1] == "/ws"), "{argv:?}");
+        }
+        // Claude Code takes its directory from the process, not a flag.
+        let claude = CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, ws, "/ws");
+        assert!(!claude.iter().any(|a| a == "-C" || a == "/ws"), "{claude:?}");
 
         // Stdin payload: claude = user only; codex = system + user joined.
         assert_eq!(CliDialect::Claude.stdin_payload("SYS", "USER"), "USER");
