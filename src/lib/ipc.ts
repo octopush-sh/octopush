@@ -521,6 +521,15 @@ export interface OpenRunPayload {
   projectPath: string;
 }
 
+/** Payload of `octo://open-talk`: a Talk conversation whose approval card
+ *  waits, chosen in the menu bar Octo's menu. Rust has already shown the window. */
+export interface OpenTalkPayload {
+  threadId: string;
+  workspaceId: string;
+  projectId: string;
+  projectPath: string;
+}
+
 export type PullKind = "ok" | "diverged" | "conflict" | "error";
 export interface PullOutcome { kind: PullKind; output: string }
 
@@ -1018,6 +1027,13 @@ export const ipc = {
       "pending_subagent_caps",
       { threadId },
     ),
+  /** The approval cards still waiting on a thread, oldest first (a reloaded
+   *  webview shows them again: a card waits until it is answered). */
+  pendingApprovals: (threadId: string) =>
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean }>>(
+      "pending_approvals",
+      { threadId },
+    ),
   /** Resolve an inline approval for a dangerous agent command. */
   respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
     invoke<void>("respond_approval", { callId, decision }),
@@ -1228,6 +1244,10 @@ export const ipc = {
   /** A crew was chosen in the menu bar Octo's menu: open its Direct surface. */
   onOpenRunFromMenuBar: (handler: (target: OpenRunPayload) => void) =>
     listen<OpenRunPayload>("octo://open-run", (ev) => handler(ev.payload)),
+  /** A Talk conversation waiting on an approval was chosen in the menu bar
+   *  Octo's menu: open it in Talk. */
+  onOpenTalkFromMenuBar: (handler: (target: OpenTalkPayload) => void) =>
+    listen<OpenTalkPayload>("octo://open-talk", (ev) => handler(ev.payload)),
   /** Theme changes cross windows (the DOM `octo:theme` event does not). */
   broadcastTheme: (theme: ThemeConfig) => emit("octo://theme", theme),
   onThemeBroadcast: (handler: (theme: ThemeConfig) => void) =>

@@ -8,6 +8,7 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
 import { isBudgetExceeded } from "../lib/budgetError";
 import { useAttentionStore } from "./attentionStore";
 import { focus } from "../lib/focus";
+import { notifyApprovalWaiting } from "../lib/approvalNotifications";
 import { deriveChatTitle } from "../lib/chatTitle";
 import { helperModelNow } from "../lib/helperModels";
 import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
@@ -539,6 +540,10 @@ interface ChatState {
   stopShellProcess: (workspaceId: string) => void;
   /** Load the workspace's recent `$`-command history into the cache. */
   loadShellHistory: (workspaceId: string) => Promise<void>;
+  /** Show the workspace's oldest waiting approval card: switch to its
+   *  conversation when another one is shown (Mission Control's and the menu
+   *  bar's way into a waiting card). No card, nothing to do. */
+  showPendingApproval: (workspaceId: string) => void;
   /** Resolve a dangerous-command approval card (removes it + tells the backend). */
   respondApproval: (
     workspaceId: string,
@@ -618,6 +623,66 @@ async function rehydrateCaps(workspaceId: string, threadId: string): Promise<voi
     // The live event stream still delivers new cards; a missed rehydrate
     // only matters for a card raised before this reload.
   }
+}
+
+/** Cards answered this session, by call id: a rehydrate whose list was read
+ *  before the answer landed must not bring one back (nor its flag). A live
+ *  request for the id takes it off again. Bounded: the oldest ids go first. */
+const answeredApprovals = new Set<string>();
+const ANSWERED_CAP = 500;
+function markAnswered(callId: string): void {
+  answeredApprovals.add(callId);
+  if (answeredApprovals.size > ANSWERED_CAP) {
+    const oldest = answeredApprovals.values().next().value;
+    if (oldest !== undefined) answeredApprovals.delete(oldest);
+  }
+}
+
+/** An approval card outlives a webview reload the same way (a card no longer
+ *  times out on its own): when a thread opens, show what still waits. */
+async function rehydrateApprovals(workspaceId: string, threadId: string): Promise<void> {
+  if (typeof ipc.pendingApprovals !== "function") return;
+  try {
+    const cards = await ipc.pendingApprovals(threadId);
+    if (!Array.isArray(cards)) return;
+    useChatStore.setState((s) => {
+      const cur = s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS;
+      const known = new Set(cur.map((a) => a.callId));
+      const fresh = cards
+        .filter((c) => !known.has(c.callId) && !answeredApprovals.has(c.callId))
+        .map((c) => ({
+          callId: c.callId,
+          threadId: c.threadId,
+          command: c.command,
+          reason: c.reason,
+          ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
+        }));
+      if (fresh.length === 0) return {};
+      return { pendingApprovalsByWs: { ...s.pendingApprovalsByWs, [workspaceId]: [...cur, ...fresh] } };
+    });
+  } catch {
+    // The live event stream still delivers new cards.
+  }
+}
+
+/** The workspaces whose Talk turn is working: streaming, and not parked on
+ *  an approval card (that turn waits on you, so the rail shows the
+ *  workspace's needs-you flag instead of the marching edge). Pure. */
+export function workingTalkWorkspaces(
+  streamingByWs: Record<string, boolean>,
+  pendingApprovalsByWs: Record<string, PendingApproval[]>,
+): string[] {
+  return Object.keys(streamingByWs).filter((id) => streamingByWs[id] && !pendingApprovalsByWs[id]?.length);
+}
+
+/** A workspace's approval cards are its needs-you state: raised while one
+ *  waits (rail, Mode switcher, Mission Control), settled when the last is
+ *  answered, whichever way it went (a click, Stop, a deleted thread, the
+ *  backend's resolve, a reload's rehydrate). */
+function syncApprovalAttention(workspaceId: string, cards: PendingApproval[]): void {
+  const attention = useAttentionStore.getState();
+  if (cards.length === 0) attention.settleApproval(workspaceId);
+  else attention.raiseApproval(workspaceId, cards[0].command, false);
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
@@ -935,6 +1000,23 @@ export const useChatStore = create<ChatState>((set, get) => {
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
+    const waiting = get().pendingApprovalsByWs[p.workspaceId] ?? EMPTY_APPROVALS;
+    if (waiting.some((a) => a.callId === p.callId)) return;
+    // A live request is always shown, even for a call id answered before: the
+    // secret guard asks again under the same id when its rescan changed.
+    answeredApprovals.delete(p.callId);
+    // The card reaches the user: the workspace's needs-you flag (chiming
+    // unless they are looking at this conversation), and a native
+    // notification while Octopush is in the background. Raised before the
+    // card lands, so the store sync below finds it raised and stays quiet.
+    const looking =
+      focus.workspaceId === p.workspaceId &&
+      focus.mode === "talk" &&
+      get().activeThreadByWs[p.workspaceId] === p.threadId &&
+      typeof document !== "undefined" &&
+      document.hasFocus();
+    useAttentionStore.getState().raiseApproval(p.workspaceId, (waiting[0] ?? p).command, !looking);
+    notifyApprovalWaiting(p.workspaceId, { secret: p.secret === true });
     set((s) => {
       const cur = s.pendingApprovalsByWs[p.workspaceId] ?? EMPTY_APPROVALS;
       if (cur.some((a) => a.callId === p.callId)) return {};
@@ -998,10 +1080,12 @@ export const useChatStore = create<ChatState>((set, get) => {
   });
 
   // ── chat://approval-resolved ──────────────────────────────────
-  // The request was answered (or timed out) — retire the card.
+  // The request was answered (a click, Stop, a deleted conversation or
+  // workspace) — retire the card.
   listen<{ workspaceId: string; callId: string }>("chat://approval-resolved", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
+    markAnswered(p.callId);
     set((s) => {
       const cur = s.pendingApprovalsByWs[p.workspaceId];
       if (!cur) return {};
@@ -1151,6 +1235,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
         }));
         void rehydrateCaps(workspaceId, activeId);
+        void rehydrateApprovals(workspaceId, activeId);
       } finally {
         loadingHistory.delete(workspaceId);
       }
@@ -1451,14 +1536,22 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (threadId) void ipc.stopShellCommand(threadId).catch(() => {});
     },
 
+    showPendingApproval: (workspaceId) => {
+      const oldest = (get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS)[0];
+      if (!oldest || get().activeThreadByWs[workspaceId] === oldest.threadId) return;
+      void get().selectThread(workspaceId, oldest.threadId);
+    },
+
     respondApproval: (workspaceId, callId, decision) => {
       // Snapshot the card so we can restore it if the IPC fails — otherwise the
-      // card vanishes (looks resolved) while the backend turn stays parked until
-      // its 300s timeout, with no way to retry the decision.
+      // card vanishes (looks resolved) while the backend turn stays parked
+      // waiting for an answer, with no way to retry the decision.
       const card = (get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).find(
         (a) => a.callId === callId,
       );
       // Optimistically retire the card; the backend also emits approval-resolved.
+      // Answered from now on, so a rehydrate already in flight can't bring it back.
+      markAnswered(callId);
       set((s) => {
         const cur = s.pendingApprovalsByWs[workspaceId];
         if (!cur) return {};
@@ -1471,6 +1564,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       void ipc.respondApproval(callId, decision).catch((e) => {
         // Restore the card + surface the error so the decision can be retried.
+        answeredApprovals.delete(callId);
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: `Could not send approval: ${String(e)}` },
           pendingApprovalsByWs: card
@@ -1653,6 +1747,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
       const messages = await ipc.listChatMessages(threadId);
       void rehydrateCaps(workspaceId, threadId);
+      void rehydrateApprovals(workspaceId, threadId);
       set((s) => ({
         messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
       }));
@@ -1782,4 +1877,16 @@ export const useChatStore = create<ChatState>((set, get) => {
         },
       })),
   };
+});
+
+// Every change to a workspace's approval cards, from any path, keeps its
+// needs-you flag honest (`syncApprovalAttention`).
+useChatStore.subscribe((s, prev) => {
+  if (s.pendingApprovalsByWs === prev.pendingApprovalsByWs) return;
+  const ids = new Set([...Object.keys(s.pendingApprovalsByWs), ...Object.keys(prev.pendingApprovalsByWs)]);
+  for (const id of ids) {
+    const cards = s.pendingApprovalsByWs[id] ?? EMPTY_APPROVALS;
+    if (cards === (prev.pendingApprovalsByWs[id] ?? EMPTY_APPROVALS)) continue;
+    syncApprovalAttention(id, cards);
+  }
 });
