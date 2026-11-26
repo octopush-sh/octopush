@@ -22,19 +22,26 @@ export interface ApprovalNotification {
   body: string;
 }
 
+/** What a card is about, as far as a notification may say. */
+export interface ApprovalCardKind {
+  secret?: boolean;
+  kind?: "mcp" | "read" | "write";
+}
+
 /** Pure: the notification for an approval card. */
-export function decideApprovalNotification(
-  card: { secret?: boolean },
-  workspaceName: string | null,
-): ApprovalNotification {
+export function decideApprovalNotification(card: ApprovalCardKind, workspaceName: string | null): ApprovalNotification {
   const what = card.secret
     ? "A commit or push is waiting for your approval (possible secret)"
-    : "A command is waiting for your approval";
+    : card.kind === "mcp"
+      ? "An MCP tool call is waiting for your approval"
+      : card.kind === "read" || card.kind === "write"
+        ? "A file access outside the workspace is waiting for your approval"
+        : "A command is waiting for your approval";
   return { title: "Talk needs a decision", body: `${workspaceName ?? "A workspace"} — ${what}` };
 }
 
 /** Fire it for a card just raised in `workspaceId`. */
-export function notifyApprovalWaiting(workspaceId: string, card: { secret?: boolean }): void {
+export function notifyApprovalWaiting(workspaceId: string, card: ApprovalCardKind): void {
   if (!useNotifyPrefs.getState().crewNotifications) return;
   const name = findWorkspaceName(useWorkspaceStore.getState().workspacesByProjectId, workspaceId);
   const n = decideApprovalNotification(card, name);

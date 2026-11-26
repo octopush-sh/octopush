@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup } from "@testing-library/react";
 import { ApprovalCard } from "./ApprovalCard";
 
 const base = { callId: "c", threadId: "t", command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3" };
@@ -24,6 +24,66 @@ describe("ApprovalCard", () => {
     expect(onRespond).toHaveBeenLastCalledWith("deny");
     fireEvent.click(screen.getByText("Run regardless"));
     expect(onRespond).toHaveBeenLastCalledWith("approve");
+  });
+
+  it("an MCP tool call reads as a tool call, not a shell command, and may be granted (#1147)", () => {
+    const onRespond = vi.fn();
+    const { container } = render(
+      <ApprovalCard
+        approval={{ ...base, kind: "mcp", command: 'mcp__github__merge_pr {"number":7}', reason: "MCP tool may change external state" }}
+        onRespond={onRespond}
+      />,
+    );
+    expect(screen.getByText("Approval needed")).toBeInTheDocument();
+    expect(container.querySelector("pre")?.textContent).toBe('mcp__github__merge_pr {"number":7}');
+    fireEvent.click(screen.getByText(/don't ask again/));
+    expect(onRespond).toHaveBeenCalledWith("always");
+  });
+
+  it("a file outside the workspace names the path, allows once, and never offers don't ask again (#1147)", () => {
+    const onRespond = vi.fn();
+    const { container } = render(
+      <ApprovalCard
+        approval={{ ...base, kind: "read", command: "~/notes/plan.md", reason: "reads a file outside the workspace" }}
+        onRespond={onRespond}
+      />,
+    );
+    const card = screen.getByRole("group", { name: "Outside the workspace: ~/notes/plan.md" });
+    expect(card).toHaveAttribute("title", "⌘↵ allows once · Esc denies");
+    expect(container.querySelector("pre")?.textContent).toBe("~/notes/plan.md");
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
+    expect(screen.getByText(/what it reads goes to your AI provider/)).toBeInTheDocument();
+    fireEvent.keyDown(card, { key: "Enter" });
+    expect(onRespond).not.toHaveBeenCalled();
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
+    expect(onRespond).toHaveBeenLastCalledWith("approve");
+    fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+    expect(onRespond).toHaveBeenLastCalledWith("deny");
+    cleanup();
+    render(<ApprovalCard approval={{ ...base, kind: "write", command: "/etc/hosts", reason: "writes a file" }} onRespond={() => {}} />);
+    expect(screen.getByText(/lets the agent write it once/)).toBeInTheDocument();
+    expect(screen.queryByText(/AI provider/)).toBeNull();
+  });
+
+  it("a credentials location leads with the safe answer, and Enter takes it", () => {
+    const onRespond = vi.fn();
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "read", sensitive: true, command: "~/.ssh/id_ed25519", reason: "reads a file outside the workspace · ~/.ssh holds SSH keys" }}
+        onRespond={onRespond}
+      />,
+    );
+    const card = screen.getByRole("group", { name: "Possible credentials: ~/.ssh/id_ed25519" });
+    expect(card).toHaveAttribute("title", "⌘↵, Enter or Esc denies");
+    expect(screen.getByText(/This may hold credentials/)).toBeInTheDocument();
+    const [first] = screen.getAllByRole("button");
+    expect(first).toHaveTextContent("Deny");
+    fireEvent.keyDown(card, { key: "Enter" });
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
+    expect(onRespond.mock.calls).toEqual([["deny"], ["deny"]]);
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(onRespond).toHaveBeenLastCalledWith("approve");
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
   });
 
   it("a plain commit's secret card doesn't mention uncommitted changes", () => {

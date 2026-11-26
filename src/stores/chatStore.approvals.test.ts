@@ -138,6 +138,16 @@ describe("it reaches you where you are", () => {
     expect(JSON.stringify(sendNotification.mock.calls)).not.toContain("git push");
   });
 
+  it("a file card keeps its kind and mark, and its notification names neither the path nor the file (#1147)", () => {
+    emit("chat://approval-request", { ...request("c1", "t1", "~/.ssh/id_ed25519"), kind: "read", sensitive: true });
+    expect(useChatStore.getState().getPendingApprovals("ws-1")[0]).toMatchObject({ kind: "read", sensitive: true });
+    expect(sendNotification).toHaveBeenCalledWith({
+      title: "Talk needs a decision",
+      body: "A workspace — A file access outside the workspace is waiting for your approval",
+    });
+    expect(JSON.stringify(sendNotification.mock.calls)).not.toContain(".ssh");
+  });
+
   it("respects the notification setting", () => {
     useNotifyPrefs.setState({ crewNotifications: false });
     emit("chat://approval-request", request("c1"));
@@ -154,6 +164,18 @@ describe("a waiting card is never lost", () => {
     await vi.waitFor(() => expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(1));
     expect(useChatStore.getState().getPendingApprovals("ws-1")[0]).toMatchObject({ callId: "c9", threadId: "t3" });
     expect(flag()).toMatchObject({ reason: "approval", detail: "git reset --hard" });
+  });
+
+  it("a reloaded MCP or file card keeps its kind", async () => {
+    (ipc.pendingApprovals as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { ...request("c10", "t5", "mcp__github__merge_pr {}"), kind: "mcp" },
+      { ...request("c11", "t5", "/etc/hosts"), kind: "write" },
+    ]);
+    await useChatStore.getState().selectThread("ws-1", "t5");
+    await vi.waitFor(() => expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(2));
+    const [mcp, write] = useChatStore.getState().getPendingApprovals("ws-1");
+    expect([mcp.kind, write.kind]).toEqual(["mcp", "write"]);
+    expect(write.sensitive).toBeUndefined();
   });
 
   it("a rehydrate racing an answer never brings the answered card back, nor its flag", async () => {
