@@ -93,10 +93,10 @@ fn director_request(request: &ChatRequest, system: &str, messages: &[LlmMessage]
         messages: messages.to_vec(),
         tools: tools.to_vec(),
         tool_choice: None,
-        // Swift's `low`, nothing for Standard, Deep's `max`; the adapters
-        // clamp it per model and send nothing to a model without effort
-        // control.
-        effort: request.effort,
+        // Swift's `low` runs as `Effort::Least`, so it never reasons more than
+        // Standard on any model; Standard sends nothing; Deep's `max` is
+        // clamped per model. A model without effort control gets nothing.
+        effort: request.effort.map(|e| if e == Effort::Low { Effort::Least } else { e }),
         // Agentic loop + multi-turn chat: the system prompt, tool schemas and
         // prior turns are re-sent every iteration, so cache them.
         cache: true,
@@ -305,12 +305,15 @@ pub struct ChatRequest {
     pub system: Option<String>,
     pub max_tokens: u32,
     /// The reasoning effort of every request the turn makes. The composer's
-    /// Swift sends `low`, Standard sends none (`None`: no thinking params, so
-    /// every model keeps its own default, as before presets set effort) and
-    /// Deep sends `max`. The provider adapters map it per model
-    /// (`anthropic::thinking_json`, `openai_compat::build_request`): `max`
-    /// becomes the highest the model takes (`max`, `high`, or a thinking
-    /// budget), and a model without effort control gets nothing.
+    /// Swift sends `low`, which the turn runs as `Effort::Least`: the least
+    /// the model takes, never more than Standard (effort lowered, thinking
+    /// never turned on; `none` on GPT-6 Sol, Luna and 6.1 Terra). Standard
+    /// sends none (`None`: no thinking params, so every model keeps its own
+    /// default, as before presets set effort). Deep sends `max`, which the
+    /// provider adapters (`anthropic::thinking_json`,
+    /// `openai_compat::build_request`) turn into the most the model takes
+    /// (`max`, `high`, or a thinking budget). A model without effort control
+    /// gets nothing.
     #[serde(default)]
     pub effort: Option<Effort>,
     /// Legacy: a skill name pinned to the conversation. The composer no
@@ -4349,12 +4352,18 @@ mod tests {
 
     #[test]
     fn swift_standard_and_deep_reach_every_director_request_as_effort() {
-        for (sent, effort) in [(SWIFT, Some(Effort::Low)), (STANDARD, None), (DEEP, Some(Effort::Max))] {
+        for (sent, asked, runs) in [
+            (SWIFT, Some(Effort::Low), Some(Effort::Least)),
+            (STANDARD, None, None),
+            (DEEP, Some(Effort::Max), Some(Effort::Max)),
+        ] {
             let request = chat_request_on("m", sent);
-            assert_eq!(request.effort, effort);
+            assert_eq!(request.effort, asked);
             let req = director_request(&request, "sys", &[], &[]);
-            assert_eq!((req.effort, req.max_tokens, req.cache), (effort, 64000, true));
+            assert_eq!((req.effort, req.max_tokens, req.cache), (runs, 64000, true));
         }
+        // `least` is internal: a request can't ask for it.
+        assert!(serde_json::from_value::<Effort>(serde_json::json!("least")).is_err());
     }
 
     #[test]
@@ -4384,13 +4393,19 @@ mod tests {
             assert_eq!(b["thinking"]["type"], "adaptive", "{model}: {b}");
             b["output_config"]["effort"].as_str().unwrap().to_string()
         };
-        // Swift: the lowest effort, where the model has effort control.
-        assert_eq!(level("claude-sonnet-5-5", SWIFT), "low");
-        assert_eq!(level("claude-opus-4-6", SWIFT), "low");
+        // Swift: low effort alone, thinking never turned on, where the model
+        // has effort control (the full check is
+        // `swift_never_reasons_more_than_standard_on_any_model`).
+        for m in ["claude-sonnet-5-5", "claude-opus-4-6"] {
+            let b = anthropic_body(m, SWIFT);
+            assert!(b.get("thinking").is_none(), "{m}: {b}");
+            assert_eq!(b["output_config"], serde_json::json!({ "effort": "low" }), "{m}: {b}");
+        }
         for m in ["claude-opus-4-5", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"] {
             assert!(!thinks(&anthropic_body(m, SWIFT)), "{m}: Swift sends nothing");
         }
         assert_eq!(openai_body("o3", SWIFT)["reasoning_effort"], "low");
+        assert_eq!(openai_body("gpt-6-sol", SWIFT)["reasoning_effort"], "none");
         assert!(openai_body("gpt-4o", SWIFT).get("reasoning_effort").is_none());
 
         // Deep: the highest the model takes.
@@ -4406,6 +4421,69 @@ mod tests {
         assert_eq!(openai_body("o3", DEEP)["reasoning_effort"], "high", "o-series stops at high");
         assert_eq!(openai_body("gpt-6-sol", DEEP)["reasoning_effort"], "max");
         assert!(openai_body("gpt-4o", DEEP).get("reasoning_effort").is_none());
+    }
+
+    /// Where a reasoning level ranks: less reasoning ranks lower.
+    fn reasoning_rank(level: &str) -> usize {
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .position(|l| *l == level)
+            .unwrap_or_else(|| panic!("unknown level {level}"))
+    }
+
+    /// Swift never reasons more than Standard, on any model in the table:
+    /// it never turns thinking on where Standard leaves it to the model, and
+    /// its effort is never above the model's own default (which Standard,
+    /// sending nothing, keeps).
+    #[test]
+    fn swift_never_reasons_more_than_standard_on_any_model() {
+        use crate::providers::{anthropic, openai_compat};
+        let req = |model: &str, preset: Option<&str>| director_request(&chat_request_on(model, preset), "sys", &[], &[]);
+        for m in [
+            "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+            "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-0",
+            "claude-haiku-5-5", "claude-haiku-4-5", "claude-fable-5-2", "claude-fable-5", "claude-mythos-5-2",
+            "claude-mythos-5", "claude-mythos-preview", "claude-3-5-sonnet-20241022", "some-unknown-model",
+        ] {
+            let standard = anthropic::build_request(&req(m, STANDARD));
+            let swift = anthropic::build_request(&req(m, SWIFT));
+            assert!(standard.get("thinking").is_none() && standard.get("output_config").is_none(), "{m}: {standard}");
+            assert!(swift.get("thinking").is_none(), "{m}: Swift turned thinking on: {swift}");
+            if let Some(level) = swift["output_config"]["effort"].as_str() {
+                // Every effort model's default is `medium` or `high`.
+                assert!(reasoning_rank(level) < reasoning_rank("medium"), "{m}: {swift}");
+            }
+        }
+        // OpenAI: Chat Completions (any gateway) and the Responses API (GPT-6 on OpenAI).
+        let openai_models = [
+            "gpt-4o", "o1", "o3", "o4-mini", "gpt-5", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra", "gpt-6-astra",
+            "gpt-6.1-sol",
+        ];
+        for m in openai_models {
+            let standard = openai_compat::build_request(&req(m, STANDARD));
+            let swift = openai_compat::build_request(&req(m, SWIFT));
+            assert!(standard.get("reasoning_effort").is_none(), "{m}: {standard}");
+            if let Some(level) = swift["reasoning_effort"].as_str() {
+                // No `reasoning_effort` runs at the API default, `medium`.
+                assert!(reasoning_rank(level) < reasoning_rank("medium"), "{m}: {swift}");
+            }
+        }
+        let base = "https://api.openai.com/v1";
+        for &m in openai_models.iter().filter(|m| m.starts_with("gpt-6")) {
+            let level = |preset| {
+                let b = openai_compat::build_responses_request(&req(m, preset), "openai", base);
+                b["reasoning"]["effort"].as_str().map(str::to_string)
+            };
+            let standard = level(STANDARD).unwrap_or_else(|| "medium".into());
+            let swift = level(SWIFT).unwrap_or_else(|| "medium".into());
+            assert!(reasoning_rank(&swift) <= reasoning_rank(&standard), "{m}: Swift {swift} vs Standard {standard}");
+        }
+        // Where `none` is the model's lowest, Swift sends it.
+        for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"] {
+            assert_eq!(openai_compat::build_request(&req(m, SWIFT))["reasoning_effort"], "none", "{m}");
+            let b = openai_compat::build_responses_request(&req(m, SWIFT), "openai", base);
+            assert_eq!(b["reasoning"]["effort"], "none", "{m}: {b}");
+        }
     }
 
     /// A response that thought, said something, then called a tool.
@@ -4473,7 +4551,7 @@ mod tests {
 
     #[test]
     fn the_forced_close_carries_the_turn_s_effort_and_instruction() {
-        for (preset, effort) in [(SWIFT, Some(Effort::Low)), (STANDARD, None), (DEEP, Some(Effort::Max))] {
+        for (preset, effort) in [(SWIFT, Some(Effort::Least)), (STANDARD, None), (DEEP, Some(Effort::Max))] {
             let request = chat_request_on("claude-sonnet-5-5", preset);
             let mut messages = vec![LlmMessage {
                 role: LlmRole::User,

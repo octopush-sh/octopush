@@ -192,8 +192,11 @@ export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
 };
 
 /** The reasoning effort each preset sends with every request of the turn.
- *  - Swift: `low`, the lowest; a model without effort control (a chat
- *    model, or one that thinks only with a budget) gets nothing.
+ *  - Swift: `low`, which the backend runs as the least reasoning the model
+ *    takes and never more than Standard: a lower effort without turning
+ *    thinking on, `none` on GPT-6 Sol, Luna and 6.1 Terra, and nothing on a
+ *    model without effort control (a chat model, or one that thinks only
+ *    with a budget).
  *  - Standard: none (`null`), so no effort or thinking setting is sent and
  *    every model keeps its own default, exactly as before presets set effort.
  *  - Deep: `max`, which the backend's provider adapters turn into the

@@ -188,7 +188,7 @@ pub fn effective_effort_level(model_id: &str, effort: Effort) -> &'static str {
 /// 4.5). Only consulted for `is_budget_model` models.
 fn budget_for_effort(effort: Effort) -> u32 {
     match effort {
-        Effort::Low => 4096,
+        Effort::Least | Effort::Low => 4096,
         Effort::Medium => 8192,
         Effort::High => 16384,
         Effort::Xhigh | Effort::Max => 24576,
@@ -199,6 +199,9 @@ fn budget_for_effort(effort: Effort) -> u32 {
 /// model-capability matrix. Pure + unit-tested. Three-way, allowlist-based:
 ///
 /// - `None` effort ⇒ `(None, None)` — no thinking params at all.
+/// - `Least` (Talk's Swift) ⇒ `output_config:{effort:"low"}` alone on an
+///   effort model, so thinking stays at the model's default, and nothing on
+///   any other model.
 /// - Effort model (Opus 4.6–5, Sonnet 4.6/5, Haiku 5.5, Fable 5, Mythos 5) ⇒
 ///   `thinking:{type:"adaptive"}` + `output_config:{effort:"<level>"}`, the
 ///   level clamped per model (`effective_effort_level`).
@@ -216,6 +219,12 @@ pub fn thinking_json(
         return (None, None);
     };
     let id = model_id.to_ascii_lowercase();
+    // Talk's Swift never reasons more than the model's default: lower the
+    // effort, never turn thinking on (Opus 4.6–4.8 and Sonnet 4.6 think only
+    // when asked). A budget-only or unknown model gets nothing.
+    if effort == Effort::Least {
+        return if is_effort_model(&id) { (None, Some(json!({ "effort": "low" }))) } else { (None, None) };
+    }
     if is_effort_model(&id) {
         (
             Some(json!({ "type": "adaptive" })),

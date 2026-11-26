@@ -142,9 +142,12 @@ fn is_openai_api_host(api_base: &str) -> bool {
 
 /// The OpenAI effort level for a reasoning model. GPT-6 takes all five levels
 /// as-is; the older reasoning models (o-series, GPT-5) stop at `high`, so
-/// `xhigh` and `max` fold to it there.
+/// `xhigh` and `max` fold to it there. Talk's Swift (`Least`) is the model's
+/// lowest: `none` where it is accepted (GPT-6 Sol, Luna, 6.1 Terra,
+/// `effort_off_level`), otherwise `low`.
 pub fn reasoning_effort_level(model_id: &str, effort: Effort) -> &'static str {
     match effort {
+        Effort::Least => effort_off_level(model_id).unwrap_or("low"),
         Effort::Xhigh | Effort::Max if !is_gpt6(model_id) => "high",
         _ => effort.as_str(),
     }

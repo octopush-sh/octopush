@@ -19,7 +19,7 @@ describe("EffortSelector tooltips", () => {
     // into each model's highest by the backend's adapters).
     expect(EFFORT_REASONING).toEqual({ swift: "low", standard: null, deep: "max" });
     const said = {
-      swift: "low reasoning effort",
+      swift: "the least reasoning the model takes, never more than Standard: a lower effort, thinking never turned on",
       standard: "the model's own default reasoning, with no effort or thinking setting sent",
       deep: "the most reasoning the model takes: effort max, or high where max isn't offered, or a 24K thinking budget",
     } as const;

@@ -987,9 +987,10 @@ export const ipc = {
     userMessage: string;
     system?: string;
     maxTokens: number;
-    /** The turn's reasoning effort: Swift low, Deep max (which the adapters
-     *  turn into each model's highest), absent for Standard so the model
-     *  keeps its own default; a model without effort control gets none. */
+    /** The turn's reasoning effort: Swift low (run as the least the model
+     *  takes, never more than Standard), Deep max (each model's highest),
+     *  absent for Standard so the model keeps its own default; a model
+     *  without effort control gets none. */
     effort?: Effort;
     attachments?: { mediaType: string; data: string }[];
     /** Re-run without inserting a new user row (history already ends with it). */

@@ -6,7 +6,7 @@ export const OPTIONS: { value: Effort; label: string; title: string }[] = [
     value: "swift",
     label: "Swift",
     title:
-      "Swift · low reasoning effort · up to 8K output tokens · fastest and cheapest. A model without an effort setting, or one that thinks only with a budget, gets nothing extra.",
+      "Swift · the least reasoning the model takes, never more than Standard: a lower effort, thinking never turned on · up to 8K output tokens · fastest and cheapest. A model without an effort setting, or one that thinks only with a budget, gets nothing extra.",
   },
   {
     value: "standard",
