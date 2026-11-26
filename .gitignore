@@ -70,3 +70,6 @@ octopus.db-journal
 .claire/
 .visual-audit/
 .web-audit/
+
+# Vitest JSON report written by the build routine
+vitest-summary.json
