@@ -28699,7 +28699,8 @@ mod talk_checkpoint_tests {
 mod request_context_tests {
     use crate::request_context::{
         agents_item, apportion, estimate_tokens, memory_chain, memory_files, memory_imports, read_memory_file, request_context,
-        session_files, skills_item, CarriedItem, MemorySkip, MAX_MEMORY_FILE_BYTES, MAX_SESSIONS,
+        session_files, skills_item, untrusted_root, CarriedItem, MemoryChain, MemorySkip, MAX_LISTED_SKIPS,
+        MAX_MEMORY_FILE_BYTES, MAX_SESSIONS,
     };
     use crate::transcripts::project_dir_name;
     use std::collections::HashSet;
@@ -28786,13 +28787,19 @@ mod request_context_tests {
         assert_eq!(memory_imports(text), ["AGENTS.md", "docs/style.md"]);
     }
 
+    /// A path resolved, as the chain reports it (temp dirs sit behind
+    /// `/private` on macOS).
+    fn canon(p: &Path) -> std::path::PathBuf {
+        std::fs::canonicalize(p).unwrap()
+    }
+
     #[test]
     fn the_claude_md_chain_is_user_then_the_project_with_imports() {
         let home = TempDir::new().unwrap();
         let tree = TempDir::new().unwrap();
         let project = tree.path().join("work").join("repo");
         write(&home.path().join(".claude/CLAUDE.md"), "user rules");
-        // A directory above the project is the user's: its file is read.
+        // A directory above the project (and outside any git work tree) is the user's.
         write(&tree.path().join("work/CLAUDE.md"), "parent rules");
         // AGENTS.md counts only because CLAUDE.md imports it; it imports
         // CLAUDE.md back, which is not counted twice.
@@ -28803,9 +28810,10 @@ mod request_context_tests {
         write(&project.join("sub/AGENTS.md"), "never imported");
 
         let items = memory_files(&project, Some(home.path()));
-        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
+        let (home_c, tree_c) = (canon(home.path()), canon(tree.path()));
+        let parent = tree_c.join("work").join("CLAUDE.md").display().to_string();
         assert_eq!(
-            labels_under(&items, &[home.path(), tree.path()]),
+            labels_under(&items, &[home_c.as_path(), tree_c.as_path()]),
             ["~/.claude/CLAUDE.md".to_string(), parent, "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
         );
         let local = items.iter().find(|i| i.label == "CLAUDE.local.md").unwrap();
@@ -28828,11 +28836,11 @@ mod request_context_tests {
         write(&work.join("CLAUDE.md"), &format!("parent rules @{}", outside.path().join("team.md").display()));
         write(&project.join("CLAUDE.md"), "project rules @../CLAUDE.md");
         let chain = memory_chain(&project, Some(home.path()));
-        let read: String = chain.iter().map(|f| f.text.as_str()).collect();
+        let read: String = chain.files.iter().map(|f| f.text.as_str()).collect();
         assert!(read.contains("parent rules") && read.contains("team rules") && read.contains("project rules"), "{chain:?}");
         // The project's import of the ancestor's file adds nothing: it was read once, as the user's.
         assert_eq!(read.matches("parent rules").count(), 1);
-        assert!(chain.iter().all(|f| f.skipped.is_none()), "{chain:?}");
+        assert!(chain.files.iter().all(|f| f.skipped.is_none()), "{chain:?}");
 
         // An ancestor's CLAUDE.md that is a symlink into the project is
         // treated as the project's: its import of a secret is skipped.
@@ -28841,11 +28849,66 @@ mod request_context_tests {
         write(&project2.join("docs/evil.md"), "evil rules @~/.aws/credentials");
         std::os::unix::fs::symlink(project2.join("docs/evil.md"), tree2.path().join("CLAUDE.md")).unwrap();
         let chain = memory_chain(&project2, Some(home.path()));
-        let read: String = chain.iter().map(|f| f.text.as_str()).collect();
+        let read: String = chain.files.iter().map(|f| f.text.as_str()).collect();
         assert!(read.contains("evil rules"), "{chain:?}");
         assert!(!read.contains("HOME-SECRET"), "{chain:?}");
-        let creds = chain.iter().find(|f| f.label == "~/.aws/credentials").expect("listed");
+        let creds = chain.files.iter().find(|f| f.label == "~/.aws/credentials").expect("listed");
         assert_eq!(creds.skipped, Some(MemorySkip::OutsideProject));
+    }
+
+    /// An ancestor inside a git work tree is the repository's, not the
+    /// user's: a project opened in a subfolder of a cloned repo, a submodule,
+    /// and a worktree beside its checkout.
+    #[test]
+    fn ancestors_inside_a_git_work_tree_are_the_repository_s() {
+        let home = TempDir::new().unwrap();
+        write(&home.path().join(".ssh/key"), "SSH-SECRET");
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("team.md"), "team rules");
+        let read_of = |chain: &MemoryChain| chain.files.iter().map(|f| f.text.clone()).collect::<String>();
+
+        // A subfolder of a cloned repo: the repo's root file is untrusted,
+        // its import of a home file is skipped, an import inside the repo is fine.
+        let tree = TempDir::new().unwrap();
+        let mono = tree.path().join("mono");
+        std::fs::create_dir_all(mono.join(".git")).unwrap();
+        write(&mono.join("CLAUDE.md"), "mono rules @~/.ssh/key @docs/shared.md");
+        write(&mono.join("docs/shared.md"), "shared rules");
+        write(&mono.join("pkg/CLAUDE.md"), "pkg rules @../docs/shared.md");
+        // Above the repo is the user's: may import from anywhere.
+        write(&tree.path().join("CLAUDE.md"), &format!("user dir rules @{}", outside.path().join("team.md").display()));
+        assert_eq!(untrusted_root(&canon(&mono.join("pkg"))), canon(&mono));
+        let chain = memory_chain(&mono.join("pkg"), Some(home.path()));
+        let read = read_of(&chain);
+        assert!(!read.contains("SSH-SECRET"), "{chain:?}");
+        for t in ["mono rules", "shared rules", "pkg rules", "user dir rules", "team rules"] {
+            assert!(read.contains(t), "{t} missing: {chain:?}");
+        }
+        let key = chain.files.iter().find(|f| f.label == "~/.ssh/key").expect("listed");
+        assert_eq!(key.skipped, Some(MemorySkip::OutsideProject));
+
+        // A submodule: its own `.git` is a file; the outermost tree wins.
+        let sub = mono.join("vendor/sub");
+        write(&sub.join(".git"), "gitdir: ../../.git/modules/sub");
+        write(&sub.join("CLAUDE.md"), "sub rules");
+        assert_eq!(untrusted_root(&canon(&sub)), canon(&mono));
+        let chain = memory_chain(&sub, Some(home.path()));
+        let read = read_of(&chain);
+        assert!(read.contains("sub rules") && read.contains("mono rules") && !read.contains("SSH-SECRET"), "{chain:?}");
+
+        // A worktree under `.octopus-worktrees/`, beside its checkout: the
+        // directories above it hold no `.git`, so they are the user's.
+        let tree = TempDir::new().unwrap();
+        std::fs::create_dir_all(tree.path().join("proj/.git")).unwrap();
+        let wt = tree.path().join(".octopus-worktrees/feat");
+        write(&wt.join(".git"), "gitdir: ../../proj/.git/worktrees/feat");
+        write(&wt.join("CLAUDE.md"), "wt rules @~/.ssh/key");
+        write(&tree.path().join("CLAUDE.md"), &format!("code dir rules @{}", outside.path().join("team.md").display()));
+        assert_eq!(untrusted_root(&canon(&wt)), canon(&wt));
+        let chain = memory_chain(&wt, Some(home.path()));
+        let read = read_of(&chain);
+        assert!(read.contains("wt rules") && read.contains("code dir rules") && read.contains("team rules"), "{chain:?}");
+        assert!(!read.contains("SSH-SECRET"), "{chain:?}");
     }
 
     /// A project's files can't pull anything from outside it into a request:
@@ -28875,29 +28938,45 @@ mod request_context_tests {
         write(&home.path().join(".claude/CLAUDE.md"), "@~/notes.md");
 
         let chain = memory_chain(&project, Some(home.path()));
-        let read: String = chain.iter().map(|f| f.text.as_str()).collect();
+        let read: String = chain.files.iter().map(|f| f.text.as_str()).collect();
         for secret in ["HOME-SECRET", "SIBLING-SECRET", "ABS-SECRET"] {
             assert!(!read.contains(secret), "{secret} was read: {chain:?}");
         }
         assert!(read.contains("inside rules") && read.contains("user notes"), "{chain:?}");
         let skipped: Vec<&str> = chain
+            .files
             .iter()
             .filter(|f| f.skipped == Some(MemorySkip::OutsideProject))
             .map(|f| f.label.as_str())
             .collect();
-        for label in ["~/.aws/credentials", "../sibling.md", "docs/notes.md"] {
+        // Labelled by where they really are.
+        let sibling = canon(&tree.path().join("sibling.md")).display().to_string();
+        let abs_real = canon(&abs).display().to_string();
+        for label in ["~/.aws/credentials", sibling.as_str(), abs_real.as_str()] {
             assert!(skipped.contains(&label), "{label} not skipped: {skipped:?}");
         }
-        assert!(skipped.iter().any(|l| l.ends_with("abs.md")), "{skipped:?}");
+        assert_eq!(skipped.iter().filter(|l| **l == abs_real).count(), 2, "the import and the symlink: {skipped:?}");
 
         // A symlinked CLAUDE.md that points out of the project is skipped.
         let linked = tree.path().join("linked");
         std::fs::create_dir_all(&linked).unwrap();
         std::os::unix::fs::symlink(&abs, linked.join("CLAUDE.md")).unwrap();
         let chain = memory_chain(&linked, None);
-        assert!(chain.iter().all(|f| !f.text.contains("ABS-SECRET")), "{chain:?}");
-        assert!(chain.iter().any(|f| f.label == "CLAUDE.md" && f.skipped == Some(MemorySkip::OutsideProject)));
-        assert!(memory_files(&linked, None).iter().all(|i| i.label != "CLAUDE.md"));
+        assert!(chain.files.iter().all(|f| !f.text.contains("ABS-SECRET")), "{chain:?}");
+        assert!(chain.files.iter().any(|f| f.path.ends_with("linked/CLAUDE.md") && f.skipped == Some(MemorySkip::OutsideProject)));
+        assert!(memory_files(&linked, None).iter().all(|i| !i.path.as_deref().is_some_and(|p| p.contains("abs.md"))));
+    }
+
+    /// A repo folder named `~` can't pass for the user's home in a label.
+    #[test]
+    fn a_repo_folder_named_tilde_is_labelled_as_the_project_s() {
+        let project = TempDir::new().unwrap();
+        write(&project.path().join("CLAUDE.md"), "@./~/.claude/CLAUDE.md");
+        write(&project.path().join("~/.claude/CLAUDE.md"), "repo rules");
+        let chain = memory_chain(project.path(), None);
+        let labels: Vec<&str> = chain.files.iter().map(|f| f.label.as_str()).collect();
+        assert!(labels.contains(&"./~/.claude/CLAUDE.md"), "{labels:?}");
+        assert!(!labels.contains(&"~/.claude/CLAUDE.md"), "{labels:?}");
     }
 
     #[test]
@@ -28907,12 +28986,47 @@ mod request_context_tests {
         big.set_len(MAX_MEMORY_FILE_BYTES + 1).unwrap();
         assert_eq!(read_memory_file(&project.path().join("CLAUDE.md"), None), Err(MemorySkip::TooLarge));
         let chain = memory_chain(project.path(), None);
-        let f = chain.iter().find(|f| f.label == "CLAUDE.md").unwrap();
+        let f = chain.files.iter().find(|f| f.label == "CLAUDE.md").unwrap();
         assert_eq!(f.skipped, Some(MemorySkip::TooLarge));
         // Not a regular file: nothing to read, nothing listed.
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("CLAUDE.md")).unwrap();
         assert_eq!(read_memory_file(&dir.path().join("CLAUDE.md"), None), Ok(None));
+    }
+
+    /// A FIFO where a memory file should be is opened non-blocking and
+    /// refused by its handle's type, so it can't hang the turn.
+    #[test]
+    fn a_fifo_in_place_of_a_memory_file_never_blocks() {
+        let project = TempDir::new().unwrap();
+        let fifo = project.path().join("CLAUDE.md");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(read_memory_file(&fifo, None), Ok(None));
+        assert!(memory_chain(project.path(), None).files.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// Skipped files are listed up to 20, then counted, here and in "What
+    /// every request carries".
+    #[test]
+    fn skipped_files_are_listed_up_to_20_then_counted() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let imports: Vec<String> = (0..25).map(|i| format!("@~/s{i}.md")).collect();
+        for i in 0..25 {
+            write(&home.path().join(format!("s{i}.md")), "x");
+        }
+        write(&project.path().join("CLAUDE.md"), &imports.join(" "));
+        let chain = memory_chain(project.path(), Some(home.path()));
+        assert_eq!(chain.files.iter().filter(|f| f.skipped.is_some()).count(), MAX_LISTED_SKIPS);
+        assert_eq!(chain.more_skipped, 5);
+        let transcripts = TempDir::new().unwrap();
+        let cwd = project.path().display().to_string();
+        let ctx = request_context(transcripts.path(), Some(home.path()), project.path(), &[cwd], &HashSet::new());
+        assert_eq!((ctx.skipped.len(), ctx.more_skipped), (20, 5));
+        assert_eq!((ctx.skipped[0].label.as_str(), ctx.skipped[0].reason.as_str()), ("~/s0.md", "outside the project"));
     }
 
     /// Direct's API stages read the root's convention files the same way.
@@ -29698,7 +29812,7 @@ mod project_instructions_tests {
         assert!(at.windows(2).all(|w| w[0] < w[1]), "user, then top down, imports after their file: {}", got.section);
         assert!(!got.section.contains("agents rules"), "{}", got.section);
         assert!(got.section.contains("Contents of CLAUDE.md:\n\nproject rules"), "{}", got.section);
-        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
+        let parent = std::fs::canonicalize(tree.path()).unwrap().join("work").join("CLAUDE.md").display().to_string();
         let sent: Vec<&str> = got.files.iter().filter(|f| f.skipped.is_none()).map(|f| f.label.as_str()).collect();
         assert!(sent.starts_with(&["~/.claude/CLAUDE.md"]) && sent.ends_with(&["CLAUDE.md", "docs/style.md", "CLAUDE.local.md"]), "{sent:?}");
         assert!(sent.contains(&parent.as_str()), "the ancestor's file is the user's, and sent: {sent:?}");
@@ -29786,7 +29900,8 @@ mod project_instructions_tests {
         assert!(got.section.len() < INSTRUCTIONS_CAP_BYTES + 2_000, "{} bytes", got.section.len());
         assert!(got.section.contains("section truncated for length"));
         // (A file of another ancestor on this machine isn't the test's.)
-        let ours = |p: &str| Path::new(p).starts_with(ws.path()) || Path::new(p).starts_with(home.path());
+        let (ws_c, home_c) = (std::fs::canonicalize(ws.path()).unwrap(), std::fs::canonicalize(home.path()).unwrap());
+        let ours = |p: &str| Path::new(p).starts_with(&ws_c) || Path::new(p).starts_with(&home_c);
         let files: Vec<_> = got.files.iter().filter(|f| f.skipped.is_none() && ours(&f.path)).collect();
         let labels: Vec<&str> = files.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(labels, ["~/.claude/CLAUDE.md", "CLAUDE.md", "x.md", "y.md"]);

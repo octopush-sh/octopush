@@ -46,7 +46,7 @@ beforeEach(() => {
   getThreadCost.mockReset().mockResolvedValue(cost());
   logbookSummary.mockReset().mockResolvedValue([]);
   listMcpServerStatus.mockReset().mockResolvedValue([]);
-  listProjectInstructions.mockReset().mockResolvedValue([]);
+  listProjectInstructions.mockReset().mockResolvedValue({ files: [], moreSkipped: 0 });
   useChatStore.setState({ activeThreadByWs: { ws: "t-1" }, messagesByWs: {}, streamingByWs: {}, continuingCalls: {} });
 });
 
@@ -204,9 +204,10 @@ describe("CompanionContext — budgets, capabilities, rows", () => {
   });
 
   it("lists the instruction files the conversation follows, before the MCP servers", async () => {
-    listProjectInstructions.mockResolvedValue([
-      { label: "CLAUDE.md", path: "/wt/CLAUDE.md", tokens: 3100, trimmed: false },
-    ]);
+    listProjectInstructions.mockResolvedValue({
+      files: [{ label: "CLAUDE.md", path: "/wt/CLAUDE.md", tokens: 3100, trimmed: false }],
+      moreSkipped: 0,
+    });
     listMcpServerStatus.mockResolvedValue([{ name: "docs-server", state: "connected", tools: 2, reason: null }]);
     await act(async () => {
       render(<CompanionContext {...baseProps} workspaceId="ws" worktreePath="/wt" />);

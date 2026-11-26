@@ -2265,9 +2265,10 @@ pub async fn list_mcp_server_status(
 #[tauri::command]
 pub async fn list_project_instructions(
     workspace_path: String,
-) -> AppResult<Vec<crate::project_instructions::InstructionFile>> {
+) -> AppResult<crate::project_instructions::InstructionList> {
     tauri::async_runtime::spawn_blocking(move || {
-        crate::project_instructions::for_workspace(std::path::Path::new(&workspace_path)).files
+        let got = crate::project_instructions::for_workspace(std::path::Path::new(&workspace_path));
+        crate::project_instructions::InstructionList { files: got.files, more_skipped: got.more_skipped }
     })
     .await
     .map_err(|e| AppError::Other(format!("project instructions: {e}")))

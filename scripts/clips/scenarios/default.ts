@@ -21,7 +21,7 @@ import type {
   ChatMessage,
   ChatThread,
   GitStatus,
-  InstructionFile,
+  InstructionList,
   McpServerConfig,
   McpToolInfo,
   ModelInfo,
@@ -311,10 +311,13 @@ export const defaultScenario: Scenario = {
     list_chat_messages: (a) => (a.threadId === THREAD.id ? MESSAGES : []),
     get_thread_cost: THREAD_COST,
     // the Companion's "follows" row: the active worktree's CLAUDE.md
-    list_project_instructions: (a): InstructionFile[] =>
-      a.workspacePath === ACTIVE.worktreePath
-        ? [{ label: "CLAUDE.md", path: `${ACTIVE.worktreePath}/CLAUDE.md`, tokens: 3100, trimmed: false }]
-        : [],
+    list_project_instructions: (a): InstructionList => ({
+      files:
+        a.workspacePath === ACTIVE.worktreePath
+          ? [{ label: "CLAUDE.md", path: `${ACTIVE.worktreePath}/CLAUDE.md`, tokens: 3100, trimmed: false }]
+          : [],
+      moreSkipped: 0,
+    }),
     // direct
     list_pipelines: PIPELINES,
     get_pipeline: PIPELINES[0],

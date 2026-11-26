@@ -410,6 +410,13 @@ export interface InstructionFile {
   skipped?: string | null;
 }
 
+/** What `list_project_instructions` answers: the files, and how many more
+ *  skipped files there were past the 20 listed. */
+export interface InstructionList {
+  files: InstructionFile[];
+  moreSkipped: number;
+}
+
 /** A configured MCP server (stdio): the command to spawn + its args/env. */
 export interface McpServerConfig {
   command: string;
@@ -556,6 +563,11 @@ export interface RequestContext {
   usualUsd: number | null;
   /** Largest first; they add up to `measuredTokens` when it is known. */
   items: CarriedItem[];
+  /** Memory files named but never read (a project file pointing outside the
+   *  project, a file over 4 MiB), at most 20. */
+  skipped: { label: string; path: string; reason: string }[];
+  /** Skipped files past those, counted. */
+  moreSkipped: number;
 }
 
 export interface ChatStreamEvent {

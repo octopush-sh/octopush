@@ -34,7 +34,9 @@
 //! provider the conversation already uses.
 
 use crate::orchestrator::runner::{cap_to, SECTION_CAP_CHARS};
-use crate::request_context::{estimate_tokens, memory_chain, read_memory_file, MemoryFile};
+use crate::request_context::{
+    estimate_tokens, memory_chain, read_memory_file, untrusted_root, MemoryChain, MemoryFile, MAX_LISTED_SKIPS,
+};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -58,7 +60,7 @@ pub struct InstructionFile {
     /// The path as the user knows it: relative to the workspace, `~/…` under
     /// home, else in full.
     pub label: String,
-    /// The file's full path, as the chain named it.
+    /// The file's full path, resolved (as the chain named it, when skipped).
     pub path: String,
     /// Estimated tokens of the text sent (0 when it was left out or skipped).
     pub tokens: u64,
@@ -75,22 +77,34 @@ pub struct InstructionFile {
 pub struct ProjectInstructions {
     pub files: Vec<InstructionFile>,
     pub section: String,
+    /// Skipped files past the [`MAX_LISTED_SKIPS`] listed in `files`.
+    pub more_skipped: usize,
+}
+
+/// What `list_project_instructions` answers for the Companion.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstructionList {
+    pub files: Vec<InstructionFile>,
+    /// Skipped files not listed in `files`, counted ("+N more").
+    pub more_skipped: usize,
 }
 
 /// Every file the workspace's instructions come from, in load order: the
 /// `CLAUDE.md` chain, then the fallback files when the workspace has no
 /// `CLAUDE.md` of its own (read with the same containment and bound).
-fn instruction_files(workspace: &Path, home: Option<&Path>) -> Vec<MemoryFile> {
+fn instruction_files(workspace: &Path, home: Option<&Path>) -> MemoryChain {
     let mut out = memory_chain(workspace, home);
     let has_own = ["CLAUDE.md", ".claude/CLAUDE.md"].iter().any(|n| workspace.join(n).is_file());
     let Ok(root) = std::fs::canonicalize(workspace) else { return out };
     if has_own {
         return out;
     }
-    let mut seen: HashSet<PathBuf> = out.iter().filter_map(|f| f.real.clone()).collect();
+    let untrusted = untrusted_root(&root);
+    let mut seen: HashSet<PathBuf> = out.files.iter().filter_map(|f| f.real.clone()).collect();
     for name in FALLBACK_FILES {
-        let path = workspace.join(name);
-        let file = match read_memory_file(&path, Some(&root)) {
+        let path = root.join(name);
+        let file = match read_memory_file(&path, Some(&untrusted)) {
             Ok(None) => continue,
             Ok(Some((real, raw))) => {
                 if !seen.insert(real.clone()) {
@@ -106,24 +120,24 @@ fn instruction_files(workspace: &Path, home: Option<&Path>) -> Vec<MemoryFile> {
                     skipped: None,
                 }
             }
-            Err(skip) => MemoryFile {
-                label: name.to_string(),
-                path,
-                real: None,
-                text: String::new(),
-                bytes: 0,
-                skipped: Some(skip),
-            },
+            Err(skip) => {
+                if out.files.iter().filter(|f| f.skipped.is_some()).count() >= MAX_LISTED_SKIPS {
+                    out.more_skipped += 1;
+                    continue;
+                }
+                MemoryFile { label: name.to_string(), path, real: None, text: String::new(), bytes: 0, skipped: Some(skip) }
+            }
         };
-        out.push(file);
+        out.files.push(file);
     }
     out
 }
 
 /// Whether `file` is the workspace's own `CLAUDE.md` (or the `AGENTS.md`
-/// standing in for it): the file the budget serves first.
-fn is_own_instructions(file: &MemoryFile, workspace: &Path) -> bool {
-    ["CLAUDE.md", ".claude/CLAUDE.md", "AGENTS.md"].iter().any(|n| file.path == workspace.join(n))
+/// standing in for it): the file the budget serves first. `root` is the
+/// workspace resolved, as the chain names its files.
+fn is_own_instructions(file: &MemoryFile, root: &Path) -> bool {
+    ["CLAUDE.md", ".claude/CLAUDE.md", "AGENTS.md"].iter().any(|n| file.path == root.join(n))
 }
 
 /// The workspace's instructions: the files and the section for the system
@@ -134,7 +148,10 @@ pub fn load(workspace: &Path, home: Option<&Path>) -> ProjectInstructions {
     // Read files, deduped by content; skipped ones are listed, never sent.
     let mut kept: Vec<(MemoryFile, String)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for file in instruction_files(workspace, home) {
+    let chain = instruction_files(workspace, home);
+    let more_skipped = chain.more_skipped;
+    let root = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    for file in chain.files {
         let text = file.text.trim().to_string();
         if file.skipped.is_none() {
             if text.is_empty() || seen.contains(&text) {
@@ -148,7 +165,7 @@ pub fn load(workspace: &Path, home: Option<&Path>) -> ProjectInstructions {
     // The budget: the workspace's own instructions first, then the rest in
     // load order. A file that fits what is left goes whole; a larger one is
     // trimmed to it, or left out when too little is left.
-    let own: Vec<bool> = kept.iter().map(|(f, _)| is_own_instructions(f, workspace)).collect();
+    let own: Vec<bool> = kept.iter().map(|(f, _)| is_own_instructions(f, &root)).collect();
     let order = (0..kept.len()).filter(|&i| own[i]).chain((0..kept.len()).filter(|&i| !own[i]));
     let mut bodies: Vec<String> = vec![String::new(); kept.len()];
     let mut budget = INSTRUCTIONS_CAP_BYTES;
@@ -173,7 +190,7 @@ pub fn load(workspace: &Path, home: Option<&Path>) -> ProjectInstructions {
     for ((file, text), body) in kept.iter().zip(&bodies) {
         files.push(InstructionFile {
             label: file.label.clone(),
-            path: file.path.display().to_string(),
+            path: file.real.as_ref().unwrap_or(&file.path).display().to_string(),
             tokens: estimate_tokens(body.len() as u64),
             trimmed: file.skipped.is_none() && body != text,
             skipped: file.skipped.map(|s| s.as_str().to_string()),
@@ -183,7 +200,7 @@ pub fn load(workspace: &Path, home: Option<&Path>) -> ProjectInstructions {
         }
     }
     if parts.is_empty() {
-        return ProjectInstructions { files, section: String::new() };
+        return ProjectInstructions { files, section: String::new(), more_skipped };
     }
     let mut section = String::from(
         "\n\n# Project instructions\n\nThe instruction files for this workspace follow: the user's own \
@@ -203,7 +220,7 @@ pub fn load(workspace: &Path, home: Option<&Path>) -> ProjectInstructions {
     if !left_out.is_empty() {
         section.push_str(&format!("\n\n(Left out for length: {}.)", left_out.join(", ")));
     }
-    ProjectInstructions { files, section }
+    ProjectInstructions { files, section, more_skipped }
 }
 
 /// The user's home for [`for_workspace`]. Under test there is none, so no

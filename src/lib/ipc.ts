@@ -622,7 +622,7 @@ import type {
   McpToolInfo,
   McpServerConfig,
   McpServerStatus,
-  InstructionFile,
+  InstructionList,
   CreateSessionArgs,
   DirectoryEntry,
   FileEdit,
@@ -1121,9 +1121,10 @@ export const ipc = {
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
   /** The instruction files Talk follows in a worktree (its CLAUDE.md chain,
-   *  or AGENTS.md), each with its token estimate. Reads only. */
+   *  or AGENTS.md), each with its token estimate, and how many skipped files
+   *  weren't listed. Reads only. */
   listProjectInstructions: (workspacePath: string) =>
-    invoke<InstructionFile[]>("list_project_instructions", { workspacePath }),
+    invoke<InstructionList>("list_project_instructions", { workspacePath }),
   /** The MCP servers switched off in one Talk conversation (none by default). */
   getThreadMcpDisabled: (threadId: string) => invoke<string[]>("get_thread_mcp_disabled", { threadId }),
   /** Turn one server off (or back on) in a conversation; resolves to its new
