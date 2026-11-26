@@ -35,6 +35,10 @@ case "$args" in
       && git merge --quiet --no-ff "$sha" -m "Merge pull request #42 from octo/$STUB_BRANCH" \\
       && git push --quiet origin HEAD:main && git rev-parse HEAD
     ;;
+  *"actions/workflows/ci.yml/dispatches"*"ref=release-check/"*)
+    # CI "runs" on the pushed commit: its verdict is STUB_CHECK_CI, read back per sha.
+    r="$(echo "$args" | sed -nE 's#.*ref=(release-check/[^ ]+).*#\\1#p')"
+    s="$(git -C "$STUB_ORIGIN" rev-parse "refs/heads/$r")" && echo "\${STUB_CHECK_CI:-success}" > "$STUB_LOG.ci.$s" ;;
   *"repos/${SLUG}/pulls "*"-f title="*) echo 42 ;;
   *"repos/${SLUG}/releases?per_page="*) printf '%s\\n' \${STUB_PUBLISHED-v0.4.89} ;;
   *) : ;;
@@ -344,38 +348,116 @@ test("run: main keeps moving → stops after the allowed re-cuts: no merge, no t
   rmSync(calm.dir, { recursive: true, force: true });
 });
 
-test("run: main moved during the merge → that merge is not tagged; a later run tags it only once CI passed on it", () => {
-  const fx = fixture();
-  const gh = join(fx.bin, "gh");
-  writeFileSync(gh, GH_STUB
-    .replace(CI_LINE, `*"actions/runs?head_sha="*) s="$(echo "$args" | sed -nE 's/.*head_sha=([0-9a-f]+).*/\\1/p')"; if [ -f "$STUB_LOG.ci.$s" ]; then cat "$STUB_LOG.ci.$s"; else echo "\${STUB_CI:-success}"; fi ;;`)
-    .replace('    work="$(mktemp -d)"', `    if [ ! -f "$STUB_LOG.raced" ]; then touch "$STUB_LOG.raced"; ${MOVE_MAIN("raced", "Raced the merge")}; fi
-    work="$(mktemp -d)"`));
-  const r = routine(fx, "run");
-  assert.equal(r.code, 2, r.out);
-  assert.match(r.out, /main moved during the merge: [0-9a-f]{40} is not the tree CI tested/);
-  assert.equal(originTags(fx), "v0.4.89", "nothing untested is tagged");
-  const merge = git(fx.origin, "rev-parse", "main");
-  assert.notEqual(git(fx.origin, "rev-parse", `${merge}^{tree}`), git(fx.origin, "rev-parse", `${merge}^2^{tree}`));
+/** CI per commit: `$STUB_LOG.ci.<sha>` when it exists (the release-check dispatch writes it), else STUB_CI. */
+const PER_SHA_CI = `*"actions/runs?head_sha="*) s="$(echo "$args" | sed -nE 's/.*head_sha=([0-9a-f]+).*/\\1/p')"; if [ -f "$STUB_LOG.ci.$s" ]; then cat "$STUB_LOG.ci.$s"; else echo "\${STUB_CI:-success}"; fi ;;`;
+const RACE = (stub) => stub.replace('    work="$(mktemp -d)"', `    if [ ! -f "$STUB_LOG.raced" ]; then touch "$STUB_LOG.raced"; ${MOVE_MAIN("raced", "Raced the merge")}; fi
+    work="$(mktemp -d)"`);
+const checkRuns = (r) => r.calls.filter((c) => /ci\.yml\/dispatches -f ref=release-check\/v0\.4\.90/.test(c));
+const branches = (fx) => git(fx.origin, "branch", "--list");
 
-  // Later: another PR lands on top (green), the merge itself has no green CI → resume refuses.
+test("run: main moved during the merge → CI runs on that merge commit, on its own branch, and it is tagged once green", () => {
+  const fx = fixture();
+  writeFileSync(join(fx.bin, "gh"), RACE(GH_STUB.replace(CI_LINE, PER_SHA_CI)));
+  const r = routine(fx, "run");
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /main moved during the merge: [0-9a-f]{40} is not the tree CI tested on [0-9a-f]{40} — running CI on the merge itself/);
+  const merge = git(fx.origin, "rev-parse", "main");
+  assert.notEqual(git(fx.origin, "rev-parse", `${merge}^{tree}`), git(fx.origin, "rev-parse", `${merge}^2^{tree}`), "the race really happened");
+  assert.equal(checkRuns(r).length, 1, r.calls.join("\n"));
+  assert.equal(git(fx.origin, "rev-parse", "v0.4.90^{commit}"), merge, "tagged after CI passed on that exact commit");
+  assert.doesNotMatch(branches(fx), /release-check/, "the check branch is removed");
+  rmSync(fx.dir, { recursive: true, force: true });
+});
+
+test("run: that merge is red → v0.4.90 is abandoned (never a v tag); the next run releases v0.4.91 from main and carries 0.4.90's notes", () => {
+  const fx = fixture();
+  writeFileSync(join(fx.bin, "gh"), RACE(GH_STUB.replace(CI_LINE, PER_SHA_CI)));
+  const r = routine(fx, "run", { STUB_CHECK_CI: "failure" });
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /v0\.4\.90 abandoned: CI failed on its merge/);
+  assert.deepEqual(originTags(fx).split("\n").sort(), ["abandoned/v0.4.90", "v0.4.89"]);
+  const merge = git(fx.origin, "rev-parse", "main");
+  assert.equal(git(fx.origin, "rev-parse", "abandoned/v0.4.90^{commit}"), merge);
+
+  // Still red: nothing is cut (main's own CI gate holds again once the version is spent).
+  writeFileSync(fx.log, "");
+  const waiting = routine(fx, "check", { STUB_CI: "failure" });
+  assert.equal(waiting.code, 1, waiting.out);
+  assert.match(waiting.out, /CI on main \([0-9a-f]{40}\) is failure — waiting/);
+
+  // A fix lands and main is green: the next release takes the number after it.
   const seed = join(fx.dir, "seed");
   git(seed, "pull", "--quiet", "origin", "main");
-  writeFileSync(join(seed, "later.txt"), "later");
-  git(seed, "add", "-A"); git(seed, "commit", "--quiet", "-m", "Merge pull request #11 from octo/later");
+  mkdirSync(join(seed, "whats-new/unreleased"), { recursive: true });
+  writeFileSync(join(seed, "whats-new/unreleased/main-green.md"), "---\ntitle: Main green again\nkind: fix\narea: app\n---\nThe fix.\n");
+  git(seed, "add", "-A"); git(seed, "commit", "--quiet", "-m", "Merge pull request #13 from octo/fix-main");
   git(seed, "push", "--quiet", "origin", "main");
-  writeFileSync(`${fx.log}.ci.${merge}`, "failure");
-  writeFileSync(fx.log, "");
-  const refused = routine(fx, "run");
-  assert.equal(refused.code, 2, refused.out);
-  assert.match(refused.out, /v0\.4\.90 is merged \([0-9a-f]{40}\) but untested: CI is failure on the merge/);
-  assert.equal(originTags(fx), "v0.4.89");
+  const next = routine(fx, "run", { STUB_BRANCH: "release/v0.4.91" });
+  assert.equal(next.code, 0, next.out);
+  assert.match(next.out, /v0\.4\.90 was abandoned \(CI failed on its merge\) — releasing v0\.4\.91 from main/);
+  assert.match(next.out, /collecting changesets for 0\.4\.91 \(since v0\.4\.89; carrying 0\.4\.90, never published\)/);
+  assert.equal(git(fx.origin, "rev-parse", "v0.4.91^{commit}"), git(fx.origin, "rev-parse", "main"));
+  const notes = git(fx.origin, "show", "main:whats-new/0.4.91/notes.md");
+  assert.match(notes, /also ships the changes of 0\.4\.90, whose build failed, so it was never published/);
+  assert.match(notes, /A nicer thing/, "0.4.90's own changes reach a published release");
+  assert.match(notes, /Main green again/);
+  assert.doesNotMatch(originTags(fx), /^v0\.4\.90$/m);
+  rmSync(fx.dir, { recursive: true, force: true });
+});
 
-  writeFileSync(`${fx.log}.ci.${merge}`, "success");
-  const tagged = routine(fx, "run");
-  assert.equal(tagged.code, 0, tagged.out);
-  assert.match(tagged.out, /already merged \([0-9a-f]{40}; CI green on the merge/);
+/** A release merged but untagged (its tag push "failed"), with per-commit CI. Returns the merge and the PR head. */
+function mergedUntagged() {
+  const fx = fixture();
+  const first = routine(fx, "run");
+  assert.equal(first.code, 0, first.out);
+  git(fx.origin, "tag", "-d", "v0.4.90"); git(fx.ws, "tag", "-d", "v0.4.90");
+  writeFileSync(fx.log, "");
+  writeFileSync(join(fx.bin, "gh"), GH_STUB.replace(CI_LINE, PER_SHA_CI));
+  return { fx, merge: git(fx.origin, "rev-parse", "main"), head: git(fx.origin, "rev-parse", "main^2") };
+}
+
+test("resume: a merge with no CI of its own but the exact tree of a green head is tagged without running CI again", () => {
+  const { fx, merge, head } = mergedUntagged();
+  writeFileSync(`${fx.log}.ci.${head}`, "success");
+  const r = routine(fx, "run", { STUB_CI: "none" });   // nothing ran on the merge, nor on main's head (it is the merge)
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /v0\.4\.90 is merged on main but not tagged — verifying it/, "the check doesn't wait for main's own CI");
+  assert.match(r.out, new RegExp(`already merged \\(${merge}; the merge ${merge} has the tree CI passed on \\(${head}\\)\\)`));
+  assert.equal(checkRuns(r).length, 0, "no second CI");
   assert.equal(git(fx.origin, "rev-parse", "v0.4.90^{commit}"), merge);
+  rmSync(fx.dir, { recursive: true, force: true });
+});
+
+test("resume: the same tree, but the head's CI failed → not tagged on that; CI runs on the merge itself first", () => {
+  const { fx, merge, head } = mergedUntagged();
+  writeFileSync(`${fx.log}.ci.${head}`, "failure");
+  const r = routine(fx, "run", { STUB_CI: "none" });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /v0\.4\.90 is merged \([0-9a-f]{40}\) but untested: CI is failure on the merge [0-9a-f]{40} and its tree is not one CI passed on — running CI on that commit/);
+  assert.equal(checkRuns(r).length, 1, r.calls.join("\n"));
+  assert.equal(git(fx.origin, "rev-parse", "v0.4.90^{commit}"), merge);
+
+  const red = mergedUntagged();
+  writeFileSync(`${red.fx.log}.ci.${red.head}`, "failure");
+  const r2 = routine(red.fx, "run", { STUB_CI: "none", STUB_CHECK_CI: "failure" });
+  assert.equal(r2.code, 2, r2.out);
+  assert.match(r2.out, /v0\.4\.90 abandoned/);
+  assert.doesNotMatch(originTags(red.fx), /^v0\.4\.90$/m);
+  rmSync(fx.dir, { recursive: true, force: true });
+  rmSync(red.fx.dir, { recursive: true, force: true });
+});
+
+test("resume: CI on the merge only lost its runners → no verdict: neither tagged nor abandoned, checked again next run", () => {
+  const { fx, head } = mergedUntagged();
+  writeFileSync(`${fx.log}.ci.${head}`, "failure");
+  writeFileSync(join(fx.bin, "gh"), GH_STUB.replace(CI_LINE, `*"actions/runs?head_sha="*'.conclusion == "failure"'*) echo 555 ;;
+  *"actions/runs/555/jobs"*) echo 555 ;;
+  ${PER_SHA_CI}`));
+  const r = routine(fx, "run", { STUB_CI: "none", STUB_CHECK_CI: "failure", OCTOPUSH_RELEASE_CI_STARVED_RETRIES: "1" });
+  assert.equal(r.code, 2, r.out);
+  assert.match(r.out, /only lost its runner — re-running it \(1\)/);
+  assert.match(r.out, /did not give a verdict \(timeout or no runner\) — the next run checks it again/);
+  assert.equal(originTags(fx), "v0.4.89", "no v tag, no abandoned tag");
   rmSync(fx.dir, { recursive: true, force: true });
 });
 
@@ -383,6 +465,9 @@ test("run: a version that was tagged but never published (its build failed) is c
   const fx = fixture({ after: [] });
   const seed = join(fx.dir, "seed");
   const put = (rel, text) => { mkdirSync(dirname(join(seed, rel)), { recursive: true }); writeFileSync(join(seed, rel), text); };
+  // An old release's changesets (published long ago, beyond the releases page): never carried.
+  put("whats-new/0.4.88/old-thing.md", "---\ntitle: Old news\nkind: fix\narea: app\n---\nShipped in 0.4.88.\n");
+  put("whats-new/0.4.88/notes.md", "## Octopush 0.4.88\n");
   // v0.4.90: collected and tagged, but release.yml failed — no GitHub release.
   put("whats-new/0.4.90/failed-thing.md", "---\ntitle: Shipped by no one yet\nkind: feature\narea: app\n---\nThe v0.4.90 build never published this.\n");
   put("whats-new/0.4.90/notes.md", "## Octopush 0.4.90\n\n### Features\n\n- **Shipped by no one yet** — The v0.4.90 build never published this.\n");
@@ -394,11 +479,12 @@ test("run: a version that was tagged but never published (its build failed) is c
   git(seed, "push", "--quiet", "origin", "main", "--tags");
   const r = routine(fx, "run", { STUB_BRANCH: "release/v0.4.91", STUB_PUBLISHED: "v0.4.89" });
   assert.equal(r.code, 0, r.out);
-  assert.match(r.out, /collecting changesets for 0\.4\.91 \(since v0\.4\.89; carrying 0\.4\.90, tagged but never published\)/);
+  assert.match(r.out, /collecting changesets for 0\.4\.91 \(since v0\.4\.89; carrying 0\.4\.90, never published\)/);
   const notes = git(fx.origin, "show", "main:whats-new/0.4.91/notes.md");
   assert.match(notes, /This release also ships the changes of 0\.4\.90, whose build failed, so it was never published\./);
   assert.match(notes, /Shipped by no one yet/);
   assert.match(notes, /The fix/);
+  assert.doesNotMatch(notes, /Old news|0\.4\.88/, "only versions after the last published release");
   assert.ok(existsSync(fx.ws));
   assert.equal(git(fx.origin, "rev-parse", "v0.4.91^{commit}"), git(fx.origin, "rev-parse", "main"));
 

@@ -27,9 +27,9 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-24.04
-    # Up to 30 min for main's CI, then CI on the release PR (≤ 45 min) — twice
-    # when main moved meanwhile and the release is cut again (release-beta.sh).
-    timeout-minutes: 150
+    # The check waits up to 30 min for main's CI; the cut has its own limit
+    # below, and the job leaves room after it for the clean-up step.
+    timeout-minutes: 230
     env:
       OCTOPUSH_DISPATCH: "1"
       OCTOPUSH_SKIP_CLIPS: "1"
@@ -63,10 +63,29 @@ jobs:
       - name: Cut the beta
         if: steps.check.outputs.go == '1'
         # No agent code runs here: dependencies install without scripts and
-        # clips aren't recorded (scripts/routines/release-beta.sh).
+        # clips aren't recorded (scripts/routines/release-beta.sh). CI on the
+        # release PR (≤ 45 min, longer with starved re-runs), again after a
+        # re-cut, and CI on the merge itself when main slipped in: a step
+        # limit, so a run that overruns still gets the clean-up below.
+        timeout-minutes: 180
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           bash scripts/routines/release-beta.sh run
+
+      - name: Close a release PR the run left open
+        # A finished run leaves none (merged, or closed by its own failure
+        # path). One left by a timeout or a cancel would pause auto-merge
+        # (automerge.mjs): close it; the next run starts over.
+        if: always() && steps.check.outputs.go == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prs="$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+            --jq '.[] | select(.head.repo.full_name == "'"$GITHUB_REPOSITORY"'" and (.head.ref | test("^release/v[0-9]+[.][0-9]+[.][0-9]+$"))) | .number')" || { echo "::warning::could not list open PRs"; exit 0; }
+          for n in $prs; do
+            gh api "repos/$GITHUB_REPOSITORY/issues/$n/comments" -f body="The nightly release run stopped before it finished (timeout or cancel), so this release PR is closed: auto-merge resumes, and the next run starts over." >/dev/null || true
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/pulls/$n" -f state=closed >/dev/null && echo "closed release PR #$n" || echo "::warning::could not close release PR #$n"
+          done
