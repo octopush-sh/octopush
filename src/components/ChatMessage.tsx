@@ -6,6 +6,8 @@ import { ChatMarkdown, REMARK_PLUGINS } from "./chat/ChatMarkdown";
 import { splitBySkillTokens } from "../lib/skillMentions";
 import { formatUsd } from "../lib/cost";
 import { tourId } from "../lib/tour/ids";
+import { parseSentContext, typedText } from "../lib/sentContext";
+import { SentContext } from "./chat/SentContext";
 
 interface MessageProps {
   role: "user" | "assistant" | "tool" | "error" | string;
@@ -19,6 +21,8 @@ interface MessageProps {
   costUsd?: number | null;
   /** When the turn was sent (ISO). A user turn shows it in its header. */
   createdAt?: string | null;
+  /** A user turn's `@` context blocks (#1150): shown as chips under the ask. */
+  contextBlocks?: string | null;
 }
 
 /** Turn times are UI copy, so they are English whatever the system locale
@@ -142,6 +146,10 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
     // a glance however long the conversation gets. Brass goes to "— You": the
     // model's eyebrow and its tool rows stay mute.
     const time = turnTime(message.createdAt);
+    // An ask sent with `@` context reads as typed, its blocks as chips under
+    // it; a row without a record of them renders exactly as it was sent.
+    const sent = parseSentContext(message.contextBlocks, content);
+    const typed = sent ? typedText(content, sent) : content;
     return (
       <article
         data-role="user"
@@ -164,7 +172,7 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
         </div>
         <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">
           {skillNames && skillNames.length > 0
-            ? splitBySkillTokens(content, skillNames).map((part, i) =>
+            ? splitBySkillTokens(typed, skillNames).map((part, i) =>
                 part.kind === "skill" ? (
                   <span
                     key={i}
@@ -179,8 +187,9 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
                   <span key={i}>{part.text}</span>
                 ),
               )
-            : content}
+            : typed}
         </div>
+        {sent && <SentContext content={content} blocks={sent} />}
       </article>
     );
   }
