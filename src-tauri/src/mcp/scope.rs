@@ -6,7 +6,7 @@
 //! out the servers a conversation switched off, and the status read spawns
 //! nothing.
 
-use super::{load_server_configs, McpRegistry, McpToolInfo};
+use super::{load_server_configs, sort_tools, sorted_server_configs, McpRegistry, McpToolInfo};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -46,10 +46,12 @@ pub struct McpServerStatus {
 impl McpRegistry {
     /// [`Self::list_tools`] without the servers in `off`. A server switched
     /// off in a conversation is never started for it, so a broken one costs
-    /// that conversation nothing.
+    /// that conversation nothing. In [`sort_tools`] order, so the tool list
+    /// of every turn and every sub-agent is the same bytes while the config
+    /// is unchanged.
     pub fn list_tools_except(&self, worktree: &Path, off: &HashSet<String>) -> Vec<McpToolInfo> {
         let mut out = Vec::new();
-        for (name, cfg) in load_server_configs(worktree) {
+        for (name, cfg) in sorted_server_configs(worktree) {
             if off.contains(&name) {
                 continue;
             }
@@ -58,6 +60,7 @@ impl McpRegistry {
                 Err(e) => tracing::warn!(server = %name, error = %e, "MCP server unavailable; skipping"),
             }
         }
+        sort_tools(&mut out);
         out
     }
 
@@ -152,7 +155,8 @@ done
         let reg = McpRegistry::new();
 
         let tools = reg.list_tools_except(wt.path(), &HashSet::new());
-        assert_eq!(tools.iter().map(|t| t.namespaced.as_str()).collect::<Vec<_>>(), vec!["mcp__docs-server__search", "mcp__docs-server__read"]);
+        // By tool name, not the server's listed order (`sort_tools`).
+        assert_eq!(tools.iter().map(|t| t.namespaced.as_str()).collect::<Vec<_>>(), vec!["mcp__docs-server__read", "mcp__docs-server__search"]);
         let status = reg.status(wt.path());
         assert_eq!(
             status,
@@ -161,5 +165,106 @@ done
 
         reg.reset_server("docs-server");
         assert_eq!(of(&reg.status(wt.path()), "docs-server").state, McpServerState::Idle);
+    }
+
+    /// Four servers, each listing its tools out of name order.
+    fn four_servers(wt: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = wt.join("three.sh");
+        std::fs::write(&script, TWO_TOOLS.replace(
+            r#"[{"name":"search","inputSchema":{"type":"object"}},{"name":"read","inputSchema":{"type":"object"}}]"#,
+            r#"[{"name":"write","description":"w","inputSchema":{"type":"object","properties":{"b":{"type":"string"},"a":{"type":"string"}}}},{"name":"search","inputSchema":{"type":"object"}},{"name":"read","inputSchema":{"type":"object"}}]"#,
+        ))
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = McpServerConfig { command: "bash".into(), args: vec![script.to_string_lossy().into_owned()], ..Default::default() };
+        write_servers(wt, &[("zeta", cfg.clone()), ("alpha", cfg.clone()), ("mid", cfg.clone()), ("beta", cfg)]);
+    }
+
+    #[test]
+    fn mcp_tool_order_is_the_same_on_every_rebuild() {
+        let wt = tempfile::tempdir().unwrap();
+        four_servers(wt.path());
+        let reg = McpRegistry::new();
+        let names = |tools: &[McpToolInfo]| tools.iter().map(|t| t.namespaced.clone()).collect::<Vec<_>>();
+        let first = names(&reg.list_tools_except(wt.path(), &HashSet::new()));
+        let mut expected = Vec::new();
+        for server in ["alpha", "beta", "mid", "zeta"] {
+            for tool in ["read", "search", "write"] {
+                expected.push(format!("mcp__{server}__{tool}"));
+            }
+        }
+        assert_eq!(first, expected);
+        // The config map is rebuilt (with a fresh hash order) on every call.
+        for _ in 0..20 {
+            assert_eq!(names(&reg.list_tools_except(wt.path(), &HashSet::new())), first);
+        }
+        assert_eq!(names(&reg.list_tools(wt.path())), first, "Settings' listing too");
+        // A server switched off just drops out; the rest keep their order.
+        let off: HashSet<String> = ["beta".to_string()].into();
+        let without: Vec<String> = first.iter().filter(|n| !n.starts_with("mcp__beta__")).cloned().collect();
+        assert_eq!(names(&reg.list_tools_except(wt.path(), &off)), without);
+    }
+
+    #[test]
+    fn two_rebuilds_send_byte_identical_tool_json() {
+        use crate::providers::{LlmContent, LlmMessage, LlmRequest, LlmRole};
+        let wt = tempfile::tempdir().unwrap();
+        four_servers(wt.path());
+        let reg = McpRegistry::new();
+        let request_tools = || {
+            let tools = reg.list_tools_except(wt.path(), &HashSet::new());
+            let req = LlmRequest {
+                model: "claude-sonnet-5-5".into(),
+                max_tokens: 1024,
+                system: "s".into(),
+                messages: vec![LlmMessage { role: LlmRole::User, content: LlmContent::Text("hi".into()) }],
+                tools: tools.iter().map(crate::chat_agents::mcp_llm_tool).collect(),
+                tool_choice: None,
+                effort: None,
+                cache: true,
+            };
+            (
+                crate::providers::anthropic::build_request(&req)["tools"].to_string(),
+                crate::providers::openai_compat::build_request(&req)["tools"].to_string(),
+            )
+        };
+        let first = request_tools();
+        assert!(first.0.contains("mcp__alpha__read"), "{}", first.0);
+        for _ in 0..10 {
+            assert_eq!(request_tools(), first);
+        }
+    }
+
+    #[test]
+    fn settings_test_connect_lists_tools_in_the_same_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = tempfile::tempdir().unwrap();
+        let script = wt.path().join("docs.sh");
+        std::fs::write(&script, TWO_TOOLS).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = McpServerConfig { command: "bash".into(), args: vec![script.to_string_lossy().into_owned()], ..Default::default() };
+        // The server lists `search` before `read`.
+        let tools = McpRegistry::test_connect_with("docs", &cfg, &crate::mcp::secrets::MemoryStore::default()).unwrap();
+        assert_eq!(tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["read", "search"]);
+    }
+
+    #[test]
+    fn sort_tools_orders_by_server_then_tool_whatever_the_input_order() {
+        let tool = |server: &str, name: &str| McpToolInfo {
+            server: server.into(),
+            name: name.into(),
+            namespaced: format!("mcp__{server}__{name}"),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            read_only: false,
+        };
+        let mut a = vec![tool("b", "z"), tool("a", "y"), tool("b", "a"), tool("a", "b")];
+        let mut b = vec![tool("a", "b"), tool("b", "a"), tool("b", "z"), tool("a", "y")];
+        sort_tools(&mut a);
+        sort_tools(&mut b);
+        let names = |v: &[McpToolInfo]| v.iter().map(|t| t.namespaced.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&a), vec!["mcp__a__b", "mcp__a__y", "mcp__b__a", "mcp__b__z"]);
+        assert_eq!(names(&a), names(&b));
     }
 }
