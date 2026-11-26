@@ -618,6 +618,11 @@ fn gen_nonce() -> String {
     format!("{:08x}{:08x}", t.wrapping_mul(2_654_435_761) ^ n, n)
 }
 
+/// The init line that makes the shell run a command exactly as written:
+/// no history expansion of `!`, and a TAB inserted rather than taken as a
+/// completion request (see `init_and_wait_ready`).
+const SHELL_INPUT_AS_WRITTEN: &str = "set +H; bind 'set disable-completion on' 2>/dev/null\n";
+
 /// The prompt marker: `␞␞OCTO_DONE_<nonce>:<exit>:<cwd>␞␞`.
 fn done_re(nonce: &str) -> regex::Regex {
     regex::Regex::new(&format!(
@@ -646,9 +651,20 @@ fn init_and_wait_ready(
     //   false completion).
     // - PROMPT_COMMAND re-asserts PS1 each prompt, so a command that overwrites
     //   PS1 (venv/conda activate, a sourced script) can't break detection.
+    //
+    // Commands are typed into this interactive shell's readline as written
+    // (`run`), so two of its interactive features would rewrite them:
+    // history expansion (`node -e "if (!x) …"` fails with "event not found"
+    // and never runs; macOS's bash 3.2 also fails `echo "done!"`) and TAB
+    // completion (a heredoc's tabs vanish, which breaks a Makefile, and a
+    // TAB with many matches asks "Display all N possibilities?" and eats the
+    // next character). `set +H` turns the first off and `disable-completion`
+    // makes TAB insert itself; neither is needed, since nobody types at this
+    // prompt. On every attach, so a shell from an older build gets them too.
     let mut init = String::new();
     init.push('\n');
     init.push_str("stty -echo 2>/dev/null; PS2=''\n");
+    init.push_str(SHELL_INPUT_AS_WRITTEN);
     init.push_str("__OCTORS=$(printf '\\036')\n");
     init.push_str(&format!(
         "__octo_ps() {{ printf '%s%sOCTO_DONE_{nonce}:%d:%s%s%s' \"$__OCTORS\" \"$__OCTORS\" \"$__octo_oc\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
@@ -1104,6 +1120,53 @@ mod e2e {
         assert_eq!(r.output, "after-stop");
 
         shell.close("s");
+    }
+
+    /// The agent's commands reach bash as written: a `!` isn't taken as a
+    /// history expansion and a TAB isn't taken as a completion request, so a
+    /// heredoc keeps its tabs (both reproduced against an interactive PTY
+    /// bash before the fix).
+    #[test]
+    #[serial]
+    fn commands_with_a_bang_or_a_tab_run_as_written() {
+        let d = boot();
+        let shell = shell_on(&d.sock);
+        let quick = Duration::from_secs(5);
+
+        let r = cap(shell.run_capture("h", "/tmp", r#"echo "if (!fs.existsSync(p)) ok"; echo "done!""#, quick).unwrap());
+        assert_eq!(r.output, "if (!fs.existsSync(p)) ok\ndone!", "history expansion rewrote the command");
+        assert!(r.ok);
+        // `$` commands share the shell, and its settings.
+        let r = done(shell.run("h", "/tmp", r#"echo "ok!then""#, quick, true).unwrap());
+        assert_eq!(r.output, "ok!then");
+
+        let dir = TempDir::new().unwrap();
+        let makefile = dir.path().join("Makefile");
+        let heredoc = format!("cat > '{}' <<'EOF'\nall:\n\t@echo ok\nEOF", makefile.display());
+        let r = cap(shell.run_capture("h", "/tmp", &heredoc, quick).unwrap());
+        assert!(r.ok, "{:?}", r.output);
+        assert_eq!(fs::read_to_string(&makefile).unwrap(), "all:\n\t@echo ok\n", "the heredoc lost its tab");
+        // A TAB mid-line, where completion would have looked for matches.
+        let r = cap(shell.run_capture("h", "/tmp", "printf '%s' 'a\tb' | od -c | head -n 1", quick).unwrap());
+        assert!(r.output.contains("\\t"), "the TAB didn't reach printf: {:?}", r.output);
+
+        shell.close("h");
+    }
+
+    /// A shell started by an older build, without those settings, gets them
+    /// on its first reattach.
+    #[test]
+    #[serial]
+    fn a_shell_from_an_older_build_runs_commands_as_written_after_reattach() {
+        let d = boot();
+        let quick = Duration::from_secs(5);
+        let old = DaemonClient::connect_to(d.sock.to_str().unwrap()).unwrap();
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        old.spawn("talk-older", "/tmp", &env, Some("/bin/bash"), 40, 120).unwrap();
+        let shell = shell_on(&d.sock);
+        let r = cap(shell.run_capture("older", "/tmp", r#"echo "if (!x) ok""#, quick).unwrap());
+        assert_eq!(r.output, "if (!x) ok");
+        shell.close("older");
     }
 
     /// A dir holding `octo-1087-tool`, an executable found only through it.

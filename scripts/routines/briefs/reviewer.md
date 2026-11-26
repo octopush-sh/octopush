@@ -29,6 +29,13 @@ itself a reason to request changes).
   `scripts/visual-audit/`, `scripts/clips/scenarios/` or adds `data-audit-ignore` to get past the audit.
 - Nothing in a human-only area (VISION.md §8), nothing that reaches for credentials, the network,
   the user's files or telemetry it shouldn't, nothing obfuscated.
+- Clean room (CLAUDE.md "Innovation and clean room"). Request changes when the diff copies
+  third-party code, text or assets (recorded tool output kept as test fixtures, documented flag,
+  schema, format and API names, and short quotes with a link and attribution are fine); adds or
+  changes a direct dependency whose license is not fine (GPL, AGPL, SSPL, none) or unknown
+  (transitive dependencies of an accepted package aren't re-judged; any other license, flag it
+  for the PM); uses another company's trademark in a name we coin (plainly naming what we
+  integrate with, run or import from is fine); or makes an unsourced claim about a competitor.
 
 ## Is it user-visible?
 

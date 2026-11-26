@@ -6,7 +6,7 @@
 // can point anywhere. Kept pure and store-free because the rule is the subtle
 // part and App is not a testable place to keep it.
 
-import type { AttentionFlag } from "../stores/attentionStore";
+import { isApprovalFlag, type AttentionFlag } from "../stores/attentionStore";
 import type { ClaudeWaitReason } from "./claudeWaiting";
 import type { WorkspaceMode } from "./modes";
 import type { PtyAttentionReason } from "./types";
@@ -25,6 +25,11 @@ export function modeForFlag(flag: AttentionFlag): WorkspaceMode {
  * entering Run to work in session A would silently erase the marker session B
  * raised. Flags with no terminal id (chat pings, and terminal pings from a
  * daemon too old to name one) clear on the mode alone, as they always did.
+ *
+ * A Talk approval card's flag never clears by looking: it is a decision the
+ * turn waits on, not news, so it stays until the card is answered
+ * (`attentionStore.settleApproval`) — leave without answering and the rail and
+ * Mission Control still say so.
  */
 export function shouldClearAttention(
   flag: AttentionFlag | undefined,
@@ -32,6 +37,7 @@ export function shouldClearAttention(
   activeTerminalId: string | null,
 ): boolean {
   if (!flag) return false;
+  if (isApprovalFlag(flag)) return false;
   if (activeMode !== modeForFlag(flag)) return false;
   if (flag.kind === "terminal" && flag.terminalId) {
     return flag.terminalId === activeTerminalId;

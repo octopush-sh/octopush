@@ -16,15 +16,18 @@ use crate::chat_history::{
     build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
 };
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, ProviderErrorKind};
 use crate::providers::{
     anthropic::AnthropicProvider,
+    complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
-    LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
-    LlmStopReason, LlmTool, LlmToolResult,
+    retry_notice, Completion, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
+    LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
-use crate::orchestrator::agentic::{resume_messages_for_answered_block, resume_messages_for_continuation, BlockedTranscript};
+use crate::orchestrator::agentic::{
+    compute_throttle, resume_messages_for_answered_block, resume_messages_for_continuation, throttle_notice, BlockedTranscript,
+};
 use crate::token_engine;
 use parking_lot::Mutex;
 use reqwest::Client;
@@ -460,6 +463,31 @@ pub struct ChatStreamEvent {
     pub output_tokens: Option<u64>,
 }
 
+/// The director's live status line while it waits on the provider: a retry
+/// after a transient failure, or a pause for the rate-limit window. Not
+/// persisted; the Player shows `text` for `delay_secs`, or until the turn
+/// moves on (a stream delta, a row, a tool start).
+pub const TURN_NOTICE_EVENT: &str = "chat://notice";
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnNoticeEvent {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub text: String,
+    pub delay_secs: u64,
+}
+
+/// A journal line ("model overloaded — retrying in 8s …") as the Player's
+/// label: the same words, starting with a capital.
+fn notice_label(line: &str) -> String {
+    let mut chars = line.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Emitted the moment a tool BEGINS executing — before the (potentially slow)
 /// `execute_tool` call returns. Lets the frontend show a live "running" card
 /// with an elapsed timer instead of a silent gap. Reconciled to the resolved
@@ -574,45 +602,135 @@ pub struct ApprovalRequestEvent {
     pub covers_uncommitted: bool,
 }
 
+/// A Talk approval card waiting on the user, as the Dock badge and the menu
+/// bar Octo count it (`fleet_status::refresh`). Never the command: what
+/// leaves the window says what kind of thing waits, not its arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalWait {
+    pub workspace_id: String,
+    pub thread_id: String,
+    /// The secret guard's card (a commit or push), not a flagged command.
+    pub secret: bool,
+    /// When the card was raised (ms): the FIFO key.
+    pub since_ms: i64,
+}
+
+/// One card in flight: what it asked, when, and who answers it.
+struct ParkedApproval {
+    request: ApprovalRequestEvent,
+    since_ms: i64,
+    tx: tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
 /// The one approval channel for dangerous agent commands in TALK: the parent
 /// loop and every sub-agent of the turn ask through it, the frontend answers
 /// by call id (`respond`), Stop denies a whole thread (`deny_thread`), and a
 /// "don't ask again" grant is per thread so a crew inherits it.
+///
+/// A card waits until it is answered: there is no timeout. Stop, deleting the
+/// conversation and deleting the workspace deny it (a deleted workspace is
+/// retired, so a turn still winding down there can never park a new card);
+/// a reloaded webview shows it again (`pending_for_thread`); and while it
+/// waits it counts as needs-you on the Dock badge and the menu bar Octo
+/// (`waiting`).
 #[derive(Default)]
 pub(crate) struct ApprovalBroker {
-    /// In-flight requests keyed by the tool call id; the value carries the
-    /// thread id (so a thread's pending approvals can be resolved together)
-    /// + the responder.
-    approvals: Mutex<HashMap<String, (String, tokio::sync::oneshot::Sender<ApprovalDecision>)>>,
+    /// In-flight requests keyed by the tool call id: the request as the card
+    /// showed it (its thread, so a thread's pending approvals can be resolved
+    /// together), when it was raised, and the responder.
+    approvals: Mutex<HashMap<String, ParkedApproval>>,
     /// Threads where the user chose "don't ask again" — dangerous agent commands
     /// run without prompting (in-memory; resets on restart, by design).
     auto_approve: Mutex<std::collections::HashSet<String>>,
+    /// Deleted workspaces: nobody can answer a card there any more, so a
+    /// request from one is denied at once instead of parked.
+    retired: Mutex<std::collections::HashSet<String>>,
 }
 
 impl ApprovalBroker {
     pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
-        if let Some((_thread, tx)) = self.approvals.lock().remove(call_id) {
-            let _ = tx.send(decision);
+        if let Some(parked) = self.approvals.lock().remove(call_id) {
+            let _ = parked.tx.send(decision);
         }
     }
 
     pub fn deny_thread(&self, thread_id: &str) {
+        self.deny_where(|r| r.thread_id == thread_id);
+    }
+
+    /// A workspace is going away: deny every card it holds, and every card it
+    /// would raise from now on, so none can wait for an answer that can no
+    /// longer come (or outlive it on the Dock badge and the menu bar).
+    pub fn retire_workspace(&self, workspace_id: &str) {
+        self.retired.lock().insert(workspace_id.to_string());
+        self.deny_where(|r| r.workspace_id == workspace_id);
+    }
+
+    /// Whether a card from `workspace_id` may wait for an answer.
+    fn admits(&self, workspace_id: &str) -> bool {
+        !self.retired.lock().contains(workspace_id)
+    }
+
+    fn deny_where(&self, matches: impl Fn(&ApprovalRequestEvent) -> bool) {
         let mut approvals = self.approvals.lock();
         let to_deny: Vec<String> = approvals
             .iter()
-            .filter(|(_, (tid, _))| tid == thread_id)
+            .filter(|(_, p)| matches(&p.request))
             .map(|(cid, _)| cid.clone())
             .collect();
         for cid in to_deny {
-            if let Some((_, tx)) = approvals.remove(&cid) {
-                let _ = tx.send(ApprovalDecision::Deny);
+            if let Some(parked) = approvals.remove(&cid) {
+                let _ = parked.tx.send(ApprovalDecision::Deny);
             }
         }
     }
 
+    /// The cards still waiting on a thread, oldest first — what a reloaded
+    /// webview needs to show again (its in-memory list is gone, the parked
+    /// turn is not).
+    pub fn pending_for_thread(&self, thread_id: &str) -> Vec<ApprovalRequestEvent> {
+        let approvals = self.approvals.lock();
+        let mut mine: Vec<&ParkedApproval> =
+            approvals.values().filter(|p| p.request.thread_id == thread_id).collect();
+        mine.sort_by(|a, b| a.since_ms.cmp(&b.since_ms).then_with(|| a.request.call_id.cmp(&b.request.call_id)));
+        mine.into_iter().map(|p| p.request.clone()).collect()
+    }
+
+    /// Every card waiting on the user, oldest first.
+    pub(crate) fn waiting(&self) -> Vec<ApprovalWait> {
+        let approvals = self.approvals.lock();
+        let mut all: Vec<(&String, ApprovalWait)> = approvals
+            .iter()
+            .map(|(cid, p)| {
+                (
+                    cid,
+                    ApprovalWait {
+                        workspace_id: p.request.workspace_id.clone(),
+                        thread_id: p.request.thread_id.clone(),
+                        secret: p.request.secret,
+                        since_ms: p.since_ms,
+                    },
+                )
+            })
+            .collect();
+        all.sort_by(|(ca, a), (cb, b)| a.since_ms.cmp(&b.since_ms).then_with(|| ca.cmp(cb)));
+        all.into_iter().map(|(_, w)| w).collect()
+    }
+
+    /// Park a card (no event, no wait): what `ask` does before it waits.
+    fn park(
+        &self,
+        request: ApprovalRequestEvent,
+        since_ms: i64,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.approvals.lock().insert(request.call_id.clone(), ParkedApproval { request, since_ms, tx });
+        rx
+    }
+
     /// Ask the user to approve a dangerous agent command and wait for the answer.
-    /// Auto-approved conversations skip the prompt. A forgotten card times out as
-    /// a denial (so a turn can't wedge forever).
+    /// Auto-approved conversations skip the prompt. The card waits as long as
+    /// it takes (see the type's doc): never a silent denial.
     pub async fn await_approval(
         &self,
         app: &AppHandle,
@@ -683,11 +801,10 @@ impl ApprovalBroker {
         reason: &str,
         secret: Option<bool>,
     ) -> ApprovalDecision {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.approvals
-            .lock()
-            .insert(call_id.to_string(), (thread_id.to_string(), tx));
-        let _ = app.emit("chat://approval-request", &ApprovalRequestEvent {
+        if !self.admits(workspace_id) {
+            return ApprovalDecision::Deny;
+        }
+        let request = ApprovalRequestEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
@@ -695,19 +812,22 @@ impl ApprovalBroker {
             reason: reason.to_string(),
             secret: secret.is_some(),
             covers_uncommitted: secret.unwrap_or(false),
-        });
-        let decision = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
-            Ok(Ok(d)) => d,
-            _ => {
-                self.approvals.lock().remove(call_id);
-                ApprovalDecision::Deny
-            }
         };
+        let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
+        let _ = app.emit("chat://approval-request", &request);
+        // The Dock badge and the menu bar Octo count it while it waits.
+        crate::fleet_status::refresh_later(app);
+        // No timeout: a card left alone used to be denied after five minutes
+        // without a word. It now waits for its answer, Stop, or the
+        // conversation's (or workspace's) deletion, which all answer it. Only
+        // a responder dropped unanswered would end here, as a denial.
+        let decision = rx.await.unwrap_or(ApprovalDecision::Deny);
         let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
         });
+        crate::fleet_status::refresh_later(app);
         decision
     }
 }
@@ -1731,12 +1851,15 @@ pub(crate) fn execute_tool_cancellable(
 /// connection pool behind an `Arc`, so cloning it shares the pool — every
 /// LLM caller (ChatEngine, `ai_complete`, orchestrator) should go through
 /// this instead of `Client::new()`, which would pay a fresh TLS handshake
-/// on every call. Built by `tls::client`, so it carries the compromised-key
-/// denylist like every other Octopush client.
+/// on every call. Built by `tls::llm_client`, so it carries the
+/// compromised-key denylist like every other Octopush client, plus a connect
+/// bound, an idle read bound and TCP keep-alive: a dropped connection fails
+/// instead of hanging a turn forever. (A model server on this Mac gets the
+/// loopback client instead: `providers::client_for`.)
 static SHARED_HTTP: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
 
 pub(crate) fn shared_http_client() -> &'static Client {
-    SHARED_HTTP.get_or_init(crate::tls::client)
+    SHARED_HTTP.get_or_init(crate::tls::llm_client)
 }
 
 /// Build the static tool list as normalized `LlmTool[]`.
@@ -1995,6 +2118,16 @@ impl ChatEngine {
         self.cap_gate.deny_thread(thread_id);
     }
 
+    /// A workspace is being deleted: stop every turn of its conversations
+    /// (`thread_ids`), as Stop would, and retire it in the approval broker,
+    /// so a turn still winding down can't park a card nobody can answer.
+    pub fn cancel_workspace(&self, workspace_id: &str, thread_ids: &[String]) {
+        for thread_id in thread_ids {
+            self.cancel(thread_id);
+        }
+        self.approvals.retire_workspace(workspace_id);
+    }
+
     /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
     /// A rewind waits for it: it would race the agent's own writes.
     pub fn is_running(&self, thread_id: &str) -> bool {
@@ -2094,6 +2227,68 @@ impl ChatEngine {
             return (format!("Tool output #{message_id} is empty"), true);
         }
         (window_text(&result, offset, limit), true)
+    }
+
+    /// Show `line` (a journal line, e.g. a retry or a rate-limit pause) on
+    /// the turn's Player for `delay_secs`. Live only: nothing is persisted.
+    fn emit_turn_notice(&self, app: &AppHandle, workspace_id: &str, thread_id: &str, line: &str, delay_secs: u64) {
+        let _ = app.emit(TURN_NOTICE_EVENT, &TurnNoticeEvent {
+            workspace_id: workspace_id.to_string(),
+            thread_id: thread_id.to_string(),
+            text: notice_label(line),
+            delay_secs,
+        });
+    }
+
+    /// One director request: transient failures (429, 529, 5xx, a connection
+    /// that couldn't be opened) are retried with the sub-agents' backoff and
+    /// `retry-after` handling, each wait shown on the Player; a request that
+    /// went out and got no answer is never sent again (`request_error`). The
+    /// whole call is raced against the turn's cancel flag, so Stop abandons
+    /// the request in flight instead of waiting for its answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn director_call(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        provider: &dyn LlmProvider,
+        api_base: &str,
+        api_key: Option<&str>,
+        req: &LlmRequest,
+        cancel: &AtomicBool,
+    ) -> Completion {
+        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+            tracing::warn!(attempt, delay, kind = kind.label(), "Talk director: provider call failed; retrying");
+            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, delay, kind), delay);
+        };
+        complete_cancellable(provider, api_base, api_key, req, &self.client, cancel, DEFAULT_MAX_RETRIES, &mut on_retry)
+            .await
+    }
+
+    /// End a turn on a provider failure: persist it as the turn's `error`
+    /// row and hand back the error the command rejects with. Both carry the
+    /// same text, so the frontend shows one card. After retries ran out, the
+    /// text says so and how to go on (`final_failure_text`); the thread is
+    /// untouched and takes the next message as usual.
+    fn fail_turn(&self, app: &AppHandle, workspace_id: &str, thread_id: &str, error: AppError, retries: u32) -> AppError {
+        let error = match error.transient_retry() {
+            Some((kind, retry_after)) if retries > 0 => {
+                AppError::Provider { kind, retry_after, message: final_failure_text(&error, retries) }
+            }
+            _ => error,
+        };
+        if let Err(persist_err) = self.insert_and_emit_message(
+            app,
+            workspace_id,
+            thread_id,
+            "error",
+            &error.to_string(),
+            None, None, None, None,
+        ) {
+            tracing::error!(error = %persist_err, "failed to persist error message");
+        }
+        error
     }
 
     /// Persist a brief "stopped" marker and emit the done event so the frontend
@@ -2994,10 +3189,17 @@ impl ChatEngine {
             saved_settings.as_ref().and_then(|s| s.subagent_max_turns),
         );
 
+        // How long to pause before the next request, from the previous
+        // response's rate-limit headroom (`compute_throttle`, the sub-agents'
+        // rule): riding out a nearly spent input-token window beats charging
+        // into a 429.
+        let mut pending_throttle: Option<u64> = None;
+
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
-            // Stop cleanly if the user cancelled this turn (checked here and
-            // after each tool — the in-flight request itself isn't aborted).
+            // Stop cleanly if the user cancelled this turn. Checked here and
+            // after each tool; a request in flight is abandoned by
+            // `director_call` itself.
             if cancel.load(Ordering::Relaxed) {
                 self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
                 return Ok(());
@@ -3019,6 +3221,14 @@ impl ChatEngine {
                 let verdict = self.db.lock().check_budget(Some(&request.workspace_id))?;
                 if should_stop_for_budget(iteration, request.override_budget, &verdict) {
                     self.finish_budget_capped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                    return Ok(());
+                }
+            }
+
+            if let Some(wait) = pending_throttle.take() {
+                self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &throttle_notice(wait), wait);
+                if !interruptible_sleep(wait, &cancel).await {
+                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
                     return Ok(());
                 }
             }
@@ -3045,29 +3255,35 @@ impl ChatEngine {
                 cache: true,
             };
 
-            let response = match provider
-                .complete(&api_base, api_key.as_deref(), &llm_req, &self.client)
+            let response = match self
+                .director_call(
+                    &app,
+                    &request.workspace_id,
+                    &request.thread_id,
+                    provider.as_ref(),
+                    &api_base,
+                    api_key.as_deref(),
+                    &llm_req,
+                    &cancel,
+                )
                 .await
             {
-                Ok(r) => r,
-                Err(e) => {
-                    let error_text = format!("{e}");
-                    if let Err(persist_err) = self.insert_and_emit_message(
-                        &app,
-                        &request.workspace_id,
-                        &request.thread_id,
-                        "error",
-                        &error_text,
-                        None, None, None, None,
-                    ) {
-                        tracing::error!(error = %persist_err, "failed to persist error message");
-                    }
-                    return Err(e);
+                Completion::Done(r) => r,
+                // Stopped mid-request or mid-backoff: the same quiet ending as
+                // a stop between rounds. Every earlier round's rows are
+                // already persisted; the abandoned request left none.
+                Completion::Cancelled => {
+                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                    return Ok(());
+                }
+                Completion::Failed { error, retries } => {
+                    return Err(self.fail_turn(&app, &request.workspace_id, &request.thread_id, error, retries));
                 }
             };
 
             usage.add(&request.model, &response);
             self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
+            pending_throttle = compute_throttle(&response);
 
             tracing::info!(
                 iteration = iteration,
@@ -3740,6 +3956,13 @@ impl ChatEngine {
             effort: None,
             cache: true,
         };
+        if let Some(wait) = pending_throttle.take() {
+            self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &throttle_notice(wait), wait);
+            if !interruptible_sleep(wait, &cancel).await {
+                self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                return Ok(());
+            }
+        }
         // Only reachable with a configured limit (an unlimited loop never
         // exhausts); the wording names it.
         let limit = match max_iterations {
@@ -3750,11 +3973,20 @@ impl ChatEngine {
             max_iterations = ?max_iterations,
             "agentic loop: iteration cap reached — asking the model to close with what it has"
         );
-        match provider
-            .complete(&api_base, api_key.as_deref(), &close_req, &self.client)
+        match self
+            .director_call(
+                &app,
+                &request.workspace_id,
+                &request.thread_id,
+                provider.as_ref(),
+                &api_base,
+                api_key.as_deref(),
+                &close_req,
+                &cancel,
+            )
             .await
         {
-            Ok(response) => {
+            Completion::Done(response) => {
                 usage.add(&request.model, &response);
                 self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
                 let final_text = response.text.trim().to_string();
@@ -3794,8 +4026,12 @@ impl ChatEngine {
                 }
                 tracing::warn!("forced close returned no text; surfacing the cap as an error");
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "forced close failed; surfacing the cap as an error");
+            Completion::Cancelled => {
+                self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
+                return Ok(());
+            }
+            Completion::Failed { error, .. } => {
+                tracing::warn!(error = %error, "forced close failed; surfacing the cap as an error");
             }
         }
 
@@ -4399,6 +4635,92 @@ mod tests {
         assert!(dangerous_command("find . -name '*.tmp' -delete").is_some());
     }
 
+    fn approval_request(workspace: &str, thread: &str, call: &str, command: &str) -> ApprovalRequestEvent {
+        ApprovalRequestEvent {
+            workspace_id: workspace.into(),
+            thread_id: thread.into(),
+            call_id: call.into(),
+            command: command.into(),
+            reason: "rewrites published history".into(),
+            secret: false,
+            covers_uncommitted: false,
+        }
+    }
+
+    #[test]
+    fn a_waiting_card_is_listed_oldest_first_until_it_is_answered() {
+        let broker = ApprovalBroker::default();
+        let mut push = broker.park(approval_request("w1", "t1", "c2", "git push --force"), 2_000);
+        let _reset = broker.park(approval_request("w2", "t2", "c1", "git reset --hard"), 1_000);
+        let _clean = broker.park(approval_request("w1", "t1", "c3", "git clean -fd"), 3_000);
+
+        // What the Dock badge and the menu bar count: every card, longest-waiting first.
+        let waits = broker.waiting();
+        let order: Vec<&str> = waits.iter().map(|w| w.thread_id.as_str()).collect();
+        assert_eq!(order, ["t2", "t1", "t1"]);
+        assert!(waits.iter().all(|w| !w.secret));
+        assert_eq!((waits[0].workspace_id.as_str(), waits[0].thread_id.as_str(), waits[0].since_ms), ("w2", "t2", 1_000));
+
+        // What a reloaded webview shows again for one conversation.
+        let shown: Vec<String> = broker.pending_for_thread("t1").into_iter().map(|r| r.call_id).collect();
+        assert_eq!(shown, ["c2", "c3"]);
+        assert!(broker.pending_for_thread("t9").is_empty());
+
+        // Nothing answers a card on its own: it is still waiting.
+        assert!(matches!(push.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+
+        broker.respond("c2", ApprovalDecision::Approve);
+        assert_eq!(push.try_recv().ok(), Some(ApprovalDecision::Approve));
+        assert_eq!(broker.waiting().len(), 2, "an answered card stops counting");
+    }
+
+    #[test]
+    fn stop_and_a_deleted_workspace_deny_their_cards_and_nothing_else() {
+        let broker = ApprovalBroker::default();
+        let mut a = broker.park(approval_request("w1", "t1", "a", "rm -rf build"), 1);
+        let mut b = broker.park(approval_request("w1", "t2", "b", "git push -f"), 2);
+        let mut c = broker.park(approval_request("w2", "t3", "c", "sudo make install"), 3);
+
+        broker.deny_thread("t1");
+        assert_eq!(a.try_recv().ok(), Some(ApprovalDecision::Deny));
+        assert!(b.try_recv().is_err() && c.try_recv().is_err(), "other conversations still wait");
+        assert!(broker.admits("w1"), "Stop is not a deletion: the next turn may ask");
+
+        broker.retire_workspace("w1");
+        assert_eq!(b.try_recv().ok(), Some(ApprovalDecision::Deny));
+        assert!(c.try_recv().is_err(), "another workspace still waits");
+        let left: Vec<String> = broker.waiting().into_iter().map(|w| w.thread_id).collect();
+        assert_eq!(left, ["t3"]);
+        // A turn still winding down in the deleted workspace can't park a new card.
+        assert!(!broker.admits("w1"));
+        assert!(broker.admits("w2"));
+    }
+
+    #[test]
+    fn deleting_a_workspace_stops_its_turns_and_retires_it() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let flag = |key: &str| {
+            let f = Arc::new(AtomicBool::new(false));
+            engine.cancels.lock().insert(key.to_string(), Arc::clone(&f));
+            f
+        };
+        let turn = flag("t1");
+        let continuation = flag("t1#continue:call-1");
+        let elsewhere = flag("t9");
+        let mut card = engine.approvals.park(approval_request("w1", "t2", "c", "git push -f"), 1);
+        let mut other = engine.approvals.park(approval_request("w2", "t9", "d", "rm -rf x"), 2);
+
+        engine.cancel_workspace("w1", &["t1".to_string(), "t2".to_string()]);
+
+        assert!(turn.load(Ordering::Relaxed) && continuation.load(Ordering::Relaxed), "its turns stop, as Stop would");
+        assert!(!elsewhere.load(Ordering::Relaxed), "another workspace's turn runs on");
+        assert_eq!(card.try_recv().ok(), Some(ApprovalDecision::Deny));
+        assert!(other.try_recv().is_err());
+        assert!(!engine.approvals.admits("w1"));
+    }
+
     #[test]
     fn approval_decision_parse() {
         assert_eq!(ApprovalDecision::parse("approve"), ApprovalDecision::Approve);
@@ -4631,5 +4953,38 @@ mod login_path_tests {
         );
         assert_eq!(passed["outcome"], "ok");
         assert!(passed.get("reason").is_none());
+    }
+}
+
+#[cfg(test)]
+mod director_reliability_tests {
+    use super::*;
+
+    #[test]
+    fn a_journal_line_becomes_a_player_label() {
+        assert_eq!(
+            notice_label(&retry_notice(2, 4, ProviderErrorKind::RateLimit)),
+            "Rate limit reached — retrying in 4s (retry 2 of 5)"
+        );
+        assert_eq!(
+            notice_label(&throttle_notice(20)),
+            "Input-token budget low — pausing 20s for the rate-limit window to reset"
+        );
+        assert_eq!(notice_label(""), "");
+    }
+
+    #[test]
+    fn the_notice_event_is_camel_case() {
+        let v = serde_json::to_value(TurnNoticeEvent {
+            workspace_id: "ws".into(),
+            thread_id: "t".into(),
+            text: "Model overloaded — retrying in 2s (retry 1 of 5)".into(),
+            delay_secs: 2,
+        })
+        .unwrap();
+        assert_eq!(v["workspaceId"], "ws");
+        assert_eq!(v["threadId"], "t");
+        assert_eq!(v["delaySecs"], 2);
+        assert_eq!(TURN_NOTICE_EVENT, "chat://notice");
     }
 }

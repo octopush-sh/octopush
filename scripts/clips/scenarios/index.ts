@@ -13,6 +13,7 @@ import { directRunning } from "./direct-running";
 import { talkWork } from "./talk-work";
 import { talkMcp } from "./talk-mcp";
 import { talkOutcomes } from "./talk-outcomes";
+import { talkApproval } from "./talk-approval";
 
 export const SCENARIOS: Record<string, Scenario> = {
   default: defaultScenario,
@@ -27,4 +28,5 @@ export const SCENARIOS: Record<string, Scenario> = {
   "talk-work": talkWork,
   "talk-mcp": talkMcp,
   "talk-outcomes": talkOutcomes,
+  "talk-approval": talkApproval,
 };

@@ -44,6 +44,8 @@ impl LlmProvider for OpenAICompatibleProvider {
             (build_request(req), chat_completions_url(api_base))
         };
 
+        // A model server on this Mac gets the loopback client (no read bound).
+        let client = super::client_for(api_base, client);
         let mut request = client.post(&url)
             .header("content-type", "application/json")
             .json(&body);
@@ -56,8 +58,9 @@ impl LlmProvider for OpenAICompatibleProvider {
         }
 
         let resp = request.send().await
-            // A request that never reached the server is transient.
-            .map_err(|e| super::request_error("OpenAI-compat request failed", &e))?;
+            // Only a connection that never opened is transient; a request
+            // that went out and wasn't answered is final (`request_error`).
+            .map_err(|e| super::request_error("OpenAI-compat request failed", api_base, &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -74,7 +77,9 @@ impl LlmProvider for OpenAICompatibleProvider {
             });
         }
 
-        let response: Value = resp.json().await
+        // Read the body first: a connection lost mid-answer is not a JSON error.
+        let bytes = resp.bytes().await.map_err(|e| super::body_error("OpenAI-compat request failed", &e))?;
+        let response: Value = serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Other(format!("JSON parse error: {e}")))?;
 
         Ok(if responses {

@@ -24,6 +24,16 @@ docs/FEATURES.md first. You can search and read the web, read this checkout, and
    when bringing back a `later` item. Website ideas are filed in octopush-web and built there.
    Mix areas; at least one fix or quality improvement; respect the non-goals; nothing that only
    adds complexity.
+4. **Innovate, don't imitate** (CLAUDE.md "Innovation and clean room"). Competitors show our
+   gaps, never the spec: never propose copying another product's feature, copy, design or code.
+   An idea for a capability (a `feature`, or an `improvement` that adds one) ends its `proposal`
+   with one line, `Where we go further: <what Octopush will do that they don't>` (the edge
+   usually comes from crews, worktree workspaces, Review, checkpoints, the cost ledger, Mission
+   Control or mixed-vendor stages), or `Parity: <why it is still worth building>`. A `fix` needs
+   no such line. Consider where agentic development is heading (longer autonomous runs, more
+   agents per developer, cheaper and local models, stricter review, provenance and compliance)
+   and leave room for it. Prefer open standards and official, documented surfaces. Never present
+   a roadmap as shipped.
 
 Write nothing else.
 
