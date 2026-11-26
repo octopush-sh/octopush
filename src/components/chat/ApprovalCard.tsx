@@ -122,7 +122,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
           <button
             type="button"
             onClick={() => onRespond("always")}
-            title="Run this and stop asking for the rest of this conversation"
+            title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret or a file outside the workspace still asks)"
             className={`ml-auto font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
           >
             Approve &amp; don't ask again

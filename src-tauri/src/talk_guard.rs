@@ -99,8 +99,10 @@ const HOME_SECRETS: &[(&str, &str)] = &[
     (".netrc", "saved logins"), (".git-credentials", "saved Git credentials"), (".npmrc", "npm tokens"),
     (".pypirc", "PyPI tokens"), (".cargo/credentials", "Cargo registry tokens"),
     (".cargo/credentials.toml", "Cargo registry tokens"), (".octopush", "Octopush's settings and API keys"),
-    (".mcp-auth", "MCP server sign-ins"), (".claude/.credentials.json", "Claude Code's sign-in"),
-    (".codex/auth.json", "Codex's sign-in"), ("Library/Keychains", "keychains"),
+    (".mcp-auth", "MCP server sign-ins"), (".claude", "Claude Code's settings and sign-in"),
+    (".claude.json", "Claude Code's settings"), (".codex", "Codex's settings and sign-in"),
+    (".vault-token", "a Vault token"), (".terraform.d", "Terraform credentials"),
+    (".config/op", "1Password CLI settings"), ("Library/Keychains", "keychains"),
 ];
 
 /// The same, outside home.
@@ -116,22 +118,43 @@ fn under(path: &Path, prefix: &Path) -> bool {
 
 /// Where a Talk turn's file tools may go without asking: the workspace, as
 /// the tools join paths onto it and resolved (`None` if it can't be: then
-/// every target asks); for reads also its main checkout, where a linked
-/// dependency folder points; and home, for the credentials locations.
+/// every target asks); for reads also the dependency folders a mission links
+/// from its main checkout ([`linked_folders`]); and home, for the
+/// credentials locations, each as named and resolved (a linked `~/.ssh`).
 pub struct Reach {
     workspace: PathBuf,
     root: Option<PathBuf>,
-    main_checkout: Option<PathBuf>,
+    linked: Vec<PathBuf>,
     home: Option<PathBuf>,
+    secrets: Vec<(PathBuf, Option<PathBuf>, &'static str)>,
+}
+
+/// The dependency folders a worktree at `<main>/.octopus-worktrees/<name>`
+/// may link from its main checkout (`worktree_share::LINK_CANDIDATES`),
+/// resolved. Read from the workspace's own path, which comes from the
+/// database, never from a file inside the workspace (its `.git` is the
+/// agent's to rewrite).
+fn linked_folders(workspace: &Path) -> Vec<PathBuf> {
+    let parent = workspace.parent().filter(|p| p.file_name().is_some_and(|n| n == ".octopus-worktrees"));
+    let Some(main) = parent.and_then(Path::parent).and_then(|m| std::fs::canonicalize(m).ok()) else { return Vec::new() };
+    crate::worktree_share::LINK_CANDIDATES.iter().map(|n| main.join(n)).collect()
 }
 
 impl Reach {
     pub fn new(workspace: &Path, home: Option<&Path>) -> Self {
+        let home = home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+        let secrets = HOME_SECRETS
+            .iter()
+            .filter_map(|(rel, why)| home.as_deref().map(|h| (h.join(rel), *why)))
+            .chain(SYSTEM_SECRETS.iter().map(|(p, why)| (PathBuf::from(*p), *why)))
+            .map(|(place, why)| (place.clone(), std::fs::canonicalize(&place).ok(), why))
+            .collect();
         Self {
             workspace: workspace.to_path_buf(),
             root: std::fs::canonicalize(workspace).ok(),
-            main_checkout: crate::codex_trust::main_repo_root(workspace).and_then(|m| std::fs::canonicalize(m).ok()),
-            home: home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())),
+            linked: linked_folders(workspace),
+            home,
+            secrets,
         }
     }
 
@@ -152,17 +175,13 @@ impl Reach {
     /// The credentials location `real` is in (or, when `walks`, holds), as
     /// the card says it, e.g. "~/.ssh holds SSH keys".
     fn secret_location(&self, real: &Path, walks: bool) -> Option<String> {
-        let home = self.home.as_deref();
-        let places = HOME_SECRETS
-            .iter()
-            .filter_map(|(rel, why)| home.map(|h| (h.join(rel), *why)))
-            .chain(SYSTEM_SECRETS.iter().map(|(p, why)| (PathBuf::from(*p), *why)));
-        for (place, why) in places {
-            if under(real, &place) {
-                return Some(format!("{} holds {why}", self.shown(&place)));
+        for (place, resolved, why) in &self.secrets {
+            let spots = std::iter::once(place).chain(resolved);
+            if spots.clone().any(|p| under(real, p)) {
+                return Some(format!("{} holds {why}", self.shown(place)));
             }
-            if walks && under(&place, real) && place.symlink_metadata().is_ok() {
-                return Some(format!("the folder holds {} ({why})", self.shown(&place)));
+            if walks && place.symlink_metadata().is_ok() && spots.into_iter().any(|p| under(p, real)) {
+                return Some(format!("the folder holds {} ({why})", self.shown(place)));
             }
         }
         None
@@ -170,11 +189,14 @@ impl Reach {
 
     /// The card a file tool's call must pass, or `None` when its target,
     /// resolved as the tool will open it ([`resolve`]), is inside the
-    /// workspace. An absolute path, a `..` or a link that leads out asks. A
-    /// credentials location asks even inside (a workspace opened at home),
-    /// and outside, a file named like an env file or a key is sensitive too.
-    /// `writes_confined`: the mission's sandbox refuses a write outside, so
-    /// it doesn't ask. `label` names the sub-agent that asks.
+    /// workspace (or, for a read, in a linked dependency folder). An absolute
+    /// path, a `..`, a link that leads out, or links too deep to follow ask.
+    /// A credentials location asks even inside (a workspace opened at home),
+    /// and a file named like an env file or a key is sensitive outside the
+    /// workspace, in a linked folder, and anywhere in a workspace that holds
+    /// home. `writes_confined`: the mission's sandbox refuses a write
+    /// outside, so a write doesn't ask (an `edit_file` still reads first, so
+    /// it asks as a read). `label` names the sub-agent that asks.
     pub fn outside_card(&self, label: Option<&str>, name: &str, input: &Value, writes_confined: bool) -> Option<ToolCard> {
         let path = |default: &'static str| input.get("path").and_then(|p| p.as_str()).unwrap_or(default).to_string();
         let (kind, verb, act, raw) = match name {
@@ -182,28 +204,43 @@ impl Reach {
             "list_files" => (CardKind::Read, "lists a folder", "list", path(".")),
             "grep" => (CardKind::Read, "searches", "search", path(".")),
             "write_file" => (CardKind::Write, "writes a file", "write", path("")),
+            "edit_file" if writes_confined => (CardKind::Read, "reads a file to edit it", "read", path("")),
             "edit_file" => (CardKind::Write, "edits a file", "edit", path("")),
             _ => return None,
         };
         if kind == CardKind::Write && writes_confined {
             return None;
         }
-        let real = resolve(&self.workspace.join(&raw));
-        let reads_main = kind == CardKind::Read && self.main_checkout.as_deref().is_some_and(|m| real.starts_with(m));
-        let inside = reads_main || self.root.as_deref().is_some_and(|r| real.starts_with(r));
+        let joined = self.workspace.join(&raw);
+        // Links too deep to follow: where it leads is unknown, so it asks.
+        let (real, too_deep) = match resolve(&joined) {
+            Some(real) => (real, false),
+            None => (lexical(&joined), true),
+        };
+        let in_root = !too_deep && self.root.as_deref().is_some_and(|r| real.starts_with(r));
+        let in_linked = !too_deep && kind == CardKind::Read && self.linked.iter().any(|l| real.starts_with(l));
+        let inside = in_root || in_linked;
+        // A workspace that holds home holds every name-marked file too.
+        let holds_home = in_root && self.home.as_deref().zip(self.root.as_deref()).is_some_and(|(h, r)| h.starts_with(r));
         let location = self.secret_location(&real, name == "grep");
-        if inside && location.is_none() {
-            return None;
-        }
         let text = real.to_string_lossy();
-        let by_name = match (inside, crate::secret_scan::is_env_file(&text), crate::secret_scan::is_sensitive_name(&text)) {
+        let by_name = match (in_root && !holds_home, crate::secret_scan::is_env_file(&text), crate::secret_scan::is_sensitive_name(&text)) {
             (true, ..) => None,
             (_, true, _) => Some("its name marks it as an env file"),
             (_, _, true) => Some("its name marks it as a key or credentials file"),
             _ => None,
         };
-        let place = if inside { "in a credentials location" } else { "outside the workspace" };
-        let why = location.or(by_name.map(str::to_string));
+        if inside && location.is_none() && by_name.is_none() {
+            return None;
+        }
+        let place = match (inside, location.is_some()) {
+            (false, _) => "outside the workspace",
+            (true, true) => "in a credentials location",
+            (true, false) if in_linked => "in a linked dependency folder",
+            (true, false) => "in the workspace",
+        };
+        let sensitive = location.is_some() || by_name.is_some();
+        let why = location.or(by_name.map(str::to_string)).or(too_deep.then(|| "its links go too deep to follow".to_string()));
         let mut reason = match &why {
             Some(why) => format!("{verb} {place} \u{b7} {why}"),
             None => format!("{verb} {place}"),
@@ -216,8 +253,23 @@ impl Reach {
             "Tool call not made \u{2014} the user declined to let it {act} {shown}, {place}. \
              Work inside the workspace, or ask the user for what you need; do not retry it."
         );
-        Some(ToolCard { kind, shown, reason, denial, sensitive: why.is_some() })
+        Some(ToolCard { kind, shown, reason, denial, sensitive })
     }
+}
+
+/// `path` with `.` and `..` folded, without touching the disk.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
 }
 
 /// How deep [`resolve`] follows a chain of dangling links.
@@ -228,12 +280,13 @@ const MAX_LINK_DEPTH: usize = 16;
 /// its target, as the kernel does), a missing component kept as written, and
 /// a dangling link followed to its target (a write through it creates it).
 /// Resolved at every component, so a `..` out of a missing folder can't hide
-/// a link after it.
-pub fn resolve(path: &Path) -> PathBuf {
+/// a link after it. `None` past [`MAX_LINK_DEPTH`] links (a loop, a long
+/// chain): where it leads is then unknown.
+pub fn resolve(path: &Path) -> Option<PathBuf> {
     resolve_at(path, 0)
 }
 
-fn resolve_at(path: &Path, depth: usize) -> PathBuf {
+fn resolve_at(path: &Path, depth: usize) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
@@ -246,16 +299,17 @@ fn resolve_at(path: &Path, depth: usize) -> PathBuf {
                 out.push(name);
                 if let Ok(real) = std::fs::canonicalize(&out) {
                     out = real;
-                } else if depth < MAX_LINK_DEPTH {
-                    if let Ok(target) = std::fs::read_link(&out) {
-                        let base = out.parent().map(Path::to_path_buf).unwrap_or_default();
-                        out = resolve_at(&base.join(target), depth + 1);
+                } else if let Ok(target) = std::fs::read_link(&out) {
+                    if depth >= MAX_LINK_DEPTH {
+                        return None;
                     }
+                    let base = out.parent().map(Path::to_path_buf).unwrap_or_default();
+                    out = resolve_at(&base.join(target), depth + 1)?;
                 }
             }
         }
     }
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -324,19 +378,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_linked_dependency_folder_reads_from_the_main_checkout_without_a_card() {
+    fn only_a_linked_dependency_folder_of_the_main_checkout_reads_without_a_card() {
         let (d, _, home) = setup();
         let main = std::fs::canonicalize(d.path()).unwrap().join("main");
         let wt = main.join(".octopus-worktrees/wt");
-        std::fs::create_dir_all(main.join(".git/worktrees/wt")).unwrap();
-        std::fs::create_dir_all(main.join("node_modules/x")).unwrap();
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
-        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", main.join(".git/worktrees/wt").display())).unwrap();
+        for dir in [main.join("node_modules/x"), main.join("src"), wt.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
         std::os::unix::fs::symlink(main.join("node_modules"), wt.join("node_modules")).unwrap();
+        // A forged `.git` whose `commondir` would make `/` the main checkout.
+        std::fs::create_dir_all(wt.join("g")).unwrap();
+        std::fs::write(wt.join("g/commondir"), "../../../../../../../../../../../../.git\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt.join("g").display())).unwrap();
         let reach = Reach::new(&wt, Some(&home));
-        assert_eq!(card(&reach, "read_file", "node_modules/x/index.js"), None);
+        assert_eq!(card(&reach, "read_file", "node_modules/x/index.js"), None, "the main checkout comes from the path");
+        let env = card(&reach, "read_file", "node_modules/x/.env").expect("an env file there still asks");
+        assert!(env.sensitive && env.reason.ends_with("its name marks it as an env file"), "{}", env.reason);
         assert_eq!(card(&reach, "write_file", "node_modules/x/index.js").map(|c| c.kind), Some(CardKind::Write), "a write there asks");
+        for outside in [main.join("src/lib.rs"), home.join("notes.txt")] {
+            assert!(card(&reach, "read_file", &outside).is_some(), "{}", outside.display());
+        }
+        // A workspace outside `.octopus-worktrees` links nothing, whatever its `.git` says.
+        let (_d2, ws, home) = setup();
+        std::fs::write(ws.join(".git"), format!("gitdir: {}\n", wt.join("g").display())).unwrap();
+        assert!(card(&Reach::new(&ws, Some(&home)), "read_file", main.join("node_modules/x/index.js")).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_too_deep_to_follow_ask() {
+        let (_d, ws, home) = setup();
+        // A chain of 17 links that ends inside the workspace, and a loop.
+        for i in 0..17 {
+            let next = if i == 16 { ws.join("missing.txt") } else { ws.join(format!("l{}", i + 1)) };
+            std::os::unix::fs::symlink(next, ws.join(format!("l{i}"))).unwrap();
+        }
+        std::os::unix::fs::symlink(ws.join("loop-b"), ws.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink(ws.join("loop-a"), ws.join("loop-b")).unwrap();
+        let reach = Reach::new(&ws, Some(&home));
+        for path in ["l0", "loop-a"] {
+            let c = card(&reach, "write_file", path).unwrap_or_else(|| panic!("{path} asks"));
+            assert!(c.reason.ends_with("its links go too deep to follow"), "{}", c.reason);
+        }
+        assert_eq!(card(&reach, "write_file", "l1"), None, "16 links are followed");
     }
 
     #[test]
@@ -348,10 +432,13 @@ mod tests {
             assert_eq!((c.kind, c.shown.as_str()), (CardKind::Write, "~/new/plan.md"));
             assert!(!c.kind.grantable(), "no \"don't ask again\" answers it");
         }
-        // A sandboxed mission refuses the write itself; a read there still asks.
+        // A sandboxed mission refuses the write itself; a read there still
+        // asks, and so does an edit, which reads the file first.
         let target = json!({"path": home.join("x").to_string_lossy()});
         assert_eq!(reach.outside_card(None, "write_file", &target, true), None);
         assert!(reach.outside_card(None, "read_file", &target, true).is_some());
+        let edit = reach.outside_card(None, "edit_file", &target, true).expect("an edit reads first");
+        assert_eq!((edit.kind, edit.reason.as_str()), (CardKind::Read, "reads a file to edit it outside the workspace"));
     }
 
     #[test]
@@ -365,11 +452,29 @@ mod tests {
         let env = card(&reach, "read_file", "../.env.local").unwrap();
         assert!(env.sensitive && env.reason.ends_with("its name marks it as an env file"));
         assert_eq!(card(&reach, "read_file", ".env"), None, "an env file inside runs as before");
-        // A workspace opened at home still asks for ~/.ssh.
+        for path in [".claude/settings.json", ".claude.json", ".codex/config.toml", ".vault-token", ".config/op/config"] {
+            assert!(card(&reach, "read_file", home.join(path)).is_some_and(|c| c.sensitive), "{path}");
+        }
+        // A workspace opened at home still asks for ~/.ssh and name-marked files.
         let at_home = Reach::new(&home, Some(&home));
         let c = at_home.outside_card(Some("Scout"), "read_file", &json!({"path": ".ssh/id_ed25519"}), false).unwrap();
         assert!(c.sensitive && c.reason == "Sub-agent \u{201c}Scout\u{201d}: reads a file in a credentials location \u{b7} ~/.ssh holds SSH keys");
+        let env = card(&at_home, "read_file", "app/.env").unwrap();
+        assert_eq!((env.sensitive, env.reason.as_str()), (true, "reads a file in the workspace \u{b7} its name marks it as an env file"));
         assert_eq!(card(&at_home, "read_file", "notes.txt"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_credentials_folder_still_counts() {
+        let (d, ws, home) = setup();
+        let keys = std::fs::canonicalize(d.path()).unwrap().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("id_work"), "k").unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::os::unix::fs::symlink(&keys, home.join(".config/gh")).unwrap();
+        let c = card(&Reach::new(&ws, Some(&home)), "read_file", keys.join("id_work")).unwrap();
+        assert!(c.sensitive && c.reason.ends_with("~/.config/gh holds GitHub CLI tokens"), "{}", c.reason);
     }
 
     #[test]

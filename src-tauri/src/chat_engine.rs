@@ -943,7 +943,7 @@ impl ApprovalBroker {
         workspace_id: &str,
         thread_id: &str,
         call_id: &str,
-        card: &ToolCard,
+        card: ToolCard,
     ) -> ApprovalDecision {
         if self.grant_answers(thread_id, Some(card.kind)) {
             return ApprovalDecision::Approve;
@@ -1045,6 +1045,30 @@ impl ApprovalBroker {
         });
         crate::fleet_status::refresh_later(app);
         decision
+    }
+}
+
+/// Ask about `card` and, once it is approved, check the call again (#1147):
+/// it runs only if what it reaches is still what the card showed. A link
+/// that changed while the card waited asks again, about where it now leads;
+/// a target that is now inside runs. `Some` is the denial for the model.
+pub(crate) async fn guard_card<F, Fut>(
+    mut card: ToolCard,
+    recheck: impl Fn() -> Option<ToolCard>,
+    ask: F,
+) -> Option<String>
+where
+    F: Fn(ToolCard) -> Fut,
+    Fut: std::future::Future<Output = ApprovalDecision>,
+{
+    loop {
+        if ask(card.clone()).await == ApprovalDecision::Deny {
+            return Some(card.denial);
+        }
+        match recheck() {
+            Some(next) if next != card => card = next,
+            _ => return None,
+        }
     }
 }
 
@@ -3916,19 +3940,10 @@ impl ChatEngine {
                 let mut denied: Option<String> = None;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
-                let card = if mcp_off || is_agent || u.name == RECALL_TOOL_NAME {
-                    None
-                } else {
-                    crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined)
-                };
-                if let Some(card) = card {
-                    let decision = self
-                        .approvals
-                        .await_card(&app, &request.workspace_id, &request.thread_id, &u.id, &card)
-                        .await;
-                    if decision == ApprovalDecision::Deny {
-                        denied = Some(card.denial);
-                    }
+                let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
+                if let Some(card) = (!(mcp_off || is_agent || u.name == RECALL_TOOL_NAME)).then(&check).flatten() {
+                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                    denied = guard_card(card, &check, ask).await;
                 }
                 // A command flagged destructive pauses for the user's OK before
                 // it runs. User-typed `$` commands meet only the secret guard.
@@ -5214,6 +5229,48 @@ mod tests {
         // A `talk_guard` card names its kind, and a credentials location says so.
         let r = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Read), sensitive: true, ..ev(false, false) }).unwrap();
         assert_eq!((r["kind"].as_str(), r["sensitive"].as_bool()), (Some("read"), Some(true)));
+    }
+
+    #[tokio::test]
+    async fn guard_card_checks_again_after_the_card_and_asks_about_a_changed_target() {
+        let card = |shown: &str| ToolCard {
+            kind: CardKind::Read,
+            shown: shown.into(),
+            reason: "reads a file outside the workspace".into(),
+            denial: format!("declined {shown}"),
+            sensitive: false,
+        };
+        // Approved, then a link moved: it asks about where it now leads.
+        let asked = Mutex::new(Vec::<String>::new());
+        let approve = |c: ToolCard| {
+            asked.lock().push(c.shown);
+            std::future::ready(ApprovalDecision::Approve)
+        };
+        assert_eq!(guard_card(card("~/a"), || Some(card("~/b")), approve).await, None);
+        assert_eq!(*asked.lock(), ["~/a", "~/b"]);
+        let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
+        assert_eq!(guard_card(card("~/a"), || Some(card("~/b")), deny).await, Some("declined ~/a".to_string()));
+        // Approved, and the target is now inside: it runs.
+        assert_eq!(guard_card(card("~/a"), || None, |_: ToolCard| std::future::ready(ApprovalDecision::Approve)).await, None);
+    }
+
+    /// The guard is only as good as its call sites: the director's loop and
+    /// the sub-agent gate must ask `talk_guard` and check again through
+    /// `guard_card` before a tool runs (#1147). An `AppHandle` can't be built
+    /// in a test, so this reads the two call sites in the source.
+    #[test]
+    fn the_director_loop_and_the_subagent_gate_call_the_guard() {
+        let engine = include_str!("chat_engine.rs");
+        let from = engine.find("// \u{2500}\u{2500} Approval gate").expect("the director's approval gate");
+        let to = from + engine[from..].find("execute_tool(&workspace_path, &u.name").expect("the director runs the tool after it");
+        let gate = &engine[from..to];
+        assert!(gate.contains("talk_guard::director_card(") && gate.contains("guard_card(card, &check"), "{gate}");
+        let agents = include_str!("chat_agents.rs");
+        let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
+        let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
+        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "guard_card(card, &check"] {
+            assert!(body.contains(call), "the sub-agent gate calls {call}");
+        }
     }
 
     #[test]

@@ -11,6 +11,11 @@ describe("ApprovalCard", () => {
     expect(screen.getByText("Approval needed")).toBeInTheDocument();
     fireEvent.click(screen.getByText(/don't ask again/));
     expect(onRespond).toHaveBeenCalledWith("always");
+    // The grant's reach is said where it is offered.
+    expect(screen.getByText(/don't ask again/)).toHaveAttribute(
+      "title",
+      "Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret or a file outside the workspace still asks)",
+    );
   });
 
   it("the secret guard's card has no don't ask again, and says when it read uncommitted changes (#819)", () => {

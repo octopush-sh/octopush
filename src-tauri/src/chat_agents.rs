@@ -816,18 +816,20 @@ impl ToolGate for SubagentGate {
             let (card_reason, denial) = gate_texts(&self.label, reason);
             (command.to_string(), card_reason, denial)
         } else {
-            // An MCP write, or a file tool reaching outside the workspace.
+            // An MCP write, or a file tool reaching outside the workspace,
+            // checked again once approved (`guard_card`).
             let label = Some(self.label.as_str());
-            let card = if self.mcp_writes.contains(name) {
-                crate::talk_guard::mcp_card(label, name, input)
-            } else {
-                self.reach.outside_card(label, name, input, self.writes_confined)?
+            let check = || {
+                if self.mcp_writes.contains(name) {
+                    Some(crate::talk_guard::mcp_card(label, name, input))
+                } else {
+                    self.reach.outside_card(label, name, input, self.writes_confined)
+                }
             };
+            let card = check()?;
             let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-            return match self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, &card).await {
-                ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => None,
-                ApprovalDecision::Deny => Some(card.denial),
-            };
+            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+            return crate::chat_engine::guard_card(card, &check, ask).await;
         };
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         match self
