@@ -9,8 +9,9 @@
 //   automerge.mjs review <n> <sha> approve|changes <body-file>
 //                                               post the review as the reviewer (refuses if the head moved)
 //   automerge.mjs review-json <n> <sha> <file>  post a reviewer agent's verdict file
-//                                               ({"verdict":"approve|changes","body":"…"}) after
-//                                               validating it and scanning it for secrets
+//                                               ({"verdict":"approve|changes","body":"…",
+//                                               "user_visible":true|false,"user_visible_reason":"…"})
+//                                               after validating it and scanning it for secrets
 //   automerge.mjs approved                      builder PRs already approved on their head (merge retries)
 //   automerge.mjs merge <n>                     verify every rule, merge; exit 0 merged, 1 refused, 2 error
 //
@@ -25,7 +26,7 @@
 //
 // Identities (owner / builder / reviewer) come from identity.mjs.
 import { readFileSync } from "node:fs";
-import { makeGh, ghRunAs, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, markPrivate, safeError, ciStatus, labelsOf, sanitize, reportFatal } from "./gh.mjs";
+import { makeGh, ghRunAs, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, markPrivate, safeError, ciStatus, mainCi, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, reviewerToken, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 
 export const MAX_CHANGED_LINES = 800;
@@ -317,13 +318,39 @@ export function epikuRefusals({ pr, files, ci, verdict, dataClass, issue, ids, p
   return r;
 }
 
-/** User-visible change heuristic: non-test code under src/ (frontend) or src-tauri/src/. */
+/**
+ * User-visible change heuristic: non-test code under src/ (frontend) or
+ * src-tauri/src/. Used only when the reviewer's verdict doesn't say (see
+ * `visibleMarker`): it parks backend-only slices, comment and docs fixes too.
+ */
 const isTest = (n) => /\.test\.[cm]?[jt]sx?$/i.test(n) || /(^|\/)tests?\.rs$/i.test(n) || /(^|\/)tests?\//i.test(n);
 const USER_VISIBLE = (n) => /^(src|src-tauri\/src)\//.test(n) && !isTest(n);
 const CHANGESET = /^whats-new\/unreleased\/[a-z0-9-]+\.md$/;
 
 export const marker = (sha, verdict) => `<!-- octopush-review:${sha}:${verdict} -->`;
 const markerRe = (sha) => new RegExp(`<!-- octopush-review:${sha}:(approve|changes) -->`, "g");
+
+/**
+ * The app reviewer's answer to "would a user notice this change?", signed by
+ * postReview into the verdict comment right before the other markers, for that
+ * commit (agent text can't carry it: sanitize). It decides whether a missing
+ * changeset parks the PR; without it, the path heuristic decides, as before.
+ */
+export const visibleMarker = (sha, visible) => `<!-- octopush-visible:${sha}:${visible ? "true" : "false"} -->`;
+export const MAX_VISIBLE_REASON = 200;
+/** true | false from the reviewer's latest verdict comment on `sha`, or null (no answer: use the heuristic). */
+export function userVisibleFor(comments, sha, reviewer) {
+  const tail = new RegExp(`<!-- octopush-visible:${sha}:(true|false) -->\\n(?:<!-- octopush-data:${sha}:(?:none|additive|breaking) -->\\n)?<!-- octopush-review:${sha}:(?:approve|changes) -->$`);
+  let v = null;
+  for (const c of comments) {
+    if (!sameLogin(c.user?.login, reviewer)) continue;
+    const body = (c.body ?? "").trimEnd();
+    if (!new RegExp(`<!-- octopush-review:${sha}:(?:approve|changes) -->$`).test(body)) continue;
+    const m = tail.exec(body)?.[1];
+    v = m === "true" ? true : m === "false" ? false : null; // a later verdict without the answer clears an earlier one
+  }
+  return v;
+}
 
 /**
  * The latest review verdict on `sha` by the reviewer account, or null. Only a
@@ -347,11 +374,24 @@ export function reviewRounds(comments, reviewer) {
   return comments.filter((c) => sameLogin(c.user?.login, reviewer) && /<!-- octopush-review:\w+:changes -->/.test(c.body ?? "")).length;
 }
 
-/** Pure rule check. Returns a list of reasons the PR may NOT be merged. */
-export function refusals({ pr, files, ci, verdict, ids, betaLive }) {
+/**
+ * Pure rule check. Returns a list of reasons the PR may NOT be merged.
+ *   - `userVisible`: the reviewer's signed answer (userVisibleFor) — true, false or null
+ *     (no answer: the path heuristic decides whether a changeset is required);
+ *   - `main`: mainCi's `{ state, sha }`, or `{ state: "error" }` when it couldn't be read;
+ *   - `behind`: how many commits of main the head lacks (null: unknown) — while main is red,
+ *     only a head that contains it may merge (its green CI then proves the fix);
+ *   - `release`: the number of an open release PR, "error" when that couldn't be read, or null.
+ * Paused, conflicted and not-yet reasons are transient: they never park the PR.
+ */
+export function refusals({ pr, files, ci, verdict, ids, betaLive, userVisible = null, main = null, behind = null, release = null }) {
   const r = [];
   const labels = labelsOf(pr);
   if (!betaLive) r.push("the beta channel isn't live yet (no .github/workflows/promote.yml on main) — auto-merge would reach every user");
+  if (release === "error") r.push("paused: can't tell whether a release PR is open — retried next run");
+  else if (release != null) r.push(`paused: release PR #${release} is open — merges wait until it lands, so the release merges the main it tested`);
+  if (main?.state === "error") r.push("paused: can't read main's CI — retried next run");
+  else if (main?.state === "red" && behind !== 0) r.push(`paused: main's CI is red at ${String(main.redSha ?? main.sha).slice(0, 7)} — merges wait until it is green (a PR whose head contains main may still merge)`);
   if (pr.state !== "open") r.push("PR is not open");
   if (pr.draft) r.push("PR is a draft");
   if (!labels.includes("agent")) r.push("PR is not labelled `agent`");
@@ -369,29 +409,44 @@ export function refusals({ pr, files, ci, verdict, ids, betaLive }) {
   const paths = files.flatMap((f) => [f.filename, f.previous_filename].filter(Boolean));
   const blocked = [...new Set(paths.filter((n) => HUMAN_ONLY.some((re) => re.test(n))))];
   if (blocked.length) r.push(`touches human-only paths: ${blocked.join(", ")}`);
-  const visible = files.some((f) => USER_VISIBLE(f.filename));
+  // The reviewer's answer wins either way; only without one does the path heuristic decide.
+  const visible = typeof userVisible === "boolean" ? userVisible : files.some((f) => USER_VISIBLE(f.filename));
   const hasChangeset = files.some((f) => CHANGESET.test(f.filename) && f.status !== "removed");
-  if (visible && !hasChangeset) r.push("user-visible change without a whats-new changeset");
-  if (pr.mergeable === false) r.push("PR has merge conflicts");
+  if (visible && !hasChangeset) r.push(`user-visible change without a whats-new changeset${userVisible === true ? " (the review says users will notice it)" : ""}`);
+  // A fix round, not a park: the builder merges main, resolves the conflicts and the PR is reviewed again (jobs.mjs).
+  if (pr.mergeable === false) r.push("PR has merge conflicts — the builder resolves them in a fix round");
   if (pr.mergeable == null) r.push("GitHub hasn't computed mergeability yet");
   return r;
 }
 
-/** Validate a reviewer agent's verdict file. Returns { verdict, body } or { error }. */
+/**
+ * The reviewer's `user_visible` answer, if it gave a usable one: a boolean and a
+ * one-line reason (its first line, capped). Anything else is no answer, which
+ * keeps the path heuristic: a malformed field can only make the rule stricter.
+ */
+export function visibleAnswer(v) {
+  if (typeof v?.user_visible !== "boolean" || typeof v.user_visible_reason !== "string") return null;
+  const reason = v.user_visible_reason.split("\n")[0].replace(/\s+/g, " ").trim();
+  if (reason.length < 3) return null;
+  return { userVisible: v.user_visible, userVisibleReason: reason.length > MAX_VISIBLE_REASON ? `${reason.slice(0, MAX_VISIBLE_REASON - 1)}…` : reason };
+}
+
+/** Validate a reviewer agent's verdict file. Returns { verdict, body[, userVisible, userVisibleReason] } or { error }. */
 export function parseVerdict(text, secrets = [], { dataClass = false } = {}) {
   let v;
   try { v = JSON.parse(text); } catch { return { error: "verdict file is not valid JSON" }; }
   if (!v || !["approve", "changes"].includes(v.verdict)) return { error: 'verdict must be "approve" or "changes"' };
   if (typeof v.body !== "string" || v.body.trim().length < 20 || v.body.length > 20000) return { error: "body must be 20–20000 chars" };
   const s = secrets.map((x) => x.trim()).filter((x) => x.length >= 8);
-  if (s.some((x) => v.body.includes(x))) return { error: "the review contains a secret value — not posted" };
+  const visible = dataClass ? null : visibleAnswer(v);
+  if (s.some((x) => v.body.includes(x) || visible?.userVisibleReason.includes(x))) return { error: "the review contains a secret value — not posted" };
   // Epiku: the reviewer must also classify the change (DATA_CLASSES); an approval without it can't merge.
   if (dataClass && !DATA_CLASSES.includes(v.data_change)) return { error: `data_change must be one of ${DATA_CLASSES.join(" | ")}` };
-  return dataClass ? { verdict: v.verdict, body: v.body, dataClass: v.data_change } : { verdict: v.verdict, body: v.body };
+  return dataClass ? { verdict: v.verdict, body: v.body, dataClass: v.data_change } : { verdict: v.verdict, body: v.body, ...(visible ?? {}) };
 }
 
-/** "Not yet" reasons that shouldn't park a PR. */
-const transient = (w) => /^CI is (pending|none)|^no approving review|^GitHub hasn't computed|^the beta channel isn't live/.test(w);
+/** "Not yet" reasons that shouldn't park a PR (paused, conflicts: a fix round). */
+const transient = (w) => /^CI is (pending|none)|^no approving review|^GitHub hasn't computed|^the beta channel isn't live|^paused: |^PR has merge conflicts/.test(w);
 
 export function betaChannelLive(gh) {
   try { return !!gh.get(`repos/${APP_REPO}/contents/.github/workflows/promote.yml?ref=main`)?.sha; } catch { return false; }
@@ -405,14 +460,22 @@ export function reviewQueue(gh, ids, repo = APP_REPO) {
     if (!sameLogin(p.user?.login, ids.builder) || p.head?.repo?.full_name !== repo || p.base?.ref !== "main") continue;
     if (ciStatus(gh, repo, p.head.sha) !== "success") continue;
     if (verdictFor(gh.list(`repos/${repo}/issues/${p.number}/comments`), p.head.sha, ids.reviewer)) continue;
+    // A conflicted app PR goes to the builder first (a fix round merges main): its head will change.
+    if (repo === APP_REPO && gh.get(`repos/${repo}/pulls/${p.number}`)?.mergeable === false) continue;
     out.push(p);
   }
   return out;
 }
 
-export function postReview(gh, reviewerGh, ids, n, sha, verdict, body, repo = APP_REPO, dataClass = null) {
+/**
+ * Post a verdict as the reviewer. `visible` is the app reviewer's
+ * `{ userVisible, userVisibleReason }` (visibleAnswer), or null: its reason is
+ * shown in the comment and its answer signed next to the verdict.
+ */
+export function postReview(gh, reviewerGh, ids, n, sha, verdict, body, repo = APP_REPO, dataClass = null, visible = null) {
   if (!["approve", "changes"].includes(verdict)) throw new Error("verdict must be approve|changes");
   if (dataClass != null && !DATA_CLASSES.includes(dataClass)) throw new Error(`data class must be ${DATA_CLASSES.join("|")}`);
+  if (visible != null && typeof visible.userVisible !== "boolean") throw new Error("user_visible must be true|false");
   const pr = gh.get(`repos/${repo}/pulls/${n}`);
   if (pr.head.sha !== sha) throw safeError(`head moved: reviewed ${sha.slice(0, 7)}, PR is now at ${pr.head.sha.slice(0, 7)} — review it again`);
   // With separate bot accounts the reviewer must not have opened the PR. In
@@ -420,7 +483,9 @@ export function postReview(gh, reviewerGh, ids, n, sha, verdict, body, repo = AP
   // holding no token (identity.mjs).
   if (!sameLogin(ids.builder, ids.reviewer) && sameLogin(pr.user?.login, ids.reviewer)) throw new Error("the reviewer can't review its own PR");
   assertActingAs(reviewerGh, ids.reviewer, ids);
-  reviewerGh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `${sanitize(body).trim()}\n\n${dataClass ? `${dataMarker(sha, dataClass)}\n` : ""}${marker(sha, verdict)}` });
+  const seen = visible ? `**User-visible:** ${visible.userVisible ? "yes" : "no"} — ${sanitize(visible.userVisibleReason).replace(/\s+/g, " ").trim()}\n\n` : "";
+  const markers = [visible ? visibleMarker(sha, visible.userVisible) : null, dataClass ? dataMarker(sha, dataClass) : null, marker(sha, verdict)].filter(Boolean).join("\n");
+  reviewerGh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `${sanitize(body).trim()}\n\n${seen}${markers}` });
   if (verdict === "approve" && dataClass === "breaking") {
     // Sound work, but never auto-merged: parked now, so no merge step even looks at it.
     reviewerGh.send("POST", `repos/${repo}/issues/${n}/labels`, { labels: ["needs-owner"] });
@@ -451,6 +516,24 @@ export function approvedQueue(gh, ids, repo = APP_REPO) {
 
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); // sleeps, doesn't spin
 
+/**
+ * The open release PR (release-beta.sh's `release/vX.Y.Z` branch of this repo
+ * into main), by number, or null. While one is open, auto-merge waits: a merge
+ * would make the release PR's merge commit a main its CI never tested (#1063).
+ */
+export const RELEASE_BRANCH = /^release\/v\d+\.\d+\.\d+$/;
+/**
+ * A release run lasts at most nightly-release.yml's job timeout (230 min). A release
+ * PR untouched for longer was left by a run that was killed: it no longer pauses
+ * anything (the next release run reuses or closes it).
+ */
+export const RELEASE_PR_STALE_MS = 4 * 3600e3;
+export function openReleasePr(gh, repo = APP_REPO, now = Date.now()) {
+  return gh.list(`repos/${repo}/pulls?state=open`)
+    .find((p) => RELEASE_BRANCH.test(p.head?.ref ?? "") && p.head?.repo?.full_name === repo && p.base?.ref === "main"
+      && !(now - Date.parse(p.updated_at) > RELEASE_PR_STALE_MS))?.number ?? null;
+}
+
 export function tryMerge(gh, actGh, n, ids, { waitMs = 3000, tries = 6 } = {}) {
   // GitHub computes mergeability lazily (null right after main moves): ask again briefly.
   let pr = gh.get(`repos/${APP_REPO}/pulls/${n}`);
@@ -459,7 +542,12 @@ export function tryMerge(gh, actGh, n, ids, { waitMs = 3000, tries = 6 } = {}) {
   const comments = gh.list(`repos/${APP_REPO}/issues/${n}/comments`);
   const ci = ciStatus(gh, APP_REPO, pr.head.sha);
   const verdict = verdictFor(comments, pr.head.sha, ids.reviewer);
-  const why = refusals({ pr, files, ci, verdict, ids, betaLive: betaChannelLive(gh) });
+  // The pauses fail closed: a lookup that fails is "paused", retried next run.
+  let main, release, behind = null;
+  try { main = mainCi(gh, APP_REPO); } catch { main = { state: "error" }; }
+  try { release = openReleasePr(gh, APP_REPO); } catch { release = "error"; }
+  if (main.state === "red") { try { behind = gh.get(`repos/${APP_REPO}/compare/${main.sha}...${pr.head.sha}`)?.behind_by ?? null; } catch { behind = null; } }
+  const why = refusals({ pr, files, ci, verdict, ids, betaLive: betaChannelLive(gh), userVisible: userVisibleFor(comments, pr.head.sha, ids.reviewer), main, behind, release });
   if (why.length) {
     if (why.some((w) => !transient(w))) {
       actGh.send("POST", `repos/${APP_REPO}/issues/${n}/labels`, { labels: ["needs-owner"] });
@@ -605,7 +693,8 @@ async function main() {
     if (!/^\d+$/.test(a ?? "") || !/^[0-9a-f]{40}$/.test(b ?? "") || !c) throw new Error("usage: review-json <n> <head-sha> <file>");
     const v = parseVerdict(readFileSync(c, "utf8"), (process.env.OCTOPUSH_SECRETS ?? "").split("\n"));
     if (v.error) { console.error(`not posted #${a}: ${v.error}`); return 1; }
-    postReview(gh, reviewerGh(), ids, Number(a), b, v.verdict, v.body);
+    const visible = typeof v.userVisible === "boolean" ? { userVisible: v.userVisible, userVisibleReason: v.userVisibleReason } : null;
+    postReview(gh, reviewerGh(), ids, Number(a), b, v.verdict, v.body, APP_REPO, null, visible);
     console.log(`posted ${v.verdict} on #${a} at ${b.slice(0, 7)}`);
     return 0;
   }

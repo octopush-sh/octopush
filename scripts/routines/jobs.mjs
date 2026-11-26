@@ -3,8 +3,13 @@
 //
 //   jobs.mjs check                 exit 0 when there is a job (read-only, fast)
 //   jobs.mjs next                  print the next job, fixes first:
-//                                    pr<TAB>number<TAB>branch<TAB>title<TAB>url   (review sent back, or red CI)
+//                                    pr<TAB>number<TAB>branch<TAB>title<TAB>url   (review sent back, red CI,
+//                                                                                  or conflicts with main)
 //                                    issue<TAB>number<TAB>title<TAB>url           (a `ready` issue)
+//                                  In the app repo, while main's CI is red, it first opens or updates
+//                                  the cycle's one "main is red" issue and offers it before anything
+//                                  else; red-CI fix rounds wait (main is the likelier cause). Once main
+//                                  is green, that issue is closed (main-health.mjs).
 //   jobs.mjs claim issue|pr <n>    label it `in-progress` (claims expire after 24 h)
 //   jobs.mjs release issue|pr <n>  remove the claim
 //
@@ -24,6 +29,7 @@ import { execFileSync } from "node:child_process";
 import { makeGh, ghForRepo, APP_REPO, WEB_REPO, isPrivateLane, markPrivate, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 import { verdictFor, reviewRounds, MAX_REVIEW_ROUNDS } from "./automerge.mjs";
+import { mainCi, headIsRed, findMainRedIssue, syncMainRed, takeable } from "./main-health.mjs";
 
 export const CLAIM_TTL_MS = 24 * 3600e3;
 export const RED_CI_MAX_AGE_MS = 7 * 24 * 3600e3;
@@ -60,7 +66,12 @@ export function builderPrs(gh, repo, ids) {
     labelsOf(p).includes("agent") && sameLogin(p.user?.login, ids.builder) && p.head?.repo?.full_name === repo && p.base?.ref === "main");
 }
 
-/** Builder PRs that need another pass: the reviewer sent them back, or CI is red. */
+/**
+ * Builder PRs that need another pass: the reviewer sent them back, CI is red,
+ * or (app repo) the PR conflicts with main — nightly-build.yml merges main into
+ * the branch and leaves the conflicts for the agent to resolve. All three count
+ * against the same MAX_FIX_ROUNDS.
+ */
 export function fixJobs(gh, repo, ids, now) {
   const out = [];
   for (const p of builderPrs(gh, repo, ids)) {
@@ -70,11 +81,74 @@ export function fixJobs(gh, repo, ids, now) {
     const sentBack = verdictFor(comments, p.head.sha, ids.reviewer) === "changes";
     const red = ciStatus(gh, repo, p.head.sha) === "failure";
     const rounds = comments.filter((c) => sameLogin(c.user?.login, ids.builder) && (c.body ?? "").trimEnd().endsWith(UPDATE_MARK)).length;
-    if (sentBack || red) {
-      out.push({ pr: p, reason: sentBack ? "changes" : "red-ci", stale: rounds >= MAX_FIX_ROUNDS || (red && now - Date.parse(p.created_at) > RED_CI_MAX_AGE_MS) });
+    // Only the app's builder workflow merges main before a fix round; the other lanes don't.
+    let conflicts = false;
+    if (!sentBack && !red && repo === APP_REPO) { try { conflicts = gh.get(`repos/${repo}/pulls/${p.number}`)?.mergeable === false; } catch { conflicts = false; } }
+    if (sentBack || red || conflicts) {
+      out.push({ pr: p, reason: sentBack ? "changes" : red ? "red-ci" : "conflicts", stale: rounds >= MAX_FIX_ROUNDS || (red && now - Date.parse(p.created_at) > RED_CI_MAX_AGE_MS) });
     }
   }
   return out;
+}
+
+/**
+ * Main's health for the app builder: `{ health, issue }`. With `write`, the
+ * "main is red" issue is opened, updated or closed to match (syncMainRed);
+ * without, it is only looked up. Never fatal: if main can't be read, the queue
+ * runs as before.
+ */
+export function mainState(gh, repo, ids, { write = false } = {}) {
+  if (repo !== APP_REPO) return { health: null, issue: null };
+  try {
+    const health = mainCi(gh, repo);
+    if (!write) return { health, issue: findMainRedIssue(gh, repo, ids) };
+    const { issue, opened = false } = syncMainRed(gh, repo, ids, health);
+    return { health, issue, opened };
+  } catch (e) {
+    console.error(`jobs: main's CI unreadable (${String(e?.message ?? e).split("\n")[0].slice(0, 200)}) — queue as usual`);
+    return { health: null, issue: null };
+  }
+}
+
+/**
+ * The PR that fixes main, when main moved past it while red: auto-merge is
+ * paused, and only a head that contains main may merge, so a green, approved
+ * fix that fell behind would wait forever. It gets a "behind-main" round
+ * (nightly-build.yml merges main in; a round that is only that merge is
+ * pushed as is). Anything unreadable gives no round.
+ */
+export function behindMainJobs(gh, repo, ids, now, { health, issue }, taken = []) {
+  if (health?.state !== "red" || !health.sha || !issue) return [];
+  const out = [];
+  for (const p of builderPrs(gh, repo, ids)) {
+    if (taken.includes(p.number) || !closingRefs(`${p.title}\n${p.body}`).includes(issue.number)) continue;
+    if (labelsOf(p).includes("needs-owner") || isFreshClaim(gh, repo, p, now)) continue;
+    let behind = null;
+    try { behind = gh.get(`repos/${repo}/compare/${health.sha}...${p.head.sha}`)?.behind_by; } catch { behind = null; }
+    if (!Number.isInteger(behind) || behind === 0) continue;
+    const comments = gh.list(`repos/${repo}/issues/${p.number}/comments`);
+    const rounds = comments.filter((c) => sameLogin(c.user?.login, ids.builder) && (c.body ?? "").trimEnd().endsWith(UPDATE_MARK)).length;
+    out.push({ pr: p, reason: "behind-main", stale: rounds >= MAX_FIX_ROUNDS });
+  }
+  return out;
+}
+
+/**
+ * The jobs in order, for `check` and `next` (app repo). While main's HEAD is
+ * red: its issue first (if the builder may take it), and no red-CI rounds
+ * except on the PR that fixes main. While main is red at all (a head still
+ * running inherits its parent's red), the fix PR gets a round if it fell
+ * behind main. Then fixes; then `ready` issues.
+ */
+export function orderedJobs(gh, repo, ids, now, { health, issue, opened = false }) {
+  const headRed = headIsRed(health);
+  const issues = issueJobs(gh, repo, ids, now);
+  const fixesMain = (p) => !!issue && closingRefs(`${p.title}\n${p.body}`).includes(issue.number);
+  const fixes = fixJobs(gh, repo, ids, now).filter((j) => !headRed || j.reason !== "red-ci" || fixesMain(j.pr));
+  fixes.push(...behindMainJobs(gh, repo, ids, now, { health, issue }, fixes.map((j) => j.pr.number)));
+  // Just opened: nobody can have claimed it yet, even if the list hasn't caught up.
+  const top = headRed && takeable(issue) ? issues.find((i) => i.number === issue.number) ?? (opened ? issue : null) : null;
+  return { top, fixes, issues: top ? issues.filter((i) => i.number !== top.number) : issues };
 }
 
 export function issueJobs(gh, repo, ids, now) {
@@ -144,16 +218,22 @@ async function main() {
   const now = Date.now();
   if (repo === WEB_REPO) return webMain({ cmd, kind, num, gh, ids, baseIds, now });
   if (cmd === "check") {
-    const f = fixJobs(gh, repo, ids, now).filter((j) => !j.stale);
+    const state = mainState(gh, repo, ids);
+    // Red with no issue yet: `next` opens it, so that is work.
+    if (headIsRed(state.health) && !state.issue) { console.log("work: main is red (its issue is opened by the next build)"); return 0; }
+    const { top, fixes, issues } = orderedJobs(gh, repo, ids, now, state);
+    if (top) { console.log(`work: issue #${top.number} (main is red)`); return 0; }
+    const f = fixes.filter((j) => !j.stale);
     if (f.length) { console.log(`work: pr #${f[0].pr.number} (${f[0].reason})`); return 0; }
-    const i = issueJobs(gh, repo, ids, now);
-    if (i.length) { console.log(`work: issue #${i[0].number}`); return 0; }
+    if (issues.length) { console.log(`work: issue #${issues[0].number}`); return 0; }
     console.log(`no review fixes and no unclaimed ready issues in ${repo}`);
     return 1;
   }
   assertActingAs(gh, ids.builder, ids);
   if (cmd === "next") {
-    for (const j of fixJobs(gh, repo, ids, now)) {
+    const { top, fixes, issues } = orderedJobs(gh, repo, ids, now, mainState(gh, repo, ids, { write: true }));
+    if (top) { console.log(jobLine({ kind: "issue", n: top.number, title: top.title, url: top.html_url }, repo)); return 0; }
+    for (const j of fixes) {
       if (j.stale) {
         gh.send("POST", `repos/${repo}/issues/${j.pr.number}/labels`, { labels: ["needs-owner"] });
         gh.send("POST", `repos/${repo}/issues/${j.pr.number}/comments`, { body: `Still failing after ${MAX_FIX_ROUNDS} fix rounds or a week of red CI — parking for the owner.\n\n<!-- octopush-jobs:stale -->` });
@@ -162,7 +242,7 @@ async function main() {
       console.log(jobLine({ kind: "pr", n: j.pr.number, branch: j.pr.head.ref, title: j.pr.title, url: j.pr.html_url }, repo));
       return 0;
     }
-    const [i] = issueJobs(gh, repo, ids, now);
+    const [i] = issues;
     if (i) { console.log(jobLine({ kind: "issue", n: i.number, title: i.title, url: i.html_url }, repo)); return 0; }
     console.error(`nothing to do in ${repo}`);
     return 1;

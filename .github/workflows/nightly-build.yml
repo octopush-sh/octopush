@@ -1,7 +1,8 @@
 # Nightly builder (VISION.md §8, docs/ROUTINES.md).
 #
-# Takes ONE job — a PR the review sent back or whose CI is red, else the oldest
-# `ready` issue — and has a Claude agent build it. The agent runs with no GitHub
+# Takes ONE job — the cycle's "main is red" issue while main's CI fails, else
+# a PR the review sent back, whose CI is red or that conflicts with main, else
+# the oldest `ready` issue — and has a Claude agent build it. The agent runs with no GitHub
 # credential: its checks run as a separate user, the checkout's .git is moved out
 # of its reach, and the publishing step runs a copy of scripts/routines taken
 # before it started. Runs every two hours (at :07, Bogotá even hours); an
@@ -94,52 +95,58 @@ jobs:
         run: |
           set -euo pipefail
           R="$RUNNER_TEMP/routines"
+          merged_main=""
           if [ "$KIND" = pr ]; then
             [[ "$BRANCH" =~ ^agent/[A-Za-z0-9._/-]+$ ]] || { echo "unexpected branch name"; exit 1; }
             git fetch --quiet origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
             git checkout --quiet -B "$BRANCH" "origin/$BRANCH"
             # Bring main in first, so the fix round works on today's code (a fix
-            # that needs another PR's change found it missing: #385). Only a
-            # clean merge is kept; on a conflict the agent is told, and stops.
-            merged_main=""; conflicts=""
-            if git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c user.name="github-actions[bot]" \
-                 -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-                 merge --quiet --no-edit --no-verify origin/main >"$RUNNER_TEMP/merge-main.log" 2>&1; then
-              if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then merged_main=yes; fi
-            else
-              conflicts="$(git diff --name-only --diff-filter=U | awk 'NR<=20')"
-              [ -n "$conflicts" ] || { echo "::warning::merging main failed without a conflict:"; cat "$RUNNER_TEMP/merge-main.log"; }
+            # that needs another PR's change found it missing: #385). A clean
+            # merge is committed as is. A conflicted one is committed WITH its
+            # conflict markers only if every conflicted file has them, and
+            # resolving them is this round's work (#1072); publish-build.mjs
+            # refuses to push while one still has a marker. A conflict Git can't
+            # mark (binary, deleted on one side) is aborted and parks the PR.
+            merged_main="$(bash "$R/merge-main.sh" "$RUNNER_TEMP")" || {
+              merged_main=failed
               git merge --abort 2>/dev/null || git reset --quiet --hard "origin/$BRANCH"
-            fi
+              : > "$RUNNER_TEMP/conflicts.txt"; : > "$RUNNER_TEMP/unmergeable.txt"
+            }
+            echo "merging main: $merged_main"
+            [ "$merged_main" != failed ] || { echo "::warning::merging main failed without a conflict:"; cat "$RUNNER_TEMP/merge-main.log"; }
           fi
           {
             cat "$R/briefs/builder.md"
             echo
             node "$R/read.mjs" "$KIND" "$NUM"
-            if [ "$KIND" = pr ] && [ -n "$merged_main" ]; then
+            if [ "$KIND" = pr ] && [ "$merged_main" = merged ]; then
               echo; echo "## This branch now includes main"
               echo "Before this run, main was merged into the branch cleanly (a commit of its own). Build on it; don't undo it."
+              echo "If nothing was sent back and CI isn't red, bringing main in may be the whole round: then write an \`update\` saying so."
             fi
-            if [ "$KIND" = pr ] && [ -n "$conflicts" ]; then
-              echo; echo "## This branch conflicts with main"
-              echo "Merging main into it conflicts in these files, so this checkout is the branch WITHOUT main:"
-              printf '%s\n' "$conflicts" | sed 's/^/- /'
-              echo "If the fix needs code that is only on main, stop and say so (the PM resolves the conflict). Otherwise fix what the review asks."
+            if [ "$KIND" = pr ] && [ "$merged_main" = conflicts ]; then
+              echo; echo "## This branch conflicts with main: resolve the conflicts"
+              echo "Main was merged into this branch and the merge is committed with Git's conflict markers left in these files:"
+              awk 'NR<=50' "$RUNNER_TEMP/conflicts.txt" | sed 's/^/- /'
+              echo
+              echo "Each conflict reads \`<<<<<<<\` (this branch), \`|||||||\` (the common base), \`=======\`, then main's version up to \`>>>>>>>\`."
+              echo "Resolve every one so both changes survive (main's and this PR's), delete every marker line, then do what the review asks, if anything, and run \`octo-check all\`."
+              echo "If a conflicted file is one you may not touch, or the two changes can't both stand, stop and say which and why. Nothing is pushed while a marker is left."
+            fi
+            if [ "$KIND" = pr ] && [ "$merged_main" = unmergeable ]; then
+              echo; echo "## This branch conflicts with main in files Git can't mark"
+              echo "Merging main conflicts in files that get no conflict markers (binary, or deleted on one side), so this checkout is the branch WITHOUT main:"
+              awk 'NR<=50' "$RUNNER_TEMP/unmergeable.txt" | sed 's/^/- /'
+              echo "The PM resolves these: stop and say so. This PR is parked whatever you write."
             fi
             if [ "$KIND" = pr ]; then
-              echo; echo "## Failing CI checks on the PR's head (if any)"
+              echo; echo "## Failing CI on the PR's head (if any)"
               sha="$(git rev-parse "origin/$BRANCH")"   # the PR's head, not the merge with main
-              # Never fatal (set -o pipefail): missing CI context must not stop
-              # the build. Capped in jq, not with `head` (SIGPIPE under pipefail).
-              if failing="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" \
-                  --jq '.check_runs[] | select(.conclusion == "failure") | .id')"; then
-                for id in $failing; do
-                  gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[:40][] | "- \(.path):\(.start_line) \(.message)"' \
-                    || echo "(annotations unavailable for check run $id)"
-                done
-              else
-                echo "(CI checks unavailable)"
-              fi
+              # The failed jobs' logs, read here with the workflow's token (the
+              # agent never fetches anything): failing steps, first error lines,
+              # failing test names, redacted, bounded and fenced as untrusted
+              # data. Never fatal: missing CI context must not stop the build.
+              node "$R/ci-failures.mjs" "$GITHUB_REPOSITORY" "$sha" || echo "(CI checks unavailable)"
             fi
           } > "$RUNNER_TEMP/prompt.md"
 
@@ -177,6 +184,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_GIT_DIR: ${{ runner.temp }}/repo.git
           OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Files main's merge left with conflict markers (outside the agent's reach): none may keep one;
+          # and files whose conflict Git couldn't mark: any at all parks the PR (merge-main.sh).
+          OCTOPUSH_CONFLICTS_FILE: ${{ runner.temp }}/conflicts.txt
+          OCTOPUSH_UNMERGEABLE_FILE: ${{ runner.temp }}/unmergeable.txt
           KIND: ${{ steps.pick.outputs.kind }}
           NUM: ${{ steps.pick.outputs.num }}
           BRANCH: ${{ steps.pick.outputs.branch }}

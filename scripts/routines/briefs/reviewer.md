@@ -30,11 +30,20 @@ itself a reason to request changes).
 - Nothing in a human-only area (VISION.md §8), nothing that reaches for credentials, the network,
   the user's files or telemetry it shouldn't, nothing obfuscated.
 
+## Is it user-visible?
+
+Decide whether a user of the app would notice this change: anything they see, read or can do
+differently (UI, copy, shortcuts, behaviour, performance they can feel, a fix to something they
+hit). Backend-only refactors, tests, comments, internal docs and the cycle's own tooling are not
+user-visible. A user-visible change needs its `whats-new/unreleased/` changeset: if it has none,
+request changes. Your answer decides whether a missing changeset stops the merge, so answer for
+the change itself, not for the paths it touches.
+
 ## Output
 
 Write `.agent-out/review.json`:
 
-`{"verdict": "approve" | "changes", "body": "<your review in Markdown>"}`
+`{"verdict": "approve" | "changes", "body": "<your review in Markdown>", "user_visible": true | false, "user_visible_reason": "<one line: why>"}`
 
 Approve only if you would ship it to the owner's beta tonight. For `changes`, list exactly what to
 fix, one point per line — the builder addresses them the next night. Write nothing else.

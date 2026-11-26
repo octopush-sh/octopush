@@ -26,9 +26,9 @@ You approve ideas; everything else runs continuously (VISION.md §8–§9): the 
 |---|---|---|
 | 00:29 | [`visual-audit.yml`](../.github/workflows/visual-audit.yml) | renders every surface in **WebKit** (the macOS engine) with real-world data at three window sizes and runs layout checks (text escaping its box, text over text, sideways scroll, unlabeled controls); new defects become `visual` issues, the first two `ready` for the builder; then a Claude design reviewer reads the screenshots against the design system and files at most 3 findings as `proposal` ([scripts/visual-audit/](../scripts/visual-audit/README.md)) |
 | 00:49 | [`web-audit.yml`](../.github/workflows/web-audit.yml) | builds octopush-web's `main`, renders every page in **Chromium** at 1440×900, 1024×700 and 390×844 and runs the layout checks plus website ones (content past the window edge on mobile, placeholder copy, retired glyphs, italics, missing title/description/social tags, broken internal links and anchors); new defects become `visual` issues **in octopush-web**, the first two `ready` for the web builder, never on legal/pricing pages ([scripts/web-audit/](../scripts/web-audit/README.md)) |
-| every 2 h (odd hours, :07) | [`nightly-build.yml`](../.github/workflows/nightly-build.yml) | each run takes one job — a PR the review sent back or whose CI is red, else the oldest `ready` issue — and a Claude agent builds it (first, CI runs whose jobs never got a macOS runner are re-run — `rerun-starved.sh`, also before each review — so they don't read as red, and so is the newest `release.yml` build, so a starved beta still ships; a PR job first gets main merged in when that merges cleanly; on a conflict the agent is told and stops for the PM); the workflow opens or updates the PR (label `agent`) and starts CI |
+| every 2 h (odd hours, :07) | [`nightly-build.yml`](../.github/workflows/nightly-build.yml) | each run takes one job — the cycle's "main is red" issue while main's CI fails, else a PR the review sent back, whose CI is red or that conflicts with main, else the oldest `ready` issue — and a Claude agent builds it (first, CI runs whose jobs never got a macOS runner are re-run — `rerun-starved.sh`, also before each review — so they don't read as red, and so is the newest `release.yml` build, so a starved beta still ships; a PR job first gets main merged in, with any conflicts left for the agent to resolve, and the failed CI jobs' log excerpt — see [Fix rounds](#fix-rounds)); the workflow opens or updates the PR (label `agent`) and starts CI |
 | every 2 h (odd hours, :37) | [`web-build.yml`](../.github/workflows/web-build.yml) | the website's builder: one job per run — a web PR the web review sent back or whose CI is red, else the oldest `ready` octopush-web issue, else the oldest app-repo issue labelled `area:web` + `ready` (not `area:app`: that is app work) — built by a Claude agent in a checkout of octopush-web (its CLAUDE.md, checks via `octo-check build\|check\|consistency`, the app's stable `FEATURES.md` as the truth reference); the workflow opens or updates the PR in octopush-web (label `agent`) and, for an app-repo issue, comments the link there |
-| every 2 h (even hours, :47) | [`nightly-review.yml`](../.github/workflows/nightly-review.yml) | an independent Claude reviewer judges each green agent PR (up to 3); `automerge.mjs` re-checks every rule on that exact commit and merges the approved ones (retrying earlier approvals whose merge was skipped for a transient reason), or parks them as `needs-owner` |
+| every 2 h (even hours, :47) | [`nightly-review.yml`](../.github/workflows/nightly-review.yml) | an independent Claude reviewer judges each green agent PR (up to 3) and says whether users will notice it (`user_visible`); `automerge.mjs` re-checks every rule on that exact commit and merges the approved ones (retrying earlier approvals whose merge was skipped for a transient reason or a pause — main red, a release PR open), or parks them as `needs-owner` |
 | every 2 h (even hours, :07) | [`web-review.yml`](../.github/workflows/web-review.yml) | an independent Claude reviewer judges each green web PR (up to 3) against octopush-web's CLAUDE.md, the truth rule (the app's `FEATURES.md` at its latest **stable** release), the design rules and the human-only areas, and posts the verdict. It never merges: approved web PRs are listed in the digest, for the PM to merge or for your `merge web#N` |
 | 05:13, 17:13 | [`nightly-release.yml`](../.github/workflows/nightly-release.yml) | if `main` moved and CI is green: notes, What's new tips, clips, version bump, release PR, CI, merge, tag → `release.yml` publishes a **beta** |
 | 06:37 | [`ideas.yml`](../.github/workflows/ideas.yml) | a Claude agent researches; at least 5 ranked ideas across app, API and site are filed — app and API ones here (label `area:app\|api`), website ones in octopush-web — and one digest issue here lists them all |
@@ -38,6 +38,75 @@ You approve ideas; everything else runs continuously (VISION.md §8–§9): the 
 | even hours, :22 | [`epiku-review.yml`](../.github/workflows/epiku-review.yml) | an independent, **adversarial** Claude reviewer judges each green Epiku PR (up to 3) against Epiku's data-safety and tenant-isolation rules and classifies it `none` / `additive` / `breaking`; then, in a separate job on a fresh runner, `automerge.mjs --repo octopush-sh/epiku merge` re-checks every rule on that exact commit and merges it, or parks it as `needs-owner`. A dry run unless the repository variable `EPIKU_AUTOMERGE` is `true` |
 
 Every workflow also has **Run workflow** (Actions tab) for a manual run. Schedules sit off the hour on purpose: GitHub delays (and sometimes drops) scheduled runs at :00 under load.
+
+### Fix rounds
+
+The cycle parks a PR (`needs-owner`) only for what it can't fix itself. These send a builder PR
+back to the builder instead (`jobs.mjs`), and together they get `MAX_FIX_ROUNDS` (3) rounds
+before the PR is parked:
+
+- **The review asked for changes.**
+- **CI is red.** A run whose jobs never got a runner (every job that didn't pass cancelled before
+  any step ran, as `lib.sh` `ci_starved_run_for` tests it) is not red: `ciStatus` skips it and
+  `rerun-starved.sh` re-runs it. A fixed step of `nightly-build.yml`, holding the workflow's token,
+  reads the failed jobs' logs through the Actions API (`ci-failures.mjs`; the agent never fetches
+  anything) and puts an excerpt in the prompt: the failing step, the first error lines of the
+  tools (rustc's whole diagnostic, tsc, Vitest, node:test, panics, `##[error]`), the failing test
+  names, and, when none of those matched, the last lines before the step failed. Every line is
+  cleaned of control and invisible characters, cut to 4,000 characters, redacted (every pattern
+  is bounded, so a megabyte of hex redacts in milliseconds), then capped to 300. Redacted: known
+  secret values (plain and base64), the credential shapes of `social.mjs`, `sk_live_`/`sk_test_`/
+  `whsec_` keys, an `Authorization:` value, basic/bearer credentials, `token <hex>`, a URL's
+  user:password, the value after `=` of any name that says secret/token/password/credential or
+  ends in key (`STRIPE_KEY=`, `?api_key=`), a quoted value of such a name (`secretKey: '…'`), an
+  opaque value after such a name, and runs of 40+ mixed-case characters with digits. The excerpt
+  is bounded to 12,000 characters and fenced as untrusted data.
+- **The PR conflicts with main** (app PRs; GitHub reports it not mergeable). The workflow merges
+  main into the branch (`merge-main.sh`). If every conflicted file got Git's markers (zdiff3), the
+  merge is committed with them and resolving them is the round's work; `publish-build.mjs` pushes
+  nothing while a conflicted file still has a marker (it parks the PR instead), and a conflict in
+  a path agents may not touch is refused as any such change is. A conflict Git can't mark — a
+  binary file, a file deleted on one side, a symlink — would be settled silently, so the merge is
+  aborted and the PR is parked whatever the agent writes. The new head is reviewed again. A
+  conflicted PR is not reviewed until then; `automerge.mjs` treats conflicts as "not yet", never
+  as a park.
+- **Main moved past the fix for a red main.** See below.
+
+A missing changeset parks a PR only when the reviewer says users will notice the change: its
+verdict file carries `user_visible: true|false` and a one-line `user_visible_reason`, which the
+posting step shows in the comment and signs next to the verdict, for that commit
+(`<!-- octopush-visible:<sha>:<bool> -->`; agent text can't carry it). Without a usable answer
+(missing, not a boolean, no reason) the old path heuristic decides — non-test code under `src/` or
+`src-tauri/src/` — so a malformed verdict can only make the rule stricter.
+
+### When main is red
+
+When CI fails on `main` (a merge of two PRs that were each green, say), every PR that merges main
+goes red too, and no beta goes out (the release waits for a green main). So:
+
+- **"Red"** is the newest verdict on main's first-parent line within 5 commits: a head whose CI is
+  still running or never ran (a release merge) inherits its parent's, so red lasts until a newer
+  commit is green; a running CI whose job already failed counts as red at once. That inherited red
+  is used only to pause merges; the issue and the queue below react only when CI failed on main's
+  **head** itself, so a fix whose CI is still running doesn't open a second issue.
+- **One issue, at the top of the queue.** While main's head is red, `jobs.mjs next`
+  (main-health.mjs) opens a `ready` issue titled "main is red: <failing job>", by the workflow's
+  bot, ending in `<!-- octopush-main-red -->`, with the red commit and the same redacted, fenced
+  log excerpt; it updates that one issue (title and body, never its labels) while the head stays
+  red, and offers it before every other job. If you park it (`needs-owner`), it stays parked. Once
+  main is green again the cycle comments and closes it (the fix PR's `Closes #n` usually does
+  first).
+- **Red-CI fix rounds wait** while main's head is red (main is the likelier cause), except on the
+  PR that closes the main-red issue. Review and conflict rounds go on.
+- **Auto-merge pauses** while main is red, except for a PR whose head already contains main's head
+  — its green CI then proves the fix, and merging it is how main turns green. A lookup that fails
+  (main's CI, the compare) counts as paused.
+- **No deadlock.** If something lands on main meanwhile, the fix PR no longer contains main's head
+  and would wait forever: while main is red, the PR that closes the main-red issue gets a
+  "behind-main" round when it is behind main (the workflow merges main in; a round that is only
+  that merge is pushed as is), under the same round limit.
+- **Right away, not at the next cron:** `ci.yml`'s `main-red` job starts the builder when a job of
+  main's CI fails (push or dispatch on `main`, never a PR run).
 
 ### Answering the digest
 
@@ -170,7 +239,11 @@ trusted:
 - **Merges re-check every rule** on the PR's head commit (`automerge.mjs`): opened by the
   workflow from a branch of this repo into `main`, labelled `agent`, CI green, an approving review
   on that exact commit, no human-only paths (renames too), ≤ 800 changed lines, a changeset for
-  user-visible changes, no conflicts, and the beta channel live. Merges reach the **beta** channel
+  user-visible changes (as the review judges it, else by path — [Fix rounds](#fix-rounds)), no
+  conflicts, and the beta channel live. They also **pause**, without parking anything, while
+  main's CI is red ([When main is red](#when-main-is-red)) and while a release PR is open (so the
+  release merges the main its CI tested, docs/RELEASING.md; one untouched for 4 hours was left by
+  a killed run and pauses nothing). Merges reach the **beta** channel
   only; stable needs your approval.
 - **Identities:** your account (`OCTOPUSH_OWNER_LOGIN`) is the only one whose answers count; the
   workflows act as `github-actions[bot]` (this repo) and the "Octopush Cycle" App's bot

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// What failed in CI on a commit, for a builder's prompt (a PR sent back or red).
+// What failed in CI on a commit, for a builder's prompt (a PR sent back or red)
+// and for the cycle's "main is red" issue (main-health.mjs).
 //
 //   ci-failures.mjs <owner/repo> <sha>
 //
@@ -10,19 +11,30 @@
 // minting the web token fail outright, and calling it without it is a 403 —
 // which, under `set -o pipefail`, killed every web-build PR run (web-build.yml).
 //
+// Runs only in a fixed workflow step, with the workflow's token; an agent never
+// fetches a log. Per failed job it reports the failing step, the first error
+// lines (`##[error]` and the compiler/test-runner lines that say what broke:
+// rustc, tsc, Vitest, node:test, panics), the failing test names, and — when no
+// such line exists — the last lines of the log before the step failed. Every
+// line is cleaned of control/invisible characters, capped, and redacted (known
+// secret values, credential shapes, anything that looks like a key); the whole
+// report is bounded and fenced as untrusted data.
+//
 // Never fatal: missing CI context must not stop a build. On any API error it
 // prints UNAVAILABLE and exits 0 (diagnostics go to stderr, never into the
-// prompt). Log lines come from CI output of the agent's own branch: only
-// `##[error]` lines, control/invisible characters stripped, capped, and the
-// whole report is fenced as untrusted data.
+// prompt).
 import { ghForRepo, ALL_REPOS, EPIKU_REPO, NON_VERDICT, markPrivate, quietErrors, quietMessage } from "./gh.mjs";
-import { fence } from "./social.mjs";
+import { fence, SECRET_PATTERNS, secretValues } from "./social.mjs";
 
 export const UNAVAILABLE = "(CI checks unavailable)";
 export const NONE = "(none)";
 export const MAX_JOBS = 5;
 export const MAX_LINES = 40;
 export const MAX_LINE = 300;
+export const MAX_TESTS = 30;
+export const TAIL_LINES = 20;
+/** The whole report, in characters: a log can't crowd the job out of the prompt. */
+export const MAX_REPORT = 12000;
 const FAILED = ["failure", "timed_out", "startup_failure"];
 export const FENCE_LABEL = "failing CI on this commit: workflow, job and step names and error lines from its CI logs, which the branch's own code produced";
 
@@ -38,19 +50,159 @@ export const clean = (s) => String(s ?? "")
   .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, "")
   .replace(/ {2,}/g, " ");
 
-/** The `##[error]` lines of a job log, cleaned and capped (the exit-code line is noise). */
-export function errorLines(log, max = MAX_LINES) {
+const cap = (line) => (line.length > MAX_LINE ? `${line.slice(0, MAX_LINE)}…` : line);
+/**
+ * A log line is cut to this before it is redacted (and to MAX_LINE after): a
+ * multi-megabyte line of test output is never worth reading whole, and a key
+ * this far in can't straddle the later MAX_LINE cut.
+ */
+export const MAX_REDACT_LINE = 4000;
+const precut = (line) => (line.length > MAX_REDACT_LINE ? line.slice(0, MAX_REDACT_LINE) : line);
+const EXIT_LINE = /^Process completed with exit code \d+\.?$/;
+
+/** The `##[error]` lines of a job log, cleaned, redacted and capped (the exit-code line is noise). */
+export function errorLines(log, max = MAX_LINES, secrets = []) {
   const out = [];
   for (const raw of String(log ?? "").split("\n")) {
     const i = raw.indexOf("##[error]");
     if (i < 0) continue;
-    const line = clean(raw.slice(i + "##[error]".length)).trim();
-    if (!line || /^Process completed with exit code \d+\.?$/.test(line)) continue;
-    out.push(line.length > MAX_LINE ? `${line.slice(0, MAX_LINE)}…` : line);
+    // Redacted whole, before any cut: half a key matches no pattern.
+    const line = redact(precut(clean(raw.slice(i + "##[error]".length)).trim()), secrets);
+    if (!line || EXIT_LINE.test(line)) continue;
+    out.push(cap(line));
     if (out.length >= max) break;
   }
   return out;
 }
+
+// ------------------------------------------------------------------ the log's own words
+
+/** Each log line without its runner timestamp, cleaned and redacted — whole, before anything is cut. */
+const STAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?/;
+const logLines = (log, secrets) => String(log ?? "").split("\n").map((l) => redact(precut(clean(l.replace(STAMP, "")).trim()), secrets));
+
+/**
+ * Lines that say what broke. `next` also keeps the line after (a panic's
+ * message); `block` keeps the lines after it up to the next blank line, at most
+ * BLOCK_LINES (rustc's location, the code and its labels).
+ */
+const BLOCK_LINES = 12;
+const NEXT_DIAGNOSTIC = /^(error|warning)(\[\w+\])?: /;
+const ERROR_LINE = [
+  { re: /^error(\[E\d{4}\])?: /, block: true },             // rustc / cargo
+  { re: /^thread '.*' panicked at /, next: /\S/ },        // a Rust test's panic, then its message
+  { re: /\berror TS\d{4,5}: / },                          // tsc
+  { re: /^(FAIL|×|✗|✖) \S/ },                             // Vitest, node:test
+  { re: /^(\w*Error)(\s*\[[A-Z_]+\])?: / },               // JS errors and assertions
+  { re: /^(left|right): / },                              // assert_eq!
+  { re: /^npm (ERR!|error) / },
+  { re: /^not ok \d+ / },                                 // node --test (TAP)
+  { re: /^test \S+ \.\.\. FAILED$/ },
+];
+/** Failing test names, by runner. */
+const TEST_NAME = [
+  /^test (\S+) \.\.\. FAILED$/,                             // cargo test
+  /^FAIL (\S.*?)$/,                                         // Vitest: FAIL src/a.test.ts > suite > name
+  /^(?:×|✗) (\S.*?)(?: \d+(?:\.\d+)? ?m?s)?$/,              // Vitest's reporter
+  /^not ok \d+ - (\S.*?)(?: #.*)?$/,                        // node --test (TAP)
+  /^✖ (\S.*?)(?: \(\d+(?:\.\d+)?m?s\))?$/,                  // node --test (spec)
+];
+
+/**
+ * What a job's log says about its failure (pure): `errors` (the `##[error]`
+ * lines and the first error lines of the tools, in log order, deduplicated),
+ * `tests` (failing test names) and `tail` (the last lines before the step
+ * failed, only when nothing else was found). All cleaned and capped.
+ */
+export function logSummary(log, { maxLines = MAX_LINES, maxTests = MAX_TESTS, tailLines = TAIL_LINES, secrets = secretValues() } = {}) {
+  const lines = logLines(log, secrets);
+  const errors = [];
+  const tests = [];
+  const seen = new Set();
+  // A diagnostic's own lines (its code, its `|` rulers) are kept as they are; a repeated headline isn't.
+  const keep = (l, dedupe = true) => { const c = cap(l); if (!c || (dedupe && seen.has(c)) || errors.length >= maxLines) return; seen.add(c); errors.push(c); };
+  let failedAt = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const at = l.indexOf("##[error]");
+    if (at >= 0) {
+      const msg = l.slice(at + "##[error]".length).trim();
+      if (EXIT_LINE.test(msg)) { if (failedAt < 0) failedAt = i; continue; }
+      if (msg.replace(/['"]/g, "").trim()) keep(msg);
+      continue;
+    }
+    if (l.startsWith("##[")) continue; // groups, commands: the runner's, not the tools'
+    for (const re of TEST_NAME) {
+      const m = re.exec(l);
+      if (m && tests.length < maxTests && !tests.includes(m[1])) tests.push(cap(m[1]));
+    }
+    const hit = ERROR_LINE.find((p) => p.re.test(l));
+    if (!hit) continue;
+    keep(l);
+    if (hit.block) {
+      for (let j = i + 1; j < lines.length && j <= i + BLOCK_LINES && lines[j] && !lines[j].startsWith("##[") && !NEXT_DIAGNOSTIC.test(lines[j]); j++) keep(lines[j], false);
+    } else if (hit.next) {
+      const after = lines[i + 1] ?? "";
+      if (hit.next.test(after) && !after.startsWith("##[")) keep(after);
+    }
+  }
+  let tail = [];
+  if (!errors.length && !tests.length) {
+    const end = failedAt >= 0 ? failedAt : lines.length;
+    tail = lines.slice(0, end).filter((l) => l && !l.startsWith("##[")).slice(-tailLines).map(cap);
+  }
+  return { errors, tests, tail };
+}
+
+// ------------------------------------------------------------------ redaction
+
+export const REDACTED = "[redacted]";
+const global = (re) => new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+const KEYWORD = "token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|credentials?";
+/** A name that holds a credential: says secret/token/password/credential, or ends in key (`STRIPE_KEY`, `secretKey`, `api-key`). */
+const SECRET_NAME = /secret|token|passw(?:or)?d|credential|api[_-]?key|private[_-]?key|access[_-]?key|key$/i;
+/** Credential shapes of payment and webhook providers, at any length from 8. */
+const PROVIDER_KEYS = [/\b[spr]k_(?:live|test)_[A-Za-z0-9]{8,}/g, /\bwhsec_[A-Za-z0-9+/=_-]{8,}/g];
+
+/**
+ * Replace anything that could be a credential with REDACTED (pure).
+ * Conservative on purpose — a lost commit id costs nothing, a leaked key does:
+ *   - the known secret `values` (plain and base64) and the credential shapes of
+ *     social.mjs (SECRET_PATTERNS), plus `sk_live_`/`sk_test_`/`whsec_` keys;
+ *   - an `Authorization:` header's value (token/bearer/basic), a basic/bearer
+ *     credential anywhere, `token <hex>`, a URL's user:password;
+ *   - the value after `=` of any name that says secret/token/password/
+ *     credential or ends in key (`GH_TOKEN=…`, `STRIPE_KEY=…`, `?api_key=…`);
+ *   - a quoted value of such a name (`secretKey: '…'`, `"apiToken": "…"`);
+ *   - an opaque value (digits in it) after such a name and `:` or `=`;
+ *   - any run of 40+ base64/URL-safe characters that mixes upper case, lower
+ *     case and digits.
+ * Callers redact a line before cutting it (ci-failures' caps): half a key
+ * matches no pattern.
+ */
+// Every name and gap above is bounded ({0,63}, \s{0,8}): on a long run of name
+// characters (a hex dump, a base64 blob) an unbounded one backtracks from every
+// position — quadratic, minutes for a megabyte. Callers also cut a line to
+// MAX_REDACT_LINE before redacting it.
+export function redact(text, values = []) {
+  let s = String(text ?? "");
+  const known = [...new Set(values.map((v) => String(v ?? "").trim()).filter((v) => v.length >= 8))].sort((a, b) => b.length - a.length);
+  for (const v of known) for (const form of [v, Buffer.from(v).toString("base64")]) s = s.split(form).join(REDACTED);
+  for (const re of [...SECRET_PATTERNS, ...PROVIDER_KEYS]) s = s.replace(global(re), REDACTED);
+  s = s.replace(/\b(authorization\s{0,8}[:=]\s{0,8}(?:(?:token|bearer|basic)\s{1,8})?)(?!\[redacted\])\S+/gi, `$1${REDACTED}`);
+  s = s.replace(/\b(bearer|basic)(\s+)(?!\[redacted\])[A-Za-z0-9._~+/=-]{8,}/gi, `$1$2${REDACTED}`);
+  s = s.replace(/\b(token\s+)[0-9a-f]{20,}\b/gi, `$1${REDACTED}`);
+  s = s.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, `$1${REDACTED}@`);
+  s = s.replace(/\b([A-Za-z][A-Za-z0-9_.-]{0,63})=(?!\[redacted\])([^\s&"'`,;]+)/g, (m, k) => (SECRET_NAME.test(k) ? `${k}=${REDACTED}` : m));
+  s = s.replace(/(["']?)\b([A-Za-z_][A-Za-z0-9_.-]{0,63})\1(\s{0,8}[:=]\s{0,8})(["'`])([^"'`\n]{4,})\4/g,
+    (m, q, k, sep, quote, v) => (SECRET_NAME.test(k) && v !== REDACTED ? `${q}${k}${q}${sep}${quote}${REDACTED}${quote}` : m));
+  s = s.replace(new RegExp(`\\b([\\w-]{0,63}?(?:${KEYWORD}))(["']?\\s{0,8}[:=]\\s{0,8}["']?)([A-Za-z0-9_\\-+/=.~]{12,})`, "gi"),
+    (m, k, sep, v) => (/\d/.test(v) && v !== REDACTED ? `${k}${sep}${REDACTED}` : m));
+  s = s.replace(/[A-Za-z0-9+/_-]{40,}={0,2}/g, (m) => (/[a-z]/.test(m) && /[A-Z]/.test(m) && /\d/.test(m) ? REDACTED : m));
+  return s;
+}
+
+// ------------------------------------------------------------------ the report
 
 /**
  * The latest run of each workflow for `sha` that failed. Like gh.mjs ciStatus,
@@ -72,31 +224,55 @@ export function failedRuns(runs) {
 export const forPrompt = (report) => (report === NONE || report === UNAVAILABLE ? report : fence(report, FENCE_LABEL));
 
 /**
- * Markdown lines describing the failing runs/jobs/steps on `sha`, or NONE.
- * `gh` is a makeGh client; listing errors propagate (the caller says UNAVAILABLE),
- * a single unreadable job log does not.
+ * The failing runs/jobs on `sha`, structured: `[{ workflow, job, conclusion,
+ * steps, errors, tests, tail, log }]` (`job` null for a run without a failed
+ * job; `{ more: true }` once MAX_JOBS is reached; `log` false when a job's log
+ * couldn't be read). Listing errors propagate (the caller says UNAVAILABLE), a
+ * single unreadable job log does not. `gh` is a makeGh client.
  */
-export function ciFailures(gh, repo, sha) {
+export function ciFailureList(gh, repo, sha, { secrets = secretValues() } = {}) {
   const runs = failedRuns(gh.get(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`)?.workflow_runs);
-  if (!runs.length) return NONE;
   const out = [];
   let jobs = 0;
   for (const run of runs) {
     const failed = (gh.get(`repos/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`)?.jobs ?? [])
       .filter((j) => FAILED.includes(j.conclusion));
-    if (!failed.length) { out.push(`- ${clean(run.name)}: ${run.conclusion}`); continue; }
+    if (!failed.length) { out.push({ workflow: clean(run.name), job: null, conclusion: run.conclusion }); continue; }
     for (const job of failed) {
-      if (jobs++ >= MAX_JOBS) { out.push(`- (more failing jobs omitted)`); return out.join("\n"); }
-      out.push(`- ${clean(run.name)} / ${clean(job.name)}: ${job.conclusion}`);
-      for (const s of job.steps ?? []) if (FAILED.includes(s.conclusion)) out.push(`  - step failed: ${clean(s.name)}`);
-      let lines;
-      try { lines = errorLines(gh.raw(`repos/${repo}/actions/jobs/${job.id}/logs`)); } catch { lines = null; }
-      if (lines === null) out.push("  - (log unavailable)");
-      else for (const l of lines) out.push(`  - ${l}`);
+      if (jobs++ >= MAX_JOBS) { out.push({ more: true }); return out; }
+      let summary = null;
+      try { summary = logSummary(gh.raw(`repos/${repo}/actions/jobs/${job.id}/logs`), { secrets }); } catch { summary = null; }
+      out.push({
+        workflow: clean(run.name), job: clean(job.name), conclusion: job.conclusion,
+        steps: (job.steps ?? []).filter((s) => FAILED.includes(s.conclusion)).map((s) => clean(s.name)),
+        log: summary !== null, ...(summary ?? { errors: [], tests: [], tail: [] }),
+      });
     }
   }
-  return out.join("\n");
+  return out;
 }
+
+/** The Markdown report for a ciFailureList, redacted and bounded, or NONE (pure but for the env's secrets). */
+export function formatFailures(list, { secrets = secretValues() } = {}) {
+  if (!list.length) return NONE;
+  const out = [];
+  for (const f of list) {
+    if (f.more) { out.push("- (more failing jobs omitted)"); break; }
+    if (!f.job) { out.push(`- ${f.workflow}: ${f.conclusion}`); continue; }
+    out.push(`- ${f.workflow} / ${f.job}: ${f.conclusion}`);
+    for (const s of f.steps ?? []) out.push(`  - step failed: ${s}`);
+    if (f.log === false) { out.push("  - (log unavailable)"); continue; }
+    for (const t of f.tests ?? []) out.push(`  - failing test: ${t}`);
+    for (const l of f.errors ?? []) out.push(`  - ${l}`);
+    if (f.tail?.length) { out.push("  - last lines of the log before the step failed:"); for (const l of f.tail) out.push(`    - ${l}`); }
+  }
+  let report = redact(out.join("\n"), secrets);
+  if (report.length > MAX_REPORT) report = `${report.slice(0, report.lastIndexOf("\n", MAX_REPORT) > 0 ? report.lastIndexOf("\n", MAX_REPORT) : MAX_REPORT)}\n- (truncated)`;
+  return report;
+}
+
+/** Markdown lines describing the failing runs/jobs/steps on `sha`, or NONE. */
+export const ciFailures = (gh, repo, sha, opts) => formatFailures(ciFailureList(gh, repo, sha, opts), opts);
 
 function main() {
   const [repo, sha] = process.argv.slice(2);
