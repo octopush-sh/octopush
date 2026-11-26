@@ -2051,11 +2051,16 @@ impl ChatEngine {
             }
             Err(e) => return (format!("Failed to load tool output: {e}"), false),
         };
-        let result = crate::chat_history::recall_source(&stored);
+        let original = self.db.lock().get_chat_tool_original(thread_id, message_id).ok().flatten();
+        let (result, cut) = crate::chat_history::recall_source(&stored, original);
         if result.is_empty() {
             return (format!("Tool output #{message_id} is empty"), true);
         }
-        (window_text(&result, offset, limit), true)
+        let window = window_text(&result, offset, limit);
+        match cut {
+            Some(note) => (format!("{window}\n{note}"), true),
+            None => (window, true),
+        }
     }
 
     /// Show `line` (a journal line, e.g. a retry or a rate-limit pause) on
@@ -2087,9 +2092,9 @@ impl ChatEngine {
         req: &LlmRequest,
         cancel: &AtomicBool,
     ) -> Completion {
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
             tracing::warn!(attempt, delay, kind = kind.label(), "Talk director: provider call failed; retrying");
-            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, delay, kind), delay);
+            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, of, delay, kind), delay);
         };
         complete_cancellable(provider, api_base, api_key, req, &self.client, cancel, DEFAULT_MAX_RETRIES, &mut on_retry)
             .await
@@ -3628,11 +3633,6 @@ impl ChatEngine {
                     }
                     tool_record["agent"] = m;
                 }
-                // `result` is what the model, the card and later turns read;
-                // `original` (only when they differ) is what recall returns.
-                if let Some(original) = mcp_original {
-                    tool_record["original"] = serde_json::Value::String(original);
-                }
                 // The thread may have been deleted while the turn was parked (a
                 // tool running, or an approval card awaiting the user). Skip the
                 // persist so we don't leave an orphaned tool row.
@@ -3659,7 +3659,18 @@ impl ChatEngine {
                                 tracing::warn!(error = %e, "failed to link sub-agent run to its row");
                             }
                         }
-                        Ok(id) => row_id = Some(id),
+                        Ok(id) => {
+                            row_id = Some(id);
+                            // The row's `result` is what the model, the card
+                            // and later turns read. The original goes to its
+                            // own table, capped, for recall only: the webview
+                            // never receives it.
+                            if let Some(original) = mcp_original.take() {
+                                if let Err(e) = self.db.lock().set_chat_tool_original(id, &request.thread_id, &original) {
+                                    tracing::warn!(error = %e, "failed to keep the original MCP output for recall");
+                                }
+                            }
+                        }
                         Err(e) => {
                             tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
                         }
@@ -4620,7 +4631,7 @@ mod director_reliability_tests {
     #[test]
     fn a_journal_line_becomes_a_player_label() {
         assert_eq!(
-            notice_label(&retry_notice(2, 4, ProviderErrorKind::RateLimit)),
+            notice_label(&retry_notice(2, 5, 4, ProviderErrorKind::RateLimit)),
             "Rate limit reached — retrying in 4s (retry 2 of 5)"
         );
         assert_eq!(

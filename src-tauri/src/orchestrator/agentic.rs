@@ -420,8 +420,8 @@ async fn answer_ask_stage(
         effort: None,
         cache: false,
     };
-    let mut on_retry = |attempt: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
-        emitter.notice(&retry_notice(attempt, delay, kind));
+    let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
+        emitter.notice(&retry_notice(attempt, of, delay, kind));
     };
     match complete_with_retry(
         provider.as_ref(),
@@ -827,8 +827,8 @@ pub async fn run_agentic_loop(
         // retried in place with backoff — the accumulated message history is
         // preserved, so a momentary blip never costs the stage its work or forces
         // a halt. Each wait is narrated into the journal.
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
-            emitter.notice(&retry_notice(attempt, delay, kind));
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
+            emitter.notice(&retry_notice(attempt, of, delay, kind));
         };
         let resp = complete_with_retry(
             provider,
@@ -1149,8 +1149,8 @@ pub async fn run_agentic_loop(
             effort,
             cache: true,
         };
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
-            emitter.notice(&retry_notice(attempt, delay, kind));
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
+            emitter.notice(&retry_notice(attempt, of, delay, kind));
         };
         match complete_with_retry(
             provider,

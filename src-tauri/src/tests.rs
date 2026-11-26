@@ -1284,6 +1284,49 @@ mod workspace_tests {
     }
 
     #[test]
+    fn an_mcp_original_is_kept_for_recall_and_never_loaded_with_the_thread() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        let row = serde_json::json!({
+            "callId": "c1",
+            "toolName": "mcp__browser__screenshot",
+            "toolInput": {},
+            "result": "[image omitted: image/png, 2048 KB]",
+        })
+        .to_string();
+        let id = db.insert_chat_message("ws", &t.id, "tool", &row, None, None, None, None).unwrap();
+        let original = format!("{{\"type\":\"image\",\"data\":\"{}\"}}", "iVBORw0KGgo".repeat(200_000));
+        db.set_chat_tool_original(id, &t.id, &original).unwrap();
+
+        // A thread load (what the webview receives) carries the row as
+        // written: the placeholder, never the original.
+        let loaded = db.list_chat_messages(&t.id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, row);
+        assert!(!loaded[0].content.contains("iVBORw0KGgo"));
+        assert!(!loaded[0].content.contains("original"));
+
+        // Recall reads it, capped at 1 MB with its full size, in this thread only.
+        let (kept, total) = db.get_chat_tool_original(&t.id, id).unwrap().expect("kept");
+        assert_eq!(kept.len(), crate::chat_history::ORIGINAL_CAP_BYTES);
+        assert_eq!(total, original.len());
+        assert!(original.starts_with(&kept));
+        let other = db.create_chat_thread("ws", "Other").unwrap();
+        assert!(db.get_chat_tool_original(&other.id, id).unwrap().is_none());
+
+        // It goes with its row.
+        db.truncate_chat_after(&t.id, id).unwrap();
+        assert!(db.get_chat_tool_original(&t.id, id).unwrap().is_none());
+        let id2 = db.insert_chat_message("ws", &t.id, "tool", &row, None, None, None, None).unwrap();
+        db.set_chat_tool_original(id2, &t.id, "small").unwrap();
+        assert_eq!(db.get_chat_tool_original(&t.id, id2).unwrap(), Some(("small".to_string(), 5)));
+        db.delete_chat_thread(&t.id).unwrap();
+        assert!(db.get_chat_tool_original(&t.id, id2).unwrap().is_none());
+    }
+
+    #[test]
     fn pinned_threads_sort_to_the_top() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();

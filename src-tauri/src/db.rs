@@ -1140,6 +1140,22 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_chat_agent_runs_thread ON chat_agent_runs(thread_id);
             "#,
         )?;
+        // The original of an MCP tool output whose binary payloads the row
+        // shows as placeholders, for `recall_tool_output` only. Kept apart
+        // from `chat_messages.content`, which the webview receives on every
+        // new row and thread load. Goes with its row (deleted thread,
+        // truncate, deleted workspace).
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_tool_originals (
+                message_id      INTEGER PRIMARY KEY,
+                thread_id       TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                total_bytes     INTEGER NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+            );
+            "#,
+        )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_spend_mission ON spend_events(mission_id, ts_utc);",
         )?;
@@ -4749,6 +4765,30 @@ impl Db {
             .query_row(params![message_id, thread_id], |r| r.get::<_, String>(0))
             .optional()?;
         Ok(content)
+    }
+
+    /// Keep the original of tool row `message_id`'s output for
+    /// `recall_tool_output`: at most `chat_history::ORIGINAL_CAP_BYTES` of it
+    /// (cut on a char boundary), with its full size.
+    pub fn set_chat_tool_original(&self, message_id: i64, thread_id: &str, original: &str) -> AppResult<()> {
+        let kept = crate::chat_history::capped_original(original);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO chat_tool_originals (message_id, thread_id, content, total_bytes) VALUES (?1, ?2, ?3, ?4)",
+            params![message_id, thread_id, kept, original.len() as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The kept original of tool row `message_id` and its full size in
+    /// bytes, scoped to `thread_id` like [`Self::get_chat_tool_output`].
+    pub fn get_chat_tool_original(&self, thread_id: &str, message_id: i64) -> AppResult<Option<(String, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT content, total_bytes FROM chat_tool_originals WHERE message_id = ?1 AND thread_id = ?2")?;
+        let row = stmt
+            .query_row(params![message_id, thread_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))
+            .optional()?;
+        Ok(row)
     }
 
     /// Append one live-journal entry of a TALK sub-agent (`Agent` tool call).

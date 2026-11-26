@@ -249,19 +249,33 @@ pub fn recall_hint(id: i64) -> String {
     format!(" — call recall_tool_output with message_id {id} for the full output")
 }
 
-/// The output `recall_tool_output` returns for a stored `role="tool"` row:
-/// its `original` when it keeps one (an MCP result whose binary payloads
-/// the model read as placeholders), else its `result`. Empty for a row that
-/// isn't JSON.
-pub fn recall_source(stored: &str) -> String {
-    let Ok(row) = serde_json::from_str::<serde_json::Value>(stored) else {
-        return String::new();
-    };
-    row.get("original")
-        .or_else(|| row.get("result"))
-        .and_then(|r| r.as_str())
-        .unwrap_or_default()
-        .to_string()
+/// Most of an MCP tool output's original that is kept for recall (1 MB).
+/// The original is the result before its binary payloads became
+/// placeholders, so it can be very large (a screenshot is megabytes of
+/// base64); past this the recall says it was cut.
+pub const ORIGINAL_CAP_BYTES: usize = 1_000_000;
+
+/// The part of `original` that is kept: its first [`ORIGINAL_CAP_BYTES`],
+/// cut on a char boundary.
+pub fn capped_original(original: &str) -> &str {
+    head_bytes(original, ORIGINAL_CAP_BYTES)
+}
+
+/// What `recall_tool_output` returns for a stored `role="tool"` row: the
+/// kept original (`chat_tool_originals`) when the row has one, else the
+/// row's `result`. The note says when the original was cut at the cap.
+pub fn recall_source(stored: &str, original: Option<(String, usize)>) -> (String, Option<String>) {
+    if let Some((kept, total)) = original {
+        let note = (kept.len() < total).then(|| {
+            format!("[original output truncated: the first {} of {total} bytes were kept]", kept.len())
+        });
+        return (kept, note);
+    }
+    let result = serde_json::from_str::<serde_json::Value>(stored)
+        .ok()
+        .and_then(|row| row.get("result").and_then(|r| r.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    (result, None)
 }
 
 /// The copy of a tool result the director's next request carries, within
@@ -557,16 +571,17 @@ mod tests {
     }
 
     #[test]
-    fn recall_returns_the_original_output_and_history_the_scrubbed_one() {
+    fn recall_returns_the_kept_original_and_history_the_scrubbed_result() {
         let row = serde_json::json!({
             "callId": "c1",
             "toolName": "mcp__browser__screenshot",
             "toolInput": {},
             "result": "[image omitted: image/png, 48 KB]",
-            "original": "{\"data\":\"iVBORw0KGgo\",\"type\":\"image\"}",
         })
         .to_string();
-        assert_eq!(recall_source(&row), "{\"data\":\"iVBORw0KGgo\",\"type\":\"image\"}");
+        let original = "{\"data\":\"iVBORw0KGgo\",\"type\":\"image\"}".to_string();
+        let total = original.len();
+        assert_eq!(recall_source(&row, Some((original.clone(), total))), (original, None));
         // History replays `result`, the placeholder.
         let rows = [
             HistoryRow { id: 1, role: "user", content: "look" },
@@ -574,14 +589,26 @@ mod tests {
             HistoryRow { id: 3, role: "assistant", content: "done" },
             HistoryRow { id: 4, role: "user", content: "next" },
         ];
-        let turns = build_history(&rows);
-        let replay = turns.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join("\n");
+        let replay = build_history(&rows).iter().map(|t| t.text.clone()).collect::<Vec<_>>().join("\n");
         assert!(replay.contains("[image omitted: image/png, 48 KB]"), "{replay}");
         assert!(!replay.contains("iVBORw0KGgo"), "{replay}");
-        // A row from before `original` existed recalls its result.
-        let old = serde_json::json!({ "toolName": "read_file", "toolInput": {}, "result": "fn main() {}" }).to_string();
-        assert_eq!(recall_source(&old), "fn main() {}");
-        assert_eq!(recall_source("not json"), "");
+        // No original kept (a built-in tool, an older row): its result.
+        assert_eq!(recall_source(&row, None), ("[image omitted: image/png, 48 KB]".to_string(), None));
+        assert_eq!(recall_source("not json", None), (String::new(), None));
+    }
+
+    #[test]
+    fn an_original_past_the_cap_is_cut_and_the_recall_says_so() {
+        let big = "é".repeat(ORIGINAL_CAP_BYTES); // 2 MB, two bytes a char
+        let kept = capped_original(&big);
+        assert_eq!(kept.len(), ORIGINAL_CAP_BYTES, "cut on a char boundary");
+        let (text, note) = recall_source("{}", Some((kept.to_string(), big.len())));
+        assert_eq!(text.len(), ORIGINAL_CAP_BYTES);
+        assert_eq!(
+            note.as_deref(),
+            Some("[original output truncated: the first 1000000 of 2000000 bytes were kept]")
+        );
+        assert_eq!(capped_original("small"), "small");
     }
 
     #[test]
