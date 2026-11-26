@@ -488,7 +488,7 @@ mod tests {
         LlmResponse {
             text: String::new(), tool_uses: Vec::new(), stop_reason: LlmStopReason::ToolUse, output_tokens: 40,
             input_tokens: prompt / 10, cache_read_tokens: prompt - prompt / 10, cache_creation_tokens: 0,
-            rate_limit: None, raw_content: Vec::new(),
+            rate_limit: None, raw_content: Vec::new(), ..Default::default()
         }
     }
 
