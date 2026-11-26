@@ -11,6 +11,7 @@
 // acceptance is journaled); any other answer still opens the full form.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { PrerequisiteCardLine } from "./PrerequisiteMark";
 import { ArrowDownUp, ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Play, Plus, Square, Terminal, TimerOff, Hourglass, X } from "lucide-react";
 import type { DiffSize, Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
@@ -629,6 +630,9 @@ function CrewCard({
           {run.task}
         </span>
       </span>
+
+      {/* "Starts after" (#960): one line while this mission waits on another. */}
+      <PrerequisiteCardLine workspaceId={run.workspaceId} />
 
       {/* Row 3 — micro-track: the run's shape at a glance. */}
       <MicroTrack stages={stages} />

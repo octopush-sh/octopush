@@ -26780,6 +26780,31 @@ mod prerequisite_tests {
     }
 
     #[test]
+    fn list_returns_the_project_links_of_active_missions_only() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        seed_workspace(&db, "p2", "x2");
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", false, true).unwrap();
+        link(&db, "w3", "w2");
+        link(&db, "x2", "x1");
+
+        let waiting = |db: &Db| -> Vec<(String, String)> {
+            let rows = db.list_workspace_prerequisites("p1").unwrap();
+            rows.into_iter().map(|p| (p.workspace_id, p.after_workspace_id)).collect()
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(waiting(&db), [pair("w2", "w1"), pair("w3", "w2")]);
+        let first = &db.list_workspace_prerequisites("p1").unwrap()[0];
+        assert!(first.auto_start && first.after_condition == "pr_merged");
+
+        // An archived mission keeps its link, but it waits on nothing now.
+        db.archive_workspace("w3").unwrap();
+        assert_eq!(waiting(&db), [pair("w2", "w1")]);
+        assert!(db.list_workspace_prerequisites("nope").unwrap().is_empty());
+    }
+
+    #[test]
     fn deleting_a_prerequisite_clears_the_links_to_it() {
         let db = seeded();
         db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();

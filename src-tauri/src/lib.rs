@@ -239,6 +239,7 @@ pub fn run() {
             commands::set_items_group,
             commands::set_workspace_prerequisite,
             commands::clear_workspace_prerequisite,
+            commands::list_workspace_prerequisites,
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,
