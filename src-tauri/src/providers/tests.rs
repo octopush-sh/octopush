@@ -2345,8 +2345,9 @@ mod openai_streaming {
             delta(json!({"refusal": "I can't share"})),
             delta(json!({"refusal": " that key."})),
             finished("stop"),
+            chat_events().pop().unwrap(),
         ];
-        let whole = json!({"choices": [{"index": 0, "finish_reason": "stop",
+        let whole = json!({"usage": usage(), "choices": [{"index": 0, "finish_reason": "stop",
             "message": {"role": "assistant", "content": "I can read the config.", "refusal": "I can't share that key."}}]});
         let (out, events) = read(&Api::Chat, chunks(&chat_sse(&refusal, true), 16)).await;
         let resp = out.unwrap();
