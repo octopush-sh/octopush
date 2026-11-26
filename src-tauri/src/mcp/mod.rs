@@ -32,6 +32,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
+pub mod content;
 mod failure;
 pub mod remote;
 pub mod secrets;
@@ -78,6 +79,24 @@ pub struct McpToolInfo {
     /// Anything else is treated as a possible write when a sub-agent calls it.
     #[serde(default)]
     pub read_only: bool,
+}
+
+/// Put tools in the order every request offers them: by server, then by tool
+/// name. Neither the config map (a `HashMap`, rebuilt on every read) nor a
+/// server's own `tools/list` promises an order, and the tool list is the
+/// start of the prompt a provider caches: any reshuffle re-bills the whole
+/// conversation at the cache-write price. A server that fails to start just
+/// drops out; the others keep their places.
+pub fn sort_tools(tools: &mut [McpToolInfo]) {
+    tools.sort_by(|a, b| a.server.cmp(&b.server).then_with(|| a.name.cmp(&b.name)));
+}
+
+/// The configured servers in name order, so servers start (and fail) in
+/// the same order every time.
+pub(crate) fn sorted_server_configs(worktree: &Path) -> Vec<(String, McpServerConfig)> {
+    let mut cfgs: Vec<(String, McpServerConfig)> = load_server_configs(worktree).into_iter().collect();
+    cfgs.sort_by(|a, b| a.0.cmp(&b.0));
+    cfgs
 }
 
 /// Parse `.claude/mcp.json` content into a name→config map. Tolerant: a missing
@@ -1246,11 +1265,12 @@ impl McpRegistry {
         }
     }
 
-    /// All tools across configured + reachable servers for a worktree.
-    /// Unreachable servers are skipped with a warning (never fatal).
+    /// All tools across configured + reachable servers for a worktree, in
+    /// [`sort_tools`] order. Unreachable servers are skipped with a warning
+    /// (never fatal).
     pub fn list_tools(&self, worktree: &Path) -> Vec<McpToolInfo> {
         let mut out = Vec::new();
-        for (name, cfg) in load_server_configs(worktree) {
+        for (name, cfg) in sorted_server_configs(worktree) {
             match self.ensure(&name, &cfg) {
                 Ok((conn, _)) => out.extend(conn.lock().tools.clone()),
                 Err(e) => {
@@ -1258,12 +1278,14 @@ impl McpRegistry {
                 }
             }
         }
+        sort_tools(&mut out);
         out
     }
 
     /// Call a namespaced MCP tool (`mcp__server__tool`), returning the textual
-    /// result (MCP `tools/call` content blocks joined). A tool that reports
-    /// its own failure (`isError`) is a result like any other.
+    /// result (MCP `tools/call` content blocks joined, binary blocks as short
+    /// placeholders: `content::render_call_result`). A tool that reports its
+    /// own failure (`isError`) is a result like any other.
     pub fn call(&self, worktree: &Path, namespaced: &str, input: &Value) -> Result<String, McpCallError> {
         self.call_on(worktree, namespaced, input, None)
     }
@@ -1308,17 +1330,7 @@ impl McpRegistry {
                 return Err(McpCallError::Connection { server, reason });
             }
         };
-        let text = result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        Ok(if text.is_empty() { result.to_string() } else { text })
+        Ok(content::render_call_result(&result))
     }
 }
 

@@ -19,7 +19,8 @@ const MAX_THROTTLE_SECS: u64 = 65;
 
 /// Cap (bytes) on a tool result fed back to the model. A single huge read can
 /// otherwise inflate every later turn's input tokens for the rest of the stage.
-const TOOL_RESULT_CAP_BYTES: usize = 24_000;
+/// Talk's director caps MCP results to the same size.
+pub(crate) const TOOL_RESULT_CAP_BYTES: usize = 24_000;
 
 /// The `max_tokens` floor for a stage given its effort. High-effort thinking
 /// spends its own tokens before the answer, so the output cap must clear that

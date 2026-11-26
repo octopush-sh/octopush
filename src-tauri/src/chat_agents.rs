@@ -863,11 +863,7 @@ impl McpSubagentTools {
         let tools: Vec<LlmTool> = discovered
             .iter()
             .filter(|t| definition.map(|d| d.mcp.allows(&t.namespaced)).unwrap_or(true))
-            .map(|t| LlmTool {
-                name: t.namespaced.clone(),
-                description: t.description.clone(),
-                input_schema: t.input_schema.clone(),
-            })
+            .map(mcp_llm_tool)
             .collect();
         (!tools.is_empty()).then(|| Self { registry, worktree: worktree.to_path_buf(), tools, turnstiles })
     }
@@ -990,6 +986,13 @@ pub async fn discover_mcp_tools(
     .ok()
     .and_then(|r| r.ok())
     .unwrap_or_default()
+}
+
+/// One discovered MCP tool as the provider sees it. The director and every
+/// sub-agent build their MCP tool definitions through this, from a list in
+/// `mcp::sort_tools` order, so the same config always gives the same bytes.
+pub fn mcp_llm_tool(t: &crate::mcp::McpToolInfo) -> LlmTool {
+    LlmTool { name: t.namespaced.clone(), description: t.description.clone(), input_schema: t.input_schema.clone() }
 }
 
 /// The MCP servers a conversation switched off (the Companion's "can use"

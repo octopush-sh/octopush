@@ -2882,13 +2882,10 @@ impl ChatEngine {
             // Discovery may have started servers or seen one fail: the
             // Companion's chips re-read their status.
             let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
-            for t in discovered {
-                tools.push(LlmTool {
-                    name: t.namespaced,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                });
-            }
+            // In `mcp::sort_tools` order (server, then tool): the same config
+            // gives the same tool bytes on every turn, so the provider's
+            // prompt cache, which starts at the tool list, survives.
+            tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
         }
 
         let mut usage = TurnUsage::default();
@@ -3522,6 +3519,7 @@ impl ChatEngine {
                     .lock()
                     .chat_thread_exists(&request.thread_id)
                     .unwrap_or(true);
+                let mut row_id: Option<i64> = None;
                 if thread_alive {
                     match self.insert_and_emit_message(
                         &app,
@@ -3534,20 +3532,23 @@ impl ChatEngine {
                         // The saved run points at its row so a continuation
                         // can rewrite the report in place.
                         Ok(id) if is_agent => {
+                            row_id = Some(id);
                             if let Err(e) = self.db.lock().set_chat_agent_run_message(&u.id, id) {
                                 tracing::warn!(error = %e, "failed to link sub-agent run to its row");
                             }
                         }
-                        Ok(_) => {}
+                        Ok(id) => row_id = Some(id),
                         Err(e) => {
                             tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
                         }
                     }
                 }
 
+                // The row keeps the whole result; an MCP result is capped
+                // in the copy the next round carries.
                 tool_results.push(LlmToolResult {
                     tool_use_id: u.id.clone(),
-                    content: result,
+                    content: crate::chat_history::tool_result_for_model(&u.name, result, row_id),
                     is_error: false,
                 });
             }

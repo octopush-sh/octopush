@@ -243,6 +243,27 @@ fn strip_tool_calls_suffix(content: &str) -> &str {
     }
 }
 
+/// The gap-marker suffix that tells the model where a cut tool output's full
+/// text is: the tool row `id`, for `recall_tool_output`.
+pub fn recall_hint(id: i64) -> String {
+    format!(" — call recall_tool_output with message_id {id} for the full output")
+}
+
+/// The copy of a tool result the director's next request carries, within
+/// the turn that ran it. An MCP result is capped like a sub-agent's tool
+/// results (head + tail within `orchestrator::agentic::TOOL_RESULT_CAP_BYTES`):
+/// a server can return megabytes (a long issue list, a page dump), and the
+/// whole result would otherwise ride in every later round of the turn. The
+/// tool row keeps the full result, so the gap marker names it (`row_id`) for
+/// `recall_tool_output`. Built-in tools keep their own caps.
+pub fn tool_result_for_model(tool_name: &str, result: String, row_id: Option<i64>) -> String {
+    if !crate::mcp::is_mcp_tool(tool_name) {
+        return result;
+    }
+    let hint = row_id.map(recall_hint).unwrap_or_default();
+    excerpt_head_tail(&result, crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES, &hint)
+}
+
 /// Format one persisted `role="tool"` row for the model. `budget` is the
 /// result allowance from [`plan_tool_history`]; a truncated result names the
 /// row id so `recall_tool_output` can fetch the rest.
@@ -258,8 +279,7 @@ fn summarize_tool_row(id: i64, content: &str, budget: usize) -> Option<String> {
     } else {
         input_json
     };
-    let hint = format!(" — call recall_tool_output with message_id {id} for the full output");
-    let result_shown = excerpt_head_tail(result, budget, &hint);
+    let result_shown = excerpt_head_tail(result, budget, &recall_hint(id));
     Some(format!("[Tool #{id}: {name} | Input: {input_shown} | Result: {result_shown}]"))
 }
 
@@ -505,6 +525,27 @@ mod tests {
         // Funding is monotone: once a row is fresh, every newer row is too.
         let first_full = plan.iter().position(|&g| g == TOOL_RESULT_FRESH).unwrap();
         assert!(plan[first_full..].iter().all(|&g| g == TOOL_RESULT_FRESH));
+    }
+
+    #[test]
+    fn an_mcp_result_is_capped_with_a_recall_pointer_to_its_row() {
+        let cap = crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES;
+        let big = format!("HEAD{}TAIL", "x".repeat(200_000));
+        let out = tool_result_for_model("mcp__github__list_issues", big.clone(), Some(42));
+        assert!(out.len() <= cap + 200, "{}", out.len());
+        assert!(out.starts_with("HEAD") && out.ends_with("TAIL"), "head and tail survive");
+        assert!(out.contains("chars omitted — call recall_tool_output with message_id 42 for the full output]"));
+        // No row (the thread was deleted mid-turn): capped, without a pointer.
+        let orphan = tool_result_for_model("mcp__github__list_issues", big, None);
+        assert!(orphan.len() <= cap + 200);
+        assert!(!orphan.contains("recall_tool_output"));
+    }
+
+    #[test]
+    fn small_mcp_results_and_built_in_tools_pass_through() {
+        assert_eq!(tool_result_for_model("mcp__docs__search", "3 hits".into(), Some(1)), "3 hits");
+        let read = "y".repeat(90_000);
+        assert_eq!(tool_result_for_model("read_file", read.clone(), Some(1)), read, "built-ins keep their own caps");
     }
 
     #[test]
