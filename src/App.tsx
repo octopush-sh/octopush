@@ -127,7 +127,7 @@ import { useReviewSource } from "./stores/reviewSourceStore";
 import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
-import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
+import { ipc, type OpenInWorkspacePayload, type OpenRunPayload } from "./lib/ipc";
 import { noticeUnreadableSettings } from "./lib/settingsNotice";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
@@ -1874,6 +1874,30 @@ function App() {
     },
     [handleSelectWorkspace],
   );
+
+  // The menu bar Octo (#718): a crew chosen in its menu. Rust has shown the
+  // window; land on the crew's Direct surface as a Mission Control card does,
+  // switching project by the payload's path when the crew's isn't open (it
+  // works before the recent-projects list loads, like "Continue in the
+  // workspace"). Mode is keyed by workspace, so it survives the project load.
+  const openRunRef = useRef<(p: OpenRunPayload) => void>(() => {});
+  openRunRef.current = (p) => {
+    setSettingsTab(null);
+    setMissionControlOpen(false);
+    setModePerWorkspace((m) => ({ ...m, [p.workspaceId]: "direct" }));
+    if (p.projectId === project?.id) {
+      selectWorkspace(p.workspaceId);
+      return;
+    }
+    rememberActiveForProject(p.projectId, p.workspaceId);
+    void openProject(p.projectPath);
+  };
+  useEffect(() => {
+    const unlisten = ipc.onOpenRunFromMenuBar((p) => openRunRef.current(p));
+    return () => {
+      unlisten.then((u) => u());
+    };
+  }, []);
 
   // Mission Control attention items → the mission's Talk (chat) / Run (terminal)
   // surface. Focusing the matching workspace+mode clears the attention flag.

@@ -35,7 +35,7 @@ path = "src/bin/octopush-run-worker/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api", "devtools"] }
+tauri = { version = "2", features = ["macos-private-api", "devtools", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"

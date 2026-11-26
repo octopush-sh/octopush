@@ -5833,6 +5833,50 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// What every `paused` run waits on, for the menu bar Octo (#718): one row
+    /// per blocked stage (`awaiting_checkpoint` or `failed`), in stage order,
+    /// or a single row with no stage for a paused run with none blocked (the
+    /// director's own pause at a boundary). Only the few columns the menu
+    /// reads: never a stage's artifact, diff or journal. The stage's title is
+    /// the frontend's `stageTitle`: the author's custom name, else the role's
+    /// label.
+    pub fn list_parked_stages(&self) -> AppResult<Vec<ParkedStageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, w.name, s.status,
+                    COALESCE(NULLIF(TRIM(s.custom_name), ''), ro.label, s.role),
+                    s.started_at IS NOT NULL,
+                    TRIM(COALESCE(s.blocked_questions, '')) != '',
+                    s.secret_hold,
+                    instr(COALESCE(s.error, ''), ?1) > 0
+             FROM runs r
+             LEFT JOIN workspaces w ON w.id = r.workspace_id
+             LEFT JOIN run_stages s ON s.run_id = r.id AND s.status IN ('awaiting_checkpoint', 'failed')
+             LEFT JOIN roles ro ON ro.key = s.role
+             WHERE r.status = 'paused'
+             ORDER BY r.id, s.position",
+        )?;
+        let rows = stmt.query_map(params![crate::orchestrator::cli_runner::PLAN_LIMIT_MARKER], |r| {
+            let status: Option<String> = r.get(2)?;
+            let stage = match status {
+                Some(status) => Some(ParkedStage {
+                    status,
+                    title: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    started: r.get(4)?,
+                    asked: r.get(5)?,
+                    // An approved hold no longer holds the stage.
+                    secret_held: r
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|j| serde_json::from_str::<crate::secret_scan::SecretHold>(&j).ok())
+                        .is_some_and(|h| !h.acknowledged),
+                    plan_limited: r.get(7)?,
+                }),
+                None => None,
+            };
+            Ok(ParkedStageRow { run_id: r.get(0)?, workspace_name: r.get(1)?, stage })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Count Direct runs that were *started* (i.e. left `draft`) since the start
     /// of the current month — the unit the free-tier Direct-runs meter shows and
     /// the quota gate counts. Mirrors the month-window convention in
@@ -8923,6 +8967,33 @@ pub struct RunRow {
     pub detached: bool,
     /// Set while the run is parked by a Claude plan limit (#731).
     pub plan_wait: Option<PlanWait>,
+}
+
+/// One row of [`Db::list_parked_stages`]: a paused run and one of its blocked
+/// stages (`None` when none is blocked).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParkedStageRow {
+    pub run_id: String,
+    pub workspace_name: Option<String>,
+    pub stage: Option<ParkedStage>,
+}
+
+/// A blocked stage, as the menu bar Octo reads it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParkedStage {
+    /// `awaiting_checkpoint` or `failed`.
+    pub status: String,
+    /// The custom name, else the role's label.
+    pub title: String,
+    /// The stage ran (a gate or a question); `false` = parked before it began
+    /// (a budget park, the director's pause, a secret-guard hold).
+    pub started: bool,
+    /// It asked the director questions (`ask_director`).
+    pub asked: bool,
+    /// The secret guard holds it and the director hasn't approved.
+    pub secret_held: bool,
+    /// A Claude plan limit stopped it.
+    pub plan_limited: bool,
 }
 
 /// A run parked at a Claude plan limit. Epoch seconds.

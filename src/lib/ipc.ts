@@ -512,6 +512,15 @@ export interface OpenInWorkspacePayload {
   relativePath: string;
 }
 
+/** Payload of `octo://open-run`: a crew chosen in the menu bar Octo's menu
+ *  (#718). Rust has already shown the window. */
+export interface OpenRunPayload {
+  runId: string;
+  workspaceId: string;
+  projectId: string;
+  projectPath: string;
+}
+
 export type PullKind = "ok" | "diverged" | "conflict" | "error";
 export interface PullOutcome { kind: PullKind; output: string }
 
@@ -1216,6 +1225,9 @@ export const ipc = {
    *  Direct-session duplicates removed). */
   onSpendIngested: (handler: () => void) =>
     listen("octo://spend-ingested", () => handler()),
+  /** A crew was chosen in the menu bar Octo's menu: open its Direct surface. */
+  onOpenRunFromMenuBar: (handler: (target: OpenRunPayload) => void) =>
+    listen<OpenRunPayload>("octo://open-run", (ev) => handler(ev.payload)),
   /** Theme changes cross windows (the DOM `octo:theme` event does not). */
   broadcastTheme: (theme: ThemeConfig) => emit("octo://theme", theme),
   onThemeBroadcast: (handler: (theme: ThemeConfig) => void) =>

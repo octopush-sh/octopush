@@ -23,6 +23,7 @@ pub mod entitlement_token;
 pub mod error;
 mod file_open;
 mod fleet_status;
+mod menu_bar;
 pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
@@ -614,6 +615,8 @@ pub fn run() {
                 // the same guarded launch path as a user's Begin.
                 std::sync::Arc::clone(&orch).spawn_routine_scheduler();
                 app.manage(orch);
+                // The menu bar Octo (#718), before the first refresh fills it.
+                menu_bar::setup(app.handle());
                 // Runs still parked from the last session badge the Dock now.
                 fleet_status::refresh_later(app.handle());
             }

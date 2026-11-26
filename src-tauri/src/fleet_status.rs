@@ -1,7 +1,8 @@
-//! The fleet's needs-you count, derived in Rust so the Dock badge never depends
-//! on the webview (main may be hidden). Mirrors `needsYou` / `fleetCounts` in
-//! `src/lib/runStatus.ts`; `src/lib/needsYou.fixtures.json` pins the two, so
-//! the badge and the fleet chip can't disagree.
+//! The fleet's needs-you count, derived in Rust so the Dock badge and the menu
+//! bar Octo (`menu_bar.rs`) never depend on the webview (main may be hidden).
+//! Mirrors `needsYou` / `fleetCounts` in `src/lib/runStatus.ts`;
+//! `src/lib/needsYou.fixtures.json` pins the two, so the badge, the menu bar
+//! and the fleet chip can't disagree.
 
 use crate::state::AppState;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -87,16 +88,38 @@ pub fn refresh_later(app: &AppHandle) {
 }
 
 /// Set the Dock badge to the needs-you count across every workspace (the same
-/// runs the fleet chip counts), clearing it at 0.
+/// runs the fleet chip counts), clearing it at 0, and hand the same read to
+/// the menu bar Octo (`menu_bar::update`), so the two can't disagree.
 pub fn refresh(app: &AppHandle) {
-    let runs = match app.state::<AppState>().db.lock().list_active_runs() {
-        Ok(runs) => runs,
-        Err(e) => {
-            tracing::warn!(error = %e, "fleet status: listing active runs failed");
-            return;
-        }
+    let (runs, parked) = {
+        let state = app.state::<AppState>();
+        let db = state.db.lock();
+        let runs = match db.list_active_runs() {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!(error = %e, "fleet status: listing active runs failed");
+                return;
+            }
+        };
+        // What each crew waits on, only while the menu bar shows it.
+        let detail = crate::menu_bar::wants_detail() && runs.iter().any(|r| needs_you(&r.status, plan_waiting(r)));
+        let parked = if detail {
+            db.list_parked_stages().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "fleet status: listing parked stages failed");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+        (runs, parked)
     };
-    let badge = derive(runs.iter().map(|r| (r.status.as_str(), plan_waiting(r)))).badge();
+    let fleet = derive(runs.iter().map(|r| (r.status.as_str(), plan_waiting(r))));
+    set_badge(app, fleet.badge());
+    crate::menu_bar::update(app, fleet, &runs, &parked);
+}
+
+/// The Dock badge, set only when the count changed.
+fn set_badge(app: &AppHandle, badge: Option<i64>) {
     let count = badge.unwrap_or(0);
     if SHOWN.load(Ordering::Acquire) == count {
         return;

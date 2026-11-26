@@ -452,6 +452,58 @@ mod workspace_tests {
     }
 
     #[test]
+    fn list_parked_stages_says_what_each_paused_run_waits_on() {
+        // The menu bar Octo's read (#718): every paused run, with its blocked
+        // stages in order, and nothing for a run that isn't paused.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let a = db.create_run("ws1", &pipeline_id, "task a", None, None, &[]).unwrap();
+        let b = db.create_run("ws1", &pipeline_id, "task b", None, None, &[]).unwrap();
+        let c = db.create_run("ws1", &pipeline_id, "task c", None, None, &[]).unwrap();
+        db.set_run_status(&a, "paused", false).unwrap();
+        db.set_run_status(&b, "paused", false).unwrap();
+        db.set_run_status(&c, "running", false).unwrap();
+        let stages = db.list_run_stages(&a).unwrap();
+        assert!(stages.len() >= 2, "the pipeline has two stages to park");
+        let (first, second) = (&stages[0], &stages[1]);
+        db.conn_ref()
+            .execute(
+                "UPDATE run_stages SET status = 'awaiting_checkpoint', started_at = '2026-11-20T10:00:00Z',
+                     custom_name = '  ', blocked_questions = '[{\"q\":\"which?\"}]'
+                 WHERE id = ?1",
+                rusqlite::params![first.id],
+            )
+            .unwrap();
+        db.conn_ref()
+            .execute(
+                "UPDATE run_stages SET status = 'failed', custom_name = 'Night shift', error = ?2,
+                     secret_hold = '{\"acknowledged\":false,\"fingerprint\":\"f\",\"findings\":[]}'
+                 WHERE id = ?1",
+                rusqlite::params![second.id, format!("stopped\n{}", crate::orchestrator::cli_runner::PLAN_LIMIT_MARKER)],
+            )
+            .unwrap();
+
+        let rows = db.list_parked_stages().unwrap();
+        assert!(rows.iter().all(|r| r.run_id != c), "a running run isn't parked");
+        let of_a: Vec<_> = rows.iter().filter(|r| r.run_id == a).collect();
+        assert_eq!(of_a.len(), 2);
+        assert!(of_a.iter().all(|r| r.workspace_name.as_deref() == Some("ws")));
+        let gate = of_a[0].stage.as_ref().unwrap();
+        let label = db.get_role(&first.role).unwrap().map(|r| r.label).unwrap_or_else(|| first.role.clone());
+        assert_eq!(gate.status, "awaiting_checkpoint");
+        assert_eq!(gate.title, label, "a blank custom name falls back to the role's label");
+        assert!(gate.started && gate.asked && !gate.secret_held && !gate.plan_limited);
+        let halt = of_a[1].stage.as_ref().unwrap();
+        assert_eq!((halt.status.as_str(), halt.title.as_str()), ("failed", "Night shift"));
+        assert!(!halt.started && !halt.asked && halt.secret_held && halt.plan_limited);
+        let of_b: Vec<_> = rows.iter().filter(|r| r.run_id == b).collect();
+        assert_eq!(of_b.len(), 1);
+        assert_eq!(of_b[0].stage, None, "paused with nothing blocked");
+    }
+
+    #[test]
     fn list_runs_settled_since_returns_runs_finished_after_the_marker() {
         // "While you were away": only completed/aborted runs whose finish is
         // strictly after `since`. A run that finished exactly at the quit

@@ -93,6 +93,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub secret_guard_enabled: Option<bool>,
 
+    /// The menu bar Octo (#718, Settings › General › Attention › "Show in
+    /// menu bar"): `None` = the default, read as **on** by
+    /// `menu_bar::enabled`; an explicit `false` hides it.
+    #[serde(default)]
+    pub menu_bar_enabled: Option<bool>,
+
     /// Provider-agnostic model tiers — `fast`, `balanced`, `strong` → a
     /// configured model id. What a sub-agent definition's `model: haiku`
     /// (or an `Agent` call's `model: "fast"`) resolves to on THIS machine,
@@ -756,6 +762,17 @@ mod tests {
         assert_eq!(settings.claude_hooks_enabled, Some(true));
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""claudeHooksEnabled":true"#), "{json}");
+    }
+
+    #[test]
+    fn the_menu_bar_octo_is_on_unless_saved_off() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.menu_bar_enabled, None);
+        assert!(crate::menu_bar::enabled(&settings), "on for every older settings.json");
+        let settings: AppSettings = serde_json::from_str(r#"{"menuBarEnabled":false}"#).unwrap();
+        assert!(!crate::menu_bar::enabled(&settings));
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""menuBarEnabled":false"#), "{json}");
     }
 
     #[test]

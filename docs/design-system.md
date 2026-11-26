@@ -343,7 +343,9 @@ in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
 
 - **Colors:** body `--color-octo-brass`, back arms `--brass-line`, eyes
   `--octo-eye` (defaults to `--color-octo-bg`). Never recolor, add gradients,
-  outline, rotate, or drop the eyes.
+  outline, rotate, or drop the eyes. The one exception is the macOS menu bar,
+  which is system chrome: there The Octo is a monochrome **template** image
+  (shape in alpha only, inked by macOS for a light or dark bar), with no brass.
 - **Adaptive detail:** below 20px the back-arm row is dropped automatically.
 - **States** (`<OctoMark state=…>`): `static` (icon placements), `idle`
   (floats/paddles/blinks), `working` (double tempo + eye scan), `pushed`
@@ -353,7 +355,12 @@ in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
 - **Placements:** app icon (`src-tauri/icons/source.svg`), Welcome hero (idle),
   top-bar live mascot (`useMascotState`: blocked > working > idle), Project
   empty state (idle), run-ledger completion moment (pushed),
-  Settings/About/legacy-sidebar (static), dev favicon.
+  Settings/About/legacy-sidebar (static), dev favicon, and the **menu bar
+  status item** (#718, `src-tauri/icons/tray/`): still poses of the rig, never
+  animated — `idle` at rest, `working` with the eyes at the end of their scan
+  and the first and third arms up, `blocked` (needs you) with the eyes at
+  half-mast — rendered by `scripts/tray-icons.py`. Being still, it never
+  competes with the app's one beacon.
 - **Canvas behaviors:** the TALK empty-state **Watcher** (gaze-follow ±2.4u + fidget
   cycle look/scratch/peek after 15s idle — `chat/OctoWatcher.tsx`) and the pinned
   **Player** (`OctoPlayer.tsx` — the shared phase machine + figure): role classes
