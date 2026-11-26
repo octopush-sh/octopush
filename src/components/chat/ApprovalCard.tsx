@@ -19,6 +19,10 @@ const COPY = {
   secret: { eyebrow: "Possible secret", title: "⌘↵, Enter or Esc leaves it out", lead: ["Leave it out", "Leave it out (⌘↵, Enter or Esc with the card focused)"], other: ["Run regardless", "Run it as it is, once, for exactly these findings"] },
 } as const;
 
+/** What a command's path card can't promise (#1201), on its tooltip. */
+export const RUN_CHECK_LIMITS =
+  "Octopush reads the paths a command names. A shell can build a path it can't see, so this is a net, not a sandbox.";
+
 /**
  * Inline approval card for a command the agent wants to run. The turn is
  * paused until the user chooses: the card waits as long as it takes (no
@@ -33,7 +37,10 @@ const COPY = {
  * file tool reaching outside the workspace (`kind: "read" | "write"`) names
  * the path, never the file, and asks every time (no "don't ask again"); on a
  * likely credentials location (`sensitive`) its safe answer leads, as on
- * the secret card, keys included.
+ * the secret card, keys included. Since #1201 a command that names a path
+ * outside the workspace or in a credentials location (`kind: "run"`) asks
+ * the same way, showing the command, and its tooltip says the check is a
+ * net, not a sandbox.
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -45,7 +52,8 @@ const COPY = {
  */
 export function ApprovalCard({ approval, onRespond }: Props) {
   const secret = approval.secret === true;
-  const outside = approval.kind === "read" || approval.kind === "write";
+  const run = approval.kind === "run";
+  const outside = approval.kind === "read" || approval.kind === "write" || run;
   const sensitive = outside && approval.sensitive === true;
   const copy = COPY[secret ? "secret" : sensitive ? "sensitive" : outside ? "outside" : "command"];
   // Where the safe answer leads, it is the first button and Enter takes it.
@@ -64,7 +72,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       tabIndex={0}
       aria-label={`${copy.eyebrow}: ${approval.command}`}
       aria-keyshortcuts={safeLead ? "Meta+Enter Enter Escape" : "Meta+Enter Escape"}
-      title={copy.title}
+      title={run ? `${copy.title}. ${RUN_CHECK_LIMITS}` : copy.title}
       onKeyDown={onKeyDown}
       data-tour={secret ? tourId("talk-secret-approval") : tourId("talk-approval")}
       className="octo-rise-in my-2 rounded-md border border-[var(--rouge-border)] bg-[var(--rouge-ghost)] px-3 py-2.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
@@ -78,7 +86,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       </div>
       <pre className="mt-2 overflow-x-auto rounded bg-octo-onyx px-2.5 py-1.5 font-mono text-[12px] text-octo-ivory">
         {/* Only a shell command reads as one. */}
-        {approval.kind === undefined && <span className="text-octo-brass">$ </span>}
+        {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
         {approval.command}
       </pre>
       {secret && (
@@ -94,7 +102,9 @@ export function ApprovalCard({ approval, onRespond }: Props) {
           {sensitive ? "This may hold credentials. " : ""}
           {approval.kind === "read"
             ? "Allowing lets the agent read it once, and what it reads goes to your AI provider. "
-            : "Allowing lets the agent write it once. "}
+            : run
+              ? "Allowing runs it once, and its output goes to your AI provider. "
+              : "Allowing lets the agent write it once. "}
           Every access outside the workspace asks again.
         </p>
       )}
@@ -122,7 +132,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
           <button
             type="button"
             onClick={() => onRespond("always")}
-            title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret or a file outside the workspace still asks)"
+            title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)"
             className={`ml-auto font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
           >
             Approve &amp; don't ask again

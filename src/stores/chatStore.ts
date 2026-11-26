@@ -168,15 +168,17 @@ export interface PendingApproval {
   secret?: boolean;
   /** The command also stages, so the scan read uncommitted changes. */
   coversUncommitted?: boolean;
-  /** What the card asks about when it isn't a shell command (#1147): an MCP
-   *  tool call, or a file tool reading or writing outside the workspace
-   *  (`command` is then the path, and there is no "don't ask again"). */
+  /** What the card asks about when it isn't a destructive command (#1147):
+   *  an MCP tool call, a file tool reading or writing outside the workspace
+   *  (`command` is then the path, and there is no "don't ask again"), or a
+   *  command naming a path outside the workspace (`run`, #1201; no "don't
+   *  ask again" either). */
   kind?: ApprovalKind;
   /** The path is a well-known credentials location: the safe answer leads. */
   sensitive?: boolean;
 }
 
-export type ApprovalKind = "mcp" | "read" | "write";
+export type ApprovalKind = "mcp" | "read" | "write" | "run";
 
 /** The card fields a request carries beyond its command and reason. */
 function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean }) {

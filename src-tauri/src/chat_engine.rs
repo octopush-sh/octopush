@@ -510,30 +510,53 @@ fn not_found_note(output: &str) -> String {
 /// level. A command word is matched by its basename (`/bin/rm`), with quotes
 /// dropped.
 pub(crate) fn dangerous_command(command: &str) -> Option<&'static str> {
-    let mut budget = MAX_NESTED_COMMANDS;
-    dangerous_at(command, 0, &mut budget)
+    each_command(command, dangerous_line).unwrap_or(Some(TOO_NESTED))
 }
 
-/// How deep [`dangerous_command`] follows commands nested in commands.
+/// How deep [`each_command`] follows commands nested in commands.
 const MAX_COMMAND_NESTING: usize = 4;
 /// How many nested commands one check reads in all.
 const MAX_NESTED_COMMANDS: usize = 64;
 /// The reason when a command nests more than the check reads.
 const TOO_NESTED: &str = "nests more commands than the check reads (over 4 deep or 64 in all)";
 
-fn dangerous_at(command: &str, depth: usize, budget: &mut usize) -> Option<&'static str> {
+/// A command nests more than [`each_command`] reads.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TooNested;
+
+/// Run `check` on each command `command` runs, nested ones first
+/// ([`nested_commands`]) and then the line itself, until one returns `Some`.
+/// Past [`MAX_COMMAND_NESTING`] levels or [`MAX_NESTED_COMMANDS`] in all it
+/// stops with `TooNested`, so the work stays linear in the command's length
+/// per level. Shared by the command check and the path check (#1201).
+pub(crate) fn each_command<T>(command: &str, mut check: impl FnMut(&str) -> Option<T>) -> Result<Option<T>, TooNested> {
+    let mut budget = MAX_NESTED_COMMANDS;
+    each_command_at(command, 0, &mut budget, &mut check)
+}
+
+fn each_command_at<T, F: FnMut(&str) -> Option<T>>(
+    command: &str,
+    depth: usize,
+    budget: &mut usize,
+    check: &mut F,
+) -> Result<Option<T>, TooNested> {
     let inner = nested_commands(command);
     if !inner.is_empty() {
         if depth >= MAX_COMMAND_NESTING || inner.len() > *budget {
-            return Some(TOO_NESTED);
+            return Err(TooNested);
         }
         *budget -= inner.len();
         for c in &inner {
-            if let Some(reason) = dangerous_at(c, depth + 1, budget) {
-                return Some(reason);
+            if let Some(found) = each_command_at(c, depth + 1, budget, check)? {
+                return Ok(Some(found));
             }
         }
     }
+    Ok(check(command))
+}
+
+/// [`dangerous_command`] for one line, its nested commands aside.
+fn dangerous_line(command: &str) -> Option<&'static str> {
     // Normalize runs of whitespace so spacing tricks (`rm  -rf`) don't slip past.
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     let c = normalized.to_lowercase();
@@ -704,6 +727,82 @@ fn nested_commands(line: &str) -> Vec<String> {
     for cap in re.captures_iter(&outer) {
         if let Some(arg) = cap.get(1).or(cap.get(2)).or(cap.get(3)) {
             out.push(arg.as_str().replace("\\\"", "\""));
+        }
+    }
+    out
+}
+
+/// What a word of a command line is to the path check (#1201).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum WordRole {
+    /// A segment's program: what runs, not what it reads.
+    Program,
+    /// An argument, or the target of a redirection.
+    Argument,
+    /// A word of a here-document's body: what the command gets on its input.
+    Data,
+}
+
+/// The words of one command line as the path check reads them (#1201):
+/// segments split at `;`, `|`, `&`, parens and backticks, words at
+/// whitespace and at `<` and `>` (a redirection's target is an argument, its
+/// fd number no word). Each segment's first word past `NAME=value`
+/// assignments is its program. A word loses its quotes and backslashes (the
+/// shell joins `"$HOME"/.ssh` into one path), a `NAME=` or `--flag=` prefix
+/// and a leading `@` (`curl -d @file`). The lines of a here-document's body
+/// (`<<EOF` … `EOF`, `<<-`, a quoted delimiter) are `Data`. A heuristic, not
+/// a shell parser. Pure.
+pub(crate) fn command_words(line: &str) -> Vec<(WordRole, String)> {
+    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heredoc = HEREDOC.get_or_init(|| {
+        regex::Regex::new(r#"(?:^|[^<])<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z0-9_.-]+))"#).unwrap()
+    });
+    let mut out = Vec::new();
+    // Here-documents opened and not closed yet, oldest first: (delimiter, `<<-`).
+    let mut bodies: std::collections::VecDeque<(String, bool)> = Default::default();
+    for text in line.split('\n') {
+        if let Some((delimiter, dash)) = bodies.front() {
+            let end = if *dash { text.trim_start_matches('\t') } else { text };
+            if end == delimiter.as_str() {
+                bodies.pop_front();
+            } else {
+                out.extend(line_words(text).into_iter().map(|(_, w)| (WordRole::Data, w)));
+            }
+            continue;
+        }
+        for cap in heredoc.captures_iter(text) {
+            if let Some(d) = cap.get(2).or(cap.get(3)).or(cap.get(4)) {
+                bodies.push_back((d.as_str().to_string(), !cap[1].is_empty()));
+            }
+        }
+        out.extend(line_words(text));
+    }
+    out
+}
+
+/// [`command_words`] for one line of text outside a here-document.
+fn line_words(text: &str) -> Vec<(WordRole, String)> {
+    static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let prefix = PREFIX.get_or_init(|| regex::Regex::new(r"^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*=").unwrap());
+    let word = |w: &str| {
+        let w: String = w.chars().filter(|c| !matches!(c, '\'' | '"' | '\\')).collect();
+        let w = prefix.find(&w).map_or(w.as_str(), |m| &w[m.end()..]);
+        w.strip_prefix('@').unwrap_or(w).to_string()
+    };
+    let mut out = Vec::new();
+    for seg in text.split([';', '|', '&', '(', ')', '`']) {
+        let mut program = true;
+        for raw in seg.split_whitespace() {
+            let mut parts = raw.split(['<', '>']);
+            let head = parts.next().unwrap_or_default();
+            let fd = head.len() < raw.len() && head.bytes().all(|b| b.is_ascii_digit());
+            if !head.is_empty() && !fd {
+                let assigns = head.split_once('=').is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()));
+                let role = if program && !assigns { WordRole::Program } else { WordRole::Argument };
+                program &= assigns;
+                out.push((role, word(head)));
+            }
+            out.extend(parts.filter(|p| !p.is_empty()).map(|p| (WordRole::Argument, word(p))));
         }
     }
     out
@@ -4181,6 +4280,20 @@ impl ChatEngine {
                         None,
                     )
                     .await;
+                    // A path outside the workspace or in a credentials
+                    // location asks every time (#1201), read from where the
+                    // command runs: the shared shell's cwd when it runs there.
+                    if denied.is_none() {
+                        let shared = self.talk_shell.available() && sandbox_roots.is_none();
+                        let check = || {
+                            let cwd = shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
+                            reach.command_card(None, command, cwd.as_deref().map(Path::new))
+                        };
+                        if let Some(card) = check() {
+                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                            denied = guard_card(card, &check, ask).await;
+                        }
+                    }
                     if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         match self
                             .await_approval(
@@ -5497,10 +5610,13 @@ mod tests {
         let to = from + engine[from..].find("execute_tool(&workspace_path, &u.name").expect("the director runs the tool after it");
         let gate = &engine[from..to];
         assert!(gate.contains("talk_guard::director_card(") && gate.contains("guard_card(card, &check"), "{gate}");
+        // A command's paths are read before the command check (#1201).
+        let paths = gate.find("reach.command_card(").expect("the director reads a command's paths");
+        assert!(paths < gate.find("dangerous_command(command)").unwrap(), "{gate}");
         let agents = include_str!("chat_agents.rs");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "guard_card(card, &check"] {
+        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
             assert!(body.contains(call), "the sub-agent gate calls {call}");
         }
     }
@@ -5648,6 +5764,24 @@ mod tests {
         // Four levels are read; a span inside a span is the next level's.
         assert_eq!(dangerous_command("a $(b $(c $(d $(rm -rf x))))"), Some("recursive force delete (rm)"));
         assert_eq!(nested_commands("a $(b $(c)) `d` e"), vec!["b $(c)".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn command_words_mark_programs_arguments_and_heredoc_bodies() {
+        use WordRole::*;
+        let words = command_words;
+        let want = |v: &[(WordRole, &str)]| v.iter().map(|(r, w)| (*r, w.to_string())).collect::<Vec<_>>();
+        assert_eq!(
+            words("FOO=1 cat \"$HOME\"/a <in 2>/dev/null | wc -l"),
+            want(&[(Argument, "1"), (Program, "cat"), (Argument, "$HOME/a"), (Argument, "in"), (Argument, "/dev/null"), (Program, "wc"), (Argument, "-l")])
+        );
+        assert_eq!(words("echo $(id) `pwd`"), want(&[(Program, "echo"), (Argument, "$"), (Program, "id"), (Program, "pwd")]));
+        assert_eq!(
+            words("cat <<-'EOF' > f\n\tx /y\n\tEOF\nls"),
+            want(&[(Program, "cat"), (Argument, "-EOF"), (Argument, "f"), (Data, "x"), (Data, "/y"), (Program, "ls")])
+        );
+        assert_eq!(words("cat <<< ~/x"), want(&[(Program, "cat"), (Argument, "~/x")]), "a here-string is no here-document");
+        assert_eq!(words("curl -d @f --out=/o"), want(&[(Program, "curl"), (Argument, "-d"), (Argument, "f"), (Argument, "/o")]));
     }
 
     #[test]
