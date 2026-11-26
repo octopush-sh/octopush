@@ -1810,3 +1810,287 @@ mod cancellable {
         assert!(std::ptr::eq(client_for("https://api.anthropic.com", &remote), &remote));
     }
 }
+
+// ─── Streaming: SSE, the Anthropic stream, stream_with_retry ────────────────────
+// Fixture transcripts follow the documented Messages streaming format
+// (event types and fields); their ids and text are made up.
+
+mod streaming {
+    use super::super::anthropic;
+    use super::super::sse::{ByteSource, SseEvent, SseParser};
+    use super::super::{stream_with_retry, Completion, LlmProvider, LlmRequest, LlmResponse, StreamEvent};
+    use crate::error::{AppError, AppResult, ProviderErrorKind};
+    use bytes::Bytes;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A body in chunks; a `None` chunk goes silent for good.
+    struct Chunks(VecDeque<Option<Vec<u8>>>);
+
+    #[async_trait::async_trait]
+    impl ByteSource for Chunks {
+        async fn next_chunk(&mut self) -> AppResult<Option<Bytes>> {
+            match self.0.pop_front() {
+                Some(Some(bytes)) => Ok(Some(Bytes::from(bytes))),
+                Some(None) => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+                None => Ok(None),
+            }
+        }
+    }
+
+    fn chunks(text: &str, size: usize) -> Chunks {
+        Chunks(text.as_bytes().chunks(size).map(|c| Some(c.to_vec())).collect())
+    }
+
+    /// Events as the wire carries them: the event name is the data's `type`.
+    fn sse(events: &[Value]) -> String {
+        events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect()
+    }
+
+    fn start() -> Value {
+        json!({"type": "message_start", "message": {"id": "msg_fixture", "type": "message", "role": "assistant",
+            "model": "claude-test", "content": [], "stop_reason": null, "stop_sequence": null,
+            "usage": {"input_tokens": 120, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 900, "output_tokens": 1}}})
+    }
+    fn block_start(index: usize, block: Value) -> Value { json!({"type": "content_block_start", "index": index, "content_block": block}) }
+    fn delta(index: usize, delta: Value) -> Value { json!({"type": "content_block_delta", "index": index, "delta": delta}) }
+    fn block_stop(index: usize) -> Value { json!({"type": "content_block_stop", "index": index}) }
+
+    /// Thinking, text, then a tool call whose input arrives in pieces.
+    fn answer_events() -> Vec<Value> {
+        vec![
+            start(),
+            block_start(0, json!({"type": "thinking", "thinking": "", "signature": ""})),
+            delta(0, json!({"type": "thinking_delta", "thinking": "The config decides"})),
+            delta(0, json!({"type": "thinking_delta", "thinking": " the port."})),
+            delta(0, json!({"type": "signature_delta", "signature": "c2lnbmVkLWZpeHR1cmU="})),
+            block_stop(0),
+            block_start(1, json!({"type": "text", "text": ""})),
+            json!({"type": "ping"}),
+            delta(1, json!({"type": "text_delta", "text": "Reading the"})),
+            delta(1, json!({"type": "text_delta", "text": " config first."})),
+            block_stop(1),
+            json!({"type": "an_event_added_later"}),
+            block_start(2, json!({"type": "tool_use", "id": "toolu_fixture", "name": "read_file", "input": {}})),
+            delta(2, json!({"type": "input_json_delta", "partial_json": ""})),
+            delta(2, json!({"type": "input_json_delta", "partial_json": "{\"path\": \"src/con"})),
+            delta(2, json!({"type": "input_json_delta", "partial_json": "fig.toml\", \"limit\": 4"})),
+            delta(2, json!({"type": "input_json_delta", "partial_json": "0}"})),
+            block_stop(2),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 57}}),
+            json!({"type": "message_stop"}),
+        ]
+    }
+
+    /// What the sink sees for `answer_events` (thinking isn't streamed).
+    fn answer_stream() -> Vec<StreamEvent> {
+        let input = |partial: &str| StreamEvent::ToolInput { index: 2, partial: partial.into() };
+        vec![
+            StreamEvent::Text("Reading the".into()),
+            StreamEvent::Text(" config first.".into()),
+            StreamEvent::ToolStart { index: 2, id: "toolu_fixture".into(), name: "read_file".into() },
+            input("{\"path\": \"src/con"),
+            input("fig.toml\", \"limit\": 4"),
+            input("0}"),
+            StreamEvent::ToolEnd { index: 2 },
+        ]
+    }
+
+    /// The same answer as a non-streamed request returns it whole.
+    fn whole_answer() -> LlmResponse {
+        anthropic::parse_response(json!({
+            "id": "msg_fixture", "type": "message", "role": "assistant", "model": "claude-test",
+            "content": [
+                {"type": "thinking", "thinking": "The config decides the port.", "signature": "c2lnbmVkLWZpeHR1cmU="},
+                {"type": "text", "text": "Reading the config first."},
+                {"type": "tool_use", "id": "toolu_fixture", "name": "read_file", "input": {"path": "src/config.toml", "limit": 40}}
+            ],
+            "stop_reason": "tool_use", "stop_sequence": null,
+            "usage": {"input_tokens": 120, "cache_creation_input_tokens": 30, "cache_read_input_tokens": 900, "output_tokens": 57}
+        }))
+    }
+
+    fn assert_same(got: &LlmResponse, want: &LlmResponse) {
+        assert_eq!(got.text, want.text);
+        assert_eq!(serde_json::to_value(&got.tool_uses).unwrap(), serde_json::to_value(&want.tool_uses).unwrap());
+        assert_eq!(got.stop_reason, want.stop_reason);
+        assert_eq!(
+            (got.input_tokens, got.output_tokens, got.cache_read_tokens, got.cache_creation_tokens),
+            (want.input_tokens, want.output_tokens, want.cache_read_tokens, want.cache_creation_tokens),
+        );
+        assert_eq!(got.raw_content, want.raw_content);
+    }
+
+    async fn read(source: Chunks) -> (AppResult<LlmResponse>, Vec<StreamEvent>) {
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let out = anthropic::read_stream(source, Some(Duration::from_secs(5)), &mut sink).await;
+        (out, events)
+    }
+
+    #[test]
+    fn sse_parser_follows_the_format() {
+        // A BOM, a comment, CRLF and CR line ends, `data` with and without
+        // the space, an event with no data (not dispatched), and one left
+        // unfinished at the end (dropped).
+        let body = "\u{FEFF}: keep-alive\r\nevent: first\r\ndata: one\r\ndata:two\r\n\r\ndata\r\revent: no-data\n\ndata: never\n";
+        let mut parser = SseParser::default();
+        let mut events = Vec::new();
+        for byte in body.as_bytes() {
+            events.extend(parser.push(std::slice::from_ref(byte)));
+        }
+        let event = |event: &str, data: &str| SseEvent { event: event.into(), data: data.into() };
+        assert_eq!(events, vec![event("first", "one\ntwo"), event("", "")]);
+    }
+
+    #[tokio::test]
+    async fn anthropic_sse_text_tool_usage() {
+        let (out, events) = read(chunks(&sse(&answer_events()), 4096)).await;
+        let resp = out.unwrap();
+        assert_eq!(resp.text, "Reading the config first.");
+        assert_eq!(resp.tool_uses.len(), 1);
+        assert_eq!((resp.tool_uses[0].id.as_str(), resp.tool_uses[0].name.as_str()), ("toolu_fixture", "read_file"));
+        assert_eq!(resp.tool_uses[0].input, json!({"path": "src/config.toml", "limit": 40}));
+        assert_eq!(resp.stop_reason, super::LlmStopReason::ToolUse);
+        // Input and cache counts from `message_start`, the cumulative output from `message_delta`.
+        assert_eq!((resp.input_tokens, resp.output_tokens), (120, 57));
+        assert_eq!((resp.cache_read_tokens, resp.cache_creation_tokens), (900, 30));
+        assert_eq!(events, answer_stream());
+    }
+
+    #[tokio::test]
+    async fn partial_tool_json_assembles() {
+        // One byte at a time, with CRLF line ends: the pieces of the input
+        // split a key and a number, and only their whole parses.
+        let body = sse(&answer_events()).replace('\n', "\r\n");
+        let (out, events) = read(chunks(&body, 1)).await;
+        let resp = out.unwrap();
+        assert_eq!(resp.tool_uses[0].input, json!({"path": "src/config.toml", "limit": 40}));
+        let sent: String =
+            events.iter().filter_map(|e| if let StreamEvent::ToolInput { partial, .. } = e { Some(partial.as_str()) } else { None }).collect();
+        assert_eq!(sent, "{\"path\": \"src/config.toml\", \"limit\": 40}");
+
+        // Pieces that never add up to JSON fail the call; they never panic.
+        let mut broken = answer_events();
+        broken[16] = delta(2, json!({"type": "input_json_delta", "partial_json": "0"}));
+        let (out, _) = read(chunks(&sse(&broken), 4096)).await;
+        let err = out.err().expect("broken tool input is an error");
+        assert!(err.to_string().contains("isn't valid JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn stream_equals_complete_response() {
+        let (out, _) = read(chunks(&sse(&answer_events()), 37)).await;
+        assert_same(&out.unwrap(), &whole_answer());
+    }
+
+    /// Streams scripted bodies through the real Anthropic stream reader.
+    struct Scripted(Mutex<VecDeque<Chunks>>, AtomicU32);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Scripted {
+        async fn complete(&self, _b: &str, _k: Option<&str>, _r: &LlmRequest, _c: &reqwest::Client) -> AppResult<LlmResponse> {
+            unreachable!("only streamed here")
+        }
+
+        async fn stream(
+            &self,
+            _b: &str,
+            _k: Option<&str>,
+            _r: &LlmRequest,
+            _c: &reqwest::Client,
+            sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> AppResult<LlmResponse> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            let body = self.0.lock().unwrap().pop_front().expect("ran out of bodies");
+            anthropic::read_stream(body, Some(Duration::from_secs(5)), sink).await.map_err(|e| match e {
+                // No backoff wait in a test, as the retry tests above do.
+                AppError::Provider { kind, message, .. } => AppError::Provider { kind, retry_after: Some(0), message },
+                other => other,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_stream_overloaded_resets_and_retries() {
+        let overloaded = sse(&[
+            start(),
+            block_start(0, json!({"type": "text", "text": ""})),
+            delta(0, json!({"type": "text_delta", "text": "Half an ans"})),
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}),
+        ]);
+        let p = Scripted(Mutex::new([chunks(&overloaded, 4096), chunks(&sse(&answer_events()), 4096)].into()), AtomicU32::new(0));
+        let cancel = AtomicBool::new(false);
+        let mut retries = Vec::new();
+        let mut on_retry = |a: u32, d: u64, k: ProviderErrorKind| retries.push((a, d, k));
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let req = super::sample_request();
+        let client = reqwest::Client::new();
+        let out = stream_with_retry(&p, "https://api.test", Some("key"), &req, &client, &cancel, 5, &mut on_retry, &mut sink).await;
+        let resp = match out { Completion::Done(resp) => resp, other => panic!("expected an answer, got {other:?}") };
+        assert_same(&resp, &whole_answer());
+        assert_eq!(p.1.load(Ordering::SeqCst), 2);
+        assert_eq!(retries, vec![(1, 0, ProviderErrorKind::Overloaded)]);
+        // The half answer, dropped by `Reset`, then the whole one.
+        assert_eq!(events[..2], [StreamEvent::Text("Half an ans".into()), StreamEvent::Reset]);
+        assert_eq!(events[2..], answer_stream()[..]);
+    }
+
+    #[tokio::test]
+    async fn idle_gap_is_network_error() {
+        let silent = Chunks(vec![Some(sse(&[start()]).into_bytes()), None].into());
+        let mut sink = |_e: StreamEvent| {};
+        let started = Instant::now();
+        let err = anthropic::read_stream(silent, Some(Duration::from_millis(150)), &mut sink).await.err().expect("a silent stream fails");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert_eq!(err.transient_retry().map(|(k, _)| k), Some(ProviderErrorKind::Network), "{err}");
+        assert!(err.to_string().contains("the stream sent nothing for 150ms"), "{err}");
+
+        // A body that ends before `message_stop` was cut off: final, never sent again.
+        let cut = anthropic::read_stream(chunks(&sse(&answer_events()[..10]), 64), None, &mut sink).await.err().expect("a cut-off stream");
+        assert!(cut.transient_retry().is_none(), "{cut}");
+        assert!(cut.to_string().contains("the stream ended before the answer was complete"), "{cut}");
+    }
+
+    #[tokio::test]
+    async fn stop_abandons_a_stream_in_flight() {
+        let silent = Chunks(vec![Some(sse(&[start()]).into_bytes()), None].into());
+        let p = Scripted(Mutex::new([silent].into()), AtomicU32::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        tokio::spawn(async move { tokio::time::sleep(Duration::from_millis(150)).await; stop.store(true, Ordering::SeqCst) });
+        let (req, client) = (super::sample_request(), reqwest::Client::new());
+        let mut on_retry = |_a: u32, _d: u64, _k: ProviderErrorKind| {};
+        let mut sink = |_e: StreamEvent| {};
+        let started = Instant::now();
+        let out = stream_with_retry(&p, "https://api.test", None, &req, &client, &cancel, 5, &mut on_retry, &mut sink).await;
+        assert!(matches!(out, Completion::Cancelled), "{out:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    /// A provider with no streaming of its own: `complete`'s answer.
+    struct Whole;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Whole {
+        async fn complete(&self, _b: &str, _k: Option<&str>, _r: &LlmRequest, _c: &reqwest::Client) -> AppResult<LlmResponse> {
+            Ok(whole_answer())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_stream_answers_through_complete() {
+        let mut events = Vec::new();
+        let mut sink = |e: StreamEvent| events.push(e);
+        let resp = Whole.stream("https://api.test", None, &super::sample_request(), &reqwest::Client::new(), &mut sink).await.unwrap();
+        assert_same(&resp, &whole_answer());
+        assert_eq!(events, vec![StreamEvent::Text("Reading the config first.".into())]);
+    }
+}

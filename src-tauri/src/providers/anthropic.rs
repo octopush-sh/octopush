@@ -1,15 +1,21 @@
 //! Anthropic Messages API implementation of the LlmProvider trait.
 
+use super::sse::{ByteSource, SseReader};
 use super::{
     Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
-    LlmStopReason, LlmToolUse, RateLimitSnapshot,
+    LlmStopReason, LlmToolUse, RateLimitSnapshot, StreamEvent,
 };
 use crate::error::{AppError, AppResult, ProviderErrorKind};
 use async_trait::async_trait;
 use reqwest::header::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 pub struct AnthropicProvider;
+
+/// How a request error's message opens.
+const WHAT: &str = "Anthropic request failed";
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
@@ -20,47 +26,12 @@ impl LlmProvider for AnthropicProvider {
         req: &LlmRequest,
         client: &reqwest::Client,
     ) -> AppResult<LlmResponse> {
-        let key = api_key.ok_or_else(|| {
-            AppError::Other("Anthropic API key not configured.".into())
-        })?;
-
-        let body = build_request(req);
-        let url = messages_url(api_base);
-        // A model server on this Mac gets the loopback client (no read bound).
-        let client = super::client_for(api_base, client);
-
-        let resp = client
-            .post(&url)
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "output-128k-2025-02-19")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            // Only a connection that never opened is transient (the retry
-            // layer sends it again); a request that went out and wasn't
-            // answered is final (`request_error`).
-            .map_err(|e| super::request_error("Anthropic request failed", api_base, &e))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            // Read `retry-after` BEFORE the body consumes the response.
-            let retry_after = parse_retry_after(resp.headers());
-            let text = resp.text().await.unwrap_or_default();
-            return Err(AppError::Provider {
-                kind: ProviderErrorKind::from_http_status(status.as_u16()),
-                retry_after,
-                // Keep the historical message shape — the UI and journals
-                // already key off the embedded status + body text.
-                message: format!("Anthropic API error {status}: {text}"),
-            });
-        }
+        let resp = post_messages(api_base, api_key, &build_request(req), client).await?;
 
         // Snapshot the rate-limit headers before the body consumes `resp`.
         let rate_limit = parse_rate_limit(resp.headers());
         // Read the body first: a connection lost mid-answer is not a JSON error.
-        let bytes = resp.bytes().await.map_err(|e| super::body_error("Anthropic request failed", &e))?;
+        let bytes = resp.bytes().await.map_err(|e| super::body_error(WHAT, &e))?;
         let response: Value = serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Other(format!("JSON parse error: {e}")))?;
 
@@ -68,6 +39,234 @@ impl LlmProvider for AnthropicProvider {
         parsed.rate_limit = rate_limit;
         Ok(parsed)
     }
+
+    /// The same request with `stream: true`, read by `read_stream`.
+    async fn stream(
+        &self,
+        api_base: &str,
+        api_key: Option<&str>,
+        req: &LlmRequest,
+        client: &reqwest::Client,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> AppResult<LlmResponse> {
+        let mut body = build_request(req);
+        body["stream"] = Value::Bool(true);
+        let resp = post_messages(api_base, api_key, &body, client).await?;
+        let rate_limit = parse_rate_limit(resp.headers());
+        // A model server on this Mac may think for longer than any bound.
+        let idle = (!super::is_loopback_base(api_base)).then_some(super::STREAM_IDLE);
+        let mut parsed = read_stream(super::sse::Body(resp, WHAT), idle, sink).await?;
+        parsed.rate_limit = rate_limit;
+        Ok(parsed)
+    }
+}
+
+/// POST `body` to the Messages endpoint; a non-success status becomes the
+/// classified provider error. Shared by `complete` and `stream`.
+async fn post_messages(
+    api_base: &str,
+    api_key: Option<&str>,
+    body: &Value,
+    client: &reqwest::Client,
+) -> AppResult<reqwest::Response> {
+    let key = api_key.ok_or_else(|| {
+        AppError::Other("Anthropic API key not configured.".into())
+    })?;
+
+    let url = messages_url(api_base);
+    // A model server on this Mac gets the loopback client (no read bound).
+    let client = super::client_for(api_base, client);
+
+    let resp = client
+        .post(&url)
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "output-128k-2025-02-19")
+        .header("content-type", "application/json")
+        .json(body)
+        .send()
+        .await
+        // Only a connection that never opened is transient (the retry
+        // layer sends it again); a request that went out and wasn't
+        // answered is final (`request_error`).
+        .map_err(|e| super::request_error(WHAT, api_base, &e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        // Read `retry-after` BEFORE the body consumes the response.
+        let retry_after = parse_retry_after(resp.headers());
+        let text = resp.text().await.unwrap_or_default();
+        return Err(AppError::Provider {
+            kind: ProviderErrorKind::from_http_status(status.as_u16()),
+            retry_after,
+            // Keep the historical message shape — the UI and journals
+            // already key off the embedded status + body text.
+            message: format!("Anthropic API error {status}: {text}"),
+        });
+    }
+    Ok(resp)
+}
+
+/// Read a Messages stream to its end and assemble the answer. Apart from
+/// `stream` so fixture transcripts can drive it with no network.
+pub async fn read_stream<S: ByteSource>(
+    source: S,
+    idle: Option<Duration>,
+    sink: &mut (dyn FnMut(StreamEvent) + Send),
+) -> AppResult<LlmResponse> {
+    let mut reader = SseReader::new(source, idle, WHAT);
+    let mut message = StreamedMessage::default();
+    while let Some(event) = reader.next().await? {
+        if message.apply(&event.data, sink)? {
+            break;
+        }
+    }
+    message.finish()
+}
+
+/// A Messages stream folded back into the message a non-streamed request
+/// returns whole, so both end in `parse_response`. Per the streaming format:
+/// `message_start` holds the message with empty `content`; each block opens
+/// at its final `index`, grows by deltas and closes; `message_delta` sets
+/// `stop_reason` and cumulative `usage`; `message_stop` ends it. `ping` and
+/// unknown event types are skipped.
+#[derive(Default)]
+struct StreamedMessage {
+    message: Option<Value>,
+    blocks: BTreeMap<usize, Value>,
+    /// Each block's input JSON so far (a `tool_use` sends it in pieces).
+    input: BTreeMap<usize, String>,
+    /// Blocks announced to the sink as tool calls.
+    tools: BTreeSet<usize>,
+    complete: bool,
+}
+
+impl StreamedMessage {
+    /// Apply one event's `data`. `Ok(true)` once the message is complete.
+    fn apply(&mut self, data: &str, sink: &mut (dyn FnMut(StreamEvent) + Send)) -> AppResult<bool> {
+        let event: Value = serde_json::from_str(data)
+            .map_err(|e| AppError::Other(format!("Anthropic stream: unreadable event ({e}): {data}")))?;
+        let index = event.get("index").and_then(Value::as_u64).map(|i| i as usize);
+        match str_at(&event, "type") {
+            "message_start" => self.message = event.get("message").cloned(),
+            "content_block_start" => {
+                let (Some(i), Some(block)) = (index, event.get("content_block")) else { return Ok(false) };
+                if str_at(block, "type") == "tool_use" {
+                    self.tools.insert(i);
+                    sink(StreamEvent::ToolStart { index: i, id: str_at(block, "id").into(), name: str_at(block, "name").into() });
+                }
+                self.blocks.insert(i, block.clone());
+            }
+            "content_block_delta" => {
+                let (Some(i), Some(delta)) = (index, event.get("delta")) else { return Ok(false) };
+                let Some(block) = self.blocks.get_mut(&i).and_then(Value::as_object_mut) else { return Ok(false) };
+                match str_at(delta, "type") {
+                    "text_delta" => {
+                        let text = str_at(delta, "text");
+                        append(block, "text", text);
+                        if !text.is_empty() {
+                            sink(StreamEvent::Text(text.into()));
+                        }
+                    }
+                    "input_json_delta" => {
+                        let partial = str_at(delta, "partial_json");
+                        self.input.entry(i).or_default().push_str(partial);
+                        if self.tools.contains(&i) && !partial.is_empty() {
+                            sink(StreamEvent::ToolInput { index: i, partial: partial.into() });
+                        }
+                    }
+                    "thinking_delta" => append(block, "thinking", str_at(delta, "thinking")),
+                    "signature_delta" => append(block, "signature", str_at(delta, "signature")),
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let Some(i) = index else { return Ok(false) };
+                // Pieces that add up to nothing leave the block's own `{}`.
+                if let Some(json) = self.input.remove(&i).filter(|j| !j.trim().is_empty()) {
+                    let input: Value = serde_json::from_str(&json).map_err(|e| {
+                        AppError::Other(format!("Anthropic stream: a tool call's input isn't valid JSON ({e}): {json}"))
+                    })?;
+                    if let Some(block) = self.blocks.get_mut(&i).and_then(Value::as_object_mut) {
+                        block.insert("input".into(), input);
+                    }
+                }
+                if self.tools.contains(&i) {
+                    sink(StreamEvent::ToolEnd { index: i });
+                }
+            }
+            "message_delta" => {
+                let message = self.message.get_or_insert_with(|| json!({}));
+                if let Some(message) = message.as_object_mut() {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_object) {
+                        merge(message, delta);
+                    }
+                    if let Some(usage) = event.get("usage").and_then(Value::as_object) {
+                        let total = message.entry("usage").or_insert_with(|| json!({}));
+                        if let Some(total) = total.as_object_mut() {
+                            merge(total, usage);
+                        }
+                    }
+                }
+            }
+            "message_stop" => {
+                self.complete = true;
+                return Ok(true);
+            }
+            "error" => return Err(stream_error(&event, data)),
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// The assembled answer, parsed as `complete` parses a whole response.
+    fn finish(self) -> AppResult<LlmResponse> {
+        if !self.complete {
+            return Err(super::cut_off_error(WHAT));
+        }
+        let mut message = match self.message {
+            Some(Value::Object(message)) => message,
+            _ => Map::new(),
+        };
+        message.insert("content".into(), Value::Array(self.blocks.into_values().collect()));
+        Ok(parse_response(Value::Object(message)))
+    }
+}
+
+/// `value[key]` as a string, empty when absent.
+fn str_at<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Append `piece` to the string field `key` of a block.
+fn append(block: &mut Map<String, Value>, key: &str, piece: &str) {
+    match block.get_mut(key) {
+        Some(Value::String(text)) => text.push_str(piece),
+        _ => {
+            block.insert(key.into(), Value::String(piece.into()));
+        }
+    }
+}
+
+fn merge(into: &mut Map<String, Value>, from: &Map<String, Value>) {
+    for (key, value) in from {
+        into.insert(key.clone(), value.clone());
+    }
+}
+
+/// An `error` event in the stream, classified like the HTTP status its
+/// documented error type stands for (`overloaded_error` is a 529), so the
+/// retry layer treats it the same way.
+fn stream_error(event: &Value, data: &str) -> AppError {
+    let kind = match event.get("error").map(|e| str_at(e, "type")).unwrap_or("") {
+        "overloaded_error" => ProviderErrorKind::Overloaded,
+        "rate_limit_error" => ProviderErrorKind::RateLimit,
+        "api_error" => ProviderErrorKind::ServerError,
+        "authentication_error" | "permission_error" => ProviderErrorKind::Auth,
+        "invalid_request_error" | "not_found_error" | "request_too_large" => ProviderErrorKind::BadRequest,
+        _ => ProviderErrorKind::Other,
+    };
+    AppError::Provider { kind, retry_after: None, message: format!("Anthropic API error in the stream: {data}") }
 }
 
 /// Resolve the Messages endpoint from a configured base URL. Users paste bases
