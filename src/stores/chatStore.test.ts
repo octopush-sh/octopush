@@ -445,6 +445,60 @@ describe("chatStore — live tool cards (P2)", () => {
   });
 });
 
+describe("chatStore — the director's retry notice", () => {
+  beforeEach(() => {
+    resetStore();
+    useChatStore.setState({ turnNoticeByThread: {} });
+  });
+
+  const notice = (threadId: string, text: string, delaySecs: number) =>
+    emit("chat://notice", { workspaceId: "ws-1", threadId, text, delaySecs });
+
+  it("shows the notice for its thread until the wait is over", () => {
+    vi.useFakeTimers();
+    try {
+      notice("t1", "Model overloaded — retrying in 8s (attempt 1 of 5)", 8);
+      expect(useChatStore.getState().turnNoticeByThread.t1?.text).toBe(
+        "Model overloaded — retrying in 8s (attempt 1 of 5)",
+      );
+      expect(useChatStore.getState().turnNoticeByThread.t2).toBeUndefined();
+      vi.advanceTimersByTime(7_900);
+      expect(useChatStore.getState().turnNoticeByThread.t1).toBeDefined();
+      vi.advanceTimersByTime(200);
+      expect(useChatStore.getState().turnNoticeByThread.t1).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an older notice's timer never clears a newer one", () => {
+    vi.useFakeTimers();
+    try {
+      notice("t1", "Model overloaded — retrying in 2s (attempt 1 of 5)", 2);
+      notice("t1", "Model overloaded — retrying in 4s (attempt 2 of 5)", 4);
+      vi.advanceTimersByTime(2_500);
+      expect(useChatStore.getState().turnNoticeByThread.t1?.text).toContain("attempt 2 of 5");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the turn moving on (a row, a delta, a tool, the end) clears it", () => {
+    const moves: Array<[string, unknown]> = [
+      ["chat://message-added", makeMsg({ threadId: "t1", id: 9, role: "assistant", content: "done" })],
+      ["chat://stream", { workspaceId: "ws-1", threadId: "t1", delta: "", done: true, inputTokens: null, outputTokens: null }],
+      ["chat://tool-start", { workspaceId: "ws-1", threadId: "t1", callId: "c", toolName: "read_file", toolInput: {}, startedAt: "" }],
+    ];
+    for (const [event, payload] of moves) {
+      notice("t1", "Rate limit reached — retrying in 2s (attempt 1 of 5)", 2);
+      notice("t2", "Rate limit reached — retrying in 2s (attempt 1 of 5)", 2);
+      emit(event, payload);
+      expect(useChatStore.getState().turnNoticeByThread.t1, event).toBeUndefined();
+      expect(useChatStore.getState().turnNoticeByThread.t2, `${event} leaves other threads alone`).toBeDefined();
+    }
+  });
+});
+
 describe("chatStore — assistant_tool_use rendering", () => {
   beforeEach(() => resetStore());
 

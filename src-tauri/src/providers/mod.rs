@@ -299,6 +299,110 @@ pub async fn complete_with_retry(
     }
 }
 
+/// The journal/turn line for one retry wait: the same words wherever a
+/// provider call is retried (sub-agents, Direct stages, the Talk director).
+pub fn retry_notice(attempt: u32, delay_secs: u64, kind: ProviderErrorKind) -> String {
+    format!(
+        "{} — retrying in {delay_secs}s (attempt {attempt} of {DEFAULT_MAX_RETRIES})",
+        kind.label()
+    )
+}
+
+/// How often a request raced against a cancel flag looks at the flag: short
+/// enough that Stop reads as instant, long enough to cost nothing.
+const CANCEL_POLL_MS: u64 = 100;
+
+/// Resolve once `cancel` is raised. It polls because a turn's cancel is a
+/// plain `AtomicBool` shared with the tool loop, `run_command` and the
+/// sub-agents; a Stop is never more than [`CANCEL_POLL_MS`] late.
+pub async fn until_cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(CANCEL_POLL_MS)).await;
+    }
+}
+
+/// Run `fut` unless `cancel` is raised first. `None` means the cancel won:
+/// `fut` is dropped where it stands, which for a provider call closes the
+/// HTTP connection, so the request in flight is abandoned instead of waited
+/// out (a backoff sleep inside it ends too).
+pub async fn or_cancelled<F: std::future::Future>(fut: F, cancel: &AtomicBool) -> Option<F::Output> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    tokio::select! {
+        out = fut => Some(out),
+        _ = until_cancelled(cancel) => None,
+    }
+}
+
+/// How a cancellable, retried provider call ended.
+#[derive(Debug)]
+pub enum Completion {
+    Done(LlmResponse),
+    /// The cancel flag was raised during the request (abandoned), during a
+    /// backoff wait, or as the last attempt failed. A stop, not a failure.
+    Cancelled,
+    /// The call failed for good. `retries` is how many retries ran first:
+    /// the full bound for a transient error that never cleared, 0 for one no
+    /// retry can fix.
+    Failed { error: AppError, retries: u32 },
+}
+
+/// [`complete_with_retry`] raced against `cancel` with [`or_cancelled`]: the
+/// same backoff, `retry-after` handling and `on_retry` narration, plus a Stop
+/// that ends the request in flight instead of waiting for its answer.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_cancellable(
+    provider: &dyn LlmProvider,
+    api_base: &str,
+    api_key: Option<&str>,
+    req: &LlmRequest,
+    client: &reqwest::Client,
+    cancel: &AtomicBool,
+    max_retries: u32,
+    on_retry: &mut (dyn FnMut(u32, u64, ProviderErrorKind) + Send),
+) -> Completion {
+    let mut retries = 0u32;
+    let outcome = {
+        let mut counting = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+            retries = attempt;
+            on_retry(attempt, delay, kind);
+        };
+        or_cancelled(
+            complete_with_retry(provider, api_base, api_key, req, client, cancel, max_retries, &mut counting),
+            cancel,
+        )
+        .await
+    };
+    match outcome {
+        Some(Ok(resp)) => Completion::Done(resp),
+        // A stop that interrupts a backoff surfaces the last error: it is
+        // still the user's stop.
+        Some(Err(error)) if !cancel.load(Ordering::Relaxed) => Completion::Failed { error, retries },
+        _ => Completion::Cancelled,
+    }
+}
+
+/// What the user reads when a provider call failed for good after `retries`
+/// retries: what happened, that nothing is lost and how to go on, then the
+/// provider's own message. An error that wasn't retried keeps the provider's
+/// message as it is (an auth error still names the API key).
+pub fn final_failure_text(error: &AppError, retries: u32) -> String {
+    match error.transient_retry() {
+        Some((kind, _)) if retries > 0 => {
+            let label = kind.label();
+            let (first, rest) = label.split_at(1);
+            format!(
+                "{}{rest}, still failing after {retries} {}. The conversation is saved: send \
+                 your message again, or say \"continue\", to pick up where it left off. ({error})",
+                first.to_ascii_uppercase(),
+                if retries == 1 { "retry" } else { "retries" },
+            )
+        }
+        _ => error.to_string(),
+    }
+}
+
 /// Build an [`AppError::Provider`] for a `reqwest` send error, prefixed with
 /// `what`. Classified as [`network_error`] (transient: the retry layer rides
 /// it out) unless it is a TLS failure no retry can fix — a compromised-CA

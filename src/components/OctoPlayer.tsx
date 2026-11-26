@@ -4,7 +4,7 @@ import { useReducedMotion } from "../hooks/useReducedMotion";
 
 /** A role the pinned Player can act out (spec 2026-07-19 §4). */
 export type OctoRole = {
-  key: "wait" | "read" | "search" | "edit" | "run" | "write" | "think" | "work" | "delegate";
+  key: "wait" | "read" | "search" | "edit" | "run" | "write" | "think" | "work" | "delegate" | "retry";
   label: string;
   bodyClass: string;
 };
@@ -19,6 +19,9 @@ export const ROLES: Record<OctoRole["key"], OctoRole> = {
   think: { key: "think", label: "Thinking…", bodyClass: "octo-mascot--working" },
   work: { key: "work", label: "Working…", bodyClass: "octo-mascot--working" },
   delegate: { key: "delegate", label: "Delegating…", bodyClass: "octo-mascot--working" },
+  /* Waiting on the provider (a retry, a rate-limit pause): at rest, not
+     working and not waiting on you. The label is the notice itself. */
+  retry: { key: "retry", label: "Retrying…", bodyClass: "octo-mascot--idle" },
 };
 
 const TOOL_FAMILIES: Array<[RegExp, OctoRole["key"]]> = [

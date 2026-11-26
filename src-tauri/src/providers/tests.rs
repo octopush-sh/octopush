@@ -1472,3 +1472,234 @@ mod retry {
         assert_eq!(p.calls.load(Ordering::Relaxed), 1, "no retry after a cancel");
     }
 }
+
+// ─── complete_cancellable: the Talk director's call ─────────────────────────────
+
+mod cancellable {
+    use super::super::{
+        anthropic::AnthropicProvider, complete_cancellable, final_failure_text, retry_notice, Completion, LlmProvider,
+        LlmRequest, LlmResponse, LlmStopReason,
+    };
+    use crate::error::{AppError, AppResult, ProviderErrorKind};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// What one scripted call does.
+    enum Step {
+        Answer,
+        Fail(ProviderErrorKind, Option<u64>),
+        /// Never answers, like a request on a connection that died silently.
+        /// Sets the flag when its future is dropped (the request abandoned).
+        Hang(Arc<AtomicBool>),
+    }
+
+    struct FakeProvider {
+        steps: Mutex<VecDeque<Step>>,
+        calls: AtomicU32,
+    }
+
+    impl FakeProvider {
+        fn new(steps: Vec<Step>) -> Self {
+            Self { steps: Mutex::new(steps.into()), calls: AtomicU32::new(0) }
+        }
+    }
+
+    /// Raises its flag on drop: proof a hung request was abandoned, not left
+    /// running in the background.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn answer() -> LlmResponse {
+        LlmResponse {
+            text: "done".into(),
+            tool_uses: vec![],
+            stop_reason: LlmStopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            rate_limit: None,
+            raw_content: vec![],
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FakeProvider {
+        async fn complete(
+            &self,
+            _api_base: &str,
+            _api_key: Option<&str>,
+            _req: &LlmRequest,
+            _client: &reqwest::Client,
+        ) -> AppResult<LlmResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let step = self.steps.lock().unwrap().pop_front().expect("fake provider ran out of steps");
+            match step {
+                Step::Answer => Ok(answer()),
+                Step::Fail(kind, retry_after) => Err(AppError::Provider {
+                    kind,
+                    retry_after,
+                    message: format!("Anthropic API error {kind:?}"),
+                }),
+                Step::Hang(dropped) => {
+                    let _guard = DropFlag(dropped);
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            }
+        }
+    }
+
+    type Retries = Arc<Mutex<Vec<(u32, u64, ProviderErrorKind)>>>;
+
+    async fn call(
+        provider: &dyn LlmProvider,
+        client: &reqwest::Client,
+        api_base: &str,
+        cancel: &AtomicBool,
+        max_retries: u32,
+    ) -> (Completion, Retries) {
+        let seen: Retries = Arc::default();
+        let log = Arc::clone(&seen);
+        let mut on_retry = move |a: u32, d: u64, k: ProviderErrorKind| log.lock().unwrap().push((a, d, k));
+        let req = super::sample_request();
+        let out = complete_cancellable(provider, api_base, Some("key"), &req, client, cancel, max_retries, &mut on_retry).await;
+        (out, seen)
+    }
+
+    /// Raise `cancel` after `ms`, as the Stop button does from another task.
+    fn stop_after(cancel: &Arc<AtomicBool>, ms: u64) {
+        let cancel = Arc::clone(cancel);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            cancel.store(true, Ordering::SeqCst);
+        });
+    }
+
+    #[tokio::test]
+    async fn a_529_then_an_answer_is_retried_with_a_notice() {
+        let p = FakeProvider::new(vec![Step::Fail(ProviderErrorKind::Overloaded, Some(0)), Step::Answer]);
+        let cancel = AtomicBool::new(false);
+        let (out, retries) = call(&p, &reqwest::Client::new(), "http://x", &cancel, 5).await;
+        assert!(matches!(out, Completion::Done(ref r) if r.text == "done"), "{out:?}");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*retries.lock().unwrap(), vec![(1, 0, ProviderErrorKind::Overloaded)]);
+        // The words the turn shows are the sub-agents' journal words.
+        assert_eq!(retry_notice(1, 8, ProviderErrorKind::Overloaded), "model overloaded — retrying in 8s (attempt 1 of 5)");
+    }
+
+    #[tokio::test]
+    async fn stop_abandons_a_request_in_flight() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let p = FakeProvider::new(vec![Step::Hang(Arc::clone(&dropped))]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        stop_after(&cancel, 150);
+        let started = Instant::now();
+        let (out, _) = tokio::time::timeout(Duration::from_secs(5), call(&p, &reqwest::Client::new(), "http://x", &cancel, 5))
+            .await
+            .expect("Stop must end a hung request");
+        assert!(matches!(out, Completion::Cancelled), "{out:?}");
+        assert!(started.elapsed() < Duration::from_millis(1000), "Stop took {:?}", started.elapsed());
+        assert!(dropped.load(Ordering::SeqCst), "the request future was dropped, not left running");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_during_a_backoff_is_a_stop_not_a_failure() {
+        let p = FakeProvider::new(vec![Step::Fail(ProviderErrorKind::RateLimit, Some(30))]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        stop_after(&cancel, 150);
+        let started = Instant::now();
+        let (out, retries) = call(&p, &reqwest::Client::new(), "http://x", &cancel, 5).await;
+        assert!(matches!(out, Completion::Cancelled), "{out:?}");
+        assert!(started.elapsed() < Duration::from_secs(2), "the 30s wait was cut short");
+        assert_eq!(retries.lock().unwrap().len(), 1, "the wait was announced");
+        assert_eq!(p.calls.load(Ordering::SeqCst), 1, "no attempt after the stop");
+    }
+
+    #[tokio::test]
+    async fn exhausted_retries_fail_with_a_clear_message() {
+        let p = FakeProvider::new(vec![
+            Step::Fail(ProviderErrorKind::Overloaded, Some(0)),
+            Step::Fail(ProviderErrorKind::Overloaded, Some(0)),
+            Step::Fail(ProviderErrorKind::Overloaded, Some(0)),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let (out, _) = call(&p, &reqwest::Client::new(), "http://x", &cancel, 2).await;
+        let (error, retries) = match out {
+            Completion::Failed { error, retries } => (error, retries),
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert_eq!(retries, 2);
+        let text = final_failure_text(&error, retries);
+        assert!(text.starts_with("Model overloaded, still failing after 2 retries."), "{text}");
+        assert!(text.contains("The conversation is saved"), "{text}");
+        assert!(text.ends_with("(Anthropic API error Overloaded)"), "the provider's own words stay: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_non_transient_error_fails_at_once_with_its_own_text() {
+        let p = FakeProvider::new(vec![Step::Fail(ProviderErrorKind::Auth, None)]);
+        let cancel = AtomicBool::new(false);
+        let (out, retries) = call(&p, &reqwest::Client::new(), "http://x", &cancel, 5).await;
+        let (error, n) = match out {
+            Completion::Failed { error, retries } => (error, retries),
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert_eq!(n, 0);
+        assert!(retries.lock().unwrap().is_empty());
+        assert_eq!(final_failure_text(&error, n), error.to_string());
+    }
+
+    /// A server that accepts connections and reads the request, then never
+    /// answers: a proxy holding a dead upstream, or a peer gone silent.
+    async fn silent_server() -> String {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    while sock.read(&mut buf).await.map(|n| n > 0).unwrap_or(false) {}
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_times_out_as_a_retryable_network_error() {
+        let base = silent_server().await;
+        // The production guards with a short idle bound (the real one is
+        // `LLM_READ_TIMEOUT`, sized for long answers).
+        let client = crate::tls::with_stall_guards(reqwest::Client::builder().no_proxy(), Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            AnthropicProvider.complete(&base, Some("key"), &super::sample_request(), &client),
+        )
+        .await
+        .expect("the idle bound must end the request");
+        let err = res.expect_err("no answer means an error");
+        assert_eq!(err.transient_retry().map(|(k, _)| k), Some(ProviderErrorKind::Network), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+
+        // Through the director's call it is retried like any dropped
+        // connection, then reported clearly.
+        let cancel = AtomicBool::new(false);
+        let (out, _) = call(&AnthropicProvider, &client, &base, &cancel, 0).await;
+        assert!(
+            matches!(out, Completion::Failed { ref error, retries: 0 } if error.transient_retry().is_some()),
+            "{out:?}"
+        );
+    }
+}
