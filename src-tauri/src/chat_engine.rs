@@ -91,6 +91,10 @@ pub(crate) fn director_system_prompt(
     if let Some(doctrine) = doctrine {
         prompt.push_str(doctrine);
     }
+    // Last of the static part (#1147): after the project's instructions,
+    // which are the repository's text, so none of it comes after the note
+    // except a skill the user invokes for one turn.
+    prompt.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
     prompt
 }
 
@@ -2733,6 +2737,18 @@ impl ChatEngine {
     /// Execute `recall_tool_output`: the full stored result of an earlier
     /// tool row in THIS thread, optionally windowed. Returns `(text, ok)` like
     /// every other tool.
+    /// The tool whose stored output `recall_tool_output` returns for
+    /// `input`, so the recalled copy keeps that tool's mark (#1147). `None`
+    /// for a context block (the user's own `@` text) or a missing row.
+    fn recalled_tool(&self, thread_id: &str, input: &serde_json::Value) -> Option<String> {
+        if input.get("block").is_some() {
+            return None;
+        }
+        let id = input.get("message_id")?.as_i64()?;
+        let stored = self.db.lock().get_chat_tool_output(thread_id, id).ok().flatten()?;
+        crate::chat_history::row_tool_name(&stored)
+    }
+
     fn recall_tool_output(&self, thread_id: &str, input: &serde_json::Value) -> (String, bool) {
         let Some(message_id) = input.get("message_id").and_then(|v| v.as_i64()) else {
             return ("recall_tool_output needs an integer `message_id`".to_string(), false);
@@ -4463,10 +4479,18 @@ impl ChatEngine {
                     tool_rows.insert(u.id.clone(), id);
                 }
                 // The row keeps the whole result; an MCP result is capped
-                // in the copy the next round carries.
+                // in the copy the next round carries. What a tool returned
+                // is marked untrusted; a denial or refusal is ours (#1147).
+                // A recalled output keeps its own tool's mark (`mcp:<server>`).
+                let content = crate::chat_history::tool_result_for_model(&u.name, result, row_id);
+                let source = if u.name == RECALL_TOOL_NAME {
+                    self.recalled_tool(&request.thread_id, &u.input).unwrap_or_else(|| u.name.clone())
+                } else {
+                    u.name.clone()
+                };
                 tool_results.push(LlmToolResult {
                     tool_use_id: u.id.clone(),
-                    content: crate::chat_history::tool_result_for_model(&u.name, result, row_id),
+                    content: if was_denied { content } else { crate::chat_history::mark_untrusted(&source, &content) },
                     is_error: false,
                 });
             }
@@ -4860,6 +4884,12 @@ mod continuation_tests {
         assert!(!ok && missing.contains("No context block 2"), "{missing}");
         // Another thread can't reach it.
         assert!(!recall("another-thread", serde_json::json!({"message_id": ask, "block": 1})).1);
+        // A recalled tool output keeps its own tool's mark; a block has none.
+        let row = serde_json::json!({"callId": "c", "toolName": "mcp__github__get_issue", "toolInput": {}, "result": "x"}).to_string();
+        let tool = db.lock().insert_chat_message("ws", &thread, "tool", &row, None, None, None, None).unwrap();
+        let from = engine.recalled_tool(&thread, &serde_json::json!({"message_id": tool})).expect("the recalled row's tool");
+        assert_eq!(crate::chat_history::untrusted_header(&from), "[untrusted output from mcp:github]");
+        assert_eq!(engine.recalled_tool(&thread, &serde_json::json!({"message_id": ask, "block": 1})), None);
     }
 }
 
