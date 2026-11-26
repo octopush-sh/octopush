@@ -20,8 +20,8 @@ interface Props {
   onExportChat?: (id: string) => void;
   /** Pin/unpin a conversation to the top of the list. */
   onPinChat?: (id: string, pinned: boolean) => void;
-  /** The thread (if any) with an in-flight turn — shows a live pulse dot. */
-  streamingChatId?: string | null;
+  /** The threads with an in-flight turn — each shows a live pulse dot. */
+  streamingChatIds?: string[];
 }
 
 export function CompanionHistory({
@@ -33,7 +33,7 @@ export function CompanionHistory({
   onRenameChat,
   onExportChat,
   onPinChat,
-  streamingChatId,
+  streamingChatIds,
 }: Props) {
   // Roving keyboard nav: ↑/↓ move focus between row buttons (M11).
   const listRef = useRef<HTMLUListElement>(null);
@@ -129,7 +129,7 @@ export function CompanionHistory({
           const active = c.id === activeChatId;
           const editing = c.id === editingId;
           const confirming = c.id === confirmingId;
-          const live = !!streamingChatId && c.id === streamingChatId;
+          const live = !!streamingChatIds?.includes(c.id);
           return (
             <li key={c.id}>
               {/* Only the open chat is boxed (panel-2 + brass-dim border);

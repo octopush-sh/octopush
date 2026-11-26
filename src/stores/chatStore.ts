@@ -348,10 +348,39 @@ function isActiveThread(
   return !active || !threadId || threadId === active;
 }
 
+const EMPTY_THREAD_IDS: string[] = [];
+
+function withThread(threads: string[] | undefined, threadId: string): string[] {
+  const list = threads ?? EMPTY_THREAD_IDS;
+  return list.includes(threadId) ? list : [...list, threadId];
+}
+
+function withoutThread(threads: string[] | undefined, threadId: string): string[] {
+  return (threads ?? EMPTY_THREAD_IDS).filter((t) => t !== threadId);
+}
+
+/** The streaming slice after a workspace's running threads, or the thread it
+ *  shows, change: the list, and `streamingByWs` read from it (whether the
+ *  shown thread runs; with none shown yet, whether any does, as
+ *  `isActiveThread` lets every event through then). */
+function streamingPatch(
+  s: Pick<ChatState, "streamingThreadsByWs" | "streamingByWs" | "activeThreadByWs">,
+  wsId: string,
+  threads: string[] = s.streamingThreadsByWs[wsId] ?? EMPTY_THREAD_IDS,
+  shown: string | undefined = s.activeThreadByWs[wsId],
+): Pick<ChatState, "streamingThreadsByWs" | "streamingByWs"> {
+  return {
+    streamingThreadsByWs: { ...s.streamingThreadsByWs, [wsId]: threads },
+    streamingByWs: { ...s.streamingByWs, [wsId]: shown ? threads.includes(shown) : threads.length > 0 },
+  };
+}
+
 interface ChatState {
   /** Messages keyed by workspaceId. Each workspace has its own conversation. */
   messagesByWs: Record<string, ChatMessage[]>;
-  /** Streaming flag per workspace. `true` only while THAT workspace's agentic loop runs. */
+  /** Streaming flag per workspace: whether the thread it shows has a turn
+   *  running. Read from `streamingThreadsByWs` on every change of that list
+   *  or of the shown thread (`streamingPatch`), never set on its own. */
   streamingByWs: Record<string, boolean>;
   /** The highest message id on screen when the running turn started, per
    *  workspace. The turn's own rows (its user row, narration, tool calls)
@@ -375,10 +404,11 @@ interface ChatState {
   /** The thread currently shown per workspace. The `…ByWs` chat state above
    *  always reflects THIS thread; switching threads reloads it. */
   activeThreadByWs: Record<string, string>;
-  /** Which thread (if any) currently has an in-flight turn per workspace, even
-   *  if it's not the one being shown — lets the streaming indicator be restored
-   *  when switching back to a still-running thread. */
-  streamingThreadByWs: Record<string, string | null>;
+  /** The threads with an in-flight turn per workspace, shown or not: each
+   *  conversation runs its own turn, with its own Stop, so switching back to
+   *  a still-running thread shows it running. A reload re-reads it from the
+   *  backend (`list_running_threads`). */
+  streamingThreadsByWs: Record<string, string[]>;
   /** The worktree's skill names per workspace (loaded by the composer), so
    *  `/name` tokens in a draft and in sent messages read as skills. */
   skillNamesByWs: Record<string, string[]>;
@@ -699,6 +729,57 @@ export const useChatStore = create<ChatState>((set, get) => {
   // (rapid workspace switches / mount races). Mirrors the terminal-init guard.
   const loadingHistory = new Set<string>();
 
+  // One load sequence per workspace, shared by loadHistory and selectThread:
+  // only the newest load may fill the view, and only while its thread is
+  // still shown. A slow earlier load can't put another thread's rows under
+  // this one (whose Edit or Regenerate would then truncate by a foreign id).
+  const loadSeq: Record<string, number> = {};
+  const beginLoad = (workspaceId: string) => {
+    const seq = (loadSeq[workspaceId] ?? 0) + 1;
+    loadSeq[workspaceId] = seq;
+    const before = new Set((get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES).map((m) => m.id));
+    return { seq, before };
+  };
+  const applyLoad = (
+    workspaceId: string,
+    threadId: string,
+    load: { seq: number; before: Set<number> },
+    rows: ChatMessage[],
+  ) =>
+    set((s) => {
+      if (loadSeq[workspaceId] !== load.seq || s.activeThreadByWs[workspaceId] !== threadId) return {};
+      // Rows that arrived by event while the read was in flight are kept.
+      const loaded = new Set(rows.map((m) => m.id));
+      const arrived = (s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES).filter(
+        (m) => !load.before.has(m.id) && !loaded.has(m.id),
+      );
+      const messages = arrived.length ? [...rows, ...arrived].sort((a, b) => a.id - b.id) : rows;
+      return { messagesByWs: { ...s.messagesByWs, [workspaceId]: messages } };
+    });
+
+  // When each thread's turn last ended (`done`), on a counter, so a
+  // running-threads answer read before that end can't mark it running again.
+  let endEpoch = 0;
+  const endedAt = new Map<string, number>();
+  // A reloaded view learns which threads still run a turn from the backend.
+  // Added to what this view already knows: every turn ends with a `done`.
+  const rehydrateRunning = async (workspaceId: string) => {
+    if (typeof ipc.listRunningThreads !== "function") return;
+    const asked = endEpoch;
+    let running: string[];
+    try {
+      running = await ipc.listRunningThreads(workspaceId);
+    } catch {
+      return;
+    }
+    const live = running.filter((t) => (endedAt.get(t) ?? 0) <= asked);
+    set((s) => {
+      const known = s.streamingThreadsByWs[workspaceId] ?? EMPTY_THREAD_IDS;
+      const added = live.filter((t) => !known.includes(t));
+      return added.length ? streamingPatch(s, workspaceId, [...known, ...added]) : {};
+    });
+  };
+
   // The turn moved on (a row, a delta, a tool start, the end): a retry or
   // pause notice for that thread is over. `seq` limits it to one notice.
   const dropNotice = (threadId: string | undefined, seq?: number) => {
@@ -824,17 +905,16 @@ export const useChatStore = create<ChatState>((set, get) => {
     const active = isActiveThread(get().activeThreadByWs, wsId, payload.threadId);
 
     if (payload.done) {
-      // The done event clears the streaming-thread tracker and fires the
-      // attention ping even for a BACKGROUND thread (so its flag never sticks
-      // and its completion is still announced). View state only clears for the
+      // The done event takes its thread off the workspace's running list and
+      // fires the attention ping even for a BACKGROUND thread (so its flag
+      // never sticks and its completion is still announced); the workspace's
+      // other running threads stay running. View state only clears for the
       // thread currently on screen.
+      if (payload.threadId) endedAt.set(payload.threadId, ++endEpoch);
       set((s) => {
-        const clearsTracker =
-          payload.threadId == null || s.streamingThreadByWs[wsId] === payload.threadId;
-        const streamingThreadByWs = clearsTracker
-          ? { ...s.streamingThreadByWs, [wsId]: null }
-          : s.streamingThreadByWs;
-        if (!active) return { streamingThreadByWs };
+        const left = payload.threadId == null ? EMPTY_THREAD_IDS : withoutThread(s.streamingThreadsByWs[wsId], payload.threadId);
+        const streaming = streamingPatch(s, wsId, left);
+        if (!active) return streaming;
         // Clear any stragglers (e.g. a tool whose result errored before its
         // resolved row landed) so no spinner outlives the turn — BUT keep the
         // live card of a `$`-direct process that's still running in this
@@ -849,13 +929,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           liveCallIds.has(t.callId),
         );
         return {
-          streamingByWs: { ...s.streamingByWs, [wsId]: false },
+          ...streaming,
           streamBufferByWs: { ...s.streamBufferByWs, [wsId]: "" },
           liveToolsByWs: {
             ...s.liveToolsByWs,
             [wsId]: kept.length ? kept : EMPTY_LIVE_TOOLS,
           },
-          streamingThreadByWs,
         };
       });
       // Only ring the chime / pulse the rail if the user isn't already
@@ -1163,7 +1242,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     liveToolsByWs: {},
     threadsByWs: {},
     activeThreadByWs: {},
-    streamingThreadByWs: {},
+    streamingThreadsByWs: {},
     skillNamesByWs: {},
     attachmentsByWs: {},
     draftInsertByWs: {},
@@ -1243,11 +1322,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           threadsByWs: { ...s.threadsByWs, [workspaceId]: threads },
           activeThreadByWs: { ...s.activeThreadByWs, [workspaceId]: activeId },
+          ...streamingPatch(s, workspaceId, undefined, activeId),
         }));
+        void rehydrateRunning(workspaceId);
+        const load = beginLoad(workspaceId);
         const messages = await ipc.listChatMessages(activeId);
-        set((s) => ({
-          messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
-        }));
+        applyLoad(workspaceId, activeId, load, messages as ChatMessage[]);
         void rehydrateCaps(workspaceId, activeId);
         void rehydrateApprovals(workspaceId, activeId);
       } finally {
@@ -1314,15 +1394,17 @@ export const useChatStore = create<ChatState>((set, get) => {
     // Core turn dispatch shared by send / regenerate. Sets the streaming flags,
     // fires the IPC, and on failure restores the flags + any staged attachments.
     runTurn: async (workspaceId, workspacePath, threadId, opts) => {
+      // A thread already running (the backend refuses the send) keeps its
+      // place when this dispatch fails.
+      const wasRunning = (get().streamingThreadsByWs[workspaceId] ?? EMPTY_THREAD_IDS).includes(threadId);
       set((s) => ({
-        streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
+        ...streamingPatch(s, workspaceId, withThread(s.streamingThreadsByWs[workspaceId], threadId)),
         // Read after regenerate/editAndResend truncated the view, so the rows
         // they cut can't count as the previous turn's.
         streamSinceByWs: {
           ...s.streamSinceByWs,
           [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
         },
-        streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
@@ -1354,8 +1436,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // affordance as the client gate.
         const errText = isBudgetExceeded(e) ? BUDGET_CAP_MSG : String(e);
         set((s) => ({
-          streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
-          streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
+          ...(wasRunning ? {} : streamingPatch(s, workspaceId, withoutThread(s.streamingThreadsByWs[workspaceId], threadId))),
           streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
           // Restore the staged attachments so a failed turn doesn't lose them.
           attachmentsByWs: attachments.length
@@ -1490,13 +1571,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       // (live:true) and this clears — re-enabling the composer ON PURPOSE so the
       // user can keep working; the pinned LiveProcessPanel + the still-running
       // `RUN` card are the "process running" indicators while it streams.
+      const wasRunning = (get().streamingThreadsByWs[workspaceId] ?? EMPTY_THREAD_IDS).includes(threadId);
       set((s) => ({
-        streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
+        ...streamingPatch(s, workspaceId, withThread(s.streamingThreadsByWs[workspaceId], threadId)),
         streamSinceByWs: {
           ...s.streamSinceByWs,
           [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
         },
-        streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
         stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
@@ -1533,16 +1614,11 @@ export const useChatStore = create<ChatState>((set, get) => {
           set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
         }
       } finally {
-        // Only clear if THIS run still owns the streaming slot — a normal LLM
-        // turn that started on the same workspace meanwhile must not be clobbered.
-        set((s) =>
-          s.streamingThreadByWs[workspaceId] === threadId
-            ? {
-                streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
-                streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: null },
-              }
-            : {},
-        );
+        // Only this command's own mark: a turn the thread was already running
+        // (the backend refuses the command then) and other threads' turns stay.
+        if (!wasRunning) {
+          set((s) => streamingPatch(s, workspaceId, withoutThread(s.streamingThreadsByWs[workspaceId], threadId)));
+        }
       }
     },
 
@@ -1759,21 +1835,18 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         activeThreadByWs: { ...s.activeThreadByWs, [workspaceId]: threadId },
         crewFocusByWs: { ...s.crewFocusByWs, [workspaceId]: null },
-        streamingByWs: {
-          ...s.streamingByWs,
-          [workspaceId]: s.streamingThreadByWs[workspaceId] === threadId,
-        },
+        ...streamingPatch(s, workspaceId, undefined, threadId),
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
         messagesByWs: { ...s.messagesByWs, [workspaceId]: EMPTY_MESSAGES },
       }));
+      void rehydrateRunning(workspaceId);
+      const load = beginLoad(workspaceId);
       const messages = await ipc.listChatMessages(threadId);
       void rehydrateCaps(workspaceId, threadId);
       void rehydrateApprovals(workspaceId, threadId);
-      set((s) => ({
-        messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
-      }));
+      applyLoad(workspaceId, threadId, load, messages as ChatMessage[]);
     },
 
     newThread: async (workspaceId) => {
@@ -1785,9 +1858,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           [workspaceId]: [created, ...(s.threadsByWs[workspaceId] ?? EMPTY_THREADS)],
         },
         activeThreadByWs: { ...s.activeThreadByWs, [workspaceId]: created.id },
-        // Fresh, empty conversation view.
+        // Fresh, empty conversation view; other threads' turns run on.
         messagesByWs: { ...s.messagesByWs, [workspaceId]: EMPTY_MESSAGES },
-        streamingByWs: { ...s.streamingByWs, [workspaceId]: false },
+        ...streamingPatch(s, workspaceId, undefined, created.id),
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },

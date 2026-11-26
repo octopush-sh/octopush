@@ -4182,8 +4182,20 @@ impl Db {
     /// Delete a message and everything after it in a thread (ids are monotonic
     /// per thread). Backs Regenerate (truncate from the assistant turn) and
     /// Edit-and-resend (truncate from the edited user message). Scoped by
-    /// thread_id so it never touches another conversation's rows.
+    /// thread_id so it never touches another conversation's rows, and
+    /// refused unless `message_id` is one of this thread's: an id from
+    /// another thread (a view that showed the wrong rows) would cut from
+    /// wherever its number falls here.
     pub fn truncate_chat_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
+        let owner: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT thread_id FROM chat_messages WHERE id = ?1", params![message_id], |r| r.get(0))
+            .optional()?;
+        if owner.flatten().as_deref() != Some(thread_id) {
+            return Err(AppError::Other(
+                "That message isn't part of this conversation, so nothing was deleted.".into(),
+            ));
+        }
         self.conn.execute(
             "DELETE FROM chat_messages WHERE thread_id = ?1 AND id >= ?2",
             params![thread_id, message_id],

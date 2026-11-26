@@ -74,7 +74,7 @@ function resetStore() {
     liveToolsByWs: {},
     threadsByWs: {},
     activeThreadByWs: {},
-    streamingThreadByWs: {},
+    streamingThreadsByWs: {},
     attachmentsByWs: {},
     composerSeedByWs: {},
   });

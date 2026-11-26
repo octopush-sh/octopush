@@ -1806,6 +1806,11 @@ pub async fn truncate_chat_after(
     thread_id: String,
     message_id: i64,
 ) -> AppResult<()> {
+    // The resend it backs would be refused, and the cut would take rows the
+    // running turn is still writing.
+    if state.chat.is_running(&thread_id) {
+        return Err(AppError::Other(crate::chat_engine::TURN_BUSY.into()));
+    }
     state.db.lock().truncate_chat_after(&thread_id, message_id)
 }
 
@@ -1872,6 +1877,14 @@ pub async fn list_chat_messages(
     thread_id: String,
 ) -> AppResult<Vec<crate::db::ChatMessageRow>> {
     state.db.lock().list_chat_messages(&thread_id)
+}
+
+/// The workspace's conversations with a director turn running now, so a
+/// reloaded view shows them as running (and offers Stop) again.
+#[tauri::command]
+pub async fn list_running_threads(state: State<'_, AppState>, workspace_id: String) -> AppResult<Vec<String>> {
+    let threads = state.db.lock().chat_thread_ids(&workspace_id)?;
+    Ok(state.chat.running_turns(&threads))
 }
 
 /// Request that the in-flight agentic turn for this thread stop. The loop
