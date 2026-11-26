@@ -317,19 +317,32 @@ pub fn load_skill(worktree: &Path, name: &str) -> Option<Skill> {
 /// `/code-review-notes` and `x/code-review` do not — and fenced code is
 /// never searched (an `@file` expansion pastes the file as a fenced block;
 /// a CHANGELOG line saying "run /release" must not invoke the skill).
+///
+/// The order is the text's, not the catalogue's: it is the order the skills
+/// share the per-turn budget in ([`skill_prompt_section`]).
 pub fn referenced_skills(worktree: &Path, text: &str) -> Vec<Skill> {
-    let known = scan_skills(worktree);
+    named_in(scan_skills(worktree), text)
+}
+
+/// [`referenced_skills`] with the user's home given.
+pub fn referenced_skills_in(worktree: &Path, home: Option<&Path>, text: &str) -> Vec<Skill> {
+    named_in(scan_skills_in(worktree, home).found, text)
+}
+
+/// The `known` skills `text` names, by first mention, deduped by name.
+fn named_in(known: Vec<Skill>, text: &str) -> Vec<Skill> {
     let prose = outside_fences(text);
-    let mut out: Vec<Skill> = Vec::new();
+    let mut found: Vec<(usize, Skill)> = Vec::new();
     for skill in known {
-        if out.iter().any(|s| s.name == skill.name) {
+        if found.iter().any(|(_, s)| s.name == skill.name) {
             continue;
         }
-        if mentions_skill(&prose, &skill.name) {
-            out.push(skill);
+        if let Some(at) = first_mention(&prose, &skill.name) {
+            found.push((at, skill));
         }
     }
-    out
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, s)| s).collect()
 }
 
 /// The text with every fenced code block (``` … ```, fence lines included)
@@ -354,13 +367,14 @@ fn outside_fences(text: &str) -> String {
     out
 }
 
-/// Whether `text` carries a standalone `/name` token.
+/// Where `text` first carries a standalone `/name` token (the slash's byte
+/// offset), if it does.
 ///
 /// Boundaries are compared as CHARS, not bytes: a byte-level test treats every
 /// UTF-8 continuation byte as "not alphanumeric", so `docs/café/code-review.md`
 /// and `🚀/code-review` would count as references and silently append a whole
 /// skill body to every stage's prompt.
-fn mentions_skill(text: &str, name: &str) -> bool {
+fn first_mention(text: &str, name: &str) -> Option<usize> {
     fn is_word_char(c: char) -> bool {
         c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/'
     }
@@ -380,17 +394,18 @@ fn mentions_skill(text: &str, name: &str) -> bool {
             Some(c) => !is_word_char(c),
         };
         if before_ok && after_ok {
-            return true;
+            return Some(start);
         }
         from = end;
     }
-    false
+    None
 }
 
-/// The most bytes of skill bodies one Talk turn or Direct stage carries: the
-/// skills it names share it, in order. About 25k tokens, so ordinary skills
-/// always go whole, while a runaway file (each may be up to 4 MiB) can't
-/// fill the prompt or the bill.
+/// The most bytes of skill bodies the skills a message or brief *names*
+/// carry in one Talk turn or Direct stage: they share it, in the order
+/// named. About 25k tokens, so ordinary skills always go whole, while a
+/// runaway file (each may be up to 4 MiB) can't fill the prompt or the
+/// bill. A skill the request pins is outside it ([`skill_prompt_section_with`]).
 pub const SKILLS_CAP_BYTES: usize = 100_000;
 
 /// With less than this left, a skill is left out rather than trimmed.
@@ -399,13 +414,30 @@ const MIN_TRIMMED_SKILL_BYTES: usize = 1_000;
 /// The section appended to a system prompt for each skill a message or brief
 /// named — the one shape TALK and DIRECT share, so an agent meets the
 /// instructions in the same form on both substrates. The bodies share
-/// [`SKILLS_CAP_BYTES`]: a skill that fits what is left goes whole, a larger
-/// one is trimmed to it (beginning and end kept), or left out when under
-/// 1,000 bytes are left; either way the section says so, and so does the log.
+/// [`SKILLS_CAP_BYTES`] in the order given (the order named,
+/// [`referenced_skills`]): a skill that fits what is left goes whole, a
+/// larger one is trimmed to it (beginning and end kept), or left out when
+/// under 1,000 bytes are left; either way the section says so, and so does
+/// the log.
 pub fn skill_prompt_section(skills: &[Skill]) -> String {
+    skill_prompt_section_with(None, skills)
+}
+
+/// [`skill_prompt_section`] with the skill the request pins (Talk's
+/// `ChatRequest.skill`): it comes first and is sent whole, bounded only by
+/// the 4 MiB a skill file may be, and it doesn't draw on the budget the
+/// `named` skills share after it. A named skill of the same name is the
+/// pinned one, not sent twice.
+pub fn skill_prompt_section_with(pinned: Option<&Skill>, named: &[Skill]) -> String {
     let mut out = String::new();
+    if let Some(skill) = pinned {
+        out.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
+    }
     let mut left = SKILLS_CAP_BYTES;
-    for skill in skills {
+    for skill in named {
+        if pinned.is_some_and(|p| p.name == skill.name) {
+            continue;
+        }
         let body = if skill.body.len() <= left {
             skill.body.clone()
         } else if left < MIN_TRIMMED_SKILL_BYTES {

@@ -30033,7 +30033,10 @@ mod skills_containment_tests {
     //! home: none reads the real `~/.claude`.
     use crate::request_context::{agents_item, skills_item, MAX_MEMORY_FILE_BYTES};
     use crate::skills::agents::scan_agent_files_in;
-    use crate::skills::{scan_skills_in, skill_prompt_section, Skill, SkippedDefinition, SKILLS_CAP_BYTES};
+    use crate::skills::{
+        referenced_skills_in, scan_skills_in, skill_prompt_section, skill_prompt_section_with, Skill, SkippedDefinition,
+        SKILLS_CAP_BYTES,
+    };
     use std::os::unix::fs::symlink;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -30303,5 +30306,45 @@ mod skills_containment_tests {
         let rest = &section[section.find("# Skill: third").unwrap()..];
         assert!(!rest.contains("ccc") && !rest.contains("Be brief."), "{rest}");
         assert_eq!(rest.matches("[Left out:").count(), 2, "{rest}");
+    }
+
+    /// The skills a message names share the budget in the order it names
+    /// them, not the catalogue's: a large skill whose name sorts first can't
+    /// crowd out one named before it.
+    #[test]
+    fn named_skills_share_the_budget_in_the_order_the_message_names_them() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        let big = format!("---\nname: aaa-big\ndescription: d\n---\nBIG{}", "b".repeat(SKILLS_CAP_BYTES + 50_000));
+        write(&project.path().join(".claude/skills/aaa-big/SKILL.md"), &big);
+        write(&project.path().join(".claude/skills/zeta/SKILL.md"), &skill("zeta"));
+
+        let order = referenced_skills_in(project.path(), Some(home.path()), "/zeta first, then /aaa-big");
+        assert_eq!(order.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["zeta", "aaa-big"]);
+        let section = skill_prompt_section(&order);
+        let (zeta, big) = (section.find("# Skill: zeta").unwrap(), section.find("# Skill: aaa-big").unwrap());
+        assert!(zeta < big, "{}", &section[..200]);
+        assert!(section[zeta..big].contains("zeta body"));
+        assert!(section[big..].contains("[Trimmed:"));
+        // Named the other way round, the large one goes first.
+        let order = referenced_skills_in(project.path(), Some(home.path()), "/aaa-big and /zeta");
+        assert_eq!(order.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["aaa-big", "zeta"]);
+    }
+
+    /// The skill the request pins comes first and goes whole, outside the
+    /// budget the named skills share.
+    #[test]
+    fn a_pinned_skill_goes_first_and_whole_outside_the_budget() {
+        let pinned = named("pinned", format!("P{}", "p".repeat(SKILLS_CAP_BYTES + 50_000)));
+        // A single pinned skill over the cap is sent whole.
+        assert_eq!(skill_prompt_section_with(Some(&pinned), &[]), format!("\n\n# Skill: pinned\n{}", pinned.body));
+        // The named skills still share the whole budget after it, and the
+        // pinned one, named too, is not sent twice.
+        let other = named("other", "o".repeat(SKILLS_CAP_BYTES - 10_000));
+        let section = skill_prompt_section_with(Some(&pinned), &[other.clone(), pinned.clone()]);
+        assert!(section.starts_with("\n\n# Skill: pinned\n"));
+        assert!(section.contains(&pinned.body) && section.contains(&other.body));
+        assert_eq!(section.matches("# Skill: pinned").count(), 1);
+        assert!(!section.contains("[Trimmed:") && !section.contains("[Left out:"));
     }
 }
