@@ -615,8 +615,8 @@ pub fn run() {
                 // the same guarded launch path as a user's Begin.
                 std::sync::Arc::clone(&orch).spawn_routine_scheduler();
                 app.manage(orch);
-                // The menu bar Octo (#718), before the first refresh fills it.
-                menu_bar::setup(app.handle());
+                // The menu bar Octo (#718): the launch refresh below builds it.
+                menu_bar::setup();
                 // Runs still parked from the last session badge the Dock now.
                 fleet_status::refresh_later(app.handle());
             }

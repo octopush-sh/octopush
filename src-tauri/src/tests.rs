@@ -498,6 +498,8 @@ mod workspace_tests {
         let halt = of_a[1].stage.as_ref().unwrap();
         assert_eq!((halt.status.as_str(), halt.title.as_str()), ("failed", "Night shift"));
         assert!(!halt.started && !halt.asked && halt.secret_held && halt.plan_limited);
+        assert!(halt.error.as_deref().is_some_and(|e| e.starts_with("stopped")), "the error, for stalled vs halted");
+        assert_eq!(gate.error, None);
         let of_b: Vec<_> = rows.iter().filter(|r| r.run_id == b).collect();
         assert_eq!(of_b.len(), 1);
         assert_eq!(of_b[0].stage, None, "paused with nothing blocked");

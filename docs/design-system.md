@@ -358,9 +358,9 @@ in `src/components/icons/OctoMark.tsx` (`viewBox 0 0 64 66`). Spec:
   Settings/About/legacy-sidebar (static), dev favicon, and the **menu bar
   status item** (#718, `src-tauri/icons/tray/`): still poses of the rig, never
   animated — `idle` at rest, `working` with the eyes at the end of their scan
-  and the first and third arms up, `blocked` (needs you) with the eyes at
-  half-mast — rendered by `scripts/tray-icons.py`. Being still, it never
-  competes with the app's one beacon.
+  and the first and third arms raised a full stroke (2.4u), `blocked` (needs
+  you) with the eyes at half-mast — rendered by `scripts/tray-icons.py`.
+  Being still, it never competes with the app's one beacon.
 - **Canvas behaviors:** the TALK empty-state **Watcher** (gaze-follow ±2.4u + fidget
   cycle look/scratch/peek after 15s idle — `chat/OctoWatcher.tsx`) and the pinned
   **Player** (`OctoPlayer.tsx` — the shared phase machine + figure): role classes

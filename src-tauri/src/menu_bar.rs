@@ -66,7 +66,11 @@ pub enum TrayState {
 /// Why a crew needs you, read off its blocked stages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
-    /// A stage failed and halted the run.
+    /// A stage stopped on a transient fault that Resume answers (a rate
+    /// limit, an overload, a dropped connection, the relaunch's
+    /// `interrupted` stamp): Mission Control's `stalled`.
+    Stalled,
+    /// A stage failed on a standing fault and halted the run.
     Halted,
     /// A Claude plan limit stopped a stage and it waits for the director.
     PlanLimit,
@@ -86,6 +90,7 @@ pub enum Reason {
 impl Reason {
     pub fn word(self) -> &'static str {
         match self {
+            Reason::Stalled => "stalled",
             Reason::Halted => "halted",
             Reason::PlanLimit => "plan limit",
             Reason::Asked => "asked you",
@@ -98,15 +103,17 @@ impl Reason {
 }
 
 /// What a paused run waits on, and the stage it waits at. Precedence as in
-/// Mission Control's card: a halt first, then a question, then a gate.
-/// `stages` are its blocked stages in stage order; `budget_spent` is the
-/// drive's own budget gate (`plan_wait::budget_spent`).
+/// Mission Control's card: a stopped stage first (`stalled` when its fault is
+/// transient, `fleet_status::is_transient_halt`, else `halted`), then a
+/// question, then a gate. `stages` are its blocked stages in stage order;
+/// `budget_spent` is the drive's own budget gate (`plan_wait::budget_spent`).
 pub fn reason(stages: &[&ParkedStage], budget_spent: bool) -> (Reason, Option<String>) {
     fn title(s: &ParkedStage) -> Option<String> {
         Some(s.title.clone()).filter(|t| !t.trim().is_empty())
     }
     if let Some(s) = stages.iter().find(|s| s.status == "failed" && !s.plan_limited) {
-        return (Reason::Halted, title(s));
+        let transient = crate::fleet_status::is_transient_halt(s.error.as_deref());
+        return (if transient { Reason::Stalled } else { Reason::Halted }, title(s));
     }
     if let Some(s) = stages.iter().find(|s| s.status == "failed") {
         return (Reason::PlanLimit, title(s));
@@ -273,14 +280,17 @@ pub fn run_of(menu_id: &str) -> Option<&str> {
 /// Whether the setting wants the item (read at launch, then kept by
 /// `save_settings`).
 static ENABLED: AtomicBool = AtomicBool::new(true);
-/// What the item shows now (`None` = draw it afresh). Locked only off the
-/// main thread: tray calls wait for the main thread while it is held.
+/// What the item shows now; `None` while it is hidden or not built yet.
+/// Held while drawing, so draws never interleave. Locked only off the main
+/// thread: tray calls wait for the main thread while it is held.
 static SHOWN: LazyLock<Mutex<Option<MenuModel>>> = LazyLock::new(|| Mutex::new(None));
 /// Time in state per active run (see [`track_since`]).
 static SEEN: LazyLock<Mutex<HashMap<String, Seen>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 /// A drawing failure is logged once.
 static ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// The pose's image. Only `@2x` exists: tray-icon draws the image 18pt tall,
+/// so a 36px image is sharp on Retina and macOS scales it for 1x screens.
 fn icon(state: TrayState) -> Image<'static> {
     match state {
         TrayState::Idle => tauri::include_image!("icons/tray/idleTemplate@2x.png"),
@@ -289,22 +299,18 @@ fn icon(state: TrayState) -> Image<'static> {
     }
 }
 
-/// At launch: read the setting and put the item up. The first refresh fills it.
-pub fn setup(app: &AppHandle) {
+/// At launch: read the setting. The launch refresh builds the item with what
+/// it should show, so it never appears empty.
+pub fn setup() {
     let on = crate::settings::load_settings().map(|s| enabled(&s)).unwrap_or(true);
     ENABLED.store(on, Ordering::Release);
-    ensure(app);
 }
 
-/// `save_settings` saw the setting: show or hide the item when it changed.
+/// `save_settings` saw the setting: when it changed, redraw at once (off the
+/// main thread), which shows the item with fresh content or hides it.
 pub fn apply_setting(app: &AppHandle, on: bool) {
-    if ENABLED.swap(on, Ordering::AcqRel) == on {
-        return;
-    }
-    *SHOWN.lock() = None;
-    ensure(app);
-    if on {
-        crate::fleet_status::refresh_later(app);
+    if ENABLED.swap(on, Ordering::AcqRel) != on {
+        crate::fleet_status::refresh(app);
     }
 }
 
@@ -313,33 +319,18 @@ pub fn wants_detail() -> bool {
     cfg!(target_os = "macos") && ENABLED.load(Ordering::Acquire)
 }
 
-/// Build the item the first time it is wanted; after that only show or hide
-/// it, so its menu handler is registered once.
-fn ensure(app: &AppHandle) {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
-    let on = ENABLED.load(Ordering::Acquire);
-    let result = match app.tray_by_id(TRAY_ID) {
-        Some(tray) => tray.set_visible(on),
-        None if on => build(app).map(|_| ()),
-        None => Ok(()),
-    };
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "menu bar: showing the status item failed");
-    }
-}
-
-fn build(app: &AppHandle) -> tauri::Result<TrayIcon> {
-    let idle = model(FleetStatus::default(), 0, Vec::new());
-    TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icon(idle.state))
+fn build(app: &AppHandle, m: &MenuModel) -> tauri::Result<TrayIcon> {
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .icon(icon(m.state))
         .icon_as_template(true)
-        .tooltip(&idle.tooltip)
-        .menu(&menu(app, &idle)?)
+        .tooltip(&m.tooltip)
+        .menu(&menu(app, m)?)
         .show_menu_on_left_click(true)
-        .on_menu_event(on_menu_event)
-        .build(app)
+        .on_menu_event(on_menu_event);
+    if let Some(title) = &m.title {
+        builder = builder.title(title);
+    }
+    builder.build(app)
 }
 
 fn menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<tauri::Wry>> {
@@ -360,6 +351,9 @@ fn menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<tauri::Wry>> {
 
 /// Called by [`crate::fleet_status::refresh`] (off the main thread) with the
 /// runs it read. `parked` is empty unless [`wants_detail`] said otherwise.
+/// The item is built the first time it is wanted (its menu handler is
+/// registered once) and afterwards only redrawn, shown or hidden; it is
+/// always drawn before it is shown, so it never flashes what it last showed.
 pub fn update(app: &AppHandle, fleet: FleetStatus, runs: &[RunRow], parked: &[ParkedStageRow]) {
     let seen = {
         let mut seen = SEEN.lock();
@@ -367,25 +361,38 @@ pub fn update(app: &AppHandle, fleet: FleetStatus, runs: &[RunRow], parked: &[Pa
         *seen = track_since(&seen, runs.iter().map(|r| (r.id.as_str(), r.status.as_str())), now);
         (*seen).clone()
     };
-    if !wants_detail() {
+    if !cfg!(target_os = "macos") {
         return;
     }
-    let Some(tray) = app.tray_by_id(TRAY_ID) else {
-        return;
-    };
-    let running = runs.iter().filter(|r| r.status == "running").count();
-    let next = model(fleet, running, waiting(runs, parked, &seen));
     let mut shown = SHOWN.lock();
-    if Option::as_ref(&*shown) == Some(&next) {
-        return;
-    }
-    match draw(app, &tray, Option::as_ref(&*shown), &next) {
-        Ok(()) => *shown = Some(next),
-        Err(e) => {
-            if !ERROR_LOGGED.swap(true, Ordering::AcqRel) {
-                tracing::warn!(error = %e, "menu bar: updating the status item failed (logged once)");
+    let tray = app.tray_by_id(TRAY_ID);
+    if !ENABLED.load(Ordering::Acquire) {
+        if let Some(tray) = tray.filter(|_| shown.is_some()) {
+            match tray.set_visible(false) {
+                Ok(()) => *shown = None,
+                Err(e) => log_once(&e),
             }
         }
+        return;
+    }
+    let running = runs.iter().filter(|r| r.status == "running").count();
+    let next = model(fleet, running, waiting(runs, parked, &seen));
+    let result = match (tray, Option::as_ref(&*shown)) {
+        (None, _) => build(app, &next).map(|_| ()),
+        (Some(_), Some(current)) if *current == next => return,
+        // Hidden: draw everything, then show it.
+        (Some(tray), None) => draw(app, &tray, None, &next).and_then(|()| tray.set_visible(true)),
+        (Some(tray), Some(current)) => draw(app, &tray, Some(current), &next),
+    };
+    match result {
+        Ok(()) => *shown = Some(next),
+        Err(e) => log_once(&e),
+    }
+}
+
+fn log_once(e: &tauri::Error) {
+    if !ERROR_LOGGED.swap(true, Ordering::AcqRel) {
+        tracing::warn!(error = %e, "menu bar: drawing the status item failed (logged once)");
     }
 }
 
@@ -473,10 +480,10 @@ mod tests {
         let m = model(
             fleet(3, 0),
             0,
-            vec![waiting_run("c", "billing", 300), waiting_run("a", "auth-flow", 100), waiting_run("b", "docs", 100)],
+            vec![waiting_run("c", "billing", 300), waiting_run("b", "docs", 100), waiting_run("a", "auth-flow", 100)],
         );
         let ids: Vec<&str> = m.items.iter().map(|e| e.id.as_str()).collect();
-        // Same wait: the run id keeps the order stable.
+        // Same wait: the run id breaks the tie, whatever order they came in.
         assert_eq!(ids, ["menu-bar:run:a", "menu-bar:run:b", "menu-bar:run:c"]);
         assert_eq!(run_of(ids[0]), Some("a"));
         assert_eq!(run_of("menu-bar:open"), None);
@@ -531,7 +538,12 @@ mod tests {
 
     #[test]
     fn each_park_says_why() {
-        let failed = stage("failed", "Tester");
+        let failed = ParkedStage { error: Some("Anthropic API error 401: authentication_error".into()), ..stage("failed", "Tester") };
+        let stalled = ParkedStage { error: Some("Anthropic API error 529: overloaded_error".into()), ..stage("failed", "Coder") };
+        let interrupted = ParkedStage {
+            error: Some("interrupted — Octopush closed while this stage was in flight".into()),
+            ..stage("failed", "Coder")
+        };
         let plan = ParkedStage { plan_limited: true, ..stage("failed", "Coder") };
         let asked = ParkedStage { asked: true, ..stage("awaiting_checkpoint", "Planner") };
         let gate = stage("awaiting_checkpoint", "Reviewer");
@@ -542,6 +554,10 @@ mod tests {
             (why, stage.unwrap_or_default())
         };
         assert_eq!(r(&[&gate], false), (Reason::Gate, "Reviewer".into()));
+        assert_eq!(r(&[&failed], false), (Reason::Halted, "Tester".into()));
+        assert_eq!(r(&[&stalled], false), (Reason::Stalled, "Coder".into()));
+        assert_eq!(r(&[&interrupted], false), (Reason::Stalled, "Coder".into()), "the relaunch stamp");
+        assert_eq!(r(&[&gate, &asked, &stalled], false), (Reason::Stalled, "Coder".into()));
         assert_eq!(r(&[&asked], false), (Reason::Asked, "Planner".into()));
         assert_eq!(r(&[&before], true), (Reason::Budget, "Tester".into()));
         assert_eq!(r(&[&before], false), (Reason::Paused, "Tester".into()));
@@ -552,6 +568,7 @@ mod tests {
         assert_eq!(r(&[&gate, &asked, &plan, &failed], false), (Reason::Halted, "Tester".into()));
         assert_eq!(r(&[&gate, &asked], false), (Reason::Asked, "Planner".into()));
         let words: Vec<&str> = [
+            Reason::Stalled,
             Reason::Halted,
             Reason::PlanLimit,
             Reason::Asked,
@@ -563,7 +580,7 @@ mod tests {
         .iter()
         .map(|r| r.word())
         .collect();
-        assert_eq!(words, ["halted", "plan limit", "asked you", "possible secret", "budget reached", "at the gate", "paused"]);
+        assert_eq!(words, ["stalled", "halted", "plan limit", "asked you", "possible secret", "budget reached", "at the gate", "paused"]);
     }
 
     #[test]
@@ -601,10 +618,22 @@ mod tests {
 
     #[test]
     fn the_menu_counts_what_the_dock_badge_counts() {
+        let mut calm = run("d", "paused", "2026-11-20T07:00:00+00:00");
+        // A plan park with its resume scheduled and nothing else waiting is in
+        // flight: no badge, no menu item, though its run is `paused`.
+        calm.plan_wait = Some(crate::db::PlanWait {
+            window: "five_hour".into(),
+            resets_at: 1_793_551_200,
+            resume_at: Some(1_793_551_290),
+            resume_count: 0,
+            other_hold: false,
+            stale_count: 0,
+        });
         let runs = vec![
             run("a", "paused", "2026-11-20T10:00:00+00:00"),
             run("b", "running", "2026-11-20T09:00:00+00:00"),
             run("c", "paused", "2026-11-20T08:00:00+00:00"),
+            calm,
         ];
         let parked = vec![
             ParkedStageRow {
@@ -618,14 +647,40 @@ mod tests {
                 workspace_name: None,
                 stage: Some(ParkedStage { started: false, ..stage("awaiting_checkpoint", "Tester") }),
             },
+            ParkedStageRow {
+                run_id: "d".into(),
+                workspace_name: Some("night-crew".into()),
+                stage: Some(ParkedStage {
+                    plan_limited: true,
+                    error: Some("Paused by your Claude plan\n(plan_limit)".into()),
+                    ..stage("failed", "Coder")
+                }),
+            },
         ];
-        let fleet = crate::fleet_status::derive(runs.iter().map(|r| (r.status.as_str(), false)));
+        let fleet =
+            crate::fleet_status::derive(runs.iter().map(|r| (r.status.as_str(), crate::fleet_status::plan_waiting(r))));
+        assert_eq!((fleet.needs_you, fleet.badge()), (2, Some(2)), "the calm plan park isn't counted");
         let seen = track_since(&HashMap::new(), runs.iter().map(|r| (r.id.as_str(), r.status.as_str())), 0);
         let m = model(fleet, 1, waiting(&runs, &parked, &seen));
         assert_eq!(m.items.len() as u32, fleet.needs_you);
-        assert_eq!(fleet.badge(), Some(2));
-        // c was created first, so it has waited longest.
+        assert_eq!(m.title.as_deref(), Some("2"));
+        // c was created first, so it has waited longest; d, older still, is in flight.
         let labels: Vec<&str> = m.items.iter().map(|e| e.label.as_str()).collect();
         assert_eq!(labels, ["Task c · Tester — budget reached", "auth-flow · Reviewer — at the gate"]);
+    }
+
+    #[test]
+    fn a_change_seen_this_session_outranks_the_creation_time() {
+        // x was created first, but this session saw it stop at 11:00, after y
+        // (created 10:00, already waiting at launch): y has waited longer.
+        let runs = vec![run("x", "paused", "2026-11-20T08:00:00+00:00"), run("y", "paused", "2026-11-20T10:00:00+00:00")];
+        let stopped_at = created_ms("2026-11-20T11:00:00+00:00");
+        let seen = HashMap::from([("x".to_string(), Seen { status: "paused".into(), since_ms: Some(stopped_at) })]);
+        let crews = waiting(&runs, &[], &seen);
+        let x = crews.iter().find(|w| w.run_id == "x").unwrap();
+        assert_eq!(x.since_ms, stopped_at);
+        let m = model(fleet(2, 0), 0, crews);
+        let ids: Vec<&str> = m.items.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["menu-bar:run:y", "menu-bar:run:x"]);
     }
 }

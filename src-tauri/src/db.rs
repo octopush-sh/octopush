@@ -5847,7 +5847,7 @@ impl Db {
                     s.started_at IS NOT NULL,
                     TRIM(COALESCE(s.blocked_questions, '')) != '',
                     s.secret_hold,
-                    instr(COALESCE(s.error, ''), ?1) > 0
+                    s.error
              FROM runs r
              LEFT JOIN workspaces w ON w.id = r.workspace_id
              LEFT JOIN run_stages s ON s.run_id = r.id AND s.status IN ('awaiting_checkpoint', 'failed')
@@ -5855,21 +5855,25 @@ impl Db {
              WHERE r.status = 'paused'
              ORDER BY r.id, s.position",
         )?;
-        let rows = stmt.query_map(params![crate::orchestrator::cli_runner::PLAN_LIMIT_MARKER], |r| {
+        let rows = stmt.query_map([], |r| {
             let status: Option<String> = r.get(2)?;
             let stage = match status {
-                Some(status) => Some(ParkedStage {
-                    status,
-                    title: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    started: r.get(4)?,
-                    asked: r.get(5)?,
-                    // An approved hold no longer holds the stage.
-                    secret_held: r
-                        .get::<_, Option<String>>(6)?
-                        .and_then(|j| serde_json::from_str::<crate::secret_scan::SecretHold>(&j).ok())
-                        .is_some_and(|h| !h.acknowledged),
-                    plan_limited: r.get(7)?,
-                }),
+                Some(status) => {
+                    let error: Option<String> = r.get(7)?;
+                    Some(ParkedStage {
+                        status,
+                        title: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        started: r.get(4)?,
+                        asked: r.get(5)?,
+                        // An approved hold no longer holds the stage.
+                        secret_held: r
+                            .get::<_, Option<String>>(6)?
+                            .and_then(|j| serde_json::from_str::<crate::secret_scan::SecretHold>(&j).ok())
+                            .is_some_and(|h| !h.acknowledged),
+                        plan_limited: error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit),
+                        error,
+                    })
+                }
                 None => None,
             };
             Ok(ParkedStageRow { run_id: r.get(0)?, workspace_name: r.get(1)?, stage })
@@ -8994,6 +8998,9 @@ pub struct ParkedStage {
     pub secret_held: bool,
     /// A Claude plan limit stopped it.
     pub plan_limited: bool,
+    /// Its error, for a failed stage: transient (`stalled`) or standing
+    /// (`halted`), by `fleet_status::is_transient_halt`.
+    pub error: Option<String>,
 }
 
 /// A run parked at a Claude plan limit. Epoch seconds.

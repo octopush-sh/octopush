@@ -1101,6 +1101,14 @@ function App() {
     [activeWorkspaceId],
   );
 
+  // Everything a tour may have opened over the canvas (Settings, the palettes,
+  // the rooms). The tour's `close-overlays` and the menu bar Octo's "open this
+  // crew" both close exactly this.
+  const closeOverlays = useCallback(() => {
+    setSettingsTab(null); setShowPalette(false); setShowSearch(false);
+    setMissionControlOpen(false); setLogbookOpen(false);
+  }, []);
+
   // Named-surface navigation for guided tours and recorded demos
   // (src/lib/tour/surfaces.ts, docs/WHATS-NEW.md §3).
   useEffect(() => {
@@ -1109,10 +1117,7 @@ function App() {
       switch (d?.kind) {
         case "settings": setSettingsTab(d.tab); break;
         case "close-settings": setSettingsTab(null); break;
-        case "close-overlays":
-          setSettingsTab(null); setShowPalette(false); setShowSearch(false);
-          setMissionControlOpen(false); setLogbookOpen(false);
-          break;
+        case "close-overlays": closeOverlays(); break;
         case "mode": setSettingsTab(null); setMode(d.mode); break;
         // "terminal" is handled next to handleSelectWorkspace, below.
         case "palette": setShowPalette(true); break;
@@ -1123,7 +1128,7 @@ function App() {
     };
     window.addEventListener(NAVIGATE_EVENT, onNavigate);
     return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
-  }, [setMode]);
+  }, [setMode, closeOverlays]);
 
   // Cross-mode action (P9): take a chat tool's shell command to RUN mode.
   // Switches to the terminal and copies the command to the clipboard so the
@@ -1876,14 +1881,14 @@ function App() {
   );
 
   // The menu bar Octo (#718): a crew chosen in its menu. Rust has shown the
-  // window; land on the crew's Direct surface as a Mission Control card does,
-  // switching project by the payload's path when the crew's isn't open (it
-  // works before the recent-projects list loads, like "Continue in the
-  // workspace"). Mode is keyed by workspace, so it survives the project load.
+  // window; close whatever covers the canvas, then land on the crew's Direct
+  // surface as a Mission Control card does, switching project by the payload's
+  // path when the crew's isn't open (it works before the recent-projects list
+  // loads, like "Continue in the workspace"). Mode is keyed by workspace, so
+  // it survives the project load.
   const openRunRef = useRef<(p: OpenRunPayload) => void>(() => {});
   openRunRef.current = (p) => {
-    setSettingsTab(null);
-    setMissionControlOpen(false);
+    closeOverlays();
     setModePerWorkspace((m) => ({ ...m, [p.workspaceId]: "direct" }));
     if (p.projectId === project?.id) {
       selectWorkspace(p.workspaceId);

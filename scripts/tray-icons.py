@@ -10,15 +10,17 @@ motion (`octo-m-*` in `src/styles.css`), so nothing is added to the creature:
 
 - idle     the rig at rest;
 - working  the eyes at the end of their scan (`octo-m-scan`, +2.4u) and the
-           first and third arms at the top of their paddle (`octo-m-float`,
-           -1.6u);
+           first and third arms raised a full stroke (-2.4u, the rig's largest
+           move: the design system caps motion at 2.5), so the pose reads as
+           paddling beside idle even at 18pt;
 - blocked  "needs you": frozen, the eyes at half-mast (the reduced-motion pose
            of `octo-mascot--blocked`: scaleY(0.45) translateY(0.6)).
 
 Template images carry shape in alpha only: macOS draws them in the menu bar's
 own ink, light or dark, so there is no colour (and no brass) in them. The mark
-is 16pt wide in an 18pt square (tray-icon draws the image 18pt tall), with its
-straight sides on whole pixels. `@2x` is the image the app loads.
+is 16pt wide in an 18pt square, with its straight sides on whole pixels. Only
+`@2x` (36px) is rendered: tray-icon draws the one image 18pt tall, so it is
+sharp on Retina and macOS scales it for 1x screens.
 
 Run from the repo root (needs Pillow): python3 scripts/tray-icons.py
 """
@@ -37,7 +39,7 @@ EYE_X, EYE_Y = (25.0, 39.0), 27.0
 # (arm y offsets, eye x offset, eye y scale, eye y offset)
 POSES = {
     "idle": ((0.0, 0.0, 0.0, 0.0), 0.0, 1.0, 0.0),
-    "working": ((-1.6, 0.0, -1.6, 0.0), 2.4, 1.0, 0.0),
+    "working": ((-2.4, 0.0, -2.4, 0.0), 2.4, 1.0, 0.0),
     # CSS applies translateY(0.6) first, then scaleY(0.45) about the eye's centre.
     "blocked": ((0.0, 0.0, 0.0, 0.0), 0.0, 0.45, 0.6 * 0.45),
 }
@@ -96,10 +98,9 @@ def render(pose, scale_pt):
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     for pose in POSES:
-        for scale, suffix in ((1, ""), (2, "@2x")):
-            path = OUT / f"{pose}Template{suffix}.png"
-            render(pose, scale).save(path, optimize=True)
-            print(path.relative_to(OUT.parent.parent.parent))
+        path = OUT / f"{pose}Template@2x.png"
+        render(pose, 2).save(path, optimize=True)
+        print(path.relative_to(OUT.parent.parent.parent))
 
 
 if __name__ == "__main__":

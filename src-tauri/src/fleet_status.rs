@@ -61,6 +61,39 @@ pub fn calm_plan_wait(resume_at: Option<i64>, other_hold: bool) -> bool {
     resume_at.is_some() && !other_hold
 }
 
+/// Whether a halted stage's error is a *transient* fault that Resume answers
+/// (a rate limit, an overload, a 5xx inside an `API error` framing, a dropped
+/// connection or a time-out, the relaunch's `interrupted` stamp, a Claude plan
+/// limit) rather than a standing one: Mission Control's `stalled`. Never a
+/// hook-deferred tool halt, whatever its stderr tail says. Mirrors TS
+/// `isTransientHalt` (runStatus.ts); `src/lib/transientHalt.fixtures.json`
+/// pins the two. Word boundaries are ASCII, as in JavaScript.
+pub fn is_transient_halt(error: Option<&str>) -> bool {
+    use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_plan_limit, is_tool_deferred};
+    static TRANSIENT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?-u:\b)rate[\s_-]?limit",
+            r"|(?-u:\b)overloaded(?-u:\b)",
+            r"|api error (429|529|50[0-4])(?-u:\b)",
+            r"|(?-u:\b)request failed(?-u:\b)",
+            r"|(?-u:\b)timed?\s?out(?-u:\b)|(?-u:\b)timeout(?-u:\b)",
+            r"|(?-u:\b)connection (reset|closed|refused)(?-u:\b)|(?-u:\b)dns(?-u:\b)",
+        ))
+        .expect("transient halt pattern")
+    });
+    let Some(error) = error.filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    if is_tool_deferred(error) || is_deferred_tool_unavailable(error) {
+        return false;
+    }
+    if is_plan_limit(error) {
+        return true;
+    }
+    let e = error.to_lowercase();
+    e.starts_with("interrupted") || TRANSIENT.is_match(&e)
+}
+
 /// Run events after which a run's status may have changed.
 pub fn affects_badge(event: &str) -> bool {
     matches!(event, "run://checkpoint" | "run://stage-update" | "run://cost" | "run://error")
@@ -192,6 +225,22 @@ mod tests {
             assert_eq!(fleet.needs_you, f["needsYou"].as_u64().unwrap() as u32, "{statuses:?}");
             assert_eq!(fleet.in_flight, f["inFlight"].as_u64().unwrap() as u32, "{statuses:?}");
             assert_eq!(fleet.badge(), f["badge"].as_i64(), "{statuses:?}");
+        }
+    }
+
+    #[test]
+    fn transient_halts_match_the_frontends_predicate_case_for_case() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/transientHalt.fixtures.json")).expect("fixtures");
+        let transient = fixtures["transient"].as_array().expect("transient");
+        let standing = fixtures["notTransient"].as_array().expect("notTransient");
+        assert!(transient.len() >= 10 && standing.len() >= 10, "both sides are covered");
+        for c in transient {
+            let e = c.as_str().unwrap();
+            assert!(is_transient_halt(Some(e)), "{e}");
+        }
+        for c in standing {
+            assert!(!is_transient_halt(c.as_str()), "{c}");
         }
     }
 

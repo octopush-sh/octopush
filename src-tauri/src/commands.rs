@@ -1756,6 +1756,7 @@ pub async fn update_workspace_customization(
 
 #[tauri::command]
 pub async fn rename_workspace(
+    app: AppHandle,
     state: State<'_, AppState>,
     workspace_id: String,
     name: String,
@@ -1764,7 +1765,10 @@ pub async fn rename_workspace(
     if name.is_empty() {
         return Err(AppError::Other("Workspace name cannot be empty".into()));
     }
-    state.db.lock().rename_workspace(&workspace_id, &name)
+    state.db.lock().rename_workspace(&workspace_id, &name)?;
+    // The menu bar names crews by workspace; a rename sends no run event.
+    crate::fleet_status::refresh_later(&app);
+    Ok(())
 }
 
 // ─── Chat commands ────────────────────────────────────────────────
