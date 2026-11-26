@@ -256,6 +256,61 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
     s
 }
 
+/// How a call ended, as the engine knows it, for its row (`stamp_outcome`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RowVerdict {
+    ok: bool,
+    /// Not run: the user denied its approval card or the secret guard's, or
+    /// the conversation has the tool's MCP server turned off.
+    denied: bool,
+    /// A shell's exit status, when it reported one.
+    exit_code: Option<i32>,
+    /// The engine itself stopped it: Stop on the turn interrupted the agent's
+    /// command, or the user stopped a `$` process.
+    stopped: bool,
+}
+
+/// Stamp how a call ended on its persisted `role="tool"` row, so the resolved
+/// ledger row can read as failed or denied instead of looking like a pass:
+/// `ok`, `outcome` (`ok` · `failed` · `denied`), `exitCode` when a shell
+/// reported one, and `reason: "stopped"` when the engine stopped it (so a
+/// stopped command reads as stopped, not as its SIGINT exit). Additive keys:
+/// rows written before them carry none, and the frontend reads their verdict
+/// from the result text instead (`lib/toolVerdict.ts`). A shell's `-1` is its
+/// "no status" sentinel (an interrupt, a busy shell), never an exit code, so
+/// it isn't recorded.
+fn stamp_outcome(record: &mut serde_json::Value, v: RowVerdict) {
+    let outcome = if v.denied {
+        "denied"
+    } else if v.ok {
+        "ok"
+    } else {
+        "failed"
+    };
+    record["ok"] = serde_json::json!(v.ok && !v.denied);
+    record["outcome"] = serde_json::json!(outcome);
+    if let Some(code) = v.exit_code.filter(|c| *c >= 0) {
+        record["exitCode"] = serde_json::json!(code);
+    }
+    if v.stopped && outcome == "failed" {
+        record["reason"] = serde_json::json!("stopped");
+    }
+}
+
+/// The persisted `role="tool"` row every call site writes: the call, what it
+/// returned, and how it ended. One builder, so what a row records is tested
+/// where it is made.
+fn tool_row(call_id: &str, tool_name: &str, tool_input: serde_json::Value, result: &str, v: RowVerdict) -> serde_json::Value {
+    let mut record = serde_json::json!({
+        "callId": call_id,
+        "toolName": tool_name,
+        "toolInput": tool_input,
+        "result": result,
+    });
+    stamp_outcome(&mut record, v);
+    record
+}
+
 /// The exit status bash gives a command it couldn't find.
 const NOT_FOUND_EXIT: i32 = 127;
 
@@ -620,6 +675,12 @@ impl ApprovalBroker {
     pub fn retire_workspace(&self, workspace_id: &str) {
         self.retired.lock().insert(workspace_id.to_string());
         self.deny_where(|r| r.workspace_id == workspace_id);
+    }
+
+    /// The workspace's deletion failed, so it stays: its conversations may
+    /// ask again.
+    pub fn reinstate_workspace(&self, workspace_id: &str) {
+        self.retired.lock().remove(workspace_id);
     }
 
     /// Whether a card from `workspace_id` may wait for an answer.
@@ -2004,6 +2065,9 @@ pub struct ChatEngine {
     continuing: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The turn-limit gate for writing sub-agents (see `CapGate`).
     pub cap_gate: Arc<CapGate>,
+    /// Threads whose live `$` process the user stopped (`stop_shell`), so its
+    /// row reads as stopped when it exits.
+    stopped_shells: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ChatEngine {
@@ -2020,7 +2084,15 @@ impl ChatEngine {
             approvals: Arc::new(ApprovalBroker::default()),
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
+            stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Stop a thread's live `$` process (SIGINT), remembering that the user
+    /// did, so its row reads as stopped rather than as exit 130.
+    pub fn stop_shell(&self, thread_id: &str) {
+        self.stopped_shells.lock().insert(thread_id.to_string());
+        self.talk_shell.interrupt(thread_id);
     }
 
     /// The approval broker, for a sub-agent gate that outlives a `&self` borrow.
@@ -2081,6 +2153,17 @@ impl ChatEngine {
             self.cancel(thread_id);
         }
         self.approvals.retire_workspace(workspace_id);
+    }
+
+    /// `delete_workspace` is done with the row: if removing it failed, the
+    /// workspace stays, so it is reinstated in the approval broker (its
+    /// cards would otherwise be denied, unseen, until a restart). Its turns
+    /// stay stopped, as after Stop. Returns `deleted` unchanged.
+    pub fn finish_workspace_delete<T>(&self, workspace_id: &str, deleted: AppResult<T>) -> AppResult<T> {
+        if deleted.is_err() {
+            self.approvals.reinstate_workspace(workspace_id);
+        }
+        deleted
     }
 
     /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
@@ -2203,14 +2286,16 @@ impl ChatEngine {
             }
             Err(e) => return (format!("Failed to load tool output: {e}"), false),
         };
-        let result = serde_json::from_str::<serde_json::Value>(&stored)
-            .ok()
-            .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_string))
-            .unwrap_or_default();
+        let original = self.db.lock().get_chat_tool_original(thread_id, message_id).ok().flatten();
+        let (result, cut) = crate::chat_history::recall_source(&stored, original);
         if result.is_empty() {
             return (format!("Tool output #{message_id} is empty"), true);
         }
-        (window_text(&result, offset, limit), true)
+        let window = window_text(&result, offset, limit);
+        match cut {
+            Some(note) => (format!("{window}\n{note}"), true),
+            None => (window, true),
+        }
     }
 
     /// Show `line` (a journal line, e.g. a retry or a rate-limit pause) on
@@ -2242,9 +2327,9 @@ impl ChatEngine {
         req: &LlmRequest,
         cancel: &AtomicBool,
     ) -> Completion {
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
             tracing::warn!(attempt, delay, kind = kind.label(), "Talk director: provider call failed; retrying");
-            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, delay, kind), delay);
+            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, of, delay, kind), delay);
         };
         complete_cancellable(provider, api_base, api_key, req, &self.client, cancel, DEFAULT_MAX_RETRIES, &mut on_retry)
             .await
@@ -2665,7 +2750,7 @@ impl ChatEngine {
                 // Hard failure (daemon down / spawn failed) — surface as a card.
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, false, started,
-                    &format!("Shell error: {e}"), "",
+                    &format!("Shell error: {e}"), "", None,
                 );
                 return Err(e);
             }
@@ -2685,6 +2770,7 @@ impl ChatEngine {
                 self.resolve_shell_card(
                     &app, &request, &call_id, &tool_input, result.ok, started,
                     &format_command_output(&result.output, result.exit_code), &result.cwd,
+                    Some(result.exit_code),
                 );
                 // Compute the badge label once here (the single source) so the
                 // frontend renders it verbatim instead of re-deriving the rule.
@@ -2696,7 +2782,7 @@ impl ChatEngine {
                 let note = "A live process is already running in this conversation — \
                             stop it before running another command.";
                 self.resolve_shell_card(
-                    &app, &request, &call_id, &tool_input, false, started, note, "",
+                    &app, &request, &call_id, &tool_input, false, started, note, "", None,
                 );
                 Ok(ShellResult {
                     output: note.to_string(),
@@ -2744,6 +2830,7 @@ impl ChatEngine {
         started: std::time::Instant,
         result_str: &str,
         abs_cwd: &str,
+        exit_code: Option<i32>,
     ) {
         let _ = app.emit("chat://tool-end", &ToolEndEvent {
             workspace_id: request.workspace_id.clone(),
@@ -2752,12 +2839,13 @@ impl ChatEngine {
             ok,
             duration_ms: started.elapsed().as_millis() as u64,
         });
-        let record = serde_json::json!({
-            "callId": call_id,
-            "toolName": "run_command",
-            "toolInput": tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
-            "result": result_str,
-        });
+        let record = tool_row(
+            call_id,
+            "run_command",
+            tool_input_with_cwd(tool_input, abs_cwd, &request.workspace_path),
+            result_str,
+            RowVerdict { ok, exit_code, ..RowVerdict::default() },
+        );
         let _ = self.insert_and_emit_message(
             app, &request.workspace_id, &request.thread_id,
             "tool", &record.to_string(), None, None, None, None,
@@ -2777,6 +2865,9 @@ impl ChatEngine {
         live: crate::talk_shell::LiveRun,
     ) {
         let db = Arc::clone(&self.db);
+        let stopped_shells = Arc::clone(&self.stopped_shells);
+        // A Stop pressed before this process started isn't this process's.
+        stopped_shells.lock().remove(&request.thread_id);
         std::thread::Builder::new()
             .name(format!("talk-live-{call_id}"))
             .spawn(move || {
@@ -2808,12 +2899,16 @@ impl ChatEngine {
                     cwd_label: relativize_cwd(&exit.cwd, &request.workspace_path),
                 });
 
-                let record = serde_json::json!({
-                    "callId": call_id,
-                    "toolName": "run_command",
-                    "toolInput": tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
-                    "result": format_command_output(&exit.full_output, exit.exit_code),
-                });
+                // The user stopped it (`stop_shell`): it reads as stopped, not
+                // as the exit status SIGINT left it with.
+                let stopped = stopped_shells.lock().remove(&request.thread_id);
+                let record = tool_row(
+                    &call_id,
+                    "run_command",
+                    tool_input_with_cwd(&tool_input, &exit.cwd, &request.workspace_path),
+                    &format_command_output(&exit.full_output, exit.exit_code),
+                    RowVerdict { ok: exit.exit_code == 0, exit_code: Some(exit.exit_code), stopped, ..RowVerdict::default() },
+                );
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
                 // The conversation may have been deleted while the process ran;
                 // don't leave an orphaned row (no FK from messages → threads).
@@ -3147,13 +3242,10 @@ impl ChatEngine {
             // Discovery may have started servers or seen one fail: the
             // Companion's chips re-read their status.
             let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
-            for t in discovered {
-                tools.push(LlmTool {
-                    name: t.namespaced,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                });
-            }
+            // In `mcp::sort_tools` order (server, then tool): the same config
+            // gives the same tool bytes on every turn, so the provider's
+            // prompt cache, which starts at the tool list, survives.
+            tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
         }
 
         let mut usage = TurnUsage::default();
@@ -3608,6 +3700,12 @@ impl ChatEngine {
                 // Absolute cwd a run_command executed in (shared shell), captured
                 // so its card can show the cwd badge. Empty for other tools.
                 let mut run_command_cwd = String::new();
+                // The shared shell's exit status, for the row's verdict.
+                let mut run_command_exit: Option<i32> = None;
+                // Stop interrupted the command: it reads as stopped.
+                let mut interrupted = false;
+                // Not run: denied at its card, or its MCP server is off here.
+                let mut was_denied = denied.is_some();
 
                 // Route MCP tools (`mcp__server__tool`) to their server; all
                 // other names are built-in workspace tools. MCP calls run off
@@ -3616,6 +3714,9 @@ impl ChatEngine {
                 // A sub-agent's outcome was collected in the fan-out; its
                 // meta rides on the persisted tool row (`agent` key).
                 let mut agent_meta: Option<AgentOutcome> = None;
+                // An MCP result whose binary payloads the model reads as
+                // placeholders: the original, kept on the row for recall.
+                let mut mcp_original: Option<String> = None;
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
@@ -3636,7 +3737,9 @@ impl ChatEngine {
                     // The list as it is now, not at the turn's start: a server
                     // turned off mid-turn stops here, one turned back on runs.
                     // (A call to a server not offered this turn can still be
-                    // copied from an earlier turn's history.)
+                    // copied from an earlier turn's history.) The user's own
+                    // setting refused it: its row reads as denied.
+                    was_denied = true;
                     (refusal, false)
                 } else if crate::mcp::is_mcp_tool(&u.name) {
                     // Bounded, and a timeout STOPS the server so the call can
@@ -3650,7 +3753,10 @@ impl ChatEngine {
                     )
                     .await
                     {
-                        Ok(out) => (out, true),
+                        Ok(out) => {
+                            mcp_original = out.original;
+                            (out.text, true)
+                        }
                         Err(e) => (e, false),
                     }
                 } else if u.name == "run_command" && self.talk_shell.available() && sandbox_roots.is_none() {
@@ -3684,6 +3790,7 @@ impl ChatEngine {
                             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                                 if cancel.load(Ordering::Relaxed) {
                                     self.talk_shell.interrupt(&request.thread_id);
+                                    interrupted = true;
                                 }
                             }
                         }
@@ -3693,6 +3800,7 @@ impl ChatEngine {
                             // Record where it ran (absolute) so the card shows the
                             // cwd badge, matching `$`-direct.
                             run_command_cwd = r.cwd.clone();
+                            run_command_exit = Some(r.exit_code);
                             // Keep the composer's cwd badge accurate if the agent
                             // `cd`'d the shared shell.
                             if !r.cwd.is_empty() {
@@ -3785,12 +3893,13 @@ impl ChatEngine {
                 } else {
                     input_for_display
                 };
-                let mut tool_record = serde_json::json!({
-                    "callId": u.id,
-                    "toolName": u.name,
-                    "toolInput": display_input,
-                    "result": result,
-                });
+                let mut tool_record = tool_row(
+                    &u.id,
+                    &u.name,
+                    display_input,
+                    &result,
+                    RowVerdict { ok, denied: was_denied, exit_code: run_command_exit, stopped: interrupted },
+                );
                 if let Some(meta) = &agent_meta {
                     // Report already sits in `result`; the meta is what the
                     // card's collapsed summary shows (tokens, cost, ending).
@@ -3808,6 +3917,7 @@ impl ChatEngine {
                     .lock()
                     .chat_thread_exists(&request.thread_id)
                     .unwrap_or(true);
+                let mut row_id: Option<i64> = None;
                 if thread_alive {
                     match self.insert_and_emit_message(
                         &app,
@@ -3820,20 +3930,34 @@ impl ChatEngine {
                         // The saved run points at its row so a continuation
                         // can rewrite the report in place.
                         Ok(id) if is_agent => {
+                            row_id = Some(id);
                             if let Err(e) = self.db.lock().set_chat_agent_run_message(&u.id, id) {
                                 tracing::warn!(error = %e, "failed to link sub-agent run to its row");
                             }
                         }
-                        Ok(_) => {}
+                        Ok(id) => {
+                            row_id = Some(id);
+                            // The row's `result` is what the model, the card
+                            // and later turns read. The original goes to its
+                            // own table, capped, for recall only: the webview
+                            // never receives it.
+                            if let Some(original) = mcp_original.take() {
+                                if let Err(e) = self.db.lock().set_chat_tool_original(id, &request.thread_id, &original) {
+                                    tracing::warn!(error = %e, "failed to keep the original MCP output for recall");
+                                }
+                            }
+                        }
                         Err(e) => {
                             tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
                         }
                     }
                 }
 
+                // The row keeps the whole result; an MCP result is capped
+                // in the copy the next round carries.
                 tool_results.push(LlmToolResult {
                     tool_use_id: u.id.clone(),
-                    content: result,
+                    content: crate::chat_history::tool_result_for_model(&u.name, result, row_id),
                     is_error: false,
                 });
             }
@@ -4760,6 +4884,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_workspace_delete_lets_its_conversations_ask_again() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+
+        engine.cancel_workspace("w1", &["t1".to_string()]);
+        assert!(!engine.approvals.admits("w1"));
+        let failed: AppResult<()> = Err(AppError::Other("database is locked".into()));
+        assert!(engine.finish_workspace_delete("w1", failed).is_err(), "the error still reaches the caller");
+        assert!(engine.approvals.admits("w1"), "the workspace stays, and so may its cards");
+
+        engine.cancel_workspace("w2", &[]);
+        assert!(engine.finish_workspace_delete("w2", Ok(())).is_ok());
+        assert!(!engine.approvals.admits("w2"), "a deleted workspace stays retired");
+    }
+
+    #[test]
     fn approval_decision_parse() {
         assert_eq!(ApprovalDecision::parse("approve"), ApprovalDecision::Approve);
         assert_eq!(ApprovalDecision::parse("always"), ApprovalDecision::ApproveAlways);
@@ -4915,6 +5056,83 @@ mod login_path_tests {
         assert_eq!(format_command_output("nope", 1), "nope\n(exit code 1)");
         assert_eq!(format_command_output("", 0), "(exit code 0)");
     }
+
+    #[test]
+    fn a_tool_row_records_how_the_call_ended() {
+        let row = || serde_json::json!({ "callId": "c1", "toolName": "run_command", "result": "x" });
+        let v = |ok, denied, exit_code, stopped| RowVerdict { ok, denied, exit_code, stopped };
+
+        let mut passed = row();
+        stamp_outcome(&mut passed, v(true, false, Some(0), false));
+        assert_eq!(passed["ok"], true);
+        assert_eq!(passed["outcome"], "ok");
+        assert_eq!(passed["exitCode"], 0);
+        assert!(passed.get("reason").is_none());
+
+        let mut failed = row();
+        stamp_outcome(&mut failed, v(false, false, Some(101), false));
+        assert_eq!(failed["ok"], false);
+        assert_eq!(failed["outcome"], "failed");
+        assert_eq!(failed["exitCode"], 101);
+
+        // A denial is its own verdict, never a pass, whatever `ok` said.
+        let mut denied = row();
+        stamp_outcome(&mut denied, v(true, true, None, false));
+        assert_eq!(denied["ok"], false);
+        assert_eq!(denied["outcome"], "denied");
+        assert!(denied.get("exitCode").is_none());
+
+        // The shell's -1 means "no status" (an interrupt, a busy shell).
+        let mut interrupted = row();
+        stamp_outcome(&mut interrupted, v(false, false, Some(-1), false));
+        assert_eq!(interrupted["outcome"], "failed");
+        assert!(interrupted.get("exitCode").is_none());
+
+        // The keys are additive: the row keeps everything it had.
+        assert_eq!(interrupted["callId"], "c1");
+        assert_eq!(interrupted["result"], "x");
+    }
+
+    #[test]
+    fn what_each_call_site_persists_reads_its_verdict() {
+        // `$`-direct, stopped by the user while it ran: the row the live
+        // streamer writes reads as stopped, with SIGINT's 130 kept as data.
+        let input = serde_json::json!({ "command": "npm run dev", "cwd": "packages/api" });
+        let stopped = tool_row(
+            "shell-7",
+            "run_command",
+            input.clone(),
+            "ready on :3000\n^C\n(exit code 130)",
+            RowVerdict { ok: false, exit_code: Some(130), stopped: true, ..RowVerdict::default() },
+        );
+        assert_eq!(stopped["callId"], "shell-7");
+        assert_eq!(stopped["toolName"], "run_command");
+        assert_eq!(stopped["toolInput"], input, "the cwd badge's input is kept as is");
+        assert_eq!((stopped["outcome"].as_str(), stopped["reason"].as_str()), (Some("failed"), Some("stopped")));
+        assert_eq!(stopped["exitCode"], 130);
+
+        // The agent loop's MCP call to a server turned off in the conversation.
+        let refused = tool_row(
+            "toolu_1",
+            "mcp__docs__search",
+            serde_json::json!({ "q": "x" }),
+            &crate::chat_agents::mcp_off_refusal("mcp__docs__search", &["docs".to_string()].into_iter().collect()).unwrap(),
+            RowVerdict { denied: true, ..RowVerdict::default() },
+        );
+        assert_eq!(refused["outcome"], "denied");
+        assert!(refused.get("reason").is_none() && refused.get("exitCode").is_none());
+
+        // A command that passed carries no reason even if a stop raced it.
+        let passed = tool_row(
+            "toolu_2",
+            "run_command",
+            serde_json::json!({ "command": "true" }),
+            "(exit code 0)",
+            RowVerdict { ok: true, exit_code: Some(0), stopped: true, ..RowVerdict::default() },
+        );
+        assert_eq!(passed["outcome"], "ok");
+        assert!(passed.get("reason").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -4924,7 +5142,7 @@ mod director_reliability_tests {
     #[test]
     fn a_journal_line_becomes_a_player_label() {
         assert_eq!(
-            notice_label(&retry_notice(2, 4, ProviderErrorKind::RateLimit)),
+            notice_label(&retry_notice(2, 5, 4, ProviderErrorKind::RateLimit)),
             "Rate limit reached — retrying in 4s (retry 2 of 5)"
         );
         assert_eq!(

@@ -300,8 +300,10 @@ pub async fn interruptible_sleep(secs: u64, cancel: &AtomicBool) -> bool {
 /// the connection gets [`LOCAL_CONNECT_RETRIES`] retry, then fails with the
 /// message that it isn't reachable. The backoff is interruptible:
 /// a raised `cancel` aborts the wait and surfaces the last error so the stage
-/// lands in the normal halt/abort flow. `on_retry(attempt, delay_secs, kind)`
-/// is invoked before each wait so callers can narrate it into the run journal.
+/// lands in the normal halt/abort flow. `on_retry(attempt, of, delay_secs,
+/// kind)` is invoked before each wait so callers can narrate it into the run
+/// journal; `of` is this failure's retry budget (`max_retries`, or
+/// [`LOCAL_CONNECT_RETRIES`] for a local server that refuses).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_with_retry(
     provider: &dyn LlmProvider,
@@ -311,7 +313,7 @@ pub async fn complete_with_retry(
     client: &reqwest::Client,
     cancel: &AtomicBool,
     max_retries: u32,
-    on_retry: &mut (dyn FnMut(u32, u64, ProviderErrorKind) + Send),
+    on_retry: &mut (dyn FnMut(u32, u32, u64, ProviderErrorKind) + Send),
 ) -> AppResult<LlmResponse> {
     let mut attempt: u32 = 0;
     let local = is_loopback_base(api_base);
@@ -336,7 +338,7 @@ pub async fn complete_with_retry(
                 let delay = retry_after
                     .unwrap_or_else(|| backoff_secs(attempt))
                     .min(RETRY_MAX_DELAY_SECS);
-                on_retry(attempt, delay, kind);
+                on_retry(attempt, budget, delay, kind);
                 if !interruptible_sleep(delay, cancel).await {
                     // A stop landed mid-backoff — don't keep retrying.
                     return Err(e);
@@ -346,13 +348,11 @@ pub async fn complete_with_retry(
     }
 }
 
-/// The journal/turn line for one retry wait: the same words wherever a
-/// provider call is retried (sub-agents, Direct stages, the Talk director).
-pub fn retry_notice(attempt: u32, delay_secs: u64, kind: ProviderErrorKind) -> String {
-    format!(
-        "{} — retrying in {delay_secs}s (retry {attempt} of {DEFAULT_MAX_RETRIES})",
-        kind.label()
-    )
+/// The journal/turn line for retry `attempt` of `of` (the budget
+/// `complete_with_retry` reports): the same words wherever a provider call
+/// is retried (sub-agents, Direct stages, the Talk director).
+pub fn retry_notice(attempt: u32, of: u32, delay_secs: u64, kind: ProviderErrorKind) -> String {
+    format!("{} — retrying in {delay_secs}s (retry {attempt} of {of})", kind.label())
 }
 
 /// How often a request raced against a cancel flag looks at the flag: short
@@ -407,13 +407,13 @@ pub async fn complete_cancellable(
     client: &reqwest::Client,
     cancel: &AtomicBool,
     max_retries: u32,
-    on_retry: &mut (dyn FnMut(u32, u64, ProviderErrorKind) + Send),
+    on_retry: &mut (dyn FnMut(u32, u32, u64, ProviderErrorKind) + Send),
 ) -> Completion {
     let mut retries = 0u32;
     let outcome = {
-        let mut counting = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+        let mut counting = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
             retries = attempt;
-            on_retry(attempt, delay, kind);
+            on_retry(attempt, of, delay, kind);
         };
         or_cancelled(
             complete_with_retry(provider, api_base, api_key, req, client, cancel, max_retries, &mut counting),

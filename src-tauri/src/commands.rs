@@ -1619,7 +1619,10 @@ pub async fn delete_workspace(
     // Remove from DB. The row's runs cascade-delete without a run:// event, so
     // a paused one would keep the Dock badge counting it: refresh it now.
     let db_path = state.db.lock().conn_ref_path(&workspace_id).ok().flatten();
-    state.db.lock().delete_workspace(&workspace_id)?;
+    // If the row can't go, the workspace stays: reinstate it in the approval
+    // broker, so its next approval card isn't denied unseen.
+    let deleted = state.db.lock().delete_workspace(&workspace_id);
+    state.chat.finish_workspace_delete(&workspace_id, deleted)?;
     crate::fleet_status::refresh_later(&app);
 
     // Its sandbox build caches go with it, unless another workspace still
@@ -1830,7 +1833,7 @@ pub async fn run_shell_command(
 /// then sees the command exit and resolves its card.
 #[tauri::command]
 pub async fn stop_shell_command(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
-    state.chat.talk_shell.interrupt(&thread_id);
+    state.chat.stop_shell(&thread_id);
     Ok(())
 }
 
