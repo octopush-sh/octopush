@@ -822,7 +822,7 @@ pub async fn run_agentic_loop(
             // history are re-sent every iteration — cache the stable prefix.
             cache: true,
         };
-        // Transient failures (rate limit, overload, 5xx, dropped connection) are
+        // Transient failures (rate limit, overload, 5xx, a connection that never opened) are
         // retried in place with backoff — the accumulated message history is
         // preserved, so a momentary blip never costs the stage its work or forces
         // a halt. Each wait is narrated into the journal.

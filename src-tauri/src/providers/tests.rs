@@ -1477,8 +1477,8 @@ mod retry {
 
 mod cancellable {
     use super::super::{
-        anthropic::AnthropicProvider, complete_cancellable, final_failure_text, retry_notice, Completion, LlmProvider,
-        LlmRequest, LlmResponse, LlmStopReason,
+        anthropic::AnthropicProvider, client_for, complete_cancellable, final_failure_text, is_loopback_base, retry_notice,
+        Completion, LlmProvider, LlmRequest, LlmResponse, LlmStopReason, DEFAULT_MAX_RETRIES, LOCAL_CONNECT_RETRIES,
     };
     use crate::error::{AppError, AppResult, ProviderErrorKind};
     use std::collections::VecDeque;
@@ -1591,7 +1591,7 @@ mod cancellable {
         assert_eq!(p.calls.load(Ordering::SeqCst), 2);
         assert_eq!(*retries.lock().unwrap(), vec![(1, 0, ProviderErrorKind::Overloaded)]);
         // The words the turn shows are the sub-agents' journal words.
-        assert_eq!(retry_notice(1, 8, ProviderErrorKind::Overloaded), "model overloaded — retrying in 8s (attempt 1 of 5)");
+        assert_eq!(retry_notice(1, 8, ProviderErrorKind::Overloaded), "model overloaded — retrying in 8s (retry 1 of 5)");
     }
 
     #[tokio::test]
@@ -1657,49 +1657,156 @@ mod cancellable {
         assert_eq!(final_failure_text(&error, n), error.to_string());
     }
 
-    /// A server that accepts connections and reads the request, then never
-    /// answers: a proxy holding a dead upstream, or a peer gone silent.
-    async fn silent_server() -> String {
-        use tokio::io::AsyncReadExt;
+    /// What a test server does once it has read the request head.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// Never answers: a proxy holding a dead upstream, a peer gone silent.
+        Nothing,
+        /// Sends the head and part of the body, then goes silent.
+        PartThenSilence,
+        /// Sends the head and part of the body, then closes the connection.
+        PartThenClose,
+    }
+
+    /// A local test server, and the address to resolve a REMOTE-looking host
+    /// to it (`remote_client`): the stall guards and the retry rules under
+    /// test apply to remote providers, and a loopback base would get the
+    /// loopback client instead.
+    async fn test_server(reply: Reply) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 tokio::spawn(async move {
+                    let mut seen = Vec::new();
                     let mut buf = [0u8; 8192];
-                    while sock.read(&mut buf).await.map(|n| n > 0).unwrap_or(false) {}
+                    while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => seen.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if !matches!(reply, Reply::Nothing) {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4000\r\n\r\n{\"content\":[{\"type\":\"text\",";
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.flush().await;
+                    }
+                    if matches!(reply, Reply::PartThenClose) {
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                 });
             }
         });
-        format!("http://{addr}")
+        addr
+    }
+
+    /// The production stall guards with a short idle bound (the real one is
+    /// `LLM_READ_TIMEOUT`), with `llm.test` resolved to `addr`.
+    fn remote_client(addr: std::net::SocketAddr) -> reqwest::Client {
+        crate::tls::with_stall_guards(reqwest::Client::builder().no_proxy().resolve("llm.test", addr), Duration::from_millis(300))
+            .build()
+            .unwrap()
+    }
+
+    async fn send(client: &reqwest::Client, base: &str) -> AppError {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            AnthropicProvider.complete(base, Some("key"), &super::sample_request(), client),
+        )
+        .await
+        .expect("the request must end")
+        .expect_err("no full answer means an error")
     }
 
     #[tokio::test]
-    async fn a_silent_connection_times_out_as_a_retryable_network_error() {
-        let base = silent_server().await;
-        // The production guards with a short idle bound (the real one is
-        // `LLM_READ_TIMEOUT`, sized for long answers).
-        let client = crate::tls::with_stall_guards(reqwest::Client::builder().no_proxy(), Duration::from_millis(300))
-            .build()
-            .unwrap();
+    async fn a_read_timeout_after_the_request_went_out_is_final() {
+        let addr = test_server(Reply::Nothing).await;
+        let (client, base) = (remote_client(addr), format!("http://llm.test:{}", addr.port()));
         let started = Instant::now();
-        let res = tokio::time::timeout(
-            Duration::from_secs(10),
-            AnthropicProvider.complete(&base, Some("key"), &super::sample_request(), &client),
-        )
-        .await
-        .expect("the idle bound must end the request");
-        let err = res.expect_err("no answer means an error");
-        assert_eq!(err.transient_retry().map(|(k, _)| k), Some(ProviderErrorKind::Network), "{err}");
+        let err = send(&client, &base).await;
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(err.transient_retry(), None, "never retried: {err}");
+        let text = err.to_string();
+        assert!(text.contains("no answer before the read timeout"), "{text}");
+        assert!(text.contains("It was not retried"), "{text}");
 
-        // Through the director's call it is retried like any dropped
-        // connection, then reported clearly.
+        // The director's call returns it at once, with no retry.
         let cancel = AtomicBool::new(false);
-        let (out, _) = call(&AnthropicProvider, &client, &base, &cancel, 0).await;
-        assert!(
-            matches!(out, Completion::Failed { ref error, retries: 0 } if error.transient_retry().is_some()),
-            "{out:?}"
-        );
+        let (out, retries) = call(&AnthropicProvider, &client, &base, &cancel, 5).await;
+        assert!(matches!(out, Completion::Failed { retries: 0, .. }), "{out:?}");
+        assert!(retries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_answer_cut_off_mid_body_is_not_a_json_error_and_is_final() {
+        for (reply, how) in [(Reply::PartThenClose, "was lost"), (Reply::PartThenSilence, "went silent")] {
+            let addr = test_server(reply).await;
+            let err = send(&remote_client(addr), &format!("http://llm.test:{}", addr.port())).await;
+            let text = err.to_string();
+            assert!(!text.contains("JSON parse error"), "{text}");
+            assert!(text.contains(&format!("the connection {how} while the answer was arriving")), "{text}");
+            assert!(text.contains("It was not retried"), "{text}");
+            assert_eq!(err.transient_retry(), None, "{text}");
+        }
+    }
+
+    /// A port nothing listens on.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_to_a_remote_provider_is_retryable() {
+        let port = closed_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let err = send(&remote_client(addr), &format!("http://llm.test:{port}")).await;
+        assert_eq!(err.transient_retry().map(|(k, _)| k), Some(ProviderErrorKind::Network), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_local_server_that_is_not_running_fails_fast_and_says_so() {
+        let base = format!("http://127.0.0.1:{}", closed_port());
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        let (out, retries) = call(&AnthropicProvider, &reqwest::Client::new(), &base, &cancel, DEFAULT_MAX_RETRIES).await;
+        // One retry after a 2s wait, not five over about a minute.
+        assert!(started.elapsed() < Duration::from_secs(6), "took {:?}", started.elapsed());
+        assert_eq!(retries.lock().unwrap().len(), LOCAL_CONNECT_RETRIES as usize);
+        let (error, n) = match out {
+            Completion::Failed { error, retries } => (error, retries),
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert_eq!(n, 1);
+        let text = final_failure_text(&error, n);
+        assert!(text.starts_with(&format!("The model server on this Mac at {base} isn't reachable. Is it running?")), "{text}");
+        assert_eq!(text, error.to_string(), "shown as it is, with no \"still failing\" prefix");
+    }
+
+    #[test]
+    fn loopback_bases_are_recognised_by_their_url() {
+        for base in [
+            "http://localhost:11434/v1",
+            "http://LOCALHOST:1234",
+            "http://ollama.localhost:11434",
+            "http://127.0.0.1:8080/v1",
+            "http://127.1.2.3",
+            "http://[::1]:11434/v1",
+            " http://localhost:4000/anthropic ",
+        ] {
+            assert!(is_loopback_base(base), "{base}");
+        }
+        for base in ["https://api.anthropic.com", "http://192.168.1.10:11434", "http://localhost.example.com", "not a url", ""] {
+            assert!(!is_loopback_base(base), "{base}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_base_gets_the_client_with_no_read_bound() {
+        let remote = reqwest::Client::new();
+        assert!(std::ptr::eq(client_for("http://localhost:11434/v1", &remote), crate::tls::local_llm_client()));
+        assert!(std::ptr::eq(client_for("https://api.anthropic.com", &remote), &remote));
     }
 }

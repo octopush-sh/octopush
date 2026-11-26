@@ -1707,7 +1707,8 @@ pub(crate) fn execute_tool_cancellable(
 /// on every call. Built by `tls::llm_client`, so it carries the
 /// compromised-key denylist like every other Octopush client, plus a connect
 /// bound, an idle read bound and TCP keep-alive: a dropped connection fails
-/// (and is retried) instead of hanging a turn forever.
+/// instead of hanging a turn forever. (A model server on this Mac gets the
+/// loopback client instead: `providers::client_for`.)
 static SHARED_HTTP: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
 
 pub(crate) fn shared_http_client() -> &'static Client {
@@ -2071,11 +2072,12 @@ impl ChatEngine {
         });
     }
 
-    /// One director request: transient failures (429, 529, 5xx, a dropped
-    /// or timed-out connection) are retried with the sub-agents' backoff and
-    /// `retry-after` handling, each wait shown on the Player, and the whole
-    /// call is raced against the turn's cancel flag, so Stop abandons the
-    /// request in flight instead of waiting for (and paying for) its answer.
+    /// One director request: transient failures (429, 529, 5xx, a connection
+    /// that couldn't be opened) are retried with the sub-agents' backoff and
+    /// `retry-after` handling, each wait shown on the Player; a request that
+    /// went out and got no answer is never sent again (`request_error`). The
+    /// whole call is raced against the turn's cancel flag, so Stop abandons
+    /// the request in flight instead of waiting for its answer.
     #[allow(clippy::too_many_arguments)]
     async fn director_call(
         &self,
@@ -4610,7 +4612,7 @@ mod director_reliability_tests {
     fn a_journal_line_becomes_a_player_label() {
         assert_eq!(
             notice_label(&retry_notice(2, 4, ProviderErrorKind::RateLimit)),
-            "Rate limit reached — retrying in 4s (attempt 2 of 5)"
+            "Rate limit reached — retrying in 4s (retry 2 of 5)"
         );
         assert_eq!(
             notice_label(&throttle_notice(20)),
@@ -4624,7 +4626,7 @@ mod director_reliability_tests {
         let v = serde_json::to_value(TurnNoticeEvent {
             workspace_id: "ws".into(),
             thread_id: "t".into(),
-            text: "Model overloaded — retrying in 2s (attempt 1 of 5)".into(),
+            text: "Model overloaded — retrying in 2s (retry 1 of 5)".into(),
             delay_secs: 2,
         })
         .unwrap();
