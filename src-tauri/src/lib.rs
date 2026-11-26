@@ -45,6 +45,7 @@ pub mod skills;
 mod state;
 pub mod sync;
 pub mod talk_checkpoints;
+pub mod talk_guard;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
@@ -290,6 +291,7 @@ pub fn run() {
             commands::undo_talk_rewind,
             commands::fork_chat_thread,
             commands::list_skills,
+            commands::list_skipped_skills,
             commands::list_subagent_types,
             commands::read_attachment,
             commands::list_mcp_tools,

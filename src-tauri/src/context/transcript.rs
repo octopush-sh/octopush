@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::chat_history::{
-    abridge_context, excerpt_head_tail, recall_hint, strip_tool_calls_suffix, summarize_tool_row, TOOL_RESULT_SETTLED,
+    abridge_context, excerpt_head_tail, mark_untrusted, recall_hint, strip_tool_calls_suffix, summarize_tool_row,
+    TOOL_RESULT_SETTLED,
 };
 use crate::context::budget::CHARS_PER_TOKEN;
 use crate::providers::{LlmContent, LlmMessage, LlmResponse, LlmRole, LlmToolResult, LlmToolUse};
@@ -119,16 +120,25 @@ pub fn view_cap(window: u64) -> usize {
 /// result is written: at most [`view_cap`] (and the MCP cap for an MCP tool),
 /// head and tail, with the row that recalls the rest. A recall is already
 /// the model's own window onto a stored output (`offset`/`limit`), so it goes
-/// out as it came. A pure function of its inputs; the row keeps the result.
-pub fn model_view(tool: &str, result: &str, row: Option<i64>, window: u64) -> String {
-    if tool == crate::chat_engine::RECALL_TOOL_NAME {
-        return result.to_string();
+/// out as it came. `mark` is the tool the output came from: the capped text
+/// goes under its untrusted header, with forged records and marks in it
+/// neutralized (`chat_history::mark_untrusted`, #1147). `None` for a denial
+/// or refusal, which is Octopush's own text. A pure function of its inputs;
+/// the row keeps the result, mark and all, so the mark is byte-stable too.
+pub fn model_view(tool: &str, result: &str, row: Option<i64>, window: u64, mark: Option<&str>) -> String {
+    let capped = if tool == crate::chat_engine::RECALL_TOOL_NAME {
+        result.to_string()
+    } else {
+        let mut cap = view_cap(window);
+        if crate::mcp::is_mcp_tool(tool) {
+            cap = cap.min(crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES);
+        }
+        excerpt_head_tail(result, cap, &row.map(recall_hint).unwrap_or_default())
+    };
+    match mark {
+        Some(source) => mark_untrusted(source, &capped),
+        None => capped,
     }
-    let mut cap = view_cap(window);
-    if crate::mcp::is_mcp_tool(tool) {
-        cap = cap.min(crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES);
-    }
-    excerpt_head_tail(result, cap, &row.map(recall_hint).unwrap_or_default())
 }
 
 /// Each answered call's stored row, by its tool_use id: the row a context
@@ -395,13 +405,13 @@ mod tests {
         assert_eq!(view_cap(8_000), VIEW_MIN_CHARS);
         assert_eq!(view_cap(1_000_000), VIEW_MAX_CHARS);
         let big = format!("HEAD{}TAIL", "x".repeat(200_000));
-        let view = model_view("read_file", &big, Some(7), 200_000);
+        let view = model_view("read_file", &big, Some(7), 200_000, None);
         assert!(view.len() <= 35_000 + 120 && view.starts_with("HEAD") && view.ends_with("TAIL"), "{}", view.len());
         assert!(view.contains("chars omitted — call recall_tool_output with message_id 7 for the full output]"));
-        assert_eq!(view, model_view("read_file", &big, Some(7), 200_000), "pure");
+        assert_eq!(view, model_view("read_file", &big, Some(7), 200_000, None), "pure");
         // An MCP result keeps the MCP cap; a recall goes out as it came.
-        assert!(model_view("mcp__docs__search", &big, Some(7), 1_000_000).len() <= crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES + 120);
-        assert_eq!(model_view("recall_tool_output", &big, Some(7), 200_000), big);
-        assert_eq!(model_view("run_command", "ok", Some(7), 200_000), "ok");
+        assert!(model_view("mcp__docs__search", &big, Some(7), 1_000_000, None).len() <= crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES + 120);
+        assert_eq!(model_view("recall_tool_output", &big, Some(7), 200_000, None), big);
+        assert_eq!(model_view("run_command", "ok", Some(7), 200_000, None), "ok");
     }
 }

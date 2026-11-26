@@ -3225,6 +3225,7 @@ mod agentic_loop_tests {
                     cache_creation_tokens: 0,
                     rate_limit: None,
                     raw_content: vec![],
+                    ..Default::default()
                 },
                 LlmResponse {
                     text: "All done.".into(),
@@ -3236,6 +3237,7 @@ mod agentic_loop_tests {
                     cache_creation_tokens: 0,
                     rate_limit: None,
                     raw_content: vec![],
+                    ..Default::default()
                 },
             ]),
         };
@@ -13377,7 +13379,7 @@ mod live_tests {
     fn resp(text: &str, tools: Vec<LlmToolUse>, stop: LlmStopReason) -> LlmResponse {
         LlmResponse { text: text.into(), tool_uses: tools, stop_reason: stop,
             input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0,
-            rate_limit: None, raw_content: vec![] }
+            rate_limit: None, raw_content: vec![], ..Default::default() }
     }
 
     #[tokio::test]
@@ -15371,6 +15373,7 @@ mod ai_token_event_tests {
             cache_creation_tokens: 700,
             rate_limit: None,
             raw_content: vec![],
+            ..Default::default()
         }
     }
 
@@ -29949,8 +29952,12 @@ mod project_instructions_tests {
         // A workspace that isn't there.
         let gone = load(&ws.path().join("missing"), None);
         assert!(gone.files.iter().all(|f| f.skipped.is_some()) && gone.section.is_empty());
-        // The director's prompt is then exactly its base.
-        assert_eq!(director_system_prompt(Some("Base.".into()), "/repo", &got.section, None), "Base.");
+        // The director's prompt is then exactly its base and the
+        // untrusted-output note (#1147).
+        assert_eq!(
+            director_system_prompt(Some("Base.".into()), "/repo", &got.section, None),
+            format!("Base.{}", crate::chat_history::UNTRUSTED_OUTPUT_NOTE)
+        );
     }
 
     #[test]
@@ -30018,10 +30025,333 @@ mod project_instructions_tests {
         write(&ws.path().join("CLAUDE.md"), "Never write italics.");
         let got = load(ws.path(), None);
         let p = director_system_prompt(None, "/repo", &got.section, Some("\n\nAUTO DOCTRINE"));
-        let at = positions(&p, &["helpful coding assistant", "# Project instructions", "Never write italics.", "AUTO DOCTRINE"]);
+        let at = positions(&p, &["helpful coding assistant", "# Project instructions", "Never write italics.", "AUTO DOCTRINE", "[untrusted output from"]);
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{p}");
         // A request's own prompt is followed by them too.
         let own = director_system_prompt(Some("Custom.".into()), "/repo", &got.section, None);
         assert!(own.starts_with("Custom.") && own.contains("Never write italics."), "{own}");
+    }
+}
+
+#[cfg(test)]
+mod skills_containment_tests {
+    //! The skills and agents readers keep a project's files to the project
+    //! and bound their reads (#1182). Every test hands the readers a temp
+    //! home: none reads the real `~/.claude`.
+    use crate::request_context::{agents_item, skills_item, MAX_MEMORY_FILE_BYTES};
+    use crate::skills::agents::scan_agent_files_in;
+    use crate::skills::{
+        referenced_skills_in, scan_skills_in, skill_prompt_section, skill_prompt_section_with, Skill, SkippedDefinition,
+        SKILLS_CAP_BYTES,
+    };
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn mkdir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    fn skill(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: d\n---\n{name} body")
+    }
+
+    fn agent(name: &str) -> String {
+        format!("---\nname: {name}\ndescription: d\n---\n{name} body")
+    }
+
+    /// A project that is its own git work tree.
+    fn repo() -> TempDir {
+        let t = TempDir::new().unwrap();
+        mkdir(&t.path().join(".git"));
+        t
+    }
+
+    fn skill_names(project: &Path, home: &Path) -> Vec<String> {
+        scan_skills_in(project, Some(home)).found.into_iter().map(|s| s.name).collect()
+    }
+
+    fn reasons(skipped: &[SkippedDefinition]) -> Vec<(&str, &str)> {
+        skipped.iter().map(|s| (s.label.as_str(), s.reason.as_str())).collect()
+    }
+
+    fn mkfifo(path: &Path) {
+        mkdir(path.parent().unwrap());
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// A valid definition named `name`, padded past 4 MiB: only the size
+    /// check keeps it from loading.
+    fn oversized(path: &Path, name: &str) {
+        write(path, &skill(name));
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(MAX_MEMORY_FILE_BYTES + 1).unwrap();
+    }
+
+    #[test]
+    fn a_symlinked_skill_md_that_leaves_the_project_is_skipped_unread() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("notes.md"), &skill("outside"));
+        mkdir(&project.path().join(".claude/skills/linked"));
+        symlink(outside.path().join("notes.md"), project.path().join(".claude/skills/linked/SKILL.md")).unwrap();
+        // A link that stays inside the project is followed.
+        write(&project.path().join("docs/review.md"), &skill("review"));
+        mkdir(&project.path().join(".claude/skills/review"));
+        symlink("../../../docs/review.md", project.path().join(".claude/skills/review/SKILL.md")).unwrap();
+
+        let scan = scan_skills_in(project.path(), Some(home.path()));
+        assert_eq!(scan.found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["review"]);
+        assert_eq!(reasons(&scan.skipped), [(".claude/skills/linked/SKILL.md", "outside the project")]);
+        assert_eq!(scan.skipped[0].name, "linked");
+        // "What every request carries" counts what the reader read.
+        assert_eq!(skills_item(project.path(), Some(home.path())).map(|i| i.count), Some(1));
+    }
+
+    #[test]
+    fn a_symlinked_skill_directory_that_leaves_the_project_is_skipped_unread() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("kit/SKILL.md"), &skill("kit"));
+        mkdir(&project.path().join(".claude/skills"));
+        symlink(outside.path().join("kit"), project.path().join(".claude/skills/kit")).unwrap();
+        // A linked directory inside the project is followed.
+        write(&project.path().join("shared/tidy/SKILL.md"), &skill("tidy"));
+        symlink(project.path().join("shared/tidy"), project.path().join(".claude/skills/tidy")).unwrap();
+
+        let scan = scan_skills_in(project.path(), Some(home.path()));
+        assert_eq!(scan.found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["tidy"]);
+        assert_eq!(reasons(&scan.skipped), [(".claude/skills/kit/SKILL.md", "outside the project")]);
+
+        // The whole skills directory linked out is skipped the same way.
+        let other = repo();
+        mkdir(&other.path().join(".claude"));
+        symlink(outside.path(), other.path().join(".claude/skills")).unwrap();
+        let scan = scan_skills_in(other.path(), Some(home.path()));
+        assert!(scan.found.is_empty(), "{:?}", scan.found);
+        assert_eq!(reasons(&scan.skipped), [(".claude/skills/kit/SKILL.md", "outside the project")]);
+    }
+
+    /// Following a link that stays in the project never relaxes the check on
+    /// the file itself: the final `SKILL.md` must resolve inside too.
+    #[test]
+    fn a_skill_directory_inside_the_project_whose_skill_md_links_out_is_skipped_unread() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("notes.md"), &skill("outside"));
+        // A plain directory in the project, and one reached by an in-project link.
+        mkdir(&project.path().join(".claude/skills/plain"));
+        symlink(outside.path().join("notes.md"), project.path().join(".claude/skills/plain/SKILL.md")).unwrap();
+        mkdir(&project.path().join("shared/kit"));
+        symlink(outside.path().join("notes.md"), project.path().join("shared/kit/SKILL.md")).unwrap();
+        symlink(project.path().join("shared/kit"), project.path().join(".claude/skills/kit")).unwrap();
+
+        let scan = scan_skills_in(project.path(), Some(home.path()));
+        assert!(scan.found.is_empty(), "{:?}", scan.found);
+        assert_eq!(
+            reasons(&scan.skipped),
+            [(".claude/skills/kit/SKILL.md", "outside the project"), (".claude/skills/plain/SKILL.md", "outside the project")]
+        );
+    }
+
+    #[test]
+    fn a_symlinked_agent_file_that_leaves_the_project_is_skipped_unread() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("notes.md"), &agent("outside"));
+        write(&project.path().join(".claude/agents/reviewer.md"), &agent("reviewer"));
+        symlink(outside.path().join("notes.md"), project.path().join(".claude/agents/linked.md")).unwrap();
+
+        let scan = scan_agent_files_in(project.path(), Some(home.path()));
+        assert_eq!(scan.found.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["reviewer"]);
+        assert_eq!(reasons(&scan.skipped), [(".claude/agents/linked.md", "outside the project")]);
+        assert_eq!(scan.skipped[0].name, "linked");
+        assert_eq!(agents_item(project.path(), Some(home.path())).map(|i| i.count), Some(1));
+    }
+
+    /// A FIFO is opened non-blocking and refused by its handle's type, in the
+    /// project and in home alike, so it can't hang a turn.
+    #[test]
+    fn a_fifo_in_place_of_a_skill_or_agent_never_blocks() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        mkfifo(&project.path().join(".claude/skills/pipe/SKILL.md"));
+        mkfifo(&project.path().join(".claude/agents/pipe.md"));
+        mkfifo(&home.path().join(".claude/agents/mine.md"));
+        let started = Instant::now();
+        let skills = scan_skills_in(project.path(), Some(home.path()));
+        let agents = scan_agent_files_in(project.path(), Some(home.path()));
+        assert!(skills.found.is_empty() && agents.found.is_empty());
+        // Not a regular file: nothing to read, nothing listed (as for CLAUDE.md).
+        assert!(skills.skipped.is_empty() && agents.skipped.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_oversized_skill_or_agent_is_skipped_unread() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        oversized(&project.path().join(".claude/skills/huge/SKILL.md"), "huge");
+        oversized(&project.path().join(".claude/agents/huge.md"), "huge");
+        // The user's own files are trusted, not unbounded.
+        oversized(&home.path().join(".claude/skills/mine/SKILL.md"), "mine");
+
+        let skills = scan_skills_in(project.path(), Some(home.path()));
+        assert!(skills.found.is_empty());
+        assert_eq!(
+            reasons(&skills.skipped),
+            [(".claude/skills/huge/SKILL.md", "over 4 MiB"), ("~/.claude/skills/mine/SKILL.md", "over 4 MiB")]
+        );
+        let agents = scan_agent_files_in(project.path(), Some(home.path()));
+        assert!(agents.found.is_empty());
+        assert_eq!(reasons(&agents.skipped), [(".claude/agents/huge.md", "over 4 MiB")]);
+    }
+
+    /// A project nested in an outer repository reaches only its own work
+    /// tree; a project in a subfolder of a repository reaches that repository.
+    #[test]
+    fn a_definition_reached_through_an_outer_repo_s_work_tree_is_skipped_unread() {
+        let home = TempDir::new().unwrap();
+        let tree = TempDir::new().unwrap();
+        let outer = tree.path().join("outer");
+        mkdir(&outer.join(".git"));
+        write(&outer.join("shared/kit/SKILL.md"), &skill("kit"));
+        write(&outer.join("shared/agent.md"), &agent("outer-agent"));
+        let inner = outer.join("inner");
+        mkdir(&inner.join(".git"));
+        mkdir(&inner.join(".claude/skills"));
+        mkdir(&inner.join(".claude/agents"));
+        symlink("../../../shared/kit", inner.join(".claude/skills/kit")).unwrap();
+        symlink(outer.join("shared/agent.md"), inner.join(".claude/agents/outer.md")).unwrap();
+
+        let skills = scan_skills_in(&inner, Some(home.path()));
+        assert!(skills.found.is_empty(), "{:?}", skills.found);
+        assert_eq!(reasons(&skills.skipped), [(".claude/skills/kit/SKILL.md", "outside the project")]);
+        let agents = scan_agent_files_in(&inner, Some(home.path()));
+        assert!(agents.found.is_empty(), "{:?}", agents.found);
+        assert_eq!(reasons(&agents.skipped), [(".claude/agents/outer.md", "outside the project")]);
+
+        // A subfolder with no `.git` of its own: the repository is its work tree.
+        let pkg = outer.join("pkg");
+        mkdir(&pkg.join(".claude/skills"));
+        symlink(outer.join("shared/kit"), pkg.join(".claude/skills/kit")).unwrap();
+        assert_eq!(skill_names(&pkg, home.path()), ["kit"]);
+    }
+
+    #[test]
+    fn the_user_s_own_skills_and_agents_still_load_and_may_link_anywhere() {
+        // A dotfiles repo in home: the user's own files stay trusted.
+        let home = TempDir::new().unwrap();
+        mkdir(&home.path().join(".git"));
+        let dotfiles = TempDir::new().unwrap();
+        write(&home.path().join(".claude/skills/mine/SKILL.md"), &skill("mine"));
+        write(&dotfiles.path().join("kit/SKILL.md"), &skill("linked-kit"));
+        symlink(dotfiles.path().join("kit"), home.path().join(".claude/skills/kit")).unwrap();
+        write(&home.path().join(".claude/agents/helper.md"), &agent("helper"));
+        write(&dotfiles.path().join("agent.md"), &agent("linked-agent"));
+        symlink(dotfiles.path().join("agent.md"), home.path().join(".claude/agents/linked.md")).unwrap();
+        // A cloned repo under that home: a link from it to the user's skill
+        // is still the repo's, and is skipped.
+        let project = home.path().join("code/repo");
+        mkdir(&project.join(".git"));
+        write(&project.join(".claude/skills/tests/SKILL.md"), &skill("tests"));
+        symlink(home.path().join(".claude/skills/mine"), project.join(".claude/skills/borrowed")).unwrap();
+
+        let skills = scan_skills_in(&project, Some(home.path()));
+        let got: Vec<(&str, &str)> = skills.found.iter().map(|s| (s.name.as_str(), s.source.as_str())).collect();
+        assert_eq!(got, [("linked-kit", "user"), ("mine", "user"), ("tests", "project")]);
+        assert_eq!(reasons(&skills.skipped), [(".claude/skills/borrowed/SKILL.md", "outside the project")]);
+        let agents = scan_agent_files_in(&project, Some(home.path()));
+        let got: Vec<(&str, &str)> = agents.found.iter().map(|d| (d.name.as_str(), d.source.as_str())).collect();
+        assert_eq!(got, [("helper", "user"), ("linked-agent", "user")]);
+        assert!(agents.skipped.is_empty(), "{:?}", agents.skipped);
+
+        // Home opened as a project, or a repo whose `.claude` links to
+        // `~/.claude`: those files are the user's, labelled and sourced so.
+        oversized(&home.path().join(".claude/skills/big/SKILL.md"), "big");
+        let linked = repo();
+        symlink(home.path().join(".claude"), linked.path().join(".claude")).unwrap();
+        for project in [home.path(), linked.path()] {
+            let scan = scan_skills_in(project, Some(home.path()));
+            let got: Vec<(&str, &str)> = scan.found.iter().map(|s| (s.name.as_str(), s.source.as_str())).collect();
+            assert_eq!(got, [("linked-kit", "user"), ("mine", "user")], "{project:?}");
+            assert_eq!(reasons(&scan.skipped), [("~/.claude/skills/big/SKILL.md", "over 4 MiB")], "{project:?}");
+            let agents = scan_agent_files_in(project, Some(home.path()));
+            assert!(agents.found.iter().all(|d| d.source == "user"), "{:?}", agents.found);
+        }
+    }
+
+    fn named(name: &str, body: String) -> Skill {
+        Skill { name: name.into(), description: String::new(), body, allowed_tools: None, source: "project".into() }
+    }
+
+    /// The skill bodies one turn carries share a cap: what fits goes whole,
+    /// the next is trimmed with a note, and the rest are left out with one.
+    #[test]
+    fn the_skills_one_turn_carries_share_a_size_cap() {
+        let small = named("small", "Be brief.".into());
+        assert_eq!(skill_prompt_section(&[small.clone()]), "\n\n# Skill: small\nBe brief.");
+
+        let first = named("first", "a".repeat(SKILLS_CAP_BYTES - 20_000));
+        let second = named("second", format!("HEAD{}TAIL", "b".repeat(50_000)));
+        let third = named("third", "c".repeat(5_000));
+        let section = skill_prompt_section(&[first, second, third, small]);
+        assert!(section.len() < SKILLS_CAP_BYTES + 2_000, "{}", section.len());
+        assert!(section.contains(&"a".repeat(SKILLS_CAP_BYTES - 20_000)), "the first skill goes whole");
+        let second_part = &section[section.find("# Skill: second").unwrap()..section.find("# Skill: third").unwrap()];
+        assert!(second_part.contains("[Trimmed:") && second_part.contains("HEAD") && second_part.contains("TAIL"));
+        let rest = &section[section.find("# Skill: third").unwrap()..];
+        assert!(!rest.contains("ccc") && !rest.contains("Be brief."), "{rest}");
+        assert_eq!(rest.matches("[Left out:").count(), 2, "{rest}");
+    }
+
+    /// The skills a message names share the budget in the order it names
+    /// them, not the catalogue's: a large skill whose name sorts first can't
+    /// crowd out one named before it.
+    #[test]
+    fn named_skills_share_the_budget_in_the_order_the_message_names_them() {
+        let home = TempDir::new().unwrap();
+        let project = repo();
+        let big = format!("---\nname: aaa-big\ndescription: d\n---\nBIG{}", "b".repeat(SKILLS_CAP_BYTES + 50_000));
+        write(&project.path().join(".claude/skills/aaa-big/SKILL.md"), &big);
+        write(&project.path().join(".claude/skills/zeta/SKILL.md"), &skill("zeta"));
+
+        let order = referenced_skills_in(project.path(), Some(home.path()), "/zeta first, then /aaa-big");
+        assert_eq!(order.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["zeta", "aaa-big"]);
+        let section = skill_prompt_section(&order);
+        let (zeta, big) = (section.find("# Skill: zeta").unwrap(), section.find("# Skill: aaa-big").unwrap());
+        assert!(zeta < big, "{}", &section[..200]);
+        assert!(section[zeta..big].contains("zeta body"));
+        assert!(section[big..].contains("[Trimmed:"));
+        // Named the other way round, the large one goes first.
+        let order = referenced_skills_in(project.path(), Some(home.path()), "/aaa-big and /zeta");
+        assert_eq!(order.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["aaa-big", "zeta"]);
+    }
+
+    /// The skill the request pins comes first and goes whole, outside the
+    /// budget the named skills share.
+    #[test]
+    fn a_pinned_skill_goes_first_and_whole_outside_the_budget() {
+        let pinned = named("pinned", format!("P{}", "p".repeat(SKILLS_CAP_BYTES + 50_000)));
+        // A single pinned skill over the cap is sent whole.
+        assert_eq!(skill_prompt_section_with(Some(&pinned), &[]), format!("\n\n# Skill: pinned\n{}", pinned.body));
+        // The named skills still share the whole budget after it, and the
+        // pinned one, named too, is not sent twice.
+        let other = named("other", "o".repeat(SKILLS_CAP_BYTES - 10_000));
+        let section = skill_prompt_section_with(Some(&pinned), &[other.clone(), pinned.clone()]);
+        assert!(section.starts_with("\n\n# Skill: pinned\n"));
+        assert!(section.contains(&pinned.body) && section.contains(&other.body));
+        assert_eq!(section.matches("# Skill: pinned").count(), 1);
+        assert!(!section.contains("[Trimmed:") && !section.contains("[Left out:"));
     }
 }

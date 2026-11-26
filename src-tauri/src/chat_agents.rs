@@ -189,6 +189,9 @@ pub fn subagent_system_prompt(
             prompt.push_str(&format!("\n\n# Agent: {}\n{}", d.name, d.body));
         }
     }
+    // Last (#1147): after the project's instructions and the definition,
+    // which can be the repository's text.
+    prompt.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
     prompt
 }
 
@@ -713,10 +716,11 @@ impl EventSink for ChatAgentSink {
 /// same "don't ask again" grant, same Stop-denies-all), labelled with the
 /// sub-agent so the user knows who is asking. Each request gets its own
 /// call id (`<agent call id>:<n>`) because one sub-agent may ask more than
-/// once. A denial is fed back as an error tool_result; nothing else is
-/// gated (reads, searches and edits stay ungated, as in the parent loop).
-/// A `run_command` that commits or pushes meets the secret guard's card
-/// first, which the grant never answers (#819).
+/// once. A denial is fed back as an error tool_result. A `run_command` that
+/// commits or pushes meets the secret guard's card first, which the grant
+/// never answers (#819). A file tool reaching outside the workspace asks as
+/// in the parent loop (`talk_guard`, #1147), and the grant never answers it
+/// either; reads, searches and edits inside the workspace stay ungated.
 pub struct SubagentGate {
     pub broker: Arc<ApprovalBroker>,
     pub app: AppHandle,
@@ -731,6 +735,10 @@ pub struct SubagentGate {
     /// may change external state (create an issue, post a comment), so it
     /// asks the user first — nobody is watching a sub-agent otherwise.
     pub mcp_writes: std::collections::HashSet<String>,
+    /// Where the file tools may go without asking: the workspace.
+    reach: crate::talk_guard::Reach,
+    /// The mission's sandbox refuses a write outside the workspace itself.
+    writes_confined: bool,
     seq: AtomicU64,
 }
 
@@ -745,8 +753,17 @@ impl SubagentGate {
             label: spec.call.description.clone(),
             workspace_path: spec.workspace_path.clone(),
             mcp_writes: std::collections::HashSet::new(),
+            reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
+            writes_confined: spec.sandbox_roots.is_some(),
             seq: AtomicU64::new(1),
         }
+    }
+
+    /// Let reads into the dependency folders a mission links from its
+    /// project (`root`, from the database) run without a card.
+    pub fn with_project_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.reach = crate::talk_guard::Reach::of_workspace(Path::new(&self.workspace_path), root.as_deref());
+        self
     }
 
     /// Gate the MCP tools among `discovered` that are not read-only.
@@ -757,11 +774,14 @@ impl SubagentGate {
 }
 
 /// The reason and denial for an MCP tool the server did not mark read-only.
-pub fn mcp_gate_texts(label: &str, tool: &str) -> (String, String) {
+/// `label` names the sub-agent that asks; the director's card has none.
+pub fn mcp_gate_texts(label: Option<&str>, tool: &str) -> (String, String) {
+    let reason = format!("MCP tool `{tool}` may change external state (its server does not mark it read-only)");
     (
-        format!(
-            "Sub-agent \u{201c}{label}\u{201d}: MCP tool `{tool}` may change external state (its server does not mark it read-only)"
-        ),
+        match label {
+            Some(label) => format!("Sub-agent \u{201c}{label}\u{201d}: {reason}"),
+            None => reason,
+        },
         format!(
             "Tool call not made — the user declined to approve `{tool}`. Continue without it, \
              use a read-only tool instead, or report what you could not do; do not retry it."
@@ -805,20 +825,21 @@ impl ToolGate for SubagentGate {
             let reason = dangerous_command(command)?;
             let (card_reason, denial) = gate_texts(&self.label, reason);
             (command.to_string(), card_reason, denial)
-        } else if self.mcp_writes.contains(name) {
-            let (card_reason, denial) = mcp_gate_texts(&self.label, name);
-            let mut args = serde_json::to_string(input).unwrap_or_default();
-            if args.len() > 400 {
-                let mut end = 400;
-                while !args.is_char_boundary(end) {
-                    end -= 1;
-                }
-                args.truncate(end);
-                args.push('…');
-            }
-            (format!("{name} {args}"), card_reason, denial)
         } else {
-            return None;
+            // An MCP write, or a file tool reaching outside the workspace,
+            // checked again once approved (`guard_card`).
+            let label = Some(self.label.as_str());
+            let check = || {
+                if self.mcp_writes.contains(name) {
+                    Some(crate::talk_guard::mcp_card(label, name, input))
+                } else {
+                    self.reach.outside_card(label, name, input, self.writes_confined)
+                }
+            };
+            let card = check()?;
+            let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+            return crate::chat_engine::guard_card(card, &check, ask).await;
         };
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         match self
@@ -1139,7 +1160,9 @@ pub async fn run_one_subagent(
         &spec_owned
     };
     let model = plan.model.clone();
-    let approval_gate = SubagentGate::new(approvals, app.clone(), spec).with_mcp_writes(mcp_tools);
+    let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
+        .with_mcp_writes(mcp_tools)
+        .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
     let external = McpSubagentTools::granted(
         mcp,
         Path::new(&spec.workspace_path),
@@ -1513,7 +1536,8 @@ mod tests {
         let d = def("security-reviewer", None, None);
         let p = subagent_system_prompt("/w", &call, Some(&d), "");
         assert!(p.contains("Your role: security-reviewer."));
-        assert!(p.ends_with("# Agent: security-reviewer\nYou are the security-reviewer."), "{p}");
+        assert!(p.contains("# Agent: security-reviewer\nYou are the security-reviewer."), "{p}");
+        assert!(p.ends_with(crate::chat_history::UNTRUSTED_OUTPUT_NOTE), "the note comes after the repo's text: {p}");
     }
 
     #[test]
@@ -1930,6 +1954,7 @@ mod tests {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
+            ..Default::default()
         }
     }
     struct Recorder {
@@ -2087,7 +2112,8 @@ mod tests {
         assert_eq!(calls.len(), 1, "the denied write never reached the server: {calls:?}");
         assert_eq!(calls[0].0, "mcp__jira__get_issue");
         // The gate's write set comes from the servers' read-only annotations.
-        let (reason, denial) = mcp_gate_texts("Ticket", "mcp__jira__add_comment");
+        let (reason, denial) = mcp_gate_texts(Some("Ticket"), "mcp__jira__add_comment");
+        assert!(reason.starts_with("Sub-agent \u{201c}Ticket\u{201d}: MCP tool"));
         assert!(reason.contains("may change external state") && denial.contains("do not retry"));
     }
 

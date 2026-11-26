@@ -9,6 +9,18 @@ describe("decideApprovalNotification", () => {
     });
   });
 
+  it("names an MCP call or a file outside the workspace, never its arguments or path (#1147)", () => {
+    expect(decideApprovalNotification({ kind: "mcp" }, "auth-flow").body).toBe(
+      "auth-flow — An MCP tool call is waiting for your approval",
+    );
+    expect(decideApprovalNotification({ kind: "read" }, "auth-flow").body).toBe(
+      "auth-flow — A file access outside the workspace is waiting for your approval",
+    );
+    expect(decideApprovalNotification({ kind: "write" }, null).body).toBe(
+      "A workspace — A file access outside the workspace is waiting for your approval",
+    );
+  });
+
   it("names a secret card for what it is, never what was found", () => {
     expect(decideApprovalNotification({ secret: true }, null)).toEqual({
       title: "Talk needs a decision",

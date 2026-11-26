@@ -618,6 +618,7 @@ import type {
   ChatMessage,
   ChatThread,
   SkillMeta,
+  SkippedDefinition,
   Attachment,
   McpToolInfo,
   McpServerConfig,
@@ -1040,7 +1041,7 @@ export const ipc = {
   /** The approval cards still waiting on a thread, oldest first (a reloaded
    *  webview shows them again: a card waits until it is answered). */
   pendingApprovals: (threadId: string) =>
-    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean }>>(
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write"; sensitive?: boolean }>>(
       "pending_approvals",
       { threadId },
     ),
@@ -1112,6 +1113,10 @@ export const ipc = {
   // ─── Skills ──────────────────────────────────────────────────────
   listSkills: (workspacePath: string) =>
     invoke<SkillMeta[]>("list_skills", { workspacePath }),
+  /** The workspace's skill files left unread: a project skill that resolves
+   *  outside the project, or one over 4 MiB. The slash menu lists them. */
+  listSkippedSkills: (workspacePath: string) =>
+    invoke<SkippedDefinition[]>("list_skipped_skills", { workspacePath }),
   /** The workspace's `.claude/agents/*.md` definitions — the `subagent_type`s
    *  Talk's `Agent` tool can run under (project ∪ user, project shadows). */
   listSubagentTypes: (workspacePath: string) =>

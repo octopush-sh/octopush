@@ -1,13 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
-const { mockListFiles, mockListSkills } = vi.hoisted(() => ({
+const { mockListFiles, mockListSkills, mockListSkippedSkills } = vi.hoisted(() => ({
   mockListFiles: vi.fn(),
   mockListSkills: vi.fn(),
+  mockListSkippedSkills: vi.fn(),
 }));
 
 vi.mock("../../lib/ipc", () => ({
-  ipc: { listWorkspaceFiles: mockListFiles, listSkills: mockListSkills },
+  ipc: { listWorkspaceFiles: mockListFiles, listSkills: mockListSkills, listSkippedSkills: mockListSkippedSkills },
 }));
 
 import { RichPromptTextarea } from "./RichPromptTextarea";
@@ -24,6 +25,7 @@ beforeEach(() => {
     { name: "code-review", description: "Review it", source: "project" },
     { name: "simplify", description: "Tidy it", source: "user" },
   ]);
+  mockListSkippedSkills.mockResolvedValue([]);
 });
 
 /** Types into the textarea the way the component reads it: value + caret. */
@@ -147,6 +149,31 @@ describe("RichPromptTextarea", () => {
     await waitFor(() =>
       expect(screen.queryByText(/No skills found/i)).not.toBeInTheDocument(),
     );
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  });
+
+  it("names a skipped skill file as Talk does, even when it is all the query matches", async () => {
+    mockListSkippedSkills.mockResolvedValue([
+      { name: "linked", label: ".claude/skills/linked/SKILL.md", path: `${WS}/.claude/skills/linked/SKILL.md`, reason: "outside the project" },
+    ]);
+    const onChange = vi.fn();
+    const onSubmit = vi.fn();
+    const { rerender } = render(
+      <RichPromptTextarea value="" onChange={onChange} workspacePath={WS} onSubmit={onSubmit} aria-label="brief" />,
+    );
+    await waitFor(() => expect(mockListSkippedSkills).toHaveBeenCalledWith(WS));
+    const ta = screen.getByLabelText("brief") as HTMLTextAreaElement;
+    type(ta, "then /link");
+    rerender(
+      <RichPromptTextarea value="then /link" onChange={onChange} workspacePath={WS} onSubmit={onSubmit} aria-label="brief" />,
+    );
+    const menu = await screen.findByRole("listbox", { name: "Skills" }, { timeout: 4000 });
+    expect(menu).toHaveTextContent("skipped: outside the project");
+    expect(menu).not.toHaveTextContent("code-review");
+    // Not selectable: Enter inserts nothing; Escape dismisses the menu.
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onChange).not.toHaveBeenCalledWith(expect.stringContaining("/linked"));
+    fireEvent.keyDown(ta, { key: "Escape" });
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
   });
 });

@@ -159,6 +159,8 @@ pub struct TalkWaiting {
     pub name: String,
     /// The secret guard's card (a commit or push), not a flagged command.
     pub secret: bool,
+    /// What the card asks about when it isn't a command (#1147).
+    pub kind: Option<crate::talk_guard::CardKind>,
     /// When the card was raised (ms): the FIFO key, shared with the crews.
     pub since_ms: i64,
 }
@@ -169,6 +171,7 @@ impl TalkWaiting {
             thread_id: wait.thread_id.clone(),
             name: workspace_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "a workspace".to_string()),
             secret: wait.secret,
+            kind: wait.kind,
             since_ms: wait.since_ms,
         }
     }
@@ -308,10 +311,17 @@ pub fn label(w: &Waiting) -> String {
 }
 
 /// `{workspace} · Talk — a command wants approval` (or `— a commit or push
-/// wants approval` for the secret guard's card): the kind of thing, never
-/// its arguments.
+/// wants approval` for the secret guard's card, `— an MCP tool call wants
+/// approval`, `— a file outside the workspace wants approval`): the kind of
+/// thing, never its arguments or its path.
 pub fn talk_label(t: &TalkWaiting) -> String {
-    let what = if t.secret { "a commit or push wants approval" } else { "a command wants approval" };
+    use crate::talk_guard::CardKind;
+    let what = match (t.secret, t.kind) {
+        (true, _) => "a commit or push wants approval",
+        (false, Some(CardKind::Mcp)) => "an MCP tool call wants approval",
+        (false, Some(CardKind::Read | CardKind::Write)) => "a file outside the workspace wants approval",
+        (false, None) => "a command wants approval",
+    };
     format!("{} · Talk — {what}", clip(t.name.trim(), NAME_MAX_CHARS))
 }
 
@@ -619,6 +629,7 @@ mod tests {
             workspace_id: "w".into(),
             thread_id: "th-1".into(),
             secret: false,
+            kind: None,
             since_ms: 50,
         };
         let talk = TalkWaiting::new(&wait, Some("auth-flow".into()));
@@ -629,6 +640,9 @@ mod tests {
         assert_eq!(m.items[0].label, "auth-flow · Talk — a command wants approval");
         let secret = TalkWaiting::new(&crate::chat_engine::ApprovalWait { secret: true, ..wait.clone() }, Some("auth-flow".into()));
         assert_eq!(talk_label(&secret), "auth-flow · Talk — a commit or push wants approval");
+        let kind = |k| talk_label(&TalkWaiting::new(&crate::chat_engine::ApprovalWait { kind: Some(k), ..wait.clone() }, Some("auth-flow".into())));
+        assert_eq!(kind(crate::talk_guard::CardKind::Mcp), "auth-flow · Talk — an MCP tool call wants approval");
+        assert_eq!(kind(crate::talk_guard::CardKind::Read), "auth-flow · Talk — a file outside the workspace wants approval");
         assert_eq!(talk_of(ids[0]), Some("th-1"));
         assert_eq!(run_of(ids[0]), None);
         assert_eq!(talk_of(ids[1]), None);

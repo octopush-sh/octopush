@@ -161,7 +161,9 @@ pub struct LlmTool {
 
 // ─── Response types ───────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+/// `Default` is an empty answer that ended its turn, for fixtures: a literal
+/// ending in `..Default::default()` keeps compiling when a field is added.
+#[derive(Debug, Default)]
 pub struct LlmResponse {
     pub text: String,
     pub tool_uses: Vec<LlmToolUse>,
@@ -187,6 +189,12 @@ pub struct LlmResponse {
     /// model, then its reasoning / message / `function_call` output items in
     /// order (replayed only to that same model). Empty for Chat Completions.
     pub raw_content: Vec<serde_json::Value>,
+    /// The provider sent no usage for this answer (a stream that ended
+    /// without its usage chunk), so the token counts are 0 because they are
+    /// unknown, not because it was free. Callers record it on the existing
+    /// usage-not-reported path (the `usage_unreported` stage flag, `unpriced`
+    /// in the ledger), never as $0.
+    pub usage_unreported: bool,
 }
 
 /// A provider's reported rate-limit headroom, normalized across providers.
@@ -199,8 +207,9 @@ pub struct RateLimitSnapshot {
     pub reset_after_secs: Option<f64>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub enum LlmStopReason {
+    #[default]
     EndTurn,
     ToolUse,
     MaxTokens,
@@ -478,13 +487,15 @@ pub async fn complete_cancellable(
     }
 }
 
-/// How long a streamed answer from a remote provider may send nothing at
-/// all (Anthropic sends `ping`s while it works) before the turn gives up on
-/// it. Final, never retried ([`silent_stream_error`]): the request was
-/// answered with a 200, so the provider may still be generating. A model
-/// server on this Mac has no such bound, as it has no read bound
-/// (`client_for`).
-pub const STREAM_IDLE: Duration = Duration::from_secs(60);
+/// How long a streamed answer from `api_base` may send nothing at all before
+/// the turn gives up on it: the adapter's own `bound` (`anthropic::STREAM_IDLE`,
+/// `openai_compat::STREAM_IDLE`, as only some servers ping while they work).
+/// Final, never retried ([`silent_stream_error`]): the request was answered
+/// with a 200, so the provider may still be generating. A model server on
+/// this Mac has no bound (`None`), as it has no read bound (`client_for`).
+pub fn stream_idle(api_base: &str, bound: Duration) -> Option<Duration> {
+    (!is_loopback_base(api_base)).then_some(bound)
+}
 
 /// The streamed counterpart of [`complete_cancellable`]: `provider.stream`
 /// with the same backoff, `retry-after` handling, `on_retry` narration and

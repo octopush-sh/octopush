@@ -16,14 +16,22 @@
 //!   - `<worktree>/.claude/skills/*/SKILL.md`  (project)
 //!   - `~/.claude/skills/*/SKILL.md`           (user)
 //!
+//! A project's files are the repository's, so they are read the way its
+//! `CLAUDE.md` is ([`definition_roots`], [`read_definition`]): only when they
+//! resolve inside the project's work tree, and bounded. The user's own files
+//! are trusted.
+//!
 //! The frontmatter is parsed by hand (the three fields we use are simple
 //! `key: value` lines) so we don't pull in a YAML dependency.
 
 pub mod agents;
 pub mod builtin_agents;
 
+use crate::request_context::{nearest_work_tree, read_memory_file, MemorySkip};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Lightweight skill descriptor for the picker (no body — keep the payload small).
 #[derive(Serialize, Clone, Debug)]
@@ -56,13 +64,114 @@ impl Skill {
     }
 }
 
-/// The two skill roots, project first (it shadows user skills of the same name).
-fn skill_roots(worktree: &Path) -> Vec<(PathBuf, &'static str)> {
-    let mut roots = vec![(worktree.join(".claude/skills"), "project")];
-    if let Some(home) = dirs::home_dir() {
-        roots.push((home.join(".claude/skills"), "user"));
+/// A skill or agent file that was found but never read, and why.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedDefinition {
+    /// What the user knows it by: the skill's directory, or the agent
+    /// file's name without `.md`.
+    pub name: String,
+    /// Where it was found: `.claude/skills/<name>/SKILL.md` in the project,
+    /// `~/.claude/…` for the user's.
+    pub label: String,
+    /// The full path where it was found (not where it resolves).
+    pub path: String,
+    /// `outside the project` or `over 4 MiB` ([`MemorySkip::as_str`]).
+    pub reason: String,
+}
+
+/// What a scan of the definition roots found: the definitions read, and
+/// the entries left unread.
+#[derive(Clone, Debug)]
+pub struct DefinitionScan<T> {
+    pub found: Vec<T>,
+    pub skipped: Vec<SkippedDefinition>,
+}
+
+impl<T> Default for DefinitionScan<T> {
+    fn default() -> Self {
+        Self { found: Vec::new(), skipped: Vec::new() }
+    }
+}
+
+impl<T> DefinitionScan<T> {
+    /// Note `path` (found under `root` as `rel`) as left unread.
+    fn skip(&mut self, root: &DefinitionRoot, name: &str, rel: &str, path: &Path, why: MemorySkip) {
+        self.skipped.push(SkippedDefinition {
+            name: name.to_string(),
+            label: format!("{}/{rel}", root.shown),
+            path: path.display().to_string(),
+            reason: why.as_str().to_string(),
+        });
+    }
+}
+
+/// One directory a scan reads definitions from.
+pub(crate) struct DefinitionRoot {
+    pub dir: PathBuf,
+    /// "project" or "user".
+    pub source: &'static str,
+    /// How `dir` is written in a skipped entry's label.
+    pub shown: String,
+    /// Where its files must resolve: the work tree confining a project's
+    /// files; `None` for the user's own directory, which is trusted.
+    pub limit: Option<PathBuf>,
+}
+
+/// The roots of `.claude/<kind>` (`skills` or `agents`), project first (it
+/// shadows the user's). The project's files are the repository's: each is
+/// read only when it resolves, symlinks included, inside the nearest git
+/// work tree around the worktree (`request_context::nearest_work_tree`, the
+/// same reach its `.claude/CLAUDE.md` has), so a link to a file elsewhere
+/// on the Mac, or into an outer repository, is never read. The user's
+/// `~/.claude/<kind>` is trusted. A project whose `.claude/<kind>` resolves
+/// to that very directory (home opened as a project, or a `.claude` linked
+/// to `~/.claude`) has no root of its own: those files are the user's, and
+/// are read, labelled and sourced as the user's.
+pub(crate) fn definition_roots(worktree: &Path, home: Option<&Path>, kind: &str) -> Vec<DefinitionRoot> {
+    let user = home.map(|h| h.join(".claude").join(kind));
+    let user_real = user.as_deref().and_then(|u| std::fs::canonicalize(u).ok());
+    let mut roots = Vec::new();
+    // Resolved first: containment compares resolved paths.
+    if let Ok(project) = std::fs::canonicalize(worktree) {
+        let dir = project.join(".claude").join(kind);
+        let users = user_real.is_some() && std::fs::canonicalize(&dir).ok() == user_real;
+        if !users {
+            roots.push(DefinitionRoot {
+                limit: Some(nearest_work_tree(&project, &project)),
+                dir,
+                source: "project",
+                shown: format!(".claude/{kind}"),
+            });
+        }
+    }
+    if let Some(dir) = user {
+        roots.push(DefinitionRoot { dir, source: "user", shown: format!("~/.claude/{kind}"), limit: None });
     }
     roots
+}
+
+/// Read one definition file the way every project file is read
+/// (`request_context::read_memory_file`): resolved, symlinks included, and
+/// refused when it leaves `limit`; opened non-blocking, a regular file, at
+/// most 4 MiB. `Ok(None)` when there is no regular file there, or it isn't
+/// UTF-8 (as before: such a file is not a definition).
+pub(crate) fn read_definition(path: &Path, limit: Option<&Path>) -> Result<Option<String>, MemorySkip> {
+    Ok(read_memory_file(path, limit)?.and_then(|(_, raw)| String::from_utf8(raw).ok()))
+}
+
+/// Log each skipped definition once per path and reason: the readers rescan
+/// on every turn, and agents have no list in the UI to show it in.
+pub(crate) fn log_skipped(kind: &str, skipped: &[SkippedDefinition]) {
+    static LOGGED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    // What one run remembers; past it, nothing more is logged.
+    const MAX_LOGGED: usize = 1024;
+    let mut logged = LOGGED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    for s in skipped {
+        if logged.len() < MAX_LOGGED && logged.insert((s.path.clone(), s.reason.clone())) {
+            tracing::warn!(path = %s.path, "{kind} {} skipped: {}", s.name, s.reason);
+        }
+    }
 }
 
 /// Split a Claude-Code-style markdown file into its frontmatter pairs and
@@ -144,29 +253,48 @@ pub fn parse_skill(content: &str, source: &str) -> Option<Skill> {
     })
 }
 
-/// Discover all skills for a worktree (project ∪ user), project shadowing user.
+/// Discover all skills for a worktree (project ∪ user), project shadowing
+/// user. Skipped entries go to the log ([`log_skipped`]).
 pub fn scan_skills(worktree: &Path) -> Vec<Skill> {
-    let mut out: Vec<Skill> = Vec::new();
-    for (root, source) in skill_roots(worktree) {
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let md = entry.path().join("SKILL.md");
-            let Ok(content) = std::fs::read_to_string(&md) else { continue };
-            if let Some(skill) = parse_skill(&content, source) {
-                // Project shadows user: skip a user skill whose name a project
-                // skill already claimed.
-                if out.iter().any(|s| s.name == skill.name) {
+    let scan = scan_skills_in(worktree, dirs::home_dir().as_deref());
+    log_skipped("skill", &scan.skipped);
+    scan.found
+}
+
+/// [`scan_skills`] with the user's home given, and the entries left unread:
+/// a project skill whose `SKILL.md` resolves outside the project, or one
+/// over 4 MiB ([`definition_roots`], [`read_definition`]). A skill directory
+/// may be a link: where its `SKILL.md` resolves decides. Entries are read in
+/// name order, so which of two same-named skills in one root wins is stable.
+pub fn scan_skills_in(worktree: &Path, home: Option<&Path>) -> DefinitionScan<Skill> {
+    let mut scan: DefinitionScan<Skill> = DefinitionScan::default();
+    for root in definition_roots(worktree, home, "skills") {
+        let Ok(entries) = std::fs::read_dir(&root.dir) else { continue };
+        let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let md = dir.join("SKILL.md");
+            let content = match read_definition(&md, root.limit.as_deref()) {
+                Ok(Some(content)) => content,
+                Ok(None) => continue,
+                Err(why) => {
+                    scan.skip(&root, &name, &format!("{name}/SKILL.md"), &md, why);
                     continue;
                 }
-                out.push(skill);
+            };
+            if let Some(skill) = parse_skill(&content, root.source) {
+                // Project shadows user: skip a user skill whose name a project
+                // skill already claimed.
+                if scan.found.iter().any(|s| s.name == skill.name) {
+                    continue;
+                }
+                scan.found.push(skill);
             }
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    scan.found.sort_by(|a, b| a.name.cmp(&b.name));
+    scan
 }
 
 /// Load a single skill by name for a worktree (project shadowing user).
@@ -189,19 +317,32 @@ pub fn load_skill(worktree: &Path, name: &str) -> Option<Skill> {
 /// `/code-review-notes` and `x/code-review` do not — and fenced code is
 /// never searched (an `@file` expansion pastes the file as a fenced block;
 /// a CHANGELOG line saying "run /release" must not invoke the skill).
+///
+/// The order is the text's, not the catalogue's: it is the order the skills
+/// share the per-turn budget in ([`skill_prompt_section`]).
 pub fn referenced_skills(worktree: &Path, text: &str) -> Vec<Skill> {
-    let known = scan_skills(worktree);
+    named_in(scan_skills(worktree), text)
+}
+
+/// [`referenced_skills`] with the user's home given.
+pub fn referenced_skills_in(worktree: &Path, home: Option<&Path>, text: &str) -> Vec<Skill> {
+    named_in(scan_skills_in(worktree, home).found, text)
+}
+
+/// The `known` skills `text` names, by first mention, deduped by name.
+fn named_in(known: Vec<Skill>, text: &str) -> Vec<Skill> {
     let prose = outside_fences(text);
-    let mut out: Vec<Skill> = Vec::new();
+    let mut found: Vec<(usize, Skill)> = Vec::new();
     for skill in known {
-        if out.iter().any(|s| s.name == skill.name) {
+        if found.iter().any(|(_, s)| s.name == skill.name) {
             continue;
         }
-        if mentions_skill(&prose, &skill.name) {
-            out.push(skill);
+        if let Some(at) = first_mention(&prose, &skill.name) {
+            found.push((at, skill));
         }
     }
-    out
+    found.sort_by_key(|(at, _)| *at);
+    found.into_iter().map(|(_, s)| s).collect()
 }
 
 /// The text with every fenced code block (``` … ```, fence lines included)
@@ -226,13 +367,14 @@ fn outside_fences(text: &str) -> String {
     out
 }
 
-/// Whether `text` carries a standalone `/name` token.
+/// Where `text` first carries a standalone `/name` token (the slash's byte
+/// offset), if it does.
 ///
 /// Boundaries are compared as CHARS, not bytes: a byte-level test treats every
 /// UTF-8 continuation byte as "not alphanumeric", so `docs/café/code-review.md`
 /// and `🚀/code-review` would count as references and silently append a whole
 /// skill body to every stage's prompt.
-fn mentions_skill(text: &str, name: &str) -> bool {
+fn first_mention(text: &str, name: &str) -> Option<usize> {
     fn is_word_char(c: char) -> bool {
         c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/'
     }
@@ -252,20 +394,68 @@ fn mentions_skill(text: &str, name: &str) -> bool {
             Some(c) => !is_word_char(c),
         };
         if before_ok && after_ok {
-            return true;
+            return Some(start);
         }
         from = end;
     }
-    false
+    None
 }
+
+/// The most bytes of skill bodies the skills a message or brief *names*
+/// carry in one Talk turn or Direct stage: they share it, in the order
+/// named. About 25k tokens, so ordinary skills always go whole, while a
+/// runaway file (each may be up to 4 MiB) can't fill the prompt or the
+/// bill. A skill the request pins is outside it ([`skill_prompt_section_with`]).
+pub const SKILLS_CAP_BYTES: usize = 100_000;
+
+/// With less than this left, a skill is left out rather than trimmed.
+const MIN_TRIMMED_SKILL_BYTES: usize = 1_000;
 
 /// The section appended to a system prompt for each skill a message or brief
 /// named — the one shape TALK and DIRECT share, so an agent meets the
-/// instructions in the same form on both substrates.
+/// instructions in the same form on both substrates. The bodies share
+/// [`SKILLS_CAP_BYTES`] in the order given (the order named,
+/// [`referenced_skills`]): a skill that fits what is left goes whole, a
+/// larger one is trimmed to it (beginning and end kept), or left out when
+/// under 1,000 bytes are left; either way the section says so, and so does
+/// the log.
 pub fn skill_prompt_section(skills: &[Skill]) -> String {
+    skill_prompt_section_with(None, skills)
+}
+
+/// [`skill_prompt_section`] with the skill the request pins (Talk's
+/// `ChatRequest.skill`): it comes first and is sent whole, bounded only by
+/// the 4 MiB a skill file may be, and it doesn't draw on the budget the
+/// `named` skills share after it. A named skill of the same name is the
+/// pinned one, not sent twice.
+pub fn skill_prompt_section_with(pinned: Option<&Skill>, named: &[Skill]) -> String {
     let mut out = String::new();
-    for skill in skills {
+    if let Some(skill) = pinned {
         out.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, skill.body));
+    }
+    let mut left = SKILLS_CAP_BYTES;
+    for skill in named {
+        if pinned.is_some_and(|p| p.name == skill.name) {
+            continue;
+        }
+        let body = if skill.body.len() <= left {
+            skill.body.clone()
+        } else if left < MIN_TRIMMED_SKILL_BYTES {
+            tracing::warn!(skill = %skill.name, "skill left out: the invoked skills pass {SKILLS_CAP_BYTES} bytes");
+            format!(
+                "[Left out: the skills invoked here pass the {SKILLS_CAP_BYTES}-byte limit per turn. Ask the user to \
+                 invoke fewer skills at once if you need this one.]"
+            )
+        } else {
+            tracing::warn!(skill = %skill.name, "skill trimmed: the invoked skills pass {SKILLS_CAP_BYTES} bytes");
+            format!(
+                "[Trimmed: the skills invoked here pass the {SKILLS_CAP_BYTES}-byte limit per turn; the beginning \
+                 and end of this one are kept.]\n{}",
+                crate::orchestrator::runner::cap_to(&skill.body, left)
+            )
+        };
+        left = left.saturating_sub(body.len());
+        out.push_str(&format!("\n\n# Skill: {}\n{}", skill.name, body));
     }
     out
 }

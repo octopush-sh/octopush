@@ -369,6 +369,19 @@ export interface SkillMeta {
   source: string;
 }
 
+/** A skill file found but never read (`list_skipped_skills`): a project
+ *  skill that resolves outside the project, or one over 4 MiB. */
+export interface SkippedDefinition {
+  /** The skill's directory name. */
+  name: string;
+  /** Where it was found: `.claude/skills/<name>/SKILL.md`, or `~/.claude/…`. */
+  label: string;
+  /** The full path where it was found. */
+  path: string;
+  /** `outside the project` or `over 4 MiB`. */
+  reason: string;
+}
+
 /** A base64 image attachment for the chat composer. */
 export interface Attachment {
   mediaType: string;
