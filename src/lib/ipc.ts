@@ -2037,7 +2037,6 @@ export interface RunEstimate {
   confidence?: "history" | "rough";
 }
 
-/** The installed Claude Code CLI's version against the tested floor. */
 /** One `modelPricing.overrides` row, USD per million tokens. */
 export interface ManagedModelRates {
   input: number;
@@ -2054,6 +2053,7 @@ export interface ManagedModelPricing {
   overrides: Record<string, ManagedModelRates>;
 }
 
+/** The installed Claude Code CLI's version against the tested floor. */
 export interface ClaudeCliVersion {
   /** `x.y.z` from `claude --version`; null when the CLI isn't found. */
   version: string | null;

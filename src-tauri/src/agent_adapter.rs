@@ -817,8 +817,10 @@ pub fn probe_claude_login() -> ClaudeLoginProbe {
 //
 // An organization can make Claude Code report spend at its own rates
 // (`modelPricing`, managed scope only, Claude Code 2.1.242+). Octopush only
-// reads the table, to say so in Settings › Usage: its ledger, budgets and
-// savings keep list prices. Claude Code checks remote (server-managed)
+// reads the table, to say so in Settings › Usage. A finished Claude Code
+// stage is booked at Claude Code's `total_cost_usd` (those rates); Talk,
+// stopped stages and the savings baseline stay at list prices, so the ledger
+// can mix the two. Claude Code checks remote (server-managed)
 // settings before the sources below; Octopush can't see those.
 
 /// The macOS configuration profile Claude Code reads (domain

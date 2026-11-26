@@ -1,7 +1,9 @@
 // Settings → Usage: the one-line note shown while an organization's managed
 // Claude Code settings carry a `modelPricing` table (#1111). Claude Code then
-// reports its own figures (and trips `--max-budget-usd`) at those rates,
-// while this ledger, budgets and savings keep list prices. Hidden otherwise.
+// reports its own figures (and trips `--max-budget-usd`) at those rates. A
+// finished Claude Code Direct stage is booked at that figure; Talk, stopped,
+// stalled or crashed stages and the savings baseline stay at list prices, so
+// totals, budgets and savings can mix the two. Hidden otherwise.
 import type { ManagedModelPricing } from "../../lib/ipc";
 
 /** "0.85× every cost · own rates for claude-sonnet-4-6". */
@@ -31,9 +33,10 @@ export function ManagedPricingNote({ pricing }: { pricing: ManagedModelPricing |
       className="octo-fade-in mt-2 text-[11px] leading-[1.55] text-octo-mute"
       title={rows || undefined}
     >
-      Your organization set Claude Code's rates on this Mac ({managedPricingSummary(pricing)}). Claude Code reports its
-      own figures at those rates; this ledger, budgets and savings keep list prices, so its figures and its
-      --max-budget-usd cap can differ from them. Rates set from the admin console aren't visible to Octopush.
+      Your organization set Claude Code's rates on this Mac ({managedPricingSummary(pricing)}). Finished Claude Code
+      stages are booked at Claude Code's own figure, which uses those rates, as does its --max-budget-usd cap; Talk,
+      stopped or crashed stages and the savings baseline use list prices, so totals, budgets and savings can mix the
+      two. Rates set from the admin console aren't visible to Octopush.
     </p>
   );
 }

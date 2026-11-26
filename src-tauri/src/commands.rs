@@ -8306,8 +8306,9 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 }
 
 /// Settings › Usage: the `modelPricing` table an organization set in Claude
-/// Code's managed settings on this Mac (read-only), or `None`. Octopush's
-/// ledger keeps list prices either way.
+/// Code's managed settings on this Mac (read-only), or `None`. Nothing is
+/// re-priced: finished Claude Code stages are booked at Claude Code's own
+/// figure (its rates), everything else at list prices.
 #[tauri::command]
 pub async fn managed_model_pricing() -> AppResult<Option<crate::agent_adapter::ModelPricing>> {
     // The configuration profile is read through `plutil`; keep it off the

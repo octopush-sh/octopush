@@ -90,12 +90,15 @@ describe("managed Claude Code pricing note", () => {
     overrides: { "claude-sonnet-4-6": { input: 2.4, output: 12, cacheRead: 0.24, cacheWrite: 3 } },
   };
 
-  it("says Claude Code reports at the organization's rates while the ledger keeps list prices", async () => {
+  it("says finished Claude Code stages use the organization's rates while the rest uses list prices", async () => {
     managedModelPricing.mockResolvedValue(DOCS_EXAMPLE);
     render(<UsagePane />);
     const note = await screen.findByTestId("usage-managed-pricing");
     expect(note.textContent).toContain("0.85× every cost · own rates for claude-sonnet-4-6");
-    expect(note.textContent).toContain("keep list prices");
+    expect(note.textContent).toContain("Finished Claude Code stages are booked at Claude Code's own figure");
+    expect(note.textContent).toContain("stopped or crashed stages and the savings baseline use list prices");
+    expect(note.textContent).toContain("can mix the two");
+    expect(note.textContent).not.toContain("keep list prices");
     expect(note.textContent).toContain("--max-budget-usd");
     expect(note.textContent).toContain("admin console");
     expect(note.getAttribute("data-tour")).toBe("usage-managed-pricing");

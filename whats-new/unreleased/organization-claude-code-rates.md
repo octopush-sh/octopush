@@ -5,8 +5,8 @@ area: app
 steps:
   - open: settings/usage
     target: usage-managed-pricing
-    caption: Claude Code reports at your organization's rates; this ledger keeps list prices.
+    caption: Finished Claude Code stages use your organization's rates; the rest uses list prices.
 ---
 When your organization's managed Claude Code settings set its own rates (`modelPricing`),
-Settings › Usage now says so. Claude Code's figures and its `--max-budget-usd` cap follow those
-rates, so they can differ from the list prices Octopush's ledger, budgets and savings use.
+Settings › Usage now says so. Finished Claude Code stages and their `--max-budget-usd` cap use
+those rates, while Talk, stopped stages and the savings baseline use list prices, so totals can mix the two.
