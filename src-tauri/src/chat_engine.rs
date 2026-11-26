@@ -20,7 +20,7 @@ use crate::error::{AppError, AppResult};
 use crate::providers::{
     anthropic::AnthropicProvider,
     openai_compat::OpenAICompatibleProvider,
-    LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
+    Effort, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
     LlmStopReason, LlmTool, LlmToolResult,
 };
 use crate::provider_router::ProviderRouter;
@@ -68,6 +68,42 @@ fn default_talk_system_prompt(workspace_path: &str) -> String {
          help the user; be concise and take action rather than just explaining \
          what to do."
     )
+}
+
+/// One request of a Talk turn: every round and the forced close carry the
+/// same model, output cap and reasoning effort, so the thinking config holds
+/// across the turn's tool loop (Anthropic requires one per loop) and the
+/// cached prefix with it.
+fn director_request(
+    model: &str,
+    max_tokens: u32,
+    effort: Option<Effort>,
+    system: &str,
+    messages: &[LlmMessage],
+    tools: &[LlmTool],
+) -> LlmRequest {
+    LlmRequest {
+        model: model.to_string(),
+        // Honor the caller's requested budget (the EffortSelector sets it)
+        // with a sane floor; the old code force-clamped to 32768, silently
+        // ignoring the request.
+        // FOLLOW-UP: some providers cap output below the Deep preset (e.g.
+        // gpt-4o at 16384) and will 400 on a larger value. A proper per-model
+        // ceiling needs a `max_output_tokens` field on ModelInfo; until then
+        // the budget is forwarded as-is (this was already the case
+        // pre-change, which force-sent 32768).
+        max_tokens: max_tokens.max(4096),
+        system: system.to_string(),
+        messages: messages.to_vec(),
+        tools: tools.to_vec(),
+        tool_choice: None,
+        // The composer's Swift / Standard / Deep (`ChatRequest::effort`); the
+        // adapters send nothing to a model without an effort setting.
+        effort,
+        // Agentic loop + multi-turn chat: the system prompt, tool schemas and
+        // prior turns are re-sent every iteration, so cache them.
+        cache: true,
+    }
 }
 
 fn recall_tool_definition() -> LlmTool {
@@ -172,6 +208,14 @@ pub struct ChatRequest {
     pub user_message: String,
     pub system: Option<String>,
     pub max_tokens: u32,
+    /// The reasoning effort of every request the turn makes: the composer's
+    /// Swift / Standard / Deep send low / medium / high. The provider adapters
+    /// map it per model (`anthropic::thinking_json`,
+    /// `openai_compat::build_request`) and send nothing to a model without an
+    /// effort setting. `None` (no effort in the request) sends no thinking
+    /// params, as every turn did before.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Legacy: a skill name pinned to the conversation. The composer no
     /// longer sends one — skills are invoked per message as `/name` tokens in
     /// the text, resolved against the worktree's skills when the turn runs.
@@ -2947,27 +2991,14 @@ impl ChatEngine {
                 }
             }
 
-            let llm_req = LlmRequest {
-                model: request.model.clone(),
-                // Honor the caller's requested budget (the EffortSelector sets
-                // it) with a sane floor; the old code force-clamped to 32768,
-                // silently ignoring the request.
-                // FOLLOW-UP: some providers cap output below the Deep preset
-                // (e.g. gpt-4o at 16384) and will 400 on a larger value. A
-                // proper per-model ceiling needs a `max_output_tokens` field on
-                // ModelInfo; until then the budget is forwarded as-is (this was
-                // already the case pre-change, which force-sent 32768).
-                max_tokens: request.max_tokens.max(4096),
-                system: system_prompt.clone(),
-                messages: messages.clone(),
-                tools: tools.clone(),
-                tool_choice: None,
-                // TALK doesn't drive per-request reasoning effort — behavior unchanged.
-                effort: None,
-                // Agentic loop + multi-turn chat: the system prompt, tool schemas
-                // and prior turns are re-sent every iteration, so cache them.
-                cache: true,
-            };
+            let llm_req = director_request(
+                &request.model,
+                request.max_tokens,
+                request.effort,
+                &system_prompt,
+                &messages,
+                &tools,
+            );
 
             let response = match provider
                 .complete(&api_base, api_key.as_deref(), &llm_req, &self.client)
@@ -3115,11 +3146,16 @@ impl ChatEngine {
                 }
             };
 
-            // Add assistant message with tool_use content to conversation.
+            // Add assistant message with tool_use content to conversation:
+            // the response's content blocks verbatim (as `run_agentic_loop`
+            // does), so a thinking block the round produced is replayed signed
+            // and in order on the next round, which the API requires while
+            // thinking is on. The truncation path above keeps rebuilding from
+            // text, since a cut-off turn can end in a partial thinking block.
             messages.push(LlmMessage {
                 role: LlmRole::Assistant,
                 content: LlmContent::AssistantWithTools {
-                    raw: vec![],
+                    raw: response.raw_content.clone(),
                     text: response.text.clone(),
                     tool_uses: response.tool_uses.clone(),
                 },
@@ -3643,16 +3679,14 @@ impl ChatEngine {
                 content: LlmContent::Text(CLOSE_INSTRUCTION.to_string()),
             }),
         }
-        let close_req = LlmRequest {
-            model: request.model.clone(),
-            max_tokens: request.max_tokens.max(4096),
-            system: system_prompt.clone(),
-            messages: messages.clone(),
-            tools: tools.clone(),
-            tool_choice: None,
-            effort: None,
-            cache: true,
-        };
+        let close_req = director_request(
+            &request.model,
+            request.max_tokens,
+            request.effort,
+            &system_prompt,
+            &messages,
+            &tools,
+        );
         // Only reachable with a configured limit (an unlimited loop never
         // exhausts); the wording names it.
         let limit = match max_iterations {
@@ -3931,6 +3965,58 @@ mod continuation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Talk request as the composer sends it, with `effort` set or absent.
+    fn chat_request(effort: Option<&str>) -> ChatRequest {
+        let mut v = serde_json::json!({
+            "workspaceId": "w", "threadId": "t", "workspacePath": "/w", "model": "m",
+            "userMessage": "hi", "system": null, "maxTokens": 8192,
+        });
+        if let Some(e) = effort {
+            v["effort"] = serde_json::json!(e);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn swift_standard_and_deep_reach_every_director_request_as_effort() {
+        for (sent, effort) in [("low", Effort::Low), ("medium", Effort::Medium), ("high", Effort::High)] {
+            let request = chat_request(Some(sent));
+            assert_eq!(request.effort, Some(effort));
+            let req = director_request(&request.model, request.max_tokens, request.effort, "sys", &[], &[]);
+            assert_eq!((req.effort, req.max_tokens, req.cache), (Some(effort), 8192, true));
+        }
+        // An older frontend sends no effort: no thinking params, as before.
+        let old = chat_request(None);
+        assert_eq!(old.effort, None);
+        assert_eq!(director_request(&old.model, old.max_tokens, old.effort, "sys", &[], &[]).effort, None);
+    }
+
+    #[test]
+    fn talk_effort_is_sent_only_to_models_that_take_one() {
+        use crate::providers::{anthropic, openai_compat};
+        let body = |model: &str, effort: Effort, max: u32| {
+            anthropic::build_request(&director_request(model, max, Some(effort), "sys", &[], &[]))
+        };
+        // An effort model: adaptive thinking at the preset's level.
+        for (effort, level) in [(Effort::Low, "low"), (Effort::Medium, "medium"), (Effort::High, "high")] {
+            let b = body("claude-sonnet-5-5", effort, 32768);
+            assert_eq!(b["thinking"]["type"], "adaptive", "{b}");
+            assert_eq!(b["output_config"]["effort"], level, "{b}");
+        }
+        // A thinking-budget model: Swift thinks not at all, Deep buys a budget.
+        let swift = body("claude-haiku-4-5-20251001", Effort::Low, 8192);
+        assert!(swift.get("thinking").is_none() && swift.get("output_config").is_none(), "{swift}");
+        let deep = body("claude-haiku-4-5-20251001", Effort::High, 64000);
+        assert_eq!(deep["thinking"]["type"], "enabled", "{deep}");
+        // A model with no effort setting gets none.
+        let legacy = body("claude-3-5-sonnet-20241022", Effort::High, 64000);
+        assert!(legacy.get("thinking").is_none() && legacy.get("output_config").is_none(), "{legacy}");
+        let chat = openai_compat::build_request(&director_request("gpt-4o", 8192, Some(Effort::Low), "sys", &[], &[]));
+        assert!(chat.get("reasoning_effort").is_none(), "{chat}");
+        let reasoning = openai_compat::build_request(&director_request("o3", 32768, Some(Effort::Medium), "sys", &[], &[]));
+        assert_eq!(reasoning["reasoning_effort"], "medium", "{reasoning}");
+    }
 
     #[test]
     fn talks_prompt_sends_mcp_problems_to_settings_not_the_cli() {

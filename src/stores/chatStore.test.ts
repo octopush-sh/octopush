@@ -43,7 +43,7 @@ vi.mock("../lib/ipc", () => ({
   },
 }));
 
-const { useChatStore, EFFORT_MAX_TOKENS } = await import("./chatStore");
+const { useChatStore, EFFORT_MAX_TOKENS, EFFORT_REASONING } = await import("./chatStore");
 const { ipc } = await import("../lib/ipc");
 
 function emit(eventName: string, payload: unknown) {
@@ -573,6 +573,18 @@ describe("chatStore — stop + effort (P3)", () => {
       expect(useChatStore.getState().getError("ws-1")).toBe("Could not start a conversation.");
     } finally {
       useChatStore.setState({ ensureThread });
+    }
+  });
+
+  it("send() sends the preset's reasoning effort: Swift low, Standard medium, Deep high", async () => {
+    expect(EFFORT_REASONING).toEqual({ swift: "low", standard: "medium", deep: "high" });
+    for (const [preset, effort] of [["swift", "low"], ["standard", "medium"], ["deep", "high"]] as const) {
+      vi.clearAllMocks();
+      useChatStore.getState().setEffort(preset);
+      await useChatStore.getState().send("ws-1", "/tmp", "hi");
+      expect(ipc.sendChatMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ effort, maxTokens: EFFORT_MAX_TOKENS[preset] }),
+      );
     }
   });
 

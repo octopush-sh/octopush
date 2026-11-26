@@ -978,6 +978,9 @@ export const ipc = {
     userMessage: string;
     system?: string;
     maxTokens: number;
+    /** The turn's reasoning effort (Swift low · Standard medium · Deep high);
+     *  a model without an effort setting gets none. */
+    effort?: Effort;
     attachments?: { mediaType: string; data: string }[];
     /** Re-run without inserting a new user row (history already ends with it). */
     regenerate?: boolean;
