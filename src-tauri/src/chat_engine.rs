@@ -21,8 +21,8 @@ use crate::providers::{
     anthropic::AnthropicProvider,
     complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
-    retry_notice, Completion, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmRole,
-    LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
+    retry_notice, Completion, Effort, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
+    LlmRole, LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
 use crate::orchestrator::agentic::{
@@ -90,6 +90,129 @@ pub(crate) fn director_system_prompt(
         prompt.push_str(doctrine);
     }
     prompt
+}
+
+/// One request of a Talk turn: every round and the forced close carry the
+/// same model, output cap and reasoning effort (`ChatRequest::effort`), so
+/// the thinking config holds across the turn's tool loop (Anthropic requires
+/// one per loop) and the cached prefix with it.
+fn director_request(request: &ChatRequest, system: &str, messages: &[LlmMessage], tools: &[LlmTool]) -> LlmRequest {
+    LlmRequest {
+        model: request.model.clone(),
+        // Honor the caller's requested budget (the EffortSelector sets it)
+        // with a sane floor; the old code force-clamped to 32768, silently
+        // ignoring the request.
+        // FOLLOW-UP: some providers cap output below the Deep preset (e.g.
+        // gpt-4o at 16384) and will 400 on a larger value. A proper per-model
+        // ceiling needs a `max_output_tokens` field on ModelInfo; until then
+        // the budget is forwarded as-is (this was already the case
+        // pre-change, which force-sent 32768).
+        max_tokens: request.max_tokens.max(4096),
+        system: system.to_string(),
+        messages: messages.to_vec(),
+        tools: tools.to_vec(),
+        tool_choice: None,
+        // Swift's `low` runs as `Effort::Least`, so it never reasons more than
+        // Standard on any model; Standard sends nothing; Deep's `max` is
+        // clamped per model. A model without effort control gets nothing.
+        effort: request.effort.map(|e| if e == Effort::Low { Effort::Least } else { e }),
+        // Agentic loop + multi-turn chat: the system prompt, tool schemas and
+        // prior turns are re-sent every iteration, so cache them.
+        cache: true,
+    }
+}
+
+/// What the forced close tells the model once a configured tool-turn limit
+/// is spent.
+const CLOSE_INSTRUCTION: &str = "Your tool budget for this turn is exhausted — you cannot call any more tools. \
+     Write your final answer NOW with what you already know: what you found or \
+     accomplished, what remains undone, and what the user should do next. If you \
+     were reviewing, state your findings so far.";
+
+/// The forced close's one more request: [`CLOSE_INSTRUCTION`] appended to the
+/// last tool result (the loop always ends right after pushing tool results,
+/// and a separate consecutive user turn breaks role alternation on strict
+/// providers), with the turn's own settings, its effort included. The tool
+/// list rides along unchanged: a history with tool_use blocks and an empty
+/// `tools` array is a hard 400 on Anthropic, and keeping it preserves the
+/// prompt-cache prefix.
+fn forced_close_request(
+    request: &ChatRequest,
+    system: &str,
+    messages: &mut Vec<LlmMessage>,
+    tools: &[LlmTool],
+) -> LlmRequest {
+    match messages.last_mut() {
+        Some(LlmMessage { content: LlmContent::ToolResults(results), .. }) if !results.is_empty() => {
+            if let Some(last) = results.last_mut() {
+                last.content.push_str("\n\n[system] ");
+                last.content.push_str(CLOSE_INSTRUCTION);
+            }
+        }
+        _ => messages.push(LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(CLOSE_INSTRUCTION.to_string()),
+        }),
+    }
+    director_request(request, system, messages, tools)
+}
+
+/// The assistant turn a tool round leaves in the loop: the response's content
+/// blocks verbatim (as `run_agentic_loop` does), so a thinking block the
+/// round produced is replayed signed and in order on the next round, which
+/// the API requires while thinking is on.
+fn tool_round_turn(response: &LlmResponse) -> LlmMessage {
+    LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::AssistantWithTools {
+            raw: response.raw_content.clone(),
+            text: response.text.clone(),
+            tool_uses: response.tool_uses.clone(),
+        },
+    }
+}
+
+/// The leading complete thinking blocks of a response's content: signed
+/// `thinking` and `redacted_thinking` blocks, up to the first other block.
+/// Empty for an OpenAI Responses turn or a response without thinking.
+fn leading_signed_thinking(raw: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    if crate::providers::openai_compat::is_responses_raw(raw) {
+        return Vec::new();
+    }
+    let nonempty = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.is_empty());
+    raw.iter()
+        .take_while(|b| match b["type"].as_str() {
+            Some("thinking") => nonempty(&b["signature"]),
+            Some("redacted_thinking") => nonempty(&b["data"]),
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// The assistant turn of a round cut off at `max_tokens` mid-tool-use. It is
+/// rebuilt from its text and tool calls, since a cut-off turn can end in a
+/// partial block, but its leading signed thinking blocks are kept in front:
+/// with a thinking budget on, the API rejects a final assistant turn that
+/// doesn't start with one.
+fn truncated_round_turn(response: &LlmResponse) -> LlmMessage {
+    let mut raw = leading_signed_thinking(&response.raw_content);
+    if !raw.is_empty() {
+        if !response.text.is_empty() {
+            raw.push(serde_json::json!({ "type": "text", "text": response.text }));
+        }
+        for u in &response.tool_uses {
+            raw.push(serde_json::json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input }));
+        }
+    }
+    LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::AssistantWithTools {
+            raw,
+            text: response.text.clone(),
+            tool_uses: response.tool_uses.clone(),
+        },
+    }
 }
 
 fn recall_tool_definition() -> LlmTool {
@@ -200,6 +323,18 @@ pub struct ChatRequest {
     pub user_message: String,
     pub system: Option<String>,
     pub max_tokens: u32,
+    /// The reasoning effort of every request the turn makes. The composer's
+    /// Swift sends `low`, which the turn runs as `Effort::Least`: the least
+    /// the model takes, never more than Standard (effort lowered, thinking
+    /// never turned on; `none` on GPT-6 Sol, Luna and 6.1 Terra). Standard
+    /// sends none (`None`: no thinking params, so every model keeps its own
+    /// default, as before presets set effort). Deep sends `max`, which the
+    /// provider adapters (`anthropic::thinking_json`,
+    /// `openai_compat::build_request`) turn into the most the model takes
+    /// (`max`, `high`, or a thinking budget). A model without effort control
+    /// gets nothing.
+    #[serde(default)]
+    pub effort: Option<Effort>,
     /// Legacy: a skill name pinned to the conversation. The composer no
     /// longer sends one — skills are invoked per message as `/name` tokens in
     /// the text, resolved against the worktree's skills when the turn runs.
@@ -3124,7 +3259,7 @@ impl ChatEngine {
         // cached system block holds. Read on a blocking thread.
         let instructions = crate::project_instructions::for_workspace_off_runtime(workspace_path.clone()).await;
         let mut system_prompt = director_system_prompt(
-            request.system,
+            request.system.clone(),
             &request.workspace_path,
             &instructions.section,
             doctrine.as_deref(),
@@ -3299,27 +3434,7 @@ impl ChatEngine {
                 }
             }
 
-            let llm_req = LlmRequest {
-                model: request.model.clone(),
-                // Honor the caller's requested budget (the EffortSelector sets
-                // it) with a sane floor; the old code force-clamped to 32768,
-                // silently ignoring the request.
-                // FOLLOW-UP: some providers cap output below the Deep preset
-                // (e.g. gpt-4o at 16384) and will 400 on a larger value. A
-                // proper per-model ceiling needs a `max_output_tokens` field on
-                // ModelInfo; until then the budget is forwarded as-is (this was
-                // already the case pre-change, which force-sent 32768).
-                max_tokens: request.max_tokens.max(4096),
-                system: system_prompt.clone(),
-                messages: messages.clone(),
-                tools: tools.clone(),
-                tool_choice: None,
-                // TALK doesn't drive per-request reasoning effort — behavior unchanged.
-                effort: None,
-                // Agentic loop + multi-turn chat: the system prompt, tool schemas
-                // and prior turns are re-sent every iteration, so cache them.
-                cache: true,
-            };
+            let llm_req = director_request(&request, &system_prompt, &messages, &tools);
 
             let response = match self
                 .director_call(
@@ -3381,15 +3496,9 @@ impl ChatEngine {
             // Handle max_tokens truncation during tool use.
             if matches!(response.stop_reason, LlmStopReason::MaxTokens) && !response.tool_uses.is_empty() {
                 tracing::warn!("Response truncated at max_tokens during tool_use — providing error tool_results and retrying");
-                // Add the truncated assistant message to history.
-                messages.push(LlmMessage {
-                    role: LlmRole::Assistant,
-                    content: LlmContent::AssistantWithTools {
-                        raw: vec![],
-                        text: response.text.clone(),
-                        tool_uses: response.tool_uses.clone(),
-                    },
-                });
+                // Add the truncated assistant message to history, its leading
+                // signed thinking kept.
+                messages.push(truncated_round_turn(&response));
                 // Provide error tool_results for each tool_use (API requires matching pairs).
                 let error_results: Vec<LlmToolResult> = response.tool_uses.iter().map(|u| LlmToolResult {
                     tool_use_id: u.id.clone(),
@@ -3473,15 +3582,9 @@ impl ChatEngine {
                 }
             };
 
-            // Add assistant message with tool_use content to conversation.
-            messages.push(LlmMessage {
-                role: LlmRole::Assistant,
-                content: LlmContent::AssistantWithTools {
-                    raw: vec![],
-                    text: response.text.clone(),
-                    tool_uses: response.tool_uses.clone(),
-                },
-            });
+            // Add assistant message with tool_use content to conversation,
+            // its content blocks verbatim (`tool_round_turn`).
+            messages.push(tool_round_turn(&response));
 
             // ── Sub-agents: fan out first ──────────────────────────
             // Every `Agent` call in this response runs CONCURRENTLY (that is
@@ -4010,39 +4113,7 @@ impl ChatEngine {
             self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
             return Ok(());
         }
-        const CLOSE_INSTRUCTION: &str =
-            "Your tool budget for this turn is exhausted — you cannot call any more tools. \
-             Write your final answer NOW with what you already know: what you found or \
-             accomplished, what remains undone, and what the user should do next. If you \
-             were reviewing, state your findings so far.";
-        // The loop always ends right after pushing tool results, so the
-        // instruction is APPENDED to the last tool result — a separate
-        // consecutive user turn breaks role alternation on strict providers.
-        // The tool list rides along unchanged: a history with tool_use blocks
-        // and an empty `tools` array is a hard 400 on Anthropic, and keeping it
-        // preserves the prompt-cache prefix.
-        match messages.last_mut() {
-            Some(LlmMessage { content: LlmContent::ToolResults(results), .. }) if !results.is_empty() => {
-                if let Some(last) = results.last_mut() {
-                    last.content.push_str("\n\n[system] ");
-                    last.content.push_str(CLOSE_INSTRUCTION);
-                }
-            }
-            _ => messages.push(LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Text(CLOSE_INSTRUCTION.to_string()),
-            }),
-        }
-        let close_req = LlmRequest {
-            model: request.model.clone(),
-            max_tokens: request.max_tokens.max(4096),
-            system: system_prompt.clone(),
-            messages: messages.clone(),
-            tools: tools.clone(),
-            tool_choice: None,
-            effort: None,
-            cache: true,
-        };
+        let close_req = forced_close_request(&request, &system_prompt, &mut messages, &tools);
         if let Some(wait) = pending_throttle.take() {
             self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &throttle_notice(wait), wait);
             if !interruptible_sleep(wait, &cancel).await {
@@ -4367,6 +4438,242 @@ mod continuation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Talk request as the composer sends it on `model`, with `effort` set
+    /// or absent.
+    fn chat_request_on(model: &str, effort: Option<&str>) -> ChatRequest {
+        let mut v = serde_json::json!({
+            "workspaceId": "w", "threadId": "t", "workspacePath": "/w", "model": model,
+            "userMessage": "hi", "system": null, "maxTokens": 64000,
+        });
+        if let Some(e) = effort {
+            v["effort"] = serde_json::json!(e);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The composer's presets as it sends them: Swift `low`, Standard nothing,
+    /// Deep `max`.
+    const SWIFT: Option<&str> = Some("low");
+    const STANDARD: Option<&str> = None;
+    const DEEP: Option<&str> = Some("max");
+
+    #[test]
+    fn swift_standard_and_deep_reach_every_director_request_as_effort() {
+        for (sent, asked, runs) in [
+            (SWIFT, Some(Effort::Low), Some(Effort::Least)),
+            (STANDARD, None, None),
+            (DEEP, Some(Effort::Max), Some(Effort::Max)),
+        ] {
+            let request = chat_request_on("m", sent);
+            assert_eq!(request.effort, asked);
+            let req = director_request(&request, "sys", &[], &[]);
+            assert_eq!((req.effort, req.max_tokens, req.cache), (runs, 64000, true));
+        }
+        // `least` is internal: a request can't ask for it.
+        assert!(serde_json::from_value::<Effort>(serde_json::json!("least")).is_err());
+    }
+
+    #[test]
+    fn standard_keeps_every_model_s_request_body_and_swift_and_deep_follow_each_model() {
+        use crate::providers::{anthropic, openai_compat};
+        let anthropic_body = |model: &str, preset: Option<&str>| {
+            anthropic::build_request(&director_request(&chat_request_on(model, preset), "sys", &[], &[]))
+        };
+        let openai_body = |model: &str, preset: Option<&str>| {
+            openai_compat::build_request(&director_request(&chat_request_on(model, preset), "sys", &[], &[]))
+        };
+        let thinks = |b: &serde_json::Value| b.get("thinking").is_some() || b.get("output_config").is_some();
+        let models = [
+            "claude-sonnet-5-5", "claude-opus-5", "claude-opus-4-6", "claude-opus-4-5", "claude-haiku-4-5-20251001",
+            "claude-3-5-sonnet-20241022",
+        ];
+        // Standard: no effort and no thinking settings on any model.
+        for m in models {
+            assert!(!thinks(&anthropic_body(m, STANDARD)), "{m}: {}", anthropic_body(m, STANDARD));
+        }
+        for m in ["o3", "gpt-5", "gpt-4o"] {
+            assert!(openai_body(m, STANDARD).get("reasoning_effort").is_none(), "{m}");
+        }
+
+        let level = |model: &str, preset: Option<&str>| {
+            let b = anthropic_body(model, preset);
+            assert_eq!(b["thinking"]["type"], "adaptive", "{model}: {b}");
+            b["output_config"]["effort"].as_str().unwrap().to_string()
+        };
+        // Swift: low effort alone, thinking never turned on, where the model
+        // has effort control (the full check is
+        // `swift_never_reasons_more_than_standard_on_any_model`).
+        for m in ["claude-sonnet-5-5", "claude-opus-4-6"] {
+            let b = anthropic_body(m, SWIFT);
+            assert!(b.get("thinking").is_none(), "{m}: {b}");
+            assert_eq!(b["output_config"], serde_json::json!({ "effort": "low" }), "{m}: {b}");
+        }
+        for m in ["claude-opus-4-5", "claude-haiku-4-5-20251001", "claude-3-5-sonnet-20241022"] {
+            assert!(!thinks(&anthropic_body(m, SWIFT)), "{m}: Swift sends nothing");
+        }
+        assert_eq!(openai_body("o3", SWIFT)["reasoning_effort"], "low");
+        assert_eq!(openai_body("gpt-6-sol", SWIFT)["reasoning_effort"], "none");
+        assert!(openai_body("gpt-4o", SWIFT).get("reasoning_effort").is_none());
+
+        // Deep: the highest the model takes.
+        assert_eq!(level("claude-sonnet-5-5", DEEP), "max");
+        assert_eq!(level("claude-opus-4-6", DEEP), "max");
+        // Opus 4.5 and Haiku 4.5 think only with a budget (`adaptive` would 400).
+        for m in ["claude-opus-4-5", "claude-opus-4-5-20251101", "claude-haiku-4-5-20251001"] {
+            let b = anthropic_body(m, DEEP);
+            assert_eq!(b["thinking"], serde_json::json!({ "type": "enabled", "budget_tokens": 24576 }), "{m}: {b}");
+            assert!(b.get("output_config").is_none(), "{m}: {b}");
+        }
+        assert!(!thinks(&anthropic_body("claude-3-5-sonnet-20241022", DEEP)));
+        assert_eq!(openai_body("o3", DEEP)["reasoning_effort"], "high", "o-series stops at high");
+        assert_eq!(openai_body("gpt-6-sol", DEEP)["reasoning_effort"], "max");
+        assert!(openai_body("gpt-4o", DEEP).get("reasoning_effort").is_none());
+    }
+
+    /// Where a reasoning level ranks: less reasoning ranks lower.
+    fn reasoning_rank(level: &str) -> usize {
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .position(|l| *l == level)
+            .unwrap_or_else(|| panic!("unknown level {level}"))
+    }
+
+    /// Swift never reasons more than Standard, on any model in the table:
+    /// it never turns thinking on where Standard leaves it to the model, and
+    /// its effort is never above the model's own default (which Standard,
+    /// sending nothing, keeps).
+    #[test]
+    fn swift_never_reasons_more_than_standard_on_any_model() {
+        use crate::providers::{anthropic, openai_compat};
+        let req = |model: &str, preset: Option<&str>| director_request(&chat_request_on(model, preset), "sys", &[], &[]);
+        for m in [
+            "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+            "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-0",
+            "claude-haiku-5-5", "claude-haiku-4-5", "claude-fable-5-2", "claude-fable-5", "claude-mythos-5-2",
+            "claude-mythos-5", "claude-mythos-preview", "claude-3-5-sonnet-20241022", "some-unknown-model",
+        ] {
+            let standard = anthropic::build_request(&req(m, STANDARD));
+            let swift = anthropic::build_request(&req(m, SWIFT));
+            assert!(standard.get("thinking").is_none() && standard.get("output_config").is_none(), "{m}: {standard}");
+            assert!(swift.get("thinking").is_none(), "{m}: Swift turned thinking on: {swift}");
+            if let Some(level) = swift["output_config"]["effort"].as_str() {
+                // Every effort model's default is `medium` or `high`.
+                assert!(reasoning_rank(level) < reasoning_rank("medium"), "{m}: {swift}");
+            }
+        }
+        // OpenAI: Chat Completions (any gateway) and the Responses API (GPT-6 on OpenAI).
+        let openai_models = [
+            "gpt-4o", "o1", "o3", "o4-mini", "gpt-5", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra", "gpt-6-astra",
+            "gpt-6.1-sol",
+        ];
+        for m in openai_models {
+            let standard = openai_compat::build_request(&req(m, STANDARD));
+            let swift = openai_compat::build_request(&req(m, SWIFT));
+            assert!(standard.get("reasoning_effort").is_none(), "{m}: {standard}");
+            if let Some(level) = swift["reasoning_effort"].as_str() {
+                // No `reasoning_effort` runs at the API default, `medium`.
+                assert!(reasoning_rank(level) < reasoning_rank("medium"), "{m}: {swift}");
+            }
+        }
+        let base = "https://api.openai.com/v1";
+        for &m in openai_models.iter().filter(|m| m.starts_with("gpt-6")) {
+            let level = |preset| {
+                let b = openai_compat::build_responses_request(&req(m, preset), "openai", base);
+                b["reasoning"]["effort"].as_str().map(str::to_string)
+            };
+            let standard = level(STANDARD).unwrap_or_else(|| "medium".into());
+            let swift = level(SWIFT).unwrap_or_else(|| "medium".into());
+            assert!(reasoning_rank(&swift) <= reasoning_rank(&standard), "{m}: Swift {swift} vs Standard {standard}");
+        }
+        // Where `none` is the model's lowest, Swift sends it.
+        for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"] {
+            assert_eq!(openai_compat::build_request(&req(m, SWIFT))["reasoning_effort"], "none", "{m}");
+            let b = openai_compat::build_responses_request(&req(m, SWIFT), "openai", base);
+            assert_eq!(b["reasoning"]["effort"], "none", "{m}: {b}");
+        }
+    }
+
+    /// A response that thought, said something, then called a tool.
+    fn tool_response(raw: Vec<serde_json::Value>, stop: LlmStopReason) -> LlmResponse {
+        LlmResponse {
+            text: "Checking.".into(),
+            tool_uses: vec![crate::providers::LlmToolUse {
+                id: "tu_1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": "a.rs" }),
+            }],
+            stop_reason: stop,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            rate_limit: None,
+            raw_content: raw,
+        }
+    }
+
+    /// The assistant turn as the Anthropic adapter sends it on the next round
+    /// (its tool results follow, and carry the cache breakpoint).
+    fn sent_turn(turn: LlmMessage) -> serde_json::Value {
+        let results = LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::ToolResults(vec![LlmToolResult { tool_use_id: "tu_1".into(), content: "ok".into(), is_error: false }]),
+        };
+        let req = director_request(&chat_request_on("claude-sonnet-5-5", DEEP), "sys", &[turn, results], &[]);
+        crate::providers::anthropic::build_request(&req)["messages"][0]["content"].clone()
+    }
+
+    #[test]
+    fn a_tool_round_is_replayed_with_its_signed_thinking_and_block_order() {
+        let raw = vec![
+            serde_json::json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
+            serde_json::json!({ "type": "text", "text": "Checking." }),
+            serde_json::json!({ "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a.rs" } }),
+        ];
+        let turn = tool_round_turn(&tool_response(raw.clone(), LlmStopReason::ToolUse));
+        assert_eq!(sent_turn(turn), serde_json::Value::Array(raw));
+    }
+
+    #[test]
+    fn a_truncated_round_keeps_its_leading_signed_thinking() {
+        let raw = vec![
+            serde_json::json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
+            serde_json::json!({ "type": "redacted_thinking", "data": "opaque" }),
+            serde_json::json!({ "type": "text", "text": "Checking." }),
+            serde_json::json!({ "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a.rs" } }),
+            // A block cut off mid-way is never replayed.
+            serde_json::json!({ "type": "thinking", "thinking": "half" }),
+        ];
+        let sent = sent_turn(truncated_round_turn(&tool_response(raw.clone(), LlmStopReason::MaxTokens)));
+        assert_eq!(sent, serde_json::Value::Array(raw[..4].to_vec()), "leading thinking, then text and tool calls");
+
+        // No thinking: rebuilt from the text and tool calls, as before.
+        let plain = sent_turn(truncated_round_turn(&tool_response(raw[2..].to_vec(), LlmStopReason::MaxTokens)));
+        assert_eq!(plain, serde_json::Value::Array(raw[2..4].to_vec()));
+        // An unsigned leading thinking block isn't kept either.
+        let unsigned = vec![serde_json::json!({ "type": "thinking", "thinking": "half" }), raw[2].clone()];
+        let sent = sent_turn(truncated_round_turn(&tool_response(unsigned, LlmStopReason::MaxTokens)));
+        assert_eq!(sent, serde_json::Value::Array(raw[2..4].to_vec()));
+    }
+
+    #[test]
+    fn the_forced_close_carries_the_turn_s_effort_and_instruction() {
+        for (preset, effort) in [(SWIFT, Some(Effort::Least)), (STANDARD, None), (DEEP, Some(Effort::Max))] {
+            let request = chat_request_on("claude-sonnet-5-5", preset);
+            let mut messages = vec![LlmMessage {
+                role: LlmRole::User,
+                content: LlmContent::ToolResults(vec![LlmToolResult { tool_use_id: "tu_1".into(), content: "ok".into(), is_error: false }]),
+            }];
+            let req = forced_close_request(&request, "sys", &mut messages, &[]);
+            assert_eq!(req.effort, effort, "{preset:?}");
+            match &messages[0].content {
+                LlmContent::ToolResults(r) => assert!(r[0].content.ends_with(CLOSE_INSTRUCTION), "{}", r[0].content),
+                _ => panic!("the instruction rides on the last tool result"),
+            }
+            assert_eq!(messages.len(), 1, "no extra user turn");
+        }
+    }
 
     #[test]
     fn talks_prompt_sends_mcp_problems_to_settings_not_the_cli() {

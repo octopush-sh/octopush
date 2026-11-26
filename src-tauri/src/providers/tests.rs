@@ -540,15 +540,16 @@ mod effort {
     fn thinking_json_classifies_three_ways() {
         // Effort models → adaptive + output_config.
         for m in [
-            "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+            "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
             "claude-sonnet-5", "claude-sonnet-4-6", "claude-fable-5", "claude-mythos-5",
         ] {
             let (thinking, oc) = plan(m);
             assert_eq!(thinking.unwrap(), json!({ "type": "adaptive" }), "{m} = effort model");
             assert!(oc.is_some(), "{m} must carry output_config");
         }
-        // Budget models → budget_tokens, no output_config.
-        for m in ["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-0"] {
+        // Budget models → budget_tokens, no output_config. Opus 4.5 is one:
+        // it rejects `adaptive` with a 400.
+        for m in ["claude-opus-4-5", "claude-opus-4-5-20251101", "claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-0"] {
             let (thinking, oc) = plan(m);
             assert_eq!(thinking.unwrap()["type"], "enabled", "{m} = budget model");
             assert!(oc.is_none(), "{m} must NOT carry output_config");
@@ -591,13 +592,12 @@ mod effort {
         assert_eq!(effective_effort_level("claude-sonnet-4-6", Effort::Xhigh), "high");
         assert_eq!(effective_effort_level("claude-sonnet-4-6", Effort::Max), "max");
         assert_eq!(effective_effort_level("claude-opus-4-6", Effort::Xhigh), "high");
-        // Opus 4.5 / unknown effort-path: cap at high (xhigh AND max fold down).
-        assert_eq!(effective_effort_level("claude-opus-4-5", Effort::Max), "high");
-        assert_eq!(effective_effort_level("claude-opus-4-5", Effort::Xhigh), "high");
+        // An unknown effort-path id: cap at high (xhigh AND max fold down).
         assert_eq!(effective_effort_level("some-unknown-model", Effort::Max), "high");
+        assert_eq!(effective_effort_level("some-unknown-model", Effort::Xhigh), "high");
         // Lower levels are never touched, on any model.
         assert_eq!(effective_effort_level("claude-sonnet-4-6", Effort::High), "high");
-        assert_eq!(effective_effort_level("claude-opus-4-5", Effort::Low), "low");
+        assert_eq!(effective_effort_level("some-unknown-model", Effort::Low), "low");
     }
 
     #[test]
