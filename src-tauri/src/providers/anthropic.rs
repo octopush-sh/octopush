@@ -26,6 +26,8 @@ impl LlmProvider for AnthropicProvider {
 
         let body = build_request(req);
         let url = messages_url(api_base);
+        // A model server on this Mac gets the loopback client (no read bound).
+        let client = super::client_for(api_base, client);
 
         let resp = client
             .post(&url)
@@ -36,9 +38,10 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            // A request that never reached the server is transient — let the
-            // retry layer ride it out rather than halting the stage.
-            .map_err(|e| super::request_error("Anthropic request failed", &e))?;
+            // Only a connection that never opened is transient (the retry
+            // layer sends it again); a request that went out and wasn't
+            // answered is final (`request_error`).
+            .map_err(|e| super::request_error("Anthropic request failed", api_base, &e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -56,9 +59,9 @@ impl LlmProvider for AnthropicProvider {
 
         // Snapshot the rate-limit headers before the body consumes `resp`.
         let rate_limit = parse_rate_limit(resp.headers());
-        let response: Value = resp
-            .json()
-            .await
+        // Read the body first: a connection lost mid-answer is not a JSON error.
+        let bytes = resp.bytes().await.map_err(|e| super::body_error("Anthropic request failed", &e))?;
+        let response: Value = serde_json::from_slice(&bytes)
             .map_err(|e| AppError::Other(format!("JSON parse error: {e}")))?;
 
         let mut parsed = parse_response(response);

@@ -8,13 +8,19 @@
 
 import { ipc } from "./ipc";
 import type { SecretFinding, SecretRefusal } from "./secretGuard";
+import type { SentContextBlock } from "./sentContext";
 import { readTerminalBuffer } from "./terminalBuffers";
 import {
   CONTEXT_CAP,
   FOLDER_MAX_ENTRIES,
   SESSION_TAIL_LINES,
+  blockTokens,
+  capRefs,
   capTail,
   capText,
+  chipLabel,
+  dirsOf,
+  extractContextRefs,
   diffForFile,
   diffScanInputs,
   fenced,
@@ -24,6 +30,7 @@ import {
   stripAnsi,
   tailLines,
   type ContextRef,
+  type SessionRef,
 } from "./talkContext";
 
 /** What the guard reads of a block: its content, named by `label` (the
@@ -43,6 +50,8 @@ export interface ResolvedBlock {
    *  per file section and hunk side for a diff (`diffScanInputs`); empty for
    *  a block that only says what's missing. */
   scan: ScanInput[];
+  /** Why nothing could be included (the text says so too). */
+  missing?: string;
 }
 
 /** Shared by the blocks resolved together, so `@diff` and `@diff:a.ts` in
@@ -61,7 +70,7 @@ export async function resolveContextBlock(
   files: string[],
   share: ResolveShare = {},
 ): Promise<ResolvedBlock> {
-  const missing = (why: string): ResolvedBlock => ({ ref, text: note(ref, why), scan: [] });
+  const missing = (why: string): ResolvedBlock => ({ ref, text: note(ref, why), scan: [], missing: why });
   try {
     switch (ref.kind) {
       case "file": {
@@ -105,7 +114,7 @@ export async function resolveContextBlock(
       case "session": {
         const lines = readTerminalBuffer(ref.session.id);
         if (!lines) {
-          return { ref, text: `\n\nRun session "${ref.session.label}" _(not included: not open)_`, scan: [] };
+          return { ref, text: `\n\nRun session "${ref.session.label}" _(not included: not open)_`, scan: [], missing: "not open" };
         }
         // The newest output is what matters: a tail over the cap loses its
         // oldest lines, and the heading counts the lines actually sent.
@@ -198,16 +207,56 @@ export async function scanContextBlocks(blocks: ResolvedBlock[]): Promise<Contex
   return { flagged, unchecked, refusal };
 }
 
-/** The message's blocks as sent: a flagged block the user left out says so
- *  in its place, and why (`unchecked`: its scan couldn't run). */
-export function joinBlocks(
+/** A message as sent: the typed text with its blocks appended, and where
+ *  each block sits (#1150). */
+export interface SentMessage {
+  content: string;
+  context: SentContextBlock[];
+}
+
+/** The message's blocks appended to what was typed: a flagged block the user
+ *  left out says so in its place, and why (`unchecked`: its scan couldn't
+ *  run). Each block's span is recorded for the thread's chips. */
+export function withContext(
+  typed: string,
   blocks: ResolvedBlock[],
   leaveOut: Set<number> = new Set(),
   unchecked: Set<number> = new Set(),
-): string {
-  return blocks
-    .map((b, i) =>
-      leaveOut.has(i) ? note(b.ref, unchecked.has(i) ? "couldn't be checked for secrets" : "possible secret") : b.text,
-    )
-    .join("");
+): SentMessage {
+  let content = typed;
+  const context = blocks.map((b, i): SentContextBlock => {
+    const leftOut = leaveOut.has(i) ? (unchecked.has(i) ? "couldn't be checked for secrets" : "possible secret") : null;
+    const text = leftOut ? note(b.ref, leftOut) : b.text;
+    const why = leftOut ?? b.missing;
+    const start = content.length;
+    content += text;
+    const entry: SentContextBlock = {
+      token: b.ref.token,
+      kind: b.ref.kind,
+      label: chipLabel(b.ref),
+      tokens: blockTokens(text),
+      start,
+      end: content.length,
+    };
+    if (why) entry.notIncluded = why;
+    return entry;
+  });
+  return { content, context };
+}
+
+/** The blocks alone, as `withContext` appends them. */
+export function joinBlocks(blocks: ResolvedBlock[], leaveOut?: Set<number>, unchecked?: Set<number>): string {
+  return withContext("", blocks, leaveOut, unchecked).content;
+}
+
+/** A resend with no composer to ask in (Edit & resend, #1150): the draft's
+ *  `@` tokens resolved fresh, as at send. A block the guard flags, or
+ *  couldn't check, is left out, and its chip says so. */
+export async function expandDraft(text: string, workspacePath: string, sessions: SessionRef[]): Promise<SentMessage> {
+  const files = await ipc.listWorkspaceFiles(workspacePath).catch(() => [] as string[]);
+  const refs = capRefs(extractContextRefs(text, { files: new Set(files), dirs: dirsOf(files), sessions })).kept;
+  if (refs.length === 0) return { content: text, context: [] };
+  const blocks = await resolveContextBlocks(refs, workspacePath, files);
+  const verdict = await scanContextBlocks(blocks);
+  return withContext(text, blocks, verdict?.flagged, verdict?.unchecked);
 }

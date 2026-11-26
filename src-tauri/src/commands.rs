@@ -1571,6 +1571,11 @@ pub async fn delete_workspace(
     branch: String,
     worktree_path: Option<String>,
 ) -> AppResult<()> {
+    // Stop the workspace's Talk turns, as Stop would, and retire it in the
+    // approval broker: a card here would wait for an answer that can no
+    // longer come, and keep counting on the Dock badge.
+    let threads = state.db.lock().chat_thread_ids(&workspace_id).unwrap_or_default();
+    state.chat.cancel_workspace(&workspace_id, &threads);
     let project_path = expand_tilde(&project_path);
     let is_main = worktree_path
         .as_deref()
@@ -1614,7 +1619,10 @@ pub async fn delete_workspace(
     // Remove from DB. The row's runs cascade-delete without a run:// event, so
     // a paused one would keep the Dock badge counting it: refresh it now.
     let db_path = state.db.lock().conn_ref_path(&workspace_id).ok().flatten();
-    state.db.lock().delete_workspace(&workspace_id)?;
+    // If the row can't go, the workspace stays: reinstate it in the approval
+    // broker, so its next approval card isn't denied unseen.
+    let deleted = state.db.lock().delete_workspace(&workspace_id);
+    state.chat.finish_workspace_delete(&workspace_id, deleted)?;
     crate::fleet_status::refresh_later(&app);
 
     // Its sandbox build caches go with it, unless another workspace still
@@ -1934,9 +1942,9 @@ pub async fn set_thread_pinned(
 
 #[tauri::command]
 pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -> AppResult<()> {
-    // Stop any in-flight turn first — this also resolves a parked dangerous-
-    // command approval (as Deny) so the agent loop doesn't stay blocked for the
-    // full 300s timeout after the conversation is gone.
+    // Stop any in-flight turn first — this also resolves a parked approval
+    // card (as Deny), which would otherwise wait for an answer that can no
+    // longer come once the conversation is gone.
     state.chat.cancel(&thread_id);
     // Tear down the thread's TALK shell (kills the daemon PTY + releases the
     // session entry) so deleting conversations doesn't leak bash processes.
@@ -5199,6 +5207,17 @@ pub async fn pending_subagent_caps(
     thread_id: String,
 ) -> AppResult<Vec<crate::chat_engine::SubagentCapEvent>> {
     Ok(state.chat.cap_gate.pending_for_thread(&thread_id))
+}
+
+/// The approval cards still waiting on a thread, oldest first — a reloaded
+/// webview asks for them when it opens the thread (the parked turn outlives
+/// the view, and a card no longer times out on its own).
+#[tauri::command]
+pub async fn pending_approvals(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<Vec<crate::chat_engine::ApprovalRequestEvent>> {
+    Ok(state.chat.approvals().pending_for_thread(&thread_id))
 }
 
 /// Give a finished sub-agent more turns (`extra_turns` `None` = no limit),

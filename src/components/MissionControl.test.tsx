@@ -817,6 +817,24 @@ describe("MissionControl", () => {
     expect(screen.queryByText("The floor is quiet.")).toBeNull();
   });
 
+  it("a Talk approval card waiting on you is a needs-you card that names the command", () => {
+    useAttentionStore.setState({
+      flagsByWs: { "ws-x": { kind: "chat", at: 1_000, since: 1_000, reason: "approval", detail: "git push --force" } },
+    });
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [{ id: "ws-x", name: "Alpha" }] },
+    } as any);
+    const onJumpToAttention = vi.fn();
+    renderRoom({ onJumpToAttention });
+    expect(screen.getByText("approval in Talk")).toBeInTheDocument();
+    expect(screen.getByText("Approve or deny: git push --force")).toBeInTheDocument();
+    // It holds the beacon as the only needs-you item, and opens the mission's Talk.
+    const card = screen.getByRole("button", { name: /approval in Talk/ });
+    expect(card.className).toContain("octo-stage-pulse");
+    fireEvent.click(card);
+    expect(onJumpToAttention).toHaveBeenCalledWith("ws-x", "chat");
+  });
+
   it("a terminal bell surfaces as a terminal attention card", () => {
     useAttentionStore.setState({ flagsByWs: { "ws-y": { kind: "terminal", at: 1_000 } } });
     renderRoom();
