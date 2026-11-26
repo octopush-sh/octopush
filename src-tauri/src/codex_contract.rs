@@ -83,6 +83,8 @@ fn help_lists(help: &str, flag: &str) -> bool {
 }
 
 const SESSION: &str = "01a1e4ff-fb0a-7ab2-aa00-7b42b409160a";
+/// A stage's worktree, with a space: it stays one argument.
+const WORKTREE: &str = "/Users/u/Octopush Worktrees/ws-1";
 
 #[test]
 fn version_file_matches_the_recorded_cli() {
@@ -122,8 +124,8 @@ fn resume_argv_flags_sit_where_the_recorded_help_accepts_them() {
             (false, CodexWriteScope::MissionSandbox),
         ] {
             let d = CliDialect::Codex;
-            let fresh = d.argv("gpt-5.5", "", 25, read_only, scope);
-            let mut a = d.resume_argv("gpt-5.5", SESSION, 25, read_only, scope).unwrap();
+            let fresh = d.argv("gpt-5.5", "", 25, read_only, scope, WORKTREE);
+            let mut a = d.resume_argv("gpt-5.5", SESSION, 25, read_only, scope, WORKTREE).unwrap();
             // What the runner adds: the effort and the writable root.
             d.push_effort_args(&mut a, "gpt-5.5", Some(crate::providers::Effort::High));
             if !read_only && scope == CodexWriteScope::Workspace {
@@ -142,8 +144,24 @@ fn resume_argv_flags_sit_where_the_recorded_help_accepts_them() {
                 assert!(help_lists(&resume, f), "[{}] `codex exec resume` doesn't list {f}", r.label("exec-resume-help.txt"));
             }
             assert!(a.windows(2).any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"high\""), "{a:?}");
-            if read_only {
-                assert!(a[..at].windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{a:?}");
+            // Since 0.172.0 a resume restores the thread's saved directory,
+            // permissions and roots unless overridden (#1110): the worktree
+            // and the sandbox are named before `resume`, where `codex exec`
+            // reads them, and the writable root rides its `-c` override.
+            let before = |flag: &str, value: &str| a[..at].windows(2).any(|w| w[0] == flag && w[1] == value);
+            assert!(before("-C", WORKTREE), "{a:?}");
+            assert!(!a[at..].iter().any(|x| x == "-C" || x == "--cd"), "{a:?}");
+            match (read_only, scope) {
+                (true, _) => assert!(before("--sandbox", "read-only"), "{a:?}"),
+                (false, CodexWriteScope::Workspace) => {
+                    assert!(before("--sandbox", "workspace-write"), "{a:?}");
+                    assert!(before("-c", "approval_policy=\"never\""), "{a:?}");
+                    let root = &codex_writable_root_args("/tmp/cache-root")[1];
+                    assert!(a.windows(2).any(|w| w[0] == "-c" && w[1] == *root), "{a:?}");
+                }
+                (false, CodexWriteScope::MissionSandbox) => {
+                    assert!(a[..at].contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{a:?}")
+                }
             }
             // A sandboxed writer's home overrides sit before the trailing `-`
             // and are flags `codex exec` lists.
