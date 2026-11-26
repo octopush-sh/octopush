@@ -4475,6 +4475,7 @@ mod continuation_tests {
             cache_creation_tokens: write,
             rate_limit: None,
             raw_content: vec![],
+            ..Default::default()
         };
         let mut u = TurnUsage::default();
         u.add("claude-opus-4-6", &r(100, 50, 0, 2000));
@@ -4754,6 +4755,7 @@ mod tests {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: raw,
+            ..Default::default()
         }
     }
 
