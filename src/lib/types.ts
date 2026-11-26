@@ -796,6 +796,9 @@ export interface AppSettings {
   /** Tool-call rounds one Talk message may run before the model is asked to
    *  answer with what it has. Unset/null → **no limit**. */
   talkMaxIterations?: number | null;
+  /** The engine a Talk turn runs on (#1143), settings.json only for now:
+   *  unset → `legacy`; `v2` replays the append-only transcript. */
+  talkEngine?: "legacy" | "v2";
   /** Run-mode attention from Claude Code's lifecycle hooks instead of the
    *  terminal bell (#287). Unset/null → **on**; only `false` turns it off. */
   claudeHooksEnabled?: boolean | null;

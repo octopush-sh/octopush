@@ -43,7 +43,7 @@ use chrono;
 /// TALK-only tool that pulls a stored tool output back into context. Earlier
 /// turns' tool results are re-sent abridged (see `chat_history`); this is the
 /// model's way to read the omitted part instead of re-running the tool.
-const RECALL_TOOL_NAME: &str = "recall_tool_output";
+pub(crate) const RECALL_TOOL_NAME: &str = "recall_tool_output";
 /// Chars a single `recall_tool_output` call returns when no `limit` is given.
 const RECALL_DEFAULT_LIMIT: usize = 40_000;
 /// Hard ceiling on one `recall_tool_output` window.
@@ -3293,6 +3293,11 @@ impl ChatEngine {
         // same-role turns merge (Anthropic 400 guard), and `error`/`stopped`
         // rows are never replayed.
         let history = self.db.lock().list_chat_messages(&request.thread_id)?;
+        let saved_settings = crate::settings::load_settings().ok();
+        // Talk engine v2 (#1143): the history replays the append-only
+        // transcript, and this turn writes its columns.
+        let v2 = saved_settings.as_ref().is_some_and(|s| s.talk_engine == crate::settings::TalkEngine::V2);
+        let transcript = v2.then(|| crate::context::transcript::rows(&history));
 
         // Talk checkpoint (#958): snapshot the tree before this turn can
         // write, so its files can be rewound later (a regenerate keeps the
@@ -3313,20 +3318,25 @@ impl ChatEngine {
             }
         }
 
-        let rows: Vec<HistoryRow<'_>> = history
-            .iter()
-            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_blocks.as_deref() })
-            .collect();
-        let mut messages: Vec<LlmMessage> = build_history(&rows)
-            .into_iter()
-            .map(|t| LlmMessage {
-                role: match t.role {
-                    HistoryRole::User => LlmRole::User,
-                    HistoryRole::Assistant => LlmRole::Assistant,
-                },
-                content: LlmContent::Text(t.text),
-            })
-            .collect();
+        let mut messages: Vec<LlmMessage> = match &transcript {
+            Some(rows) => crate::context::transcript::build(rows, &request.model),
+            None => {
+                let rows: Vec<HistoryRow<'_>> = history
+                    .iter()
+                    .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_blocks.as_deref() })
+                    .collect();
+                build_history(&rows)
+                    .into_iter()
+                    .map(|t| LlmMessage {
+                        role: match t.role {
+                            HistoryRole::User => LlmRole::User,
+                            HistoryRole::Assistant => LlmRole::Assistant,
+                        },
+                        content: LlmContent::Text(t.text),
+                    })
+                    .collect()
+            }
+        };
 
         // Attach this turn's images: replace the current (last) user turn with a
         // multimodal block carrying the text + image blocks. Attachments aren't
@@ -3488,8 +3498,10 @@ impl ChatEngine {
             model_budget = model_budget.with_fixed_window();
         }
         let mut context_guard = budget::ContextGuard::new(model_budget, budget::load_learned(&self.db.lock(), &request.model));
-        // Each tool call's stored row, which a stub names for recall.
-        let mut tool_rows: HashMap<String, i64> = HashMap::new();
+        // Each tool call's stored row, which a stub names for recall (the
+        // transcript's earlier calls among them).
+        let mut tool_rows: HashMap<String, i64> =
+            transcript.as_deref().map(crate::context::transcript::tool_rows).unwrap_or_default();
 
         // Snapshot files already modified before this turn started. Anything
         // present here was the user's own change — we won't credit it to the
@@ -3505,7 +3517,6 @@ impl ChatEngine {
         // Tool-call rounds this turn may run: the saved "Limit tool turns per
         // message" preference (Settings › General), clamped — or, unset, no
         // limit: the turn runs until the model answers or the user stops it.
-        let saved_settings = crate::settings::load_settings().ok();
         let max_iterations = effective_talk_max_iterations(
             saved_settings.as_ref().and_then(|s| s.talk_max_iterations),
         );
@@ -3717,6 +3728,18 @@ impl ChatEngine {
                     }
                 }
             };
+
+            // v2: the row keeps the round verbatim, with its model, so later
+            // turns replay what this one sends next.
+            if v2 && assistant_msg_id >= 0 {
+                let round = crate::context::transcript::RoundRecord::of(&request.model, &response);
+                let kept = serde_json::to_string(&round)
+                    .map_err(AppError::from)
+                    .and_then(|json| self.db.lock().set_chat_round(assistant_msg_id, &json));
+                if let Err(e) = kept {
+                    tracing::warn!(error = %e, "failed to keep the tool round for the transcript");
+                }
+            }
 
             // Add assistant message with tool_use content to conversation,
             // its content blocks verbatim (`tool_round_turn`).
@@ -4176,12 +4199,21 @@ impl ChatEngine {
                     tool_rows.insert(u.id.clone(), id);
                 }
                 // The row keeps the whole result; an MCP result is capped
-                // in the copy the next round carries.
-                tool_results.push(LlmToolResult {
-                    tool_use_id: u.id.clone(),
-                    content: crate::chat_history::tool_result_for_model(&u.name, result, row_id),
-                    is_error: false,
-                });
+                // in the copy the next round carries. v2 caps every result
+                // once, from the model's window, and the row keeps that copy
+                // for later turns to replay.
+                let content = if v2 {
+                    let view = crate::context::transcript::model_view(&u.name, &result, row_id, context_guard.budget().window);
+                    if let Some(id) = row_id {
+                        if let Err(e) = self.db.lock().set_chat_tool_view(id, &u.id, &view) {
+                            tracing::warn!(error = %e, "failed to keep the tool result's model view");
+                        }
+                    }
+                    view
+                } else {
+                    crate::chat_history::tool_result_for_model(&u.name, result, row_id)
+                };
+                tool_results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error: false });
             }
 
             // ── Catch-all file-edit attribution ───────────────────
@@ -4795,6 +4827,117 @@ mod tests {
         let unsigned = vec![serde_json::json!({ "type": "thinking", "thinking": "half" }), raw[2].clone()];
         let sent = sent_turn(truncated_round_turn(&tool_response(unsigned, LlmStopReason::MaxTokens)));
         assert_eq!(sent, serde_json::Value::Array(raw[2..4].to_vec()));
+    }
+
+    /// A response that thought, said something, then made `calls`.
+    fn round_response(text: &str, calls: &[(&str, &str)]) -> LlmResponse {
+        let tool_uses: Vec<crate::providers::LlmToolUse> = calls
+            .iter()
+            .map(|(id, name)| crate::providers::LlmToolUse { id: (*id).into(), name: (*name).into(), input: serde_json::json!({ "path": "src/a.rs" }) })
+            .collect();
+        let mut raw = vec![
+            serde_json::json!({ "type": "thinking", "thinking": "plan", "signature": format!("sig-{}", calls[0].0) }),
+            serde_json::json!({ "type": "text", "text": text }),
+        ];
+        raw.extend(tool_uses.iter().map(|u| serde_json::json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input })));
+        LlmResponse { raw_content: raw, text: text.into(), tool_uses, ..tool_response(vec![], LlmStopReason::ToolUse) }
+    }
+
+    /// One v2 tool round as `run_agentic_turn` runs it: the assistant row and
+    /// its record, then each call's row and its model view. Appends what the
+    /// loop sends on the next round.
+    fn v2_round(d: &Db, thread: &str, model: &str, response: &LlmResponse, outputs: &[&str], messages: &mut Vec<LlmMessage>) {
+        let atu = d.insert_chat_message("ws", thread, "assistant_tool_use", &format!("{}\n\n[tool_calls: []]", response.text), Some(model), None, None, None).unwrap();
+        let record = crate::context::transcript::RoundRecord::of(model, response);
+        d.set_chat_round(atu, &serde_json::to_string(&record).unwrap()).unwrap();
+        messages.push(tool_round_turn(response));
+        let mut results = Vec::new();
+        for (u, out) in response.tool_uses.iter().zip(outputs) {
+            let row = tool_row(&u.id, &u.name, u.input.clone(), out, RowVerdict { ok: true, ..RowVerdict::default() });
+            let id = d.insert_chat_message("ws", thread, "tool", &row.to_string(), None, None, None, None).unwrap();
+            let view = crate::context::transcript::model_view(&u.name, out, Some(id), 200_000);
+            d.set_chat_tool_view(id, &u.id, &view).unwrap();
+            results.push(LlmToolResult { tool_use_id: u.id.clone(), content: view, is_error: false });
+        }
+        messages.push(LlmMessage { role: LlmRole::User, content: LlmContent::ToolResults(results) });
+    }
+
+    #[test]
+    fn transcript_is_prefix_stable_across_turns() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let d = Db::open(tmp.path()).unwrap();
+        d.insert_project("p", "P", "/tmp/p").unwrap();
+        d.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = d.create_chat_thread("ws", "T").unwrap().id;
+        let model = "claude-opus-5-5";
+        let insert = |role: &str, content: &str| d.insert_chat_message("ws", &t, role, content, None, None, None, None).unwrap();
+        // What a turn starts from, on v2.
+        let start = || crate::context::transcript::build(&crate::context::transcript::rows(&d.list_chat_messages(&t).unwrap()), model);
+        // The messages of a request as each adapter puts them on the wire,
+        // one string per message (breakpoints aside: B3 places them).
+        let wire = |messages: &[LlmMessage], openai: bool| -> Vec<String> {
+            let mut req = director_request(&chat_request_on(model, DEEP), "sys", messages, &[]);
+            req.cache = false;
+            let body = if openai { crate::providers::openai_compat::build_request(&req) } else { crate::providers::anthropic::build_request(&req) };
+            body["messages"].as_array().unwrap().iter().map(|m| m.to_string()).collect()
+        };
+        let extends = |last: &[LlmMessage], next: &[LlmMessage]| {
+            [false, true].into_iter().all(|openai| {
+                let (a, b) = (wire(last, openai), wire(next, openai));
+                a.len() < b.len() && a[..] == b[..a.len()]
+            })
+        };
+
+        // Turn 1: two rounds, one of them parallel, with a 120 KB file.
+        insert("user", "fix the failing test");
+        let mut turn1 = start();
+        let file = format!("HEAD{}TAIL", "x".repeat(120_000));
+        let r1 = round_response("Reading.", &[("tu_1", "read_file"), ("tu_2", "Agent")]);
+        v2_round(&d, &t, model, &r1, &[file.as_str(), "report: 1 failure"], &mut turn1);
+        let r2 = round_response("Fixing.", &[("tu_3", "edit_file")]);
+        v2_round(&d, &t, model, &r2, &["ok"], &mut turn1);
+        insert("assistant", "Fixed the off-by-one.");
+
+        // Turn 2. A model view is written once: a second write changes nothing.
+        let agent_row = d.list_chat_messages(&t).unwrap().into_iter().find(|m| m.tool_use_id.as_deref() == Some("tu_2")).unwrap().id;
+        d.set_chat_tool_view(agent_row, "tu_2", "rewritten").unwrap();
+        let ask = insert("user", "add a regression test\n\na.ts\n```\nx\n```");
+        d.set_chat_message_context(ask, r#"[{"token":"a.ts","kind":"file","label":"a.ts","tokens":4,"start":21,"end":37}]"#).unwrap();
+        let mut turn2 = start();
+        assert!(extends(&turn1, &turn2), "turn 2 starts with the bytes turn 1 last sent");
+        let r3 = round_response("Writing it.", &[("tu_4", "write_file")]);
+        v2_round(&d, &t, model, &r3, &["written"], &mut turn2);
+        insert("assistant", "Added.");
+
+        // Turn 3: the same again, a small @ block included.
+        insert("user", "thanks");
+        let turn3 = start();
+        assert!(extends(&turn2, &turn3), "turn 3 starts with the bytes turn 2 last sent");
+
+        // A continued sub-agent rewrites its row: the director reads the new
+        // report, its turn as text from then on, and the ask before it holds.
+        let record = tool_row("tu_2", "Agent", serde_json::json!({}), "report: fixed", RowVerdict::default());
+        d.update_chat_message_content(agent_row, &record.to_string()).unwrap();
+        let continued = start();
+        assert_eq!(wire(&continued[..1], false), wire(&turn3[..1], false));
+        assert!(matches!(&continued[1].content, LlmContent::Text(t) if t.contains("report: fixed")), "{:?}", continued[1]);
+
+        // The legacy history rewrites the rounds as text the next turn, so
+        // the prefix breaks where turn 1's first round was.
+        let history = d.list_chat_messages(&t).unwrap();
+        let legacy_rows: Vec<HistoryRow<'_>> = history
+            .iter()
+            .take_while(|m| m.id <= ask)
+            .map(|m| HistoryRow { id: m.id, role: &m.role, content: &m.content, context: m.context_blocks.as_deref() })
+            .collect();
+        let legacy: Vec<LlmMessage> = build_history(&legacy_rows)
+            .into_iter()
+            .map(|h| LlmMessage {
+                role: if h.role == HistoryRole::User { LlmRole::User } else { LlmRole::Assistant },
+                content: LlmContent::Text(h.text),
+            })
+            .collect();
+        assert!(!extends(&turn1, &legacy));
     }
 
     #[test]

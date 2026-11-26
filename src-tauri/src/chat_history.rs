@@ -295,7 +295,7 @@ fn shortened_context_len(content: &str, context_blocks: &str) -> usize {
 /// within the settled allowance, with the recall id that brings it back.
 /// A pure function of the row, so once shortened a block is byte-stable:
 /// the one full-to-shortened change happens the turn after it was sent.
-fn abridge_context(id: i64, content: &str, context_blocks: &str) -> String {
+pub(crate) fn abridge_context(id: i64, content: &str, context_blocks: &str) -> String {
     let Some(spans) = context_spans(content, context_blocks) else {
         return content.to_string();
     };
@@ -334,7 +334,7 @@ pub struct HistoryTurn {
 /// rows; everything before it is the model's own lead-in prose.
 const TOOL_CALLS_MARKER: &str = "[tool_calls:";
 
-fn strip_tool_calls_suffix(content: &str) -> &str {
+pub(crate) fn strip_tool_calls_suffix(content: &str) -> &str {
     match content.find(TOOL_CALLS_MARKER) {
         Some(idx) => content[..idx].trim(),
         None => content.trim(),
@@ -394,7 +394,7 @@ pub fn tool_result_for_model(tool_name: &str, result: String, row_id: Option<i64
 /// Format one persisted `role="tool"` row for the model. `budget` is the
 /// result allowance from [`plan_tool_history`]; a truncated result names the
 /// row id so `recall_tool_output` can fetch the rest.
-fn summarize_tool_row(id: i64, content: &str, budget: usize) -> Option<String> {
+pub(crate) fn summarize_tool_row(id: i64, content: &str, budget: usize) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
     let name = parsed.get("toolName").and_then(|n| n.as_str()).unwrap_or("tool");
     let empty_obj = serde_json::json!({});
