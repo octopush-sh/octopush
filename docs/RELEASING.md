@@ -124,9 +124,45 @@ twice a day ([`ROUTINES.md`](ROUTINES.md)):
   commits `chore: release v<next>`, pushes, opens a PR labelled `release`, waits
   for CI (≤ 45 min; a run that only lost its runner is re-run), merges it (merge commit, pinned to the head sha), and pushes
   the annotated tag `v<next>` on the merge commit. `release.yml` then publishes the beta.
+- **The tag lands only on a tree CI tested** (#1063: v0.4.142 tagged a merge
+  that had never been built). A merge commit has the PR head's exact tree only
+  if the head still contains `main`, so after CI passes the routine fetches
+  `main` again:
+  - if `main` moved while CI ran, it cuts the release again from the new
+    `main` (same branch and PR, new head; what landed is in the notes) and
+    waits for CI again — at most `OCTOPUSH_RELEASE_RECUTS` times (default 1),
+    then it stops;
+  - after the merge it checks that the merge commit's tree is the tested
+    head's. If `main` slipped in between, CI runs on the merge commit itself,
+    pushed as its own branch `release-check/v<next>` (so no dispatch on `main`
+    can cancel it) and waited for; a run that only lost its runner is re-run.
+    Green: tagged. Red: the version is **abandoned** — tag `abandoned/v<next>`
+    on the merge (never a `v*` tag, so no build) — and the next run, once
+    `main` is green, releases the number after it and carries its notes. No
+    verdict (timeout, runners never came): nothing is tagged and the next run
+    checks again.
+  - the same check covers a release that merged but never got its tag: the
+    resume tags it at once only if CI passed on the merge, or on a head with
+    exactly its tree; otherwise it runs CI on the merge as above. `check` fires
+    for such a release even while `main`'s head has no green CI (the merge is
+    verified on its own).
+
+  Auto-merge of agent PRs pauses while a release PR is open
+  ([`ROUTINES.md`](ROUTINES.md)), so `main` rarely moves in the first place.
+- **A failed build's notes are not lost.** `--since` is the newest `v*` tag with
+  a published GitHub release. Every collected version on `main`
+  (`whats-new/X.Y.Z/`) after it that was never published — its tagged build
+  failed, or it was abandoned — is carried (at most 5):
+  `whats-new.mjs collect <next> --since <published> --carry <versions>` puts
+  their changesets into the notes, with a line saying they were never
+  published. (Their What's new tips already reach users: the modal shows every
+  bundled version since the last one seen.)
 - On any failure it stops, leaves no tag behind, and comments on and closes the
   PR. Re-running is safe: an open PR is reused, and a release that merged but
-  never got its tag is only tagged.
+  never got its tag is only tagged, once CI passed on that tree. The cut step
+  has its own time limit (180 min); a later step of `nightly-release.yml`
+  closes a release PR that a timed-out or cancelled run left open, so the
+  auto-merge pause doesn't hold.
 
 ### The updater endpoint (host indirection)
 

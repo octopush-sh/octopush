@@ -3,10 +3,13 @@
 //
 //   node scripts/whats-new.mjs check
 //       Validate every changeset (unreleased and released). Exit 1 on any error.
-//   node scripts/whats-new.mjs collect <version> [--since <git-ref>]
+//   node scripts/whats-new.mjs collect <version> [--since <git-ref>] [--carry <X.Y.Z>[,…]]
 //       Move whats-new/unreleased/* into whats-new/<version>/ and write
 //       whats-new/<version>/notes.md. With --since, merged PRs between <git-ref>
 //       and HEAD that brought no changeset are listed under "Maintenance".
+//       With --carry, the changesets of those versions (tagged, but their build
+//       failed, so they were never published) are in the notes too, and the
+//       notes say so: nothing they shipped is left out of a published release.
 //   node scripts/whats-new.mjs notes <version>
 //       Print whats-new/<version>/notes.md (for release scripts).
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
@@ -132,8 +135,14 @@ function mergedPrs(since) {
   });
 }
 
-export function renderNotes(version, entries, maintenance) {
+/** "0.4.142", "0.4.141 and 0.4.142", "0.4.140, 0.4.141 and 0.4.142" (pure). */
+const listOf = (xs) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}`);
+
+export function renderNotes(version, entries, maintenance, carried = []) {
   const lines = [`## Octopush ${version}`, ""];
+  if (carried.length) {
+    lines.push(`This release also ships the changes of ${listOf(carried)}, whose build failed, so ${carried.length === 1 ? "it was" : "they were"} never published.`, "");
+  }
   const groups = [["feature", "Features"], ["improvement", "Improvements"], ["fix", "Fixes"]];
   for (const [kind, heading] of groups) {
     const items = entries.filter((e) => e.meta.kind === kind);
@@ -152,8 +161,12 @@ export function renderNotes(version, entries, maintenance) {
   return lines.join("\n").trimEnd() + "\n";
 }
 
-function collect(version, since) {
+function collect(version, since, carry = []) {
   if (!VERSION.test(version)) { console.error(`version "${version}" must be X.Y.Z`); process.exit(2); }
+  for (const v of carry) {
+    if (!VERSION.test(v) || v === version) { console.error(`--carry "${v}" must be another X.Y.Z`); process.exit(2); }
+    if (!existsSync(join(WN, v))) { console.error(`--carry ${v}: no whats-new/${v}/`); process.exit(2); }
+  }
   const dest = join(WN, version);
   if (existsSync(join(dest, "notes.md"))) { console.error(`whats-new/${version}/notes.md already exists`); process.exit(2); }
   mkdirSync(dest, { recursive: true });
@@ -165,7 +178,10 @@ function collect(version, since) {
     if (existsSync(clip)) renameSync(clip, join(dest, `${slug}.webm`));
     moved.push(slug);
   }
-  const entries = changesetFiles(dest).sort().map((f) => ({ slug: basename(f, ".md"), ...parseChangeset(readFileSync(f, "utf8")) }));
+  const read = (dir) => changesetFiles(dir).sort().map((f) => ({ slug: basename(f, ".md"), ...parseChangeset(readFileSync(f, "utf8")) }));
+  const entries = read(dest);
+  // The carried versions' changesets stay where they are (their tips already ship in the app's bundle).
+  for (const v of carry) for (const e of read(join(WN, v))) if (!entries.some((x) => x.slug === e.slug)) entries.push(e);
   let maintenance = [];
   if (since) {
     // A PR "brought" a changeset if its merge added a file in whats-new/unreleased/.
@@ -174,20 +190,21 @@ function collect(version, since) {
     for (const m of log.matchAll(/Merge pull request #(\d+)/g)) withChangeset.add(Number(m[1]));
     maintenance = mergedPrs(since).filter((p) => !withChangeset.has(p.number) && !/^chore: release v/i.test(p.title));
   }
-  writeFileSync(join(dest, "notes.md"), renderNotes(version, entries, maintenance));
-  console.log(`whats-new: ${moved.length} changeset(s) → whats-new/${version}/ · notes.md written`);
+  writeFileSync(join(dest, "notes.md"), renderNotes(version, entries, maintenance, carry));
+  console.log(`whats-new: ${moved.length} changeset(s) → whats-new/${version}/ · notes.md written${carry.length ? ` (also carries ${carry.join(", ")})` : ""}`);
 }
 
 const [cmd, ...args] = process.argv.slice(2);
 if (cmd === "check") check();
 else if (cmd === "collect") {
   const i = args.indexOf("--since");
-  collect(args[0], i >= 0 ? args[i + 1] : undefined);
+  const c = args.indexOf("--carry");
+  collect(args[0], i >= 0 ? args[i + 1] : undefined, c >= 0 ? String(args[c + 1] ?? "").split(",").filter(Boolean) : []);
 } else if (cmd === "notes") {
   const p = join(WN, args[0] ?? "", "notes.md");
   if (!existsSync(p)) { console.error(`no notes for ${args[0]}`); process.exit(1); }
   process.stdout.write(readFileSync(p, "utf8"));
 } else if (cmd !== undefined || process.argv[1]?.endsWith("whats-new.mjs")) {
-  console.error("usage: whats-new.mjs check | collect <version> [--since <ref>] | notes <version>");
+  console.error("usage: whats-new.mjs check | collect <version> [--since <ref>] [--carry <X.Y.Z>[,…]] | notes <version>");
   process.exit(64);
 }
