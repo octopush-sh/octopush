@@ -59,16 +59,18 @@ jobs:
       - name: cargo test
         working-directory: src-tauri
         shell: bash
-        # Failures are also surfaced as an annotation: agents read CI through the
-        # API (annotations), not through raw log downloads.
+        # Failures are also surfaced as an annotation (the run's summary page).
+        # The builder's fix rounds read this job's log through a fixed step
+        # (scripts/routines/ci-failures.mjs), never the agent itself.
         run: |
           set -o pipefail
           if ! cargo test --locked 2>&1 | tee "$RUNNER_TEMP/cargo-test.log"; then
             summary="$(grep -E '^(error(\[E[0-9]+\])?:|test .* \.\.\. FAILED|thread .* panicked|failures:|    [a-z_:]+$|  --> |assertion|^  left|^ right|^called `Result::unwrap\(\)`)' "$RUNNER_TEMP/cargo-test.log" | head -n 80 || true)"
             [ -n "$summary" ] || summary="$(tail -n 40 "$RUNNER_TEMP/cargo-test.log")"
-            summary="${summary//'%'/'%25'}"
-            summary="${summary//$'\r'/'%0D'}"
-            echo "::error title=cargo test failed::${summary//$'\n'/'%0A'}"
+            # Escaped with sed/awk, not ${var//…/'…'}: the macOS runner's bash
+            # kept those quotes literally and the annotation read just `'`.
+            summary="$(printf '%s\n' "$summary" | tr -d '\r' | sed 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }')"
+            echo "::error title=cargo test failed::${summary}"
             exit 1
           fi
       - name: cargo clippy
@@ -104,6 +106,23 @@ jobs:
         run: node --test scripts/web-audit/web-audit.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
+
+  main-red:
+    # main's CI failed: start the builder now instead of at its cron. Its job
+    # picker (jobs.mjs) opens or updates the cycle's one "main is red" issue
+    # and offers it first; auto-merge pauses meanwhile (automerge.mjs). It sees
+    # this run's failed job although the run is still finishing (main-health.mjs).
+    needs: [frontend, backend, repo-rules]
+    if: always() && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start the builder
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-build.yml/dispatches" -f ref=main >/dev/null && echo "builder started" || echo "::warning::builder dispatch failed"
 
   review-next:
     # The nightly builder dispatches CI on its agent/… branch with GITHUB_TOKEN,

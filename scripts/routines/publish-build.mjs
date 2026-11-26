@@ -25,7 +25,10 @@
 //
 // Env: GH_TOKEN, OCTOPUSH_GIT_DIR (the checkout's .git, moved out of the agent's
 // reach), OCTOPUSH_SECRETS (newline-separated values that must never be
-// published — the Claude token), GITHUB_REPOSITORY.
+// published — the Claude token), GITHUB_REPOSITORY, and optionally
+// OCTOPUSH_CONFLICTS_FILE (the files main's merge left with conflict markers,
+// one per line, written by nightly-build.yml where the agent can't reach it:
+// nothing is pushed while one of them still has a marker).
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
@@ -87,6 +90,19 @@ export function parseResult(text, kind) {
   return { error: `action "${r.action}" is not valid for a${kind === "issue" ? "n issue" : " PR"} job` };
 }
 
+/** A line Git writes into a conflicted file (any conflict style). */
+const CONFLICT_MARKER = /^(<{7}|\|{7}|>{7})( |$)|^={7}$/m;
+export const hasConflictMarkers = (text) => CONFLICT_MARKER.test(String(text ?? ""));
+/** The conflicted files that still carry a marker (pure but for reading them). */
+export function unresolvedConflicts(paths) {
+  return paths.filter((p) => { try { return lstatSync(p).isFile() && hasConflictMarkers(readFileSync(p, "utf8")); } catch { return false; } });
+}
+/** The list nightly-build.yml wrote, or none. */
+export function conflictList(file) {
+  if (!file || !existsSync(file)) return [];
+  return readFileSync(file, "utf8").split("\n").map((l) => l.trim()).filter(Boolean);
+}
+
 /** Does any text contain one of the secret values? */
 export function leaks(texts, secrets) {
   const s = secrets.map((x) => x.trim()).filter((x) => x.length >= 8);
@@ -137,6 +153,16 @@ export function parsePorcelain(out) {
   return entries;
 }
 
+/** Has the workflow committed onto the branch (main merged in) since it fetched it? */
+function aheadOfRemote(gitDir, branch) {
+  try {
+    const rev = (ref) => git(gitDir, ["rev-parse", "--verify", "--quiet", ref], { stdio: ["pipe", "pipe", "pipe"] }).trim();
+    const head = rev("HEAD");
+    const remote = rev(`refs/remotes/origin/${branch}`);
+    return !!head && !!remote && head !== remote && git(gitDir, ["merge-base", "--is-ancestor", remote, head], { stdio: ["pipe", "pipe", "pipe"] }) !== null;
+  } catch { return false; }
+}
+
 function changedPaths(gitDir) {
   return parsePorcelain(git(gitDir, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]));
 }
@@ -169,8 +195,9 @@ async function main() {
   if (web && !process.env.GH_TOKEN) throw new Error("GH_TOKEN (the app repo) is required for web jobs");
   // Every token-holding value must be scanned for, not only the Claude one.
   const secrets = (process.env.OCTOPUSH_SECRETS ?? "").split("\n");
+  const conflicts = kind === "pr" ? conflictList(process.env.OCTOPUSH_CONFLICTS_FILE) : [];
   try {
-    return await publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: ghForRepo(repo), appGh: makeGh() });
+    return await publish({ kind, n, existingBranch, repo, gitDir, token, secrets, conflicts, gh: ghForRepo(repo), appGh: makeGh() });
   } catch (e) {
     throw isPrivateLane(repo) ? privateFailure(e) : e;
   }
@@ -193,7 +220,7 @@ export function privateFailure(e, stage = STAGE) {
  * The whole publishing flow, run in the current directory (the agent's
  * checkout). `pushUrl` is only for tests (a local bare repo).
  */
-export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh, appGh = gh, pushUrl }) {
+export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, conflicts = [], gh, appGh = gh, pushUrl }) {
   QUIET = isPrivateLane(repo);
   STAGE = "result";
   // Where the job's issue lives: an app-issue job's issue is in the app repo.
@@ -211,18 +238,24 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   STAGE = "status";
   const entries = changedPaths(gitDir);
   const all = entries.map((e) => e.path);
-  if (!all.length) { park(jobGh, jobRepo, kind, n, "It reported success but changed no files."); return 1; }
+  // A PR job may have nothing left to change once main is merged in (the conflict GitHub saw is
+  // gone, or main had the fix): the merge commit the workflow made is then the whole round.
+  const mergeOnly = !all.length && kind === "pr" && !!existingBranch && aheadOfRemote(gitDir, existingBranch);
+  if (!all.length && !mergeOnly) { park(jobGh, jobRepo, kind, n, "It reported success but changed no files."); return 1; }
   const bad = forbiddenPaths(all, repo);
   if (bad.length) { park(jobGh, jobRepo, kind, n, `It changed paths agents may not touch: ${bad.join(", ")}.`); return 1; }
   // A committed symlink could point the reviewer (or anyone) at /proc or runner files.
   const links = all.filter((p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } });
   if (links.length) { park(jobGh, jobRepo, kind, n, `It created symlinks, which agents may not commit: ${links.join(", ")}.`); return 1; }
+  // Main's merge was committed with its conflicts for the agent to resolve: none may reach the branch unresolved.
+  const unresolved = unresolvedConflicts(conflicts);
+  if (unresolved.length) { park(jobGh, jobRepo, kind, n, `It left merge conflict markers in: ${unresolved.join(", ")}. Resolve them (main was merged into the branch) and push.`); return 1; }
   // A cache file is never added, but removing one that is already committed
   // (a report a past round shipped) must still reach the branch.
   const paths = entries
     .filter((e) => e.xy.includes("D") || !CACHE.some((re) => re.test(e.path)))
     .map((e) => e.path);
-  if (!paths.length) { park(jobGh, jobRepo, kind, n, "It changed only cache files."); return 1; }
+  if (!paths.length && !mergeOnly) { park(jobGh, jobRepo, kind, n, "It changed only cache files."); return 1; }
   const contents = paths.filter((p) => existsSync(p)).map((p) => { try { return readFileSync(p, "utf8"); } catch { return ""; } });
   if (leaks([...contents, r.title ?? "", r.summary ?? ""], [...secrets, token])) {
     park(jobGh, jobRepo, kind, n, "Its output contained a secret value, so nothing was pushed. Look at the workflow run.");
@@ -232,11 +265,13 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   const branch = kind === "pr" ? existingBranch : branchFor(n, r.title, kind, repo);
   if (!branch) throw new Error("a PR job needs its branch");
   const closes = kind === "app-issue" ? `Closes ${APP_REPO}#${n}` : `Closes #${n}`;
-  STAGE = "stage";
-  // Literal pathspecs from stdin: a file named "*" or ":(glob)**" is just a name.
-  git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
-  STAGE = "commit";
-  git(gitDir, [...botIdentity(), "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\n${closes}`]);
+  if (paths.length) {
+    STAGE = "stage";
+    // Literal pathspecs from stdin: a file named "*" or ":(glob)**" is just a name.
+    git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
+    STAGE = "commit";
+    git(gitDir, [...botIdentity(), "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\n${closes}`]);
+  }
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
   // The token reaches git through the environment, never argv (visible in the process table).
   const authEnv = { ...process.env, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader", GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${auth}` };

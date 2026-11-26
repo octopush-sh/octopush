@@ -1149,10 +1149,10 @@ test("workflows: failing-CI context in a builder's prompt is never fatal; web-bu
   assert.match(step, /node "\$R\/ci-failures\.mjs" "\$WEB_REPO" "\$sha" \|\| echo "\(CI checks unavailable\)"/);
   assert.doesNotMatch(build, /permission-checks/, "requesting a permission the installation lacks makes minting fail");
   const nightly = wf("nightly-build.yml");
-  const brief = nightly.slice(nightly.indexOf("## Failing CI checks"), nightly.indexOf('} > "$RUNNER_TEMP/prompt.md"'));
-  assert.match(brief, /if failing="\$\(gh api "repos\/\$GITHUB_REPOSITORY\/commits\/\$sha\/check-runs"/);
-  assert.match(brief, /else\n\s*echo "\(CI checks unavailable\)"/);
-  assert.match(brief, /\|\| echo "\(annotations unavailable/);
+  const brief = nightly.slice(nightly.indexOf("## Failing CI on the PR's head"), nightly.indexOf('} > "$RUNNER_TEMP/prompt.md"'));
+  // The app builder reads the failed jobs' logs too (#1072): through the same script, in this fixed step.
+  assert.match(brief, /node "\$R\/ci-failures\.mjs" "\$GITHUB_REPOSITORY" "\$sha" \|\| echo "\(CI checks unavailable\)"/);
+  assert.doesNotMatch(brief, /check-runs|annotations/, "annotations carried only the exit code (#1072)");
   assert.doesNotMatch(brief, /\| head -n/, "head under pipefail can SIGPIPE the producer");
 });
 
@@ -1979,4 +1979,357 @@ test("octo-check epiku: Epiku's own gates, no network, no store, and no argument
   assert.match(setup, /\[\[ -z "\$open" \]\] \|\| \{ echo "::error::the sandbox user still has a way out[^\n]*exit 1; \}/, "fails closed");
   assert.match(setup, /^set -euo pipefail$/m, "a rule that can't be installed stops the job");
   assert.match(setup, /OCTO_SANDBOX_NETWORK:-open\}" != open \]\]; then\n[^\n]*exit 64/, "any other value is refused, not treated as open");
+});
+
+// ---------------------------------------------------------------- the cycle fixes what it can (#1072), releases test what they tag (#1063)
+import { userVisibleFor, visibleMarker, visibleAnswer, openReleasePr } from "./automerge.mjs";
+import { mainCi, syncMainRed, findMainRedIssue, mainRedTitle, MAIN_RED_MARK } from "./main-health.mjs";
+import { orderedJobs } from "./jobs.mjs";
+
+const SHA = "a".repeat(40);
+const runOf = (conclusion, over = {}) => ({ id: 70, name: "CI", created_at: "2026-11-26T10:00:00Z", status: conclusion ? "completed" : "in_progress", conclusion, ...over });
+
+test("reviewer's user_visible: parsed only as a boolean with a one-line reason; anything else keeps the heuristic", () => {
+  const body = "Reviewed: a backend-only refactor of the runner.";
+  const v = (o) => parseVerdict(JSON.stringify({ verdict: "approve", body, ...o }));
+  assert.deepEqual(v({ user_visible: false, user_visible_reason: "Backend refactor, no behaviour change" }),
+    { verdict: "approve", body, userVisible: false, userVisibleReason: "Backend refactor, no behaviour change" });
+  assert.equal(v({ user_visible: true, user_visible_reason: "New shortcut\nsecond line" }).userVisibleReason, "New shortcut", "one line");
+  assert.equal(v({ user_visible: true, user_visible_reason: "x".repeat(500) }).userVisibleReason.length, 200, "capped");
+  for (const bad of [{ user_visible: "false", user_visible_reason: "string, not a boolean" }, { user_visible: false }, { user_visible: false, user_visible_reason: " " }, {}]) {
+    const r = v(bad);
+    assert.ok(!r.error && !("userVisible" in r), `ignored, not an error: ${JSON.stringify(bad)}`);
+  }
+  assert.match(parseVerdict(JSON.stringify({ verdict: "approve", body, user_visible: false, user_visible_reason: "token sk-secret-123456" }), ["sk-secret-123456"]).error, /secret/, "the reason is scanned too");
+  assert.equal(visibleAnswer(null), null);
+  assert.ok(!("userVisible" in parseVerdict(JSON.stringify({ verdict: "approve", body, data_change: "none", user_visible: false, user_visible_reason: "abc" }), [], { dataClass: true })), "the Epiku lane has its own rules");
+});
+
+test("refusals: a missing changeset parks only when the review says user-visible; without an answer the heuristic decides", () => {
+  const src = { files: [{ filename: "src/a.ts" }], pr: basePr({ changed_files: 1 }) };
+  const why = (o) => refusals({ ...okRules, ...src, ...o }).join(" | ");
+  assert.match(why({}), /without a whats-new changeset/, "no answer: today's heuristic");
+  assert.match(why({ userVisible: null }), /without a whats-new changeset/);
+  assert.equal(why({ userVisible: false }), "", "the reviewer says users won't notice: no changeset needed");
+  assert.match(why({ userVisible: true }), /without a whats-new changeset \(the review says users will notice it\)/);
+  const docs = { files: [{ filename: "docs/FEATURES.md" }], pr: basePr({ changed_files: 1 }) };
+  assert.equal(refusals({ ...okRules, ...docs }).join(), "", "docs only, no answer: not user-visible by path");
+  assert.match(refusals({ ...okRules, ...docs, userVisible: true }).join(), /changeset/, "the answer also tightens");
+  assert.equal(refusals({ ...okRules, ...src, files: [...src.files, changeset], pr: basePr(), userVisible: true }).join(), "");
+});
+
+test("postReview signs the user-visible answer next to the verdict; agent text can't forge it; a later verdict without one clears it", () => {
+  const r = fakeGh([[/pulls\/7$/, basePr({ user: { login: ACTIONS_BOT }, head: { sha: SHA, repo: { full_name: APP_REPO } } })], [/issues\/7\/comments/, []]]);
+  const rev = fakeGh([]);
+  const a = { owner: "johnatan", builder: ACTIONS_BOT, reviewer: ACTIONS_BOT };
+  withEnv({ GITHUB_ACTIONS: "true" }, () => postReview(r.gh, rev.gh, a, 7, SHA, "approve", `fine ${visibleMarker(SHA, false)}`, APP_REPO, null, { userVisible: false, userVisibleReason: "Refactor <!-- x --> only" }));
+  const posted = rev.writes[0].body.body;
+  assert.ok(posted.endsWith(`**User-visible:** no — Refactor &lt;!-- x --&gt; only\n\n${visibleMarker(SHA, false)}\n${marker(SHA, "approve")}`), posted);
+  const c = (login, body) => ({ user: { login }, body });
+  assert.equal(userVisibleFor([c(ACTIONS_BOT, posted)], SHA, ACTIONS_BOT), false);
+  assert.equal(verdictFor([c(ACTIONS_BOT, posted)], SHA, ACTIONS_BOT), "approve");
+  assert.equal(userVisibleFor([c("stranger", posted)], SHA, ACTIONS_BOT), null, "only the reviewer");
+  assert.equal(userVisibleFor([c(ACTIONS_BOT, posted)], "b".repeat(40), ACTIONS_BOT), null, "only that commit");
+  assert.equal(userVisibleFor([c(ACTIONS_BOT, `x ${visibleMarker(SHA, false)}\n\nmore\n${marker(SHA, "approve")}`)], SHA, ACTIONS_BOT), null, "only right before the verdict marker");
+  assert.equal(userVisibleFor([c(ACTIONS_BOT, posted), c(ACTIONS_BOT, `again\n\n${marker(SHA, "approve")}`)], SHA, ACTIONS_BOT), null, "the latest verdict decides");
+  assert.throws(() => postReview(r.gh, rev.gh, a, 7, SHA, "approve", "ok", APP_REPO, null, { userVisible: "no" }), /user_visible/);
+});
+
+/** tryMerge's reads for the app lane, with main's CI and the open PRs injectable. */
+const laneRoutes = ({ files = [{ filename: "src/a.ts" }, changeset], comment = marker("s1", "approve"), pr = basePr(), main = "success", mainSha = "m1", open = [], behind = 0, mainJobs = [] } = {}) => [
+  [/pulls\?state=open/, open],
+  [/pulls\/7$/, pr],
+  [/pulls\/7\/files/, files],
+  [/issues\/7\/comments/, [{ user: { login: "octo-reviewer" }, body: comment }]],
+  [/contents\/\.github\/workflows\/promote\.yml/, { sha: "p" }],
+  [/commits\/main$/, { sha: mainSha, parents: [{ sha: "m0" }] }],
+  [/commits\/m0$/, { sha: "m0", parents: [] }],
+  [new RegExp(`actions/runs\\?head_sha=${mainSha}`), { workflow_runs: main == null ? [] : [runOf(main === "pending" ? null : main)] }],
+  [/actions\/runs\?head_sha=m0/, { workflow_runs: [runOf("success")] }],
+  [/actions\/runs\/70\/jobs/, { jobs: mainJobs }],
+  [/actions\/runs\?head_sha=s1/, { workflow_runs: [runOf("success")] }],
+  [/compare\/m1\.\.\.s1$/, { behind_by: behind }],
+];
+const merge = (o, opts) => { const r = fakeGh(laneRoutes(o)), act = fakeGh([]); return { res: tryMerge(r.gh, act.gh, 7, ids, { waitMs: 1, ...opts }), writes: act.writes, reads: r.writes }; };
+const merged = (m) => m.writes.some((w) => /\/merge$/.test(w.path));
+const parked = (m) => m.writes.some((w) => w.body.labels?.includes("needs-owner"));
+
+test("tryMerge: the review's user_visible answer decides the changeset rule on the merge itself", () => {
+  const signed = (v) => `ok\n\n${visibleMarker("s1", v)}\n${marker("s1", "approve")}`;
+  assert.ok(merged(merge({ files: [{ filename: "src-tauri/src/runner.rs" }], pr: basePr({ changed_files: 1 }), comment: signed(false) })), "backend-only slice: merged");
+  const yes = merge({ files: [{ filename: "src-tauri/src/runner.rs" }], pr: basePr({ changed_files: 1 }), comment: signed(true) });
+  assert.ok(!merged(yes) && parked(yes));
+  const none = merge({ files: [{ filename: "src/a.ts" }], pr: basePr({ changed_files: 1 }) });
+  assert.ok(!merged(none) && parked(none), "no answer: parked as before");
+});
+
+test("tryMerge: merge conflicts are a fix round, not a park", () => {
+  const m = merge({ pr: basePr({ mergeable: false }) }, { tries: 1 });
+  assert.equal(m.res.merged, false);
+  assert.match(m.res.why.join(), /merge conflicts — the builder resolves them in a fix round/);
+  assert.equal(m.writes.length, 0, "no label, no comment: jobs.mjs gives the builder the round");
+});
+
+test("tryMerge pauses while main is red — except for a head that contains main — and while a release PR is open", () => {
+  const red = merge({ main: "failure", behind: 1 });
+  assert.ok(!merged(red) && !parked(red));
+  assert.match(red.res.why.join(), /paused: main's CI is red at m1/);
+  const behind = merge({ main: "failure", behind: 2 });
+  assert.ok(!merged(behind), "a head without main's head: its green CI proves nothing about main");
+  const fix = merge({ main: "failure", behind: 0 });
+  assert.ok(merged(fix), "the PR that contains main and is green is the fix: it merges");
+  const running = merge({ main: "pending", mainJobs: [{ conclusion: "failure" }], behind: 1 });
+  assert.match(running.res.why.join(), /main's CI is red/, "a running CI with a failed job already counts");
+  assert.ok(merged(merge({ main: "pending", mainJobs: [{ conclusion: "success" }] })), "running, nothing failed: the parent's green verdict holds");
+  assert.ok(merged(merge({ main: null })), "no CI on the head (a release merge): the parent's verdict");
+
+  const rel = { number: 12, head: { ref: "release/v0.4.151", repo: { full_name: APP_REPO } }, base: { ref: "main" } };
+  const busy = merge({ open: [rel] });
+  assert.ok(!merged(busy) && !parked(busy));
+  assert.match(busy.res.why.join(), /paused: release PR #12 is open/);
+  assert.ok(merged(merge({ open: [{ ...rel, head: { ref: "release/v0.4.151", repo: { full_name: "evil/octopush" } } }] })), "a fork's branch named release/… pauses nothing");
+  assert.ok(merged(merge({ open: [{ ...rel, head: { ref: "agent/release/v1.2.3", repo: { full_name: APP_REPO } } }] })));
+
+  // A lookup that fails is a pause, never a merge.
+  const routes = laneRoutes();
+  const failing = makeGh((args) => {
+    const path = args[0].replace(/[?&]per_page=100&page=\d+$/, "");
+    if (/commits\/main$|pulls\?state=open/.test(path)) throw new Error("gh: Bad Gateway (HTTP 502)");
+    const hit = routes.find(([re]) => re.test(path));
+    return JSON.stringify(hit ? hit[1] : []);
+  });
+  const act = fakeGh([]);
+  const res = tryMerge(failing, act.gh, 7, ids, { waitMs: 1 });
+  assert.equal(res.merged, false);
+  assert.match(res.why.join(" | "), /can't tell whether a release PR is open.*can't read main's CI|can't read main's CI.*release/);
+  assert.equal(act.writes.length, 0);
+  assert.equal(openReleasePr(fakeGh([[/pulls\?state=open/, [rel]]]).gh), 12);
+});
+
+test("mainCi: green, red, a failed job in a running CI, the parent's verdict for a head without one", () => {
+  const gh = (head, { parent = "success", jobs = [] } = {}) => fakeGh([
+    [/commits\/main$/, { sha: "h", parents: [{ sha: "p" }] }],
+    [/commits\/p$/, { sha: "p", parents: [{ sha: "q" }] }],
+    [/commits\/q$/, { sha: "q", parents: [] }],
+    [/actions\/runs\?head_sha=h/, { workflow_runs: head == null ? [] : [runOf(head === "pending" ? null : head)] }],
+    [/actions\/runs\?head_sha=p/, { workflow_runs: parent == null ? [] : [runOf(parent)] }],
+    [/actions\/runs\?head_sha=q/, { workflow_runs: [] }],
+    [/actions\/runs\/70\/jobs/, { jobs }],
+  ]).gh;
+  assert.deepEqual(mainCi(gh("success")), { state: "green", sha: "h", redSha: null });
+  assert.deepEqual(mainCi(gh("failure")), { state: "red", sha: "h", redSha: "h" });
+  assert.deepEqual(mainCi(gh("pending", { jobs: [{ conclusion: "success" }, { conclusion: "failure" }] })), { state: "red", sha: "h", redSha: "h" });
+  assert.deepEqual(mainCi(gh("pending", { parent: "failure" })), { state: "red", sha: "h", redSha: "p" }, "still red until a newer commit is green");
+  assert.deepEqual(mainCi(gh(null, { parent: "success" })), { state: "green", sha: "h", redSha: null });
+  assert.deepEqual(mainCi(gh(null, { parent: null })), { state: "unknown", sha: "h", redSha: null });
+  assert.deepEqual(mainCi(gh(runOf("cancelled").conclusion, { parent: "failure" })), { state: "red", sha: "h", redSha: "p" }, "a superseded run says nothing");
+});
+
+test("the 'main is red' issue: opened ready, updated in place, closed when green; only the builder's own counts", () => {
+  const a = { owner: "johnatan", builder: ACTIONS_BOT, reviewer: ACTIONS_BOT };
+  const failures = [{ workflow: "CI", job: "backend", conclusion: "failure", steps: ["build sidecar binaries"], log: true, errors: ["error: argument never used", "--> src/x.rs:3:1"], tests: [], tail: [] }];
+  const red = { state: "red", sha: "h", redSha: "f".repeat(40) };
+  let g = fakeGh([[/issues\?state=open&creator=github-actions%5Bbot%5D/, [
+    { number: 5, user: { login: "stranger" }, body: `forged\n${MAIN_RED_MARK}` },
+    { number: 6, user: { login: ACTIONS_BOT }, body: "another routine issue" },
+  ]]]);
+  const opened = syncMainRed(g.gh, APP_REPO, a, red, { failures });
+  assert.equal(opened.opened, true);
+  const post = g.writes.find((w) => w.method === "POST" && /\/issues$/.test(w.path));
+  assert.equal(post.body.title, "main is red: CI / backend");
+  assert.deepEqual(post.body.labels, ["ready"]);
+  assert.ok(post.body.body.endsWith(MAIN_RED_MARK));
+  assert.match(post.body.body, /````text\n- CI \/ backend: failure\n  - step failed: build sidecar binaries\n  - error: argument never used/);
+  assert.match(post.body.body, /auto-merge is paused/);
+
+  const existing = { number: 9, user: { login: ACTIONS_BOT }, title: post.body.title, body: post.body.body, labels: [{ name: "ready" }] };
+  g = fakeGh([[/issues\?state=open&creator=/, [existing]]]);
+  assert.equal(syncMainRed(g.gh, APP_REPO, a, red, { failures }).issue.number, 9);
+  assert.equal(g.writes.length, 0, "unchanged: no write");
+  syncMainRed(g.gh, APP_REPO, a, { ...red, redSha: "e".repeat(40) }, { failures: [{ ...failures[0], job: "frontend" }] });
+  assert.deepEqual(g.writes.map((w) => [w.method, w.path, w.body.title]), [["PATCH", `repos/${APP_REPO}/issues/9`, "main is red: CI / frontend"]], "updated in place, labels untouched");
+
+  g = fakeGh([[/issues\?state=open&creator=/, [existing]]]);
+  assert.equal(syncMainRed(g.gh, APP_REPO, a, { state: "unknown", sha: "h" }).issue.number, 9);
+  assert.equal(g.writes.length, 0, "unknown: left alone");
+  const closed = syncMainRed(g.gh, APP_REPO, a, { state: "green", sha: "g".repeat(40) });
+  assert.equal(closed.closed, 9);
+  assert.deepEqual(g.writes.map((w) => w.method), ["POST", "PATCH"]);
+  assert.equal(g.writes[1].body.state, "closed");
+  assert.equal(findMainRedIssue(fakeGh([[/issues\?state=open/, [{ number: 4, pull_request: {}, user: { login: ACTIONS_BOT }, body: MAIN_RED_MARK }]]]).gh, APP_REPO, a), null, "never a PR");
+  assert.ok(mainRedTitle(Array.from({ length: 9 }, (_, i) => ({ workflow: "CI", job: `job-number-${i}` }))).length <= 90);
+});
+
+test("jobs: while main is red its issue comes first and red-CI rounds wait, except the one fixing main; conflicts are a fix round", () => {
+  const now = Date.parse("2026-11-26T12:00:00Z");
+  const a = { owner: "johnatan", builder: ACTIONS_BOT, reviewer: ACTIONS_BOT };
+  const pr = (n, over = {}) => ({ number: n, title: `t${n}`, body: `Closes #${n + 100}`, created_at: "2026-11-26T00:00:00Z", ...basePr({ user: { login: ACTIONS_BOT }, head: { sha: `h${n}`, ref: `agent/b${n}`, repo: { full_name: APP_REPO } } }), ...over });
+  const routes = (prs, mergeable = {}) => fakeGh([
+    [/pulls\?state=open/, prs],
+    ...prs.map((p) => [new RegExp(`pulls/${p.number}$`), { ...p, mergeable: mergeable[p.number] ?? true }]),
+    [/issues\/\d+\/comments/, []],
+    [/actions\/runs\?head_sha=h1/, { workflow_runs: [runOf("failure")] }],
+    [/actions\/runs\?head_sha=h2/, { workflow_runs: [runOf("failure")] }],
+    [/actions\/runs\?head_sha=h3/, { workflow_runs: [runOf("success")] }],
+    [/issues\?labels=ready/, [{ number: 50, labels: [{ name: "ready" }] }, { number: 60, title: "main is red: CI / backend", labels: [{ name: "ready" }] }]],
+  ]).gh;
+  const prs = [pr(1), pr(2, { body: "Closes #60" }), pr(3)];
+  const issue = { number: 60, labels: [{ name: "ready" }] };
+  const redState = { health: { state: "red" }, issue };
+  let o = orderedJobs(routes([pr(1), pr(3)]), APP_REPO, a, now, redState);
+  assert.equal(o.top.number, 60, "the main-red issue first");
+  assert.deepEqual(o.fixes.map((j) => j.pr.number), [], "red-CI rounds wait while main is red");
+  assert.deepEqual(o.issues.map((i) => i.number), [50]);
+  o = orderedJobs(routes(prs), APP_REPO, a, now, redState);
+  assert.equal(o.top, null, "an open PR already claims the issue");
+  assert.deepEqual(o.fixes.map((j) => [j.pr.number, j.reason]), [[2, "red-ci"]], "the PR fixing main still gets its rounds");
+  o = orderedJobs(routes(prs), APP_REPO, a, now, { health: { state: "green" }, issue: null });
+  assert.deepEqual(o.fixes.map((j) => j.pr.number), [1, 2]);
+  o = orderedJobs(routes([pr(1), pr(3)]), APP_REPO, a, now, { health: { state: "red" }, issue: { ...issue, labels: [{ name: "needs-owner" }] } });
+  assert.equal(o.top, null, "a parked issue isn't taken");
+  o = orderedJobs(routes([pr(3)], { 3: false }), APP_REPO, a, now, { health: { state: "green" }, issue: null });
+  assert.deepEqual(o.fixes.map((j) => [j.pr.number, j.reason]), [[3, "conflicts"]], "green, approved-or-not, but conflicting: a fix round");
+  assert.deepEqual(fixJobs(routes([{ ...pr(3), head: { ...pr(3).head, repo: { full_name: WEB_REPO } } }], { 3: false }), WEB_REPO, a, now), [], "only the app lane merges main before a round");
+  o = orderedJobs(routes([]), APP_REPO, a, now, { health: { state: "red" }, issue: { number: 61, labels: [{ name: "ready" }] }, opened: true });
+  assert.equal(o.top.number, 61, "a just-opened issue is taken even before the list shows it");
+});
+
+test("ci-failures: the log's own words — rustc blocks, failing tests, a tail when nothing matched — redacted and bounded", async () => {
+  const { logSummary, formatFailures, redact, REDACTED, MAX_REPORT } = await import("./ci-failures.mjs");
+  const T = "2026-11-23T20:08:15.5058200Z ";
+  const rust = [
+    "##[group]Run cargo build --locked --bins", "##[endgroup]",
+    "\x1b[1m\x1b[92m Compiling\x1b[0m git2 v0.21.0",
+    "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: argument never used\x1b[0m",
+    "    \x1b[1m\x1b[94m--> \x1b[0msrc/orchestrator/cli_runner.rs:3630:13",
+    "     |", "3618 |  \"launching {} · {}\",", "     |  ---- formatting specifier missing", "",
+    "\x1b[33mwarning\x1b[0m: unused", "error: could not compile `octopush` (lib) due to 1 previous error",
+    "##[error]Process completed with exit code 101.",
+  ].map((l) => T + l).join("\n");
+  const r = logSummary(rust);
+  assert.deepEqual(r.errors.slice(0, 5), ["error: argument never used", "--> src/orchestrator/cli_runner.rs:3630:13", "|", "3618 | \"launching {} · {}\",", "| ---- formatting specifier missing"]);
+  assert.ok(r.errors.includes("error: could not compile `octopush` (lib) due to 1 previous error"));
+  assert.ok(!r.errors.some((l) => /warning|Compiling|exit code/.test(l)));
+  assert.deepEqual(r.tail, [], "no tail when the errors say it");
+
+  const tests = [
+    "test commands::tests::merges_main ... ok", "test commands::tests::keeps_the_lock ... FAILED",
+    "thread 'commands::tests::keeps_the_lock' panicked at src/commands.rs:12:5:", "assertion `left == right` failed",
+    " FAIL  src/lib/a.test.ts > parser > reads a line", "AssertionError: expected 1 to be 2",
+    "not ok 3 - routines: queue order", "##[error]Process completed with exit code 1.",
+  ].map((l) => T + l).join("\n");
+  const t = logSummary(tests);
+  assert.deepEqual(t.tests, ["commands::tests::keeps_the_lock", "src/lib/a.test.ts > parser > reads a line", "routines: queue order"]);
+  assert.ok(t.errors.includes("assertion `left == right` failed"), "a panic's message comes with it");
+  assert.ok(t.errors.includes("AssertionError: expected 1 to be 2"));
+
+  const quiet = logSummary([...Array.from({ length: 30 }, (_, i) => `${T}line ${i}`), `${T}##[error]Process completed with exit code 2.`, `${T}after`].join("\n"), { tailLines: 3 });
+  assert.deepEqual(quiet, { errors: [], tests: [], tail: ["line 27", "line 28", "line 29"] }, "the last lines before the step failed");
+
+  // Redaction: values, shapes, headers, URLs, variables, opaque runs — and the ordinary words around them stay.
+  const ghp = `ghp_${"A1b2".repeat(9)}`;
+  const s = redact([
+    `push with ${ghp}`, "Authorization: bearer abc.def-123_456", "https://x-access-token:s3cr3t@github.com/o/r",
+    "GH_TOKEN=whatever-it-is", "api_key: 'k3y-0123456789abc'", `blob ${"Ab1".repeat(15)}`, "mysecretvalue123 in a sentence",
+    "test commands::tests::reads_a_very_long_snake_case_test_name_ok ... FAILED", `commit ${"f".repeat(40)}`, "let token = read_token_from_env();",
+  ].join("\n"), ["mysecretvalue123"]);
+  assert.ok(!s.includes(ghp) && !s.includes("abc.def-123_456") && !s.includes("s3cr3t") && !s.includes("whatever-it-is") && !s.includes("k3y-0123456789abc") && !s.includes("Ab1Ab1") && !s.includes("mysecretvalue123"), s);
+  assert.match(s, /reads_a_very_long_snake_case_test_name_ok/, "test names survive");
+  assert.match(s, new RegExp(`commit ${"f".repeat(40)}`), "a commit id survives (no upper case)");
+  assert.match(s, /let token = read_token_from_env\(\);/, "code that names a token survives");
+  assert.match(s, /GH_TOKEN=\[redacted\]/);
+  assert.equal(redact(`x ${Buffer.from("mysecretvalue123").toString("base64")}`, ["mysecretvalue123"]), `x ${REDACTED}`, "base64 too");
+
+  const report = formatFailures([{ workflow: "CI", job: "backend", conclusion: "failure", steps: ["cargo test"], log: true, errors: Array.from({ length: 2000 }, (_, i) => `error: e${i} ${"x".repeat(50)}`), tests: [], tail: [] }], { secrets: ["mysecretvalue123"] });
+  assert.ok(report.length <= MAX_REPORT + 20 && report.endsWith("- (truncated)"), "bounded");
+  assert.equal(formatFailures([{ workflow: "CI", job: "b", conclusion: "failure", steps: [], log: true, errors: ["error: leaked mysecretvalue123"], tests: [], tail: [] }], { secrets: ["mysecretvalue123"] }),
+    `- CI / b: failure\n  - error: leaked ${REDACTED}`);
+});
+
+test("publish-build: a fix round that leaves a conflict marker is parked, a resolved one is pushed", async () => {
+  const { publish, hasConflictMarkers, conflictList } = await import("./publish-build.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const { mkdirSync } = await import("node:fs");
+  assert.ok(hasConflictMarkers("a\n<<<<<<< HEAD\nb\n||||||| base\n=======\nc\n>>>>>>> origin/main\n"));
+  assert.ok(!hasConflictMarkers("const s = '<<<<<<< not at a line start';\n== heading ==\n"));
+  assert.deepEqual(conflictList("/nonexistent/conflicts.txt"), []);
+  const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  const sh = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env });
+  const run = async (text) => {
+    const root = mkdtempSync(join(tmpdir(), "pubc-"));
+    const bare = join(root, "origin.git"); sh(root, "init", "-q", "--bare", bare);
+    const work = join(root, "work"); mkdirSync(join(work, "src"), { recursive: true }); sh(work, "init", "-q");
+    writeFileSync(join(work, "src", "a.ts"), "<<<<<<< HEAD\nconst a = 1;\n=======\nconst a = 2;\n>>>>>>> origin/main\n");
+    sh(work, "add", "."); sh(work, "commit", "-qm", "merge main (conflicts left for the builder)");
+    sh(work, "push", "-q", bare, "HEAD:refs/heads/agent/x");
+    const gitDir = join(root, "repo.git"); execFileSync("mv", [join(work, ".git"), gitDir]);
+    writeFileSync(join(work, "src", "a.ts"), text);
+    mkdirSync(join(work, ".agent-out")); writeFileSync(join(work, ".agent-out", "result.json"), JSON.stringify({ action: "update", summary: "Resolved the conflict" }));
+    writeFileSync(join(root, "conflicts.txt"), "src/a.ts\n");
+    const f = fakeGh([]);
+    const cwd = process.cwd(); process.chdir(work);
+    try {
+      const code = await publish({ kind: "pr", n: 7, existingBranch: "agent/x", repo: "o/r", gitDir, token: "gh-token", secrets: [], conflicts: conflictList(join(root, "conflicts.txt")), gh: f.gh, pushUrl: bare });
+      return { code, writes: f.writes, head: execFileSync("git", ["--git-dir", bare, "show", "agent/x:src/a.ts"], { encoding: "utf8" }) };
+    } finally { process.chdir(cwd); }
+  };
+  const left = await run("<<<<<<< HEAD\nconst a = 1;\n=======\nconst a = 3;\n>>>>>>> origin/main\n");
+  assert.equal(left.code, 1);
+  assert.match(left.head, /<<<<<<< HEAD/, "nothing new pushed");
+  assert.ok(left.writes.some((w) => /conflict markers in: src\/a\.ts/.test(w.body.body ?? "")));
+  const fixed = await run("const a = 3;\n");
+  assert.equal(fixed.code, 0);
+  assert.equal(fixed.head, "const a = 3;\n");
+});
+
+test("workflows: conflicts are committed for the builder and checked before publishing; main's red CI starts the builder", async () => {
+  const { readFileSync } = await import("node:fs");
+  const wf = (f) => readFileSync(new URL(`../../.github/workflows/${f}`, import.meta.url), "utf8");
+  const build = wf("nightly-build.yml");
+  const ctx = build.slice(build.indexOf("name: Context and brief"), build.indexOf("name: Install and sandbox"));
+  assert.match(ctx, /merge\.conflictStyle=zdiff3/);
+  assert.match(ctx, /git --literal-pathspecs add -A --pathspec-from-file="\$RUNNER_TEMP\/conflicts\.z" --pathspec-file-nul/);
+  assert.match(ctx, /tr '\\0' '\\n' < "\$RUNNER_TEMP\/conflicts\.z" > "\$RUNNER_TEMP\/conflicts\.txt"/);
+  assert.doesNotMatch(ctx, /stop and say so \(the PM resolves the conflict\)/, "a conflict is no longer a stop");
+  const pub = build.slice(build.indexOf("name: Publish"), build.indexOf("name: Release the claim"));
+  assert.match(pub, /OCTOPUSH_CONFLICTS_FILE: \$\{\{ runner\.temp \}\}\/conflicts\.txt/);
+  const ci = wf("ci.yml");
+  const job = ci.slice(ci.indexOf("  main-red:"), ci.indexOf("  review-next:"));
+  assert.match(job, /if: always\(\) && github\.ref == 'refs\/heads\/main' && github\.event_name != 'pull_request' && contains\(needs\.\*\.result, 'failure'\)/);
+  assert.match(job, /permissions:\n\s+actions: write\n/);
+  assert.match(job, /nightly-build\.yml\/dispatches" -f ref=main/);
+  assert.doesNotMatch(ci.slice(ci.indexOf("name: cargo test"), ci.indexOf("name: cargo clippy")), /\/\/'%'\/'%25'/, "the annotation's escaping works in the macOS runner's bash");
+});
+
+test("publish-build: a fix round whose whole work was merging main pushes that merge; with nothing new at all it is parked", async () => {
+  const { publish } = await import("./publish-build.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const { mkdirSync } = await import("node:fs");
+  const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  const sh = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env }).trim();
+  const run = async (mergedMain) => {
+    const root = mkdtempSync(join(tmpdir(), "pubm-"));
+    const bare = join(root, "origin.git"); sh(root, "init", "-q", "--bare", bare);
+    const work = join(root, "work"); mkdirSync(work); sh(work, "init", "-q");
+    writeFileSync(join(work, "a.txt"), "a\n"); sh(work, "add", "."); sh(work, "commit", "-qm", "branch");
+    sh(work, "push", "-q", bare, "HEAD:refs/heads/agent/x");
+    sh(work, "update-ref", "refs/remotes/origin/agent/x", "HEAD"); // as the workflow's fetch leaves it
+    if (mergedMain) { writeFileSync(join(work, "b.txt"), "main\n"); sh(work, "add", "."); sh(work, "commit", "-qm", "Merge main"); }
+    const head = sh(work, "rev-parse", "HEAD");
+    const gitDir = join(root, "repo.git"); execFileSync("mv", [join(work, ".git"), gitDir]);
+    mkdirSync(join(work, ".agent-out")); writeFileSync(join(work, ".agent-out", "result.json"), JSON.stringify({ action: "update", summary: "Main merged cleanly; nothing else to change." }));
+    const f = fakeGh([]);
+    const cwd = process.cwd(); process.chdir(work);
+    try {
+      const code = await publish({ kind: "pr", n: 7, existingBranch: "agent/x", repo: "o/r", gitDir, token: "gh-token", secrets: [], gh: f.gh, pushUrl: bare });
+      return { code, head, pushed: execFileSync("git", ["--git-dir", bare, "rev-parse", "agent/x"], { encoding: "utf8" }).trim(), writes: f.writes };
+    } finally { process.chdir(cwd); }
+  };
+  const merged = await run(true);
+  assert.equal(merged.code, 0);
+  assert.equal(merged.pushed, merged.head, "the merge commit is the round");
+  assert.ok(merged.writes.some((w) => /ci\.yml\/dispatches$/.test(w.path)));
+  const nothing = await run(false);
+  assert.equal(nothing.code, 1);
+  assert.ok(nothing.writes.some((w) => w.body.labels?.includes("needs-owner")));
 });

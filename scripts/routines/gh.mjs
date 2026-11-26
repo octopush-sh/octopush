@@ -91,14 +91,56 @@ export function makeGh(run = ghRun) {
  */
 export const NON_VERDICT = ["action_required", "cancelled", "skipped", "stale", "neutral"];
 
-export function ciStatus(gh, repo, sha) {
-  const runs = (gh.get(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=50`)?.workflow_runs ?? [])
+/** The newest "CI" run for a commit that says something about the code, or null. */
+export function latestCiRun(gh, repo, sha) {
+  return (gh.get(`repos/${repo}/actions/runs?head_sha=${sha}&per_page=50`)?.workflow_runs ?? [])
     .filter((r) => r.name === "CI" && !(r.status === "completed" && NON_VERDICT.includes(r.conclusion)) && r.status !== "waiting")
-    .sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
-  const last = runs.at(-1);
+    .sort((a, b) => (a.created_at < b.created_at ? -1 : 1)).at(-1) ?? null;
+}
+
+export function ciStatus(gh, repo, sha) {
+  const last = latestCiRun(gh, repo, sha);
   if (!last) return "none";
   if (last.status !== "completed") return "pending";
   return last.conclusion === "success" ? "success" : "failure";
+}
+
+/** First-parent commits of main looked at when its head has no verdict yet (a merge whose CI is running). */
+export const MAIN_LOOKBACK = 5;
+const FAILED_JOB = ["failure", "timed_out", "startup_failure"];
+
+/** Has a still-running CI run on `sha` already failed a job? (ci.yml starts the builder from inside that run.) */
+function failingWhileRunning(gh, repo, sha) {
+  const run = latestCiRun(gh, repo, sha);
+  if (!run || run.status === "completed") return false;
+  return (gh.get(`repos/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`)?.jobs ?? []).some((j) => FAILED_JOB.includes(j.conclusion));
+}
+
+/**
+ * main's CI: `{ state, sha, redSha }`. `state` is
+ *   green   — the newest verdict on main's first-parent line is a pass;
+ *   red     — it is a failure (`redSha` is the commit it failed on), or a job of
+ *             the head's running CI has already failed;
+ *   unknown — no verdict on the last MAIN_LOOKBACK commits (nothing pauses).
+ * A head whose CI is still running or never ran (a release merge) inherits the
+ * verdict of its first parent, so "red" lasts until a newer commit is green.
+ * API errors propagate: each caller decides what "can't tell" means.
+ */
+export function mainCi(gh, repo = APP_REPO) {
+  let ref = "main";
+  let head = null;
+  for (let i = 0; i < MAIN_LOOKBACK; i++) {
+    const c = gh.get(`repos/${repo}/commits/${ref}`);
+    if (!c?.sha) break;
+    head ??= c.sha;
+    const st = ciStatus(gh, repo, c.sha);
+    if (st === "success") return { state: "green", sha: head, redSha: null };
+    if (st === "failure") return { state: "red", sha: head, redSha: c.sha };
+    if (st === "pending" && failingWhileRunning(gh, repo, c.sha)) return { state: "red", sha: head, redSha: c.sha };
+    ref = c.parents?.[0]?.sha;
+    if (!ref) break;
+  }
+  return { state: "unknown", sha: head, redSha: null };
 }
 
 export const labelsOf = (issueOrPr) => (issueOrPr.labels ?? []).map((l) => (typeof l === "string" ? l : l.name));
