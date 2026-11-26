@@ -2104,6 +2104,9 @@ test("tryMerge pauses while main is red — except for a head that contains main
   assert.match(res.why.join(" | "), /can't tell whether a release PR is open.*can't read main's CI|can't read main's CI.*release/);
   assert.equal(act.writes.length, 0);
   assert.equal(openReleasePr(fakeGh([[/pulls\?state=open/, [rel]]]).gh), 12);
+  const now = Date.parse("2026-11-26T12:00:00Z");
+  assert.equal(openReleasePr(fakeGh([[/pulls\?state=open/, [{ ...rel, updated_at: "2026-11-26T10:30:00Z" }]]]).gh, APP_REPO, now), 12, "a release in flight pauses");
+  assert.equal(openReleasePr(fakeGh([[/pulls\?state=open/, [{ ...rel, updated_at: "2026-11-26T07:00:00Z" }]]]).gh, APP_REPO, now), null, "one a killed run left behind doesn't pause forever");
 });
 
 test("mainCi: green, red, a failed job in a running CI, the parent's verdict for a head without one", () => {

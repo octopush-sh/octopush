@@ -522,9 +522,16 @@ const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0
  * would make the release PR's merge commit a main its CI never tested (#1063).
  */
 export const RELEASE_BRANCH = /^release\/v\d+\.\d+\.\d+$/;
-export function openReleasePr(gh, repo = APP_REPO) {
+/**
+ * A release run lasts at most nightly-release.yml's timeout (150 min). A release
+ * PR untouched for longer was left by a run that was killed: it no longer pauses
+ * anything (the next release run reuses or closes it).
+ */
+export const RELEASE_PR_STALE_MS = 4 * 3600e3;
+export function openReleasePr(gh, repo = APP_REPO, now = Date.now()) {
   return gh.list(`repos/${repo}/pulls?state=open`)
-    .find((p) => RELEASE_BRANCH.test(p.head?.ref ?? "") && p.head?.repo?.full_name === repo && p.base?.ref === "main")?.number ?? null;
+    .find((p) => RELEASE_BRANCH.test(p.head?.ref ?? "") && p.head?.repo?.full_name === repo && p.base?.ref === "main"
+      && !(now - Date.parse(p.updated_at) > RELEASE_PR_STALE_MS))?.number ?? null;
 }
 
 export function tryMerge(gh, actGh, n, ids, { waitMs = 3000, tries = 6 } = {}) {

@@ -218,7 +218,8 @@ trusted:
   user-visible changes (as the review judges it, else by path — [Fix rounds](#fix-rounds)), no
   conflicts, and the beta channel live. They also **pause**, without parking anything, while
   main's CI is red ([When main is red](#when-main-is-red)) and while a release PR is open (so the
-  release merges the main its CI tested, docs/RELEASING.md). Merges reach the **beta** channel
+  release merges the main its CI tested, docs/RELEASING.md; one untouched for 4 hours was left by
+  a killed run and pauses nothing). Merges reach the **beta** channel
   only; stable needs your approval.
 - **Identities:** your account (`OCTOPUSH_OWNER_LOGIN`) is the only one whose answers count; the
   workflows act as `github-actions[bot]` (this repo) and the "Octopush Cycle" App's bot
