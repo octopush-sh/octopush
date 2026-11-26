@@ -281,6 +281,7 @@ function makeInitScript(data) {
       case "rename_chat_thread": return null;
       case "get_message": return null;
       case "list_skills": return [];
+      case "list_skipped_skills": return [];
       case "list_terminals": return [];
       case "list_pty_sessions": return [];
       case "list_mcp_servers": return [];

@@ -3390,19 +3390,23 @@ impl ChatEngine {
             .find(|m| m.role == "user")
             .map(|m| m.content.clone())
             .unwrap_or_else(|| request.user_message.clone());
-        let mut invoked = crate::skills::referenced_skills(&workspace_path, &turn_text);
-        if let Some(pinned) = request.skill.as_deref() {
-            if !invoked.iter().any(|s| s.name == pinned) {
-                if let Some(skill) = crate::skills::load_skill(&workspace_path, pinned) {
-                    invoked.push(skill);
-                }
-            }
-        }
+        // The skill the request pins (`request.skill`) comes first and goes
+        // whole; the skills the message names share the per-turn budget
+        // after it, in the order named (`skills::skill_prompt_section_with`).
+        let mut named = crate::skills::referenced_skills(&workspace_path, &turn_text);
+        let pinned = match request.skill.as_deref() {
+            Some(p) => match named.iter().position(|s| s.name == p) {
+                Some(i) => Some(named.remove(i)),
+                None => crate::skills::load_skill(&workspace_path, p),
+            },
+            None => None,
+        };
+        let invoked: Vec<&crate::skills::Skill> = pinned.iter().chain(named.iter()).collect();
         if !invoked.is_empty() {
-            system_prompt.push_str(&crate::skills::skill_prompt_section(&invoked));
+            system_prompt.push_str(&crate::skills::skill_prompt_section_with(pinned.as_ref(), &named));
             // `allowed-tools`: the union across the invoked skills; a skill
             // that declares none opens the full set for the turn.
-            let (allowed, open): (Vec<&Vec<String>>, bool) = invoked.iter().fold((Vec::new(), false), |(mut v, open), s| {
+            let (allowed, open): (Vec<&Vec<String>>, bool) = invoked.iter().copied().fold((Vec::new(), false), |(mut v, open), s| {
                 match &s.allowed_tools {
                     Some(a) => v.push(a),
                     None => return (v, true),
