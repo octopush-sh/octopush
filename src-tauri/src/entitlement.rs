@@ -7,6 +7,9 @@
 //! the restricted tier — the monthly Direct-run cap, enforced by
 //! [`Entitlement::check_direct_run_quota`] in `commands::start_run`.
 //!
+//! Once an entitlement public key is compiled in, the plan comes from a
+//! server-signed token instead (`entitlement_token`, #582).
+//!
 //! See `docs/premium/accounts-and-subscriptions-implementation-plan.md`.
 
 use serde::Serialize;
@@ -68,8 +71,51 @@ impl Entitlement {
     /// (`public_metadata.plan` via Clerk). A "pro" plan gets [`Entitlement::pro`]
     /// (uncapped); **everyone else (Free / signed-out / unknown) gets
     /// [`Entitlement::free_restricted`]** — the monthly Direct-run cap is live.
+    ///
+    /// **Signed entitlement token (#582).** Once a public key is compiled into
+    /// `entitlement_token::ENTITLEMENT_PUBLIC_KEY`, the plan comes only from a
+    /// valid server-signed token instead of the unsigned keychain string; see
+    /// [`Entitlement::resolve`] for the rules.
     pub fn current() -> Self {
-        Self::for_plan(crate::auth::current_plan().as_deref())
+        Self::resolve(
+            crate::entitlement_token::compiled_key().as_ref(),
+            crate::auth::current_plan,
+            || crate::auth::current_identity().map(|(sub, _)| sub),
+            crate::entitlement_token::load_token,
+            chrono::Utc::now(),
+        )
+    }
+
+    /// The resolution behind [`Entitlement::current`], with every input
+    /// injectable so tests drive the real `verify_token`:
+    ///
+    /// - **No key compiled in** → the legacy session plan, exactly as before
+    ///   #582. The token is not even read.
+    /// - **Key set, signed in, token valid for this user and not expired** →
+    ///   the token's plan.
+    /// - **Key set, anything else** (signed out, no token, bad signature,
+    ///   tampered, wrong version, another user's, expired) → **Free**. The
+    ///   legacy plan string is never consulted.
+    pub fn resolve(
+        key: Option<&ed25519_dalek::VerifyingKey>,
+        legacy_plan: impl FnOnce() -> Option<String>,
+        session_sub: impl FnOnce() -> Option<String>,
+        token: impl FnOnce() -> Option<String>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let Some(key) = key else {
+            return Self::for_plan(legacy_plan().as_deref());
+        };
+        let Some(sub) = session_sub() else {
+            return Self::free_restricted();
+        };
+        let Some(token) = token() else {
+            return Self::free_restricted();
+        };
+        match crate::entitlement_token::verify_token(&token, key, &sub, now) {
+            Ok(claims) => Self::for_plan(Some(&claims.plan)),
+            Err(_) => Self::free_restricted(),
+        }
     }
 
     /// Map a plan claim to an entitlement. Pure (the keyring read lives in
