@@ -11,6 +11,9 @@
 //! [`ENTITLEMENT_PUBLIC_KEY`], compiled into the binary. Local state can carry a
 //! claim the server signed; it can no longer invent one. A patched, rebuilt
 //! client still bypasses this, and nothing short of attestation would stop that.
+//! Nor does it bind the token to this Mac: `sub` comes from the same unsigned
+//! keychain session, so another Pro user's token plus an edited `sub` (and no
+//! refresh token, so nothing re-checks it) gives Pro until that token's `exp`.
 //!
 //! **Token format** (mirrors `octopush-api/api/_lib/entitlement.ts`). Not a JWT:
 //! there is no algorithm field, so there is no "alg: none" class of bug.
@@ -21,7 +24,9 @@
 //! ```
 //!
 //! **Offline.** The server issues a [`LEASE_DAYS`]-day lease. Refreshes happen
-//! on launch, after sign-in and after checkout ([`refresh`]); any failed refresh
+//! on launch, after sign-in, after checkout ([`refresh`]) and from the
+//! `auth_refresh` poll whenever Clerk's plan disagrees with the token's
+//! ([`token_lags_session`]); any failed refresh
 //! keeps the cached token, so only that many days with no successful refresh
 //! end the lease.
 
@@ -43,9 +48,6 @@ pub const TOKEN_VERSION: u32 = 1;
 /// ~250 bytes.
 pub const MAX_TOKEN_BYTES: usize = 4096;
 
-/// How far in the future `iat` may be (clock skew allowance), in seconds.
-pub const MAX_IAT_SKEW_SECS: i64 = 5 * 60;
-
 /// Tauri event emitted when a refresh changed the effective plan, so the
 /// frontend's `entitlementStore` reloads.
 pub const ENTITLEMENT_CHANGED_EVENT: &str = "entitlement-changed";
@@ -59,6 +61,16 @@ pub const ENTITLEMENT_CHANGED_EVENT: &str = "entitlement-changed";
 /// read, and `Entitlement::current` keeps using the legacy session plan, so a
 /// build with this empty behaves exactly as before #582. Once a key is set, only
 /// a valid signed token grants Pro. Ship that change as a beta first.
+///
+/// **Before setting it** (an owner decision: it changes a data flow), in the
+/// same change that compiles the key in:
+/// - [ ] With a key, every signed-in user POSTs to octopush-api on launch,
+///   sign-in, checkout and the `auth_refresh` poll, whether or not sync is on.
+///   Update the Privacy pane's `OUTBOUND` line ("Octopush's sync service, only
+///   if you turn on sync"), which would otherwise be false.
+/// - [ ] Update the website's privacy page to match.
+/// - [ ] In docs/FEATURES.md, drop "dormant until a key is compiled in" and
+///   describe the sync gates as following the token.
 pub const ENTITLEMENT_PUBLIC_KEY: &str = "";
 
 /// Claims as signed by the server. Parsed only after the signature verifies.
@@ -87,8 +99,6 @@ pub enum TokenRejection {
     WrongSubject,
     /// Past its `exp`.
     Expired,
-    /// `iat` more than [`MAX_IAT_SKEW_SECS`] in the future.
-    IssuedInFuture,
 }
 
 /// Parse a base64 raw 32-byte Ed25519 public key. `None` when empty, invalid,
@@ -121,8 +131,10 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 ///
 /// The key and the clock are parameters so tests exercise this exact function.
 /// Order: size bound → shape → strict signature over `"v1.<claims>"` → parse
-/// claims → `v` → `sub` → `exp` → `iat` not in the future. The claims bytes are
-/// never interpreted before the signature checks out.
+/// claims → `v` → `sub` → `exp`. The claims bytes are never interpreted before
+/// the signature checks out. `iat` is not checked: only the server signs, so a
+/// future `iat` protects nothing, and refusing one would lock out a Mac whose
+/// clock runs slow.
 pub fn verify_token(
     token: &str,
     key: &VerifyingKey,
@@ -164,9 +176,6 @@ pub fn verify_token(
     if now.timestamp() >= claims.exp {
         return Err(TokenRejection::Expired);
     }
-    if claims.iat > now.timestamp() + MAX_IAT_SKEW_SECS {
-        return Err(TokenRejection::IssuedInFuture);
-    }
     Ok(claims)
 }
 
@@ -187,14 +196,25 @@ pub fn store_token(token: &str) -> AppResult<()> {
 }
 
 pub fn load_token() -> Option<String> {
-    if let Some(cached) = &*TOKEN_CACHE.lock().unwrap() {
+    load_through(&TOKEN_CACHE, || {
+        crate::auth::keychain_entry(KEYRING_ACCOUNT)
+            .ok()
+            .and_then(|e| e.get_password().ok())
+    })
+}
+
+/// [`load_token`]'s cache logic, with the keychain read injected so tests can
+/// land a store or clear in the middle of it.
+fn load_through(
+    cache: &Mutex<Option<Option<String>>>,
+    read: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(cached) = &*cache.lock().unwrap() {
         return cached.clone();
     }
     // Read the keychain WITHOUT holding the lock (it can block on an OS prompt).
-    let loaded = crate::auth::keychain_entry(KEYRING_ACCOUNT)
-        .ok()
-        .and_then(|e| e.get_password().ok());
-    let mut cache = TOKEN_CACHE.lock().unwrap();
+    let loaded = read();
+    let mut cache = cache.lock().unwrap();
     // A store/clear that landed while we were reading wins over our read.
     if let Some(cached) = &*cache {
         return cached.clone();
@@ -280,6 +300,16 @@ pub fn decide_refresh(
     }
 }
 
+/// `POST /api/entitlement` on the sync API, honouring the same test override
+/// of the base URL as `sync::api_base` (`sync::test_net`).
+fn entitlement_url() -> String {
+    #[cfg(test)]
+    if let Some(base) = crate::sync::test_net::base() {
+        return format!("{base}/api/entitlement");
+    }
+    format!("{}/api/entitlement", crate::sync::SYNC_API_BASE)
+}
+
 /// Fetch a fresh token from `POST /api/entitlement` and store it.
 ///
 /// No-op (no request at all) while no key is compiled in, or when signed out.
@@ -300,7 +330,7 @@ pub async fn refresh() -> Option<String> {
             return None;
         }
     };
-    let url = format!("{}/api/entitlement", crate::sync::SYNC_API_BASE);
+    let url = entitlement_url();
     let resp = match client.post(&url).bearer_auth(access).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -627,19 +657,85 @@ mod tests {
     }
 
     #[test]
-    fn a_token_issued_in_the_future_is_refused() {
-        let at = |iat: i64| {
-            mint_raw(
-                &serde_json::json!({"v": 1, "sub": "user_abc", "plan": "pro", "iat": iat, "exp": iat + 30 * 86_400}),
-                &signing_key(),
-            )
-        };
-        let t = now().timestamp();
-        assert!(verify_token(&at(t + MAX_IAT_SKEW_SECS), &key(), "user_abc", now()).is_ok(), "within skew");
-        assert_eq!(
-            verify_token(&at(t + MAX_IAT_SKEW_SECS + 1), &key(), "user_abc", now()),
-            Err(TokenRejection::IssuedInFuture)
+    fn a_fresh_token_is_accepted_on_a_mac_whose_clock_runs_slow() {
+        // Issued "an hour from now" by this Mac's clock: only `exp` matters.
+        let iat = now().timestamp() + 3_600;
+        let token = mint_raw(
+            &serde_json::json!({"v": 1, "sub": "user_abc", "plan": "pro", "iat": iat, "exp": iat + 30 * 86_400}),
+            &signing_key(),
         );
+        assert_eq!(verify_token(&token, &key(), "user_abc", now()).map(|c| c.plan).as_deref(), Ok("pro"));
+    }
+
+    #[test]
+    fn an_identity_r_signature_is_refused_even_under_a_weak_key() {
+        // R = the identity point, s = 0, under the identity public key: the
+        // cofactorless equation [s]B = R + [k]A holds for any message, so plain
+        // `verify` accepts it. Only `verify_strict` refuses it.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).expect("decodes as a point");
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&identity);
+        let payload = format!(
+            "v1.{}",
+            URL_SAFE_NO_PAD.encode(br#"{"v":1,"sub":"user_abc","plan":"pro","iat":0,"exp":9999999999}"#)
+        );
+        {
+            use ed25519_dalek::Verifier;
+            assert!(
+                weak.verify(payload.as_bytes(), &Signature::from_bytes(&sig)).is_ok(),
+                "the lax check accepts it, so this test means something"
+            );
+        }
+        let token = format!("{payload}.{}", URL_SAFE_NO_PAD.encode(sig));
+        assert_eq!(verify_token(&token, &weak, "user_abc", now()), Err(TokenRejection::BadSignature));
+    }
+
+    #[test]
+    fn the_signature_is_checked_before_the_claims_are_parsed() {
+        // Unsigned non-JSON: parsing first would say Malformed.
+        let token = format!(
+            "v1.{}.{}",
+            URL_SAFE_NO_PAD.encode(b"not json"),
+            URL_SAFE_NO_PAD.encode([0u8; 64])
+        );
+        assert_eq!(verify_token(&token, &key(), "user_abc", now()), Err(TokenRejection::BadSignature));
+    }
+
+    #[test]
+    fn a_store_or_clear_during_the_keychain_read_wins() {
+        // A store lands while the keychain read is in flight.
+        let cache = Mutex::new(None);
+        let got = load_through(&cache, || {
+            *cache.lock().unwrap() = Some(Some("stored".into()));
+            Some("stale".into())
+        });
+        assert_eq!(got.as_deref(), Some("stored"));
+        assert_eq!(*cache.lock().unwrap(), Some(Some("stored".to_string())));
+
+        // A clear (sign-out) lands while the keychain read is in flight.
+        let cache = Mutex::new(None);
+        let got = load_through(&cache, || {
+            *cache.lock().unwrap() = Some(None);
+            Some("stale".into())
+        });
+        assert_eq!(got, None, "a sign-out mid-read must not bring the token back");
+        assert_eq!(*cache.lock().unwrap(), Some(None));
+
+        // No race: the read is cached, and the keychain is read only once.
+        let cache = Mutex::new(None);
+        assert_eq!(load_through(&cache, || Some("read".into())).as_deref(), Some("read"));
+        assert_eq!(load_through(&cache, || panic!("read twice")).as_deref(), Some("read"));
+    }
+
+    #[test]
+    fn the_refresh_url_follows_the_sync_test_override() {
+        assert_eq!(entitlement_url(), format!("{}/api/entitlement", crate::sync::SYNC_API_BASE));
+        crate::sync::test_net::set(Some("http://127.0.0.1:9".into()), None);
+        let overridden = entitlement_url();
+        crate::sync::test_net::set(None, None);
+        assert_eq!(overridden, "http://127.0.0.1:9/api/entitlement");
     }
 
     // ── Refresh decisions ───────────────────────────────────────────────────
