@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { AUTO_RESUME_CAP, isPlanWaiting, pickBlockedStage, planLimitedStage, planWaitWhy } from "./planWait";
+import {
+  AUTO_RESUME_CAP,
+  STALE_RESUMES,
+  isPlanWaiting,
+  pickBlockedStage,
+  planLimitedStage,
+  planWaitLine,
+  planWaitSentence,
+  planWaitWhy,
+} from "./planWait";
 import { beaconAnchor } from "./beacon";
 import type { PlanWait } from "./ipc";
 
@@ -53,6 +62,34 @@ describe("planWait", () => {
     const blockedStage = pickBlockedStage([plan, gate]);
     expect(beaconAnchor({ run, blockedStage, runningStage: null, launcherReady: false, planWaiting: isPlanWaiting(run) }))
       .toEqual({ kind: "decision" });
+  });
+
+  it("shares the stale-report allowance and its copy with Rust", async () => {
+    // @ts-expect-error node:fs is untyped in this project
+    const fs = await import("node:fs");
+    const rust: string = fs.readFileSync("src-tauri/src/orchestrator/plan_wait.rs", "utf8");
+    expect(Number(rust.match(/pub const STALE_RESUMES: i64 = (\d+);/)![1])).toBe(STALE_RESUMES);
+    const notice = rust.match(/pub const STALE_REPORT_NOTICE: &str =\s*"([^"]+)";/)![1];
+    const stale = { planWait: wait({ resumeAt: null, staleCount: STALE_RESUMES + 1 }), budgetUsd: null, costUsd: 0 };
+    expect(planWaitWhy(stale)).toBe(notice);
+  });
+
+  it("names a limit that had already reset, and only once it waits for the director", () => {
+    const now = 1_793_551_000_000;
+    const stale = { status: "paused" as const, planWait: wait({ resumeAt: null, staleCount: 2 }), budgetUsd: null, costUsd: 0 };
+    expect(planWaitWhy(stale)).toMatch(/^Claude Code reported a plan limit that had already reset\. .*2\.1\.332/);
+    expect(planWaitSentence(stale, now)).toBe("paused by a plan limit that had already reset");
+    expect(planWaitLine(stale, now)).toBe("plan limit · already reset");
+    // The first stale report resumes on its own: nothing about it to explain.
+    const first = { status: "paused" as const, planWait: wait({ staleCount: 1 }), budgetUsd: null, costUsd: 0 };
+    expect(isPlanWaiting(first)).toBe(true);
+    expect(planWaitWhy(first)).toMatch(/^It continues the same session/);
+    // A budget that is spent still says so first.
+    expect(planWaitWhy({ ...stale, budgetUsd: 1, costUsd: 1 })).toMatch(/budget is spent/);
+    // A build that doesn't send the count behaves as before.
+    expect(planWaitWhy({ planWait: wait({ resumeAt: null }), budgetUsd: null, costUsd: 0 })).toBe(
+      "It doesn't resume on its own. Resume it when you're ready.",
+    );
   });
 
   it("names the cap when it was reached", () => {

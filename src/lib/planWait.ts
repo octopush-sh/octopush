@@ -4,7 +4,7 @@
 // Waiting is not "needs you": no decision is required, so a scheduled park
 // sits in flight and never takes the beacon.
 
-import type { Run } from "./ipc";
+import type { PlanWait, Run } from "./ipc";
 import { resetLabel, windowName } from "./claudePlan";
 
 /** The marker `cli_runner::apply_plan_limit` puts on a plan-limited stage error. */
@@ -35,6 +35,16 @@ export function planLimitedStage<S extends { status: string; error?: string | nu
  *  `plan_wait::AUTO_RESUME_CAP` in Rust; `planWait.test.ts` pins the two. */
 export const AUTO_RESUME_CAP = 3;
 
+/** Stale reports in a row resumed on their own before the run waits for the
+ *  director. Mirrors `plan_wait::STALE_RESUMES`; `planWait.test.ts` pins it. */
+export const STALE_RESUMES = 1;
+
+/** Claude Code reported a limit that had already reset, again (#1109): the
+ *  run waits for the director instead of spending its automatic resumes. */
+function staleReported(w: PlanWait): boolean {
+  return w.resumeAt == null && (w.staleCount ?? 0) > STALE_RESUMES;
+}
+
 /** A paused run waiting for its plan to reset, with an automatic resume
  *  scheduled, and nothing else in it waiting for the director: only then is
  *  it calm. A sibling's real halt, gate or question keeps it needs-you. */
@@ -49,6 +59,7 @@ export function planWaitLine(run: Pick<Run, "status" | "planWait">, nowMs: numbe
   const w = run.planWait;
   if (run.status !== "paused" || !w) return null;
   if (w.resumeAt != null) return `plan limit · resumes ${resetLabel(w.resumeAt, nowMs)}`;
+  if (staleReported(w)) return "plan limit · already reset";
   return `plan limit · resets ${resetLabel(w.resetsAt, nowMs)}`;
 }
 
@@ -57,6 +68,7 @@ export function planWaitSentence(run: Pick<Run, "status" | "planWait">, nowMs: n
   const w = run.planWait;
   if (!w) return "paused by your Claude plan";
   if (w.resumeAt != null) return `paused by your Claude plan · resumes at ${resetLabel(w.resumeAt, nowMs)}`;
+  if (staleReported(w)) return "paused by a plan limit that had already reset";
   return `paused by your Claude plan · the ${windowName(w.window)} resets at ${resetLabel(w.resetsAt, nowMs)}`;
 }
 
@@ -69,6 +81,10 @@ export function planWaitWhy(run: Pick<Run, "planWait" | "budgetUsd" | "costUsd">
   // The drive's budget gate: a budget of 0 is no budget.
   if (run.budgetUsd != null && run.budgetUsd > 0 && run.costUsd >= run.budgetUsd) {
     return "The run's budget is spent, so it doesn't resume on its own. Resume it when you're ready.";
+  }
+  // `plan_wait::STALE_REPORT_NOTICE`, word for word.
+  if (staleReported(w)) {
+    return "Claude Code reported a plan limit that had already reset. Claude Code 2.1.332 fixes this. Update Claude Code, then Resume.";
   }
   if (w.resumeCount >= AUTO_RESUME_CAP) {
     return `It hit the limit again after ${AUTO_RESUME_CAP} automatic resumes, so it waits for you.`;

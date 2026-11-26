@@ -985,6 +985,9 @@ impl Db {
         // the row, so the app and a detached worker share one count and a
         // restart doesn't reset it.
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_retry_count INTEGER NOT NULL DEFAULT 0")?;
+        // Plan-limit reports in a row whose reset was already past (#1109):
+        // Claude Code before 2.1.332 can report a limit that already reset.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_stale_count INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mission_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE terminals ADD COLUMN mission_id TEXT")?;
         // One-shot re-parenting: every existing workspace becomes a 'build'
@@ -5789,7 +5792,8 @@ impl Db {
                         reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
                     plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
                       AND (s.status = 'awaiting_checkpoint'
-                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
                  FROM runs WHERE id = ?1",
                 params![run_id],
                 row_to_run,
@@ -5804,7 +5808,8 @@ impl Db {
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
                     plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
                       AND (s.status = 'awaiting_checkpoint'
-                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs WHERE workspace_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], row_to_run)?;
@@ -5820,7 +5825,8 @@ impl Db {
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
                     plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
                       AND (s.status = 'awaiting_checkpoint'
-                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs WHERE status IN ('running', 'paused') ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_run)?;
@@ -5890,7 +5896,8 @@ impl Db {
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
                     plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
                       AND (s.status = 'awaiting_checkpoint'
-                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs WHERE status IN ('completed', 'aborted') ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_run)?;
@@ -5913,7 +5920,8 @@ impl Db {
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
                     plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
                       AND (s.status = 'awaiting_checkpoint'
-                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0))),
+                    plan_stale_count
              FROM runs
              WHERE status IN ('completed', 'aborted') AND finished_at IS NOT NULL AND finished_at > ?1
              ORDER BY finished_at DESC LIMIT 50",
@@ -6357,23 +6365,27 @@ impl Db {
     // ── Claude plan limit park (#731) ────────────────────────────────────────
 
     /// Park the run at a Claude plan limit: the window, its reset, and the
-    /// automatic resume (`None` = the director resumes).
+    /// automatic resume (`None` = the director resumes), and how many reports
+    /// in a row came with their reset already past (`stale_count`, #1109).
     pub fn set_run_plan_wait(
         &self,
         run_id: &str,
         window: &str,
         resets_at: i64,
         resume_at: Option<i64>,
+        stale_count: i64,
     ) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4 WHERE id = ?1",
-            params![run_id, window, resets_at, resume_at],
+            "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4, plan_stale_count = ?5
+             WHERE id = ?1",
+            params![run_id, window, resets_at, resume_at, stale_count],
         )?;
         Ok(())
     }
 
     /// The run is no longer parked by its plan (resumed, resolved, aborted).
     /// The automatic-resume count is kept: see [`Db::reset_plan_resume_count`].
+    /// So is the stale-report count: the next report must know it came in a row.
     pub fn clear_run_plan_wait(&self, run_id: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE runs SET plan_window = NULL, plan_resets_at = NULL, plan_resume_at = NULL WHERE id = ?1",
@@ -6394,7 +6406,9 @@ impl Db {
 
     /// Claim the automatic resume of a plan-parked run whose time has come:
     /// a compare-and-set, so the app's tick and a waiting detached worker can
-    /// race and exactly one of them resumes. Counts the resume.
+    /// race and exactly one of them resumes. Counts the resume, unless the
+    /// park came from a stale report (`plan_stale_count`, #1109): that one
+    /// resume is Claude Code's error, not the plan's wall.
     ///
     /// The claim does NOT clear the resume time: it moves it to `retry_at`.
     /// Applying the Resume ends the park (`clear_run_plan_wait`); until then
@@ -6402,7 +6416,8 @@ impl Db {
     /// dies between the claim and the apply can never lose the resume.
     pub fn claim_plan_resume(&self, run_id: &str, now: i64, retry_at: i64) -> AppResult<bool> {
         let n = self.conn.execute(
-            "UPDATE runs SET plan_resume_at = ?3, plan_resume_count = plan_resume_count + 1
+            "UPDATE runs SET plan_resume_at = ?3,
+                 plan_resume_count = plan_resume_count + (CASE WHEN plan_stale_count > 0 THEN 0 ELSE 1 END)
              WHERE id = ?1 AND status = 'paused' AND plan_resume_at IS NOT NULL AND plan_resume_at <= ?2",
             params![run_id, now, retry_at],
         )?;
@@ -6429,7 +6444,7 @@ impl Db {
     ) -> AppResult<bool> {
         let n = self.conn.execute(
             "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4,
-                 plan_resume_count = MAX(plan_resume_count - 1, 0)
+                 plan_resume_count = MAX(plan_resume_count - (CASE WHEN plan_stale_count > 0 THEN 0 ELSE 1 END), 0)
              WHERE id = ?1 AND status = 'paused'
                AND (plan_resume_at = ?5 OR (plan_window IS NULL AND plan_resume_at IS NULL))",
             params![run_id, window, resets_at, resume_at, claimed_at],
@@ -6438,11 +6453,12 @@ impl Db {
     }
 
     /// A fresh allowance of automatic resumes (the director acted, or a stage
-    /// finished: the run got past the wall). Failed claims start over too.
+    /// finished: the run got past the wall). Failed claims and stale reports
+    /// start over too.
     pub fn reset_plan_resume_count(&self, run_id: &str) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE runs SET plan_resume_count = 0, plan_retry_count = 0
-             WHERE id = ?1 AND (plan_resume_count <> 0 OR plan_retry_count <> 0)",
+            "UPDATE runs SET plan_resume_count = 0, plan_retry_count = 0, plan_stale_count = 0
+             WHERE id = ?1 AND (plan_resume_count <> 0 OR plan_retry_count <> 0 OR plan_stale_count <> 0)",
             params![run_id],
         )?;
         Ok(())
@@ -6482,6 +6498,16 @@ impl Db {
         Ok(self
             .conn
             .query_row("SELECT plan_resume_count FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Plan-limit reports in a row whose reset was already past (#1109),
+    /// since the director last acted or a stage finished.
+    pub fn plan_stale_count(&self, run_id: &str) -> AppResult<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT plan_stale_count FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
             .optional()?
             .unwrap_or(0))
     }
@@ -8915,6 +8941,10 @@ pub struct PlanWait {
     /// gate or a question (anything resolvable that isn't a plan limit). The
     /// run then needs you, even with an automatic resume scheduled.
     pub other_hold: bool,
+    /// Reports in a row whose reset was already past when they came (#1109):
+    /// 1 = this park resumes once, uncounted; 2 = it waits for the director
+    /// (`plan_wait::DirectorReason::StaleReport`).
+    pub stale_count: i64,
 }
 
 /// The routines column list, in the order `row_to_routine` reads them.
@@ -9022,12 +9052,14 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
             let resume_at: Option<i64> = r.get(15)?;
             let resume_count: i64 = r.get(16)?;
             let other_hold = r.get::<_, i64>(17)? != 0;
+            let stale_count: i64 = r.get(18)?;
             resets_at.map(|resets_at| PlanWait {
                 window: window.unwrap_or_default(),
                 resets_at,
                 resume_at,
                 resume_count,
                 other_hold,
+                stale_count,
             })
         },
     })

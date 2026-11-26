@@ -24807,6 +24807,64 @@ mod plan_wait_tests {
     }
 
     #[tokio::test]
+    async fn a_reset_already_past_resumes_once_uncounted_then_waits_for_the_director() {
+        // #1109: Claude Code before 2.1.332 can report a limit that already
+        // reset; the stream's `resetsAt` is then in the past.
+        use crate::orchestrator::plan_wait::STALE_REPORT_NOTICE;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 10, now() - 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("parked by the plan");
+        assert_eq!(wait.stale_count, 1);
+        let at = wait.resume_at.expect("one automatic resume, after the margin");
+        let t = now();
+        assert!((t + RESUME_MARGIN_SECS - 5..=t + RESUME_MARGIN_SECS + RESUME_JITTER_SECS).contains(&at), "{at}");
+        // Resumes on its own: Notify me elsewhere stays quiet.
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("plan_limit"));
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("had already reset") && e.contains("not counted")), "{log:?}");
+
+        make_due(&db, &run_id);
+        assert!(matches!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { .. }));
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "the stale report's resume isn't counted");
+
+        // The second stale report in a row: the director, with the cap untouched.
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Paused);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!((wait.resume_at, wait.stale_count, wait.resume_count), (None, 2, 0));
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"), "now it needs you");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains(STALE_REPORT_NOTICE)), "{log:?}");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+
+        // The director acting starts the count over.
+        db.lock().reset_plan_resume_count(&run_id).unwrap();
+        assert_eq!(db.lock().plan_stale_count(&run_id).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_stale_claim_puts_the_park_back_uncounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() - 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let w = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        // Two real resumes ran before this stale report.
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_count = 2 WHERE id = ?1", [&run_id]).unwrap();
+        make_due(&db, &run_id);
+        let t = now();
+        assert!(db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap());
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 2, "the stale claim isn't counted");
+        assert!(db.lock().restore_plan_resume(&run_id, &w.window, w.resets_at, Some(t + RETRY_SECS), t + RETRY_SECS).unwrap());
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 2, "nor is it taken back");
+        assert_eq!(db.lock().plan_stale_count(&run_id).unwrap(), 1, "still the same stale park");
+    }
+
+    #[tokio::test]
     async fn the_director_can_resume_early() {
         let dir = tempfile::tempdir().unwrap();
         let (db, run_id) = seed(&dir.path().join("o.db"));
