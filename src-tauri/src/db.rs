@@ -7439,6 +7439,77 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every stage of `pipeline_id`'s settled runs (completed, failed or
+    /// aborted), newest run first, with its archived failed attempts and the
+    /// direct spend of each model that ran it. Read-only; feeds the crew
+    /// report (`orchestrator::crew_report`), which picks the windows.
+    pub fn stage_outcomes(&self, pipeline_id: &str) -> AppResult<Vec<crate::orchestrator::crew_report::StageRunSample>> {
+        use crate::orchestrator::crew_report::{ModelSpend, StageRunSample};
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.run_id, r.status, s.position, s.role, s.status, s.escalated != 0,
+                    (SELECT COUNT(*) FROM stage_iterations i WHERE i.stage_id = s.id AND i.status = 'failed'),
+                    s.loop_target_position, s.loop_iterations
+             FROM run_stages s JOIN runs r ON r.id = s.run_id
+             WHERE r.pipeline_id = ?1 AND r.status IN ('completed', 'failed', 'aborted')
+             ORDER BY r.created_at DESC, r.rowid DESC, s.position",
+        )?;
+        let rows = stmt.query_map(params![pipeline_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StageRunSample {
+                    run_id: r.get(1)?,
+                    run_status: r.get(2)?,
+                    position: r.get(3)?,
+                    role: r.get(4)?,
+                    status: r.get(5)?,
+                    escalated: r.get(6)?,
+                    failed_attempts: r.get(7)?,
+                    loop_target_position: r.get(8)?,
+                    loop_iterations: r.get(9)?,
+                    spend: Vec::new(),
+                },
+            ))
+        })?;
+        let mut samples = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT se.source_id, se.model, SUM(se.cost_usd), MAX(se.cost_basis = 'unpriced'),
+                    SUM(se.input_tokens), SUM(se.output_tokens),
+                    SUM(se.cache_read_tokens), SUM(se.cache_creation_tokens)
+             FROM spend_events se
+             JOIN run_stages s ON s.id = se.source_id
+             JOIN runs r ON r.id = s.run_id
+             WHERE se.surface = 'direct' AND r.pipeline_id = ?1
+             GROUP BY se.source_id, se.model
+             ORDER BY MIN(se.ts_utc)",
+        )?;
+        let spend = stmt.query_map(params![pipeline_id], |r| {
+            let n = |i: usize| r.get::<_, i64>(i).map(|v| v.max(0) as u64);
+            Ok((
+                r.get::<_, String>(0)?,
+                ModelSpend {
+                    model: r.get(1)?,
+                    cost_usd: r.get(2)?,
+                    unpriced: r.get(3)?,
+                    tokens: crate::orchestrator::cost::TokenSample {
+                        input: n(4)?,
+                        output: n(5)?,
+                        cache_read: n(6)?,
+                        cache_creation: n(7)?,
+                    },
+                },
+            ))
+        })?;
+        let mut by_stage: std::collections::HashMap<String, Vec<ModelSpend>> = std::collections::HashMap::new();
+        for row in spend {
+            let (id, m) = row?;
+            by_stage.entry(id).or_default().push(m);
+        }
+        for (id, s) in &mut samples {
+            s.spend = by_stage.remove(id.as_str()).unwrap_or_default();
+        }
+        Ok(samples.into_iter().map(|(_, s)| s).collect())
+    }
+
     /// Resolve a stage's workspace/project/model and append a `direct` spend
     /// event. `finished_at`-derived idempotency key = one row per completion.
     #[allow(clippy::too_many_arguments)]

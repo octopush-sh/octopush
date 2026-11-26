@@ -1832,6 +1832,9 @@ export const ipc = {
       pipelineId,
       stageOverrides: stageOverrides ?? null,
     }),
+  /** Per-stage outcomes of this Mac's latest runs of a pipeline, and the
+   *  right-sizing suggestions they support (#983). Read-only. */
+  getCrewReport: (pipelineId: string) => invoke<CrewReport>("get_crew_report", { pipelineId }),
 
   // ─── Entitlement (premium scaffolding) ────────────────────────
   getEntitlement: () => invoke<Entitlement>("get_entitlement"),
@@ -2031,6 +2034,48 @@ export interface RunEstimate {
   unpricedStages?: number;
   perStage?: StageEstimate[];
   confidence?: "history" | "rough";
+}
+
+/** One stage's record over its latest runs (`orchestrator::crew_report`).
+ *  Dollar figures are `null` when a run of it is unpriced — never $0. */
+export interface StageOutcome {
+  position: number;
+  role: string;
+  runs: number;
+  firstPass: number;
+  /** Times a review sent this stage back. */
+  loopBacks: number;
+  escalated: number;
+  halted: number;
+  medianUsd: number | null;
+  byModel: { model: string; runs: number; medianUsd: number | null }[];
+  /** Newest first. */
+  recent: ("pass" | "rework" | "halt")[];
+}
+
+export interface CrewSuggestion {
+  kind: "startStrong" | "lighterTier" | "loopHotspot";
+  position: number;
+  role: string;
+  runs: number;
+  /** Escalations (startStrong) or first passes (lighterTier). */
+  count: number;
+  model: string | null;
+  modelLabel: string | null;
+  /** lighterTier: the escalation the edit keeps or sets. */
+  escalateModel: string | null;
+  escalateLabel: string | null;
+  /** Estimated saving per run; null when a model is unpriced. */
+  savingUsd: number | null;
+  senderPosition: number | null;
+  meanLoops: number | null;
+}
+
+export interface CrewReport {
+  /** Runs a stage needs before it has a record or a suggestion. */
+  minRuns: number;
+  stages: StageOutcome[];
+  suggestions: CrewSuggestion[];
 }
 
 /** The installed Claude Code CLI's version against the tested floor. */
