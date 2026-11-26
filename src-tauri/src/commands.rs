@@ -8516,6 +8516,7 @@ mod ai_complete_tests {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
+            usage_unreported: false,
         };
         let text = super::ai_response_text(structured);
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -8531,6 +8532,7 @@ mod ai_complete_tests {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
+            usage_unreported: false,
         };
         assert_eq!(super::ai_response_text(prose), "plain answer");
     }

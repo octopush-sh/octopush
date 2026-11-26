@@ -19,6 +19,7 @@ use super::{
 use crate::error::{AppError, AppResult, ProviderErrorKind};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 mod streaming;
 pub use streaming::read_stream;
@@ -33,6 +34,12 @@ pub struct OpenAICompatibleProvider {
 
 /// How a request error's message opens.
 const WHAT: &str = "OpenAI-compat request failed";
+
+/// How long an OpenAI-compatible stream may send nothing (`super::stream_idle`).
+/// These servers promise no keep-alive, and a reasoning model may send
+/// nothing while it thinks, so the bound is ten minutes, not Anthropic's one.
+/// Silence past it is still final, never retried.
+pub const STREAM_IDLE: Duration = Duration::from_secs(600);
 
 /// Which of the two APIs a request goes to (`uses_responses_api`), with what
 /// the Responses parser needs to record where its reasoning came from.
@@ -149,12 +156,31 @@ impl LlmProvider for OpenAICompatibleProvider {
             // in a last chunk; without it every streamed turn would price at 0.
             body["stream_options"] = json!({ "include_usage": true });
         }
-        let resp = Self::post(api_base, api_key, &url, &body, client).await?;
+        let resp = match Self::post(api_base, api_key, &url, &body, client).await {
+            // A server that refuses `stream_options` is asked once more without
+            // it: a 400 isn't billed and nothing has streamed yet. Its answer
+            // then carries no usage, so it is `usage_unreported`, never $0.
+            Err(e) if body.get("stream_options").is_some() && rejects_stream_options(&e) => {
+                if let Some(fields) = body.as_object_mut() {
+                    fields.remove("stream_options");
+                }
+                Self::post(api_base, api_key, &url, &body, client).await?
+            }
+            other => other?,
+        };
         let whole = is_json(resp.headers());
         // A model server on this Mac may think for longer than any bound.
-        let idle = (!super::is_loopback_base(api_base)).then_some(super::STREAM_IDLE);
+        let idle = super::stream_idle(api_base, STREAM_IDLE);
         read_stream(super::sse::Body(resp, WHAT), whole, idle, &api, sink).await
     }
+}
+
+/// Whether `e` is a 400 whose body names `stream_options`: a Chat
+/// Completions server that doesn't accept the field. Narrow on purpose, so
+/// any other rejection is never sent twice.
+fn rejects_stream_options(e: &AppError) -> bool {
+    matches!(e, AppError::Provider { message, .. }
+        if message.starts_with("OpenAI-compat API error 400 ") && message.contains("stream_options"))
 }
 
 fn parse_json(bytes: &[u8]) -> AppResult<Value> {
@@ -618,6 +644,7 @@ pub fn parse_responses_response(response: Value, model: &str, provider: &str, ap
         cache_creation_tokens,
         rate_limit: None,
         raw_content,
+        usage_unreported: false,
     }
 }
 
@@ -791,5 +818,6 @@ pub fn parse_response(response: Value) -> LlmResponse {
         rate_limit: None,
         // OpenAI-compat returns no verbatim content-block array to replay.
         raw_content: vec![],
+        usage_unreported: false,
     }
 }

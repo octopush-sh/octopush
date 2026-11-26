@@ -15,7 +15,8 @@ type Sink<'s> = &'s mut (dyn FnMut(StreamEvent) + Send);
 
 /// Read the answer to a `stream: true` request and assemble it. `whole`: the
 /// server answered with a whole JSON body anyway, parsed as `complete` parses
-/// it, its text handed over as one `Text`. Apart so fixtures can drive it.
+/// it, its text handed over as one `Text`. An answer that carried no `usage`
+/// is `usage_unreported`, never priced as $0. Apart so fixtures can drive it.
 pub async fn read_stream<S: ByteSource>(
     mut source: S,
     whole: bool,
@@ -28,7 +29,7 @@ pub async fn read_stream<S: ByteSource>(
         while let Some(chunk) = source.next_chunk().await? {
             bytes.extend_from_slice(&chunk);
         }
-        let resp = api.parse(parse_json(&bytes)?);
+        let resp = assemble(api, parse_json(&bytes)?);
         if !resp.text.is_empty() {
             sink(StreamEvent::Text(resp.text.clone()));
         }
@@ -39,7 +40,16 @@ pub async fn read_stream<S: ByteSource>(
         Api::Chat => fold::<ChatChunks, S>(&mut reader, sink).await?,
         Api::Responses { .. } => fold::<ResponsesEvents, S>(&mut reader, sink).await?,
     };
-    Ok(api.parse(body))
+    Ok(assemble(api, body))
+}
+
+/// `body` parsed by `api`'s parser, flagged when it carried no usage (a Chat
+/// Completions server that ignored or refused `include_usage`).
+fn assemble(api: &Api<'_>, body: Value) -> LlmResponse {
+    let reported = body.get("usage").is_some_and(Value::is_object);
+    let mut resp = api.parse(body);
+    resp.usage_unreported = !reported;
+    resp
 }
 
 /// One API's events, folded into the body a whole response carries.
@@ -119,8 +129,10 @@ struct Call {
 }
 
 impl ChatChunks {
-    fn call(&mut self, piece: &Value, sink: Sink<'_>) {
-        let index = piece.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+    /// One `tool_calls` piece; `position` is its place in the chunk's array,
+    /// the call's index when a server leaves `index` out.
+    fn call(&mut self, position: usize, piece: &Value, sink: Sink<'_>) {
+        let index = piece.get("index").and_then(Value::as_u64).map_or(position, |i| i as usize);
         let call = self.calls.entry(index).or_default();
         let function = piece.get("function");
         // The first id and name stand: a server may repeat them in every piece.
@@ -190,8 +202,9 @@ impl Fold for ChatChunks {
             refusal.push_str(why);
             sink(StreamEvent::Text(why.into()));
         }
-        for piece in delta.and_then(|d| d.get("tool_calls")).and_then(Value::as_array).into_iter().flatten() {
-            self.call(piece, sink);
+        let pieces = delta.and_then(|d| d.get("tool_calls")).and_then(Value::as_array).into_iter().flatten();
+        for (position, piece) in pieces.enumerate() {
+            self.call(position, piece, sink);
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = Some(reason.into());

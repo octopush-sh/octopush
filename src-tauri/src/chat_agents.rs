@@ -1930,6 +1930,7 @@ mod tests {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
+            usage_unreported: false,
         }
     }
     struct Recorder {
