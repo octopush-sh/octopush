@@ -3745,7 +3745,8 @@ impl ChatEngine {
         };
         // Where the file tools may go without asking (#1147). A sandboxed
         // mission's own sandbox refuses a write outside the workspace.
-        let reach = crate::talk_guard::Reach::of_workspace(&workspace_path);
+        let main_checkout = crate::talk_guard::project_root(&self.db, &request.workspace_id);
+        let reach = crate::talk_guard::Reach::of_workspace(&workspace_path, main_checkout.as_deref());
         let writes_confined = sandbox_roots.is_some();
 
         let mut usage = TurnUsage::default();

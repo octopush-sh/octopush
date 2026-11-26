@@ -750,10 +750,17 @@ impl SubagentGate {
             label: spec.call.description.clone(),
             workspace_path: spec.workspace_path.clone(),
             mcp_writes: std::collections::HashSet::new(),
-            reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path)),
+            reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
             writes_confined: spec.sandbox_roots.is_some(),
             seq: AtomicU64::new(1),
         }
+    }
+
+    /// Let reads into the dependency folders a mission links from its
+    /// project (`root`, from the database) run without a card.
+    pub fn with_project_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.reach = crate::talk_guard::Reach::of_workspace(Path::new(&self.workspace_path), root.as_deref());
+        self
     }
 
     /// Gate the MCP tools among `discovered` that are not read-only.
@@ -1150,7 +1157,9 @@ pub async fn run_one_subagent(
         &spec_owned
     };
     let model = plan.model.clone();
-    let approval_gate = SubagentGate::new(approvals, app.clone(), spec).with_mcp_writes(mcp_tools);
+    let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
+        .with_mcp_writes(mcp_tools)
+        .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
     let external = McpSubagentTools::granted(
         mcp,
         Path::new(&spec.workspace_path),

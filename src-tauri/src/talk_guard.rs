@@ -129,19 +129,26 @@ pub struct Reach {
     secrets: Vec<(PathBuf, Option<PathBuf>, &'static str)>,
 }
 
-/// The dependency folders a worktree at `<main>/.octopus-worktrees/<name>`
-/// may link from its main checkout (`worktree_share::LINK_CANDIDATES`),
-/// resolved. Read from the workspace's own path, which comes from the
-/// database, never from a file inside the workspace (its `.git` is the
-/// agent's to rewrite).
-fn linked_folders(workspace: &Path) -> Vec<PathBuf> {
-    let parent = workspace.parent().filter(|p| p.file_name().is_some_and(|n| n == ".octopus-worktrees"));
-    let Some(main) = parent.and_then(Path::parent).and_then(|m| std::fs::canonicalize(m).ok()) else { return Vec::new() };
+/// The dependency folders a mission may link from its project's main
+/// checkout (`worktree_share::LINK_CANDIDATES`), resolved. `main_checkout`
+/// is the project's root as the database has it ([`project_root`]), never
+/// read from a file inside the workspace (its `.git` is the agent's to
+/// rewrite) nor guessed from where the worktree sits (worktrees live beside
+/// the project, in `<parent>/.octopus-worktrees`).
+fn linked_folders(main_checkout: Option<&Path>) -> Vec<PathBuf> {
+    let Some(main) = main_checkout.and_then(|m| std::fs::canonicalize(m).ok()) else { return Vec::new() };
     crate::worktree_share::LINK_CANDIDATES.iter().map(|n| main.join(n)).collect()
 }
 
+/// The root of the project `workspace_id` belongs to, from the database.
+pub fn project_root(db: &parking_lot::Mutex<crate::db::Db>, workspace_id: &str) -> Option<PathBuf> {
+    let db = db.lock();
+    let project_id = db.get_workspace(workspace_id).ok().flatten()?.project_id;
+    db.get_project(&project_id).ok().flatten().map(|p| PathBuf::from(p.path))
+}
+
 impl Reach {
-    pub fn new(workspace: &Path, home: Option<&Path>) -> Self {
+    pub fn new(workspace: &Path, main_checkout: Option<&Path>, home: Option<&Path>) -> Self {
         let home = home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
         let secrets = HOME_SECRETS
             .iter()
@@ -152,15 +159,15 @@ impl Reach {
         Self {
             workspace: workspace.to_path_buf(),
             root: std::fs::canonicalize(workspace).ok(),
-            linked: linked_folders(workspace),
+            linked: linked_folders(main_checkout),
             home,
             secrets,
         }
     }
 
     /// [`Reach::new`] with the user's home.
-    pub fn of_workspace(workspace: &Path) -> Self {
-        Self::new(workspace, dirs::home_dir().as_deref())
+    pub fn of_workspace(workspace: &Path, main_checkout: Option<&Path>) -> Self {
+        Self::new(workspace, main_checkout, dirs::home_dir().as_deref())
     }
 
     /// `path` as the card names it: `~/…` under home, else in full.
@@ -338,7 +345,7 @@ mod tests {
     #[test]
     fn read_file_of_an_absolute_path_outside_the_workspace_asks() {
         let (_d, ws, home) = setup();
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         let c = card(&reach, "read_file", home.join("notes.txt")).expect("an absolute path outside asks");
         assert_eq!((c.kind, c.shown.as_str(), c.sensitive), (CardKind::Read, "~/notes.txt", false), "it names the path");
         assert_eq!(c.reason, "reads a file outside the workspace");
@@ -349,7 +356,7 @@ mod tests {
     #[test]
     fn a_read_inside_the_workspace_runs_without_a_card() {
         let (_d, ws, home) = setup();
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         let abs = ws.join("a.txt");
         let abs = abs.to_str().unwrap();
         for (tool, path) in [("read_file", "a.txt"), ("read_file", abs), ("list_files", "."), ("grep", "."), ("write_file", "new/dir/b.txt"), ("edit_file", "./a.txt"), ("glob", "/"), ("run_command", "/")] {
@@ -365,7 +372,7 @@ mod tests {
         for (to, at) in [(home.join("notes.txt"), "link.txt"), (home.clone(), "homedir"), (home.join("planted.txt"), "dangling"), (ws.join("a.txt"), "inner")] {
             std::os::unix::fs::symlink(to, ws.join(at)).unwrap();
         }
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         let c = card(&reach, "read_file", "link.txt").unwrap();
         assert_eq!((c.shown.as_str(), c.reason.as_str()), ("~/notes.txt", "reads a file outside the workspace"), "it names where the link leads");
         // A linked folder behind a `..` out of a missing one.
@@ -376,32 +383,49 @@ mod tests {
         assert_eq!(card(&reach, "read_file", "inner"), None, "a link that stays inside runs as before");
     }
 
+    /// The real layout: the project at `<parent>/proj`, its worktree beside
+    /// it at `<parent>/.octopus-worktrees/wt` with `node_modules` linked.
     #[cfg(unix)]
-    #[test]
-    fn only_a_linked_dependency_folder_of_the_main_checkout_reads_without_a_card() {
+    fn beside_the_project() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let (d, _, home) = setup();
-        let main = std::fs::canonicalize(d.path()).unwrap().join("main");
-        let wt = main.join(".octopus-worktrees/wt");
-        for dir in [main.join("node_modules/x"), main.join("src"), wt.clone()] {
+        let parent = std::fs::canonicalize(d.path()).unwrap();
+        let (proj, wt) = (parent.join("proj"), parent.join(".octopus-worktrees/wt"));
+        for dir in [proj.join("node_modules/x"), proj.join("src"), parent.join("node_modules/y"), parent.join(".venv"), wt.clone()] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        std::os::unix::fs::symlink(main.join("node_modules"), wt.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(proj.join("node_modules"), wt.join("node_modules")).unwrap();
+        (d, proj, wt, home)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_dependency_folder_of_the_project_reads_without_a_card() {
+        let (_d, proj, wt, home) = beside_the_project();
+        let reach = Reach::new(&wt, Some(&proj), Some(&home));
+        assert_eq!(card(&reach, "read_file", "node_modules/x/index.js"), None);
+        assert_eq!(card(&reach, "grep", "node_modules/x"), None);
+        let env = card(&reach, "read_file", "node_modules/x/.env").expect("an env file there still asks");
+        assert!(env.sensitive && env.reason.ends_with("its name marks it as an env file"), "{}", env.reason);
+        assert_eq!(card(&reach, "write_file", "node_modules/x/index.js").map(|c| c.kind), Some(CardKind::Write), "a write there asks");
+        assert!(card(&reach, "read_file", proj.join("src/lib.rs")).is_some(), "the rest of the project asks");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_around_the_worktrees_is_not_the_project() {
+        let (_d, proj, wt, home) = beside_the_project();
+        let parent = proj.parent().unwrap().to_path_buf();
         // A forged `.git` whose `commondir` would make `/` the main checkout.
         std::fs::create_dir_all(wt.join("g")).unwrap();
         std::fs::write(wt.join("g/commondir"), "../../../../../../../../../../../../.git\n").unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt.join("g").display())).unwrap();
-        let reach = Reach::new(&wt, Some(&home));
-        assert_eq!(card(&reach, "read_file", "node_modules/x/index.js"), None, "the main checkout comes from the path");
-        let env = card(&reach, "read_file", "node_modules/x/.env").expect("an env file there still asks");
-        assert!(env.sensitive && env.reason.ends_with("its name marks it as an env file"), "{}", env.reason);
-        assert_eq!(card(&reach, "write_file", "node_modules/x/index.js").map(|c| c.kind), Some(CardKind::Write), "a write there asks");
-        for outside in [main.join("src/lib.rs"), home.join("notes.txt")] {
-            assert!(card(&reach, "read_file", &outside).is_some(), "{}", outside.display());
+        for reach in [Reach::new(&wt, Some(&proj), Some(&home)), Reach::new(&wt, None, Some(&home))] {
+            for outside in [parent.join("node_modules/y/index.js"), parent.join(".venv/pyvenv.cfg"), home.join("notes.txt")] {
+                assert!(card(&reach, "read_file", &outside).is_some(), "{}", outside.display());
+            }
         }
-        // A workspace outside `.octopus-worktrees` links nothing, whatever its `.git` says.
-        let (_d2, ws, home) = setup();
-        std::fs::write(ws.join(".git"), format!("gitdir: {}\n", wt.join("g").display())).unwrap();
-        assert!(card(&Reach::new(&ws, Some(&home)), "read_file", main.join("node_modules/x/index.js")).is_some());
+        // With no project from the database, nothing reads as linked.
+        assert!(card(&Reach::new(&wt, None, Some(&home)), "read_file", "node_modules/x/index.js").is_some());
     }
 
     #[cfg(unix)]
@@ -415,7 +439,7 @@ mod tests {
         }
         std::os::unix::fs::symlink(ws.join("loop-b"), ws.join("loop-a")).unwrap();
         std::os::unix::fs::symlink(ws.join("loop-a"), ws.join("loop-b")).unwrap();
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         for path in ["l0", "loop-a"] {
             let c = card(&reach, "write_file", path).unwrap_or_else(|| panic!("{path} asks"));
             assert!(c.reason.ends_with("its links go too deep to follow"), "{}", c.reason);
@@ -426,7 +450,7 @@ mod tests {
     #[test]
     fn write_outside_workspace_requires_approval() {
         let (_d, ws, home) = setup();
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         for tool in ["write_file", "edit_file"] {
             let c = card(&reach, tool, home.join("new/plan.md")).unwrap_or_else(|| panic!("{tool} outside asks"));
             assert_eq!((c.kind, c.shown.as_str()), (CardKind::Write, "~/new/plan.md"));
@@ -444,7 +468,7 @@ mod tests {
     #[test]
     fn credentials_locations_are_marked_and_say_why() {
         let (_d, ws, home) = setup();
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         let key = card(&reach, "read_file", home.join(".SSH/id_ed25519")).unwrap();
         assert!(key.sensitive && key.reason == "reads a file outside the workspace \u{b7} ~/.ssh holds SSH keys", "{}", key.reason);
         let grep = card(&reach, "grep", &home).unwrap();
@@ -456,7 +480,7 @@ mod tests {
             assert!(card(&reach, "read_file", home.join(path)).is_some_and(|c| c.sensitive), "{path}");
         }
         // A workspace opened at home still asks for ~/.ssh and name-marked files.
-        let at_home = Reach::new(&home, Some(&home));
+        let at_home = Reach::new(&home, None, Some(&home));
         let c = at_home.outside_card(Some("Scout"), "read_file", &json!({"path": ".ssh/id_ed25519"}), false).unwrap();
         assert!(c.sensitive && c.reason == "Sub-agent \u{201c}Scout\u{201d}: reads a file in a credentials location \u{b7} ~/.ssh holds SSH keys");
         let env = card(&at_home, "read_file", "app/.env").unwrap();
@@ -473,14 +497,24 @@ mod tests {
         std::fs::write(keys.join("id_work"), "k").unwrap();
         std::fs::create_dir_all(home.join(".config")).unwrap();
         std::os::unix::fs::symlink(&keys, home.join(".config/gh")).unwrap();
-        let c = card(&Reach::new(&ws, Some(&home)), "read_file", keys.join("id_work")).unwrap();
+        let c = card(&Reach::new(&ws, None, Some(&home)), "read_file", keys.join("id_work")).unwrap();
         assert!(c.sensitive && c.reason.ends_with("~/.config/gh holds GitHub CLI tokens"), "{}", c.reason);
+    }
+
+    #[test]
+    fn the_project_root_comes_from_the_database() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(tmp.path()).unwrap());
+        db.lock().insert_project("p", "P", "/code/proj").unwrap();
+        db.lock().insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        assert_eq!(project_root(&db, "ws"), Some(PathBuf::from("/code/proj")));
+        assert_eq!(project_root(&db, "missing"), None);
     }
 
     #[test]
     fn director_mcp_write_requires_approval() {
         let (_d, ws, home) = setup();
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         let read_only: HashSet<String> = ["mcp__github__get_issue".to_string()].into();
         let c = director_card("mcp__github__merge_pr", &json!({"number": 7}), &read_only, &reach, false)
             .expect("a tool without readOnlyHint asks");
@@ -493,7 +527,7 @@ mod tests {
     #[test]
     fn director_mcp_readonly_runs_without_card() {
         let (_d, ws, home) = setup();
-        let reach = Reach::new(&ws, Some(&home));
+        let reach = Reach::new(&ws, None, Some(&home));
         let read_only: HashSet<String> = ["mcp__github__get_issue".to_string()].into();
         for (tool, input) in [("mcp__github__get_issue", json!({"number": 7})), ("read_file", json!({"path": "a.txt"}))] {
             assert_eq!(director_card(tool, &input, &read_only, &reach, false), None, "{tool}");
