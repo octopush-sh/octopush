@@ -479,9 +479,11 @@ pub async fn complete_cancellable(
 }
 
 /// How long a streamed answer from a remote provider may send nothing at
-/// all (Anthropic sends `ping`s while it works) before the connection counts
-/// as dead: a `Network` error, retried like one. A model server on this Mac
-/// has no such bound, as it has no read bound (`client_for`).
+/// all (Anthropic sends `ping`s while it works) before the turn gives up on
+/// it. Final, never retried ([`silent_stream_error`]): the request was
+/// answered with a 200, so the provider may still be generating. A model
+/// server on this Mac has no such bound, as it has no read bound
+/// (`client_for`).
 pub const STREAM_IDLE: Duration = Duration::from_secs(60);
 
 /// The streamed counterpart of [`complete_cancellable`]: `provider.stream`
@@ -600,6 +602,13 @@ pub fn body_error(what: &str, e: &reqwest::Error) -> AppError {
     let detail = crate::tls::describe_request_error(e);
     let how = if e.is_timeout() { "went silent" } else { "was lost" };
     final_error(format!("{what}: the connection {how} while the answer was arriving ({detail}). {NOT_RETRIED}"))
+}
+
+/// The error for a stream that sent nothing for `idle` after its 200. Final,
+/// like a body that dropped: the provider may still be generating, and
+/// sending the request again could run (and bill) it twice.
+pub fn silent_stream_error(what: &str, idle: Duration) -> AppError {
+    final_error(format!("{what}: the stream sent nothing for {idle:?} while the answer was arriving. {NOT_RETRIED}"))
 }
 
 /// The error for a stream that ended before the provider said the answer

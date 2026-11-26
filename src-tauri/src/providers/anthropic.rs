@@ -204,7 +204,9 @@ impl StreamedMessage {
                     if let Some(usage) = event.get("usage").and_then(Value::as_object) {
                         let total = message.entry("usage").or_insert_with(|| json!({}));
                         if let Some(total) = total.as_object_mut() {
-                            merge(total, usage);
+                            // A null never replaces a count `message_start` gave.
+                            let counts = usage.iter().filter(|(_, v)| !v.is_null());
+                            total.extend(counts.map(|(k, v)| (k.clone(), v.clone())));
                         }
                     }
                 }

@@ -49,7 +49,7 @@ async fn stream(&self, …, req, client, sink: &mut dyn FnMut(StreamEvent)) -> A
 
 - The default implementation calls `complete` and emits one `Text`, so a provider that can't stream works unchanged.
 - It returns the same assembled `LlmResponse` (usage, `raw_content`), so pricing and replay don't move.
-- `stream_with_retry` extends `complete_with_retry`: a transient error mid-stream emits `Reset` and retries; an idle gap over 60 s is a `Network` error; the request races the turn's cancel.
+- `stream_with_retry` extends `complete_with_retry`: a transient error mid-stream emits `Reset` and retries; an idle gap over 60 s after a 200 is final, never retried, like a dropped body (the provider may still be generating, so a retry could run and bill the request twice); the request races the turn's cancel.
 
 **Events.** `chat://stream` gains additive `round`, `kind: "text" | "narration"` and `reset`.
 - On a round's first `ToolStart` the host emits `kind: "narration"`, and the frontend moves that buffer into the work block (`.octo-fade-in`).

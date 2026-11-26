@@ -32,6 +32,17 @@ pub struct SseParser {
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 impl SseParser {
+    /// The body ended: a CR left waiting for a possible LF ends its line, so
+    /// an event whose blank line is that lone CR is dispatched. An event left
+    /// unfinished is dropped, as the format says.
+    pub fn finish(&mut self) -> Vec<SseEvent> {
+        if self.buf.last() == Some(&b'\r') {
+            // A CR then an LF is one line end, as the CR alone was.
+            return self.push(b"\n");
+        }
+        Vec::new()
+    }
+
     /// Feed the next chunk; returns the events it completed, in order.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
@@ -140,7 +151,7 @@ impl<S: ByteSource> SseReader<S> {
     }
 
     /// The next event, or `None` once the body has ended. A body that sends
-    /// nothing for `idle` fails as a `Network` error instead of hanging.
+    /// nothing for `idle` fails, for good, instead of hanging.
     pub async fn next(&mut self) -> AppResult<Option<SseEvent>> {
         loop {
             if let Some(event) = self.ready.pop_front() {
@@ -150,14 +161,17 @@ impl<S: ByteSource> SseReader<S> {
                 return Ok(None);
             }
             let chunk = match self.idle {
-                Some(idle) => tokio::time::timeout(idle, self.source.next_chunk()).await.map_err(|_| {
-                    super::network_error(format!("{}: the stream sent nothing for {idle:?}", self.what))
-                })??,
+                Some(idle) => tokio::time::timeout(idle, self.source.next_chunk())
+                    .await
+                    .map_err(|_| super::silent_stream_error(self.what, idle))??,
                 None => self.source.next_chunk().await?,
             };
             match chunk {
                 Some(bytes) => self.ready.extend(self.parser.push(&bytes)),
-                None => self.ended = true,
+                None => {
+                    self.ready.extend(self.parser.finish());
+                    self.ended = true;
+                }
             }
         }
     }

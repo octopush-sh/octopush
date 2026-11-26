@@ -1888,7 +1888,8 @@ mod streaming {
             delta(2, json!({"type": "input_json_delta", "partial_json": "fig.toml\", \"limit\": 4"})),
             delta(2, json!({"type": "input_json_delta", "partial_json": "0}"})),
             block_stop(2),
-            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 57}}),
+            // A null count never replaces the one `message_start` gave.
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 57, "cache_read_input_tokens": null}}),
             json!({"type": "message_stop"}),
         ]
     }
@@ -1952,6 +1953,16 @@ mod streaming {
         }
         let event = |event: &str, data: &str| SseEvent { event: event.into(), data: data.into() };
         assert_eq!(events, vec![event("first", "one\ntwo"), event("", "")]);
+        assert!(parser.finish().is_empty(), "the unfinished event is dropped");
+
+        // A character split across chunks arrives whole; a body whose last
+        // blank line is a lone CR still dispatches its event at the end.
+        let mut parser = SseParser::default();
+        let body = "data: caf\u{e9} \u{2615}\r\r".as_bytes();
+        let (head, tail) = body.split_at(10); // inside the two bytes of é
+        assert!(parser.push(head).is_empty());
+        assert!(parser.push(tail).is_empty(), "the CR may still be half a CRLF");
+        assert_eq!(parser.finish(), vec![event("", "caf\u{e9} \u{2615}")]);
     }
 
     #[tokio::test]
@@ -1996,7 +2007,7 @@ mod streaming {
     }
 
     /// Streams scripted bodies through the real Anthropic stream reader.
-    struct Scripted(Mutex<VecDeque<Chunks>>, AtomicU32);
+    struct Scripted(Mutex<VecDeque<Chunks>>, AtomicU32, Duration);
 
     #[async_trait::async_trait]
     impl LlmProvider for Scripted {
@@ -2014,7 +2025,7 @@ mod streaming {
         ) -> AppResult<LlmResponse> {
             self.1.fetch_add(1, Ordering::SeqCst);
             let body = self.0.lock().unwrap().pop_front().expect("ran out of bodies");
-            anthropic::read_stream(body, Some(Duration::from_secs(5)), sink).await.map_err(|e| match e {
+            anthropic::read_stream(body, Some(self.2), sink).await.map_err(|e| match e {
                 // No backoff wait in a test, as the retry tests above do.
                 AppError::Provider { kind, message, .. } => AppError::Provider { kind, retry_after: Some(0), message },
                 other => other,
@@ -2030,7 +2041,8 @@ mod streaming {
             delta(0, json!({"type": "text_delta", "text": "Half an ans"})),
             json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}),
         ]);
-        let p = Scripted(Mutex::new([chunks(&overloaded, 4096), chunks(&sse(&answer_events()), 4096)].into()), AtomicU32::new(0));
+        let bodies = [chunks(&overloaded, 4096), chunks(&sse(&answer_events()), 4096)];
+        let p = Scripted(Mutex::new(bodies.into()), AtomicU32::new(0), Duration::from_secs(5));
         let cancel = AtomicBool::new(false);
         let mut retries = Vec::new();
         let mut on_retry = |a: u32, d: u64, k: ProviderErrorKind| retries.push((a, d, k));
@@ -2049,14 +2061,23 @@ mod streaming {
     }
 
     #[tokio::test]
-    async fn idle_gap_is_network_error() {
+    async fn idle_gap_is_final_not_retried() {
+        // Silent after its 200: the provider may still be generating, so the
+        // call fails for good instead of hanging, and is never sent again.
         let silent = Chunks(vec![Some(sse(&[start()]).into_bytes()), None].into());
+        let p = Scripted(Mutex::new([silent].into()), AtomicU32::new(0), Duration::from_millis(150));
+        let (req, client, cancel) = (super::sample_request(), reqwest::Client::new(), AtomicBool::new(false));
+        let mut retried = false;
+        let mut on_retry = |_a: u32, _d: u64, _k: ProviderErrorKind| retried = true;
         let mut sink = |_e: StreamEvent| {};
         let started = Instant::now();
-        let err = anthropic::read_stream(silent, Some(Duration::from_millis(150)), &mut sink).await.err().expect("a silent stream fails");
+        let out = stream_with_retry(&p, "https://api.test", None, &req, &client, &cancel, 5, &mut on_retry, &mut sink).await;
         assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
-        assert_eq!(err.transient_retry().map(|(k, _)| k), Some(ProviderErrorKind::Network), "{err}");
-        assert!(err.to_string().contains("the stream sent nothing for 150ms"), "{err}");
+        let (err, retries) = match out { Completion::Failed { error, retries } => (error, retries), other => panic!("{other:?}") };
+        assert_eq!((retries, p.1.load(Ordering::SeqCst), retried), (0, 1, false), "sent once, never retried");
+        assert!(err.transient_retry().is_none(), "{err}");
+        assert!(err.to_string().contains("the stream sent nothing for 150ms while the answer was arriving"), "{err}");
+        assert!(err.to_string().contains("It was not retried"), "{err}");
 
         // A body that ends before `message_stop` was cut off: final, never sent again.
         let cut = anthropic::read_stream(chunks(&sse(&answer_events()[..10]), 64), None, &mut sink).await.err().expect("a cut-off stream");
@@ -2067,7 +2088,7 @@ mod streaming {
     #[tokio::test]
     async fn stop_abandons_a_stream_in_flight() {
         let silent = Chunks(vec![Some(sse(&[start()]).into_bytes()), None].into());
-        let p = Scripted(Mutex::new([silent].into()), AtomicU32::new(0));
+        let p = Scripted(Mutex::new([silent].into()), AtomicU32::new(0), Duration::from_secs(5));
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&cancel);
         tokio::spawn(async move { tokio::time::sleep(Duration::from_millis(150)).await; stop.store(true, Ordering::SeqCst) });
