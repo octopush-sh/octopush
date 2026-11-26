@@ -12,8 +12,10 @@ const getUsageReport = vi.fn();
 const getUsageBreakdown = vi.fn();
 const refreshPricing = vi.fn();
 const getGatewayReconciliation = vi.fn();
+const managedModelPricing = vi.fn();
 vi.mock("../../lib/ipc", () => ({
   ipc: {
+    managedModelPricing: (...a: unknown[]) => managedModelPricing(...a),
     getUsageReport: (...a: unknown[]) => getUsageReport(...a),
     getUsageBreakdown: (...a: unknown[]) => getUsageBreakdown(...a),
     getGatewayReconciliation: (...a: unknown[]) => getGatewayReconciliation(...a),
@@ -29,6 +31,7 @@ vi.mock("../../lib/ipc", () => ({
 vi.mock("../Toasts", () => ({ pushToast: vi.fn() }));
 
 import { UsagePane, periodRange, pricingAgeDays } from "./UsagePane";
+import { managedPricingSummary } from "./ManagedPricingNote";
 
 const slice = (over: Partial<UsageReport["totals"]> = {}): UsageReport["totals"] => ({
   inputTokens: 10_000,
@@ -78,6 +81,55 @@ beforeEach(() => {
   getUsageBreakdown.mockReset().mockResolvedValue({ cloudCostUsd: 12.5, cloudTokens: 12_000, localTokens: 0, estimatedLocalSavingsUsd: 0 });
   refreshPricing.mockReset().mockResolvedValue({ modelsUpdated: 3, modelsTotal: 5, fetchedAt: new Date().toISOString() });
   getGatewayReconciliation.mockReset().mockResolvedValue(null);
+  managedModelPricing.mockReset().mockResolvedValue(null);
+});
+
+describe("managed Claude Code pricing note", () => {
+  const DOCS_EXAMPLE = {
+    multiplier: 0.85,
+    overrides: { "claude-sonnet-4-6": { input: 2.4, output: 12, cacheRead: 0.24, cacheWrite: 3 } },
+  };
+
+  it("says finished Claude Code stages use the organization's rates while the rest uses list prices", async () => {
+    managedModelPricing.mockResolvedValue(DOCS_EXAMPLE);
+    render(<UsagePane />);
+    const note = await screen.findByTestId("usage-managed-pricing");
+    expect(note.textContent).toContain("0.85× every cost · own rates for claude-sonnet-4-6");
+    expect(note.textContent).toContain("Finished Claude Code stages are booked at Claude Code's own figure");
+    expect(note.textContent).toContain("stopped or crashed stages and the savings baseline use list prices");
+    expect(note.textContent).toContain("can mix the two");
+    expect(note.textContent).not.toContain("keep list prices");
+    expect(note.textContent).toContain("--max-budget-usd");
+    expect(note.textContent).toContain("admin console");
+    expect(note.getAttribute("data-tour")).toBe("usage-managed-pricing");
+    expect(note.getAttribute("title")).toBe(
+      "claude-sonnet-4-6: $2.4 in · $12 out · $0.24 cache read · $3 cache write per MTok",
+    );
+    expect(managedModelPricing).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts several override rows and reads a multiplier alone", () => {
+    expect(
+      managedPricingSummary({
+        multiplier: null,
+        overrides: { a: DOCS_EXAMPLE.overrides["claude-sonnet-4-6"], b: DOCS_EXAMPLE.overrides["claude-sonnet-4-6"] },
+      }),
+    ).toBe("own rates for 2 models");
+    expect(managedPricingSummary({ multiplier: 0.7, overrides: {} })).toBe("0.7× every cost");
+  });
+
+  it("stays hidden with no table", async () => {
+    render(<UsagePane />);
+    await screen.findByTestId("usage-stat-cost");
+    expect(screen.queryByTestId("usage-managed-pricing")).toBeNull();
+  });
+
+  it("stays hidden when the read fails", async () => {
+    managedModelPricing.mockRejectedValue(new Error("no"));
+    render(<UsagePane />);
+    await screen.findByTestId("usage-stat-cost");
+    expect(screen.queryByTestId("usage-managed-pricing")).toBeNull();
+  });
 });
 
 describe("periodRange", () => {

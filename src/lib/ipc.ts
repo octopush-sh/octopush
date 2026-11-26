@@ -1926,6 +1926,10 @@ export const ipc = {
   /** Installed Claude Code CLI version vs the tested floor (cached per app session). */
   claudeCliVersion: () =>
     invoke<ClaudeCliVersion>("claude_cli_version"),
+  /** Settings › Usage: the `modelPricing` table an organization set in Claude
+   *  Code's managed settings on this Mac, read-only; null when none is set. */
+  managedModelPricing: () =>
+    invoke<ManagedModelPricing | null>("managed_model_pricing"),
   /** Direct launcher: the one model among `models` the installed Claude Code
    *  is too old to launch (`agent_adapter::CLAUDE_MODEL_FLOORS`), read from the
    *  cached version without probing; null when none or the version is unknown. */
@@ -2031,6 +2035,22 @@ export interface RunEstimate {
   unpricedStages?: number;
   perStage?: StageEstimate[];
   confidence?: "history" | "rough";
+}
+
+/** One `modelPricing.overrides` row, USD per million tokens. */
+export interface ManagedModelRates {
+  input: number;
+  output: number;
+  cacheRead: number;
+  /** Both 5-minute and 1-hour cache writes. */
+  cacheWrite: number;
+}
+
+/** Claude Code's managed `modelPricing` (`agent_adapter::ModelPricing`): a
+ *  multiplier applied on top of every cost, and rates by model ID. */
+export interface ManagedModelPricing {
+  multiplier: number | null;
+  overrides: Record<string, ManagedModelRates>;
 }
 
 /** The installed Claude Code CLI's version against the tested floor. */
