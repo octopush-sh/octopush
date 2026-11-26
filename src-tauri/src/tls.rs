@@ -47,6 +47,7 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -791,6 +792,77 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     }
 }
 
+// ─── Stalled connections ──────────────────────────────────────────────────
+
+/// Longest wait for a connection to open (TCP + TLS) before the request fails
+/// as a network error. Nothing was sent yet, so the provider retry layer may
+/// send it again.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest silence between two reads of a response on the pooled LLM client.
+/// Provider requests don't stream yet, so the first byte of an answer
+/// arrives only once the whole answer is generated: the bound has to cover
+/// the longest legitimate generation (64k output tokens at a slow ~40
+/// tokens/s is about 27 minutes). It is an idle bound, never a total one: a
+/// response that keeps arriving is never cut. A connection that died
+/// silently is found much sooner by the keep-alive probes below. When it
+/// fires the request is not retried (the provider may still be generating
+/// it: `providers::request_error`). A model server on this Mac has no read
+/// bound at all ([`local_llm_client`]).
+pub const LLM_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// TCP keep-alive: probe an idle connection after 30s, then every 10s, and
+/// give up after 3 unanswered probes. A NAT or VPN that drops the connection
+/// without a FIN or RST is noticed within about a minute (the read fails,
+/// and the turn says the connection was lost), and the probes keep a NAT
+/// mapping from idling out while a long answer is generated.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// `builder` with a connect bound, an idle `read_timeout` between reads and
+/// TCP keep-alive, so a dropped connection ends in an error instead of a
+/// request that never returns. Takes the read timeout so a test can use a
+/// short one; production passes [`LLM_READ_TIMEOUT`] ([`llm_client`]).
+pub fn with_stall_guards(builder: reqwest::ClientBuilder, read_timeout: Duration) -> reqwest::ClientBuilder {
+    builder
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(read_timeout)
+        .tcp_keepalive(TCP_KEEPALIVE)
+        .tcp_keepalive_interval(TCP_KEEPALIVE_INTERVAL)
+        .tcp_keepalive_retries(TCP_KEEPALIVE_RETRIES)
+}
+
+/// The process-wide pooled client every LLM call goes through
+/// (`chat_engine::shared_http_client`): [`client_builder`] with
+/// [`with_stall_guards`]. Never fails, like [`client`]: should the hardened
+/// build error, the fallback keeps the same guards.
+pub fn llm_client() -> reqwest::Client {
+    with_stall_guards(client_builder(), LLM_READ_TIMEOUT).build().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "tls: could not build the hardened LLM client; using reqwest's default TLS");
+        with_stall_guards(reqwest::Client::builder(), LLM_READ_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// The pooled client for a model server on this Mac (a loopback base:
+/// Ollama, LM Studio, a local gateway; `providers::client_for` picks it): a
+/// connect bound but **no read bound**, because a local model on a laptop
+/// can take far longer than any remote provider to produce a long answer,
+/// and no proxy, because loopback traffic never leaves the Mac. Built once.
+pub fn local_llm_client() -> &'static reqwest::Client {
+    static LOCAL: OnceLock<reqwest::Client> = OnceLock::new();
+    LOCAL.get_or_init(|| {
+        client_builder().connect_timeout(CONNECT_TIMEOUT).no_proxy().build().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "tls: could not build the loopback LLM client; using reqwest's default TLS");
+            reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+    })
+}
+
 /// A ready client with default options, for call sites that used
 /// `reqwest::Client::new()`. Like `Client::new()` it never fails: should the
 /// build error (reqwest documents this as "the TLS backend cannot be
@@ -1379,6 +1451,17 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
         // version skew against reqwest would make `build()` fail here.
         assert!(shared_config().is_some(), "platform verifier");
         client_builder().build().expect("hardened client builds");
+    }
+
+    #[test]
+    fn the_llm_client_builds_with_its_stall_guards() {
+        // The guards ride on the hardened builder: a value reqwest rejected
+        // would fail the build here.
+        with_stall_guards(client_builder(), LLM_READ_TIMEOUT)
+            .build()
+            .expect("hardened LLM client builds");
+        // The loopback client is built once and shared.
+        assert!(std::ptr::eq(local_llm_client(), local_llm_client()));
     }
 
     #[test]

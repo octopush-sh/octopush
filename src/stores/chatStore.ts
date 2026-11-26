@@ -67,6 +67,32 @@ export function appendAgentLog(
   return { ...logs, [callId]: next };
 }
 
+/** The director's live status while it waits on the provider (a retry, a
+ *  rate-limit pause), from `chat://notice`. Never persisted: the Player shows
+ *  `text` until `delaySecs` pass or the turn moves on. */
+export const CHAT_NOTICE_EVENT = "chat://notice";
+
+export interface TurnNotice {
+  text: string;
+  /** Tells a later notice from this one, so an old timer can't clear it. */
+  seq: number;
+}
+
+/** Pure reducer: drop `threadId`'s notice, if it still has one (and, when
+ *  `seq` is given, only that notice). Returns the same map when nothing
+ *  changes, so subscribers don't re-render on every stream delta. */
+export function clearTurnNotice(
+  notices: Record<string, TurnNotice>,
+  threadId: string | undefined,
+  seq?: number,
+): Record<string, TurnNotice> {
+  if (!threadId) return notices;
+  const current = notices[threadId];
+  if (!current || (seq !== undefined && current.seq !== seq)) return notices;
+  const { [threadId]: _gone, ...rest } = notices;
+  return rest;
+}
+
 /** A tool currently executing (between `chat://tool-start` and the resolved
  *  `chat://message-added` role=tool). Rendered as a live "running" card. */
 export interface LiveTool {
@@ -395,6 +421,10 @@ interface ChatState {
   continueErrorByCall: Record<string, string>;
   /** Text the composer takes once as its draft (a fork's turn), per workspace. */
   composerSeedByWs: Record<string, string | null>;
+  /** The director's live retry / pause notice, per thread (see `TurnNotice`).
+   *  Per thread, so a background thread's notice is still there when the
+   *  user switches back to it. */
+  turnNoticeByThread: Record<string, TurnNotice>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -595,11 +625,20 @@ export const useChatStore = create<ChatState>((set, get) => {
   // (rapid workspace switches / mount races). Mirrors the terminal-init guard.
   const loadingHistory = new Set<string>();
 
+  // The turn moved on (a row, a delta, a tool start, the end): a retry or
+  // pause notice for that thread is over. `seq` limits it to one notice.
+  const dropNotice = (threadId: string | undefined, seq?: number) => {
+    const current = get().turnNoticeByThread;
+    const next = clearTurnNotice(current, threadId, seq);
+    if (next !== current) set({ turnNoticeByThread: next });
+  };
+
   // ── chat://message-added ──────────────────────────────────────
   // Append a message to ITS workspace's bucket, with idempotency on id.
   listen<MessageAddedEvent>("chat://message-added", (ev) => {
     const payload = ev.payload;
     const wsId = payload.workspaceId;
+    dropNotice(payload.threadId);
 
     set((s) => {
       // Only reflect events for the thread currently shown in this workspace;
@@ -702,6 +741,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     const payload = ev.payload;
     const wsId = payload.workspaceId;
     if (!wsId) return;
+    dropNotice(payload.threadId);
     const active = isActiveThread(get().activeThreadByWs, wsId, payload.threadId);
 
     if (payload.done) {
@@ -755,11 +795,27 @@ export const useChatStore = create<ChatState>((set, get) => {
     }
   });
 
+  // ── chat://notice ─────────────────────────────────────────────
+  // The director waits on the provider (a retry after a 429/529/5xx or a
+  // dropped connection, or a rate-limit pause): the Player says so for the
+  // length of the wait. Kept per thread, whichever one is on screen.
+  let noticeSeq = 0;
+  listen<{ workspaceId: string; threadId: string; text: string; delaySecs: number }>(CHAT_NOTICE_EVENT, (ev) => {
+    const p = ev.payload;
+    if (!p.threadId || !p.text) return;
+    const seq = ++noticeSeq;
+    set((s) => ({ turnNoticeByThread: { ...s.turnNoticeByThread, [p.threadId]: { text: p.text, seq } } }));
+    // The wait is over and the request goes out again: back to the turn's
+    // own role ("Thinking…") unless a newer notice replaced this one.
+    setTimeout(() => dropNotice(p.threadId, seq), Math.max(0, p.delaySecs) * 1000);
+  });
+
   // ── chat://tool-start ─────────────────────────────────────────
   // A tool began executing — show a live "running" card immediately.
   listen<ToolStartEvent>("chat://tool-start", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
+    dropNotice(p.threadId);
     if (!isActiveThread(get().activeThreadByWs, p.workspaceId, p.threadId)) return;
     set((s) => {
       const live = s.liveToolsByWs[p.workspaceId] ?? EMPTY_LIVE_TOOLS;
@@ -1026,6 +1082,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     continuingCalls: {},
     continueErrorByCall: {},
     composerSeedByWs: {},
+    turnNoticeByThread: {},
     model: helperModelNow("review"),
     effort: "standard",
 
