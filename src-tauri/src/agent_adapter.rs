@@ -293,6 +293,9 @@ pub const CLAUDE_RECOMMENDED_FIXES: &[(&str, &str, RecommendedAudience)] = &[
         RecommendedAudience::Any,
     ),
     ("2.1.331", "fixes MCP tool calls hanging up to 30 minutes on some malformed replies from a local or WebSocket server", RecommendedAudience::Any),
+    // #1109: before it, a crew stage can be told a plan limit is reached
+    // after it already reset (`plan_wait::DirectorReason::StaleReport`).
+    ("2.1.332", "fixes a usage limit being reported as reached after it had already reset", RecommendedAudience::Any),
 ];
 
 /// A [`CLAUDE_RECOMMENDED_FIXES`] row the installed Claude Code lacks.
@@ -1757,11 +1760,18 @@ mod tests {
         let missing = |v: &str| {
             claude_recommended_fixes(v, CLAUDE_RECOMMENDED_FIXES).into_iter().map(|f| (f.version, f.audience)).collect::<Vec<_>>()
         };
-        let all = vec![("2.1.330".to_string(), Run), ("2.1.330".to_string(), Any), ("2.1.331".to_string(), Any)];
+        let all = vec![
+            ("2.1.330".to_string(), Run),
+            ("2.1.330".to_string(), Any),
+            ("2.1.331".to_string(), Any),
+            ("2.1.332".to_string(), Any),
+        ];
         // #1065: a 2.1.329 user still learns about ExitWorktree, not only the newest fix.
         assert_eq!(missing("2.1.329"), all);
-        assert_eq!(missing("2.1.330"), vec![("2.1.331".to_string(), Any)]);
-        assert_eq!(missing("2.1.331"), vec![]);
+        assert_eq!(missing("2.1.330"), vec![("2.1.331".to_string(), Any), ("2.1.332".to_string(), Any)]);
+        // #1109: the stale plan-limit report.
+        assert_eq!(missing("2.1.331"), vec![("2.1.332".to_string(), Any)]);
+        assert_eq!(missing("2.1.332"), vec![]);
         assert_eq!(missing("2.2.0"), vec![]);
         assert_eq!(missing("unknown"), vec![], "an unknown version never recommends");
 
@@ -1770,6 +1780,7 @@ mod tests {
         assert!(fixes[0].reason.contains("ExitWorktree"));
         assert!(fixes[1].reason.contains("settings"));
         assert!(fixes[2].reason.contains("MCP tool calls hanging"));
+        assert!(fixes[3].reason.contains("after it had already reset"));
 
         // Oldest first whatever the table order; a row keeps its audience.
         let table = [("2.1.9", "fixes b", Any), ("2.1.2", "fixes a", Run)];

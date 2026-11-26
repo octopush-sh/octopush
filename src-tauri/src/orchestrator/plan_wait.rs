@@ -15,6 +15,12 @@
 //! dossier, `--resume` of the same session), so every checkpoint still holds.
 //! Automatic resumes are capped ([`AUTO_RESUME_CAP`]); a run whose budget is
 //! spent, or whose window resets too far off, waits for the director.
+//!
+//! A report whose reset is already past is stale (#1109): Claude Code before
+//! 2.1.332 can say a limit is reached after it reset. Such a park resumes
+//! once, uncounted ([`STALE_RESUMES`]); the next stale report in a row waits for
+//! the director ([`DirectorReason::StaleReport`]) instead of spending the
+//! automatic resumes minutes apart.
 
 use std::sync::Arc;
 
@@ -37,6 +43,13 @@ pub const RESUME_JITTER_SECS: i64 = 60;
 /// A window that resets further off than this is not waited for
 /// automatically (a weekly window is at most 7 days away).
 pub const MAX_WAIT_SECS: i64 = 8 * 86_400;
+/// Stale reports in a row resumed automatically (uncounted) before the run
+/// waits for the director. Mirrored in `src/lib/planWait.ts`.
+pub const STALE_RESUMES: i64 = 1;
+
+/// What the journal and the halt say when stale reports hand the run over.
+pub const STALE_REPORT_NOTICE: &str =
+    "Claude Code reported a plan limit that had already reset. Claude Code 2.1.332 fixes this. Update Claude Code, then Resume.";
 
 /// Why a plan-parked run waits for the director instead of resuming itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +60,20 @@ pub enum DirectorReason {
     BudgetSpent,
     /// The window resets more than [`MAX_WAIT_SECS`] away.
     TooFar,
+    /// More than [`STALE_RESUMES`] reports in a row named a reset already
+    /// past: Claude Code keeps reporting a limit that is gone.
+    StaleReport,
+}
+
+/// Pure: the stale-report count of a report resetting at `resets_at`, given
+/// the count of the reports before it in a row. A reset still ahead is a real
+/// wall and starts the count over.
+pub fn stale_count(resets_at: i64, now: i64, before: i64) -> i64 {
+    if resets_at > now {
+        0
+    } else {
+        before.max(0) + 1
+    }
 }
 
 /// What to do with a run a plan limit just parked.
@@ -60,11 +87,17 @@ pub enum ParkDecision {
 
 /// Pure: the park decision. `jitter` is clamped to `0..=RESUME_JITTER_SECS`.
 /// A reset already in the past resumes from `now` (plus the margin).
-pub fn park_decision(resets_at: i64, now: i64, resume_count: i64, budget_spent: bool, jitter: i64) -> ParkDecision {
+/// `stale` is this report's [`stale_count`]: a stale report within
+/// [`STALE_RESUMES`] resumes whatever the cap (its resume isn't counted);
+/// past it the run waits for the director.
+pub fn park_decision(resets_at: i64, now: i64, resume_count: i64, stale: i64, budget_spent: bool, jitter: i64) -> ParkDecision {
     if budget_spent {
         return ParkDecision::Director(DirectorReason::BudgetSpent);
     }
-    if resume_count >= AUTO_RESUME_CAP {
+    if stale > STALE_RESUMES {
+        return ParkDecision::Director(DirectorReason::StaleReport);
+    }
+    if stale == 0 && resume_count >= AUTO_RESUME_CAP {
         return ParkDecision::Director(DirectorReason::CapReached);
     }
     if resets_at - now > MAX_WAIT_SECS {
@@ -186,14 +219,30 @@ impl Orchestrator {
             Some(w) if w.resets_at > limit.resets_at => (w.window.clone(), w.resets_at),
             _ => (limit.window.clone(), limit.resets_at),
         };
-        let decision = park_decision(resets_at, now, count, budget_spent(&run), jitter());
+        // Stale reports in a row before this one. A park still standing is
+        // this same batch's (a resume clears it): its own stale report, if it
+        // had one, is not one before.
+        let before = match &run.plan_wait {
+            Some(w) => (w.stale_count - 1).max(0),
+            None => self.db.lock().plan_stale_count(run_id)?,
+        };
+        let stale = stale_count(resets_at, now, before);
+        let decision = park_decision(resets_at, now, count, stale, budget_spent(&run), jitter());
         let window = plan_window_name(&window_key);
         let resets = clock_label(resets_at, now);
         let (resume_at, notice) = match decision {
+            ParkDecision::Resume { at } if stale > 0 => (
+                Some(at),
+                format!(
+                    "Claude Code reported a plan limit that had already reset · resumes at {}, not counted as an automatic resume",
+                    clock_label(at, now)
+                ),
+            ),
             ParkDecision::Resume { at } => (
                 Some(at),
                 format!("Paused by your Claude plan · resumes at {}", clock_label(at, now)),
             ),
+            ParkDecision::Director(DirectorReason::StaleReport) => (None, STALE_REPORT_NOTICE.to_string()),
             ParkDecision::Director(DirectorReason::CapReached) => (
                 None,
                 format!(
@@ -210,7 +259,7 @@ impl Orchestrator {
                 format!("Paused by your Claude plan · the {window} resets at {resets}, too far off to wait for, so it waits for you"),
             ),
         };
-        self.db.lock().set_run_plan_wait(run_id, &window_key, resets_at, resume_at)?;
+        self.db.lock().set_run_plan_wait(run_id, &window_key, resets_at, resume_at, stale)?;
         self.journal_notice(run_id, stage_id, &notice);
         self.emit_run_update(run_id);
         Ok(resume_at.is_some())
@@ -378,6 +427,7 @@ impl Orchestrator {
             return Ok(PlanClaim::NeedsYou);
         }
         let count = self.db.lock().plan_resume_count(run_id)?;
+        let stale = run.plan_wait.as_ref().is_some_and(|w| w.stale_count > 0);
         // Resume on the plan-limited stage resumes every plan-limited stage
         // of the run (`apply_checkpoint_action`).
         match self.resolve_checkpoint_apply_only(
@@ -386,11 +436,12 @@ impl Orchestrator {
             CheckpointAction::Resume { max_turns_override: None },
         ) {
             Ok(Some(budget_override)) => {
-                self.journal_notice(
-                    run_id,
-                    &stage.id,
-                    &format!("Claude plan window reset · resuming (automatic resume {count} of {AUTO_RESUME_CAP})"),
-                );
+                let notice = if stale {
+                    "Resuming after a plan limit that had already reset · not counted as an automatic resume".to_string()
+                } else {
+                    format!("Claude plan window reset · resuming (automatic resume {count} of {AUTO_RESUME_CAP})")
+                };
+                self.journal_notice(run_id, &stage.id, &notice);
                 Ok(PlanClaim::Resumed { budget_override })
             }
             Ok(None) => Ok(PlanClaim::NotClaimed),
@@ -489,40 +540,80 @@ mod tests {
     #[test]
     fn schedules_after_the_reset_with_margin_and_bounded_jitter() {
         let resets = NOW + 3_600;
-        assert_eq!(park_decision(resets, NOW, 0, false, 0), ParkDecision::Resume { at: resets + 90 });
-        assert_eq!(park_decision(resets, NOW, 0, false, 42), ParkDecision::Resume { at: resets + 132 });
+        assert_eq!(park_decision(resets, NOW, 0, 0, false, 0), ParkDecision::Resume { at: resets + 90 });
+        assert_eq!(park_decision(resets, NOW, 0, 0, false, 42), ParkDecision::Resume { at: resets + 132 });
         // Jitter is clamped either way.
-        assert_eq!(park_decision(resets, NOW, 0, false, 10_000), ParkDecision::Resume { at: resets + 150 });
-        assert_eq!(park_decision(resets, NOW, 0, false, -5), ParkDecision::Resume { at: resets + 90 });
+        assert_eq!(park_decision(resets, NOW, 0, 0, false, 10_000), ParkDecision::Resume { at: resets + 150 });
+        assert_eq!(park_decision(resets, NOW, 0, 0, false, -5), ParkDecision::Resume { at: resets + 90 });
     }
 
     #[test]
     fn a_reset_already_past_resumes_from_now() {
-        assert_eq!(park_decision(NOW - 600, NOW, 1, false, 0), ParkDecision::Resume { at: NOW + 90 });
+        assert_eq!(park_decision(NOW - 600, NOW, 1, 1, false, 0), ParkDecision::Resume { at: NOW + 90 });
     }
 
     #[test]
     fn the_cap_hands_the_run_to_the_director() {
         let resets = NOW + 60;
-        assert!(matches!(park_decision(resets, NOW, AUTO_RESUME_CAP - 1, false, 0), ParkDecision::Resume { .. }));
+        assert!(matches!(park_decision(resets, NOW, AUTO_RESUME_CAP - 1, 0, false, 0), ParkDecision::Resume { .. }));
         assert_eq!(
-            park_decision(resets, NOW, AUTO_RESUME_CAP, false, 0),
+            park_decision(resets, NOW, AUTO_RESUME_CAP, 0, false, 0),
             ParkDecision::Director(DirectorReason::CapReached)
         );
     }
 
     #[test]
     fn a_spent_budget_never_resumes() {
-        assert_eq!(park_decision(NOW + 60, NOW, 0, true, 0), ParkDecision::Director(DirectorReason::BudgetSpent));
+        assert_eq!(park_decision(NOW + 60, NOW, 0, 0, true, 0), ParkDecision::Director(DirectorReason::BudgetSpent));
+        assert_eq!(park_decision(NOW - 60, NOW, 0, 1, true, 0), ParkDecision::Director(DirectorReason::BudgetSpent));
     }
 
     #[test]
     fn a_window_too_far_off_waits_for_the_director() {
-        assert!(matches!(park_decision(NOW + 7 * 86_400, NOW, 0, false, 0), ParkDecision::Resume { .. }));
+        assert!(matches!(park_decision(NOW + 7 * 86_400, NOW, 0, 0, false, 0), ParkDecision::Resume { .. }));
         assert_eq!(
-            park_decision(NOW + MAX_WAIT_SECS + 1, NOW, 0, false, 0),
+            park_decision(NOW + MAX_WAIT_SECS + 1, NOW, 0, 0, false, 0),
             ParkDecision::Director(DirectorReason::TooFar)
         );
+    }
+
+    #[test]
+    fn a_reset_already_past_is_a_stale_report_and_a_reset_ahead_starts_the_count_over() {
+        // #1109: Claude Code before 2.1.332 can report a limit that already reset.
+        assert_eq!(stale_count(NOW - 600, NOW, 0), 1);
+        assert_eq!(stale_count(NOW, NOW, 0), 1, "a reset at this very second is past too");
+        assert_eq!(stale_count(NOW - 1, NOW, 1), 2, "in a row");
+        assert_eq!(stale_count(NOW + 60, NOW, 1), 0, "a real wall");
+        assert_eq!(stale_count(NOW - 1, NOW, -3), 1);
+    }
+
+    #[test]
+    fn a_stale_report_resumes_once_uncounted_then_waits_for_the_director() {
+        let past = NOW - 600;
+        // The first: one resume after the margin, even with the cap already used.
+        let first = stale_count(past, NOW, 0);
+        assert_eq!(park_decision(past, NOW, 0, first, false, 0), ParkDecision::Resume { at: NOW + RESUME_MARGIN_SECS });
+        assert_eq!(park_decision(past, NOW, AUTO_RESUME_CAP, first, false, 0), ParkDecision::Resume { at: NOW + RESUME_MARGIN_SECS });
+        // The second in a row: the director, whatever is left of the cap.
+        let second = stale_count(past, NOW, first);
+        assert_eq!(park_decision(past, NOW, 0, second, false, 0), ParkDecision::Director(DirectorReason::StaleReport));
+        // A reset still ahead behaves as before.
+        let fresh = stale_count(NOW + 3_600, NOW, second);
+        assert_eq!(park_decision(NOW + 3_600, NOW, 0, fresh, false, 0), ParkDecision::Resume { at: NOW + 3_600 + 90 });
+        assert_eq!(
+            park_decision(NOW + 3_600, NOW, AUTO_RESUME_CAP, fresh, false, 0),
+            ParkDecision::Director(DirectorReason::CapReached)
+        );
+    }
+
+    #[test]
+    fn the_stale_report_notice_names_the_fix() {
+        assert!(STALE_REPORT_NOTICE.contains("already reset"));
+        assert!(STALE_REPORT_NOTICE.contains("2.1.332"));
+        // The release that fixes it is the one Readiness recommends.
+        assert!(crate::agent_adapter::CLAUDE_RECOMMENDED_FIXES
+            .iter()
+            .any(|(v, why, _)| *v == "2.1.332" && why.contains("already reset")));
     }
 
     #[test]

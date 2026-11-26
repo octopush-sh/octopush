@@ -1391,13 +1391,13 @@ mod tests {
         }
         let ok = claude_check(probe("echo '2.1.325 (Claude Code)'"), "2.1.314");
         assert_eq!((ok.status, ok.fix.as_deref()), (CheckStatus::Ok, None));
-        assert_eq!(versions(&ok), ["2.1.330", "2.1.330", "2.1.331"]);
+        assert_eq!(versions(&ok), ["2.1.330", "2.1.330", "2.1.331", "2.1.332"]);
         assert!(ok.recommended[0].reason.contains("ExitWorktree"), "{:?}", ok.recommended);
         let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");
-        assert_eq!((old.status, versions(&old).len()), (CheckStatus::Warn, 3));
-        let one_short = claude_check(probe("echo '2.1.330 (Claude Code)'"), "2.1.314");
-        assert_eq!((one_short.status, versions(&one_short)), (CheckStatus::Ok, vec!["2.1.331"]));
-        for current in ["2.1.331", "2.2.0"] {
+        assert_eq!((old.status, versions(&old).len()), (CheckStatus::Warn, 4));
+        let one_short = claude_check(probe("echo '2.1.331 (Claude Code)'"), "2.1.314");
+        assert_eq!((one_short.status, versions(&one_short)), (CheckStatus::Ok, vec!["2.1.332"]));
+        for current in ["2.1.332", "2.2.0"] {
             let row = claude_check(probe(&format!("echo '{current} (Claude Code)'")), "2.1.314");
             assert_eq!((row.status, row.recommended), (CheckStatus::Ok, vec![]), "{current}");
         }

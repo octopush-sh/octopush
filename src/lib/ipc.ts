@@ -287,6 +287,9 @@ export interface PlanWait {
   /** Another stage also waits for the director (a real halt, a gate, a
    *  question): the run needs you even with a resume scheduled. */
   otherHold: boolean;
+  /** Reports in a row whose reset was already past (#1109): 1 resumes once,
+   *  uncounted; more waits for the director. Absent from older builds. */
+  staleCount?: number;
 }
 /** One question a blocked stage asks the director via `ask_director` — paired
  *  with the agent's own best guess so the director can accept it in one click.

@@ -1705,6 +1705,38 @@ fn a_rejected_plan_window_halts_the_stage_as_a_plan_limit() {
 }
 
 #[test]
+fn a_rejected_window_whose_reset_is_past_still_reaches_the_park() {
+    // #1109: Claude Code before 2.1.332 can report a limit after it reset.
+    // The watch keeps the stale `resetsAt` as-is; `plan_wait` names it.
+    use crate::orchestrator::cli_runner::{apply_plan_limit, is_plan_limit};
+    use crate::orchestrator::plan_wait::{park_decision, stale_count, DirectorReason, ParkDecision};
+    let rec = recording("2.1.314");
+    let fx = rec.label(REJECTED_REL);
+    let past = 1_000_000_000_i64;
+    let events: Vec<Value> = rec
+        .jsonl(REJECTED_REL)
+        .into_iter()
+        .map(|mut e| {
+            if e["type"] == "rate_limit_event" && e["rate_limit_info"]["status"] == "rejected" {
+                e["rate_limit_info"]["resetsAt"] = Value::from(past);
+            }
+            e
+        })
+        .collect();
+    let watch = plan_watch(&events);
+    assert_eq!(watch.limit().map(|l| l.resets_at), Some(past), "[{fx}]");
+    let result = events.iter().find(|e| is_result_event(e)).unwrap().to_string();
+    let out = apply_plan_limit(parse_cli_result(&result, true, ArtifactKind::Diff, "").unwrap(), &watch);
+    assert!(is_plan_limit(out.error.as_deref().unwrap()), "[{fx}]");
+    let limit = out.cli.plan_limit.expect("parks");
+    let now = past + 600;
+    let first = stale_count(limit.resets_at, now, 0);
+    assert_eq!(park_decision(limit.resets_at, now, 0, first, false, 0), ParkDecision::Resume { at: now + 90 }, "[{fx}]");
+    let second = stale_count(limit.resets_at, now, first);
+    assert_eq!(park_decision(limit.resets_at, now, 0, second, false, 0), ParkDecision::Director(DirectorReason::StaleReport));
+}
+
+#[test]
 fn a_rejected_window_covered_by_extra_usage_is_not_a_plan_limit() {
     // `subscriber-rate-limit.jsonl`'s third event: rejected, but
     // `isUsingOverage: true` — extra usage serves the request.
