@@ -3478,14 +3478,16 @@ impl ChatEngine {
         // Every request of the turn stays inside the model's window
         // (`context::budget`); system prompt and tools are fixed for the turn.
         let fixed_chars = budget::fixed_chars(&system_prompt, &tools);
-        let mut context_guard = budget::ContextGuard::new(
-            budget::ContextBudget::for_model(
-                crate::orchestrator::cli_runner::catalog_context_window(&request.model),
-                request.max_tokens.max(4096),
-                request.effort,
-            ),
-            budget::load_learned(&self.db.lock(), &request.model),
+        let mut model_budget = budget::ContextBudget::for_model(
+            crate::orchestrator::cli_runner::catalog_context_window(&request.model),
+            request.max_tokens.max(4096),
+            request.effort,
         );
+        // An id that names its window (`[1m]`) is never lowered.
+        if crate::orchestrator::cli_runner::has_1m_suffix(&request.model) {
+            model_budget = model_budget.with_fixed_window();
+        }
+        let mut context_guard = budget::ContextGuard::new(model_budget, budget::load_learned(&self.db.lock(), &request.model));
         // Each tool call's stored row, which a stub names for recall.
         let mut tool_rows: HashMap<String, i64> = HashMap::new();
 
@@ -3586,21 +3588,16 @@ impl ChatEngine {
                         return Ok(());
                     }
                     Completion::Failed { error, retries } => {
-                        // Too long for the model: lower the window, stub the
-                        // request to fit and send it once more. A second
-                        // refusal, or nothing to stub, ends the turn as before.
-                        if let Some(recovery) = context_guard.on_overflow(&error, &mut messages, fixed_chars, &tool_rows) {
+                        // A prompt too long for the model is stubbed to fit
+                        // and sent once more (`ContextGuard::after_failure`).
+                        let next = context_guard.after_failure(&error, &mut messages, fixed_chars, &tool_rows);
+                        if next.save {
                             self.save_context_budget(&request.model, context_guard.learned());
-                            if recovery.results > 0 {
-                                tracing::warn!(
-                                    window = recovery.window,
-                                    results = recovery.results,
-                                    "Talk director: prompt too long; compacted, retrying once"
-                                );
-                                let line = context_guard.recovery_notice(&recovery);
-                                self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &line, CONTEXT_NOTICE_SECS);
-                                continue;
-                            }
+                        }
+                        if let Some(line) = next.retry {
+                            tracing::warn!("Talk director: prompt too long; compacted, retrying once");
+                            self.emit_turn_notice(&app, &request.workspace_id, &request.thread_id, &line, CONTEXT_NOTICE_SECS);
+                            continue;
                         }
                         return Err(self.fail_turn(&app, &request.workspace_id, &request.thread_id, error, retries));
                     }

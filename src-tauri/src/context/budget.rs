@@ -3,12 +3,13 @@
 //! At each round boundary the guard estimates how much of the model's window
 //! the next request fills: the last response's real prompt size, plus
 //! chars/3.5 of what changed since, times a per-model calibration that
-//! converges on the provider's own counts. Past the soft threshold, older
-//! tool results are replaced by stubs in the request only (the stored rows
-//! never change), and each stub names its row for `recall_tool_output`. A
-//! context-length error lowers the window trusted for the model, and the
-//! request is stubbed to fit and sent once more. The calibration and the
-//! lowered window are kept per model in `app_meta`.
+//! converges on the provider's own counts (an image counts a fixed cost).
+//! Past the soft threshold, older tool results are replaced by stubs in the
+//! request only (the stored rows never change), and each stub names its row
+//! for `recall_tool_output`. A context-length error is answered once per
+//! round: the request is stubbed to fit and sent again, and a window the
+//! provider reported is kept for the model. The calibration and that window
+//! live per model in `app_meta`; a larger prompt that fits raises the window.
 //!
 //! Sub-agents and Direct stages keep `orchestrator::agentic::compact_history`
 //! until B8. The guard shares its size measure (`message_chars`), its soft
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::orchestrator::agentic::{message_chars, CONTEXT_FILL_RATIO_PCT, DEFAULT_CONTEXT_TOKENS};
-use crate::providers::{Effort, LlmContent, LlmMessage, LlmResponse, LlmTool};
+use crate::providers::{Effort, LlmBlock, LlmContent, LlmMessage, LlmResponse, LlmTool};
 
 /// The window (tokens) assumed for a model the catalog doesn't list: low,
 /// since small local models are the ones an overgrown history stops.
@@ -37,6 +38,10 @@ pub const HARD_PCT: u64 = 90;
 pub const TARGET_PCT: u64 = 50;
 /// Characters per token in the estimate, before calibration.
 pub const CHARS_PER_TOKEN: f64 = 3.5;
+/// What one image counts (tokens). Its cost follows the picture's size, not
+/// its base64 length: Anthropic documents width × height / 750, about 1,600
+/// at its default size cap, so this is a conservative constant.
+pub const IMAGE_TOKENS: u64 = 1_600;
 /// The whole rounds at the end of a request that are never stubbed.
 pub const KEEP_ROUNDS: usize = 2;
 /// A result this size or smaller stays whole: its stub would save little.
@@ -48,9 +53,9 @@ const CALIBRATION_WEIGHT: f64 = 0.3;
 /// The range of one reading, so a provider that reports nonsense can't
 /// swing the estimate.
 const CALIBRATION_RANGE: (f64, f64) = (0.25, 4.0);
-/// The lowest window an error without figures lowers a model to.
+/// The lowest window a context-length error can set (tokens).
 const MIN_WINDOW_TOKENS: u64 = 4_096;
-/// A context-length error without figures: the window is taken as this
+/// A context-length error without figures: its retry is sized for this
 /// share (%) of the estimate of the request that failed.
 const UNREPORTED_WINDOW_PCT: u64 = 85;
 
@@ -60,7 +65,29 @@ pub fn fixed_chars(system: &str, tools: &[LlmTool]) -> usize {
     system.len() + serde_json::to_string(tools).map_or(0, |s| s.len())
 }
 
-fn request_chars(fixed_chars: usize, messages: &[LlmMessage]) -> usize { fixed_chars + messages.iter().map(message_chars).sum::<usize>() }
+/// A request's size for the estimate: its chars, images aside, and its images.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Size {
+    chars: usize,
+    images: usize,
+}
+
+fn message_size(m: &LlmMessage) -> Size {
+    match &m.content {
+        LlmContent::Multimodal(blocks) => blocks.iter().fold(Size::default(), |s, b| match b {
+            LlmBlock::Text(t) => Size { chars: s.chars + t.len(), ..s },
+            LlmBlock::Image { .. } => Size { images: s.images + 1, ..s },
+        }),
+        _ => Size { chars: message_chars(m), images: 0 },
+    }
+}
+
+fn request_size(fixed_chars: usize, messages: &[LlmMessage]) -> Size {
+    messages.iter().map(message_size).fold(Size { chars: fixed_chars, images: 0 }, |a, s| Size {
+        chars: a.chars + s.chars,
+        images: a.images + s.images,
+    })
+}
 
 /// How much of a model's window a request may fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +97,8 @@ pub struct ContextBudget {
     /// The catalog doesn't list the model, so `window` is
     /// [`DEFAULT_WINDOW_TOKENS`].
     pub assumed: bool,
+    /// The model id names its window (`[1m]`): it is never lowered.
+    pub fixed_window: bool,
     /// The output the request asks for, kept free of the prompt.
     pub reserve: u64,
     /// The output cap asked for, before the clamp to half the window.
@@ -83,9 +112,12 @@ impl ContextBudget {
     pub fn for_model(window: Option<u64>, max_tokens: u32, effort: Option<Effort>) -> Self {
         let known = window.filter(|w| *w > 0);
         let asked = if max_tokens > 0 { max_tokens } else { crate::orchestrator::agentic::max_tokens_for(effort) };
-        Self { window: 0, assumed: known.is_none(), reserve: 0, asked: u64::from(asked) }
+        Self { window: 0, assumed: known.is_none(), fixed_window: false, reserve: 0, asked: u64::from(asked) }
             .with_window(known.unwrap_or(DEFAULT_WINDOW_TOKENS))
     }
+
+    /// The same budget on a window the model id names, never lowered.
+    pub fn with_fixed_window(self) -> Self { Self { fixed_window: true, ..self } }
 
     /// The same request on another window. The reserve never takes more
     /// than half of it, so a small local window still leaves room to talk.
@@ -105,7 +137,8 @@ impl ContextBudget {
 pub struct Learned {
     /// Real prompt tokens over the chars/3.5 estimate, as a moving average.
     pub calibration: Option<f64>,
-    /// A window lowered by a context-length error (tokens).
+    /// A window below the catalog's that the provider reported in a
+    /// context-length error (tokens), raised when a larger prompt fits.
     pub window: Option<u64>,
     /// The catalog window `window` was lowered from. Once the catalog says
     /// something else (the model's context size was edited in Settings ›
@@ -134,13 +167,22 @@ pub struct Stubbed {
     pub after: u64,
 }
 
-/// A context-length error the guard answered: the window it now trusts
-/// (tokens) and the results it stubbed for the retry.
+/// A context-length error the guard answered: the window the retry was
+/// sized for (tokens), the results it stubbed, and whether what was learned
+/// changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Recovery {
-    pub window: u64,
-    pub lowered: bool,
-    pub results: usize,
+struct Recovery {
+    window: u64,
+    results: usize,
+    learned: bool,
+}
+
+/// What the director does with a failed request: save what the guard
+/// learned, and send the request once more with the Player's line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AfterFailure {
+    pub save: bool,
+    pub retry: Option<String>,
 }
 
 /// One model's guard for one turn.
@@ -151,10 +193,10 @@ pub struct ContextGuard {
     catalog_window: u64,
     learned: Learned,
     calibration: f64,
-    /// The last request answered: its real prompt tokens and its size in chars.
-    anchor: Option<(u64, usize)>,
-    /// The size in chars of the request in flight.
-    in_flight: Option<usize>,
+    /// The last request answered: its real prompt tokens and its size.
+    anchor: Option<(u64, Size)>,
+    /// The size of the request in flight.
+    in_flight: Option<Size>,
     /// This round already retried after a context-length error.
     retried: bool,
 }
@@ -164,7 +206,7 @@ fn clamp_reading(ratio: f64) -> f64 { ratio.clamp(CALIBRATION_RANGE.0, CALIBRATI
 impl ContextGuard {
     pub fn new(budget: ContextBudget, mut learned: Learned) -> Self {
         let catalog_window = budget.window;
-        if learned.lowered_from != Some(catalog_window) {
+        if budget.fixed_window || learned.lowered_from != Some(catalog_window) {
             learned.window = None;
             learned.lowered_from = None;
         }
@@ -183,14 +225,16 @@ impl ContextGuard {
     /// The estimate (tokens) of a request carrying `messages` after
     /// `fixed_chars` of system prompt and tools.
     pub fn estimate(&self, fixed_chars: usize, messages: &[LlmMessage]) -> u64 {
-        self.estimate_chars(request_chars(fixed_chars, messages))
+        self.estimate_size(request_size(fixed_chars, messages))
     }
 
-    fn estimate_chars(&self, chars: usize) -> u64 {
-        let tokens = |c: f64| c / CHARS_PER_TOKEN * self.calibration;
+    fn estimate_size(&self, size: Size) -> u64 {
+        let tokens = |chars: f64, images: f64| chars / CHARS_PER_TOKEN * self.calibration + images * IMAGE_TOKENS as f64;
         let estimate = match self.anchor {
-            Some((real, at)) => real as f64 + tokens(chars as f64 - at as f64),
-            None => tokens(chars as f64),
+            Some((real, at)) => {
+                real as f64 + tokens(size.chars as f64 - at.chars as f64, size.images as f64 - at.images as f64)
+            }
+            None => tokens(size.chars as f64, size.images as f64),
         };
         estimate.max(0.0).round() as u64
     }
@@ -239,67 +283,95 @@ impl ContextGuard {
 
     /// The request about to go out carries `messages`.
     pub fn sent(&mut self, fixed_chars: usize, messages: &[LlmMessage]) {
-        self.in_flight = Some(request_chars(fixed_chars, messages));
+        self.in_flight = Some(request_size(fixed_chars, messages));
     }
 
     /// The answer to the request in flight. Its real prompt size (input,
     /// cache reads and cache writes) anchors the next estimate and updates
-    /// the calibration. `true` when what was learned changed.
+    /// the calibration. A prompt that fit with its answer proves the window
+    /// holds that much, so a lower learned window is raised to it (cleared
+    /// once it reaches the catalog's). `true` when what was learned changed.
     pub fn observed(&mut self, response: &LlmResponse) -> bool {
         self.retried = false;
         let real = response.input_tokens + response.cache_read_tokens + response.cache_creation_tokens;
-        match self.in_flight.take() {
-            Some(chars) => self.reading(real, chars),
-            None => false,
+        let Some(size) = self.in_flight.take() else { return false };
+        let calibrated = self.reading(real, size);
+        let fit = real + response.output_tokens;
+        let raised = real > 0 && self.budget.window < self.catalog_window && fit > self.budget.window;
+        if raised {
+            let window = fit.min(self.catalog_window);
+            self.budget = self.budget.with_window(window);
+            let lower = window < self.catalog_window;
+            self.learned.window = lower.then_some(window);
+            self.learned.lowered_from = lower.then_some(self.catalog_window);
         }
+        calibrated || raised
     }
 
-    /// One real prompt size (tokens) for a request of `chars`. A server that
-    /// reports no usage leaves the estimate as it was.
-    fn reading(&mut self, real: u64, chars: usize) -> bool {
-        if real == 0 || chars == 0 {
+    /// One real prompt size (tokens) for a request of `size`: the next
+    /// estimate's anchor, and a calibration reading unless the request
+    /// carries an image (whose cost says nothing about the tokenizer). A
+    /// server that reports no usage leaves the estimate as it was. `true`
+    /// when the calibration changed.
+    fn reading(&mut self, real: u64, size: Size) -> bool {
+        if real == 0 || size.chars == 0 {
             return false;
         }
-        self.anchor = Some((real, chars));
-        let ratio = clamp_reading(real as f64 / (chars as f64 / CHARS_PER_TOKEN));
+        self.anchor = Some((real, size));
+        if size.images > 0 {
+            return false;
+        }
+        let ratio = clamp_reading(real as f64 / (size.chars as f64 / CHARS_PER_TOKEN));
         self.calibration = self.calibration * (1.0 - CALIBRATION_WEIGHT) + ratio * CALIBRATION_WEIGHT;
         self.learned.calibration = Some(self.calibration);
         true
     }
 
-    /// A request that failed. When the provider said the prompt didn't fit
-    /// and this round hasn't retried yet: the prompt size it reported (if
-    /// any) becomes a reading, the window it reported (or, without one, 85%
-    /// of the estimate of the request it refused) becomes the window trusted
-    /// for the model, and the request is stubbed to fit it with only the
-    /// last round whole. `None` otherwise. With no result stubbed, the same
-    /// request would fail again: the caller then ends the turn as before.
-    pub fn on_overflow(&mut self, error: &AppError, messages: &mut [LlmMessage], fixed_chars: usize, rows: &HashMap<String, i64>) -> Option<Recovery> {
+    /// A failed request. When the provider said the prompt didn't fit and
+    /// this round hasn't retried yet: the prompt size it reported becomes a
+    /// reading; a lower window it reported (at least [`MIN_WINDOW_TOKENS`])
+    /// becomes the model's, unless the id names its window; and the request
+    /// is stubbed to fit, with only the last round whole. With neither
+    /// figure, the retry alone is sized for 85% of the estimate of the
+    /// refused request, and nothing about the window is kept. `None` when the
+    /// error isn't a context-length one or the round already retried.
+    fn on_overflow(&mut self, error: &AppError, messages: &mut [LlmMessage], fixed_chars: usize, rows: &HashMap<String, i64>) -> Option<Recovery> {
         let AppError::Provider { kind, message, .. } = error else { return None };
         if self.retried || kind.is_transient() || !is_context_overflow(message) {
             return None;
         }
         self.retried = true;
-        let chars = match self.in_flight.take() { Some(chars) => chars, None => request_chars(fixed_chars, messages) };
+        let before = self.learned.clone();
+        let size = match self.in_flight.take() { Some(size) => size, None => request_size(fixed_chars, messages) };
         let (prompt, limit) = overflow_figures(message);
         if let Some(prompt) = prompt {
-            self.reading(prompt, chars);
+            self.reading(prompt, size);
         }
         let current = self.budget.window;
-        let window = match limit {
-            Some(limit) if limit < current => limit,
-            // The window is right; the reported prompt corrected the estimate.
-            Some(_) if prompt.is_some() => current,
-            _ => (self.estimate_chars(chars) * UNREPORTED_WINDOW_PCT / 100).max(MIN_WINDOW_TOKENS).min(current),
-        };
-        let lowered = window < current;
-        if lowered {
+        let reported = limit.map(|l| l.max(MIN_WINDOW_TOKENS)).filter(|l| *l < current && !self.budget.fixed_window);
+        if let Some(window) = reported {
             self.budget = self.budget.with_window(window);
             self.learned.window = Some(window);
             self.learned.lowered_from = Some(self.catalog_window);
         }
-        let results = self.stub_to(messages, fixed_chars, rows, self.budget.share(TARGET_PCT), 1);
-        Some(Recovery { window, lowered, results })
+        let retry = if reported.is_some() || prompt.is_some() || self.budget.fixed_window {
+            self.budget
+        } else {
+            self.budget.with_window((self.estimate_size(size) * UNREPORTED_WINDOW_PCT / 100).clamp(MIN_WINDOW_TOKENS.min(current), current))
+        };
+        let results = self.stub_to(messages, fixed_chars, rows, retry.share(TARGET_PCT), 1);
+        Some(Recovery { window: retry.window, results, learned: self.learned != before })
+    }
+
+    /// The Failed arm of a director request: whether to save what was
+    /// learned, and the Player's line when the request goes out once more (a
+    /// context-length error, answered once per round, with something to
+    /// stub). Otherwise the turn ends with the provider's error, as before.
+    pub fn after_failure(&mut self, error: &AppError, messages: &mut [LlmMessage], fixed_chars: usize, rows: &HashMap<String, i64>) -> AfterFailure {
+        match self.on_overflow(error, messages, fixed_chars, rows) {
+            Some(r) => AfterFailure { save: r.learned, retry: (r.results > 0).then(|| self.recovery_notice(&r)) },
+            None => AfterFailure { save: false, retry: None },
+        }
     }
 
     /// The Player's line for a request the guard stubbed.
@@ -307,7 +379,7 @@ impl ContextGuard {
         let window = if self.budget.assumed && self.learned.window.is_none() {
             format!("an assumed {} tokens: the catalog doesn't list this model's window", short(self.budget.window))
         } else if self.learned.window.is_some() {
-            format!("{} tokens, lowered after a prompt this model refused", short(self.budget.window))
+            format!("{} tokens, as this model reported", short(self.budget.window))
         } else {
             format!("{} tokens", short(self.budget.window))
         };
@@ -318,10 +390,8 @@ impl ContextGuard {
         )
     }
 
-    /// The Player's line for a context-length error the guard answered.
-    pub fn recovery_notice(&self, r: &Recovery) -> String {
-        let window = if r.lowered { format!(", its window is now taken as {} tokens", short(r.window)) } else { String::new() };
-        format!("prompt too long for this model{window} — shortened {}, retrying once", earlier_results(r.results))
+    fn recovery_notice(&self, r: &Recovery) -> String {
+        format!("prompt too long for this model — shortened {} to fit {} tokens, retrying once", earlier_results(r.results), short(r.window))
     }
 }
 
@@ -344,23 +414,25 @@ pub fn stub(result: &str, row: Option<i64>) -> String {
 }
 
 /// Whether a provider's error says the prompt doesn't fit the model's
-/// window, in the wordings of the Anthropic API, the OpenAI API and
-/// OpenAI-compatible local servers. An output cap above the model's limit is
-/// another error and doesn't match.
+/// window, by the documented shapes: the Anthropic API's "prompt is too
+/// long" and "exceed context limit" `invalid_request_error`s, the OpenAI
+/// API's `context_length_exceeded` code and its "maximum context length is"
+/// message (which OpenAI-compatible servers reuse), and the llama.cpp
+/// server's `exceed_context_size_error`. An output cap above the model's
+/// limit is another error and doesn't match.
 pub fn is_context_overflow(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    ["prompt is too long", "exceed context limit", "context_length_exceeded", "maximum context length", "context window", "context size", "context length"]
+    ["prompt is too long", "exceed context limit", "context_length_exceeded", "maximum context length is", "exceed_context_size_error"]
         .iter()
         .any(|p| m.contains(p))
 }
 
 static PROMPT_FIGURE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)prompt is too long:\s*(\d+)|context limit:\s*(\d+)|resulted in\s*(\d+)|\((\d+) in the messages|request \((\d+) tokens")
+    Regex::new(r#"(?i)prompt is too long:\s*(\d+)|context limit:\s*(\d+)|resulted in\s*(\d+)|\((\d+) in the messages|"n_prompt_tokens"\s*:\s*(\d+)"#)
         .expect("prompt figure pattern")
 });
 static LIMIT_FIGURE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)>\s*(\d+)|maximum context length is\s*(\d+)|context size \((\d+)|context length of (?:only )?(\d+)")
-        .expect("limit figure pattern")
+    Regex::new(r#"(?i)>\s*(\d+)|maximum context length is\s*(\d+)|"n_ctx"\s*:\s*(\d+)"#).expect("limit figure pattern")
 });
 
 /// The prompt size and the window (tokens) a context-length error reports,
@@ -482,7 +554,7 @@ mod tests {
             messages.extend(round(&[format!("t{i}").as_str()], &[60_000], false));
         }
         // About 103k tokens by the estimate: the guard sees no need to act.
-        assert_eq!(guard.before_round(&mut messages, 0, &rows(6)), None);
+        assert_eq!(guard.before_round(&mut messages, 0, &rows(8)), None);
         guard.sent(0, &messages);
 
         let too_long = provider_error(
@@ -490,38 +562,79 @@ mod tests {
             r#"Anthropic API error 400 Bad Request: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 150000 tokens > 120000 maximum"}}"#,
         );
         let last_round = format!("{:?}", &messages[11..]);
-        let r = guard.on_overflow(&too_long, &mut messages, 0, &rows(6)).expect("recovers the first time");
-        assert_eq!((r.window, r.lowered), (120_000, true));
-        assert!(r.results > 0, "{r:?}");
+        let next = guard.after_failure(&too_long, &mut messages, 0, &rows(8));
+        assert!(next.save, "the reported window is kept");
+        let line = next.retry.expect("retries the first time");
+        assert_eq!(line, "prompt too long for this model — shortened 5 earlier tool results to fit 120k tokens, retrying once");
         assert!(guard.estimate(0, &messages) <= guard.budget().usable() / 2, "fits the lowered window");
         assert_eq!(format!("{:?}", &messages[11..]), last_round, "the newest round stays whole");
-        assert_eq!(guard.learned().window, Some(120_000));
-        assert_eq!(guard.learned().lowered_from, Some(200_000));
-        assert!(guard.recovery_notice(&r).starts_with("prompt too long for this model, its window is now taken as 120k tokens"));
+        assert_eq!((guard.learned().window, guard.learned().lowered_from), (Some(120_000), Some(200_000)));
 
         // Once: the same round failing again ends the turn.
         guard.sent(0, &messages);
-        assert_eq!(guard.on_overflow(&too_long, &mut messages, 0, &rows(6)), None);
+        assert_eq!(guard.after_failure(&too_long, &mut messages, 0, &rows(8)), AfterFailure { save: false, retry: None });
         // An answered round may recover again later.
         assert!(guard.observed(&response(60_000)));
+        messages.extend(round(&["t7"], &[60_000], false));
+        messages.extend(round(&["t8"], &[60_000], false));
         guard.sent(0, &messages);
-        assert!(guard.on_overflow(&too_long, &mut messages, 0, &rows(6)).is_some());
+        assert!(guard.after_failure(&too_long, &mut messages, 0, &rows(8)).retry.is_some());
 
         // Other failures are not context errors, whatever their numbers.
         let mut fresh = ContextGuard::new(budget, Learned::default());
         for e in [
             provider_error(ProviderErrorKind::BadRequest, "max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens"),
+            provider_error(ProviderErrorKind::BadRequest, "tools.3: the context window parameter is invalid"),
             provider_error(ProviderErrorKind::RateLimit, "prompt is too long"),
             AppError::Other("prompt is too long".into()),
         ] {
-            assert_eq!(fresh.on_overflow(&e, &mut messages, 0, &rows(6)), None, "{e}");
+            assert_eq!(fresh.after_failure(&e, &mut messages, 0, &rows(8)), AfterFailure { save: false, retry: None }, "{e}");
         }
 
         // A window lowered from another catalog window no longer applies.
         let learned = guard.learned().clone();
         assert_eq!(ContextGuard::new(budget, learned.clone()).budget().window, 120_000);
-        let edited = ContextGuard::new(ContextBudget::for_model(Some(256_000), 8_000, None), learned);
+        let edited = ContextGuard::new(ContextBudget::for_model(Some(256_000), 8_000, None), learned.clone());
         assert_eq!((edited.budget().window, edited.learned().window), (256_000, None));
+
+        // An id that names its window is never lowered, by the past or by a 400.
+        let fixed = ContextBudget::for_model(Some(200_000), 8_000, None).with_fixed_window();
+        let mut one_m = ContextGuard::new(fixed, learned);
+        assert_eq!((one_m.budget().window, one_m.learned().window), (200_000, None));
+        let mut messages = vec![user("go")];
+        messages.extend(round(&["t1"], &[60_000], false));
+        messages.extend(round(&["t2"], &[60_000], false));
+        one_m.sent(0, &messages);
+        one_m.after_failure(&too_long, &mut messages, 0, &rows(2));
+        assert_eq!((one_m.budget().window, one_m.learned().window), (200_000, None));
+
+        // A reported window is never taken below the floor.
+        let mut tiny = ContextGuard::new(budget, Learned::default());
+        tiny.sent(0, &messages);
+        let small = provider_error(ProviderErrorKind::BadRequest, "prompt is too long: 3000 tokens > 2048 maximum");
+        assert!(tiny.after_failure(&small, &mut messages, 0, &rows(2)).save);
+        assert_eq!(tiny.learned().window, Some(MIN_WINDOW_TOKENS));
+    }
+
+    #[test]
+    fn a_larger_prompt_that_fits_raises_the_learned_window() {
+        let lowered = Learned { calibration: None, window: Some(120_000), lowered_from: Some(200_000) };
+        let mut guard = ContextGuard::new(ContextBudget::for_model(Some(200_000), 8_000, None), lowered);
+        assert_eq!(guard.budget().window, 120_000);
+        let messages = vec![user("go")];
+        // A smaller prompt says nothing about the window.
+        guard.sent(0, &messages);
+        guard.observed(&response(60_000));
+        assert_eq!(guard.learned().window, Some(120_000));
+        // 150k of prompt and 40 of answer fit: the window holds that much.
+        guard.sent(0, &messages);
+        assert!(guard.observed(&response(150_000)));
+        assert_eq!((guard.budget().window, guard.learned().window), (150_040, Some(150_040)));
+        // Up to the catalog's, the lowered window is gone.
+        guard.sent(0, &messages);
+        assert!(guard.observed(&response(199_990)));
+        assert_eq!(guard.budget().window, 200_000);
+        assert_eq!((guard.learned().window, guard.learned().lowered_from), (None, None));
     }
 
     #[test]
@@ -534,66 +647,63 @@ mod tests {
                 Some(200_000),
             ),
             (
-                "This model's maximum context length is 128000 tokens. However, your messages resulted in 130567 tokens.",
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130567 tokens.","code":"context_length_exceeded"}}"#,
                 Some(130_567),
                 Some(128_000),
             ),
-            ("request (9000 tokens) exceeds the available context size (8192 tokens)", Some(9_000), Some(8_192)),
-            ("context length exceeded", None, None),
+            (
+                r#"{"error":{"code":400,"message":"the request exceeds the available context size","type":"exceed_context_size_error","n_prompt_tokens":9000,"n_ctx":8192}}"#,
+                Some(9_000),
+                Some(8_192),
+            ),
+            (r#"{"error":{"code":"context_length_exceeded","message":"Your input is too long for this model."}}"#, None, None),
         ];
         for (message, prompt, limit) in cases {
             assert!(is_context_overflow(message), "{message}");
             assert_eq!(overflow_figures(message), (prompt, limit), "{message}");
         }
+        assert!(!is_context_overflow("the context window parameter is invalid"));
+        assert!(!is_context_overflow("context length must be a positive integer"));
 
-        // Without figures, the window is taken as 85% of what was refused.
-        let budget = ContextBudget::for_model(None, 32_768, None);
-        let mut guard = ContextGuard::new(budget, Learned::default());
+        // Without figures, only the retry is sized for 85% of what was
+        // refused: the window trusted for the model stays as it was.
+        let mut guard = ContextGuard::new(ContextBudget::for_model(None, 32_768, None), Learned::default());
         let mut messages = vec![user("go")];
         for i in 1..=3 {
             messages.extend(round(&[format!("t{i}").as_str()], &[14_000], false));
         }
         guard.sent(0, &messages);
         let sent = guard.estimate(0, &messages);
-        let e = provider_error(ProviderErrorKind::BadRequest, "OpenAI-compat API error 400: context length exceeded");
+        let e = provider_error(ProviderErrorKind::BadRequest, cases[4].0);
         let r = guard.on_overflow(&e, &mut messages, 0, &rows(3)).expect("recovers");
         assert_eq!(r.window, sent * 85 / 100);
-        assert!(r.lowered && r.results > 0, "{r:?}");
+        assert!(r.results > 0 && !r.learned, "{r:?}");
+        assert_eq!((guard.budget().window, guard.learned().window), (DEFAULT_WINDOW_TOKENS, None));
         // The reserve never takes more than half of a small window.
-        assert_eq!(guard.budget().reserve, r.window / 2);
+        assert_eq!(ContextBudget::for_model(Some(8_000), 32_768, None).reserve, 4_000);
     }
 
     #[test]
-    fn calibration_converges() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let db = Db::open(tmp.path()).unwrap();
-        let model = "local-model-q4";
-        let mut guard = ContextGuard::new(ContextBudget::for_model(Some(10_000_000), 4_096, None), load_learned(&db, model));
-        assert_eq!(guard.calibration(), 1.0);
-        // This model's tokenizer counts 1.6x the chars/3.5 estimate.
-        let mut messages = vec![user("explain the module")];
-        let fixed = 2_000;
-        for i in 0..25 {
-            messages.extend(round(&[format!("t{i}").as_str()], &[7_000], false));
-            guard.sent(fixed, &messages);
-            let real = (request_chars(fixed, &messages) as f64 / CHARS_PER_TOKEN * 1.6).round() as u64;
-            assert!(guard.observed(&response(real)));
-            save_learned(&db, model, guard.learned()).unwrap();
-        }
-        assert!((guard.calibration() - 1.6).abs() < 0.01, "{}", guard.calibration());
-        // The next request's estimate lands on the provider's count.
-        messages.extend(round(&["next"], &[7_000], false));
-        let real = request_chars(fixed, &messages) as f64 / CHARS_PER_TOKEN * 1.6;
-        let estimate = guard.estimate(fixed, &messages) as f64;
-        assert!((estimate - real).abs() / real < 0.01, "{estimate} vs {real}");
-
-        // Kept per model: a new turn starts calibrated, another model doesn't.
-        let next_turn = ContextGuard::new(ContextBudget::for_model(Some(10_000_000), 4_096, None), load_learned(&db, model));
-        assert!((next_turn.calibration() - 1.6).abs() < 0.01);
-        assert_eq!(load_learned(&db, "another-model"), Learned::default());
-        // A server that reports no usage leaves the estimate alone.
-        guard.sent(fixed, &messages);
-        assert!(!guard.observed(&response(0)));
+    fn an_image_costs_a_fixed_estimate_and_never_calibrates() {
+        let mut guard = ContextGuard::new(ContextBudget::for_model(Some(200_000), 8_000, None), Learned::default());
+        // A 3 MB screenshot is about 1.6k tokens, not 430k.
+        let screenshot = LlmBlock::Image { media_type: "image/png".into(), data: "A".repeat(3_000_000) };
+        let mut messages = vec![LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::Multimodal(vec![LlmBlock::Text("why does this fail?".into()), screenshot]),
+        }];
+        assert_eq!(guard.estimate(0, &messages), (19.0 / CHARS_PER_TOKEN).round() as u64 + IMAGE_TOKENS);
+        // Its real count anchors the next estimate but is no reading.
+        guard.sent(0, &messages);
+        assert!(!guard.observed(&response(1_650)));
+        assert_eq!((guard.calibration(), guard.learned().calibration), (1.0, None));
+        messages.extend(round(&["t1"], &[7_000], false));
+        assert_eq!(guard.estimate(0, &messages), 1_650 + 2_004);
+        // Nor is a prompt size a context-length error reports for it.
+        guard.sent(0, &messages);
+        let e = provider_error(ProviderErrorKind::BadRequest, "prompt is too long: 250000 tokens > 200000 maximum");
+        guard.after_failure(&e, &mut messages, 0, &rows(1));
+        assert_eq!(guard.learned().calibration, None);
     }
 
     #[test]
