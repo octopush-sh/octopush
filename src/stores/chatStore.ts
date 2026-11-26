@@ -207,7 +207,7 @@ export const EFFORT_MAX_TOKENS: Record<Effort, number> = {
  *    model without effort control (a chat model, or one that thinks only
  *    with a budget).
  *  - Standard: none (`null`), so no effort or thinking setting is sent and
- *    every model keeps its own default, exactly as before presets set effort.
+ *    every model keeps its own default effort and thinking.
  *  - Deep: `max`, which the backend's provider adapters turn into the
  *    highest the model takes (`max`, or `high` where max isn't offered, or a
  *    thinking budget on models that use one).
