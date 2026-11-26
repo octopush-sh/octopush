@@ -130,12 +130,14 @@ Steering becomes fleet-level: one instruction addressed to many agents from Miss
 ALTER TABLE chat_messages ADD COLUMN raw_json TEXT;       -- the round's verbatim blocks + origin model
 ALTER TABLE chat_messages ADD COLUMN tool_use_id TEXT;
 ALTER TABLE chat_messages ADD COLUMN model_view TEXT;     -- the exact capped text the model was given
-ALTER TABLE chat_messages ADD COLUMN context_blocks TEXT; -- @file blocks, out of the user text
+ALTER TABLE chat_messages ADD COLUMN context_blocks TEXT; -- the @ blocks' spans in content (#1150)
 ALTER TABLE chat_messages ADD COLUMN pinned INTEGER;
 ```
 
 - A tool result is capped **once**, when written (`model_view`, sized from the model's window), and replayed byte-for-byte from then on. The full output stays in `content` for recall.
 - Legacy rows render at the fixed settled allowance: a function of the row, never of its age.
+- `context_blocks` is the `@` record (shipped with #1150): one entry per block, `{token, kind, label, tokens, start, end, notIncluded?}`, its span in `content` in UTF-16 units. `content` stays the full text the model received; the UI shows the typed part and a chip per block, and `recall_tool_output {message_id, block}` returns a block whole.
+- **The accepted exception** to "a function of the row, never of its age": a block of 8k characters or more goes out whole in the turn it was attached to and shortened from the next turn on (head + tail within the settled allowance, with its recall id). The shortened form is a pure function of the block, so the change happens once and the row is byte-stable after it; it costs one cache write from that row on, once. Smaller blocks are never shortened. Shortened blocks count against the thread budget at their settled size from their own turn on.
 - So the prefix only grows, and the fresh-to-settled rewrite (audit F7a) disappears by construction.
 - `raw_json` is replayed only to its origin model; after a model switch the round is rebuilt from text and tool uses. `ComposerEstimate` prices the whole prompt at the full input rate, so its figure already covers that miss.
 
@@ -189,12 +191,12 @@ CREATE TABLE IF NOT EXISTS chat_segments (
 | # | Slice | Acceptance and tests |
 |---|---|---|
 | B1 | `context/budget.rs`; guard in `before_round` (mechanical stubs, recall hint); learned window on a 400 | `guard_triggers_at_soft`, `prompt_too_long_lowers_window_and_retries_once`, `calibration_converges`, `keep_tail_never_splits_a_round` |
-| B2 | Columns `raw_json`, `tool_use_id`, `model_view`; `transcript.rs` behind the flag | `transcript_is_prefix_stable_across_turns` (bytes), `legacy_rows_render_without_model_view`, `raw_replayed_only_to_origin_model` |
+| B2 | Columns `raw_json`, `tool_use_id`, `model_view`; `transcript.rs` behind the flag. `context_blocks` (#1150) is the `@` record, and its one deterministic full-to-shortened change is the accepted exception to byte-for-byte replay | `transcript_is_prefix_stable_across_turns` (bytes), `legacy_rows_render_without_model_view`, `raw_replayed_only_to_origin_model` |
 | B3 | Turn-context block; `CachePlan` in the Anthropic adapter; OpenAI cache key | `tools_and_system_bytes_identical_across_turns_modes_and_skills`, `previous_tail_is_always_a_breakpoint`, `never_more_than_four` |
 | B4 | `chat://context`; cache-hit % and meter in the Companion | `cache_hit_pct_from_spend_events`. Verify on a real thread: first-request reads above 90 % |
 | B5 | `chat_segments`, computed summary, `summary` role, `restore_chat_segment` | `originals_never_deleted`, `restore_round_trips_bytes`, `restore_refused_over_window`, `fork_remaps_segments`, `truncate_drops_cut_segments` |
 | B6 | Written summary on the fast tier; auto, opportunistic, manual triggers; `SummaryRow` | `summary_billed_to_origin`, `writer_failure_falls_back`, `stop_leaves_no_segment`, `cold_cache_triggers_early`. FEATURES, changeset |
-| B7 | Recall for any row; `search_history`; pins; `context_blocks` for `@file` | `recall_covers_summarized_rows`, `search_finds_original_text`, `pinned_row_survives` |
+| B7 | Recall for any row; `search_history`; pins. `context_blocks` is the `@` record (shipped with #1150, recall by `message_id` + `block`), shortened once from the turn after it was sent | `recall_covers_summarized_rows`, `search_finds_original_text`, `pinned_row_survives` |
 | B8 | Sub-agents and Direct stages on `budget.rs`; sub-agent originals recallable from `chat_agent_runs` | Compaction tests ported; `subagent_recall_after_compaction` |
 
 ### Risks

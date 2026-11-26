@@ -460,7 +460,7 @@ export interface ChatMessage {
   contextTokens?: number | null;
   /** A user row's `@` context blocks (`SentContextBlock[]` as JSON, #1150);
    *  absent on older rows. */
-  contextJson?: string | null;
+  contextBlocks?: string | null;
 }
 
 /** What one Talk conversation has cost so far, from the ledger (director

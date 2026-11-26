@@ -1,6 +1,6 @@
 /**
  * The `@` context an ask was sent with (#1150), as saved on its row
- * (`chat_messages.context_json`). The row's `content` stays the full text the
+ * (`chat_messages.context_blocks`). The row's `content` stays the full text the
  * model received; each entry says where one block sits in it, so the thread
  * shows the ask as typed with a chip per block, and later turns re-send the
  * blocks abridged (`chat_history.rs`). Offsets are UTF-16 units, the way
@@ -35,12 +35,12 @@ function isBlock(b: unknown): b is SentContextBlock {
 /** A row's blocks, in order, or null when it has none — an older row, or a
  *  record that doesn't fit its content, renders exactly as it was sent. */
 export function parseSentContext(
-  contextJson: string | null | undefined,
+  contextBlocks: string | null | undefined,
   content: string,
 ): SentContextBlock[] | null {
   let parsed: unknown = null;
   try {
-    parsed = contextJson ? JSON.parse(contextJson) : null;
+    parsed = contextBlocks ? JSON.parse(contextBlocks) : null;
   } catch {
     /* not a record: render the row as sent */
   }

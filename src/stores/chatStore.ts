@@ -311,7 +311,7 @@ const EMPTY_CAPS: PendingCap[] = [];
 
 /** A turn's `@` block spans, by thread, until its user row lands: the backend
  *  saves them on the row, and `chat://message-added` doesn't carry them. */
-const pendingContext = new Map<string, { content: string; contextJson: string }>();
+const pendingContext = new Map<string, { content: string; contextBlocks: string }>();
 
 /** The per-turn budget decision. `blocked` → the workspace/global cap is hit and
  *  no override was available (refuse the turn). `overrode` → the cap was hit but a
@@ -675,7 +675,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       };
       const sent = payload.threadId ? pendingContext.get(payload.threadId) : undefined;
       if (payload.role === "user" && sent && sent.content === payload.content) {
-        newMessage.contextJson = sent.contextJson;
+        newMessage.contextBlocks = sent.contextBlocks;
         pendingContext.delete(payload.threadId!);
       }
 
@@ -1244,8 +1244,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
       const attachments = opts.attachments ?? EMPTY_ATTACHMENTS;
-      const contextJson = opts.context?.length ? JSON.stringify(opts.context) : undefined;
-      if (contextJson) pendingContext.set(threadId, { content: opts.userMessage, contextJson });
+      const contextBlocks = opts.context?.length ? JSON.stringify(opts.context) : undefined;
+      const pending = contextBlocks ? { content: opts.userMessage, contextBlocks } : null;
+      if (pending) pendingContext.set(threadId, pending);
       try {
         await ipc.sendChatMessage({
           workspaceId,
@@ -1260,7 +1261,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             : undefined,
           regenerate: opts.regenerate || undefined,
           overrideBudget: opts.overrideBudget || undefined,
-          contextJson,
+          contextBlocks,
         });
       } catch (e) {
         // A backend budget block (e.g. a project cap the client doesn't track, or
@@ -1297,7 +1298,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         return false;
       } finally {
-        if (contextJson) pendingContext.delete(threadId);
+        // Only this turn's own entry: a later turn in the thread may have set its own.
+        if (pending && pendingContext.get(threadId) === pending) pendingContext.delete(threadId);
       }
       return true;
     },
@@ -1776,7 +1778,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // An ask sent with `@` context goes back as typed: its tokens resolve
       // again on send, instead of riding along twice (#1150).
       const msg = (get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES).find((m) => m.id === messageId);
-      const blocks = msg ? parseSentContext(msg.contextJson, sent) : null;
+      const blocks = msg ? parseSentContext(msg.contextBlocks, sent) : null;
       const draft = blocks ? typedText(sent, blocks) : sent;
       set((s) => ({
         threadsByWs: {

@@ -146,13 +146,24 @@ export function ChatCanvas({
   }, [activeThreadId, streaming, messages.length]);
 
   // An ask sent with `@` context is edited as typed, so on resend its tokens
-  // resolve fresh, as from the composer (#1150).
+  // resolve fresh, as from the composer (#1150). While they resolve, the
+  // turn's actions stay disabled, so a second Resend can't race the first.
+  const [resolving, setResolving] = useState(false);
+  const resolvingRef = useRef(false);
   const resendEdit = useCallback(
     async (id: number, text: string, hadContext: boolean) => {
       if (!hadContext) return editAndResend(workspaceId, workspacePath, id, text);
-      const sessions = sessionRefs(useTerminalsStore.getState().getTerminals(workspaceId));
-      const { content, context } = await expandDraft(text, workspacePath, sessions);
-      await editAndResend(workspaceId, workspacePath, id, content, undefined, context);
+      if (resolvingRef.current) return;
+      resolvingRef.current = true;
+      setResolving(true);
+      try {
+        const sessions = sessionRefs(useTerminalsStore.getState().getTerminals(workspaceId));
+        const { content, context } = await expandDraft(text, workspacePath, sessions);
+        await editAndResend(workspaceId, workspacePath, id, content, undefined, context);
+      } finally {
+        resolvingRef.current = false;
+        setResolving(false);
+      }
     },
     [editAndResend, workspaceId, workspacePath],
   );
@@ -329,7 +340,7 @@ export function ChatCanvas({
                 }
                 noCheckpoint={item.message.role === "user" ? skipped.get(item.message.id) : undefined}
                 onFork={item.message.role === "user" && activeThreadId ? handleFork : undefined}
-                disabled={streaming}
+                disabled={streaming || resolving}
               />
             );
           })}
@@ -501,7 +512,7 @@ function MessageRow({
   const [draft, setDraft] = useState("");
 
   // An ask sent with `@` context: what was typed, apart from its blocks.
-  const sent = message.role === "user" ? parseSentContext(message.contextJson, message.content) : null;
+  const sent = message.role === "user" ? parseSentContext(message.contextBlocks, message.content) : null;
   const typed = sent ? typedText(message.content, sent) : message.content;
 
   function handleCopy() {

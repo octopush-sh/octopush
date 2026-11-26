@@ -205,7 +205,7 @@ pub struct ChatRequest {
     /// the user row: the thread shows the ask as typed, and later turns
     /// re-send the blocks abridged.
     #[serde(default)]
-    pub context_json: Option<String>,
+    pub context_blocks: Option<String>,
 }
 
 /// A base64 image attachment sent with a user turn.
@@ -2815,9 +2815,13 @@ impl ChatEngine {
                 &request.user_message,
                 None, None, None, None,
             )?;
-            if let Some(ctx) = request.context_json.as_deref() {
-                if crate::chat_history::context_spans(&request.user_message, ctx).is_some() {
-                    let _ = self.db.lock().set_chat_message_context(id, ctx);
+            // Without the record the ask still runs; it renders and replays
+            // as before, with its blocks whole.
+            if let Some(ctx) = request.context_blocks.as_deref() {
+                if crate::chat_history::context_spans(&request.user_message, ctx).is_none() {
+                    tracing::warn!(message_id = id, "the ask's @ context blocks don't fit its text; not saved");
+                } else if let Err(e) = self.db.lock().set_chat_message_context(id, ctx) {
+                    tracing::warn!(error = %e, message_id = id, "failed to save the ask's @ context blocks");
                 }
             }
         }
@@ -2851,7 +2855,7 @@ impl ChatEngine {
 
         let rows: Vec<HistoryRow<'_>> = history
             .iter()
-            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_json.as_deref() })
+            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_blocks.as_deref() })
             .collect();
         let mut messages: Vec<LlmMessage> = build_history(&rows)
             .into_iter()
@@ -4083,6 +4087,32 @@ mod continuation_tests {
         engine.record_subagent_spend("ws-1", "t-2", "call-2", &unknown);
         let c = db.lock().thread_cost("t-2", None).unwrap();
         assert_eq!((c.unpriced_calls, c.subagents_usd), (1, 0.0));
+    }
+
+    #[test]
+    fn recall_returns_a_context_block_by_message_and_block() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let (thread, ask) = {
+            let d = db.lock();
+            d.insert_project("p", "P", "/tmp/p").unwrap();
+            d.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+            let t = d.create_chat_thread("ws", "T").unwrap();
+            let id = d.insert_chat_message("ws", &t.id, "user", "fix @a.ts\n\na.ts\n```\nx\n```", None, None, None, None).unwrap();
+            d.set_chat_message_context(id, r#"[{"token":"a.ts","kind":"file","label":"a.ts","tokens":4,"start":9,"end":25}]"#).unwrap();
+            (t.id, id)
+        };
+        let recall = |thread: &str, input: serde_json::Value| engine.recall_tool_output(thread, &input);
+        assert_eq!(recall(&thread, serde_json::json!({"message_id": ask, "block": 1})), ("\n\na.ts\n```\nx\n```".to_string(), true));
+        assert_eq!(
+            recall(&thread, serde_json::json!({"message_id": ask, "block": 1, "offset": 2, "limit": 4})).0,
+            "(chars 3-6 of 16)\na.ts"
+        );
+        let (missing, ok) = recall(&thread, serde_json::json!({"message_id": ask, "block": 2}));
+        assert!(!ok && missing.contains("No context block 2"), "{missing}");
+        // Another thread can't reach it.
+        assert!(!recall("another-thread", serde_json::json!({"message_id": ask, "block": 1})).1);
     }
 }
 

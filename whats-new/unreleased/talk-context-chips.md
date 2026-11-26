@@ -1,5 +1,5 @@
 ---
-title: Talk shows @ attachments as chips and sends them once
+title: Talk shows @ attachments as chips under your message
 kind: improvement
 area: app
 steps:
@@ -9,5 +9,5 @@ steps:
     action: none
 ---
 A message with `@` files, ranges, sessions or the diff now shows what you typed, with a chip per
-attachment that opens it in place. Later turns send the attachments abridged instead of whole, so a
-long thread stays within the model's limit.
+attachment that opens it in place. From the next turn on, an attachment of 8,000 characters or more
+is sent shortened, and the model can fetch it whole again when it needs it.

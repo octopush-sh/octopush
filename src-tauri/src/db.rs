@@ -1126,7 +1126,7 @@ impl Db {
         // A user row's `@` context blocks (#1150): `[{token, kind, label,
         // tokens, start, end, notIncluded?}]`, offsets into `content` (UTF-16
         // units). NULL on older rows and on asks with no `@` context.
-        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN context_json TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN context_blocks TEXT")?;
         // A finished sub-agent's conversation, kept so the user can give it
         // more turns or an answer and it CONTINUES instead of starting over.
         self.conn.execute_batch(
@@ -4167,9 +4167,9 @@ impl Db {
             tx.execute(
                 "INSERT INTO chat_messages (workspace_id, thread_id, role, content, model, input_tokens,
                     output_tokens, cost_usd, created_at, cache_read_tokens, cache_creation_tokens, context_tokens,
-                    context_json)
+                    context_blocks)
                  SELECT workspace_id, ?1, role, content, model, input_tokens, output_tokens, cost_usd,
-                    created_at, cache_read_tokens, cache_creation_tokens, context_tokens, context_json
+                    created_at, cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks
                  FROM chat_messages WHERE id = ?2",
                 params![thread.id, old],
             )?;
@@ -4718,7 +4718,7 @@ impl Db {
     pub fn get_chat_message(&self, message_id: i64) -> AppResult<Option<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
-                    cache_read_tokens, cache_creation_tokens, context_tokens, context_json
+                    cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks
              FROM chat_messages WHERE id = ?1",
         )?;
         let row = stmt
@@ -4732,7 +4732,7 @@ impl Db {
                     cache_read_tokens: r.get(9)?,
                     cache_creation_tokens: r.get(10)?,
                     context_tokens: r.get(11)?,
-                    context_json: r.get(12)?,
+                    context_blocks: r.get(12)?,
                     input_tokens: r.get(5)?,
                     output_tokens: r.get(6)?,
                     cost_usd: r.get(7)?,
@@ -4763,8 +4763,8 @@ impl Db {
         let row = self
             .conn
             .query_row(
-                "SELECT content, context_json FROM chat_messages
-                 WHERE id = ?1 AND thread_id = ?2 AND role = 'user' AND context_json IS NOT NULL",
+                "SELECT content, context_blocks FROM chat_messages
+                 WHERE id = ?1 AND thread_id = ?2 AND role = 'user' AND context_blocks IS NOT NULL",
                 params![message_id, thread_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -4773,10 +4773,10 @@ impl Db {
     }
 
     /// Record where a just-sent ask's `@` context blocks sit in its content.
-    pub fn set_chat_message_context(&self, message_id: i64, context_json: &str) -> AppResult<()> {
+    pub fn set_chat_message_context(&self, message_id: i64, context_blocks: &str) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE chat_messages SET context_json = ?2 WHERE id = ?1",
-            params![message_id, context_json],
+            "UPDATE chat_messages SET context_blocks = ?2 WHERE id = ?1",
+            params![message_id, context_blocks],
         )?;
         Ok(())
     }
@@ -5273,7 +5273,7 @@ impl Db {
     pub fn list_chat_messages(&self, thread_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
-                    cache_read_tokens, cache_creation_tokens, context_tokens, context_json
+                    cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks
              FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
@@ -5290,7 +5290,7 @@ impl Db {
                 cache_read_tokens: r.get(9)?,
                 cache_creation_tokens: r.get(10)?,
                 context_tokens: r.get(11)?,
-                context_json: r.get(12)?,
+                context_blocks: r.get(12)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -8312,7 +8312,7 @@ pub struct ChatMessageRow {
     pub context_tokens: Option<i64>,
     /// A user row's `@` context blocks (#1150); NULL renders and replays as
     /// before.
-    pub context_json: Option<String>,
+    pub context_blocks: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

@@ -280,13 +280,13 @@ describe("ChatMessage — an ask sent with @ context (#1150)", () => {
   const a = `\n\nsrc/a.ts\n\`\`\`\n${Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n")}\n\`\`\``;
   const env = "\n\n.env _(not included: possible secret)_";
   const content = ask + a + env;
-  const contextJson = JSON.stringify([
+  const contextBlocks = JSON.stringify([
     { token: "src/a.ts", kind: "file", label: "a.ts", tokens: 1234, start: ask.length, end: ask.length + a.length },
     { token: ".env", kind: "file", label: ".env", tokens: 9, start: ask.length + a.length, end: content.length, notIncluded: "possible secret" },
   ]);
 
   it("reads as typed, with chips that open a block in place", () => {
-    const { container } = render(<ChatMessage message={{ role: "user", content, contextJson }} />);
+    const { container } = render(<ChatMessage message={{ role: "user", content, contextBlocks }} />);
     expect(screen.getByText(ask)).toBeInTheDocument();
     expect(container.textContent).not.toContain("line 3");
     const chip = screen.getByRole("button", { name: /a\.ts/ });
@@ -310,7 +310,7 @@ describe("ChatMessage — an ask sent with @ context (#1150)", () => {
 
   it("renders a row without a record, or with one that doesn't fit, as today", () => {
     for (const record of [undefined, '[{"start": 0, "end": 99999}]']) {
-      const { container, unmount } = render(<ChatMessage message={{ role: "user", content, contextJson: record }} />);
+      const { container, unmount } = render(<ChatMessage message={{ role: "user", content, contextBlocks: record }} />);
       expect(container.querySelector("[data-role='user'] .whitespace-pre-wrap")?.textContent).toBe(content);
       expect(screen.queryByRole("group", { name: "Context sent with this message" })).toBeNull();
       unmount();

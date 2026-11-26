@@ -22,7 +22,7 @@ interface MessageProps {
   /** When the turn was sent (ISO). A user turn shows it in its header. */
   createdAt?: string | null;
   /** A user turn's `@` context blocks (#1150): shown as chips under the ask. */
-  contextJson?: string | null;
+  contextBlocks?: string | null;
 }
 
 /** Turn times are UI copy, so they are English whatever the system locale
@@ -148,7 +148,7 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
     const time = turnTime(message.createdAt);
     // An ask sent with `@` context reads as typed, its blocks as chips under
     // it; a row without a record of them renders exactly as it was sent.
-    const sent = parseSentContext(message.contextJson, content);
+    const sent = parseSentContext(message.contextBlocks, content);
     const typed = sent ? typedText(content, sent) : content;
     return (
       <article

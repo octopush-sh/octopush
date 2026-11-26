@@ -118,11 +118,19 @@ const TOOL_INPUT_MAX: usize = 600;
 /// A pure function of the rows, so the same thread state always renders the
 /// same prefix.
 pub fn plan_tool_history(rows: &[(usize, usize)]) -> Vec<usize> {
+    plan_tool_history_with(rows, 0)
+}
+
+/// [`plan_tool_history`] with `fixed` settled chars the thread also re-sends
+/// (its shortened `@` context blocks) counted against the same budget. They
+/// are never stubbed themselves; they make the oldest tool rows collapse
+/// sooner. `fixed` only grows as rows are appended, so the plan stays monotone.
+pub fn plan_tool_history_with(rows: &[(usize, usize)], fixed: usize) -> Vec<usize> {
     let mut plan: Vec<usize> = rows
         .iter()
         .map(|&(_, len)| len.min(TOOL_RESULT_SETTLED))
         .collect();
-    let settled_total: usize = plan.iter().sum();
+    let settled_total: usize = plan.iter().sum::<usize>() + fixed;
     if settled_total > TOOL_HISTORY_TOTAL_BUDGET {
         let overflow = settled_total - TOOL_HISTORY_TOTAL_BUDGET;
         let target = overflow.div_ceil(TOOL_HISTORY_COLLAPSE_BLOCK) * TOOL_HISTORY_COLLAPSE_BLOCK;
@@ -216,7 +224,7 @@ pub struct HistoryRow<'a> {
     pub id: i64,
     pub role: &'a str,
     pub content: &'a str,
-    /// A user row's `@` context spans (`chat_messages.context_json`, #1150).
+    /// A user row's `@` context spans (`chat_messages.context_blocks`, #1150).
     pub context: Option<&'a str>,
 }
 
@@ -252,8 +260,8 @@ fn utf16_to_bytes(s: &str, offsets: &[usize]) -> Option<Vec<usize>> {
 /// Where a user row's `@` context blocks sit in its content, as byte spans
 /// in order. `None` for a missing, malformed or out-of-range record, which
 /// then renders and replays as an ordinary row.
-pub fn context_spans(content: &str, context_json: &str) -> Option<Vec<(usize, usize)>> {
-    let spans: Vec<ContextSpan> = serde_json::from_str(context_json).ok()?;
+pub fn context_spans(content: &str, context_blocks: &str) -> Option<Vec<(usize, usize)>> {
+    let spans: Vec<ContextSpan> = serde_json::from_str(context_blocks).ok()?;
     if spans.is_empty() {
         return None;
     }
@@ -264,24 +272,44 @@ pub fn context_spans(content: &str, context_json: &str) -> Option<Vec<(usize, us
 
 /// The full text of block `block` (1-based) of a user row, for
 /// `recall_tool_output`.
-pub fn context_block<'a>(content: &'a str, context_json: &str, block: usize) -> Option<&'a str> {
-    let (start, end) = *context_spans(content, context_json)?.get(block.checked_sub(1)?)?;
+pub fn context_block<'a>(content: &'a str, context_blocks: &str, block: usize) -> Option<&'a str> {
+    let (start, end) = *context_spans(content, context_blocks)?.get(block.checked_sub(1)?)?;
     Some(&content[start..end])
 }
 
-/// A user row as later turns re-send it: the typed text whole, each `@`
-/// block settled like a tool result (head + tail within the settled
-/// allowance) with the recall id that brings it back.
-fn abridge_context(id: i64, content: &str, context_json: &str) -> String {
-    let Some(spans) = context_spans(content, context_json) else {
+/// The smallest `@` block that is ever shortened; anything under it is
+/// re-sent whole on every turn.
+pub const CONTEXT_BLOCK_SHORTEN_MIN: usize = 8_000;
+
+/// Chars a row's shortened `@` blocks count against the thread-wide tool
+/// budget, in every turn including their own, so the count doesn't move
+/// when they shorten.
+fn shortened_context_len(content: &str, context_blocks: &str) -> usize {
+    context_spans(content, context_blocks).map_or(0, |spans| {
+        spans.iter().filter(|&&(s, e)| e - s >= CONTEXT_BLOCK_SHORTEN_MIN).count() * TOOL_RESULT_SETTLED
+    })
+}
+
+/// A user row as later turns re-send it: the typed text whole, and each `@`
+/// block of [`CONTEXT_BLOCK_SHORTEN_MIN`] or more shortened to head + tail
+/// within the settled allowance, with the recall id that brings it back.
+/// A pure function of the row, so once shortened a block is byte-stable:
+/// the one full-to-shortened change happens the turn after it was sent.
+fn abridge_context(id: i64, content: &str, context_blocks: &str) -> String {
+    let Some(spans) = context_spans(content, context_blocks) else {
         return content.to_string();
     };
     let mut out = String::new();
     let mut at = 0;
     for (n, &(start, end)) in spans.iter().enumerate() {
         out.push_str(&content[at..start]);
-        let hint = format!(" — call recall_tool_output with message_id {id} and block {} for the full block", n + 1);
-        out.push_str(&excerpt_head_tail(&content[start..end], TOOL_RESULT_SETTLED, &hint));
+        let block = &content[start..end];
+        if block.len() >= CONTEXT_BLOCK_SHORTEN_MIN {
+            let hint = format!(" — call recall_tool_output with message_id {id} and block {} for the full block", n + 1);
+            out.push_str(&excerpt_head_tail(block, TOOL_RESULT_SETTLED, &hint));
+        } else {
+            out.push_str(block);
+        }
         at = end;
     }
     out.push_str(&content[at..]);
@@ -368,12 +396,16 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
             _ => {}
         }
     }
+    let mut shortened = 0usize;
     for (i, row) in rows.iter().enumerate() {
         if row.role == "tool" {
             tool_plan_input.push((ages[i], tool_len(row.content)));
         }
+        if let (Some(ctx), "user") = (row.context, row.role) {
+            shortened += shortened_context_len(row.content, ctx);
+        }
     }
-    let plan = plan_tool_history(&tool_plan_input);
+    let plan = plan_tool_history_with(&tool_plan_input, shortened);
     let mut plan_iter = plan.into_iter();
     // The ask being answered goes out whole; an earlier one's `@` blocks
     // settle from the next turn on, so they aren't re-sent every turn.
@@ -716,23 +748,47 @@ mod tests {
     fn at_file_blocks_abridged_after_one_turn() {
         let blocks: Vec<String> = (0..10).map(|n| format!("\n\nsrc/f{n}.ts\n```\n{}\n```", "x".repeat(60_000))).collect();
         let (content, ctx) = ask_with_blocks("fix the null check", &blocks);
-        let ask = |id| HistoryRow { id, role: "user", content: &content, context: Some(&ctx) };
+        let ask = HistoryRow { id: 1, role: "user", content: &content, context: Some(&ctx) };
+        let row = |id: i64, role: &'static str, content: &'static str| HistoryRow { id, role, content, context: None };
         // The turn it was attached to: every block goes out whole.
-        let now = build_history(&[ask(1)]);
-        assert_eq!(now[0].text, content);
-        // The next turn: the typed text is whole, each block settles to its
+        assert_eq!(build_history(&[ask])[0].text, content);
+        // The next turn: the typed text is whole, each block shortened to its
         // head and tail with the id that recalls it.
-        let rows = [ask(1), HistoryRow { id: 2, role: "assistant", content: "Fixed.", context: None }, HistoryRow { id: 3, role: "user", content: "thanks", context: None }];
-        let later = build_history(&rows);
-        assert!(later[0].text.starts_with("fix the null check\n\nsrc/f0.ts\n```\n"), "{}", &later[0].text[..80]);
-        assert!(later[0].text.len() < 10 * (TOOL_RESULT_SETTLED + 200), "{}", later[0].text.len());
-        assert!(later[0].text.contains("call recall_tool_output with message_id 1 and block 1 for the full block"));
-        assert!(later[0].text.contains("message_id 1 and block 10 for"));
-        assert!(later[0].text.ends_with("\n```"));
-        // A block under the allowance (a "not included" note) stays whole.
-        let (small, small_ctx) = ask_with_blocks("look", &["\n\n@.env _(not included: possible secret)_".to_string()]);
-        let rows = [HistoryRow { id: 1, role: "user", content: &small, context: Some(&small_ctx) }, HistoryRow { id: 2, role: "user", content: "next", context: None }];
+        let next = build_history(&[ask, row(2, "assistant", "Fixed."), row(3, "user", "thanks")]);
+        let shortened = &next[0].text;
+        assert!(shortened.starts_with("fix the null check\n\nsrc/f0.ts\n```\n"), "{}", &shortened[..80]);
+        assert!(shortened.len() < 10 * (TOOL_RESULT_SETTLED + 200), "{}", shortened.len());
+        assert!(shortened.contains("call recall_tool_output with message_id 1 and block 1 for the full block"));
+        assert!(shortened.contains("message_id 1 and block 10 for"));
+        assert!(shortened.ends_with("\n```"));
+        // Once: two turns on, the same bytes.
+        let later = [ask, row(2, "assistant", "Fixed."), row(3, "user", "thanks"), row(4, "assistant", "Sure."), row(5, "user", "bye")];
+        assert_eq!(&build_history(&later)[0].text, shortened);
+        // A block under CONTEXT_BLOCK_SHORTEN_MIN is re-sent whole every turn.
+        let (small, small_ctx) = ask_with_blocks("look", &[format!("\n\na.ts\n```\n{}\n```", "y".repeat(7_000))]);
+        let rows = [HistoryRow { id: 1, role: "user", content: &small, context: Some(&small_ctx) }, row(2, "user", "next")];
         assert_eq!(build_history(&rows)[0].text, format!("{small}\n\nnext"));
+    }
+
+    #[test]
+    fn shortened_blocks_count_toward_the_thread_budget() {
+        // 52 settled tool rows (78k) fit the 80k budget on their own; two
+        // shortened blocks (3k) tip it over, so the oldest tool rows stub.
+        let tools = vec![(5, 5_000); 52];
+        assert!(plan_tool_history_with(&tools, 0).iter().all(|&g| g == TOOL_RESULT_SETTLED));
+        assert_eq!(plan_tool_history_with(&tools, 2 * TOOL_RESULT_SETTLED)[0], TOOL_HISTORY_STUB);
+        // build_history counts them from their own turn on.
+        let big = "z".repeat(CONTEXT_BLOCK_SHORTEN_MIN);
+        let (content, ctx) = ask_with_blocks("look", &[big.clone(), big]);
+        let outputs: Vec<String> = (0..52).map(|i| tool_row(i, "run_command", &"o".repeat(5_000))).collect();
+        let mut rows = vec![HistoryRow { id: 0, role: "user", content: "start", context: None }];
+        rows.extend(outputs.iter().enumerate().map(|(i, t)| HistoryRow { id: i as i64 + 1, role: "tool", content: t, context: None }));
+        rows.push(HistoryRow { id: 99, role: "assistant", content: "ok", context: None });
+        rows.push(HistoryRow { id: 100, role: "user", content: &content, context: Some(&ctx) });
+        let with_blocks = build_history(&rows)[1].text.len();
+        rows.last_mut().unwrap().context = None;
+        let without = build_history(&rows)[1].text.len();
+        assert!(with_blocks < without, "{with_blocks} vs {without}");
     }
 
     #[test]
@@ -762,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn old_rows_without_context_json_build_history_unchanged() {
+    fn old_rows_without_context_blocks_build_history_unchanged() {
         // An old row holds the same text, blocks and all, with no record of
         // them: it replays verbatim, now and on every later turn, as before.
         let (content, _) = ask_with_blocks("fix it", &[format!("\n\nsrc/a.ts\n```\n{}\n```", "x".repeat(9_000))]);
