@@ -168,6 +168,23 @@ export interface PendingApproval {
   secret?: boolean;
   /** The command also stages, so the scan read uncommitted changes. */
   coversUncommitted?: boolean;
+  /** What the card asks about when it isn't a shell command (#1147): an MCP
+   *  tool call, or a file tool reading or writing outside the workspace
+   *  (`command` is then the path, and there is no "don't ask again"). */
+  kind?: ApprovalKind;
+  /** The path is a well-known credentials location: the safe answer leads. */
+  sensitive?: boolean;
+}
+
+export type ApprovalKind = "mcp" | "read" | "write";
+
+/** The card fields a request carries beyond its command and reason. */
+function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean }) {
+  return {
+    ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
+    ...(c.kind ? { kind: c.kind } : {}),
+    ...(c.sensitive ? { sensitive: true } : {}),
+  };
 }
 
 /** A `$`-direct command the secret guard refused (#819): the confirm shows
@@ -757,7 +774,7 @@ async function rehydrateApprovals(workspaceId: string, threadId: string): Promis
           threadId: c.threadId,
           command: c.command,
           reason: c.reason,
-          ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
+          ...approvalMarks(c),
         }));
       if (fresh.length === 0) return {};
       return { pendingApprovalsByWs: { ...s.pendingApprovalsByWs, [workspaceId]: [...cur, ...fresh] } };
@@ -1153,6 +1170,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     reason: string;
     secret?: boolean;
     coversUncommitted?: boolean;
+    kind?: ApprovalKind;
+    sensitive?: boolean;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
@@ -1173,7 +1192,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       typeof document !== "undefined" &&
       document.hasFocus();
     useAttentionStore.getState().raiseApproval(p.workspaceId, (waiting[0] ?? p).command, !looking);
-    notifyApprovalWaiting(p.workspaceId, { secret: p.secret === true });
+    notifyApprovalWaiting(p.workspaceId, { secret: p.secret === true, kind: p.kind });
     set((s) => {
       const cur = s.pendingApprovalsByWs[p.workspaceId] ?? EMPTY_APPROVALS;
       if (cur.some((a) => a.callId === p.callId)) return {};
@@ -1187,7 +1206,7 @@ export const useChatStore = create<ChatState>((set, get) => {
               threadId: p.threadId,
               command: p.command,
               reason: p.reason,
-              ...(p.secret ? { secret: true, coversUncommitted: p.coversUncommitted === true } : {}),
+              ...approvalMarks(p),
             },
           ],
         },

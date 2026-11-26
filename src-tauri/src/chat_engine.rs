@@ -29,6 +29,7 @@ use crate::provider_router::ProviderRouter;
 use crate::orchestrator::agentic::{
     compute_throttle, resume_messages_for_answered_block, resume_messages_for_continuation, throttle_notice, BlockedTranscript,
 };
+use crate::talk_guard::{CardKind, ToolCard};
 use crate::token_engine;
 use parking_lot::Mutex;
 use reqwest::Client;
@@ -974,6 +975,13 @@ pub struct ApprovalRequestEvent {
     /// The command also stages, so the scan read uncommitted changes.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub covers_uncommitted: bool,
+    /// What it asks about when it isn't a shell command (`talk_guard`,
+    /// #1147); `command` is then the MCP call or the path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<CardKind>,
+    /// The path is a well-known credentials location: the safe answer leads.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -985,6 +993,8 @@ pub struct ApprovalWait {
     pub thread_id: String,
     /// The secret guard's card (a commit or push), not a flagged command.
     pub secret: bool,
+    /// What the card asks about when it isn't a command (#1147).
+    pub kind: Option<CardKind>,
     /// When the card was raised (ms): the FIFO key.
     pub since_ms: i64,
 }
@@ -1088,6 +1098,7 @@ impl ApprovalBroker {
                         workspace_id: p.request.workspace_id.clone(),
                         thread_id: p.request.thread_id.clone(),
                         secret: p.request.secret,
+                        kind: p.request.kind,
                         since_ms: p.since_ms,
                     },
                 )
@@ -1123,9 +1134,34 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None).await;
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None).await;
         self.record(thread_id, decision, false);
         decision
+    }
+
+    /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
+    /// thread's grant answers like a command, or a file outside the
+    /// workspace, which asks every time and whose approval grants nothing.
+    pub async fn await_card(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        card: ToolCard,
+    ) -> ApprovalDecision {
+        if self.grant_answers(thread_id, Some(card.kind)) {
+            return ApprovalDecision::Approve;
+        }
+        let marks = Some((card.kind, card.sensitive));
+        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks).await;
+        self.record(thread_id, decision, !card.kind.grantable())
+    }
+
+    /// Whether the thread's "don't ask again" answers a card of `kind` unseen:
+    /// a command's (`None`) or an MCP call's, never a file outside.
+    pub(crate) fn grant_answers(&self, thread_id: &str, kind: Option<CardKind>) -> bool {
+        kind.is_none_or(CardKind::grantable) && self.auto_approve.lock().contains(thread_id)
     }
 
     /// Ask about a command the secret guard stopped (#819). Unlike
@@ -1143,12 +1179,13 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted))
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None)
             .await;
         self.record(thread_id, decision, true)
     }
 
-    /// Keep a "don't ask again" grant, except from a secret card, whose
+    /// Keep a "don't ask again" grant, except from a card that grants nothing
+    /// (`secret`: the secret card, a file outside the workspace), whose
     /// approval reads as a plain one. Returns the decision to act on.
     pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
         match decision {
@@ -1169,7 +1206,8 @@ impl ApprovalBroker {
     }
 
     /// Emit the card and wait for its answer. `secret` is `Some(covers
-    /// uncommitted)` for the secret guard's card.
+    /// uncommitted)` for the secret guard's card, `card` the kind and
+    /// sensitivity of a `talk_guard` card.
     #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
@@ -1180,6 +1218,7 @@ impl ApprovalBroker {
         command: &str,
         reason: &str,
         secret: Option<bool>,
+        card: Option<(CardKind, bool)>,
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1192,6 +1231,8 @@ impl ApprovalBroker {
             reason: reason.to_string(),
             secret: secret.is_some(),
             covers_uncommitted: secret.unwrap_or(false),
+            kind: card.map(|(k, _)| k),
+            sensitive: card.is_some_and(|(_, s)| s),
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -1209,6 +1250,30 @@ impl ApprovalBroker {
         });
         crate::fleet_status::refresh_later(app);
         decision
+    }
+}
+
+/// Ask about `card` and, once it is approved, check the call again (#1147):
+/// it runs only if what it reaches is still what the card showed. A link
+/// that changed while the card waited asks again, about where it now leads;
+/// a target that is now inside runs. `Some` is the denial for the model.
+pub(crate) async fn guard_card<F, Fut>(
+    mut card: ToolCard,
+    recheck: impl Fn() -> Option<ToolCard>,
+    ask: F,
+) -> Option<String>
+where
+    F: Fn(ToolCard) -> Fut,
+    Fut: std::future::Future<Output = ApprovalDecision>,
+{
+    loop {
+        if ask(card.clone()).await == ApprovalDecision::Deny {
+            return Some(card.denial);
+        }
+        match recheck() {
+            Some(next) if next != card => card = next,
+            _ => return None,
+        }
     }
 }
 
@@ -3675,8 +3740,9 @@ impl ChatEngine {
         // a hung server can't freeze the turn (`discover_mcp_tools`). Servers
         // the user switched off in this conversation (Companion "can use")
         // are left out and never started for it; the same path as
-        // sub-agents'. What it offers is fixed for the turn.
-        {
+        // sub-agents'. What it offers is fixed for the turn. Any MCP tool it
+        // didn't discover with `readOnlyHint` asks first (#1147).
+        let mcp_read_only: std::collections::HashSet<String> = {
             let discovered = discover_thread_mcp_tools(
                 Arc::clone(&self.mcp),
                 &self.db,
@@ -3691,7 +3757,13 @@ impl ChatEngine {
             // gives the same tool bytes on every turn, so the provider's
             // prompt cache, which starts at the tool list, survives.
             tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
-        }
+            discovered.into_iter().filter(|t| t.read_only).map(|t| t.namespaced).collect()
+        };
+        // Where the file tools may go without asking (#1147). A sandboxed
+        // mission's own sandbox refuses a write outside the workspace.
+        let main_checkout = crate::talk_guard::project_root(&self.db, &request.workspace_id);
+        let reach = crate::talk_guard::Reach::of_workspace(&workspace_path, main_checkout.as_deref());
+        let writes_confined = sandbox_roots.is_some();
 
         let mut usage = TurnUsage::default();
 
@@ -4079,13 +4151,23 @@ impl ChatEngine {
                     u.input.clone()
                 };
 
-                // ── Approval gate (agent run_command only) ────────────
+                // ── Approval gate ─────────────────────────────────────
+                // An MCP write and a file tool reaching outside the workspace
+                // ask first (#1147); a server switched off here is refused
+                // below without asking.
+                let mut denied: Option<String> = None;
+                let mcp_off = crate::mcp::is_mcp_tool(&u.name)
+                    && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
+                let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
+                if let Some(card) = (!(mcp_off || is_agent || u.name == RECALL_TOOL_NAME)).then(&check).flatten() {
+                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                    denied = guard_card(card, &check, ask).await;
+                }
                 // A command flagged destructive pauses for the user's OK before
                 // it runs. User-typed `$` commands meet only the secret guard.
                 // A denial skips execution and tells the model the user
                 // declined. The secret guard asks first (#819): a thread's
                 // "don't ask again" covers the destructive check, never it.
-                let mut denied: Option<String> = None;
                 if u.name == "run_command" {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     denied = guard_agent_command(
@@ -5369,12 +5451,73 @@ mod tests {
     fn approval_event_marks_a_secret_card_only_when_it_is_one() {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
-            command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted,
+            command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
+        assert!(plain.get("kind").is_none() && plain.get("sensitive").is_none());
         let s = serde_json::to_value(ev(true, true)).unwrap();
         assert_eq!((s["secret"].as_bool(), s["coversUncommitted"].as_bool()), (Some(true), Some(true)));
+        // A `talk_guard` card names its kind, and a credentials location says so.
+        let r = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Read), sensitive: true, ..ev(false, false) }).unwrap();
+        assert_eq!((r["kind"].as_str(), r["sensitive"].as_bool()), (Some("read"), Some(true)));
+    }
+
+    #[tokio::test]
+    async fn guard_card_checks_again_after_the_card_and_asks_about_a_changed_target() {
+        let card = |shown: &str| ToolCard {
+            kind: CardKind::Read,
+            shown: shown.into(),
+            reason: "reads a file outside the workspace".into(),
+            denial: format!("declined {shown}"),
+            sensitive: false,
+        };
+        // Approved, then a link moved: it asks about where it now leads.
+        let asked = Mutex::new(Vec::<String>::new());
+        let approve = |c: ToolCard| {
+            asked.lock().push(c.shown);
+            std::future::ready(ApprovalDecision::Approve)
+        };
+        assert_eq!(guard_card(card("~/a"), || Some(card("~/b")), approve).await, None);
+        assert_eq!(*asked.lock(), ["~/a", "~/b"]);
+        let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
+        assert_eq!(guard_card(card("~/a"), || Some(card("~/b")), deny).await, Some("declined ~/a".to_string()));
+        // Approved, and the target is now inside: it runs.
+        assert_eq!(guard_card(card("~/a"), || None, |_: ToolCard| std::future::ready(ApprovalDecision::Approve)).await, None);
+    }
+
+    /// The guard is only as good as its call sites: the director's loop and
+    /// the sub-agent gate must ask `talk_guard` and check again through
+    /// `guard_card` before a tool runs (#1147). An `AppHandle` can't be built
+    /// in a test, so this reads the two call sites in the source.
+    #[test]
+    fn the_director_loop_and_the_subagent_gate_call_the_guard() {
+        let engine = include_str!("chat_engine.rs");
+        let from = engine.find("// \u{2500}\u{2500} Approval gate").expect("the director's approval gate");
+        let to = from + engine[from..].find("execute_tool(&workspace_path, &u.name").expect("the director runs the tool after it");
+        let gate = &engine[from..to];
+        assert!(gate.contains("talk_guard::director_card(") && gate.contains("guard_card(card, &check"), "{gate}");
+        let agents = include_str!("chat_agents.rs");
+        let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
+        let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
+        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "guard_card(card, &check"] {
+            assert!(body.contains(call), "the sub-agent gate calls {call}");
+        }
+    }
+
+    #[test]
+    fn outside_write_never_auto_approved() {
+        let broker = ApprovalBroker::default();
+        // A thread's "don't ask again" answers its next command and MCP call ...
+        assert_eq!(broker.record("t", ApprovalDecision::ApproveAlways, false), ApprovalDecision::ApproveAlways);
+        assert!(broker.grant_answers("t", None) && broker.grant_answers("t", Some(CardKind::Mcp)));
+        // ... never a file outside the workspace, nor another thread's card.
+        assert!(!broker.grant_answers("t", Some(CardKind::Write)) && !broker.grant_answers("t", Some(CardKind::Read)));
+        assert!(!broker.grant_answers("other", None));
+        // "Always" on a file card acts as one approval and grants nothing.
+        let fresh = ApprovalBroker::default();
+        assert_eq!(fresh.record("u", ApprovalDecision::ApproveAlways, !CardKind::Write.grantable()), ApprovalDecision::Approve);
+        assert!(!fresh.auto_approves("u"));
     }
 
     #[test]
@@ -5574,6 +5717,8 @@ mod tests {
             reason: "rewrites published history".into(),
             secret: false,
             covers_uncommitted: false,
+            kind: None,
+            sensitive: false,
         }
     }
 

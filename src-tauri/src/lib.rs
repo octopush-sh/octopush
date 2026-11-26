@@ -45,6 +45,7 @@ pub mod skills;
 mod state;
 pub mod sync;
 pub mod talk_checkpoints;
+pub mod talk_guard;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
