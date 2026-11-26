@@ -312,6 +312,9 @@ impl AgentRunner for ApiRunner {
         // literal `/slug` the agent would have to guess at — resolved here, at
         // the moment this role actually runs.
         system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
+        // Its tool results come marked untrusted, as Talk's do (#1147). Last,
+        // after the repo's conventions and skills, which are repo content.
+        system.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
         // An answered ask_director block CONTINUES its saved conversation —
         // the exploration that led to the question is not re-run or re-paid.
         // The director's decisions (already formatted into `feedback`) arrive
