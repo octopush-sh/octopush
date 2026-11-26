@@ -4192,7 +4192,7 @@ impl Db {
             .query_row("SELECT thread_id FROM chat_messages WHERE id = ?1", params![message_id], |r| r.get(0))
             .optional()?;
         if owner.flatten().as_deref() != Some(thread_id) {
-            return Err(AppError::Other(
+            return Err(crate::error::AppError::Other(
                 "That message isn't part of this conversation, so nothing was deleted.".into(),
             ));
         }
