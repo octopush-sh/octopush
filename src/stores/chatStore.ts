@@ -1021,8 +1021,9 @@ export const useChatStore = create<ChatState>((set, get) => {
     answeredApprovals.delete(p.callId);
     // The card reaches the user: the workspace's needs-you flag (chiming
     // unless they are looking at this conversation), and a native
-    // notification while Octopush is in the background. Raised before the
-    // card lands, so the store sync below finds it raised and stays quiet.
+    // notification, which always fires (a locked screen looks focused; see
+    // `approvalNotifications.ts`). Raised before the card lands, so the
+    // store sync below finds it raised and stays quiet.
     const looking =
       focus.workspaceId === p.workspaceId &&
       focus.mode === "talk" &&

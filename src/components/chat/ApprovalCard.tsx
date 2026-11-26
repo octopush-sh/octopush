@@ -76,7 +76,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         <button
           type="button"
           onClick={() => onRespond(lead)}
-          title={secret ? "Leave it out (⌘↵, Enter or Esc)" : "Approve (⌘↵)"}
+          title={secret ? "Leave it out (⌘↵, Enter or Esc with the card focused)" : "Approve (⌘↵ with the card focused)"}
           aria-keyshortcuts={secret ? "Meta+Enter Enter Escape" : "Meta+Enter"}
           className={`rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass ${QUICK}`}
         >
@@ -85,7 +85,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         <button
           type="button"
           onClick={() => onRespond(secret ? "approve" : "deny")}
-          title={secret ? "Run it as it is, once, for exactly these findings" : "Deny (Esc)"}
+          title={secret ? "Run it as it is, once, for exactly these findings" : "Deny (Esc with the card focused)"}
           aria-keyshortcuts={secret ? undefined : "Escape"}
           className={`rounded-md border border-octo-hairline px-3 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-rouge hover:border-[var(--rouge-border)] ${QUICK}`}
         >
