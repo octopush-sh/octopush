@@ -4,4 +4,5 @@ kind: fix
 area: app
 ---
 Talk's command check now reads commands inside `$(…)`, backticks and `bash -c "…"`, knows
-`/bin/rm` is `rm`, and asks before a `+main` push or a `curl` upload of a dotfile such as `.env`.
+`/bin/rm` is `rm`, and asks before a `+main` push, a remote branch delete, a downloaded script run
+through `bash <(curl …)`, or a `curl` upload of a dotfile such as `.env`.
