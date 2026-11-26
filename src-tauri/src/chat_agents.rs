@@ -183,6 +183,7 @@ pub fn subagent_system_prompt(
          then anything left undone.",
         description = call.description,
     );
+    prompt.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
     prompt.push_str(instructions);
     if let Some(d) = definition {
         if !d.body.is_empty() {

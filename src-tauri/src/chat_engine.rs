@@ -86,6 +86,7 @@ pub(crate) fn director_system_prompt(
     doctrine: Option<&str>,
 ) -> String {
     let mut prompt = system.unwrap_or_else(|| default_talk_system_prompt(workspace_path));
+    prompt.push_str(crate::chat_history::UNTRUSTED_OUTPUT_NOTE);
     prompt.push_str(instructions);
     if let Some(doctrine) = doctrine {
         prompt.push_str(doctrine);
@@ -4176,10 +4177,12 @@ impl ChatEngine {
                     tool_rows.insert(u.id.clone(), id);
                 }
                 // The row keeps the whole result; an MCP result is capped
-                // in the copy the next round carries.
+                // in the copy the next round carries. What a tool returned
+                // is marked untrusted; a denial or refusal is ours (#1147).
+                let content = crate::chat_history::tool_result_for_model(&u.name, result, row_id);
                 tool_results.push(LlmToolResult {
                     tool_use_id: u.id.clone(),
-                    content: crate::chat_history::tool_result_for_model(&u.name, result, row_id),
+                    content: if was_denied { content } else { crate::chat_history::mark_untrusted(&u.name, &content) },
                     is_error: false,
                 });
             }

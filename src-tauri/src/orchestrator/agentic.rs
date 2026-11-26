@@ -60,6 +60,18 @@ pub(crate) fn throttle_notice(wait: u64) -> String {
 /// result is still kept in the work journal as evidence — only the copy sent
 /// back to the model is trimmed (head + tail), with a marker telling the model
 /// how to retrieve the omitted middle if it needs it.
+/// The copy of a tool's result the model reads: capped, and marked as
+/// untrusted output of its tool (`chat_history::mark_untrusted`, #1147)
+/// unless the gate denied the call, whose text is Octopush's own.
+fn model_copy(tool: &str, result: &str, denied: bool) -> String {
+    let capped = cap_tool_result(result);
+    if denied {
+        capped
+    } else {
+        crate::chat_history::mark_untrusted(tool, &capped)
+    }
+}
+
 fn cap_tool_result(s: &str) -> String {
     if s.len() <= TOOL_RESULT_CAP_BYTES {
         return s.to_string();
@@ -529,6 +541,18 @@ fn compact_history(messages: &mut [LlmMessage], system_chars: usize, target_char
 }
 
 /// Test-only re-export of [`compact_history`] (the fn itself stays private).
+#[cfg(test)]
+mod untrusted_tests {
+    #[test]
+    fn a_sub_agent_reads_tool_output_marked_and_a_denial_unmarked() {
+        let out = super::model_copy("mcp__jira__get_issue", "body", false);
+        assert_eq!(out, "[untrusted output from mcp:jira]\nbody");
+        assert_eq!(super::model_copy("run_command", "Command not run", true), "Command not run");
+        let big = "x".repeat(super::TOOL_RESULT_CAP_BYTES * 2);
+        assert!(super::model_copy("read_file", &big, false).len() < super::TOOL_RESULT_CAP_BYTES + 300, "capped, then marked");
+    }
+}
+
 #[cfg(test)]
 pub fn compact_history_for_tests(
     messages: &mut [LlmMessage],
@@ -1025,6 +1049,7 @@ pub async fn run_agentic_loop(
                     Some(g) => g.check(&u.name, &u.input).await,
                     None => None,
                 };
+                let denied = denial.is_some();
                 let (text, ok) = match denial {
                     Some(msg) => (msg, false),
                     None => match ext.call(&u.name, &u.input).await {
@@ -1034,7 +1059,8 @@ pub async fn run_agentic_loop(
                 };
                 emitter.tool_result(ok, &crate::orchestrator::live::summarize(&text));
                 out.tool_calls.push(ToolCallLog { name: u.name.clone(), input: u.input.clone(), result: text.clone() });
-                results.push(LlmToolResult { tool_use_id: u.id.clone(), content: cap_tool_result(&text), is_error: !ok });
+                let content = model_copy(&u.name, &text, denied);
+                results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error: !ok });
                 continue;
             }
             emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
@@ -1078,7 +1104,7 @@ pub async fn run_agentic_loop(
             });
             results.push(LlmToolResult {
                 tool_use_id: u.id.clone(),
-                content: cap_tool_result(&result),
+                content: model_copy(&u.name, &result, denied),
                 is_error: denied,
             });
         }

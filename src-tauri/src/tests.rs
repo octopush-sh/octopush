@@ -29949,8 +29949,12 @@ mod project_instructions_tests {
         // A workspace that isn't there.
         let gone = load(&ws.path().join("missing"), None);
         assert!(gone.files.iter().all(|f| f.skipped.is_some()) && gone.section.is_empty());
-        // The director's prompt is then exactly its base.
-        assert_eq!(director_system_prompt(Some("Base.".into()), "/repo", &got.section, None), "Base.");
+        // The director's prompt is then exactly its base and the
+        // untrusted-output note (#1147).
+        assert_eq!(
+            director_system_prompt(Some("Base.".into()), "/repo", &got.section, None),
+            format!("Base.{}", crate::chat_history::UNTRUSTED_OUTPUT_NOTE)
+        );
     }
 
     #[test]
@@ -30018,7 +30022,7 @@ mod project_instructions_tests {
         write(&ws.path().join("CLAUDE.md"), "Never write italics.");
         let got = load(ws.path(), None);
         let p = director_system_prompt(None, "/repo", &got.section, Some("\n\nAUTO DOCTRINE"));
-        let at = positions(&p, &["helpful coding assistant", "# Project instructions", "Never write italics.", "AUTO DOCTRINE"]);
+        let at = positions(&p, &["helpful coding assistant", "[untrusted output from", "# Project instructions", "Never write italics.", "AUTO DOCTRINE"]);
         assert!(at.windows(2).all(|w| w[0] < w[1]), "{p}");
         // A request's own prompt is followed by them too.
         let own = director_system_prompt(Some("Custom.".into()), "/repo", &got.section, None);
