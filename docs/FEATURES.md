@@ -1104,7 +1104,7 @@ Four distinct integration surfaces: (1) Jira issue tracking, (2) Octopush as an 
 
 ### Settings shell & navigation
 - **Settings overlay** — Full-screen overlay (not a modal); header eyebrow `Preferences` + The Octo at 18px (static) + `Octopush` wordmark in Fraunces (`.brand-wordmark`) + `ESC · CLOSE`. _Support:_ `Settings.tsx`; `icons/OctoMark.tsx`. _Entry:_ top-bar gear; `⌘,` (General); `⌘⇧T` (Usage).
-- **Grouped master-detail nav** — 4 groups: **Setup** (General, Editor), **Intelligence** (Models, Usage), **Connections** (Integrations), **App** (Appearance, Shortcuts, Privacy, About). Active tab brass; pane crossfades. _Support:_ `lib/settingsTabs.ts`, `Settings.tsx`.
+- **Grouped master-detail nav** — 4 groups: **Setup** (General, Editor), **Intelligence** (Models, Usage), **Connections** (Integrations), **App** (Appearance, Shortcuts, Privacy, About). Every row is 32px with a 1px border slot (transparent at rest) and its label in 13px sans in every state; the active row only changes colour (brass text on a brass-ghost ground with a brass-dim border), so switching tabs never moves the rows. Pane crossfades. _Support:_ `lib/settingsTabs.ts`, `Settings.tsx`.
 - **Escape handling** — Capture-phase Esc closes but always `preventDefault`s (never exits macOS full-screen); defers to a stacked ModalShell; ignores Esc in inputs. _Support:_ `Settings.tsx`.
 
 ### Settings panes
