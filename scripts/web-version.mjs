@@ -3,7 +3,7 @@
 // `src/data/release.ts` VERSION and one changelog entry per release since the
 // landing's last version (the website's truth rule: VERSION must be the
 // stable app). promote.yml's `web-version` job runs this in a checkout of
-// octopush-web and opens the PR; the owner merges it (VISION §8).
+// octopush-web and opens the PR; the PM or the owner merges it (VISION §8).
 //
 //   node scripts/web-version.mjs <web-checkout> <new-version>   (reads releases with gh)
 //
