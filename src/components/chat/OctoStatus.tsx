@@ -5,13 +5,17 @@ import { isAgentToolName } from "../../lib/agentTools";
 export type { OctoRole };
 
 /** The Player's script for TALK: what is the turn actually doing right now?
- *  Priority: someone must answer (wait) > a live tool > text flowing > thought. */
+ *  Priority: someone must answer (wait) > a retry or pause notice > a live
+ *  tool > text flowing > thought. */
 export function roleForActivity(args: {
   approvals: number;
   liveTools: LiveTool[];
   streamBuffer: string;
+  /** The director's live notice ("Model overloaded — retrying in 8s …"). */
+  notice?: string | null;
 }): OctoRole {
   if (args.approvals > 0) return ROLES.wait;
+  if (args.notice) return { ...ROLES.retry, label: args.notice };
   const live = [...args.liveTools].reverse().find((t) => !t.done);
   // A running crew reads as delegation, whatever the last card was.
   if (live && isAgentToolName(live.toolName)) return ROLES.delegate;
@@ -32,6 +36,8 @@ interface Props {
   streamBuffer: string;
   liveTools: LiveTool[];
   approvals: number;
+  /** The director's retry / rate-limit notice for this thread, if any. */
+  notice?: string | null;
 }
 
 /** TALK adapter over the shared OctoPlayer (spec 2026-07-19 §4). */
@@ -43,12 +49,13 @@ export function OctoStatus({
   streamBuffer,
   liveTools,
   approvals,
+  notice = null,
 }: Props) {
   return (
     <OctoPlayer
       identity={workspaceId}
       active={streaming || approvals > 0}
-      role={roleForActivity({ approvals, liveTools, streamBuffer })}
+      role={roleForActivity({ approvals, liveTools, streamBuffer, notice })}
       skipBeat={hasError || wasStopped}
     />
   );

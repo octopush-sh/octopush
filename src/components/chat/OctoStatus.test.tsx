@@ -42,6 +42,15 @@ describe("roleForActivity", () => {
     expect(r.label).toBe("Working…");
     expect(r.bodyClass).toBe("octo-mascot--working");
   });
+  it("a retry notice outranks tools and thought, never an approval", () => {
+    const notice = "Model overloaded — retrying in 8s (retry 1 of 5)";
+    const r = roleForActivity({ approvals: 0, liveTools: [], streamBuffer: "", notice });
+    expect(r.key).toBe("retry");
+    expect(r.label).toBe(notice);
+    expect(r.bodyClass).toBe("octo-mascot--idle");
+    expect(roleForActivity({ approvals: 1, liveTools: [], streamBuffer: "", notice }).key).toBe("wait");
+    expect(roleForActivity({ approvals: 0, liveTools: [], streamBuffer: "", notice: null }).key).toBe("think");
+  });
   it("buffer → write; nothing → think", () => {
     expect(roleForActivity({ approvals: 0, liveTools: [], streamBuffer: "hola" }).key).toBe("write");
     expect(roleForActivity({ approvals: 0, liveTools: [], streamBuffer: "" }).key).toBe("think");
@@ -70,6 +79,14 @@ describe("OctoStatus", () => {
     const root = container.firstElementChild as HTMLElement;
     expect(root.dataset.placement).toBe("pinned");
     expect(root.className).toMatch(/\babsolute\b/);
+  });
+
+  it("says it is retrying, in sage, while the provider is retried", () => {
+    const { getByText } = render(
+      <OctoStatus {...base} streaming notice="Rate limit reached — retrying in 4s (retry 2 of 5)" />,
+    );
+    const label = getByText("Rate limit reached — retrying in 4s (retry 2 of 5)");
+    expect(label.className).toContain("text-octo-sage");
   });
 
   it("waiting label renders in brass", () => {
