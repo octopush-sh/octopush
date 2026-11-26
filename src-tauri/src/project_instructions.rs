@@ -8,10 +8,12 @@
 //!   [`request_context::memory_chain`] resolves it and reads each file once:
 //!   `~/.claude/CLAUDE.md`, then from the top directory down to the
 //!   workspace each one's `CLAUDE.md`, `.claude/CLAUDE.md` and
-//!   `CLAUDE.local.md`, each followed by the files it `@imports`. Only the
-//!   user's own `~/.claude/CLAUDE.md` may point anywhere; every other file,
-//!   import or symlink target must resolve inside the workspace, or it is
-//!   listed as skipped and never read. A file over 4 MiB is skipped too.
+//!   `CLAUDE.local.md`, each followed by the files it `@imports`. The
+//!   user's files (`~/.claude/CLAUDE.md` and those of the directories above
+//!   the workspace) may import from anywhere. The repository is the
+//!   untrusted part: a file that resolves inside the workspace, and what it
+//!   imports or links to, must stay inside it, or it is listed as skipped
+//!   and never read. A file over 4 MiB is skipped too.
 //! - **`AGENTS.md` is the fallback.** A project that keeps both usually
 //!   mirrors one into the other (often with a line changed, so a content
 //!   dedupe misses it). So the workspace's `AGENTS.md` and `CONVENTIONS.md`
@@ -185,8 +187,9 @@ pub fn load(workspace: &Path, home: Option<&Path>) -> ProjectInstructions {
     }
     let mut section = String::from(
         "\n\n# Project instructions\n\nThe instruction files for this workspace follow: the user's own \
-         ~/.claude/CLAUDE.md and the project's CLAUDE.md files. Follow them while you work here: they \
-         take precedence over the general guidance above, and a later file over an earlier one.",
+         (~/.claude/CLAUDE.md and those of the directories above the project), then the project's. \
+         Follow them while you work here: they take precedence over the general guidance above, and a \
+         later file over an earlier one.",
     );
     for part in &parts {
         section.push_str("\n\n");

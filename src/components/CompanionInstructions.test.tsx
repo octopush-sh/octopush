@@ -42,7 +42,7 @@ describe("instructionsTitle", () => {
       { label: "~/.aws/credentials", path: "/Users/dev/.aws/credentials", tokens: 0, trimmed: false, skipped: "outside the project" },
     ]);
     expect(title.split("\n")).toEqual([
-      "Talk and its sub-agents follow these files, read again on every turn: your ~/.claude/CLAUDE.md and this project's CLAUDE.md files, or its AGENTS.md when it has no CLAUDE.md. A file outside the project is skipped.",
+      "Talk and its sub-agents follow these files, read again on every turn: yours (~/.claude/CLAUDE.md and those in the folders above this project), then this project's CLAUDE.md files, or its AGENTS.md when it has no CLAUDE.md. A project file that points outside the project is skipped.",
       "~/.claude/CLAUDE.md · 850 tokens",
       "CLAUDE.md · 4k tokens · trimmed to fit",
       "CLAUDE.local.md · left out, the instructions were already at their limit",

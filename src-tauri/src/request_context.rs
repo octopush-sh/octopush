@@ -242,9 +242,11 @@ pub struct MemoryFile {
     pub skipped: Option<MemorySkip>,
 }
 
-/// Whose file it is, which decides where it may point: the user's own
-/// `~/.claude/CLAUDE.md` (and what it imports) may point anywhere; every
-/// other file is the project's and must resolve inside it.
+/// Whose file it is, which decides where it may point. The user's files
+/// (`~/.claude/CLAUDE.md`, the files of the directories above the project,
+/// and what they import) may point anywhere. A file that resolves inside the
+/// project is the project's, however it was reached, and it may point only
+/// inside the project: the repository is the untrusted part.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Trust {
     User,
@@ -266,6 +268,10 @@ impl ChainWalk<'_> {
     /// Add the memory file at `path` (when it is one not yet reached) and,
     /// up to [`MAX_IMPORT_DEPTH`], the files it imports.
     fn add(&mut self, path: &Path, trust: Trust, depth: usize) {
+        // Already read by another route (an import of an ancestor's file, say).
+        if std::fs::canonicalize(path).is_ok_and(|r| self.seen.contains(&r)) {
+            return;
+        }
         let limit = match trust {
             Trust::User => None,
             Trust::Project => match &self.root {
@@ -287,7 +293,9 @@ impl ChainWalk<'_> {
         if !self.seen.insert(real.clone()) {
             return;
         }
-        // A file inside the project is the project's, whoever imported it.
+        // A file inside the project is the project's, whoever imported it or
+        // linked to it: an ancestor's file that resolves into the project
+        // can't let a project file's imports out.
         let trust = if self.root.as_deref().is_some_and(|r| real.starts_with(r)) { Trust::Project } else { trust };
         let text = String::from_utf8_lossy(&raw).into_owned();
         let imports = if depth < MAX_IMPORT_DEPTH { memory_imports(&text) } else { Vec::new() };
@@ -305,10 +313,12 @@ impl ChainWalk<'_> {
 /// `~/.claude/CLAUDE.md`, then from the top directory down to `project`
 /// each one's `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md`, each
 /// followed by what it imports (an `AGENTS.md` counts only when imported).
-/// Everything but the user's own file is the project's, and is read only
-/// when it resolves inside `project`: an ancestor's file, an import of
-/// `~/…`, `../…` or an absolute path, and a symlink out of the project are
-/// listed as skipped ([`MemorySkip::OutsideProject`]), never read.
+/// The user's own file and the directories above `project` are the user's,
+/// and their imports may point anywhere. The project's files, and anything
+/// that resolves into the project, are read only when they resolve inside
+/// it: an import of `~/…`, `../…` or an absolute path, or a symlink out of
+/// the project, is listed as skipped ([`MemorySkip::OutsideProject`]),
+/// never read. Every file is size-capped ([`read_memory_file`]).
 pub fn memory_chain(project: &Path, home: Option<&Path>) -> Vec<MemoryFile> {
     let mut walk = ChainWalk { project, home, root: std::fs::canonicalize(project).ok(), seen: HashSet::new(), out: Vec::new() };
     if let Some(h) = home {
@@ -318,8 +328,11 @@ pub fn memory_chain(project: &Path, home: Option<&Path>) -> Vec<MemoryFile> {
     let mut dirs: Vec<&Path> = project.ancestors().filter(|d| d.parent().is_some()).collect();
     dirs.reverse();
     for dir in dirs {
+        // Directories above the project are the user's; the project's own
+        // files are the repository's.
+        let trust = if dir == project { Trust::Project } else { Trust::User };
         for name in ["CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md"] {
-            walk.add(&dir.join(name), Trust::Project, 0);
+            walk.add(&dir.join(name), trust, 0);
         }
     }
     walk.out

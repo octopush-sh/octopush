@@ -28725,7 +28725,7 @@ mod request_context_tests {
         let tree = TempDir::new().unwrap();
         let project = tree.path().join("work").join("repo");
         write(&home.path().join(".claude/CLAUDE.md"), "user rules");
-        // An ancestor's file is outside the project: named, never read.
+        // A directory above the project is the user's: its file is read.
         write(&tree.path().join("work/CLAUDE.md"), "parent rules");
         // AGENTS.md counts only because CLAUDE.md imports it; it imports
         // CLAUDE.md back, which is not counted twice.
@@ -28736,16 +28736,49 @@ mod request_context_tests {
         write(&project.join("sub/AGENTS.md"), "never imported");
 
         let items = memory_files(&project, Some(home.path()));
+        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
         assert_eq!(
             labels_under(&items, &[home.path(), tree.path()]),
-            ["~/.claude/CLAUDE.md".to_string(), "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
+            ["~/.claude/CLAUDE.md".to_string(), parent, "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
         );
         let local = items.iter().find(|i| i.label == "CLAUDE.local.md").unwrap();
         assert_eq!((local.kind.as_str(), local.count, local.bytes), ("memory", 1, 5));
-        let parent = tree.path().join("work").join("CLAUDE.md");
+    }
+
+    /// The directories above the project are the user's: their files may
+    /// import from anywhere. A file that resolves into the project is the
+    /// project's however it was reached, so a project file can't escape
+    /// through an ancestor's symlink, or by importing an ancestor's file.
+    #[test]
+    fn ancestors_are_the_user_s_and_the_project_can_t_escape_through_them() {
+        let home = TempDir::new().unwrap();
+        let tree = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(&outside.path().join("team.md"), "team rules");
+        write(&home.path().join(".aws/credentials"), "HOME-SECRET");
+        let work = tree.path().join("work");
+        let project = work.join("repo");
+        write(&work.join("CLAUDE.md"), &format!("parent rules @{}", outside.path().join("team.md").display()));
+        write(&project.join("CLAUDE.md"), "project rules @../CLAUDE.md");
         let chain = memory_chain(&project, Some(home.path()));
-        let skipped = chain.iter().find(|f| f.path == parent).expect("the ancestor's file is listed");
-        assert_eq!((skipped.skipped, skipped.bytes, skipped.text.as_str()), (Some(MemorySkip::OutsideProject), 0, ""));
+        let read: String = chain.iter().map(|f| f.text.as_str()).collect();
+        assert!(read.contains("parent rules") && read.contains("team rules") && read.contains("project rules"), "{chain:?}");
+        // The project's import of the ancestor's file adds nothing: it was read once, as the user's.
+        assert_eq!(read.matches("parent rules").count(), 1);
+        assert!(chain.iter().all(|f| f.skipped.is_none()), "{chain:?}");
+
+        // An ancestor's CLAUDE.md that is a symlink into the project is
+        // treated as the project's: its import of a secret is skipped.
+        let tree2 = TempDir::new().unwrap();
+        let project2 = tree2.path().join("repo");
+        write(&project2.join("docs/evil.md"), "evil rules @~/.aws/credentials");
+        std::os::unix::fs::symlink(project2.join("docs/evil.md"), tree2.path().join("CLAUDE.md")).unwrap();
+        let chain = memory_chain(&project2, Some(home.path()));
+        let read: String = chain.iter().map(|f| f.text.as_str()).collect();
+        assert!(read.contains("evil rules"), "{chain:?}");
+        assert!(!read.contains("HOME-SECRET"), "{chain:?}");
+        let creds = chain.iter().find(|f| f.label == "~/.aws/credentials").expect("listed");
+        assert_eq!(creds.skipped, Some(MemorySkip::OutsideProject));
     }
 
     /// A project's files can't pull anything from outside it into a request:
@@ -29581,7 +29614,7 @@ mod project_instructions_tests {
     }
 
     #[test]
-    fn talk_reads_the_user_s_file_then_the_project_s_chain_with_imports() {
+    fn talk_reads_the_user_s_files_then_the_project_s_chain_with_imports() {
         let home = TempDir::new().unwrap();
         let tree = TempDir::new().unwrap();
         let ws = tree.path().join("work").join("repo");
@@ -29594,17 +29627,14 @@ mod project_instructions_tests {
         write(&ws.join("AGENTS.md"), "agents rules");
 
         let got = load(&ws, Some(home.path()));
-        let at = positions(&got.section, &["user rules", "project rules", "style rules", "local rules"]);
-        assert!(at.windows(2).all(|w| w[0] < w[1]), "user, then the project, imports after their file: {}", got.section);
+        let at = positions(&got.section, &["user rules", "parent rules", "project rules", "style rules", "local rules"]);
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "user, then top down, imports after their file: {}", got.section);
         assert!(!got.section.contains("agents rules"), "{}", got.section);
         assert!(got.section.contains("Contents of CLAUDE.md:\n\nproject rules"), "{}", got.section);
-        // The ancestor's file is outside the project: listed as skipped, never sent.
-        assert!(!got.section.contains("parent rules"), "{}", got.section);
         let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
-        let skipped = got.files.iter().find(|f| f.path == parent).expect("the ancestor's file is listed");
-        assert_eq!((skipped.skipped.as_deref(), skipped.tokens), (Some("outside the project"), 0));
         let sent: Vec<&str> = got.files.iter().filter(|f| f.skipped.is_none()).map(|f| f.label.as_str()).collect();
-        assert_eq!(sent, ["~/.claude/CLAUDE.md", "CLAUDE.md", "docs/style.md", "CLAUDE.local.md"]);
+        assert!(sent.starts_with(&["~/.claude/CLAUDE.md"]) && sent.ends_with(&["CLAUDE.md", "docs/style.md", "CLAUDE.local.md"]), "{sent:?}");
+        assert!(sent.contains(&parent.as_str()), "the ancestor's file is the user's, and sent: {sent:?}");
         assert!(got.files.iter().filter(|f| f.skipped.is_none()).all(|f| !f.trimmed && f.tokens > 0), "{:?}", got.files);
     }
 
@@ -29688,8 +29718,9 @@ mod project_instructions_tests {
         let got = load(ws.path(), Some(home.path()));
         assert!(got.section.len() < INSTRUCTIONS_CAP_BYTES + 2_000, "{} bytes", got.section.len());
         assert!(got.section.contains("section truncated for length"));
-        // (A skipped file of another ancestor on this machine isn't the test's.)
-        let files: Vec<_> = got.files.iter().filter(|f| f.skipped.is_none()).collect();
+        // (A file of another ancestor on this machine isn't the test's.)
+        let ours = |p: &str| Path::new(p).starts_with(ws.path()) || Path::new(p).starts_with(home.path());
+        let files: Vec<_> = got.files.iter().filter(|f| f.skipped.is_none() && ours(&f.path)).collect();
         let labels: Vec<&str> = files.iter().map(|f| f.label.as_str()).collect();
         assert_eq!(labels, ["~/.claude/CLAUDE.md", "CLAUDE.md", "x.md", "y.md"]);
         // The workspace's CLAUDE.md got its full share, though it loads after the user's file…

@@ -16,7 +16,7 @@ function fileLine(f: InstructionFile): string {
  *  Pure so the copy is tested. */
 export function instructionsTitle(files: InstructionFile[]): string {
   return [
-    "Talk and its sub-agents follow these files, read again on every turn: your ~/.claude/CLAUDE.md and this project's CLAUDE.md files, or its AGENTS.md when it has no CLAUDE.md. A file outside the project is skipped.",
+    "Talk and its sub-agents follow these files, read again on every turn: yours (~/.claude/CLAUDE.md and those in the folders above this project), then this project's CLAUDE.md files, or its AGENTS.md when it has no CLAUDE.md. A project file that points outside the project is skipped.",
     ...files.map(fileLine),
   ].join("\n");
 }
