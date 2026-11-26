@@ -249,6 +249,21 @@ pub fn recall_hint(id: i64) -> String {
     format!(" — call recall_tool_output with message_id {id} for the full output")
 }
 
+/// The output `recall_tool_output` returns for a stored `role="tool"` row:
+/// its `original` when it keeps one (an MCP result whose binary payloads
+/// the model read as placeholders), else its `result`. Empty for a row that
+/// isn't JSON.
+pub fn recall_source(stored: &str) -> String {
+    let Ok(row) = serde_json::from_str::<serde_json::Value>(stored) else {
+        return String::new();
+    };
+    row.get("original")
+        .or_else(|| row.get("result"))
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// The copy of a tool result the director's next request carries, within
 /// the turn that ran it. An MCP result is capped like a sub-agent's tool
 /// results (head + tail within `orchestrator::agentic::TOOL_RESULT_CAP_BYTES`):
@@ -539,6 +554,34 @@ mod tests {
         let orphan = tool_result_for_model("mcp__github__list_issues", big, None);
         assert!(orphan.len() <= cap + 200);
         assert!(!orphan.contains("recall_tool_output"));
+    }
+
+    #[test]
+    fn recall_returns_the_original_output_and_history_the_scrubbed_one() {
+        let row = serde_json::json!({
+            "callId": "c1",
+            "toolName": "mcp__browser__screenshot",
+            "toolInput": {},
+            "result": "[image omitted: image/png, 48 KB]",
+            "original": "{\"data\":\"iVBORw0KGgo\",\"type\":\"image\"}",
+        })
+        .to_string();
+        assert_eq!(recall_source(&row), "{\"data\":\"iVBORw0KGgo\",\"type\":\"image\"}");
+        // History replays `result`, the placeholder.
+        let rows = [
+            HistoryRow { id: 1, role: "user", content: "look" },
+            HistoryRow { id: 2, role: "tool", content: &row },
+            HistoryRow { id: 3, role: "assistant", content: "done" },
+            HistoryRow { id: 4, role: "user", content: "next" },
+        ];
+        let turns = build_history(&rows);
+        let replay = turns.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(replay.contains("[image omitted: image/png, 48 KB]"), "{replay}");
+        assert!(!replay.contains("iVBORw0KGgo"), "{replay}");
+        // A row from before `original` existed recalls its result.
+        let old = serde_json::json!({ "toolName": "read_file", "toolInput": {}, "result": "fn main() {}" }).to_string();
+        assert_eq!(recall_source(&old), "fn main() {}");
+        assert_eq!(recall_source("not json"), "");
     }
 
     #[test]

@@ -2020,10 +2020,7 @@ impl ChatEngine {
             }
             Err(e) => return (format!("Failed to load tool output: {e}"), false),
         };
-        let result = serde_json::from_str::<serde_json::Value>(&stored)
-            .ok()
-            .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_string))
-            .unwrap_or_default();
+        let result = crate::chat_history::recall_source(&stored);
         if result.is_empty() {
             return (format!("Tool output #{message_id} is empty"), true);
         }
@@ -3327,6 +3324,9 @@ impl ChatEngine {
                 // A sub-agent's outcome was collected in the fan-out; its
                 // meta rides on the persisted tool row (`agent` key).
                 let mut agent_meta: Option<AgentOutcome> = None;
+                // An MCP result whose binary payloads the model reads as
+                // placeholders: the original, kept on the row for recall.
+                let mut mcp_original: Option<String> = None;
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
@@ -3361,7 +3361,10 @@ impl ChatEngine {
                     )
                     .await
                     {
-                        Ok(out) => (out, true),
+                        Ok(out) => {
+                            mcp_original = out.original;
+                            (out.text, true)
+                        }
                         Err(e) => (e, false),
                     }
                 } else if u.name == "run_command" && self.talk_shell.available() && sandbox_roots.is_none() {
@@ -3510,6 +3513,11 @@ impl ChatEngine {
                         obj.remove("report");
                     }
                     tool_record["agent"] = m;
+                }
+                // `result` is what the model, the card and later turns read;
+                // `original` (only when they differ) is what recall returns.
+                if let Some(original) = mcp_original {
+                    tool_record["original"] = serde_json::Value::String(original);
                 }
                 // The thread may have been deleted while the turn was parked (a
                 // tool running, or an approval card awaiting the user). Skip the

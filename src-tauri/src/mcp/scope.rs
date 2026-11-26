@@ -237,6 +237,19 @@ done
     }
 
     #[test]
+    fn settings_test_connect_lists_tools_in_the_same_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = tempfile::tempdir().unwrap();
+        let script = wt.path().join("docs.sh");
+        std::fs::write(&script, TWO_TOOLS).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = McpServerConfig { command: "bash".into(), args: vec![script.to_string_lossy().into_owned()], ..Default::default() };
+        // The server lists `search` before `read`.
+        let tools = McpRegistry::test_connect_with("docs", &cfg, &crate::mcp::secrets::MemoryStore::default()).unwrap();
+        assert_eq!(tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["read", "search"]);
+    }
+
+    #[test]
     fn sort_tools_orders_by_server_then_tool_whatever_the_input_order() {
         let tool = |server: &str, name: &str| McpToolInfo {
             server: server.into(),

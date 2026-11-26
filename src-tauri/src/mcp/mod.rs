@@ -863,14 +863,16 @@ pub fn server_of(namespaced: &str) -> Option<String> {
 /// timed out can never complete later in the background — the blocked
 /// worker gets EOF and returns, and the next call re-spawns the server. The
 /// error says so, and warns that a request the server had already sent (a
-/// write to a tracker) may still have landed.
+/// write to a tracker) may still have landed. A result comes back rendered
+/// (`content::McpOutput`): the text the model reads, and the original when
+/// a binary payload in it was replaced.
 pub async fn call_bounded(
     registry: Arc<McpRegistry>,
     worktree: std::path::PathBuf,
     namespaced: String,
     input: Value,
     bound: std::time::Duration,
-) -> Result<String, String> {
+) -> Result<content::McpOutput, String> {
     let reg = Arc::clone(&registry);
     let name = namespaced.clone();
     let target = CallTarget::default();
@@ -1198,7 +1200,10 @@ impl McpRegistry {
         let (child, values) = Self::spawn(name, cfg, store)?;
         let conn = Self::handshake(name, child)
             .map_err(|e| redact_text(&secrets::scrub(&e, &values), &known_secrets(cfg)))?;
-        Ok(conn.tools.clone())
+        // Settings lists them in the order every request offers them.
+        let mut tools = conn.tools.clone();
+        sort_tools(&mut tools);
+        Ok(tools)
     }
 
     /// Lazily connect (and cache) a server's connection. Spawn + handshake
@@ -1283,11 +1288,11 @@ impl McpRegistry {
     }
 
     /// Call a namespaced MCP tool (`mcp__server__tool`), returning the textual
-    /// result (MCP `tools/call` content blocks joined, binary blocks as short
-    /// placeholders: `content::render_call_result`). A tool that reports its
-    /// own failure (`isError`) is a result like any other.
+    /// result the model reads (MCP `tools/call` content blocks joined, binary
+    /// payloads as short placeholders: `content::render_call_result`). A tool
+    /// that reports its own failure (`isError`) is a result like any other.
     pub fn call(&self, worktree: &Path, namespaced: &str, input: &Value) -> Result<String, McpCallError> {
-        self.call_on(worktree, namespaced, input, None)
+        self.call_on(worktree, namespaced, input, None).map(|out| out.text)
     }
 
     /// [`Self::call`], recording the process it uses in `target` before the
@@ -1298,7 +1303,7 @@ impl McpRegistry {
         namespaced: &str,
         input: &Value,
         target: Option<&CallTarget>,
-    ) -> Result<String, McpCallError> {
+    ) -> Result<content::McpOutput, McpCallError> {
         let (server, tool) =
             parse_namespaced(namespaced).ok_or_else(|| McpCallError::NotMcpTool(namespaced.to_string()))?;
         let cfgs = load_server_configs(worktree);

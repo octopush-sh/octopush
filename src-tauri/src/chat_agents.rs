@@ -885,6 +885,7 @@ impl ExternalTools for McpSubagentTools {
         };
         // Bounded on the wire (the turnstile above absorbs the queue), and a
         // timeout STOPS the server so the call can never complete later.
+        // A sub-agent reads the rendered text (binary payloads replaced).
         crate::mcp::call_bounded(
             Arc::clone(&self.registry),
             self.worktree.clone(),
@@ -893,6 +894,7 @@ impl ExternalTools for McpSubagentTools {
             crate::mcp::CALL_TIMEOUT,
         )
         .await
+        .map(|out| out.text)
     }
 }
 
