@@ -1284,6 +1284,49 @@ mod workspace_tests {
     }
 
     #[test]
+    fn an_mcp_original_is_kept_for_recall_and_never_loaded_with_the_thread() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        let row = serde_json::json!({
+            "callId": "c1",
+            "toolName": "mcp__browser__screenshot",
+            "toolInput": {},
+            "result": "[image omitted: image/png, 2048 KB]",
+        })
+        .to_string();
+        let id = db.insert_chat_message("ws", &t.id, "tool", &row, None, None, None, None).unwrap();
+        let original = format!("{{\"type\":\"image\",\"data\":\"{}\"}}", "iVBORw0KGgo".repeat(200_000));
+        db.set_chat_tool_original(id, &t.id, &original).unwrap();
+
+        // A thread load (what the webview receives) carries the row as
+        // written: the placeholder, never the original.
+        let loaded = db.list_chat_messages(&t.id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, row);
+        assert!(!loaded[0].content.contains("iVBORw0KGgo"));
+        assert!(!loaded[0].content.contains("original"));
+
+        // Recall reads it, capped at 1 MB with its full size, in this thread only.
+        let (kept, total) = db.get_chat_tool_original(&t.id, id).unwrap().expect("kept");
+        assert_eq!(kept.len(), crate::chat_history::ORIGINAL_CAP_BYTES);
+        assert_eq!(total, original.len());
+        assert!(original.starts_with(&kept));
+        let other = db.create_chat_thread("ws", "Other").unwrap();
+        assert!(db.get_chat_tool_original(&other.id, id).unwrap().is_none());
+
+        // It goes with its row.
+        db.truncate_chat_after(&t.id, id).unwrap();
+        assert!(db.get_chat_tool_original(&t.id, id).unwrap().is_none());
+        let id2 = db.insert_chat_message("ws", &t.id, "tool", &row, None, None, None, None).unwrap();
+        db.set_chat_tool_original(id2, &t.id, "small").unwrap();
+        assert_eq!(db.get_chat_tool_original(&t.id, id2).unwrap(), Some(("small".to_string(), 5)));
+        db.delete_chat_thread(&t.id).unwrap();
+        assert!(db.get_chat_tool_original(&t.id, id2).unwrap().is_none());
+    }
+
+    #[test]
     fn pinned_threads_sort_to_the_top() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();
@@ -1332,6 +1375,30 @@ mod workspace_tests {
         db.truncate_chat_after(&t2.id, 0).unwrap(); // id >= 0 clears t2 only
         assert_eq!(db.list_chat_messages(&t2.id).unwrap().len(), 0);
         assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sent_context_is_kept_on_its_row_scoped_and_forked() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        let old = db.insert_chat_message("ws", &t.id, "user", "plain", None, None, None, None).unwrap();
+        let ask = db.insert_chat_message("ws", &t.id, "user", "fix @a.ts\n\na.ts\n```\nx\n```", None, None, None, None).unwrap();
+        let ctx = r#"[{"token":"a.ts","kind":"file","label":"a.ts","tokens":4,"start":9,"end":25}]"#;
+        db.set_chat_message_context(ask, ctx).unwrap();
+        let rows = db.list_chat_messages(&t.id).unwrap();
+        assert_eq!(rows[0].context_blocks, None, "a row without context stays as it was");
+        assert_eq!(rows[1].context_blocks.as_deref(), Some(ctx));
+        // Recall reaches it only from its own thread, and only on a row with context.
+        assert!(db.get_chat_sent_context(&t.id, ask).unwrap().is_some());
+        assert!(db.get_chat_sent_context(&t.id, old).unwrap().is_none());
+        let other = db.create_chat_thread("ws", "U").unwrap();
+        assert!(db.get_chat_sent_context(&other.id, ask).unwrap().is_none());
+        // A fork keeps the record on the rows it copies.
+        let next = db.insert_chat_message("ws", &t.id, "user", "next", None, None, None, None).unwrap();
+        let (fork, _, _) = db.fork_chat_thread(&t.id, next).unwrap();
+        assert_eq!(db.list_chat_messages(&fork.id).unwrap()[1].context_blocks.as_deref(), Some(ctx));
     }
 
     #[test]

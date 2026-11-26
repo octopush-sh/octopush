@@ -8,9 +8,11 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
 import { isBudgetExceeded } from "../lib/budgetError";
 import { useAttentionStore } from "./attentionStore";
 import { focus } from "../lib/focus";
+import { notifyApprovalWaiting } from "../lib/approvalNotifications";
 import { deriveChatTitle } from "../lib/chatTitle";
 import { helperModelNow } from "../lib/helperModels";
 import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
+import { parseSentContext, typedText, type SentContextBlock } from "../lib/sentContext";
 
 export interface ToolExecution {
   toolName: string;
@@ -65,6 +67,32 @@ export function appendAgentLog(
   const prev = logs[callId] ?? [];
   const next = prev.length >= AGENT_LOG_CAP ? [...prev.slice(prev.length - AGENT_LOG_CAP + 1), entry] : [...prev, entry];
   return { ...logs, [callId]: next };
+}
+
+/** The director's live status while it waits on the provider (a retry, a
+ *  rate-limit pause), from `chat://notice`. Never persisted: the Player shows
+ *  `text` until `delaySecs` pass or the turn moves on. */
+export const CHAT_NOTICE_EVENT = "chat://notice";
+
+export interface TurnNotice {
+  text: string;
+  /** Tells a later notice from this one, so an old timer can't clear it. */
+  seq: number;
+}
+
+/** Pure reducer: drop `threadId`'s notice, if it still has one (and, when
+ *  `seq` is given, only that notice). Returns the same map when nothing
+ *  changes, so subscribers don't re-render on every stream delta. */
+export function clearTurnNotice(
+  notices: Record<string, TurnNotice>,
+  threadId: string | undefined,
+  seq?: number,
+): Record<string, TurnNotice> {
+  if (!threadId) return notices;
+  const current = notices[threadId];
+  if (!current || (seq !== undefined && current.seq !== seq)) return notices;
+  const { [threadId]: _gone, ...rest } = notices;
+  return rest;
 }
 
 /** A tool currently executing (between `chat://tool-start` and the resolved
@@ -282,6 +310,10 @@ const EMPTY_SKILL_NAMES: string[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 const EMPTY_CAPS: PendingCap[] = [];
 
+/** A turn's `@` block spans, by thread, until its user row lands: the backend
+ *  saves them on the row, and `chat://message-added` doesn't carry them. */
+const pendingContext = new Map<string, { content: string; contextBlocks: string }>();
+
 /** The per-turn budget decision. `blocked` → the workspace/global cap is hit and
  *  no override was available (refuse the turn). `overrode` → the cap was hit but a
  *  per-turn override was consumed, so the turn proceeds AND the backend gate must
@@ -395,6 +427,10 @@ interface ChatState {
   continueErrorByCall: Record<string, string>;
   /** Text the composer takes once as its draft (a fork's turn), per workspace. */
   composerSeedByWs: Record<string, string | null>;
+  /** The director's live retry / pause notice, per thread (see `TurnNotice`).
+   *  Per thread, so a background thread's notice is still there when the
+   *  user switches back to it. */
+  turnNoticeByThread: Record<string, TurnNotice>;
 
   /** Global model preference. Applies to whichever workspace the user types in. */
   model: string;
@@ -445,7 +481,7 @@ interface ChatState {
     workspacePath: string,
     content: string,
     systemPrompt?: string,
-    opts?: { attachments?: boolean; onDispatched?: () => void },
+    opts?: { attachments?: boolean; onDispatched?: () => void; context?: SentContextBlock[] },
   ) => Promise<boolean>;
   /** Internal: dispatch one agentic turn (shared by send / regenerate).
    *  Resolves `false` when the IPC failed. */
@@ -460,6 +496,8 @@ interface ChatState {
       regenerate?: boolean;
       /** The turn's budget override was consumed → tell the backend to skip its gate. */
       overrideBudget?: boolean;
+      /** Where the `@` blocks sit in `userMessage` (#1150). */
+      context?: SentContextBlock[];
     },
   ) => Promise<boolean>;
   /** Internal: budget-gate, truncate from a cutoff message id, then dispatch.
@@ -475,6 +513,7 @@ interface ChatState {
       attachments?: Attachment[];
       regenerate?: boolean;
       overrideBudget?: boolean;
+      context?: SentContextBlock[];
     },
   ) => Promise<void>;
   /** Regenerate an assistant turn: drop it (and any trailing tool rows) back to
@@ -486,13 +525,14 @@ interface ChatState {
     systemPrompt?: string,
   ) => Promise<void>;
   /** Edit a user message and resend: truncate from it, then dispatch the new
-   *  text as a fresh turn. */
+   *  text as a fresh turn (with its `@` blocks' spans, when it has any). */
   editAndResend: (
     workspaceId: string,
     workspacePath: string,
     userMessageId: number,
     newContent: string,
     systemPrompt?: string,
+    context?: SentContextBlock[],
   ) => Promise<void>;
   /** Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
    *  The command + output are persisted into the conversation as context. */
@@ -509,6 +549,10 @@ interface ChatState {
   stopShellProcess: (workspaceId: string) => void;
   /** Load the workspace's recent `$`-command history into the cache. */
   loadShellHistory: (workspaceId: string) => Promise<void>;
+  /** Show the workspace's oldest waiting approval card: switch to its
+   *  conversation when another one is shown (Mission Control's and the menu
+   *  bar's way into a waiting card). No card, nothing to do. */
+  showPendingApproval: (workspaceId: string) => void;
   /** Resolve a dangerous-command approval card (removes it + tells the backend). */
   respondApproval: (
     workspaceId: string,
@@ -590,16 +634,85 @@ async function rehydrateCaps(workspaceId: string, threadId: string): Promise<voi
   }
 }
 
+/** Cards answered this session, by call id: a rehydrate whose list was read
+ *  before the answer landed must not bring one back (nor its flag). A live
+ *  request for the id takes it off again. Bounded: the oldest ids go first. */
+const answeredApprovals = new Set<string>();
+const ANSWERED_CAP = 500;
+function markAnswered(callId: string): void {
+  answeredApprovals.add(callId);
+  if (answeredApprovals.size > ANSWERED_CAP) {
+    const oldest = answeredApprovals.values().next().value;
+    if (oldest !== undefined) answeredApprovals.delete(oldest);
+  }
+}
+
+/** An approval card outlives a webview reload the same way (a card no longer
+ *  times out on its own): when a thread opens, show what still waits. */
+async function rehydrateApprovals(workspaceId: string, threadId: string): Promise<void> {
+  if (typeof ipc.pendingApprovals !== "function") return;
+  try {
+    const cards = await ipc.pendingApprovals(threadId);
+    if (!Array.isArray(cards)) return;
+    useChatStore.setState((s) => {
+      const cur = s.pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS;
+      const known = new Set(cur.map((a) => a.callId));
+      const fresh = cards
+        .filter((c) => !known.has(c.callId) && !answeredApprovals.has(c.callId))
+        .map((c) => ({
+          callId: c.callId,
+          threadId: c.threadId,
+          command: c.command,
+          reason: c.reason,
+          ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
+        }));
+      if (fresh.length === 0) return {};
+      return { pendingApprovalsByWs: { ...s.pendingApprovalsByWs, [workspaceId]: [...cur, ...fresh] } };
+    });
+  } catch {
+    // The live event stream still delivers new cards.
+  }
+}
+
+/** The workspaces whose Talk turn is working: streaming, and not parked on
+ *  an approval card (that turn waits on you, so the rail shows the
+ *  workspace's needs-you flag instead of the marching edge). Pure. */
+export function workingTalkWorkspaces(
+  streamingByWs: Record<string, boolean>,
+  pendingApprovalsByWs: Record<string, PendingApproval[]>,
+): string[] {
+  return Object.keys(streamingByWs).filter((id) => streamingByWs[id] && !pendingApprovalsByWs[id]?.length);
+}
+
+/** A workspace's approval cards are its needs-you state: raised while one
+ *  waits (rail, Mode switcher, Mission Control), settled when the last is
+ *  answered, whichever way it went (a click, Stop, a deleted thread, the
+ *  backend's resolve, a reload's rehydrate). */
+function syncApprovalAttention(workspaceId: string, cards: PendingApproval[]): void {
+  const attention = useAttentionStore.getState();
+  if (cards.length === 0) attention.settleApproval(workspaceId);
+  else attention.raiseApproval(workspaceId, cards[0].command, false);
+}
+
 export const useChatStore = create<ChatState>((set, get) => {
   // Guards loadHistory against concurrent double-creation of a default thread
   // (rapid workspace switches / mount races). Mirrors the terminal-init guard.
   const loadingHistory = new Set<string>();
+
+  // The turn moved on (a row, a delta, a tool start, the end): a retry or
+  // pause notice for that thread is over. `seq` limits it to one notice.
+  const dropNotice = (threadId: string | undefined, seq?: number) => {
+    const current = get().turnNoticeByThread;
+    const next = clearTurnNotice(current, threadId, seq);
+    if (next !== current) set({ turnNoticeByThread: next });
+  };
 
   // ── chat://message-added ──────────────────────────────────────
   // Append a message to ITS workspace's bucket, with idempotency on id.
   listen<MessageAddedEvent>("chat://message-added", (ev) => {
     const payload = ev.payload;
     const wsId = payload.workspaceId;
+    dropNotice(payload.threadId);
 
     set((s) => {
       // Only reflect events for the thread currently shown in this workspace;
@@ -625,6 +738,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         cacheCreationTokens: payload.cacheCreationTokens ?? null,
         contextTokens: payload.contextTokens ?? null,
       };
+      const sent = payload.threadId ? pendingContext.get(payload.threadId) : undefined;
+      if (payload.role === "user" && sent && sent.content === payload.content) {
+        newMessage.contextBlocks = sent.contextBlocks;
+        pendingContext.delete(payload.threadId!);
+      }
 
       // When a resolved tool row arrives, retire its live "running" card so the
       // ToolCallCard from the timeline takes over with no flash. Correlate by
@@ -702,6 +820,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     const payload = ev.payload;
     const wsId = payload.workspaceId;
     if (!wsId) return;
+    dropNotice(payload.threadId);
     const active = isActiveThread(get().activeThreadByWs, wsId, payload.threadId);
 
     if (payload.done) {
@@ -755,11 +874,27 @@ export const useChatStore = create<ChatState>((set, get) => {
     }
   });
 
+  // ── chat://notice ─────────────────────────────────────────────
+  // The director waits on the provider (a retry after a 429/529/5xx or a
+  // dropped connection, or a rate-limit pause): the Player says so for the
+  // length of the wait. Kept per thread, whichever one is on screen.
+  let noticeSeq = 0;
+  listen<{ workspaceId: string; threadId: string; text: string; delaySecs: number }>(CHAT_NOTICE_EVENT, (ev) => {
+    const p = ev.payload;
+    if (!p.threadId || !p.text) return;
+    const seq = ++noticeSeq;
+    set((s) => ({ turnNoticeByThread: { ...s.turnNoticeByThread, [p.threadId]: { text: p.text, seq } } }));
+    // The wait is over and the request goes out again: back to the turn's
+    // own role ("Thinking…") unless a newer notice replaced this one.
+    setTimeout(() => dropNotice(p.threadId, seq), Math.max(0, p.delaySecs) * 1000);
+  });
+
   // ── chat://tool-start ─────────────────────────────────────────
   // A tool began executing — show a live "running" card immediately.
   listen<ToolStartEvent>("chat://tool-start", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
+    dropNotice(p.threadId);
     if (!isActiveThread(get().activeThreadByWs, p.workspaceId, p.threadId)) return;
     set((s) => {
       const live = s.liveToolsByWs[p.workspaceId] ?? EMPTY_LIVE_TOOLS;
@@ -879,6 +1014,24 @@ export const useChatStore = create<ChatState>((set, get) => {
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
+    const waiting = get().pendingApprovalsByWs[p.workspaceId] ?? EMPTY_APPROVALS;
+    if (waiting.some((a) => a.callId === p.callId)) return;
+    // A live request is always shown, even for a call id answered before: the
+    // secret guard asks again under the same id when its rescan changed.
+    answeredApprovals.delete(p.callId);
+    // The card reaches the user: the workspace's needs-you flag (chiming
+    // unless they are looking at this conversation), and a native
+    // notification, which always fires (a locked screen looks focused; see
+    // `approvalNotifications.ts`). Raised before the card lands, so the
+    // store sync below finds it raised and stays quiet.
+    const looking =
+      focus.workspaceId === p.workspaceId &&
+      focus.mode === "talk" &&
+      get().activeThreadByWs[p.workspaceId] === p.threadId &&
+      typeof document !== "undefined" &&
+      document.hasFocus();
+    useAttentionStore.getState().raiseApproval(p.workspaceId, (waiting[0] ?? p).command, !looking);
+    notifyApprovalWaiting(p.workspaceId, { secret: p.secret === true });
     set((s) => {
       const cur = s.pendingApprovalsByWs[p.workspaceId] ?? EMPTY_APPROVALS;
       if (cur.some((a) => a.callId === p.callId)) return {};
@@ -942,10 +1095,12 @@ export const useChatStore = create<ChatState>((set, get) => {
   });
 
   // ── chat://approval-resolved ──────────────────────────────────
-  // The request was answered (or timed out) — retire the card.
+  // The request was answered (a click, Stop, a deleted conversation or
+  // workspace) — retire the card.
   listen<{ workspaceId: string; callId: string }>("chat://approval-resolved", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
+    markAnswered(p.callId);
     set((s) => {
       const cur = s.pendingApprovalsByWs[p.workspaceId];
       if (!cur) return {};
@@ -1026,6 +1181,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     continuingCalls: {},
     continueErrorByCall: {},
     composerSeedByWs: {},
+    turnNoticeByThread: {},
     model: helperModelNow("review"),
     effort: "standard",
 
@@ -1094,6 +1250,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
         }));
         void rehydrateCaps(workspaceId, activeId);
+        void rehydrateApprovals(workspaceId, activeId);
       } finally {
         loadingHistory.delete(workspaceId);
       }
@@ -1149,6 +1306,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         systemPrompt,
         attachments,
         overrideBudget: gate.overrode,
+        context: sendOpts?.context,
       });
       sendOpts?.onDispatched?.();
       return turn;
@@ -1172,6 +1330,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
       const attachments = opts.attachments ?? EMPTY_ATTACHMENTS;
+      const contextBlocks = opts.context?.length ? JSON.stringify(opts.context) : undefined;
+      const pending = contextBlocks ? { content: opts.userMessage, contextBlocks } : null;
+      if (pending) pendingContext.set(threadId, pending);
       try {
         await ipc.sendChatMessage({
           workspaceId,
@@ -1186,6 +1347,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             : undefined,
           regenerate: opts.regenerate || undefined,
           overrideBudget: opts.overrideBudget || undefined,
+          contextBlocks,
         });
       } catch (e) {
         // A backend budget block (e.g. a project cap the client doesn't track, or
@@ -1221,6 +1383,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: errText } }));
         }
         return false;
+      } finally {
+        // Only this turn's own entry: a later turn in the thread may have set its own.
+        if (pending && pendingContext.get(threadId) === pending) pendingContext.delete(threadId);
       }
       return true;
     },
@@ -1283,7 +1448,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
     },
 
-    editAndResend: async (workspaceId, workspacePath, userMessageId, newContent, systemPrompt) => {
+    editAndResend: async (workspaceId, workspacePath, userMessageId, newContent, systemPrompt, context) => {
       const threadId = get().activeThreadByWs[workspaceId];
       if (!threadId || !newContent.trim()) return;
       // Carry any staged attachments onto the resent turn (like send does).
@@ -1294,6 +1459,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         userMessage: newContent,
         systemPrompt,
         attachments,
+        context,
       });
     },
 
@@ -1394,14 +1560,22 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (threadId) void ipc.stopShellCommand(threadId).catch(() => {});
     },
 
+    showPendingApproval: (workspaceId) => {
+      const oldest = (get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS)[0];
+      if (!oldest || get().activeThreadByWs[workspaceId] === oldest.threadId) return;
+      void get().selectThread(workspaceId, oldest.threadId);
+    },
+
     respondApproval: (workspaceId, callId, decision) => {
       // Snapshot the card so we can restore it if the IPC fails — otherwise the
-      // card vanishes (looks resolved) while the backend turn stays parked until
-      // its 300s timeout, with no way to retry the decision.
+      // card vanishes (looks resolved) while the backend turn stays parked
+      // waiting for an answer, with no way to retry the decision.
       const card = (get().pendingApprovalsByWs[workspaceId] ?? EMPTY_APPROVALS).find(
         (a) => a.callId === callId,
       );
       // Optimistically retire the card; the backend also emits approval-resolved.
+      // Answered from now on, so a rehydrate already in flight can't bring it back.
+      markAnswered(callId);
       set((s) => {
         const cur = s.pendingApprovalsByWs[workspaceId];
         if (!cur) return {};
@@ -1414,6 +1588,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       void ipc.respondApproval(callId, decision).catch((e) => {
         // Restore the card + surface the error so the decision can be retried.
+        answeredApprovals.delete(callId);
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: `Could not send approval: ${String(e)}` },
           pendingApprovalsByWs: card
@@ -1596,6 +1771,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
       const messages = await ipc.listChatMessages(threadId);
       void rehydrateCaps(workspaceId, threadId);
+      void rehydrateApprovals(workspaceId, threadId);
       set((s) => ({
         messagesByWs: { ...s.messagesByWs, [workspaceId]: messages as ChatMessage[] },
       }));
@@ -1694,7 +1870,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     forkThread: async (workspaceId, threadId, messageId) => {
-      const { thread, draft } = await ipc.forkChatThread(threadId, messageId);
+      const { thread, draft: sent } = await ipc.forkChatThread(threadId, messageId);
+      // An ask sent with `@` context goes back as typed: its tokens resolve
+      // again on send, instead of riding along twice (#1150).
+      const msg = (get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES).find((m) => m.id === messageId);
+      const blocks = msg ? parseSentContext(msg.contextBlocks, sent) : null;
+      const draft = blocks ? typedText(sent, blocks) : sent;
       set((s) => ({
         threadsByWs: {
           ...s.threadsByWs,
@@ -1725,4 +1906,16 @@ export const useChatStore = create<ChatState>((set, get) => {
         },
       })),
   };
+});
+
+// Every change to a workspace's approval cards, from any path, keeps its
+// needs-you flag honest (`syncApprovalAttention`).
+useChatStore.subscribe((s, prev) => {
+  if (s.pendingApprovalsByWs === prev.pendingApprovalsByWs) return;
+  const ids = new Set([...Object.keys(s.pendingApprovalsByWs), ...Object.keys(prev.pendingApprovalsByWs)]);
+  for (const id of ids) {
+    const cards = s.pendingApprovalsByWs[id] ?? EMPTY_APPROVALS;
+    if (cards === (prev.pendingApprovalsByWs[id] ?? EMPTY_APPROVALS)) continue;
+    syncApprovalAttention(id, cards);
+  }
 });

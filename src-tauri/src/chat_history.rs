@@ -118,11 +118,19 @@ const TOOL_INPUT_MAX: usize = 600;
 /// A pure function of the rows, so the same thread state always renders the
 /// same prefix.
 pub fn plan_tool_history(rows: &[(usize, usize)]) -> Vec<usize> {
+    plan_tool_history_with(rows, 0)
+}
+
+/// [`plan_tool_history`] with `fixed` settled chars the thread also re-sends
+/// (its shortened `@` context blocks) counted against the same budget. They
+/// are never stubbed themselves; they make the oldest tool rows collapse
+/// sooner. `fixed` only grows as rows are appended, so the plan stays monotone.
+pub fn plan_tool_history_with(rows: &[(usize, usize)], fixed: usize) -> Vec<usize> {
     let mut plan: Vec<usize> = rows
         .iter()
         .map(|&(_, len)| len.min(TOOL_RESULT_SETTLED))
         .collect();
-    let settled_total: usize = plan.iter().sum();
+    let settled_total: usize = plan.iter().sum::<usize>() + fixed;
     if settled_total > TOOL_HISTORY_TOTAL_BUDGET {
         let overflow = settled_total - TOOL_HISTORY_TOTAL_BUDGET;
         let target = overflow.div_ceil(TOOL_HISTORY_COLLAPSE_BLOCK) * TOOL_HISTORY_COLLAPSE_BLOCK;
@@ -216,6 +224,96 @@ pub struct HistoryRow<'a> {
     pub id: i64,
     pub role: &'a str,
     pub content: &'a str,
+    /// A user row's `@` context spans (`chat_messages.context_blocks`, #1150).
+    pub context: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct ContextSpan {
+    start: usize,
+    end: usize,
+}
+
+/// Byte offsets for UTF-16 offsets (what the UI slices with), in order;
+/// `None` if one is past the end, mid-character or out of order.
+fn utf16_to_bytes(s: &str, offsets: &[usize]) -> Option<Vec<usize>> {
+    if offsets.windows(2).any(|w| w[0] > w[1]) {
+        return None;
+    }
+    if s.is_ascii() {
+        return offsets.iter().all(|&o| o <= s.len()).then(|| offsets.to_vec());
+    }
+    let mut out = Vec::with_capacity(offsets.len());
+    let mut units = 0usize;
+    for (byte, ch) in s.char_indices().chain(std::iter::once((s.len(), '\0'))) {
+        while out.len() < offsets.len() && offsets[out.len()] <= units {
+            if offsets[out.len()] < units {
+                return None;
+            }
+            out.push(byte);
+        }
+        units += ch.len_utf16();
+    }
+    (out.len() == offsets.len()).then_some(out)
+}
+
+/// Where a user row's `@` context blocks sit in its content, as byte spans
+/// in order. `None` for a missing, malformed or out-of-range record, which
+/// then renders and replays as an ordinary row.
+pub fn context_spans(content: &str, context_blocks: &str) -> Option<Vec<(usize, usize)>> {
+    let spans: Vec<ContextSpan> = serde_json::from_str(context_blocks).ok()?;
+    if spans.is_empty() {
+        return None;
+    }
+    let flat: Vec<usize> = spans.iter().flat_map(|s| [s.start, s.end]).collect();
+    let bytes = utf16_to_bytes(content, &flat)?;
+    Some(bytes.chunks(2).map(|c| (c[0], c[1])).collect())
+}
+
+/// The full text of block `block` (1-based) of a user row, for
+/// `recall_tool_output`.
+pub fn context_block<'a>(content: &'a str, context_blocks: &str, block: usize) -> Option<&'a str> {
+    let (start, end) = *context_spans(content, context_blocks)?.get(block.checked_sub(1)?)?;
+    Some(&content[start..end])
+}
+
+/// The smallest `@` block that is ever shortened; anything under it is
+/// re-sent whole on every turn.
+pub const CONTEXT_BLOCK_SHORTEN_MIN: usize = 8_000;
+
+/// Chars a row's shortened `@` blocks count against the thread-wide tool
+/// budget, in every turn including their own, so the count doesn't move
+/// when they shorten.
+fn shortened_context_len(content: &str, context_blocks: &str) -> usize {
+    context_spans(content, context_blocks).map_or(0, |spans| {
+        spans.iter().filter(|&&(s, e)| e - s >= CONTEXT_BLOCK_SHORTEN_MIN).count() * TOOL_RESULT_SETTLED
+    })
+}
+
+/// A user row as later turns re-send it: the typed text whole, and each `@`
+/// block of [`CONTEXT_BLOCK_SHORTEN_MIN`] or more shortened to head + tail
+/// within the settled allowance, with the recall id that brings it back.
+/// A pure function of the row, so once shortened a block is byte-stable:
+/// the one full-to-shortened change happens the turn after it was sent.
+fn abridge_context(id: i64, content: &str, context_blocks: &str) -> String {
+    let Some(spans) = context_spans(content, context_blocks) else {
+        return content.to_string();
+    };
+    let mut out = String::new();
+    let mut at = 0;
+    for (n, &(start, end)) in spans.iter().enumerate() {
+        out.push_str(&content[at..start]);
+        let block = &content[start..end];
+        if block.len() >= CONTEXT_BLOCK_SHORTEN_MIN {
+            let hint = format!(" — call recall_tool_output with message_id {id} and block {} for the full block", n + 1);
+            out.push_str(&excerpt_head_tail(block, TOOL_RESULT_SETTLED, &hint));
+        } else {
+            out.push_str(block);
+        }
+        at = end;
+    }
+    out.push_str(&content[at..]);
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +341,56 @@ fn strip_tool_calls_suffix(content: &str) -> &str {
     }
 }
 
+/// The gap-marker suffix that tells the model where a cut tool output's full
+/// text is: the tool row `id`, for `recall_tool_output`.
+pub fn recall_hint(id: i64) -> String {
+    format!(" — call recall_tool_output with message_id {id} for the full output")
+}
+
+/// Most of an MCP tool output's original that is kept for recall (1 MB).
+/// The original is the result before its binary payloads became
+/// placeholders, so it can be very large (a screenshot is megabytes of
+/// base64); past this the recall says it was cut.
+pub const ORIGINAL_CAP_BYTES: usize = 1_000_000;
+
+/// The part of `original` that is kept: its first [`ORIGINAL_CAP_BYTES`],
+/// cut on a char boundary.
+pub fn capped_original(original: &str) -> &str {
+    head_bytes(original, ORIGINAL_CAP_BYTES)
+}
+
+/// What `recall_tool_output` returns for a stored `role="tool"` row: the
+/// kept original (`chat_tool_originals`) when the row has one, else the
+/// row's `result`. The note says when the original was cut at the cap.
+pub fn recall_source(stored: &str, original: Option<(String, usize)>) -> (String, Option<String>) {
+    if let Some((kept, total)) = original {
+        let note = (kept.len() < total).then(|| {
+            format!("[original output truncated: the first {} of {total} bytes were kept]", kept.len())
+        });
+        return (kept, note);
+    }
+    let result = serde_json::from_str::<serde_json::Value>(stored)
+        .ok()
+        .and_then(|row| row.get("result").and_then(|r| r.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    (result, None)
+}
+
+/// The copy of a tool result the director's next request carries, within
+/// the turn that ran it. An MCP result is capped like a sub-agent's tool
+/// results (head + tail within `orchestrator::agentic::TOOL_RESULT_CAP_BYTES`):
+/// a server can return megabytes (a long issue list, a page dump), and the
+/// whole result would otherwise ride in every later round of the turn. The
+/// tool row keeps the full result, so the gap marker names it (`row_id`) for
+/// `recall_tool_output`. Built-in tools keep their own caps.
+pub fn tool_result_for_model(tool_name: &str, result: String, row_id: Option<i64>) -> String {
+    if !crate::mcp::is_mcp_tool(tool_name) {
+        return result;
+    }
+    let hint = row_id.map(recall_hint).unwrap_or_default();
+    excerpt_head_tail(&result, crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES, &hint)
+}
+
 /// Format one persisted `role="tool"` row for the model. `budget` is the
 /// result allowance from [`plan_tool_history`]; a truncated result names the
 /// row id so `recall_tool_output` can fetch the rest.
@@ -258,8 +406,7 @@ fn summarize_tool_row(id: i64, content: &str, budget: usize) -> Option<String> {
     } else {
         input_json
     };
-    let hint = format!(" — call recall_tool_output with message_id {id} for the full output");
-    let result_shown = excerpt_head_tail(result, budget, &hint);
+    let result_shown = excerpt_head_tail(result, budget, &recall_hint(id));
     Some(format!("[Tool #{id}: {name} | Input: {input_shown} | Result: {result_shown}]"))
 }
 
@@ -298,13 +445,20 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
             _ => {}
         }
     }
+    let mut shortened = 0usize;
     for (i, row) in rows.iter().enumerate() {
         if row.role == "tool" {
             tool_plan_input.push((ages[i], tool_len(row.content)));
         }
+        if let (Some(ctx), "user") = (row.context, row.role) {
+            shortened += shortened_context_len(row.content, ctx);
+        }
     }
-    let plan = plan_tool_history(&tool_plan_input);
+    let plan = plan_tool_history_with(&tool_plan_input, shortened);
     let mut plan_iter = plan.into_iter();
+    // The ask being answered goes out whole; an earlier one's `@` blocks
+    // settle from the next turn on, so they aren't re-sent every turn.
+    let current = rows.iter().rposition(|r| r.role == "user");
 
     // Pass 2 — assemble.
     let mut turns: Vec<HistoryTurn> = Vec::new();
@@ -334,7 +488,7 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
         content
     };
 
-    for row in rows {
+    for (i, row) in rows.iter().enumerate() {
         match row.role {
             "tool" => {
                 let budget = plan_iter.next().unwrap_or(TOOL_HISTORY_STUB);
@@ -353,7 +507,10 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
                 push_turn(&mut turns, HistoryRole::Assistant, text);
             }
             "user" => {
-                let text = flush(&mut pending, row.content);
+                let text = match row.context {
+                    Some(ctx) if Some(i) != current => flush(&mut pending, &abridge_context(row.id, row.content, ctx)),
+                    _ => flush(&mut pending, row.content),
+                };
                 push_turn(&mut turns, HistoryRole::User, text);
             }
             _ => {}
@@ -508,6 +665,68 @@ mod tests {
     }
 
     #[test]
+    fn an_mcp_result_is_capped_with_a_recall_pointer_to_its_row() {
+        let cap = crate::orchestrator::agentic::TOOL_RESULT_CAP_BYTES;
+        let big = format!("HEAD{}TAIL", "x".repeat(200_000));
+        let out = tool_result_for_model("mcp__github__list_issues", big.clone(), Some(42));
+        assert!(out.len() <= cap + 200, "{}", out.len());
+        assert!(out.starts_with("HEAD") && out.ends_with("TAIL"), "head and tail survive");
+        assert!(out.contains("chars omitted — call recall_tool_output with message_id 42 for the full output]"));
+        // No row (the thread was deleted mid-turn): capped, without a pointer.
+        let orphan = tool_result_for_model("mcp__github__list_issues", big, None);
+        assert!(orphan.len() <= cap + 200);
+        assert!(!orphan.contains("recall_tool_output"));
+    }
+
+    #[test]
+    fn recall_returns_the_kept_original_and_history_the_scrubbed_result() {
+        let row = serde_json::json!({
+            "callId": "c1",
+            "toolName": "mcp__browser__screenshot",
+            "toolInput": {},
+            "result": "[image omitted: image/png, 48 KB]",
+        })
+        .to_string();
+        let original = "{\"data\":\"iVBORw0KGgo\",\"type\":\"image\"}".to_string();
+        let total = original.len();
+        assert_eq!(recall_source(&row, Some((original.clone(), total))), (original, None));
+        // History replays `result`, the placeholder.
+        let rows = [
+            HistoryRow { id: 1, role: "user", content: "look", context: None },
+            HistoryRow { id: 2, role: "tool", content: &row, context: None },
+            HistoryRow { id: 3, role: "assistant", content: "done", context: None },
+            HistoryRow { id: 4, role: "user", content: "next", context: None },
+        ];
+        let replay = build_history(&rows).iter().map(|t| t.text.clone()).collect::<Vec<_>>().join("\n");
+        assert!(replay.contains("[image omitted: image/png, 48 KB]"), "{replay}");
+        assert!(!replay.contains("iVBORw0KGgo"), "{replay}");
+        // No original kept (a built-in tool, an older row): its result.
+        assert_eq!(recall_source(&row, None), ("[image omitted: image/png, 48 KB]".to_string(), None));
+        assert_eq!(recall_source("not json", None), (String::new(), None));
+    }
+
+    #[test]
+    fn an_original_past_the_cap_is_cut_and_the_recall_says_so() {
+        let big = "é".repeat(ORIGINAL_CAP_BYTES); // 2 MB, two bytes a char
+        let kept = capped_original(&big);
+        assert_eq!(kept.len(), ORIGINAL_CAP_BYTES, "cut on a char boundary");
+        let (text, note) = recall_source("{}", Some((kept.to_string(), big.len())));
+        assert_eq!(text.len(), ORIGINAL_CAP_BYTES);
+        assert_eq!(
+            note.as_deref(),
+            Some("[original output truncated: the first 1000000 of 2000000 bytes were kept]")
+        );
+        assert_eq!(capped_original("small"), "small");
+    }
+
+    #[test]
+    fn small_mcp_results_and_built_in_tools_pass_through() {
+        assert_eq!(tool_result_for_model("mcp__docs__search", "3 hits".into(), Some(1)), "3 hits");
+        let read = "y".repeat(90_000);
+        assert_eq!(tool_result_for_model("read_file", read.clone(), Some(1)), read, "built-ins keep their own caps");
+    }
+
+    #[test]
     fn excerpt_keeps_both_ends_and_marks_the_gap() {
         let s = format!("{}MIDDLE{}", "a".repeat(1000), "z".repeat(1000));
         let out = excerpt_head_tail(&s, 100, " — recall #7");
@@ -541,11 +760,11 @@ mod tests {
     fn history_glues_narration_and_tools_into_the_assistant_turn() {
         let t1 = tool_row(2, "run_command", "ok");
         let rows = [
-            HistoryRow { id: 1, role: "user", content: "run it" },
-            HistoryRow { id: 2, role: "assistant_tool_use", content: "I'll run it.\n\n[tool_calls: [{}]]" },
-            HistoryRow { id: 3, role: "tool", content: &t1 },
-            HistoryRow { id: 4, role: "assistant", content: "Done." },
-            HistoryRow { id: 5, role: "user", content: "thanks" },
+            HistoryRow { id: 1, role: "user", content: "run it", context: None },
+            HistoryRow { id: 2, role: "assistant_tool_use", content: "I'll run it.\n\n[tool_calls: [{}]]", context: None },
+            HistoryRow { id: 3, role: "tool", content: &t1, context: None },
+            HistoryRow { id: 4, role: "assistant", content: "Done.", context: None },
+            HistoryRow { id: 5, role: "user", content: "thanks", context: None },
         ];
         let turns = build_history(&rows);
         assert_eq!(turns.len(), 3);
@@ -564,13 +783,13 @@ mod tests {
         let old_tool = tool_row(2, "run_command", &big);
         let new_tool = tool_row(6, "run_command", &big);
         let rows = [
-            HistoryRow { id: 1, role: "user", content: "a" },
-            HistoryRow { id: 2, role: "tool", content: &old_tool },
-            HistoryRow { id: 3, role: "assistant", content: "A" },
-            HistoryRow { id: 4, role: "user", content: "b" },
-            HistoryRow { id: 5, role: "tool", content: &new_tool },
-            HistoryRow { id: 6, role: "assistant", content: "B" },
-            HistoryRow { id: 7, role: "user", content: "c" },
+            HistoryRow { id: 1, role: "user", content: "a", context: None },
+            HistoryRow { id: 2, role: "tool", content: &old_tool, context: None },
+            HistoryRow { id: 3, role: "assistant", content: "A", context: None },
+            HistoryRow { id: 4, role: "user", content: "b", context: None },
+            HistoryRow { id: 5, role: "tool", content: &new_tool, context: None },
+            HistoryRow { id: 6, role: "assistant", content: "B", context: None },
+            HistoryRow { id: 7, role: "user", content: "c", context: None },
         ];
         let turns = build_history(&rows);
         let old_len = turns[1].text.len();
@@ -590,12 +809,12 @@ mod tests {
         // survives on the user turn, and the two user rows merge into one.
         let t = tool_row(3, "read_file", "contents");
         let rows = [
-            HistoryRow { id: 1, role: "user", content: "review" },
-            HistoryRow { id: 2, role: "assistant_tool_use", content: "[tool_calls: []]" },
-            HistoryRow { id: 3, role: "tool", content: &t },
-            HistoryRow { id: 4, role: "error", content: "boom" },
-            HistoryRow { id: 5, role: "stopped", content: "stopped" },
-            HistoryRow { id: 6, role: "user", content: "continue" },
+            HistoryRow { id: 1, role: "user", content: "review", context: None },
+            HistoryRow { id: 2, role: "assistant_tool_use", content: "[tool_calls: []]", context: None },
+            HistoryRow { id: 3, role: "tool", content: &t, context: None },
+            HistoryRow { id: 4, role: "error", content: "boom", context: None },
+            HistoryRow { id: 5, role: "stopped", content: "stopped", context: None },
+            HistoryRow { id: 6, role: "user", content: "continue", context: None },
         ];
         let turns = build_history(&rows);
         assert_eq!(turns.len(), 1);
@@ -615,12 +834,114 @@ mod tests {
         })
         .to_string();
         let rows = [
-            HistoryRow { id: 1, role: "user", content: "a" },
-            HistoryRow { id: 2, role: "tool", content: &content },
-            HistoryRow { id: 3, role: "assistant", content: "A" },
+            HistoryRow { id: 1, role: "user", content: "a", context: None },
+            HistoryRow { id: 2, role: "tool", content: &content, context: None },
+            HistoryRow { id: 3, role: "assistant", content: "A", context: None },
         ];
         let turns = build_history(&rows);
         assert!(turns[1].text.len() < 1_000, "{}", turns[1].text.len());
         assert!(turns[1].text.contains("…"));
+    }
+    /// A user row as the composer saves it: the ask, then each block at its
+    /// span (UTF-16 offsets; ASCII here, so the same as bytes).
+    fn ask_with_blocks(ask: &str, blocks: &[String]) -> (String, String) {
+        let mut content = ask.to_string();
+        let mut spans = Vec::new();
+        for b in blocks {
+            let start = content.len();
+            content.push_str(b);
+            spans.push(serde_json::json!({"token": "a.ts", "kind": "file", "label": "a.ts", "tokens": 1, "start": start, "end": content.len()}));
+        }
+        (content, serde_json::Value::Array(spans).to_string())
+    }
+
+    #[test]
+    fn at_file_blocks_abridged_after_one_turn() {
+        let blocks: Vec<String> = (0..10).map(|n| format!("\n\nsrc/f{n}.ts\n```\n{}\n```", "x".repeat(60_000))).collect();
+        let (content, ctx) = ask_with_blocks("fix the null check", &blocks);
+        let ask = HistoryRow { id: 1, role: "user", content: &content, context: Some(&ctx) };
+        let row = |id: i64, role: &'static str, content: &'static str| HistoryRow { id, role, content, context: None };
+        // The turn it was attached to: every block goes out whole.
+        assert_eq!(build_history(&[ask])[0].text, content);
+        // The next turn: the typed text is whole, each block shortened to its
+        // head and tail with the id that recalls it.
+        let next = build_history(&[ask, row(2, "assistant", "Fixed."), row(3, "user", "thanks")]);
+        let shortened = &next[0].text;
+        assert!(shortened.starts_with("fix the null check\n\nsrc/f0.ts\n```\n"), "{}", &shortened[..80]);
+        assert!(shortened.len() < 10 * (TOOL_RESULT_SETTLED + 200), "{}", shortened.len());
+        assert!(shortened.contains("call recall_tool_output with message_id 1 and block 1 for the full block"));
+        assert!(shortened.contains("message_id 1 and block 10 for"));
+        assert!(shortened.ends_with("\n```"));
+        // Once: two turns on, the same bytes.
+        let later = [ask, row(2, "assistant", "Fixed."), row(3, "user", "thanks"), row(4, "assistant", "Sure."), row(5, "user", "bye")];
+        assert_eq!(&build_history(&later)[0].text, shortened);
+        // A block under CONTEXT_BLOCK_SHORTEN_MIN is re-sent whole every turn.
+        let (small, small_ctx) = ask_with_blocks("look", &[format!("\n\na.ts\n```\n{}\n```", "y".repeat(7_000))]);
+        let rows = [HistoryRow { id: 1, role: "user", content: &small, context: Some(&small_ctx) }, row(2, "user", "next")];
+        assert_eq!(build_history(&rows)[0].text, format!("{small}\n\nnext"));
+    }
+
+    #[test]
+    fn shortened_blocks_count_toward_the_thread_budget() {
+        // 52 settled tool rows (78k) fit the 80k budget on their own; two
+        // shortened blocks (3k) tip it over, so the oldest tool rows stub.
+        let tools = vec![(5, 5_000); 52];
+        assert!(plan_tool_history_with(&tools, 0).iter().all(|&g| g == TOOL_RESULT_SETTLED));
+        assert_eq!(plan_tool_history_with(&tools, 2 * TOOL_RESULT_SETTLED)[0], TOOL_HISTORY_STUB);
+        // build_history counts them from their own turn on.
+        let big = "z".repeat(CONTEXT_BLOCK_SHORTEN_MIN);
+        let (content, ctx) = ask_with_blocks("look", &[big.clone(), big]);
+        let outputs: Vec<String> = (0..52).map(|i| tool_row(i, "run_command", &"o".repeat(5_000))).collect();
+        let mut rows = vec![HistoryRow { id: 0, role: "user", content: "start", context: None }];
+        rows.extend(outputs.iter().enumerate().map(|(i, t)| HistoryRow { id: i as i64 + 1, role: "tool", content: t, context: None }));
+        rows.push(HistoryRow { id: 99, role: "assistant", content: "ok", context: None });
+        rows.push(HistoryRow { id: 100, role: "user", content: &content, context: Some(&ctx) });
+        let with_blocks = build_history(&rows)[1].text.len();
+        rows.last_mut().unwrap().context = None;
+        let without = build_history(&rows)[1].text.len();
+        assert!(with_blocks < without, "{with_blocks} vs {without}");
+    }
+
+    #[test]
+    fn recall_returns_full_context_block() {
+        let blocks = vec!["\n\nsrc/a.ts\n```\nfirst\n```".to_string(), format!("\n\nsrc/b.ts\n```\n{}\n```", "é".repeat(3))];
+        let (content, _) = ask_with_blocks("compare", &blocks);
+        // Offsets in UTF-16 units, as the UI writes them: `é` is one unit, two bytes.
+        let utf16 = |s: &str| s.encode_utf16().count();
+        let b_start = utf16("compare") + utf16(&blocks[0]);
+        let ctx = serde_json::json!([
+            {"start": utf16("compare"), "end": b_start},
+            {"start": b_start, "end": b_start + utf16(&blocks[1])},
+        ])
+        .to_string();
+        assert_eq!(context_block(&content, &ctx, 1), Some(blocks[0].as_str()));
+        assert_eq!(context_block(&content, &ctx, 2), Some(blocks[1].as_str()));
+        assert_eq!(context_block(&content, &ctx, 0), None);
+        assert_eq!(context_block(&content, &ctx, 3), None);
+        // A record that doesn't fit its content (past the end, mid-character,
+        // out of order, malformed) is no record at all.
+        assert_eq!(context_spans(&content, r#"[{"start": 0, "end": 9999}]"#), None);
+        assert_eq!(context_spans("é", r#"[{"start": 0, "end": 1}]"#), Some(vec![(0, 2)]));
+        assert_eq!(context_spans("😀", r#"[{"start": 0, "end": 1}]"#), None);
+        assert_eq!(context_spans(&content, r#"[{"start": 5, "end": 2}]"#), None);
+        assert_eq!(context_spans(&content, "not json"), None);
+        assert_eq!(context_spans(&content, "[]"), None);
+    }
+
+    #[test]
+    fn old_rows_without_context_blocks_build_history_unchanged() {
+        // An old row holds the same text, blocks and all, with no record of
+        // them: it replays verbatim, now and on every later turn, as before.
+        let (content, _) = ask_with_blocks("fix it", &[format!("\n\nsrc/a.ts\n```\n{}\n```", "x".repeat(9_000))]);
+        let old = [
+            HistoryRow { id: 1, role: "user", content: &content, context: None },
+            HistoryRow { id: 2, role: "assistant", content: "Done.", context: None },
+            HistoryRow { id: 3, role: "user", content: "and now?", context: None },
+        ];
+        let turns = build_history(&old);
+        assert_eq!(turns[0], HistoryTurn { role: HistoryRole::User, text: content.clone() });
+        // A record that doesn't fit is ignored the same way.
+        let bad = [HistoryRow { context: Some("[{\"start\": 1, \"end\": 999999}]"), ..old[0] }, old[1], old[2]];
+        assert_eq!(build_history(&bad), turns);
     }
 }

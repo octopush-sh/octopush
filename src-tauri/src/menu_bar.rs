@@ -8,9 +8,10 @@
 //! (the Dock badge's number), only when it is above 0.
 //!
 //! The menu is native (no second web surface): the count, then the crews
-//! that need you, longest-waiting first like Mission Control's needs-you
-//! band, each opening that crew's Direct surface; then Open Octopush and
-//! Quit Octopush.
+//! that need you and the Talk conversations whose approval card waits on
+//! you, longest-waiting first like Mission Control's needs-you band, each
+//! opening that crew's Direct surface or that conversation in Talk; then
+//! Open Octopush and Quit Octopush.
 //!
 //! One source of truth: [`crate::fleet_status::refresh`] reads the active
 //! runs once, on the run events it already listens to, and hands them here,
@@ -37,8 +38,11 @@ use crate::state::AppState;
 pub const TRAY_ID: &str = "fleet";
 /// Emitted to `main` when a crew is chosen in the menu: [`OpenRunPayload`].
 pub const OPEN_RUN_EVENT: &str = "octo://open-run";
+/// Emitted to `main` when a Talk conversation is chosen: [`OpenTalkPayload`].
+pub const OPEN_TALK_EVENT: &str = "octo://open-talk";
 
 const RUN_PREFIX: &str = "menu-bar:run:";
+const TALK_PREFIX: &str = "menu-bar:talk:";
 const OPEN_ID: &str = "menu-bar:open";
 const HEADER_ID: &str = "menu-bar:count";
 const MORE_ID: &str = "menu-bar:more";
@@ -145,6 +149,31 @@ pub struct Waiting {
     pub since_ms: i64,
 }
 
+/// A Talk conversation whose approval card waits on you, as the menu lists
+/// it: its oldest card ([`crate::fleet_status::talk_conversations`]). What
+/// kind of thing waits, never the command or its arguments.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TalkWaiting {
+    pub thread_id: String,
+    /// The workspace's name, else "a workspace".
+    pub name: String,
+    /// The secret guard's card (a commit or push), not a flagged command.
+    pub secret: bool,
+    /// When the card was raised (ms): the FIFO key, shared with the crews.
+    pub since_ms: i64,
+}
+
+impl TalkWaiting {
+    pub fn new(wait: &crate::chat_engine::ApprovalWait, workspace_name: Option<String>) -> Self {
+        TalkWaiting {
+            thread_id: wait.thread_id.clone(),
+            name: workspace_name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "a workspace".to_string()),
+            secret: wait.secret,
+            since_ms: wait.since_ms,
+        }
+    }
+}
+
 /// A run's status and when this session saw it change.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Seen {
@@ -219,31 +248,52 @@ pub struct MenuModel {
     pub more: Option<String>,
 }
 
-/// The status item for `fleet`, with `running` crews at work and `waiting`
-/// the crews that need you. Listed longest-waiting first (ties by run id, so
-/// the order is stable).
-pub fn model(fleet: FleetStatus, running: usize, mut waiting: Vec<Waiting>) -> MenuModel {
-    waiting.sort_by(|a, b| a.since_ms.cmp(&b.since_ms).then_with(|| a.run_id.cmp(&b.run_id)));
-    let n = fleet.needs_you as usize;
-    let crews = |k: usize| if k == 1 { "1 crew".to_string() } else { format!("{k} crews") };
-    let (state, tooltip) = if n > 0 {
-        (TrayState::Blocked, format!("Octopush — {} {}", crews(n), if n == 1 { "needs you" } else { "need you" }))
+fn crews(k: usize) -> String {
+    if k == 1 { "1 crew".to_string() } else { format!("{k} crews") }
+}
+
+fn conversations(k: usize) -> String {
+    if k == 1 { "1 conversation".to_string() } else { format!("{k} conversations") }
+}
+
+/// "1 crew needs you", "2 conversations need you", "1 crew and 1
+/// conversation need you"; `None` when nothing does.
+fn needs_you_phrase(crew_count: usize, talk_count: usize) -> Option<String> {
+    let verb = |n: usize| if n == 1 { "needs you" } else { "need you" };
+    match (crew_count, talk_count) {
+        (0, 0) => None,
+        (c, 0) => Some(format!("{} {}", crews(c), verb(c))),
+        (0, t) => Some(format!("{} {}", conversations(t), verb(t))),
+        (c, t) => Some(format!("{} and {} need you", crews(c), conversations(t))),
+    }
+}
+
+/// The status item for `fleet`, with `running` crews at work, `waiting` the
+/// crews that need you and `talk` the Talk conversations whose approval card
+/// waits on you. Listed longest-waiting first, crews and conversations
+/// together (ties by id, so the order is stable).
+pub fn model(fleet: FleetStatus, running: usize, waiting: Vec<Waiting>, talk: Vec<TalkWaiting>) -> MenuModel {
+    let mut entries: Vec<(i64, Entry)> = waiting
+        .iter()
+        .map(|w| (w.since_ms, Entry { id: format!("{RUN_PREFIX}{}", w.run_id), label: label(w) }))
+        .chain(
+            talk.iter()
+                .map(|t| (t.since_ms, Entry { id: format!("{TALK_PREFIX}{}", t.thread_id), label: talk_label(t) })),
+        )
+        .collect();
+    entries.sort_by(|(a, ea), (b, eb)| a.cmp(b).then_with(|| ea.id.cmp(&eb.id)));
+    let n = fleet.waiting() as usize;
+    let phrase = needs_you_phrase(fleet.needs_you as usize, fleet.talk as usize);
+    let (state, tooltip) = if let Some(p) = &phrase {
+        (TrayState::Blocked, format!("Octopush — {p}"))
     } else if running > 0 {
         (TrayState::Working, format!("Octopush — {} working", crews(running)))
     } else {
         (TrayState::Idle, "Octopush — idle".to_string())
     };
-    let header = match n {
-        0 => "No crew needs you".to_string(),
-        1 => "1 crew needs you".to_string(),
-        _ => format!("{n} crews need you"),
-    };
-    let items = waiting
-        .iter()
-        .take(MAX_ITEMS)
-        .map(|w| Entry { id: format!("{RUN_PREFIX}{}", w.run_id), label: label(w) })
-        .collect();
-    let more = (waiting.len() > MAX_ITEMS).then(|| format!("and {} more", waiting.len() - MAX_ITEMS));
+    let header = phrase.unwrap_or_else(|| "No crew needs you".to_string());
+    let more = (entries.len() > MAX_ITEMS).then(|| format!("and {} more", entries.len() - MAX_ITEMS));
+    let items = entries.into_iter().take(MAX_ITEMS).map(|(_, e)| e).collect();
     MenuModel { state, title: (n > 0).then(|| n.to_string()), tooltip, header, items, more }
 }
 
@@ -255,6 +305,14 @@ pub fn label(w: &Waiting) -> String {
         Some(stage) => format!("{name} · {} — {}", clip(stage.trim(), STAGE_MAX_CHARS), w.reason.word()),
         None => format!("{name} — {}", w.reason.word()),
     }
+}
+
+/// `{workspace} · Talk — a command wants approval` (or `— a commit or push
+/// wants approval` for the secret guard's card): the kind of thing, never
+/// its arguments.
+pub fn talk_label(t: &TalkWaiting) -> String {
+    let what = if t.secret { "a commit or push wants approval" } else { "a command wants approval" };
+    format!("{} · Talk — {what}", clip(t.name.trim(), NAME_MAX_CHARS))
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -273,6 +331,11 @@ pub fn menu_text(s: &str) -> String {
 /// The run a menu item opens.
 pub fn run_of(menu_id: &str) -> Option<&str> {
     menu_id.strip_prefix(RUN_PREFIX).filter(|id| !id.is_empty())
+}
+
+/// The Talk conversation a menu item opens.
+pub fn talk_of(menu_id: &str) -> Option<&str> {
+    menu_id.strip_prefix(TALK_PREFIX).filter(|id| !id.is_empty())
 }
 
 // ─── Drawing it (thin Tauri layer) ─────────────────────────────────
@@ -354,7 +417,7 @@ fn menu(app: &AppHandle, m: &MenuModel) -> tauri::Result<Menu<tauri::Wry>> {
 /// The item is built the first time it is wanted (its menu handler is
 /// registered once) and afterwards only redrawn, shown or hidden; it is
 /// always drawn before it is shown, so it never flashes what it last showed.
-pub fn update(app: &AppHandle, fleet: FleetStatus, runs: &[RunRow], parked: &[ParkedStageRow]) {
+pub fn update(app: &AppHandle, fleet: FleetStatus, runs: &[RunRow], parked: &[ParkedStageRow], talk: Vec<TalkWaiting>) {
     let seen = {
         let mut seen = SEEN.lock();
         let now = chrono::Utc::now().timestamp_millis();
@@ -376,7 +439,7 @@ pub fn update(app: &AppHandle, fleet: FleetStatus, runs: &[RunRow], parked: &[Pa
         return;
     }
     let running = runs.iter().filter(|r| r.status == "running").count();
-    let next = model(fleet, running, waiting(runs, parked, &seen));
+    let next = model(fleet, running, waiting(runs, parked, &seen), talk);
     let result = match (tray, Option::as_ref(&*shown)) {
         (None, _) => build(app, &next).map(|_| ()),
         (Some(_), Some(current)) if *current == next => return,
@@ -422,10 +485,26 @@ pub struct OpenRunPayload {
     pub project_path: String,
 }
 
+/// Where a chosen Talk conversation lives, for the window to go there.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenTalkPayload {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub project_id: String,
+    pub project_path: String,
+}
+
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     let id: &str = event.id().as_ref();
     if id == OPEN_ID {
         crate::file_open::show_main(app);
+        return;
+    }
+    if let Some(thread_id) = talk_of(id) {
+        crate::file_open::show_main(app);
+        let (app, thread_id) = (app.clone(), thread_id.to_string());
+        std::thread::spawn(move || open_talk(&app, &thread_id));
         return;
     }
     let Some(run_id) = run_of(id) else {
@@ -459,6 +538,26 @@ fn open_run(app: &AppHandle, run_id: &str) {
     }
 }
 
+fn open_talk(app: &AppHandle, thread_id: &str) {
+    let target = {
+        let state = app.state::<AppState>();
+        let db = state.db.lock();
+        db.chat_thread_home(thread_id).ok().flatten().and_then(|(workspace_id, _)| {
+            let ws = db.get_workspace(&workspace_id).ok().flatten()?;
+            let (project_id, _, project_path) = db.get_project_by_id(&ws.project_id).ok().flatten()?;
+            Some(OpenTalkPayload { thread_id: thread_id.to_string(), workspace_id: ws.id, project_id, project_path })
+        })
+    };
+    match target {
+        Some(payload) => {
+            if let Err(e) = app.emit_to("main", OPEN_TALK_EVENT, payload) {
+                tracing::warn!(error = %e, "menu bar: opening the conversation failed");
+            }
+        }
+        None => tracing::info!("menu bar: the chosen conversation is gone"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,7 +571,7 @@ mod tests {
     }
 
     fn fleet(needs_you: u32, in_flight: u32) -> FleetStatus {
-        FleetStatus { needs_you, in_flight }
+        FleetStatus { needs_you, in_flight, talk: 0 }
     }
 
     #[test]
@@ -481,6 +580,7 @@ mod tests {
             fleet(3, 0),
             0,
             vec![waiting_run("c", "billing", 300), waiting_run("b", "docs", 100), waiting_run("a", "auth-flow", 100)],
+            Vec::new(),
         );
         let ids: Vec<&str> = m.items.iter().map(|e| e.id.as_str()).collect();
         // Same wait: the run id breaks the tie, whatever order they came in.
@@ -492,31 +592,65 @@ mod tests {
 
     #[test]
     fn the_count_rides_beside_the_icon_only_above_zero() {
-        let m = model(fleet(2, 1), 1, vec![waiting_run("a", "x", 1), waiting_run("b", "y", 2)]);
+        let m = model(fleet(2, 1), 1, vec![waiting_run("a", "x", 1), waiting_run("b", "y", 2)], Vec::new());
         assert_eq!(m.title.as_deref(), Some("2"));
         assert_eq!(m.header, "2 crews need you");
         assert_eq!(m.tooltip, "Octopush — 2 crews need you");
         assert_eq!(m.state, TrayState::Blocked);
 
-        let m = model(fleet(1, 0), 0, vec![waiting_run("a", "x", 1)]);
+        let m = model(fleet(1, 0), 0, vec![waiting_run("a", "x", 1)], Vec::new());
         assert_eq!((m.header.as_str(), m.title.as_deref()), ("1 crew needs you", Some("1")));
         assert_eq!(m.tooltip, "Octopush — 1 crew needs you");
 
-        let m = model(fleet(0, 2), 2, Vec::new());
+        let m = model(fleet(0, 2), 2, Vec::new(), Vec::new());
         assert_eq!(m.title, None);
         assert_eq!(m.header, "No crew needs you");
         assert!(m.items.is_empty() && m.more.is_none());
         assert_eq!((m.state, m.tooltip.as_str()), (TrayState::Working, "Octopush — 2 crews working"));
 
         // A plan park that resumes on its own is in flight, not at work.
-        let m = model(fleet(0, 1), 0, Vec::new());
+        let m = model(fleet(0, 1), 0, Vec::new(), Vec::new());
         assert_eq!((m.state, m.tooltip.as_str()), (TrayState::Idle, "Octopush — idle"));
+    }
+
+    #[test]
+    fn a_talk_approval_is_listed_with_the_crews_by_how_long_it_waited() {
+        let wait = crate::chat_engine::ApprovalWait {
+            workspace_id: "w".into(),
+            thread_id: "th-1".into(),
+            secret: false,
+            since_ms: 50,
+        };
+        let talk = TalkWaiting::new(&wait, Some("auth-flow".into()));
+        let fleet = FleetStatus { needs_you: 1, in_flight: 0, talk: 1 };
+        let m = model(fleet, 0, vec![waiting_run("r1", "billing", 100)], vec![talk]);
+        let ids: Vec<&str> = m.items.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["menu-bar:talk:th-1", "menu-bar:run:r1"], "the conversation waited longer");
+        assert_eq!(m.items[0].label, "auth-flow · Talk — a command wants approval");
+        let secret = TalkWaiting::new(&crate::chat_engine::ApprovalWait { secret: true, ..wait.clone() }, Some("auth-flow".into()));
+        assert_eq!(talk_label(&secret), "auth-flow · Talk — a commit or push wants approval");
+        assert_eq!(talk_of(ids[0]), Some("th-1"));
+        assert_eq!(run_of(ids[0]), None);
+        assert_eq!(talk_of(ids[1]), None);
+        assert_eq!(m.title.as_deref(), Some("2"));
+        assert_eq!(m.header, "1 crew and 1 conversation need you");
+        assert_eq!((m.state, m.tooltip.as_str()), (TrayState::Blocked, "Octopush — 1 crew and 1 conversation need you"));
+
+        // Talk alone, and a workspace with no name.
+        let alone = TalkWaiting::new(&wait, None);
+        assert_eq!(alone.name, "a workspace");
+        let m = model(FleetStatus { talk: 2, ..FleetStatus::default() }, 0, Vec::new(), vec![alone.clone(), alone]);
+        assert_eq!(m.header, "2 conversations need you");
+        assert_eq!(m.state, TrayState::Blocked);
+        let m = model(FleetStatus { talk: 1, ..FleetStatus::default() }, 0, Vec::new(), Vec::new());
+        assert_eq!(m.header, "1 conversation needs you");
+        assert_eq!(talk_of("menu-bar:talk:"), None);
     }
 
     #[test]
     fn past_ten_crews_the_rest_are_counted() {
         let crews: Vec<Waiting> = (0..13).map(|i| waiting_run(&format!("r{i:02}"), "ws", i)).collect();
-        let m = model(fleet(13, 0), 0, crews);
+        let m = model(fleet(13, 0), 0, crews, Vec::new());
         assert_eq!(m.items.len(), MAX_ITEMS);
         assert_eq!(m.more.as_deref(), Some("and 3 more"));
         assert_eq!(m.header, "13 crews need you");
@@ -661,7 +795,7 @@ mod tests {
             crate::fleet_status::derive(runs.iter().map(|r| (r.status.as_str(), crate::fleet_status::plan_waiting(r))));
         assert_eq!((fleet.needs_you, fleet.badge()), (2, Some(2)), "the calm plan park isn't counted");
         let seen = track_since(&HashMap::new(), runs.iter().map(|r| (r.id.as_str(), r.status.as_str())), 0);
-        let m = model(fleet, 1, waiting(&runs, &parked, &seen));
+        let m = model(fleet, 1, waiting(&runs, &parked, &seen), Vec::new());
         assert_eq!(m.items.len() as u32, fleet.needs_you);
         assert_eq!(m.title.as_deref(), Some("2"));
         // c was created first, so it has waited longest; d, older still, is in flight.
@@ -679,7 +813,7 @@ mod tests {
         let crews = waiting(&runs, &[], &seen);
         let x = crews.iter().find(|w| w.run_id == "x").unwrap();
         assert_eq!(x.since_ms, stopped_at);
-        let m = model(fleet(2, 0), 0, crews);
+        let m = model(fleet(2, 0), 0, crews, Vec::new());
         let ids: Vec<&str> = m.items.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["menu-bar:run:y", "menu-bar:run:x"]);
     }

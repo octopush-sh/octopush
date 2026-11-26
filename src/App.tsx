@@ -83,7 +83,7 @@ import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
 import { focus as focusPane, useTerminalLayoutStore } from "./stores/terminalLayoutStore";
 import { useTerminalSlotsStore } from "./stores/terminalSlotsStore";
-import { useChatStore } from "./stores/chatStore";
+import { useChatStore, workingTalkWorkspaces } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
 import { useShallow } from "zustand/react/shallow";
@@ -127,7 +127,7 @@ import { useReviewSource } from "./stores/reviewSourceStore";
 import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
-import { ipc, type OpenInWorkspacePayload, type OpenRunPayload } from "./lib/ipc";
+import { ipc, type OpenInWorkspacePayload, type OpenRunPayload, type OpenTalkPayload } from "./lib/ipc";
 import { noticeUnreadableSettings } from "./lib/settingsNotice";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
@@ -197,8 +197,10 @@ function App() {
   // RUN/terminal uses `TerminalState.busy` — the daemon's foreground signal
   // ("a non-shell command owns the PTY"), NOT `running` (= shell session alive,
   // which would mark the bar forever for any open terminal).
+  // A turn parked on an approval card isn't working: it waits on you, so the
+  // rail shows the workspace's needs-you flag instead of the marching edge.
   const chatRunningIds = useChatStore(
-    useShallow((s) => Object.keys(s.streamingByWs).filter((id) => s.streamingByWs[id])),
+    useShallow((s) => workingTalkWorkspaces(s.streamingByWs, s.pendingApprovalsByWs)),
   );
   const directRunningIds = useRunsStore(
     useShallow((s) => Object.keys(s.runsByWs).filter((id) => hasActiveDirectRun(s.runsByWs[id]))),
@@ -1904,6 +1906,29 @@ function App() {
     };
   }, []);
 
+  // The menu bar Octo: a Talk conversation whose approval card waits. Same
+  // landing as a crew, on Talk, with that conversation shown (chosen before
+  // the project loads, so `loadHistory` keeps it).
+  const openTalkRef = useRef<(p: OpenTalkPayload) => void>(() => {});
+  openTalkRef.current = (p) => {
+    closeOverlays();
+    setModePerWorkspace((m) => ({ ...m, [p.workspaceId]: "talk" }));
+    const chat = useChatStore.getState();
+    if (chat.activeThreadByWs[p.workspaceId] !== p.threadId) void chat.selectThread(p.workspaceId, p.threadId);
+    if (p.projectId === project?.id) {
+      selectWorkspace(p.workspaceId);
+      return;
+    }
+    rememberActiveForProject(p.projectId, p.workspaceId);
+    void openProject(p.projectPath);
+  };
+  useEffect(() => {
+    const unlisten = ipc.onOpenTalkFromMenuBar((p) => openTalkRef.current(p));
+    return () => {
+      unlisten.then((u) => u());
+    };
+  }, []);
+
   // Mission Control attention items → the mission's Talk (chat) / Run (terminal)
   // surface. Focusing the matching workspace+mode clears the attention flag.
   const handleJumpToAttention = useCallback(
@@ -1911,6 +1936,8 @@ function App() {
       setMissionControlOpen(false);
       handleSelectWorkspace(workspaceId);
       setModePerWorkspace((p) => ({ ...p, [workspaceId]: kind === "chat" ? "talk" : "run" }));
+      // A waiting approval card may sit in another conversation: show it.
+      if (kind === "chat") useChatStore.getState().showPendingApproval(workspaceId);
     },
     [handleSelectWorkspace],
   );

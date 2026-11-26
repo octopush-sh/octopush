@@ -473,6 +473,9 @@ export interface ChatMessage {
   /** The size of the LAST prompt of the turn (uncached + cached + written)
    *  — what the context meter shows. */
   contextTokens?: number | null;
+  /** A user row's `@` context blocks (`SentContextBlock[]` as JSON, #1150);
+   *  absent on older rows. */
+  contextBlocks?: string | null;
 }
 
 /** What one Talk conversation has cost so far, from the ledger (director
