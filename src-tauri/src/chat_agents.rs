@@ -1931,6 +1931,7 @@ mod tests {
             cache_creation_tokens: 0,
             rate_limit: None,
             raw_content: vec![],
+            ..Default::default()
         }
     }
     struct Recorder {

@@ -17,6 +17,10 @@ pub struct AnthropicProvider;
 /// How a request error's message opens.
 const WHAT: &str = "Anthropic request failed";
 
+/// How long an Anthropic stream may send nothing (`super::stream_idle`): the
+/// API sends `ping`s while it works, so a silent minute means it is gone.
+pub const STREAM_IDLE: Duration = Duration::from_secs(60);
+
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     async fn complete(
@@ -54,7 +58,7 @@ impl LlmProvider for AnthropicProvider {
         let resp = post_messages(api_base, api_key, &body, client).await?;
         let rate_limit = parse_rate_limit(resp.headers());
         // A model server on this Mac may think for longer than any bound.
-        let idle = (!super::is_loopback_base(api_base)).then_some(super::STREAM_IDLE);
+        let idle = super::stream_idle(api_base, STREAM_IDLE);
         let mut parsed = read_stream(super::sse::Body(resp, WHAT), idle, sink).await?;
         parsed.rate_limit = rate_limit;
         Ok(parsed)
@@ -661,5 +665,6 @@ pub fn parse_response(response: Value) -> LlmResponse {
         // Filled by `complete()` from response headers; the pure parser has none.
         rate_limit: None,
         raw_content,
+        usage_unreported: false,
     }
 }

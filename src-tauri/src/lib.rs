@@ -290,6 +290,7 @@ pub fn run() {
             commands::undo_talk_rewind,
             commands::fork_chat_thread,
             commands::list_skills,
+            commands::list_skipped_skills,
             commands::list_subagent_types,
             commands::read_attachment,
             commands::list_mcp_tools,
