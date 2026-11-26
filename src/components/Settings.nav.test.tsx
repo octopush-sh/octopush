@@ -49,4 +49,38 @@ describe("Settings — grouped navigation", () => {
     expect(screen.getByText("How code reads.")).toBeInTheDocument();
     expect(screen.queryByText("The basics.")).not.toBeInTheDocument();
   });
+
+  it("the active row keeps the same font, size and height as the rest", async () => {
+    await renderSettings();
+    const rowShape = (name: string) => {
+      const button = screen.getByRole("button", { name });
+      const label = button.querySelector("span")!;
+      return {
+        button: button.className,
+        font: label.className.split(" ").filter((c) => !c.startsWith("text-octo-") && !c.startsWith("hover:")),
+      };
+    };
+    const atRest = rowShape("Editor");
+    const active = rowShape("General");
+    expect(screen.getByRole("button", { name: "General" })).toHaveAttribute("aria-current", "page");
+    expect(active).toEqual(atRest);
+    expect(active.font).toContain("font-sans");
+    expect(active.font).not.toContain("font-serif");
+    expect(active.button).toContain("h-8");
+
+    // Switching tabs changes only colour: the old row and the new one keep their shape.
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Editor" })); });
+    expect(rowShape("Editor")).toEqual(atRest);
+    expect(rowShape("General")).toEqual(atRest);
+  });
+
+  it("reserves the border slot on rows at rest", async () => {
+    await renderSettings();
+    const rest = screen.getByRole("button", { name: "Editor" });
+    const active = screen.getByRole("button", { name: "General" });
+    expect(rest.className).toContain("border");
+    expect(rest.style.borderColor).toBe("transparent");
+    expect(active.style.borderColor).toBe("var(--brass-dim)");
+    expect(active.style.background).toBe("var(--brass-ghost)");
+  });
 });

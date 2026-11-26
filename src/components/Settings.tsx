@@ -126,23 +126,26 @@ function TabButton({ label, tour, active, onClick }: {
   active: boolean;
   onClick: () => void;
 }) {
+  // Every row has the same height, font and 1px border slot in every state;
+  // only the ground, border colour and text colour mark the active row, so
+  // switching tabs never moves a row below it.
   return (
     <button
       type="button"
       data-tour={tour}
       onClick={onClick}
       aria-current={active ? "page" : undefined}
-      className="mb-0.5 flex w-full items-baseline rounded-md px-3 py-1.5 text-left transition"
+      className="mb-0.5 flex h-8 w-full items-center rounded-md border border-solid px-3 text-left transition"
       style={
         active
-          ? { background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }
-          : { border: "1px solid transparent" }
+          ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" }
+          : { borderColor: "transparent" }
       }
     >
       <span
         className={
           active
-            ? "font-serif text-[14px] text-octo-brass"
+            ? "font-sans text-[13px] text-octo-brass"
             : "font-sans text-[13px] text-octo-sage hover:text-octo-ivory"
         }
       >
