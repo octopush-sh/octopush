@@ -1411,7 +1411,7 @@ mod retry {
     async fn drive(provider: &ScriptedProvider, cancel: &AtomicBool, max_retries: u32) -> (AppResult<LlmResponse>, u32) {
         let client = reqwest::Client::new();
         let retries = AtomicU32::new(0);
-        let mut on_retry = |_a: u32, _d: u64, _k: ProviderErrorKind| {
+        let mut on_retry = |_a: u32, _of: u32, _d: u64, _k: ProviderErrorKind| {
             retries.fetch_add(1, Ordering::Relaxed);
         };
         let req = super::sample_request();
@@ -1556,7 +1556,8 @@ mod cancellable {
         }
     }
 
-    type Retries = Arc<Mutex<Vec<(u32, u64, ProviderErrorKind)>>>;
+    /// Each announced wait: (attempt, of, delay, kind).
+    type Retries = Arc<Mutex<Vec<(u32, u32, u64, ProviderErrorKind)>>>;
 
     async fn call(
         provider: &dyn LlmProvider,
@@ -1567,7 +1568,7 @@ mod cancellable {
     ) -> (Completion, Retries) {
         let seen: Retries = Arc::default();
         let log = Arc::clone(&seen);
-        let mut on_retry = move |a: u32, d: u64, k: ProviderErrorKind| log.lock().unwrap().push((a, d, k));
+        let mut on_retry = move |a: u32, of: u32, d: u64, k: ProviderErrorKind| log.lock().unwrap().push((a, of, d, k));
         let req = super::sample_request();
         let out = complete_cancellable(provider, api_base, Some("key"), &req, client, cancel, max_retries, &mut on_retry).await;
         (out, seen)
@@ -1589,9 +1590,9 @@ mod cancellable {
         let (out, retries) = call(&p, &reqwest::Client::new(), "http://x", &cancel, 5).await;
         assert!(matches!(out, Completion::Done(ref r) if r.text == "done"), "{out:?}");
         assert_eq!(p.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(*retries.lock().unwrap(), vec![(1, 0, ProviderErrorKind::Overloaded)]);
+        assert_eq!(*retries.lock().unwrap(), vec![(1, 5, 0, ProviderErrorKind::Overloaded)]);
         // The words the turn shows are the sub-agents' journal words.
-        assert_eq!(retry_notice(1, 8, ProviderErrorKind::Overloaded), "model overloaded — retrying in 8s (retry 1 of 5)");
+        assert_eq!(retry_notice(1, 5, 8, ProviderErrorKind::Overloaded), "model overloaded — retrying in 8s (retry 1 of 5)");
     }
 
     #[tokio::test]
@@ -1775,6 +1776,10 @@ mod cancellable {
         // One retry after a 2s wait, not five over about a minute.
         assert!(started.elapsed() < Duration::from_secs(6), "took {:?}", started.elapsed());
         assert_eq!(retries.lock().unwrap().len(), LOCAL_CONNECT_RETRIES as usize);
+        // Announced against the local budget: "retry 1 of 1", not "of 5".
+        let (attempt, of, delay, kind) = retries.lock().unwrap()[0];
+        assert_eq!((attempt, of), (1, LOCAL_CONNECT_RETRIES));
+        assert_eq!(retry_notice(attempt, of, delay, kind), "network error — retrying in 2s (retry 1 of 1)");
         let (error, n) = match out {
             Completion::Failed { error, retries } => (error, retries),
             other => panic!("expected a failure, got {other:?}"),

@@ -81,7 +81,9 @@ fn recall_tool_definition() -> LlmTool {
              context as `[Tool #<message_id>: …]`; when one says chars were omitted \
              and you need that part, call this with its message_id instead of \
              re-running the tool. Pass offset/limit (in characters) to page through \
-             a very long output."
+             a very long output. An `@` context block of an earlier user message \
+             that says chars were omitted comes back the same way: its message_id \
+             and block number."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -89,6 +91,10 @@ fn recall_tool_definition() -> LlmTool {
                 "message_id": {
                     "type": "integer",
                     "description": "The #id shown on the abridged tool summary"
+                },
+                "block": {
+                    "type": "integer",
+                    "description": "For an abridged @ context block: its block number"
                 },
                 "offset": {
                     "type": "integer",
@@ -195,6 +201,11 @@ pub struct ChatRequest {
     /// for this send (the user consciously chose "Override for this turn").
     #[serde(default)]
     pub override_budget: bool,
+    /// Where the `@` context blocks sit in `user_message` (#1150), saved on
+    /// the user row: the thread shows the ask as typed, and later turns
+    /// re-send the blocks abridged.
+    #[serde(default)]
+    pub context_blocks: Option<String>,
 }
 
 /// A base64 image attachment sent with a user turn.
@@ -664,6 +675,12 @@ impl ApprovalBroker {
     pub fn retire_workspace(&self, workspace_id: &str) {
         self.retired.lock().insert(workspace_id.to_string());
         self.deny_where(|r| r.workspace_id == workspace_id);
+    }
+
+    /// The workspace's deletion failed, so it stays: its conversations may
+    /// ask again.
+    pub fn reinstate_workspace(&self, workspace_id: &str) {
+        self.retired.lock().remove(workspace_id);
     }
 
     /// Whether a card from `workspace_id` may wait for an answer.
@@ -2128,6 +2145,17 @@ impl ChatEngine {
         self.approvals.retire_workspace(workspace_id);
     }
 
+    /// `delete_workspace` is done with the row: if removing it failed, the
+    /// workspace stays, so it is reinstated in the approval broker (its
+    /// cards would otherwise be denied, unseen, until a restart). Its turns
+    /// stay stopped, as after Stop. Returns `deleted` unchanged.
+    pub fn finish_workspace_delete<T>(&self, workspace_id: &str, deleted: AppResult<T>) -> AppResult<T> {
+        if deleted.is_err() {
+            self.approvals.reinstate_workspace(workspace_id);
+        }
+        deleted
+    }
+
     /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
     /// A rewind waits for it: it would race the agent's own writes.
     pub fn is_running(&self, thread_id: &str) -> bool {
@@ -2209,6 +2237,14 @@ impl ChatEngine {
             .map(|l| l as usize)
             .unwrap_or(RECALL_DEFAULT_LIMIT)
             .clamp(1, RECALL_MAX_LIMIT);
+        if let Some(block) = input.get("block").and_then(|v| v.as_u64()) {
+            let row = self.db.lock().get_chat_sent_context(thread_id, message_id).ok().flatten();
+            let text = row.as_ref().and_then(|(c, ctx)| crate::chat_history::context_block(c, ctx, block as usize));
+            return match text {
+                Some(t) => (window_text(t, offset, limit), true),
+                None => (format!("No context block {block} on message {message_id} in this conversation"), false),
+            };
+        }
         let stored = match self.db.lock().get_chat_tool_output(thread_id, message_id) {
             Ok(Some(c)) => c,
             Ok(None) => {
@@ -2219,14 +2255,16 @@ impl ChatEngine {
             }
             Err(e) => return (format!("Failed to load tool output: {e}"), false),
         };
-        let result = serde_json::from_str::<serde_json::Value>(&stored)
-            .ok()
-            .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(str::to_string))
-            .unwrap_or_default();
+        let original = self.db.lock().get_chat_tool_original(thread_id, message_id).ok().flatten();
+        let (result, cut) = crate::chat_history::recall_source(&stored, original);
         if result.is_empty() {
             return (format!("Tool output #{message_id} is empty"), true);
         }
-        (window_text(&result, offset, limit), true)
+        let window = window_text(&result, offset, limit);
+        match cut {
+            Some(note) => (format!("{window}\n{note}"), true),
+            None => (window, true),
+        }
     }
 
     /// Show `line` (a journal line, e.g. a retry or a rate-limit pause) on
@@ -2258,9 +2296,9 @@ impl ChatEngine {
         req: &LlmRequest,
         cancel: &AtomicBool,
     ) -> Completion {
-        let mut on_retry = |attempt: u32, delay: u64, kind: ProviderErrorKind| {
+        let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
             tracing::warn!(attempt, delay, kind = kind.label(), "Talk director: provider call failed; retrying");
-            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, delay, kind), delay);
+            self.emit_turn_notice(app, workspace_id, thread_id, &retry_notice(attempt, of, delay, kind), delay);
         };
         complete_cancellable(provider, api_base, api_key, req, &self.client, cancel, DEFAULT_MAX_RETRIES, &mut on_retry)
             .await
@@ -2966,7 +3004,7 @@ impl ChatEngine {
         // DB id. Skipped on regenerate: history already ends with the user turn
         // (the old assistant turn was truncated), so we just re-run the loop.
         if !request.regenerate {
-            self.insert_and_emit_message(
+            let id = self.insert_and_emit_message(
                 &app,
                 &request.workspace_id,
                 &request.thread_id,
@@ -2974,6 +3012,15 @@ impl ChatEngine {
                 &request.user_message,
                 None, None, None, None,
             )?;
+            // Without the record the ask still runs; it renders and replays
+            // as before, with its blocks whole.
+            if let Some(ctx) = request.context_blocks.as_deref() {
+                if crate::chat_history::context_spans(&request.user_message, ctx).is_none() {
+                    tracing::warn!(message_id = id, "the ask's @ context blocks don't fit its text; not saved");
+                } else if let Err(e) = self.db.lock().set_chat_message_context(id, ctx) {
+                    tracing::warn!(error = %e, message_id = id, "failed to save the ask's @ context blocks");
+                }
+            }
         }
 
         // Build conversation history (this thread only) as normalized
@@ -3005,7 +3052,7 @@ impl ChatEngine {
 
         let rows: Vec<HistoryRow<'_>> = history
             .iter()
-            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str() })
+            .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_blocks.as_deref() })
             .collect();
         let mut messages: Vec<LlmMessage> = build_history(&rows)
             .into_iter()
@@ -3153,13 +3200,10 @@ impl ChatEngine {
             // Discovery may have started servers or seen one fail: the
             // Companion's chips re-read their status.
             let _ = app.emit(crate::mcp::scope::STATUS_CHANGED_EVENT, ());
-            for t in discovered {
-                tools.push(LlmTool {
-                    name: t.namespaced,
-                    description: t.description,
-                    input_schema: t.input_schema,
-                });
-            }
+            // In `mcp::sort_tools` order (server, then tool): the same config
+            // gives the same tool bytes on every turn, so the provider's
+            // prompt cache, which starts at the tool list, survives.
+            tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
         }
 
         let mut usage = TurnUsage::default();
@@ -3628,6 +3672,9 @@ impl ChatEngine {
                 // A sub-agent's outcome was collected in the fan-out; its
                 // meta rides on the persisted tool row (`agent` key).
                 let mut agent_meta: Option<AgentOutcome> = None;
+                // An MCP result whose binary payloads the model reads as
+                // placeholders: the original, kept on the row for recall.
+                let mut mcp_original: Option<String> = None;
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
@@ -3664,7 +3711,10 @@ impl ChatEngine {
                     )
                     .await
                     {
-                        Ok(out) => (out, true),
+                        Ok(out) => {
+                            mcp_original = out.original;
+                            (out.text, true)
+                        }
                         Err(e) => (e, false),
                     }
                 } else if u.name == "run_command" && self.talk_shell.available() && sandbox_roots.is_none() {
@@ -3825,6 +3875,7 @@ impl ChatEngine {
                     .lock()
                     .chat_thread_exists(&request.thread_id)
                     .unwrap_or(true);
+                let mut row_id: Option<i64> = None;
                 if thread_alive {
                     match self.insert_and_emit_message(
                         &app,
@@ -3837,20 +3888,34 @@ impl ChatEngine {
                         // The saved run points at its row so a continuation
                         // can rewrite the report in place.
                         Ok(id) if is_agent => {
+                            row_id = Some(id);
                             if let Err(e) = self.db.lock().set_chat_agent_run_message(&u.id, id) {
                                 tracing::warn!(error = %e, "failed to link sub-agent run to its row");
                             }
                         }
-                        Ok(_) => {}
+                        Ok(id) => {
+                            row_id = Some(id);
+                            // The row's `result` is what the model, the card
+                            // and later turns read. The original goes to its
+                            // own table, capped, for recall only: the webview
+                            // never receives it.
+                            if let Some(original) = mcp_original.take() {
+                                if let Err(e) = self.db.lock().set_chat_tool_original(id, &request.thread_id, &original) {
+                                    tracing::warn!(error = %e, "failed to keep the original MCP output for recall");
+                                }
+                            }
+                        }
                         Err(e) => {
                             tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
                         }
                     }
                 }
 
+                // The row keeps the whole result; an MCP result is capped
+                // in the copy the next round carries.
                 tool_results.push(LlmToolResult {
                     tool_use_id: u.id.clone(),
-                    content: result,
+                    content: crate::chat_history::tool_result_for_model(&u.name, result, row_id),
                     is_error: false,
                 });
             }
@@ -4248,6 +4313,32 @@ mod continuation_tests {
         engine.record_subagent_spend("ws-1", "t-2", "call-2", &unknown);
         let c = db.lock().thread_cost("t-2", None).unwrap();
         assert_eq!((c.unpriced_calls, c.subagents_usd), (1, 0.0));
+    }
+
+    #[test]
+    fn recall_returns_a_context_block_by_message_and_block() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let (thread, ask) = {
+            let d = db.lock();
+            d.insert_project("p", "P", "/tmp/p").unwrap();
+            d.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+            let t = d.create_chat_thread("ws", "T").unwrap();
+            let id = d.insert_chat_message("ws", &t.id, "user", "fix @a.ts\n\na.ts\n```\nx\n```", None, None, None, None).unwrap();
+            d.set_chat_message_context(id, r#"[{"token":"a.ts","kind":"file","label":"a.ts","tokens":4,"start":9,"end":25}]"#).unwrap();
+            (t.id, id)
+        };
+        let recall = |thread: &str, input: serde_json::Value| engine.recall_tool_output(thread, &input);
+        assert_eq!(recall(&thread, serde_json::json!({"message_id": ask, "block": 1})), ("\n\na.ts\n```\nx\n```".to_string(), true));
+        assert_eq!(
+            recall(&thread, serde_json::json!({"message_id": ask, "block": 1, "offset": 2, "limit": 4})).0,
+            "(chars 3-6 of 16)\na.ts"
+        );
+        let (missing, ok) = recall(&thread, serde_json::json!({"message_id": ask, "block": 2}));
+        assert!(!ok && missing.contains("No context block 2"), "{missing}");
+        // Another thread can't reach it.
+        assert!(!recall("another-thread", serde_json::json!({"message_id": ask, "block": 1})).1);
     }
 }
 
@@ -4722,6 +4813,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_workspace_delete_lets_its_conversations_ask_again() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+
+        engine.cancel_workspace("w1", &["t1".to_string()]);
+        assert!(!engine.approvals.admits("w1"));
+        let failed: AppResult<()> = Err(AppError::Other("database is locked".into()));
+        assert!(engine.finish_workspace_delete("w1", failed).is_err(), "the error still reaches the caller");
+        assert!(engine.approvals.admits("w1"), "the workspace stays, and so may its cards");
+
+        engine.cancel_workspace("w2", &[]);
+        assert!(engine.finish_workspace_delete("w2", Ok(())).is_ok());
+        assert!(!engine.approvals.admits("w2"), "a deleted workspace stays retired");
+    }
+
+    #[test]
     fn approval_decision_parse() {
         assert_eq!(ApprovalDecision::parse("approve"), ApprovalDecision::Approve);
         assert_eq!(ApprovalDecision::parse("always"), ApprovalDecision::ApproveAlways);
@@ -4963,7 +5071,7 @@ mod director_reliability_tests {
     #[test]
     fn a_journal_line_becomes_a_player_label() {
         assert_eq!(
-            notice_label(&retry_notice(2, 4, ProviderErrorKind::RateLimit)),
+            notice_label(&retry_notice(2, 5, 4, ProviderErrorKind::RateLimit)),
             "Rate limit reached — retrying in 4s (retry 2 of 5)"
         );
         assert_eq!(

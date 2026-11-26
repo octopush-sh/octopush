@@ -19,9 +19,9 @@ import {
   type ContextCatalog,
 } from "../../lib/talkContext";
 import {
-  joinBlocks,
   resolveContextBlocks,
   scanContextBlocks,
+  withContext,
   type ResolvedBlock,
 } from "../../lib/talkContextResolve";
 import type { SecretRefusal } from "../../lib/secretGuard";
@@ -588,8 +588,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
     // Expand the @ mentions — files, line ranges, folders, Run sessions, the
     // diff — into fenced context blocks appended to the message, so the model
-    // receives them. The chat shows exactly what was sent (transparent). Each
-    // block is capped at 64k; one that can't be read says so in the message.
+    // receives them. The thread shows the ask as typed, each block a chip
+    // that opens it (#1150). Each block is capped at 64k; one that can't be
+    // read says so in the message.
     // At most MAX_MENTIONS ride along. Before anything is sent, the secret
     // guard reads every block; a finding, or a block it couldn't scan, waits
     // for the confirm (#1046).
@@ -616,7 +617,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           setContextGuard({ ...verdict, blocks, outgoing, draft: trimmed, workspaceId, workspacePath });
           return;
         }
-        send(workspaceId, workspacePath, outgoing + joinBlocks(blocks));
+        sendWithContext(workspaceId, workspacePath, outgoing, blocks);
       } finally {
         if (!held) {
           expandingRef.current = false;
@@ -626,6 +627,12 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     })();
   }, [streaming, send, runShell, workspaceId, workspacePath, catalog, files]);
 
+  /** Send the typed text with its blocks, and where each one sits (#1150). */
+  function sendWithContext(wsId: string, wsPath: string, typed: string, blocks: ResolvedBlock[], leaveOut?: Set<number>, unchecked?: Set<number>) {
+    const { content, context } = withContext(typed, blocks, leaveOut, unchecked);
+    send(wsId, wsPath, content, undefined, { context });
+  }
+
   /** The confirm's answer: send without the flagged blocks (each says it was
    *  left out, and why), or with them for this one message. */
   function resolveContextGuard(sendAnyway: boolean) {
@@ -634,7 +641,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     setContextGuard(null);
     expandingRef.current = false;
     setExpanding(false);
-    send(g.workspaceId, g.workspacePath, g.outgoing + joinBlocks(g.blocks, sendAnyway ? undefined : g.flagged, g.unchecked));
+    sendWithContext(g.workspaceId, g.workspacePath, g.outgoing, g.blocks, sendAnyway ? undefined : g.flagged, g.unchecked);
     textareaRef.current?.focus();
   }
 

@@ -12,6 +12,7 @@ import { notifyApprovalWaiting } from "../lib/approvalNotifications";
 import { deriveChatTitle } from "../lib/chatTitle";
 import { helperModelNow } from "../lib/helperModels";
 import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
+import { parseSentContext, typedText, type SentContextBlock } from "../lib/sentContext";
 
 export interface ToolExecution {
   toolName: string;
@@ -318,6 +319,10 @@ const EMPTY_SKILL_NAMES: string[] = [];
 const EMPTY_APPROVALS: PendingApproval[] = [];
 const EMPTY_CAPS: PendingCap[] = [];
 
+/** A turn's `@` block spans, by thread, until its user row lands: the backend
+ *  saves them on the row, and `chat://message-added` doesn't carry them. */
+const pendingContext = new Map<string, { content: string; contextBlocks: string }>();
+
 /** The per-turn budget decision. `blocked` → the workspace/global cap is hit and
  *  no override was available (refuse the turn). `overrode` → the cap was hit but a
  *  per-turn override was consumed, so the turn proceeds AND the backend gate must
@@ -485,7 +490,7 @@ interface ChatState {
     workspacePath: string,
     content: string,
     systemPrompt?: string,
-    opts?: { attachments?: boolean; onDispatched?: () => void },
+    opts?: { attachments?: boolean; onDispatched?: () => void; context?: SentContextBlock[] },
   ) => Promise<boolean>;
   /** Internal: dispatch one agentic turn (shared by send / regenerate).
    *  Resolves `false` when the IPC failed. */
@@ -500,6 +505,8 @@ interface ChatState {
       regenerate?: boolean;
       /** The turn's budget override was consumed → tell the backend to skip its gate. */
       overrideBudget?: boolean;
+      /** Where the `@` blocks sit in `userMessage` (#1150). */
+      context?: SentContextBlock[];
     },
   ) => Promise<boolean>;
   /** Internal: budget-gate, truncate from a cutoff message id, then dispatch.
@@ -515,6 +522,7 @@ interface ChatState {
       attachments?: Attachment[];
       regenerate?: boolean;
       overrideBudget?: boolean;
+      context?: SentContextBlock[];
     },
   ) => Promise<void>;
   /** Regenerate an assistant turn: drop it (and any trailing tool rows) back to
@@ -526,13 +534,14 @@ interface ChatState {
     systemPrompt?: string,
   ) => Promise<void>;
   /** Edit a user message and resend: truncate from it, then dispatch the new
-   *  text as a fresh turn. */
+   *  text as a fresh turn (with its `@` blocks' spans, when it has any). */
   editAndResend: (
     workspaceId: string,
     workspacePath: string,
     userMessageId: number,
     newContent: string,
     systemPrompt?: string,
+    context?: SentContextBlock[],
   ) => Promise<void>;
   /** Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
    *  The command + output are persisted into the conversation as context. */
@@ -738,6 +747,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         cacheCreationTokens: payload.cacheCreationTokens ?? null,
         contextTokens: payload.contextTokens ?? null,
       };
+      const sent = payload.threadId ? pendingContext.get(payload.threadId) : undefined;
+      if (payload.role === "user" && sent && sent.content === payload.content) {
+        newMessage.contextBlocks = sent.contextBlocks;
+        pendingContext.delete(payload.threadId!);
+      }
 
       // When a resolved tool row arrives, retire its live "running" card so the
       // ToolCallCard from the timeline takes over with no flash. Correlate by
@@ -1016,8 +1030,9 @@ export const useChatStore = create<ChatState>((set, get) => {
     answeredApprovals.delete(p.callId);
     // The card reaches the user: the workspace's needs-you flag (chiming
     // unless they are looking at this conversation), and a native
-    // notification while Octopush is in the background. Raised before the
-    // card lands, so the store sync below finds it raised and stays quiet.
+    // notification, which always fires (a locked screen looks focused; see
+    // `approvalNotifications.ts`). Raised before the card lands, so the
+    // store sync below finds it raised and stays quiet.
     const looking =
       focus.workspaceId === p.workspaceId &&
       focus.mode === "talk" &&
@@ -1300,6 +1315,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         systemPrompt,
         attachments,
         overrideBudget: gate.overrode,
+        context: sendOpts?.context,
       });
       sendOpts?.onDispatched?.();
       return turn;
@@ -1323,6 +1339,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         liveToolsByWs: { ...s.liveToolsByWs, [workspaceId]: EMPTY_LIVE_TOOLS },
       }));
       const attachments = opts.attachments ?? EMPTY_ATTACHMENTS;
+      const contextBlocks = opts.context?.length ? JSON.stringify(opts.context) : undefined;
+      const pending = contextBlocks ? { content: opts.userMessage, contextBlocks } : null;
+      if (pending) pendingContext.set(threadId, pending);
       try {
         await ipc.sendChatMessage({
           workspaceId,
@@ -1337,6 +1356,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             : undefined,
           regenerate: opts.regenerate || undefined,
           overrideBudget: opts.overrideBudget || undefined,
+          contextBlocks,
         });
       } catch (e) {
         // A backend budget block (e.g. a project cap the client doesn't track, or
@@ -1372,6 +1392,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: errText } }));
         }
         return false;
+      } finally {
+        // Only this turn's own entry: a later turn in the thread may have set its own.
+        if (pending && pendingContext.get(threadId) === pending) pendingContext.delete(threadId);
       }
       return true;
     },
@@ -1434,7 +1457,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
     },
 
-    editAndResend: async (workspaceId, workspacePath, userMessageId, newContent, systemPrompt) => {
+    editAndResend: async (workspaceId, workspacePath, userMessageId, newContent, systemPrompt, context) => {
       const threadId = get().activeThreadByWs[workspaceId];
       if (!threadId || !newContent.trim()) return;
       // Carry any staged attachments onto the resent turn (like send does).
@@ -1445,6 +1468,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         userMessage: newContent,
         systemPrompt,
         attachments,
+        context,
       });
     },
 
@@ -1855,7 +1879,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     forkThread: async (workspaceId, threadId, messageId) => {
-      const { thread, draft } = await ipc.forkChatThread(threadId, messageId);
+      const { thread, draft: sent } = await ipc.forkChatThread(threadId, messageId);
+      // An ask sent with `@` context goes back as typed: its tokens resolve
+      // again on send, instead of riding along twice (#1150).
+      const msg = (get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES).find((m) => m.id === messageId);
+      const blocks = msg ? parseSentContext(msg.contextBlocks, sent) : null;
+      const draft = blocks ? typedText(sent, blocks) : sent;
       set((s) => ({
         threadsByWs: {
           ...s.threadsByWs,
