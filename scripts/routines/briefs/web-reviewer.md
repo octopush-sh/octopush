@@ -39,11 +39,13 @@ itself a reason to request changes).
   `release.ts` and the changelog together.
 - Nothing that reaches for credentials, adds trackers or third-party requests, or is obfuscated.
 - Clean room (CLAUDE.md "Innovation and clean room"). Request changes when the diff copies
-  third-party code, text or assets; adds a dependency whose license is incompatible or unknown
-  (fine: MIT, BSD, ISC, Apache-2.0, MPL-2.0; not GPL, AGPL, SSPL, unlicensed); uses another
-  company's trademark in a name we coin (plainly naming what we integrate with or run is fine);
-  makes an unsourced claim about a competitor; or puts a
-  competitor's logo or product screenshot, or disparaging copy, on any page (`/vs/*` and
+  third-party code, text or assets (documented flag, format and API names and short quotes with a
+  link and attribution are fine); adds or changes a direct dependency whose license is not fine
+  (GPL, AGPL, SSPL, none) or unknown (transitive dependencies of an accepted package aren't
+  re-judged; any other license, flag it for the PM); uses another company's trademark in a name
+  we coin (plainly naming what we integrate with or run is fine, and so is a comparison page's
+  title or slug that names the compared product); makes an unsourced claim about a competitor; or
+  puts a competitor's logo or product screenshot, or disparaging copy, on any page (`/vs/*` and
   `/alternatives/*` included).
 
 ## Output

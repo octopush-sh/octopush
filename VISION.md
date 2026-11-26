@@ -51,10 +51,10 @@ The agent workflow is the product. The editor, terminal, diff and git tooling ex
    (stream-json, flags, documented files) and keep every dependency on its internals behind one
    adapter with fixture-backed tests (§6).
 8. **Innovate, don't imitate.** Competitors show us our gaps; they are never the spec. Every
-   proposal names its edge (a "Where we go further" line, or "Parity" and why it is still worth
-   building) and looks ahead: longer autonomous runs, more agents per developer, cheaper and
-   local models, stricter review and provenance. The full rule is `CLAUDE.md` "Innovation and
-   clean room".
+   proposal for a capability names its edge (a "Where we go further" line, or "Parity" and why it
+   is still worth building; bug fixes need none) and looks ahead: longer autonomous runs, more
+   agents per developer, cheaper and local models, stricter review and provenance. The full rule
+   is `CLAUDE.md` "Innovation and clean room".
 9. **Complement the platforms.** The model labs build the models and their agents; Octopush
    makes those agents work together under the developer's direction. Open standards and
    official, documented surfaces (MCP, `AGENTS.md`, skills, the CLIs' flags), adopted early;
@@ -177,22 +177,25 @@ other users only after that promotion.
 - Keep `AGENTS.md` identical to `CLAUDE.md` (CI enforces it).
 - **Clean room** (full text: `CLAUDE.md` "Innovation and clean room"). Nothing copied from
   another product (code, prompts, UI copy, docs, icons, illustrations, screenshots, distinctive
-  visual design), even when it is public or open source. Third-party code only as a declared
-  dependency, named in the PR, with a license compatible with the Elastic License 2.0 (MIT, BSD,
-  ISC, Apache-2.0, MPL-2.0; never GPL, AGPL, SSPL or unlicensed code). Names we coin for our
-  own features, commands or products never contain another company's mark; naming the product we
-  integrate with, run or import from ("Jira", "Claude Code") is fine, in plain words and without
-  its logo. Competitors only in factual, sourced comparisons, with no logos, no screenshots and no
-  disparagement. Public information only.
-  Unsure → stop and ask. Reviewers request changes on any of these.
+  visual design), even when it is public or open source; recorded tool output kept as test
+  fixtures, the names of documented flags, schemas, formats and APIs, and short quotes with a
+  link and attribution are fine. Third-party code only as a declared dependency, named in the PR,
+  with a license compatible with the Elastic License 2.0, judged per direct dependency the PR
+  adds or changes: never GPL, AGPL, SSPL or unlicensed code; the examples that are fine and the
+  narrow LGPL case are in `CLAUDE.md`; anything else, ask. Names we coin for our own features,
+  commands or products never contain another company's mark; naming the product we integrate
+  with, run or import from ("Jira", "Claude Code") is fine, in plain words and without its logo.
+  Competitors only in factual, sourced comparisons, with no logos, no screenshots and no
+  disparagement. Public information only. Unsure → stop and ask.
 - **Model use.** Opus 5.5 by default for daily work: building, filing, docs and routine reviews.
   Fable 5.2 only for the design of a P1/P2 epic before it is built, the independent review of a
   high-risk PR (security, credentials, billing, stored-data migrations, the release and update
   channels, a breaking Epiku change) or a hard problem after two failed attempts. The PM caps
-  Fable use each week and reports it in the weekly report.
+  Fable use each week and reports it to the owner weekly in the PM conversation, as counts only,
+  never in the public report issue.
 - **Ideas are welcome, as issues** labelled `proposal` (+ `idea` when they come from the ideas
-  routine), each naming its edge (§3.8). The owner answers them in the digest: yes → `ready`,
-  no → closed, not yet → `later`.
+  routine); an idea for a capability names its edge (§3.8). The owner answers them in the digest:
+  yes → `ready`, no → closed, not yet → `later`.
 - When unsure, stop and write the question in the PR or issue instead of guessing.
 
 ## 9. Owner's loop
