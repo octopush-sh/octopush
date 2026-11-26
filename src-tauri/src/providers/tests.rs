@@ -2258,7 +2258,7 @@ mod openai_streaming {
     }
 
     async fn failure(api: &Api<'_>, body: &str) -> AppError {
-        read(api, chunks(body, 4096)).await.0.err().expect("the stream fails")
+        read(api, chunks(body, 4096)).await.0.expect_err("the stream fails")
     }
 
     fn kind_of(e: &AppError) -> Option<ProviderErrorKind> {
