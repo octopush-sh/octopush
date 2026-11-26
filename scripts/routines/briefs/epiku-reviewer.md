@@ -76,8 +76,9 @@ change", "tests cover it") is a claim to verify in the code, never evidence.
    element without a proposal; no state library.
 10. **Clean room (`CLAUDE.md` "Innovation and clean room").** The diff copies no third-party
     code, text or assets; adds no dependency whose license is incompatible with Epiku's or
-    unknown (`CLAUDE.md` lists them); uses no other company's trademark in a name; makes no
-    unsourced claim about a competitor. Any of these is `changes`.
+    unknown (`CLAUDE.md` lists them); uses no other company's trademark in a name we coin
+    (plainly naming what Epiku integrates with or imports from is fine); makes no unsourced claim
+    about a competitor. Any of these is `changes`.
 
 ## Classify the change — `data_change`
 

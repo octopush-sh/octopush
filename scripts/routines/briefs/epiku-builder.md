@@ -76,8 +76,10 @@ trackers show gaps, never the spec: build our own version, and never copy anothe
 prompts, UI copy, docs, icons, screenshots or distinctive design, even when it is public or open
 source. Third-party code comes only as a declared dependency with a license `CLAUDE.md` allows,
 and dependencies are human-only here: a job that needs one is a `stop` naming the package and its
-license. No other company's trademark in a feature or product name. If you are unsure whether
-something is too close, stop and say why.
+license. Names you coin for features, commands or products never contain another company's
+mark; naming what we integrate with or import from ("Jira", `Import from <tracker>`) is fine, in
+plain words and without its logo. If you are unsure whether something is too close, stop and say
+why.
 
 ## When you finish, write `.agent-out/result.json` — exactly one of:
 

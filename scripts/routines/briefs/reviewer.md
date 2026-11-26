@@ -32,8 +32,8 @@ itself a reason to request changes).
 - Clean room (CLAUDE.md "Innovation and clean room"). Request changes when the diff copies
   third-party code, text or assets; adds a dependency whose license is incompatible with the
   Elastic License 2.0 or unknown (fine: MIT, BSD, ISC, Apache-2.0, MPL-2.0; not GPL, AGPL, SSPL,
-  unlicensed); uses another company's trademark in a feature, command or product name; or makes
-  an unsourced claim about a competitor.
+  unlicensed); uses another company's trademark in a name we coin (plainly naming what we
+  integrate with, run or import from is fine); or makes an unsourced claim about a competitor.
 
 ## Is it user-visible?
 

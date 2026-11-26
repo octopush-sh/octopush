@@ -41,7 +41,8 @@ itself a reason to request changes).
 - Clean room (CLAUDE.md "Innovation and clean room"). Request changes when the diff copies
   third-party code, text or assets; adds a dependency whose license is incompatible or unknown
   (fine: MIT, BSD, ISC, Apache-2.0, MPL-2.0; not GPL, AGPL, SSPL, unlicensed); uses another
-  company's trademark in a name; makes an unsourced claim about a competitor; or puts a
+  company's trademark in a name we coin (plainly naming what we integrate with or run is fine);
+  makes an unsourced claim about a competitor; or puts a
   competitor's logo or product screenshot, or disparaging copy, on any page (`/vs/*` and
   `/alternatives/*` included).
 

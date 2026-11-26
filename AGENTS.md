@@ -23,11 +23,11 @@ Octopush exists to be the best tool for agentic developers, today and over the n
 5. **Clean room — we own everything we ship.**
    - **Nothing copied.** Never copy another product's source code, prompts, UI copy, documentation, icons, illustrations, screenshots or distinctive visual design, even when it is public or open source. Describe observed behaviour in your own words, then design our own.
    - **Dependencies, not pasted code.** Third-party code enters only as a declared dependency whose license is compatible with this repo (Elastic License 2.0), and the PR names it. Fine: MIT, BSD, ISC, Apache-2.0, MPL-2.0. Not fine: GPL, AGPL, SSPL, and code with no license.
-   - **Trademarks.** No other company's trademark in a feature, command or product name. Name a competitor only in a factual, sourced comparison; never use its logo or screenshots of its product, and never disparage it.
+   - **Trademarks.** Names we coin for our own features, commands or products never contain another company's mark. Naming the product we integrate with, run or import from is fine, in plain words and without its logo: "Jira", "Claude Code", `Import from <tracker>`. Name a competitor only in a factual, sourced comparison; never use its logo or screenshots of its product, and never disparage it.
    - **Public information only.** Never use or describe non-public information about another company's product (leaked prompts, decompiled code, private APIs).
    - **When in doubt, stop** and ask in the issue or PR.
 
-**Reviewers request changes** when a diff copies third-party code, text or assets; adds a dependency whose license is incompatible or unknown; uses another company's trademark in a name; or makes an unsourced claim about a competitor.
+**Reviewers request changes** when a diff copies third-party code, text or assets; adds a dependency whose license is incompatible or unknown; uses another company's trademark in a name we coin; or makes an unsourced claim about a competitor.
 
 **Model use (PM and team).** Default: **Opus 5.5** for daily work — building, filing, docs and routine reviews. **Fable 5.2** only where it adds value: the design of a P1/P2 epic before it is built; the independent review of a high-risk PR (security, credentials, billing, stored-data migrations, the release and update channels, a breaking Epiku change); a hard problem after two failed attempts. The PM caps Fable use each week and reports it in the weekly report, so the week's budget lasts.
 
