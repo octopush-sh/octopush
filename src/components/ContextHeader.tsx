@@ -1,11 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-<<<<<<< HEAD
-import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, PackageX, Wrench } from "lucide-react";
-||||||| 39ed3b2f
-import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Wrench } from "lucide-react";
-=======
-import { CircleCheck, CircleDashed, CircleX, Copy, EthernetPort, GitBranch, Hammer, Wrench } from "lucide-react";
->>>>>>> origin/main
+import { CircleCheck, CircleDashed, CircleX, Copy, EthernetPort, GitBranch, Hammer, PackageX, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { INTENT_ICON, SHIPS_NOTHING_TITLE, shipsNothing } from "../lib/missionIntent";
 import { checksTitle } from "../lib/prChecks";

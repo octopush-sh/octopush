@@ -5171,44 +5171,6 @@ impl ChatEngine {
             messages.push(tool_round_turn(&response));
 
             // The mode decides each call before anything runs (#1146): a call
-<<<<<<< HEAD
-            // it refuses gets a fixed result and never reaches a card.
-            let mode_denials: HashMap<String, String> = response
-                .tool_uses
-                .iter()
-                .filter_map(|u| {
-                    let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
-                    let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
-                    let ctx = crate::permissions::PolicyCtx {
-                        exec_roots: exec_roots.as_deref(),
-                        mcp_read_only: &mcp_read_only,
-                        delegate_writes: crate::chat_agents::delegate_writes(definition),
-                        forced: crate::permissions::forced(sandbox_roots.as_deref()),
-                        ships_nothing,
-                    };
-                    let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
-                    crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
-                })
-                .collect();
-||||||| 39ed3b2f
-            // it refuses gets a fixed result and never reaches a card.
-            let mode_denials: HashMap<String, String> = response
-                .tool_uses
-                .iter()
-                .filter_map(|u| {
-                    let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
-                    let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
-                    let ctx = crate::permissions::PolicyCtx {
-                        exec_roots: exec_roots.as_deref(),
-                        mcp_read_only: &mcp_read_only,
-                        delegate_writes: crate::chat_agents::delegate_writes(definition),
-                        forced: crate::permissions::forced(sandbox_roots.as_deref()),
-                    };
-                    let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
-                    crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
-                })
-                .collect();
-=======
             // it refuses gets a fixed result and never reaches a card; one
             // Ask first holds waits on its card below (#1231).
             let mut mode_denials: HashMap<String, String> = HashMap::new();
@@ -5221,6 +5183,7 @@ impl ChatEngine {
                     mcp_read_only: &mcp_read_only,
                     delegate_writes: crate::chat_agents::delegate_writes(definition),
                     forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                    ships_nothing,
                 };
                 let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
                 match crate::permissions::decide(mode, &call, &ctx) {
@@ -5233,7 +5196,6 @@ impl ChatEngine {
                     }
                 }
             }
->>>>>>> origin/main
 
             // ── Sub-agents: fan out first ──────────────────────────
             // Every `Agent` call in this response runs CONCURRENTLY (that is

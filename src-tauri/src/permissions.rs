@@ -1280,11 +1280,11 @@ mod tests {
                 self.0.ask_first(name, input).await
             }
         }
-        let gate = ModeGate::new(Arc::new(|| Mode::Ask), None, false, HashSet::new(), Some(Box::new(Shared(Arc::clone(&calls)))));
+        let gate = ModeGate::new(Arc::new(|| Mode::Ask), None, false, false, HashSet::new(), Some(Box::new(Shared(Arc::clone(&calls)))));
         assert_eq!(gate.check("write_file", &write).await.as_deref(), Some(ASK_DECLINED_CHANGE));
         assert_eq!(gate.check("run_command", &json!({ "command": "git status" })).await, None);
         assert_eq!(*calls.0.lock(), ["ask write_file", "check run_command"], "a declined call never reaches the tool; a reader skips the card, not the guards");
-        let alone = ModeGate::new(Arc::new(|| Mode::Ask), None, false, HashSet::new(), None);
+        let alone = ModeGate::new(Arc::new(|| Mode::Ask), None, false, false, HashSet::new(), None);
         assert_eq!(alone.check("edit_file", &write).await.as_deref(), Some(CANNOT_ASK));
     }
 
@@ -1639,7 +1639,7 @@ mod tests {
     fn the_hosts_read_the_missions_posture() {
         let engine = include_str!("chat_engine.rs");
         assert!(engine.contains("let ships_nothing = crate::mission::read_ships_nothing(&mission);"), "the turn reads the posture");
-        let from = engine.find("let mode_denials: HashMap<String, String>").expect("the round's mode decisions");
+        let from = engine.find("let mut mode_denials: HashMap<String, String>").expect("the round's mode decisions");
         let to = from + engine[from..].find("crate::permissions::decide(mode, &call, &ctx)").expect("the decision");
         let ctx = &engine[from..to];
         assert!(ctx.contains("PolicyCtx {") && ctx.contains("ships_nothing,"), "the PolicyCtx in mode_denials reads the mission: {ctx}");
