@@ -1343,7 +1343,7 @@ mod tests {
         let asked = Mutex::new(0);
         let approve = |_: ToolCard| {
             *asked.lock() += 1;
-            std::fs::write(ws.path().join("a.rs"), "gone\n").unwrap();
+            std::fs::write(ws.path().join("a.rs"), "replaced\n").unwrap();
             std::future::ready(ApprovalDecision::Approve)
         };
         let now = || refused_before_card(&reach, "edit_file", &input, None);
