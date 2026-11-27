@@ -8,7 +8,8 @@ import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
 import { issueTypeToken } from "../lib/issueTrackerSelectors";
-import { detectIssueKeyForProject } from "../lib/detectIssueKey";
+import { detectTrackerKey } from "../lib/detectIssueKey";
+import { useIssuesStore, useKnownStory } from "../stores/issuesStore";
 import { copyToClipboard } from "../lib/clipboard";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { HeaderSandbox } from "./HeaderSandbox";
@@ -69,10 +70,11 @@ function Sep() {
  *  key sits inside a demotion rung that must clip — `.octo-demote` reserves the
  *  padding for both (styles.css). */
 function IssueKey({ issue }: { issue: Issue }) {
+  const tracker = useIssuesStore((s) => (s.tracker === "epiku" ? "Epiku" : "Jira"));
   return (
     <button
       type="button"
-      aria-label={`Open ${issue.key} in Jira`}
+      aria-label={`Open ${issue.key} in ${tracker}`}
       title={
         `${issue.issueType.toUpperCase()}` +
         (issue.priority ? ` · ${issue.priority.toUpperCase()}` : "") +
@@ -103,7 +105,8 @@ interface Props {
   onFixChecks?: (pr: Pr) => void | Promise<void>;
   /** The active workspace. A manually linked ticket (linkedIssueKey) wins;
    *  otherwise a branch-detected key gated on the project's Jira key
-   *  (detectIssueKeyForProject). */
+   *  (detectIssueKeyForProject), or under Epiku a dotted id that is one of
+   *  the project's stories (detectTrackerKey). */
   workspace?: Workspace | null;
   /** Whether the issue tracker is configured. When false, no ticket is
    *  shown even if a key is present — the eyebrow reads "Workspace" and the
@@ -162,7 +165,9 @@ export function ContextHeader({
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const manualKey = workspace?.linkedIssueKey ?? null;
-  const detectedKey = detectIssueKeyForProject(branch, jiraProjectKey ?? null);
+  const tracker = useIssuesStore((s) => s.tracker);
+  const isKnownStory = useKnownStory();
+  const detectedKey = detectTrackerKey(branch, tracker, jiraProjectKey ?? null, isKnownStory);
   const resolvedKey = manualKey ?? detectedKey;
   const activeKey = resolvedKey && issueTrackerConfigured ? resolvedKey : null;
   const activeIssue = useActiveIssue(activeKey);
