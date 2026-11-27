@@ -2369,12 +2369,12 @@ pub async fn get_thread_permission_mode(state: State<'_, AppState>, thread_id: S
     Ok(ThreadPermissionMode { stored: stored.as_str(), effective: effective.as_str() })
 }
 
-/// Set a Talk conversation's permission mode, `plan` or `edit`; a turn that
-/// is running takes it from its next round. Ask first isn't settable yet.
+/// Set a Talk conversation's permission mode, `plan`, `ask` or `edit`; a
+/// turn that is running takes it from its next round, and notes the switch.
 #[tauri::command]
 pub async fn set_thread_permission_mode(state: State<'_, AppState>, thread_id: String, mode: String) -> AppResult<String> {
     let Some(mode) = crate::permissions::Mode::settable(&mode) else {
-        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan` or `edit`.")));
+        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan`, `ask` or `edit`.")));
     };
     state.db.lock().set_thread_permission_mode(&thread_id, mode)?;
     Ok(mode.as_str().to_string())

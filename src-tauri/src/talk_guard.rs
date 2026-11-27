@@ -25,6 +25,10 @@ pub enum CardKind {
     /// A command naming a path outside the workspace or in a credentials
     /// location (#1201).
     Run,
+    /// A file change Ask first holds (#1231), with its diff.
+    Edit,
+    /// A command Ask first holds (#1231): one that doesn't only read.
+    Exec,
 }
 
 impl CardKind {
@@ -50,6 +54,10 @@ pub struct ToolCard {
     /// thread's commands read from then on, and how the card names it
     /// (#1201): only on a command's card for a read outside the workspace.
     pub remember: Option<(PathBuf, String)>,
+    /// What an Ask first card for a file change shows (#1231): the unified
+    /// diff the call makes, redacted and capped. Part of the card, so a file
+    /// that changes while the card waits asks again (`guard_card`).
+    pub diff: Option<String>,
 }
 
 /// An MCP card shows a string argument up to this long, a longer one (a
@@ -61,7 +69,7 @@ const MCP_ARGS_MAX: usize = 400;
 /// names the sub-agent that asks.
 pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value) -> ToolCard {
     let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool);
-    ToolCard { kind: CardKind::Mcp, shown: format!("{tool} {}", mcp_args_shown(input)), reason, denial, sensitive: false, remember: None }
+    ToolCard { kind: CardKind::Mcp, shown: format!("{tool} {}", mcp_args_shown(input)), reason, denial, sensitive: false, remember: None, diff: None }
 }
 
 /// An MCP call's arguments as its card shows them: JSON, with each long
@@ -180,6 +188,11 @@ impl Reach {
         Self::new(workspace, main_checkout, dirs::home_dir().as_deref())
     }
 
+    /// The workspace the file tools join paths onto.
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     /// `path` as the card names it: `~/…` under home, else in full.
     fn shown(&self, path: &Path) -> String {
         match self.home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
@@ -235,7 +248,7 @@ impl Reach {
              Work inside the workspace, or ask the user for what you need; do not retry it.",
             r.shown, r.place
         );
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None })
+        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None, diff: None })
     }
 
     /// Where `joined` leads, resolved as a tool opening it gets there
@@ -333,7 +346,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember })
+        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember, diff: None })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
@@ -619,7 +632,7 @@ impl Reached {
 }
 
 /// `reason` with the sub-agent that asks in front, when one does.
-fn sub_agent(label: Option<&str>, reason: String) -> String {
+pub(crate) fn sub_agent(label: Option<&str>, reason: String) -> String {
     match label {
         Some(l) => format!("Sub-agent \u{201c}{l}\u{201d}: {reason}"),
         None => reason,

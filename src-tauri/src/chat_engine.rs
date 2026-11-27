@@ -1548,6 +1548,9 @@ pub struct ApprovalRequestEvent {
     /// its "Allow reading … for this conversation" answer remembers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remember_dir: Option<String>,
+    /// An Ask first card for a file change (#1231): the diff the call makes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1703,7 +1706,7 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None, None).await;
         self.record(thread_id, decision, false);
         decision
     }
@@ -1724,7 +1727,8 @@ impl ApprovalBroker {
         }
         let marks = Some((card.kind, card.sensitive));
         let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
+        let diff = card.diff.as_deref();
+        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, diff).await;
         self.settle_card(thread_id, decision, &card)
     }
 
@@ -1767,7 +1771,7 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None, None)
             .await;
         self.record(thread_id, decision, true)
     }
@@ -1795,7 +1799,7 @@ impl ApprovalBroker {
 
     /// Emit the card and wait for its answer. `secret` is `Some(covers
     /// uncommitted)` for the secret guard's card, `card` the kind and
-    /// sensitivity of a `talk_guard` card.
+    /// sensitivity of a `talk_guard` card, `diff` an Ask first card's diff.
     #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
@@ -1808,6 +1812,7 @@ impl ApprovalBroker {
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
+        diff: Option<&str>,
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1823,6 +1828,7 @@ impl ApprovalBroker {
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
+            diff: diff.map(str::to_string),
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -2776,6 +2782,48 @@ fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String
     tries.into_iter().find(|(o, _)| !o.is_empty() && content.contains(o.as_str()))
 }
 
+/// Why an `edit_file` call can't apply whatever the file holds, or `None`.
+fn edit_input_problem(input: &serde_json::Value) -> Option<String> {
+    let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+    let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    if old_string.is_empty() {
+        return Some("edit_file needs a non-empty `old_string`".to_string());
+    }
+    (old_string == new_string).then(|| "`old_string` and `new_string` are identical — nothing to change".to_string())
+}
+
+/// What an `edit_file` call leaves of `content` and how many occurrences it
+/// replaced, or why it doesn't apply. Pure, so Ask first's card (#1231)
+/// shows the very edit the tool makes.
+pub(crate) fn apply_edit(content: &str, input: &serde_json::Value, path: &str) -> Result<(String, usize), String> {
+    if let Some(problem) = edit_input_problem(input) {
+        return Err(problem);
+    }
+    let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+    let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The model copied the edit from `read_file`'s view (`edit_from_view`).
+    let (old_string, new_string) = edit_from_view(content, old_string, new_string)
+        .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
+    let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
+    let count = content.matches(old_string).count();
+    if count == 0 {
+        return Err(format!(
+            "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
+        ));
+    }
+    if count > 1 && !replace_all {
+        return Err(format!(
+            "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
+        ));
+    }
+    Ok(if replace_all {
+        (content.replace(old_string, new_string), count)
+    } else {
+        (content.replacen(old_string, new_string, 1), 1)
+    })
+}
+
 /// [`execute_tool_cancellable`] with no cancel flag. The app always passes
 /// one ([`run_builtin`]); tests call this.
 #[cfg(test)]
@@ -3096,45 +3144,17 @@ pub(crate) fn execute_tool_cancellable(
         }
         "edit_file" => {
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
-            let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-            if old_string.is_empty() {
-                return ("edit_file needs a non-empty `old_string`".to_string(), false);
-            }
-            if old_string == new_string {
-                return ("`old_string` and `new_string` are identical — nothing to change".to_string(), false);
+            if let Some(problem) = edit_input_problem(input) {
+                return (problem, false);
             }
             let full = workspace_path.join(path);
             let content = match std::fs::read_to_string(&full) {
                 Ok(c) => c,
                 Err(e) => return (format!("Error reading {path}: {e}"), false),
             };
-            // The model copied the edit from `read_file`'s view (`edit_from_view`).
-            let (old_string, new_string) = edit_from_view(&content, old_string, new_string)
-                .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
-            let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
-            let count = content.matches(old_string).count();
-            if count == 0 {
-                return (
-                    format!(
-                        "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
-                    ),
-                    false,
-                );
-            }
-            if count > 1 && !replace_all {
-                return (
-                    format!(
-                        "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
-                    ),
-                    false,
-                );
-            }
-            let (updated, replaced) = if replace_all {
-                (content.replace(old_string, new_string), count)
-            } else {
-                (content.replacen(old_string, new_string, 1), 1)
+            let (updated, replaced) = match apply_edit(&content, input, path) {
+                Ok(edit) => edit,
+                Err(problem) => return (problem, false),
             };
             // Same containment story as write_file: lexical pre-check plus the
             // kernel-enforced sandboxed write when the mission is sandboxed.
@@ -4835,6 +4855,9 @@ impl ChatEngine {
         // Tool rounds in a row cut at the output limit: two end the turn.
         let mut truncations = TruncationStreak::default();
 
+        // The mode the last round ran in, so a switch during the turn is noted.
+        let mut round_mode: Option<crate::permissions::Mode> = None;
+
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
             // Stop cleanly if the user cancelled this turn. Checked here and
@@ -4934,6 +4957,17 @@ impl ChatEngine {
             usage.add(&request.model, &response);
             self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
             pending_throttle = compute_throttle(&response);
+
+            // A switch during the turn applies from this round, and leaves a
+            // quiet note naming the mode now in force (#1231), before the
+            // round's rows. The v2 transcript skips it (`is_mode_note`).
+            if round_mode.is_some_and(|was| was != mode) {
+                let note = crate::permissions::mode_note(mode);
+                if let Err(e) = self.insert_and_emit_message(&app, &request.workspace_id, &request.thread_id, "stopped", &note, None, None, None, None) {
+                    tracing::warn!(error = %e, "failed to note the permission mode switch");
+                }
+            }
+            round_mode = Some(mode);
 
             tracing::info!(
                 iteration = iteration,
@@ -5077,23 +5111,30 @@ impl ChatEngine {
             messages.push(tool_round_turn(&response));
 
             // The mode decides each call before anything runs (#1146): a call
-            // it refuses gets a fixed result and never reaches a card.
-            let mode_denials: HashMap<String, String> = response
-                .tool_uses
-                .iter()
-                .filter_map(|u| {
-                    let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
-                    let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
-                    let ctx = crate::permissions::PolicyCtx {
-                        exec_roots: exec_roots.as_deref(),
-                        mcp_read_only: &mcp_read_only,
-                        delegate_writes: crate::chat_agents::delegate_writes(definition),
-                        forced: crate::permissions::forced(sandbox_roots.as_deref()),
-                    };
-                    let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
-                    crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
-                })
-                .collect();
+            // it refuses gets a fixed result and never reaches a card; one
+            // Ask first holds waits on its card below (#1231).
+            let mut mode_denials: HashMap<String, String> = HashMap::new();
+            let mut mode_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for u in &response.tool_uses {
+                let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
+                let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
+                let ctx = crate::permissions::PolicyCtx {
+                    exec_roots: exec_roots.as_deref(),
+                    mcp_read_only: &mcp_read_only,
+                    delegate_writes: crate::chat_agents::delegate_writes(definition),
+                    forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                };
+                let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
+                match crate::permissions::decide(mode, &call, &ctx) {
+                    crate::permissions::Decision::Allow => {}
+                    crate::permissions::Decision::Ask { .. } => {
+                        mode_asks.insert(u.id.clone());
+                    }
+                    crate::permissions::Decision::Deny { message } => {
+                        mode_denials.insert(u.id.clone(), message);
+                    }
+                }
+            }
 
             // ── Sub-agents: fan out first ──────────────────────────
             // Every `Agent` call in this response runs CONCURRENTLY (that is
@@ -5263,6 +5304,17 @@ impl ChatEngine {
                 // A tool a skill loaded this turn doesn't allow is refused
                 // before anything asks the user (#1135).
                 let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools).filter(|_| !mode_denied);
+                // Ask first holds a change or a command that doesn't only read
+                // on its card (#1231), its diff checked again once approved: a
+                // file that changed meanwhile asks again. The guards' cards
+                // still ask after it.
+                if mode_asks.contains(&u.id) && skill_refusal.is_none() {
+                    let check = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));
+                    if let Some(card) = check() {
+                        let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                        denied = guard_card(card, &check, ask).await;
+                    }
+                }
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
@@ -7507,7 +7559,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None,
+            remember_dir: None, diff: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7533,6 +7585,7 @@ mod tests {
             denial: "d".into(),
             sensitive: false,
             remember: Some((dir.clone(), "/tmp/x".into())),
+            diff: None,
         };
         assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
         assert_eq!(broker.read_dirs("t"), vec![dir]);
@@ -7554,6 +7607,7 @@ mod tests {
             denial: format!("declined {shown}"),
             sensitive: false,
             remember: None,
+            diff: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -7833,6 +7887,7 @@ mod tests {
             kind: None,
             sensitive: false,
             remember_dir: None,
+            diff: None,
         }
     }
 

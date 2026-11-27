@@ -912,6 +912,17 @@ pub fn gate_texts(label: &str, reason: &str) -> (String, String) {
 
 #[async_trait::async_trait]
 impl ToolGate for SubagentGate {
+    /// Ask first's card (#1231), on the director's broker with the
+    /// sub-agent's name on it, its diff checked again once approved.
+    async fn ask_first(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+        let label = Some(self.label.as_str());
+        let check = || Some(crate::permissions::ask_card(label, name, input, &self.reach));
+        let card = check()?;
+        let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+        let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+        crate::chat_engine::guard_card(card, &check, ask).await
+    }
+
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let (shown, card_reason, denial) = if name == "run_command" {
             let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
