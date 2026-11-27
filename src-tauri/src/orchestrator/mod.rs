@@ -1287,22 +1287,29 @@ impl Orchestrator {
             }
             let skills = crate::skills::referenced_skills(&workspace_path, &reference_text);
             // The MCP servers the stage chose (#1134), on an API stage the app
-            // drives. A read-only role or mission gets only read-only tools.
+            // drives, started from the Settings configs pinned when the run
+            // was created. A read-only role or mission gets only read-only
+            // tools. A Routine's run is known by the `routine_id` stamped at
+            // dispatch, which outlives the Routine and its later fires.
             let mcp_servers = self.db.lock().get_stage_mcp_servers(&stage.id)?;
             let mcp = if mcp_servers.is_empty() {
                 None
             } else {
-                let routine = self.db.lock().routine_name_for_run(&run.id)?.is_some();
+                let routine = self.db.lock().run_routine_id(&run.id)?.is_some();
                 match mcp_skip_reason(matches!(spec.substrate, AgentSubstrate::Api), self.headless, routine) {
                     Some(why) => {
                         self.journal_notice(&run.id, &stage.id, why);
                         None
                     }
-                    None => self.mcp.as_ref().map(|registry| crate::orchestrator::runner::StageMcp {
-                        registry: Arc::clone(registry),
-                        servers: mcp_servers,
-                        read_only: stage_read_only || git_isolation == "readonly",
-                    }),
+                    None => match &self.mcp {
+                        Some(registry) => Some(crate::orchestrator::runner::StageMcp {
+                            registry: Arc::clone(registry),
+                            servers: mcp_servers,
+                            pinned: Arc::new(self.db.lock().get_stage_mcp_pinned(&stage.id)?),
+                            read_only: stage_read_only || git_isolation == "readonly",
+                        }),
+                        None => None,
+                    },
                 }
             };
             let ctx = StageContext {

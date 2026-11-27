@@ -3,23 +3,26 @@ import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-libra
 import type { McpServerStatus } from "../../lib/types";
 
 const statusMock = vi.hoisted(() => vi.fn());
+const projectMock = vi.hoisted(() => vi.fn());
 const changedMock = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/ipc", async () => {
   const actual = await vi.importActual<any>("../../lib/ipc");
-  return { ...actual, ipc: { ...actual.ipc, listMcpServerStatus: statusMock, onMcpChanged: changedMock } };
+  return {
+    ...actual,
+    ipc: { ...actual.ipc, listUserMcpServerStatus: statusMock, listMcpServerStatus: projectMock, onMcpChanged: changedMock },
+  };
 });
 
 const { StageMcpServers, mcpUnavailableTitle, stageMcpChipTitle, stageMcpChips, stageMcpNote } = await import(
   "./StageMcpServers"
 );
 const { graphToStageDrafts, newStageData } = await import("./graph");
-const { useMcpScopeStore } = await import("../../stores/mcpScopeStore");
 
 const SERVERS: McpServerStatus[] = [
   { name: "docs", state: "connected", tools: 3, reason: null },
   { name: "tracker", state: "failed", tools: null, reason: "spawn npx: not found" },
 ];
-const EMPTY_LINE = "No MCP servers in Settings › Integrations or this project's .claude/mcp.json.";
+const EMPTY_LINE = "No MCP servers in Settings › Integrations.";
 
 beforeEach(() => {
   changedMock.mockResolvedValue(() => {});
@@ -28,21 +31,14 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   statusMock.mockReset();
+  projectMock.mockReset();
   changedMock.mockReset();
-  useMcpScopeStore.setState({ statusByPath: {} });
 });
 
-function renderField(
-  chosen: string[] | undefined,
-  substrate: "api" | "cli" = "api",
-  model = "claude-sonnet-5-5",
-  workspacePath: string | null = "/ws/mcp",
-) {
+function renderField(chosen: string[] | undefined, substrate: "api" | "cli" = "api", model = "claude-sonnet-5-5") {
   if (!statusMock.getMockImplementation()) statusMock.mockResolvedValue(SERVERS);
   const onChange = vi.fn();
-  render(
-    <StageMcpServers workspacePath={workspacePath ?? undefined} substrate={substrate} model={model} chosen={chosen} onChange={onChange} />,
-  );
+  render(<StageMcpServers substrate={substrate} model={model} chosen={chosen} onChange={onChange} />);
   return onChange;
 }
 
@@ -69,7 +65,7 @@ describe("StageMcpServers", () => {
   it("doesn't claim none are configured when the read fails, and keeps the chosen servers", async () => {
     statusMock.mockRejectedValue(new Error("ipc down"));
     const onChange = renderField(["tracker"]);
-    expect(await screen.findByText("Couldn't read the MCP servers configured here.")).toBeTruthy();
+    expect(await screen.findByText("Couldn't read the MCP servers in Settings › Integrations.")).toBeTruthy();
     expect(screen.queryByText(EMPTY_LINE)).toBeNull();
     const chip = screen.getByRole("switch", { name: /tracker/ });
     expect(chip.getAttribute("title")).toBe("tracker · status unknown · click to take it off this stage");
@@ -77,13 +73,13 @@ describe("StageMcpServers", () => {
     expect(onChange).toHaveBeenLastCalledWith([]);
   });
 
-  it("reads nothing without a workspace", () => {
-    renderField(["docs"], "api", "claude-sonnet-5-5", null);
-    expect(statusMock).not.toHaveBeenCalled();
-    expect(screen.getByText("Open a workspace to choose its MCP servers.")).toBeTruthy();
-    expect(screen.queryByText(EMPTY_LINE)).toBeNull();
-    expect(screen.getByRole("switch", { name: /docs/ }).getAttribute("title")).toMatch(/status unknown/);
-    expect(stageMcpNote(undefined, [], false)).toBe("Open a workspace to choose its MCP servers.");
+  it("offers only the Settings servers, never a project's .claude/mcp.json", async () => {
+    renderField(undefined);
+    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(2));
+    expect(statusMock).toHaveBeenCalledWith();
+    expect(projectMock).not.toHaveBeenCalled();
+    expect(stageMcpNote([], false)).toBe(EMPTY_LINE);
+    expect(stageMcpNote(undefined, false)).toBe("Reading the MCP servers…");
   });
 
   it("tones every chip's icon by its server's status, on or off", async () => {
@@ -112,10 +108,9 @@ describe("StageMcpServers", () => {
     await waitFor(() => expect(statusMock).toHaveBeenCalledTimes(2));
   });
 
-  it("lists the workspace's servers, every one off by default", async () => {
+  it("lists the Settings servers, every one off by default", async () => {
     renderField(undefined);
     await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(2));
-    expect(statusMock).toHaveBeenCalledWith("/ws/mcp");
     for (const chip of screen.getAllByRole("switch")) expect(chip.getAttribute("aria-checked")).toBe("false");
     expect(newStageData("review").mcpServers).toEqual([]);
   });
@@ -138,10 +133,10 @@ describe("StageMcpServers", () => {
     expect(mcpUnavailableTitle("claude-sonnet-5-5")).toMatch(/Claude Code's own MCP servers/);
   });
 
-  it("keeps a chosen server that isn't configured here, so it can be taken off", () => {
+  it("keeps a chosen server that isn't in Settings, so it can be taken off", () => {
     expect(stageMcpChips(SERVERS, ["gone", "docs"]).map((c) => c.name)).toEqual(["docs", "tracker", "gone"]);
     expect(stageMcpChipTitle("gone", null, true)).toBe(
-      "gone · not configured on this Mac or in this project · click to take it off this stage",
+      "gone · not in Settings › Integrations · click to take it off this stage",
     );
     expect(stageMcpChipTitle("docs", SERVERS[0], false)).toBe("docs · connected · 3 tools · click to let this stage use it");
     expect(stageMcpChipTitle("tracker", SERVERS[1], false)).toMatch(/failed: spawn npx: not found/);

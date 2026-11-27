@@ -1167,6 +1167,9 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The Settings › Integrations servers only, with their live status: what
+   *  a Direct stage can choose. Spawns nothing. */
+  listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
   /** The instruction files Talk follows in a worktree (its CLAUDE.md chain,
    *  or AGENTS.md), each with its token estimate, and how many skipped files
    *  weren't listed. Reads only. */

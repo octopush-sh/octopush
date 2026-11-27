@@ -2319,6 +2319,16 @@ pub async fn list_mcp_server_status(
     Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
 }
 
+/// The Settings › Integrations servers only (`~/.claude/mcp.json`), with
+/// what the registry knows about each: the servers a Direct stage can
+/// choose (#1134). Spawns nothing.
+#[tauri::command]
+pub async fn list_user_mcp_server_status(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::mcp::scope::McpServerStatus>> {
+    Ok(state.chat.mcp.status_of(&crate::mcp::load_user_servers()))
+}
+
 /// The instruction files Talk and its sub-agents follow in a worktree (its
 /// CLAUDE.md chain, or AGENTS.md), with the tokens each adds, for the
 /// Companion's "follows" row. Reads only.
@@ -2702,14 +2712,20 @@ pub async fn create_run(
     stage_overrides: Option<Vec<(i64, String)>>,
 ) -> AppResult<String> {
     let overrides = stage_overrides.unwrap_or_default();
-    state.db.lock().create_run(
+    // The stages' chosen MCP servers run with their Settings configs as
+    // they are now (#1134), never a worktree's `.claude/mcp.json`.
+    let user_servers = tokio::task::spawn_blocking(crate::mcp::load_user_servers).await.unwrap_or_default();
+    let db = state.db.lock();
+    let run_id = db.create_run(
         &workspace_id,
         &pipeline_id,
         &task,
         reference_model.as_deref(),
         linked_issue_key.as_deref(),
         &overrides,
-    )
+    )?;
+    db.pin_run_mcp_servers(&run_id, &user_servers)?;
+    Ok(run_id)
 }
 
 #[tauri::command]

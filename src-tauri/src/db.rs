@@ -865,6 +865,14 @@ impl Db {
         // unattended, so access is opt-in per stage.
         add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN mcp_servers TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN mcp_servers TEXT")?;
+        // The chosen servers' Settings configs, pinned when the run is
+        // created (JSON object name → config; `pin_run_mcp_servers`). NULL ⇒
+        // nothing pinned, so the stage starts no server.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN mcp_pinned TEXT")?;
+        // The Routine that dispatched the run, stamped once at dispatch and
+        // kept after the Routine fires again or is deleted. NULL ⇒ not a
+        // Routine's run.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN routine_id TEXT")?;
         // The escape valve: a parked stage's `ask_director` questions (JSON
         // `BlockedAsk`), NULL unless the stage is blocked awaiting the director.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_questions TEXT")?;
@@ -8339,6 +8347,61 @@ impl Db {
             .optional()?
             .flatten();
         Ok(parse_mcp_servers(raw))
+    }
+
+    /// Pin each stage's chosen MCP servers (#1134) to their config in
+    /// `user` (the Settings servers, `mcp::load_user_servers`), once, when
+    /// the run is created. A chosen server `user` doesn't have isn't pinned,
+    /// so the stage reports it and runs without it. An existing pin is never
+    /// replaced, so the run keeps the configs from its creation whatever is
+    /// written to any file later.
+    pub fn pin_run_mcp_servers(
+        &self,
+        run_id: &str,
+        user: &std::collections::HashMap<String, crate::mcp::McpServerConfig>,
+    ) -> AppResult<()> {
+        let mut stmt = self.conn.prepare("SELECT id, mcp_servers FROM run_stages WHERE run_id = ?1 AND mcp_pinned IS NULL")?;
+        let stages = stmt
+            .query_map(params![run_id], |r| Ok((r.get::<_, String>(0)?, parse_mcp_servers(r.get::<_, Option<String>>(1)?))))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (stage_id, chosen) in stages.into_iter().filter(|(_, c)| !c.is_empty()) {
+            let pinned: std::collections::BTreeMap<&String, &crate::mcp::McpServerConfig> =
+                chosen.iter().filter_map(|name| user.get(name).map(|cfg| (name, cfg))).collect();
+            let json = serde_json::to_string(&pinned).map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+            self.conn.execute("UPDATE run_stages SET mcp_pinned = ?2 WHERE id = ?1", params![stage_id, json])?;
+        }
+        Ok(())
+    }
+
+    /// The configs pinned for a run stage's MCP servers; NULL or unreadable
+    /// ⇒ none.
+    pub fn get_stage_mcp_pinned(
+        &self,
+        stage_id: &str,
+    ) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT mcp_pinned FROM run_stages WHERE id = ?1", params![stage_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default())
+    }
+
+    /// Mark a run as dispatched by the Routine `routine_id`.
+    pub fn stamp_run_routine(&self, run_id: &str, routine_id: &str) -> AppResult<()> {
+        self.conn.execute("UPDATE runs SET routine_id = ?2 WHERE id = ?1", params![run_id, routine_id])?;
+        Ok(())
+    }
+
+    /// The Routine that dispatched a run (`stamp_run_routine`), if one did.
+    /// Kept after that Routine fires again or is deleted.
+    pub fn run_routine_id(&self, run_id: &str) -> AppResult<Option<String>> {
+        let id: Option<String> = self
+            .conn
+            .query_row("SELECT routine_id FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(id)
     }
 
     /// Override a stage's tool-turn budget (used by Resume/Re-run with N turns).

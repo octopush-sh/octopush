@@ -3,22 +3,21 @@ import { Server } from "lucide-react";
 import { chipTone } from "../CompanionMcpScope";
 import { runsOnClaudeCode } from "../../lib/claudeCli";
 import type { McpServerStatus } from "../../lib/types";
-import { useMcpScopeStore } from "../../stores/mcpScopeStore";
 import { ipc, type AgentSubstrate } from "../../lib/ipc";
 
-// Stable empty so the selector never hands React a fresh array per render.
+// Stable empty, so `chosen` absent never makes a fresh array per render.
 const NONE: string[] = [];
 
 const EASE = "transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)]";
 
 const FIELD_TITLE =
-  "The MCP servers this stage may use, from Settings › Integrations and this project's .claude/mcp.json. " +
-  "Off for every stage until you turn one on: crews run unattended. A read-only stage gets only the tools a server marks read-only. " +
-  "Not in detached runs or Routines yet.";
+  "The MCP servers this stage may use, from Settings › Integrations only: a project's .claude/mcp.json isn't offered. " +
+  "Off for every stage until you turn one on: crews run unattended. Each run keeps the servers' settings from when it was created. " +
+  "A read-only stage gets only the tools a server marks read-only. Not in detached runs or Routines yet.";
 
 /** What a chip knows about its server: the registry's status, `null` when
- *  the server isn't configured here, `"unknown"` when the list couldn't be
- *  read (no workspace, or a failed read). */
+ *  the server isn't in Settings › Integrations, `"unknown"` when the list
+ *  couldn't be read. */
 export type StageMcpChipStatus = McpServerStatus | null | "unknown";
 
 /** Why the field is unavailable on a CLI stage: the CLI brings its own
@@ -36,7 +35,7 @@ export function stageMcpChipTitle(name: string, status: StageMcpChipStatus, on: 
     status === "unknown"
       ? "status unknown"
       : !status
-        ? "not configured on this Mac or in this project"
+        ? "not in Settings › Integrations"
         : status.state === "connected"
           ? status.tools == null
             ? "connected"
@@ -47,9 +46,9 @@ export function stageMcpChipTitle(name: string, status: StageMcpChipStatus, on: 
   return `${name} · ${state} · ${on ? "click to take it off this stage" : "click to let this stage use it"}`;
 }
 
-/** The chips to show: every configured server, then any the stage chose that
- *  isn't configured here (so it can be taken off). With no reading
- *  (`status` null), only the chosen servers, of unknown status. Pure. */
+/** The chips to show: every Settings server, then any the stage chose that
+ *  isn't one (so it can be taken off). With no reading (`status` null), only
+ *  the chosen servers, of unknown status. Pure. */
 export function stageMcpChips(
   status: McpServerStatus[] | null,
   chosen: string[],
@@ -62,36 +61,29 @@ export function stageMcpChips(
 
 /** The field's one line under the chips, if any: what the list's reading
  *  is, never "none configured" unless a read said so. Pure. */
-export function stageMcpNote(
-  workspacePath: string | undefined,
-  status: McpServerStatus[] | undefined,
-  failed: boolean,
-): string | null {
-  if (!workspacePath) return "Open a workspace to choose its MCP servers.";
-  if (status) return status.length === 0 ? "No MCP servers in Settings › Integrations or this project's .claude/mcp.json." : null;
-  return failed ? "Couldn't read the MCP servers configured here." : "Reading the MCP servers…";
+export function stageMcpNote(status: McpServerStatus[] | undefined, failed: boolean): string | null {
+  if (status) return status.length === 0 ? "No MCP servers in Settings › Integrations." : null;
+  return failed ? "Couldn't read the MCP servers in Settings › Integrations." : "Reading the MCP servers…";
 }
 
 /** The Stage inspector's "MCP servers" field (#1134): one toggle chip per
- *  server, off by default. API stages only for now; on a CLI stage the chips
- *  are disabled and the field says why. The list re-reads on a workspace
- *  change and on `mcp://config-changed` / `mcp://status-changed`. */
+ *  Settings server, off by default. API stages only for now; on a CLI stage
+ *  the chips are disabled and the field says why. The list re-reads on
+ *  `mcp://config-changed` / `mcp://status-changed`. */
 export function StageMcpServers({
-  workspacePath,
   substrate,
   model,
   chosen,
   onChange,
 }: {
-  workspacePath?: string;
   substrate: AgentSubstrate;
   model: string;
   chosen: string[] | undefined;
   onChange: (next: string[]) => void;
 }) {
-  const status = useMcpScopeStore((s) => (workspacePath ? s.statusByPath[workspacePath] : undefined));
-  // The path whose last read failed; a reading already held still shows.
-  const [failedPath, setFailedPath] = useState<string | null>(null);
+  const [status, setStatus] = useState<McpServerStatus[] | undefined>(undefined);
+  // The last read failed; a reading already held still shows.
+  const [failed, setFailed] = useState(false);
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
@@ -111,25 +103,27 @@ export function StageMcpServers({
   }, []);
 
   useEffect(() => {
-    if (!workspacePath) return;
     let live = true;
-    void useMcpScopeStore
-      .getState()
-      .loadStatus(workspacePath)
-      .then((ok) => {
-        if (live) setFailedPath(ok ? null : workspacePath);
+    ipc
+      .listUserMcpServerStatus()
+      .then((next) => {
+        if (!live) return;
+        setStatus(next);
+        setFailed(false);
+      })
+      .catch(() => {
+        if (live) setFailed(true);
       });
     return () => {
       live = false;
     };
-  }, [workspacePath, tick]);
+  }, [tick]);
 
   const isCli = substrate === "cli";
   const on = chosen ?? NONE;
-  const failed = !!workspacePath && failedPath === workspacePath;
-  const loading = !!workspacePath && !status && !failed;
+  const loading = !status && !failed;
   const chips = loading ? [] : stageMcpChips(status ?? null, on);
-  const note = stageMcpNote(workspacePath, status, failed);
+  const note = stageMcpNote(status, failed);
   const toggle = (name: string) =>
     onChange(on.includes(name) ? on.filter((n) => n !== name) : [...on, name].sort());
 

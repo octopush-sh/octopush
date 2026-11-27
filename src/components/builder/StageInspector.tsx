@@ -149,9 +149,6 @@ interface Props {
   issue?: { error?: string; warning?: string };
   /** This stage's track record on a saved pipeline; absent on a new stage. */
   record?: StageRecord | null;
-  /** The open workspace, whose MCP servers (Settings › Integrations and its
-   *  `.claude/mcp.json`) the MCP field lists. */
-  workspacePath?: string;
   onPatch: (partial: Partial<StageNodeData>) => void;
   onSetLoop: (next: LoopState) => void;
   onClose: () => void;
@@ -161,7 +158,7 @@ interface Props {
  *  substrate, tools, MCP servers, gate, turn budget, free-form instructions, and (for review
  *  archetypes) the loop. The archetype is the operability anchor; everything
  *  else is the author's to shape. */
-export function StageInspector({ node, ancestors, loop, issue, record, workspacePath, onPatch, onSetLoop, onClose }: Props) {
+export function StageInspector({ node, ancestors, loop, issue, record, onPatch, onSetLoop, onClose }: Props) {
   const data = node.data;
   // Subscribe to roles store so the Listbox re-renders when roles load late.
   // archetypes() reads the module-level cache populated by setArchetypes() —
@@ -405,7 +402,6 @@ export function StageInspector({ node, ancestors, loop, issue, record, workspace
 
           {/* MCP servers — opt-in per stage, API substrate only for now. */}
           <StageMcpServers
-            workspacePath={workspacePath}
             substrate={data.substrate}
             model={data.agentModel}
             chosen={data.mcpServers}

@@ -15,9 +15,7 @@ interface McpScopeState {
   statusByPath: Record<string, McpServerStatus[]>;
   /** The servers off per thread; absent until loaded. */
   offByThread: Record<string, string[]>;
-  /** Resolves false when the read failed (the last reading, if any, stays),
-   *  true otherwise, including when a newer load superseded this one. */
-  loadStatus: (worktreePath: string) => Promise<boolean>;
+  loadStatus: (worktreePath: string) => Promise<void>;
   loadOff: (threadId: string) => Promise<void>;
   /** Turn one server off in a conversation, or back on. Ignored until the
    *  thread's list has loaded. The chip changes at once; writes for one
@@ -45,12 +43,10 @@ export const useMcpScopeStore = create<McpScopeState>((set, get) => ({
     const seq = (statusSeq[worktreePath] = (statusSeq[worktreePath] ?? 0) + 1);
     try {
       const status = await ipc.listMcpServerStatus(worktreePath);
-      if (statusSeq[worktreePath] !== seq) return true;
+      if (statusSeq[worktreePath] !== seq) return;
       set((s) => ({ statusByPath: { ...s.statusByPath, [worktreePath]: status } }));
-      return true;
     } catch {
       // Keep the last reading: a failed read says nothing about the servers.
-      return false;
     }
   },
 

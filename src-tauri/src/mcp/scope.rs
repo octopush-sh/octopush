@@ -6,7 +6,7 @@
 //! out the servers a conversation switched off, and the status read spawns
 //! nothing.
 
-use super::{load_server_configs, sort_tools, sorted_server_configs, McpRegistry, McpToolInfo};
+use super::{load_server_configs, sort_tools, sorted_server_configs, McpRegistry, McpServerConfig, McpToolInfo};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -66,18 +66,24 @@ impl McpRegistry {
 
     /// The tools of only the servers in `only` (a Direct stage's choice), in
     /// [`sort_tools`] order, and why each chosen server gave none: it isn't
-    /// configured for `worktree`, or it failed to start (the reason redacted
-    /// as every start failure is). The other servers are never started.
-    pub fn list_tools_of(&self, worktree: &Path, only: &[String]) -> (Vec<McpToolInfo>, Vec<(String, String)>) {
+    /// in `pinned` (the run's Settings servers, fixed when it was created),
+    /// or it failed to start (the reason redacted as every start failure
+    /// is). Reads no file, so no `.claude/mcp.json` can add or redefine a
+    /// server here. The other servers are never started.
+    pub fn list_tools_of(
+        &self,
+        pinned: &HashMap<String, McpServerConfig>,
+        only: &[String],
+    ) -> (Vec<McpToolInfo>, Vec<(String, String)>) {
         let mut out = Vec::new();
         let mut missing = Vec::new();
-        let cfgs = sorted_server_configs(worktree);
         let mut wanted: Vec<&String> = only.iter().collect();
         wanted.sort();
         wanted.dedup();
         for name in wanted {
-            let Some((_, cfg)) = cfgs.iter().find(|(n, _)| n == name) else {
-                missing.push((name.clone(), "it isn't configured on this Mac or in this project".to_string()));
+            let Some(cfg) = pinned.get(name) else {
+                let why = "it isn't among the Settings servers pinned when this run was created";
+                missing.push((name.clone(), why.to_string()));
                 continue;
             };
             match self.ensure(name, cfg) {
@@ -94,7 +100,12 @@ impl McpRegistry {
     /// nothing, and takes one registry lock at a time and never a
     /// connection's own lock (a call in flight can hold that for a minute).
     pub fn status(&self, worktree: &Path) -> Vec<McpServerStatus> {
-        let cfgs = load_server_configs(worktree);
+        self.status_of(&load_server_configs(worktree))
+    }
+
+    /// [`Self::status`] of the servers in `cfgs` (Settings' own, for a
+    /// Direct stage's chips).
+    pub fn status_of(&self, cfgs: &HashMap<String, McpServerConfig>) -> Vec<McpServerStatus> {
         let mut names: Vec<&String> = cfgs.keys().collect();
         names.sort();
         // A connection or failure counts only for the config on disk now: one
@@ -235,20 +246,24 @@ done
     fn a_stage_gets_only_the_servers_it_chose() {
         let wt = tempfile::tempdir().unwrap();
         four_servers(wt.path());
+        // The run's pinned servers: three of the four. `zeta` is defined by
+        // the worktree's `.claude/mcp.json` only.
+        let mut pinned = crate::mcp::project_config(wt.path());
+        pinned.remove("zeta");
         let reg = McpRegistry::new();
-        let chosen = vec!["mid".to_string(), "gone".to_string(), "alpha".to_string()];
-        let (tools, missing) = reg.list_tools_of(wt.path(), &chosen);
+        let chosen = vec!["mid".to_string(), "gone".to_string(), "alpha".to_string(), "zeta".to_string()];
+        let (tools, missing) = reg.list_tools_of(&pinned, &chosen);
         let servers: HashSet<&str> = tools.iter().map(|t| t.server.as_str()).collect();
         assert_eq!(servers, ["alpha", "mid"].into());
         assert_eq!(tools.len(), 6);
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].0, "gone");
-        // The servers it didn't choose were never started.
+        let missing: Vec<&str> = missing.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(missing, ["gone", "zeta"], "a server the worktree's file defines is never used");
+        // The servers it didn't choose, or that weren't pinned, were never started.
         for name in ["beta", "zeta"] {
             assert_eq!(of(&reg.status(wt.path()), name).state, McpServerState::Idle);
         }
         // No choice, no tools and nothing started.
-        let (none, missing) = reg.list_tools_of(wt.path(), &[]);
+        let (none, missing) = reg.list_tools_of(&pinned, &[]);
         assert!(none.is_empty() && missing.is_empty());
     }
 

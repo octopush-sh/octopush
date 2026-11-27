@@ -66,8 +66,6 @@ const defaultEdgeOptions = {
 interface Props {
   /** null = compose a new pipeline; a loaded pipeline = edit (builtins fork on save). */
   pipeline: PipelineWithStages | null;
-  /** The open workspace, for the inspector's MCP server list. */
-  workspacePath?: string;
   onClose: () => void;
 }
 
@@ -80,7 +78,7 @@ export function PipelineBuilder(props: Props) {
   );
 }
 
-function BuilderInner({ pipeline, workspacePath, onClose }: Props) {
+function BuilderInner({ pipeline, onClose }: Props) {
   const isBuiltin = pipeline?.pipeline.isBuiltin ?? false;
   const save = usePipelineStore((s) => s.save);
   const remove = usePipelineStore((s) => s.remove);
@@ -661,7 +659,6 @@ function BuilderInner({ pipeline, workspacePath, onClose }: Props) {
                 loop={loopState}
                 issue={validation.byNode[dockNode.id]}
                 record={recordFor(dockNode)}
-                workspacePath={workspacePath}
                 onPatch={(p) => patchData(dockNode.id, p)}
                 onSetLoop={setLoop}
                 onClose={() => setSelectedId(null)}
