@@ -13,11 +13,13 @@ const STATUS_DOT: Record<StatusCategory, string> = {
 interface Props {
   candidates: Issue[];
   projectKey: string | null;
+  /** The project whose tracker verifies a typed key (#1127). */
+  projectId?: string | null;
   onPick: (key: string) => void;
   onCancel: () => void;
 }
 
-export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }: Props) {
+export function InlineTicketPicker({ candidates, projectKey, projectId = null, onPick, onCancel }: Props) {
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<"project" | "all">(projectKey ? "project" : "all");
   const [highlight, setHighlight] = useState(0);
@@ -43,7 +45,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
 
   async function pickFallback() {
     try {
-      await ipc.getIssue(query);
+      await ipc.getIssue(query, projectId);
       onPick(query);
     } catch {
       // Quiet — surface remains the picker; user can clear and retry.

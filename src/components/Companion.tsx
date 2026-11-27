@@ -14,7 +14,7 @@ import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
 import { FadeSwap } from "./primitives/FadeSwap";
-import { useIssuesStore } from "../stores/issuesStore";
+import { useIssuesStore, useKnownStory } from "../stores/issuesStore";
 import { useChatStore } from "../stores/chatStore";
 import { findCrewAgent } from "./chat/CrewCard";
 
@@ -22,7 +22,7 @@ import { findCrewAgent } from "./chat/CrewCard";
 const EMPTY_MESSAGES: never[] = [];
 const EMPTY_LIVE: never[] = [];
 import { selectElsewhereCount } from "../lib/issueTrackerSelectors";
-import { detectIssueKeyForProject } from "../lib/detectIssueKey";
+import { detectTrackerKey } from "../lib/detectIssueKey";
 
 interface ContextProps {
   tokensUsed: number;
@@ -103,6 +103,8 @@ export function Companion({
   onMakeProject,
 }: Props) {
   const issues = useIssuesStore((s) => s.issues);
+  const tracker = useIssuesStore((s) => s.tracker);
+  const epiku = tracker === "epiku";
   const [elsewhereOpen, setElsewhereOpen] = useState(false);
   // A chosen sub-agent takes the whole Talk panel — its room, not a card
   // squeezed above the other sections. Only while it still resolves: a focus
@@ -124,18 +126,22 @@ export function Companion({
 
   const branch = workspace?.branch ?? "";
   const manualKey = workspace?.linkedIssueKey ?? null;
-  const detectedKey = detectIssueKeyForProject(branch, project?.jiraProjectKey ?? null);
+  const isKnownStory = useKnownStory();
+  const detectedKey = detectTrackerKey(branch, tracker, project?.jiraProjectKey ?? null, isKnownStory);
   const activeKey = manualKey ?? detectedKey;
   // Backlog project key: the configured key, else a manually-linked ticket's
   // prefix. A key guessed from an arbitrary branch name is NOT used (C5).
-  const projectKey =
-    project?.jiraProjectKey ?? (manualKey ? manualKey.split("-")[0] : null);
+  // Epiku's list is the project's already: no key, no Elsewhere.
+  const projectKey = epiku
+    ? null
+    : project?.jiraProjectKey ?? (manualKey ? manualKey.split("-")[0] : null);
   const elsewhereCount = selectElsewhereCount(issues ?? [], projectKey);
 
   // Gate: only show Jira panels when tracker is configured AND we have a
   // resolved project key. If projectKey is null, the project is not linked to
   // any Jira project — render nothing Jira-related.
-  const showJiraBlock = issueTrackerConfigured && workspace !== null && project !== null && projectKey !== null;
+  const showJiraBlock =
+    issueTrackerConfigured && workspace !== null && project !== null && (epiku || projectKey !== null);
 
   // ── Collapsed strip — slim, like the workspace rail ─────────────
   if (collapsed) {
@@ -191,6 +197,7 @@ export function Companion({
           <WorkContextPanel
             configured={issueTrackerConfigured}
             projectKey={projectKey}
+            wholeBacklog={epiku}
             projectId={projectId}
             defaultCollapsed={mode !== "talk"}
             activeKey={activeKey}

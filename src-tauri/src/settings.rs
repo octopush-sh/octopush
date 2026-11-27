@@ -34,6 +34,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub issue_tracker: Option<crate::issue_tracker::jira::JiraConfig>,
 
+    /// Epiku, read-only (#1127): base URL and project. The token is in the
+    /// Keychain (`issue_tracker::epiku::token_store`), never here. Owned by
+    /// `save_epiku_config`; whole-file saves carry it over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epiku: Option<crate::issue_tracker::epiku::EpikuConfig>,
+
     /// Optional override command for "Open in editor" (e.g. "code", "cursor").
     /// When empty/None, the app autodetects an installed editor.
     #[serde(default)]
@@ -604,15 +610,16 @@ pub fn clear_sync_opt_ins() -> AppResult<()> {
 
 /// A whole-settings save coming from the frontend: everything but the sync
 /// opt-ins (owned by `set_sync_pref`), the updater prefs (owned by
-/// `set_update_channel` / `set_skipped_update_version`) and "Notify me
-/// elsewhere" (owned by `set_notify_elsewhere`), which are carried over from
-/// disk.
+/// `set_update_channel` / `set_skipped_update_version`), "Notify me
+/// elsewhere" (owned by `set_notify_elsewhere`) and the Epiku connection
+/// (owned by `save_epiku_config`), which are carried over from disk.
 pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
     let _guard = SETTINGS_WRITE_LOCK.lock();
     let on_disk = load_settings_for_write()?;
     incoming.preserve_sync_fields_from(&on_disk);
     incoming.preserve_update_fields_from(&on_disk);
     incoming.preserve_notify_fields_from(&on_disk);
+    incoming.epiku = on_disk.epiku;
     save_settings(&incoming)
 }
 
@@ -692,6 +699,12 @@ pub fn get_issue_tracker_config() -> Option<crate::issue_tracker::jira::JiraConf
 /// Persist the issue tracker configuration.
 pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig) -> AppResult<()> {
     update_settings(|s| s.issue_tracker = Some(config))
+}
+
+/// Persist (or, with `None`, drop) the Epiku connection. Its token is kept
+/// apart, in the Keychain.
+pub fn save_epiku_config(config: Option<crate::issue_tracker::epiku::EpikuConfig>) -> AppResult<()> {
+    update_settings(|s| s.epiku = config)
 }
 
 /// Persist git credentials for a host. Goes through [`update_settings`], so it
@@ -853,6 +866,29 @@ mod tests {
         let off = load_settings().unwrap();
         assert!(!off.notify_elsewhere_enabled);
         assert_eq!(off.notify_elsewhere_url, None);
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn the_epiku_connection_is_kept_without_a_token_and_only_its_writer_changes_it() {
+        use crate::issue_tracker::epiku::EpikuConfig;
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.epiku, None);
+        assert!(!serde_json::to_string(&settings).unwrap().contains("epiku"), "no key until one is saved");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+        let cfg = EpikuConfig { base_url: "https://epiku.example.com".into(), project: "sample-project".into() };
+        save_epiku_config(Some(cfg.clone())).unwrap();
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains(r#""epiku": {"#) && !file.to_lowercase().contains("token"), "{file}");
+
+        // A whole-file save from a pane (stale, or crafted) can't drop or change it.
+        save_settings_from_ui(AppSettings::default()).unwrap();
+        assert_eq!(load_settings().unwrap().epiku, Some(cfg));
+        save_epiku_config(None).unwrap();
+        assert_eq!(load_settings().unwrap().epiku, None);
         test_settings_path::set(None);
     }
 
