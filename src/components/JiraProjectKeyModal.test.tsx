@@ -49,4 +49,29 @@ describe("JiraProjectKeyModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
     expect(onSave).toHaveBeenCalledWith(null);
   });
+
+  it("offers Jira, Epiku and None, and saves the Epiku project", () => {
+    const onSave = vi.fn();
+    const tracker = { choice: null, epikuProject: null, epikuDefault: "sample-project", epikuConnected: true };
+    render(<JiraProjectKeyModal initialValue="" projectName="P" tracker={tracker} onSave={onSave} onClose={vi.fn()} />);
+    expect(screen.getByRole("radio", { name: "Jira" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByRole("radio", { name: "Epiku" }));
+    const field = screen.getByLabelText("Epiku project");
+    expect(field).toHaveAttribute("placeholder", "sample-project");
+    fireEvent.change(field, { target: { value: " other-project " } });
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(onSave).toHaveBeenCalledWith(null, { choice: "epiku", epikuProject: "other-project" });
+  });
+
+  it("leaves an untouched default unset, and None stores none", () => {
+    const onSave = vi.fn();
+    const tracker = { choice: null, epikuProject: null, epikuDefault: null, epikuConnected: false };
+    render(<JiraProjectKeyModal initialValue="OCT" projectName="P" tracker={tracker} onSave={onSave} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(onSave).toHaveBeenLastCalledWith("OCT", { choice: null, epikuProject: null });
+    fireEvent.click(screen.getByRole("radio", { name: "None" }));
+    expect(screen.getByText("This project shows no tickets and no backlog.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /save/i }));
+    expect(onSave).toHaveBeenLastCalledWith("OCT", { choice: "none", epikuProject: null });
+  });
 });
