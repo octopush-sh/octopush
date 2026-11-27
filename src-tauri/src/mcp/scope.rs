@@ -6,7 +6,7 @@
 //! out the servers a conversation switched off, and the status read spawns
 //! nothing.
 
-use super::{sort_tools, McpRegistry, McpToolInfo};
+use super::{sort_tools, McpRegistry, McpServerConfig, McpToolInfo};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -64,12 +64,48 @@ impl McpRegistry {
         out
     }
 
+    /// The tools of only the servers in `only` (a Direct stage's choice), in
+    /// [`sort_tools`] order, and why each chosen server gave none: it isn't
+    /// in `pinned` (the run's Settings servers, fixed when it was created),
+    /// or it failed to start (the reason redacted as every start failure
+    /// is). Reads no file, so no `.claude/mcp.json` can add or redefine a
+    /// server here. The other servers are never started.
+    pub fn list_tools_of(
+        &self,
+        pinned: &HashMap<String, McpServerConfig>,
+        only: &[String],
+    ) -> (Vec<McpToolInfo>, Vec<(String, String)>) {
+        let mut out = Vec::new();
+        let mut missing = Vec::new();
+        let mut wanted: Vec<&String> = only.iter().collect();
+        wanted.sort();
+        wanted.dedup();
+        for name in wanted {
+            let Some(cfg) = pinned.get(name) else {
+                let why = "it isn't among the Settings servers pinned when this run was created";
+                missing.push((name.clone(), why.to_string()));
+                continue;
+            };
+            match self.ensure(name, cfg) {
+                Ok((conn, _)) => out.extend(conn.lock().tools.clone()),
+                Err(e) => missing.push((name.clone(), e.trim().lines().next().unwrap_or("").trim().to_string())),
+            }
+        }
+        sort_tools(&mut out);
+        (out, missing)
+    }
+
     /// Every server it may start for `worktree` (Settings ∪ approved project), sorted, with
     /// what this session knows about it. Reads the registry only: it spawns
     /// nothing, and takes one registry lock at a time and never a
     /// connection's own lock (a call in flight can hold that for a minute).
     pub fn status(&self, worktree: &Path) -> Vec<McpServerStatus> {
-        let cfgs = self.configs(worktree);
+        self.status_of(&self.configs(worktree))
+    }
+
+    /// [`Self::status`] of the servers in `cfgs` (Settings' own, for a
+    /// Direct stage's chips).
+    pub fn status_of(&self, cfgs: &HashMap<String, McpServerConfig>) -> Vec<McpServerStatus> {
         let mut names: Vec<&String> = cfgs.keys().collect();
         names.sort();
         // A connection or failure counts only for the config on disk now: one
@@ -204,6 +240,31 @@ done
         let off: HashSet<String> = ["beta".to_string()].into();
         let without: Vec<String> = first.iter().filter(|n| !n.starts_with("mcp__beta__")).cloned().collect();
         assert_eq!(names(&reg.list_tools_except(wt.path(), &off)), without);
+    }
+
+    #[test]
+    fn a_stage_gets_only_the_servers_it_chose() {
+        let wt = tempfile::tempdir().unwrap();
+        four_servers(wt.path());
+        // The run's pinned servers: three of the four. `zeta` is defined by
+        // the worktree's `.claude/mcp.json` only.
+        let mut pinned = crate::mcp::project_config(wt.path());
+        pinned.remove("zeta");
+        let reg = McpRegistry::trusting_projects();
+        let chosen = vec!["mid".to_string(), "gone".to_string(), "alpha".to_string(), "zeta".to_string()];
+        let (tools, missing) = reg.list_tools_of(&pinned, &chosen);
+        let servers: HashSet<&str> = tools.iter().map(|t| t.server.as_str()).collect();
+        assert_eq!(servers, ["alpha", "mid"].into());
+        assert_eq!(tools.len(), 6);
+        let missing: Vec<&str> = missing.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(missing, ["gone", "zeta"], "a server the worktree's file defines is never used");
+        // The servers it didn't choose, or that weren't pinned, were never started.
+        for name in ["beta", "zeta"] {
+            assert_eq!(of(&reg.status(wt.path()), name).state, McpServerState::Idle);
+        }
+        // No choice, no tools and nothing started.
+        let (none, missing) = reg.list_tools_of(&pinned, &[]);
+        assert!(none.is_empty() && missing.is_empty());
     }
 
     #[test]

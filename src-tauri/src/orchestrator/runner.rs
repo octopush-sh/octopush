@@ -63,6 +63,87 @@ pub struct StageContext {
     /// CLI stage then gets `disableSkillShellExecution` in its `--settings`
     /// (see `cli_runner::disable_skill_shell`); Codex and `ApiRunner` ignore it.
     pub skill_shell_off: bool,
+    /// The MCP servers an API stage was given (#1134), when the app drives
+    /// it. `None`: no server chosen, a CLI stage, or a run where MCP isn't
+    /// available yet (the detached worker, a Routine; the drive says so).
+    pub mcp: Option<StageMcp>,
+}
+
+/// An API stage's MCP servers, resolved in the app process: the registry
+/// Talk uses (its connections, `mcp__server__tool` names, Keychain secrets
+/// read at spawn, redacted start errors) over only the servers the stage chose.
+pub struct StageMcp {
+    pub registry: Arc<crate::mcp::McpRegistry>,
+    pub servers: Vec<String>,
+    /// The chosen servers' Settings configs, pinned when the run was created
+    /// (`Db::pin_run_mcp_servers`). Every start and call uses these, never a
+    /// file read later, so nothing a stage writes changes what runs.
+    pub pinned: Arc<std::collections::HashMap<String, crate::mcp::McpServerConfig>>,
+    /// A read-only role or mission: only tools the server marks
+    /// `readOnlyHint: true` are offered.
+    pub read_only: bool,
+}
+
+/// What a stage is offered of its servers' tools: all of them, or on a
+/// read-only stage only those annotated `readOnlyHint: true` (a tool with no
+/// annotation counts as writing). Returns the kept tools and how many were
+/// left out. Pure.
+pub fn stage_mcp_offer(tools: Vec<crate::mcp::McpToolInfo>, read_only: bool) -> (Vec<crate::mcp::McpToolInfo>, usize) {
+    let total = tools.len();
+    let kept: Vec<_> = tools.into_iter().filter(|t| !read_only || t.read_only).collect();
+    let left_out = total - kept.len();
+    (kept, left_out)
+}
+
+/// The stage notice for a chosen server that gave the stage no tools.
+pub fn mcp_unavailable_notice(server: &str, reason: &str) -> String {
+    format!("MCP server {server} isn't available to this stage: {reason}")
+}
+
+/// Start the stage's chosen servers from their pinned configs (bounded, off
+/// the runtime) and build the tools it is offered. A server that fails to
+/// start, or wasn't pinned, is a notice in the stage's journal and the stage
+/// runs on without it.
+pub async fn stage_mcp_tools(
+    mcp: &StageMcp,
+    emitter: &crate::orchestrator::live::LiveEmitter<'_>,
+) -> Option<crate::chat_agents::McpSubagentTools> {
+    let (reg, pinned, servers) = (Arc::clone(&mcp.registry), Arc::clone(&mcp.pinned), mcp.servers.clone());
+    let found = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || reg.list_tools_of(&pinned, &servers)),
+    )
+    .await;
+    let (tools, missing) = match found {
+        Ok(Ok(found)) => found,
+        Ok(Err(_)) => {
+            emitter.notice("Starting the MCP servers stopped with an internal error, so this stage runs without them");
+            return None;
+        }
+        Err(_) => {
+            emitter.notice("MCP servers didn't start within 20s, so this stage runs without them");
+            return None;
+        }
+    };
+    for (server, reason) in &missing {
+        emitter.notice(&mcp_unavailable_notice(server, reason));
+    }
+    let (kept, left_out) = stage_mcp_offer(tools, mcp.read_only);
+    if left_out > 0 {
+        emitter.notice(&format!(
+            "{left_out} MCP {} left out: a read-only stage gets only tools their server marks read-only",
+            if left_out == 1 { "tool" } else { "tools" }
+        ));
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    Some(crate::chat_agents::McpSubagentTools {
+        registry: Arc::clone(&mcp.registry),
+        configs: crate::mcp::CallConfigs::Pinned(Arc::clone(&mcp.pinned)),
+        tools: kept.iter().map(crate::chat_agents::mcp_llm_tool).collect(),
+        turnstiles: crate::chat_agents::mcp_turnstiles(&kept),
+    })
 }
 
 /// The error message for a stage whose agentic work ended without a final
@@ -376,6 +457,11 @@ impl AgentRunner for ApiRunner {
         // clamp defensively so a corrupt row can never yield a zero-turn loop.
         let max_iterations = stage.max_iterations.max(1) as usize;
         let read_only_tools = read_only.then(|| crate::orchestrator::read_only::read_only_api_tools(stage.tools.as_deref()));
+        // The stage's chosen MCP servers (#1134), on top of the workspace set.
+        let mcp_tools = match &ctx.mcp {
+            Some(mcp) => stage_mcp_tools(mcp, &emitter).await,
+            None => None,
+        };
         let result = run_agentic_loop_billed(
             provider.as_ref(),
             &api_base,
@@ -399,7 +485,7 @@ impl AgentRunner for ApiRunner {
             ctx.spend_limit,
             &ctx.peers,
             if read_only { Some(&crate::orchestrator::read_only::ReadOnlyGitGate as &dyn crate::orchestrator::agentic::ToolGate) } else { None },
-            None,
+            mcp_tools.as_ref().map(|t| t as &dyn crate::orchestrator::agentic::ExternalTools),
         )
         .await;
 
@@ -550,5 +636,169 @@ impl AgentRunner for ApiRunner {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+    use crate::mcp::McpToolInfo;
+    use crate::orchestrator::agentic::ExternalTools;
+
+    fn tool(server: &str, name: &str, read_only: bool) -> McpToolInfo {
+        McpToolInfo {
+            server: server.into(),
+            name: name.into(),
+            namespaced: crate::mcp::namespaced_name(server, name),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn a_read_only_stage_keeps_only_tools_marked_read_only() {
+        let all = vec![tool("tracker", "search", true), tool("tracker", "post", false)];
+        let (kept, left_out) = stage_mcp_offer(all.clone(), true);
+        assert_eq!(kept.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec!["search"]);
+        assert_eq!(left_out, 1);
+        let (kept, left_out) = stage_mcp_offer(all, false);
+        assert_eq!((kept.len(), left_out), (2, 0));
+    }
+
+    #[test]
+    fn mcp_reaches_only_api_stages_in_the_apps_own_drive() {
+        use crate::orchestrator::mcp_skip_reason;
+        assert_eq!(mcp_skip_reason(true, false, false), None);
+        assert!(mcp_skip_reason(true, true, false).unwrap().contains("detached runs"));
+        assert!(mcp_skip_reason(true, true, true).unwrap().contains("Routines"));
+        assert!(mcp_skip_reason(true, false, true).unwrap().contains("Routines"));
+        assert!(mcp_skip_reason(false, false, false).unwrap().contains("their own MCP servers"));
+    }
+
+    struct Notices(parking_lot::Mutex<Vec<String>>);
+    impl crate::orchestrator::events::EventSink for Notices {
+        fn emit(&self, _event: &str, payload: serde_json::Value) {
+            if let Some(t) = payload["entry"]["text"].as_str() {
+                self.0.lock().push(t.to_string());
+            }
+        }
+    }
+
+    // Lists `search` (marked read-only) and `post` (no annotation); a call
+    // answers with `REPLY`. Any arguments are files to create on start.
+    #[cfg(unix)]
+    const TRACKER: &str = r#"#!/usr/bin/env bash
+for f in "$@"; do touch "$f"; done
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"t","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"post","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"REPLY"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+    /// A tracker server script in `dir` that answers calls with `reply`,
+    /// and its config; `marker`, if any, is created when it starts.
+    #[cfg(unix)]
+    fn tracker(dir: &std::path::Path, file: &str, reply: &str, marker: Option<&std::path::Path>) -> crate::mcp::McpServerConfig {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(file);
+        std::fs::write(&script, TRACKER.replace("REPLY", reply)).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut args = vec![script.to_string_lossy().into_owned()];
+        args.extend(marker.map(|m| m.to_string_lossy().into_owned()));
+        crate::mcp::McpServerConfig { command: "bash".into(), args, ..Default::default() }
+    }
+
+    /// Write `servers` as the worktree's own `.claude/mcp.json`.
+    #[cfg(unix)]
+    fn write_project_servers(wt: &std::path::Path, servers: &[(&str, &crate::mcp::McpServerConfig)]) {
+        let map: std::collections::HashMap<&str, &crate::mcp::McpServerConfig> = servers.iter().copied().collect();
+        std::fs::create_dir_all(wt.join(".claude")).unwrap();
+        std::fs::write(wt.join(".claude/mcp.json"), serde_json::json!({ "mcpServers": map }).to_string()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_api_stage_is_offered_only_the_servers_it_chose() {
+        let wt = tempfile::tempdir().unwrap();
+        let user = tracker(wt.path(), "tracker.sh", "pinned", None);
+        // The worktree's own file defines a server of its own; it must never start.
+        let started = wt.path().join("project-server-started");
+        let project = tracker(wt.path(), "project.sh", "project", Some(&started));
+        write_project_servers(wt.path(), &[("stage-project", &project), ("stage-other", &user)]);
+        let pinned = Arc::new(std::collections::HashMap::from([
+            ("stage-tracker".to_string(), user.clone()),
+            ("stage-other".to_string(), user),
+        ]));
+        let registry = Arc::new(crate::mcp::McpRegistry::new());
+        let sink = Notices(parking_lot::Mutex::new(Vec::new()));
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r", "s");
+        let names = |t: &crate::chat_agents::McpSubagentTools| t.definitions().into_iter().map(|d| d.name).collect::<Vec<_>>();
+
+        let chosen = |read_only| StageMcp {
+            registry: Arc::clone(&registry),
+            servers: vec!["stage-tracker".into(), "stage-missing".into(), "stage-project".into()],
+            pinned: Arc::clone(&pinned),
+            read_only,
+        };
+        let writer = stage_mcp_tools(&chosen(false), &emitter).await.expect("tools");
+        assert_eq!(names(&writer), vec!["mcp__stage-tracker__post", "mcp__stage-tracker__search"]);
+        assert!(!writer.owns("mcp__stage-other__search"), "a server the stage didn't choose");
+        let notices = sink.0.lock().clone();
+        for server in ["stage-missing", "stage-project"] {
+            assert!(
+                notices.iter().any(|n| n.starts_with(&format!("MCP server {server} isn't available to this stage: it isn't among the Settings servers pinned"))),
+                "{notices:?}"
+            );
+        }
+        assert!(!started.exists(), "a server only the worktree's .claude/mcp.json defines never starts");
+
+        let reviewer = stage_mcp_tools(&chosen(true), &emitter).await.expect("tools");
+        assert_eq!(names(&reviewer), vec!["mcp__stage-tracker__search"]);
+        assert!(!reviewer.owns("mcp__stage-tracker__post"), "no annotation counts as writing");
+        let notices = sink.0.lock().clone();
+        assert!(notices.iter().any(|n| n.starts_with("1 MCP tool left out")), "{notices:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stage_that_rewrites_mcp_json_still_runs_the_pinned_server() {
+        let wt = tempfile::tempdir().unwrap();
+        let user = tracker(wt.path(), "tracker.sh", "pinned", None);
+        let pinned = Arc::new(std::collections::HashMap::from([("stage-pin".to_string(), user)]));
+        let registry = Arc::new(crate::mcp::McpRegistry::new());
+        let sink = Notices(parking_lot::Mutex::new(Vec::new()));
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r", "s");
+        let mcp = StageMcp {
+            registry: Arc::clone(&registry),
+            servers: vec!["stage-pin".into()],
+            pinned,
+            read_only: false,
+        };
+        let tools = stage_mcp_tools(&mcp, &emitter).await.expect("tools");
+
+        // The stage writes its own definition of the same server.
+        let hijacked = wt.path().join("rewritten-server-started");
+        let rewritten = tracker(wt.path(), "rewritten.sh", "rewritten", Some(&hijacked));
+        write_project_servers(wt.path(), &[("stage-pin", &rewritten)]);
+
+        async fn search(t: &crate::chat_agents::McpSubagentTools) -> Result<String, String> {
+            t.call("mcp__stage-pin__search", &serde_json::json!({})).await
+        }
+        assert_eq!(search(&tools).await.unwrap(), "pinned");
+        // Restarted (a Settings save or Reconnect), it starts from the pin again.
+        registry.reset_server("stage-pin");
+        assert_eq!(search(&tools).await.unwrap(), "pinned");
+        // So does the next stage, or the next loop pass.
+        let next = stage_mcp_tools(&mcp, &emitter).await.expect("tools");
+        assert_eq!(search(&next).await.unwrap(), "pinned");
+        assert!(!hijacked.exists(), "the rewritten entry never ran");
     }
 }
