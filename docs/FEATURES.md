@@ -1075,7 +1075,7 @@ Four distinct integration surfaces: (1) Jira issue tracking, (2) Octopush as an 
 - **"My issues" JQL** — `assignee = currentUser() AND statusCategory != Done ORDER BY status, priority`. _Support:_ `my_issues_jql()`.
 - **Branch→key detection (Rust)** — Extracts the first `[A-Z][A-Z0-9]+-<digits>` key from a branch. _Support:_ `detect_issue_key`.
 - **Jira Cloud auth (HTTP Basic)** — `base64(email:api_token)`; config `{baseUrl, email, apiToken}`. _Support:_ `issue_tracker/jira.rs`.
-- **Endpoints** — `list_my_issues` (`POST /rest/api/3/search/jql`), `get_issue` (`GET /rest/api/3/issue/{key}` with issuelinks+subtasks), `list_issues_in_epic` (`parent = EPIC` with a legacy `"Epic Link"` fallback). _Support:_ `jira.rs`.
+- **Endpoints** — `list_my_issues` (`POST /rest/api/3/search/jql`), `get_issue` (`GET /rest/api/3/issue/{key}` with issuelinks+subtasks+description; the description, Atlassian Document Format or a plain string, becomes plain text: paragraphs, headings, `- ` list items, fenced code blocks, hard breaks, mention text and card URLs, cut at 8,000 characters with a closing "(cut at 8,000 characters)", `jira::description_text`; list endpoints leave it `None`), `list_issues_in_epic` (`parent = EPIC` with a legacy `"Epic Link"` fallback). _Support:_ `jira.rs`.
 - **Link parsing** — Blocks/blocked-by from `issuelinks` (only "Blocks" type); subtasks from the inline array. _Support:_ `parse_issuelinks`, `parse_subtasks`.
 - **Credential storage** — Token in `~/.octopush/settings.json` under `issueTracker`. _Support:_ `settings.rs`.
 - **Commands** — `list_my_issues`, `get_issue`, `list_issues_in_epic`, `get_issue_tracker_config`, `save_issue_tracker_config`, `update_workspace_link`, `update_project_jira_key`. _Support:_ `commands.rs`.
