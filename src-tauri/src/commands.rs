@@ -1445,10 +1445,6 @@ pub async fn project_collisions(
     .map_err(|e| AppError::Other(format!("collision scan: {e}")))
 }
 
-/// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
-/// for Mission Control's settled and needs-you cards. `None` when the
-/// workspace or its worktree is gone, it isn't a git repo, or the diff timed
-/// out — the card then shows nothing rather than a made-up zero.
 /// The workspace's port block (#1219), allocated now if it has none: the
 /// header shows the same range its terminals and Talk shell get. `None` when
 /// the workspace is gone or every block is taken.
@@ -1460,6 +1456,10 @@ pub async fn workspace_ports(
     Ok(crate::workspace_ports::ensure(&state.db.lock(), &workspace_id))
 }
 
+/// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
+/// for Mission Control's settled and needs-you cards. `None` when the
+/// workspace or its worktree is gone, it isn't a git repo, or the diff timed
+/// out — the card then shows nothing rather than a made-up zero.
 #[tauri::command]
 pub async fn workspace_diff_size(
     state: State<'_, AppState>,

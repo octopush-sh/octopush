@@ -1,5 +1,5 @@
 //! Workspace ports (#1219) — each workspace owns a block of local ports, so
-//! two workspaces in flight never fight over the same dev-server port.
+//! a dev server that reads `OCTOPUSH_PORT` doesn't fight another workspace's.
 //!
 //! A block is [`BLOCK_SIZE`] ports from a fixed range ([`RANGE_START`] up to
 //! [`RANGE_END`], below macOS's ephemeral ports). It is allocated the first
