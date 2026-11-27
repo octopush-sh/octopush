@@ -2376,6 +2376,11 @@ function App() {
   // existing-workspace alert.
   async function startTestForTicket(issue: Issue) {
     setBacklogTicketMenu(null);
+    const epiku = epikuTicketTarget(issue, activeTracker, activeProject);
+    if (epiku) {
+      setCreatorForTicket({ ...epiku, initialIntent: "test" });
+      return;
+    }
     await continueCreateForTicket(issue.key, issue.summary, "test");
   }
 
