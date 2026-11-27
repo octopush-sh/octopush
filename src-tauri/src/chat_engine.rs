@@ -2181,7 +2181,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "read_file",
-            "description": "Read the contents of a file in the workspace. For large files, pass offset/limit to read a window of lines instead of the whole file.",
+            "description": "Read the contents of a file in the workspace. Each line comes back led by its line number and a tab; the number isn't part of the file. For large files, pass offset/limit to read a window of lines instead of the whole file.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -2203,7 +2203,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "write_file",
-            "description": "Write content to a file in the workspace. Creates the file and parent directories if they don't exist. Overwrites existing content.",
+            "description": "Write content to a file in the workspace. Creates the file and parent directories if they don't exist. Overwrites existing content: an existing file must have been read with read_file first, and is refused if it changed on disk since.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -2289,7 +2289,7 @@ fn tool_definitions() -> serde_json::Value {
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "The exact text to replace"
+                        "description": "The exact text to replace, without read_file's line-number prefixes"
                     },
                     "new_string": {
                         "type": "string",
@@ -2739,6 +2739,38 @@ fn read_file_head(full: &Path) -> std::io::Result<(String, u64)> {
     Ok((utf8_keeping_cut(bytes, cut)?, size))
 }
 
+/// `lines` as `read_file` shows them to the model: each led by its number,
+/// counting from `first`, right-aligned in six columns and then a tab (the
+/// `cat -n` layout), so the model can cite `path:line` and aim an edit.
+fn number_lines<'a>(lines: impl Iterator<Item = &'a str>, first: usize) -> String {
+    lines
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{line}", first + i))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `text` without the [`number_lines`] prefix on each of its lines, when
+/// every line carries one (a trailing newline aside); `None` otherwise.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let last = lines.len() - 1;
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i == last && line.is_empty() && i > 0 {
+            out.push("");
+            continue;
+        }
+        let rest = line.trim_start_matches(' ');
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 || rest.as_bytes().get(digits) != Some(&b'\t') {
+            return None;
+        }
+        out.push(&rest[digits + 1..]);
+    }
+    Some(out.join("\n"))
+}
+
 /// [`execute_tool_cancellable`] with no cancel flag. The app always passes
 /// one ([`run_builtin`]); tests call this.
 #[cfg(test)]
@@ -2840,7 +2872,7 @@ pub(crate) fn execute_tool_cancellable(
                 return match read_line_window(&full, start, limit.map(|l| l as usize)) {
                     Ok((window, total)) => {
                         let shown = window.len();
-                        let body = window.join("\n");
+                        let body = number_lines(window.iter().map(String::as_str), start + 1);
                         let body = truncate_char_safe(&body, READ_FILE_MAX_BYTES);
                         let of = match total {
                             Some(total) => format!(" of {total}"),
@@ -2854,11 +2886,12 @@ pub(crate) fn execute_tool_cancellable(
             match read_file_head(&full) {
                 Ok((head, size)) if size > head.len() as u64 => (
                     format!(
-                        "{head}... (truncated, {size} bytes total — re-read with `offset`/`limit` to see the rest)"
+                        "{}... (truncated, {size} bytes total — re-read with `offset`/`limit` to see the rest)",
+                        number_lines(head.lines(), 1)
                     ),
                     true,
                 ),
-                Ok((content, _)) => (content, true),
+                Ok((content, _)) => (number_lines(content.lines(), 1), true),
                 Err(e) => (format!("Error reading {path}: {e}"), false),
             }
         }
@@ -3068,6 +3101,18 @@ pub(crate) fn execute_tool_cancellable(
                 Ok(c) => c,
                 Err(e) => return (format!("Error reading {path}: {e}"), false),
             };
+            // The model copied `read_file`'s numbered lines into the edit:
+            // match on the text without the numbers (and write `new_string`
+            // without them too, when it carries them on every line).
+            let unnumbered = (!content.contains(old_string))
+                .then(|| strip_line_numbers(old_string))
+                .flatten()
+                .filter(|old| !old.is_empty() && content.contains(old.as_str()));
+            let (old_string, new_string) = match unnumbered {
+                Some(old) => (old, strip_line_numbers(new_string).unwrap_or_else(|| new_string.to_string())),
+                None => (old_string.to_string(), new_string.to_string()),
+            };
+            let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
             let count = content.matches(old_string).count();
             if count == 0 {
                 return (
@@ -3368,6 +3413,9 @@ pub struct ChatEngine {
     /// Threads whose live `$` process the user stopped (`stop_shell`), so its
     /// row reads as stopped when it exits.
     stopped_shells: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per thread, the files the agent read or wrote as it saw them, so a
+    /// `write_file` never overwrites a file blind (#1165).
+    file_seen: Arc<Mutex<HashMap<String, crate::file_seen::FileSeen>>>,
 }
 
 impl ChatEngine {
@@ -3385,7 +3433,23 @@ impl ChatEngine {
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
             stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            file_seen: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Why the agent's tool call `name` with `input` must not run in
+    /// `thread_id`: a `write_file` over a file it hasn't read, or that
+    /// changed since (`file_seen`).
+    fn file_seen_refusal(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value) -> Option<String> {
+        self.file_seen.lock().get(thread_id).map_or_else(
+            || crate::file_seen::FileSeen::default().refusal(workspace, name, input),
+            |seen| seen.refusal(workspace, name, input),
+        )
+    }
+
+    /// After the agent's tool call ran in `thread_id`: what it now knows of the file.
+    fn note_file_seen(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value, ok: bool) {
+        self.file_seen.lock().entry(thread_id.to_string()).or_default().note(workspace, name, input, ok);
     }
 
     /// Stop a thread's live `$` process (SIGINT), remembering that the user
@@ -5288,6 +5352,8 @@ impl ChatEngine {
                 // An MCP result whose binary payloads the model reads as
                 // placeholders: the original, kept on the row for recall.
                 let mut mcp_original: Option<String> = None;
+                // A `write_file` the overwrite guard refused (`file_seen`).
+                let mut write_refused = false;
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
@@ -5415,12 +5481,18 @@ impl ChatEngine {
                     let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
                     (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
+                } else if let Some(refusal) = self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input) {
+                    // A write over a file the agent hasn't read, or that
+                    // changed since: refused, nothing written.
+                    write_refused = true;
+                    (refusal, false)
                 } else {
                     // Every other built-in tool, off the runtime thread too: a
                     // long grep never stalls another workspace's turn, and a
                     // walk Stop ended reads as stopped.
                     let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
+                    self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1);
                     ran
                 };
                 // A long command's output: its row and the model read the
@@ -5442,7 +5514,7 @@ impl ChatEngine {
                 });
 
                 // If the tool wrote a file, record it in file_edits for the Review canvas.
-                if (u.name == "write_file" || u.name == "edit_file") && !mode_denied {
+                if (u.name == "write_file" || u.name == "edit_file") && !mode_denied && !write_refused {
                     if let Some(path) = u.input.get("path").and_then(|p| p.as_str()) {
                         let msg_id = if assistant_msg_id >= 0 { Some(assistant_msg_id) } else { None };
                         if let Err(e) = self.db.lock().insert_file_edit(
@@ -6910,6 +6982,66 @@ mod tests {
     }
 
     #[test]
+    fn read_file_numbers_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::write(wp.join("n.rs"), "fn main() {\r\n    run();\n}\n").unwrap();
+        let (out, ok) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "n.rs" }), None);
+        assert!(ok, "{out}");
+        assert_eq!(out, "     1\tfn main() {\n     2\t    run();\n     3\t}");
+        // A window counts from its first line.
+        let (out, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "n.rs", "offset": 2, "limit": 1 }), None);
+        assert_eq!(out, "(lines 2-2; more follow)\n     2\t    run();");
+        // Line ten and on keep the column.
+        let long = (1..=12).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(wp.join("long.txt"), long).unwrap();
+        let (out, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "long.txt" }), None);
+        assert!(out.ends_with("\n    11\tl11\n    12\tl12"), "{out}");
+    }
+
+    #[test]
+    fn edit_file_strips_copied_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::write(wp.join("f.rs"), "fn a() {\n    one();\n    two();\n}\n").unwrap();
+        // old_string and new_string copied from read_file's numbered view.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({
+                "path": "f.rs",
+                "old_string": "     2\t    one();\n     3\t    two();\n",
+                "new_string": "     2\t    one();\n     3\t    three();\n",
+            }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("f.rs")).unwrap(), "fn a() {\n    one();\n    three();\n}\n");
+        // Only old_string numbered: new_string is written as given.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "f.rs", "old_string": "     4\t}", "new_string": "} // end" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("f.rs")).unwrap(), "fn a() {\n    one();\n    three();\n} // end\n");
+        // Raw text still matches first: a file that holds the numbers keeps them.
+        std::fs::write(wp.join("t.tsv"), "1\tx\n2\ty\n").unwrap();
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "t.tsv", "old_string": "2\ty", "new_string": "2\tz" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("t.tsv")).unwrap(), "1\tx\n2\tz\n");
+        // A line without a number isn't stripped.
+        assert_eq!(strip_line_numbers("     1\ta\nb"), None);
+        assert_eq!(strip_line_numbers("12\ta\n13\tb\n").as_deref(), Some("a\nb\n"));
+    }
+
+    #[test]
     fn read_file_truncates_multibyte_content_on_a_char_boundary() {
         // Regression: the old `&content[..100_000]` byte slice panicked when
         // byte 100k fell inside a multibyte character.
@@ -7124,14 +7256,14 @@ mod tests {
         let read = |input: serde_json::Value| execute_tool(wp, "read_file", &input, None);
         let (out, ok) = read(serde_json::json!({ "path": "w.txt", "offset": 2, "limit": 3 }));
         assert!(ok, "{out}");
-        assert_eq!(out, "(lines 2-4; more follow)\nline2\nline3\nline4");
+        assert_eq!(out, "(lines 2-4; more follow)\n     2\tline2\n     3\tline3\n     4\tline4");
         // A window that ends at the file's end knows its total.
         std::fs::write(wp.join("short.txt"), "a\nb\nc\n").unwrap();
         let (out, ok) = read(serde_json::json!({ "path": "short.txt", "offset": 2, "limit": 5 }));
         assert!(ok);
-        assert_eq!(out, "(lines 2-3 of 3)\nb\nc");
+        assert_eq!(out, "(lines 2-3 of 3)\n     2\tb\n     3\tc");
         let (out, _) = read(serde_json::json!({ "path": "short.txt", "offset": 3, "limit": 1 }));
-        assert_eq!(out, "(lines 3-3 of 3)\nc");
+        assert_eq!(out, "(lines 3-3 of 3)\n     3\tc");
         // Past the end: nothing shown, the total still told.
         let (out, _) = read(serde_json::json!({ "path": "short.txt", "offset": 9 }));
         assert_eq!(out, "(lines 9-8 of 3)\n");
@@ -7145,7 +7277,7 @@ mod tests {
         // One huge line in a window is cut at the cap, not read whole.
         let (out, ok) = read(serde_json::json!({ "path": "big.txt", "limit": 1 }));
         assert!(ok, "{}", &out[..80]);
-        assert!(out.starts_with("(lines 1-1; more follow)\nxxx"), "{}", &out[..80]);
+        assert!(out.starts_with("(lines 1-1; more follow)\n     1\txxx"), "{}", &out[..80]);
         assert!(out.len() < READ_FILE_MAX_BYTES + 100);
     }
 
