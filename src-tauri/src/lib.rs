@@ -24,6 +24,7 @@ pub mod entitlement;
 pub mod entitlement_token;
 pub mod error;
 mod file_open;
+mod file_seen;
 mod fleet_status;
 mod menu_bar;
 pub mod gateway;

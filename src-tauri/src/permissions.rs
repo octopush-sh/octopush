@@ -1714,7 +1714,7 @@ mod tests {
             "decision => crate::permissions::refusal(decision).map(|m| (u.id.clone(), m)),",
             "if let Some(note) = mode_watch.at_round(mode) {",
             "if denied.is_none() && skill_refusal.is_none() && (mode_asks.contains(&u.id) || moved) {",
-            "denied = crate::ask_first::ask_first(preview, ask).await;",
+            "denied = crate::ask_first::ask_first(preview, ask, refused).await;",
             "let grants = mode != crate::permissions::Mode::Ask;",
             "self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants)",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
