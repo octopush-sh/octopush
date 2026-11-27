@@ -4806,6 +4806,15 @@ pub async fn set_workspace_prerequisite(
     )
 }
 
+/// The links of `project_id`'s active missions.
+#[tauri::command]
+pub async fn list_workspace_prerequisites(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<Vec<crate::db::PrerequisiteRow>> {
+    state.db.lock().list_workspace_prerequisites(&project_id)
+}
+
 /// Stop `workspace_id` waiting on another mission.
 #[tauri::command]
 pub async fn clear_workspace_prerequisite(

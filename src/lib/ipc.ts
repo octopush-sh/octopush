@@ -22,6 +22,20 @@ export type UpdateDownloadEvent =
   | { event: "Progress"; data: { chunkLength: number } }
   | { event: "Finished" };
 
+// ─── Starts after (#960) — types ───────────────────────────────────────────
+
+export type PrerequisiteCondition = "run_finished" | "pr_merged";
+
+/** A mission waiting on another of its project (the Rust `PrerequisiteRow`). */
+export interface Prerequisite {
+  workspaceId: string;
+  afterWorkspaceId: string;
+  afterCondition: PrerequisiteCondition;
+  branchFromPrerequisite: boolean;
+  /** Start the run on its own once the condition holds; off = stage it. */
+  autoStart: boolean;
+}
+
 // ─── Direct mode (orchestration) — types ──────────────────────────────────
 
 export type AgentSubstrate = "api" | "cli";
@@ -909,6 +923,14 @@ export const ipc = {
    *  refusal leaves them all where they were. */
   setItemsGroup: (kind: GroupScope, itemIds: string[], groupId: string | null) =>
     invoke<void>("set_items_group", { kind, itemIds, groupId }),
+
+  // ─── Starts after (#960): a mission waiting on another of its project ───
+  listWorkspacePrerequisites: (projectId: string) =>
+    invoke<Prerequisite[]>("list_workspace_prerequisites", { projectId }),
+  /** Replaces any earlier link; refused (in English) for a cycle or an archived prerequisite. */
+  setWorkspacePrerequisite: (workspaceId: string, afterWorkspaceId: string, condition: PrerequisiteCondition, autoStart: boolean) =>
+    invoke<Prerequisite>("set_workspace_prerequisite", { workspaceId, afterWorkspaceId, condition, branchFromPrerequisite: false, autoStart }),
+  clearWorkspacePrerequisite: (workspaceId: string) => invoke<void>("clear_workspace_prerequisite", { workspaceId }),
 
   // ─── Workspaces ─────────────────────────────────────────────────
   createWorkspace: (projectId: string, projectPath: string, name: string, task: string,
