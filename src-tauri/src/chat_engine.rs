@@ -2771,6 +2771,28 @@ fn strip_line_numbers(text: &str) -> Option<String> {
     Some(out.join("\n"))
 }
 
+/// What `edit_file` matches when `old` isn't in `content` as written, for an
+/// edit copied from `read_file`'s view: `old` without the line numbers (and
+/// `new` too, when it carries them on every line), and, in a file with CRLF
+/// line ends, with its `\r` back (the view drops them). `None` when neither
+/// matches.
+fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String)> {
+    if content.contains(old) {
+        return None;
+    }
+    let mut tries = Vec::new();
+    if let Some(unnumbered) = strip_line_numbers(old) {
+        tries.push((unnumbered, strip_line_numbers(new).unwrap_or_else(|| new.to_string())));
+    }
+    if content.contains("\r\n") {
+        let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+        let restored: Vec<_> = tries.iter().map(|(o, n)| (crlf(o), crlf(n))).collect();
+        tries.extend(restored);
+        tries.push((crlf(old), crlf(new)));
+    }
+    tries.into_iter().find(|(o, _)| !o.is_empty() && content.contains(o.as_str()))
+}
+
 /// [`execute_tool_cancellable`] with no cancel flag. The app always passes
 /// one ([`run_builtin`]); tests call this.
 #[cfg(test)]
@@ -2884,14 +2906,18 @@ pub(crate) fn execute_tool_cancellable(
                 };
             }
             match read_file_head(&full) {
-                Ok((head, size)) if size > head.len() as u64 => (
-                    format!(
-                        "{}... (truncated, {size} bytes total — re-read with `offset`/`limit` to see the rest)",
-                        number_lines(head.lines(), 1)
-                    ),
-                    true,
-                ),
-                Ok((content, _)) => (number_lines(content.lines(), 1), true),
+                Ok((head, size)) => {
+                    let body = number_lines(head.lines(), 1);
+                    if size == head.len() as u64 && body.len() <= READ_FILE_MAX_BYTES {
+                        (body, true)
+                    } else {
+                        // The numbers take room too: what is shown, note
+                        // included, stays within the cap.
+                        let note = format!("... (truncated, {size} bytes total — re-read with `offset`/`limit` to see the rest)");
+                        let body = truncate_char_safe(&body, READ_FILE_MAX_BYTES.saturating_sub(note.len()));
+                        (format!("{body}{note}"), true)
+                    }
+                }
                 Err(e) => (format!("Error reading {path}: {e}"), false),
             }
         }
@@ -3101,17 +3127,9 @@ pub(crate) fn execute_tool_cancellable(
                 Ok(c) => c,
                 Err(e) => return (format!("Error reading {path}: {e}"), false),
             };
-            // The model copied `read_file`'s numbered lines into the edit:
-            // match on the text without the numbers (and write `new_string`
-            // without them too, when it carries them on every line).
-            let unnumbered = (!content.contains(old_string))
-                .then(|| strip_line_numbers(old_string))
-                .flatten()
-                .filter(|old| !old.is_empty() && content.contains(old.as_str()));
-            let (old_string, new_string) = match unnumbered {
-                Some(old) => (old, strip_line_numbers(new_string).unwrap_or_else(|| new_string.to_string())),
-                None => (old_string.to_string(), new_string.to_string()),
-            };
+            // The model copied the edit from `read_file`'s view (`edit_from_view`).
+            let (old_string, new_string) = edit_from_view(&content, old_string, new_string)
+                .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
             let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
             let count = content.matches(old_string).count();
             if count == 0 {
@@ -3414,8 +3432,9 @@ pub struct ChatEngine {
     /// row reads as stopped when it exits.
     stopped_shells: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Per thread, the files the agent read or wrote as it saw them, so a
-    /// `write_file` never overwrites a file blind (#1165).
-    file_seen: Arc<Mutex<HashMap<String, crate::file_seen::FileSeen>>>,
+    /// `write_file` never overwrites a file blind (#1165). The outer lock
+    /// only hands out a thread's record; checks lock just that one.
+    file_seen: Arc<Mutex<HashMap<String, Arc<Mutex<crate::file_seen::FileSeen>>>>>,
 }
 
 impl ChatEngine {
@@ -3439,17 +3458,26 @@ impl ChatEngine {
 
     /// Why the agent's tool call `name` with `input` must not run in
     /// `thread_id`: a `write_file` over a file it hasn't read, or that
-    /// changed since (`file_seen`).
-    fn file_seen_refusal(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value) -> Option<String> {
-        self.file_seen.lock().get(thread_id).map_or_else(
-            || crate::file_seen::FileSeen::default().refusal(workspace, name, input),
-            |seen| seen.refusal(workspace, name, input),
-        )
+    /// changed since (`file_seen`). Off the runtime thread: it may hash the file.
+    async fn file_seen_refusal(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value) -> Option<String> {
+        if !crate::file_seen::guards(name) {
+            return None;
+        }
+        crate::file_seen::refusal_off_thread(self.thread_file_seen(thread_id), workspace, name, input).await
     }
 
-    /// After the agent's tool call ran in `thread_id`: what it now knows of the file.
-    fn note_file_seen(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value, ok: bool) {
-        self.file_seen.lock().entry(thread_id.to_string()).or_default().note(workspace, name, input, ok);
+    /// After the agent's tool call ran in `thread_id`: what it now knows of
+    /// the file. Off the runtime thread: it hashes the file.
+    async fn note_file_seen(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value, ok: bool) {
+        if !ok || !crate::file_seen::tracks(name) {
+            return;
+        }
+        crate::file_seen::note_off_thread(self.thread_file_seen(thread_id), workspace, name, input, ok).await;
+    }
+
+    /// The record of what `thread_id`'s agent has seen.
+    fn thread_file_seen(&self, thread_id: &str) -> Arc<Mutex<crate::file_seen::FileSeen>> {
+        Arc::clone(self.file_seen.lock().entry(thread_id.to_string()).or_default())
     }
 
     /// Stop a thread's live `$` process (SIGINT), remembering that the user
@@ -5481,7 +5509,7 @@ impl ChatEngine {
                     let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
                     (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
-                } else if let Some(refusal) = self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input) {
+                } else if let Some(refusal) = self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await {
                     // A write over a file the agent hasn't read, or that
                     // changed since: refused, nothing written.
                     write_refused = true;
@@ -5492,7 +5520,7 @@ impl ChatEngine {
                     // walk Stop ended reads as stopped.
                     let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
-                    self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1);
+                    self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1).await;
                     ran
                 };
                 // A long command's output: its row and the model read the
@@ -7039,6 +7067,76 @@ mod tests {
         // A line without a number isn't stripped.
         assert_eq!(strip_line_numbers("     1\ta\nb"), None);
         assert_eq!(strip_line_numbers("12\ta\n13\tb\n").as_deref(), Some("a\nb\n"));
+    }
+
+    #[test]
+    fn edit_file_copied_from_the_view_keeps_crlf_line_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::write(wp.join("w.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+        // The view shows the lines without their `\r`; the edit is copied from it.
+        let (view, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "w.txt" }), None);
+        assert!(!view.contains('\r'), "{view:?}");
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "w.txt", "old_string": "     1\tone\n     2\ttwo", "new_string": "     1\tone\n     2\t2" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("w.txt")).unwrap(), "one\r\n2\r\nthree\r\n");
+        // Unnumbered, too.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "w.txt", "old_string": "2\nthree", "new_string": "2\n3" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("w.txt")).unwrap(), "one\r\n2\r\n3\r\n");
+        // A file with `\n` line ends gets no `\r`.
+        std::fs::write(wp.join("u.txt"), "a\nb\n").unwrap();
+        assert!(edit_from_view("a\nb\n", "a\nc", "x").is_none());
+        let (msg, ok) = execute_tool(wp, "edit_file", &serde_json::json!({ "path": "u.txt", "old_string": "a\nb", "new_string": "a\nc" }), None);
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("u.txt")).unwrap(), "a\nc\n");
+    }
+
+    /// The numbers take room: a whole-file read of many short lines still
+    /// stays within the cap, and says it was cut.
+    #[test]
+    fn numbered_read_stays_within_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        for (name, text) in [("blank.txt", "\n".repeat(99_000)), ("code.rs", "x = 1;\n".repeat(14_000))] {
+            std::fs::write(wp.join(name), &text).unwrap();
+            let (out, ok) = execute_tool(wp, "read_file", &serde_json::json!({ "path": name }), None);
+            assert!(ok, "{name}");
+            assert!(out.len() <= READ_FILE_MAX_BYTES, "{name}: {} bytes", out.len());
+            assert!(out.ends_with(&format!("(truncated, {} bytes total — re-read with `offset`/`limit` to see the rest)", text.len())), "{name}");
+        }
+        // A small file is shown whole, with no note.
+        std::fs::write(wp.join("small.txt"), "a\nb\n").unwrap();
+        let (out, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "small.txt" }), None);
+        assert_eq!(out, "     1\ta\n     2\tb");
+    }
+
+    /// Talk's overwrite guard (#1165): the check runs off the runtime thread
+    /// before the tool, the record after it, and a refused write is no
+    /// Review row. An `AppHandle` can't be built in a test, so this reads the
+    /// branch in the source.
+    #[test]
+    fn the_director_loop_guards_write_file() {
+        let engine = include_str!("chat_engine.rs");
+        let from = engine.find("// A `write_file` the overwrite guard refused").expect("the guard's flag");
+        let to = from + engine[from..].find("// Persist tool execution").expect("the tool row");
+        let body = &engine[from..to];
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("the director's loop no longer has: {s}"));
+        let check = at("self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await");
+        let run = at("run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await");
+        let note = at("self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1).await");
+        assert!(check < at("write_refused = true;") && check < run && run < note, "{body}");
+        assert!(body.contains("&& !mode_denied && !write_refused"), "a refused write is recorded as an edit");
     }
 
     #[test]

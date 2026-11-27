@@ -1169,11 +1169,11 @@ pub async fn run_agentic_loop_billed(
                 tokio::task::spawn_blocking(move || {
                     // A write over a file this loop hasn't read, or that
                     // changed since, is refused (#1165).
-                    if let Some(refusal) = seen.lock().refusal(&wp, &name, &input) {
+                    if let Some(refusal) = crate::file_seen::refusal(&seen, &wp, &name, &input) {
                         return (refusal, false);
                     }
                     let (result, ok) = execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag));
-                    seen.lock().note(&wp, &name, &input, ok);
+                    crate::file_seen::note(&seen, &wp, &name, &input, ok);
                     (result, ok)
                 })
                 .await
