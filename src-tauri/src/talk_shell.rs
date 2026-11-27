@@ -699,9 +699,10 @@ fn gen_nonce() -> String {
 }
 
 /// The init line that makes the shell run a command exactly as written:
-/// no history expansion of `!`, and a TAB inserted rather than taken as a
+/// no history expansion of `!`, a `cd` that goes where the path check reads
+/// it (no `CDPATH`, #1229), and a TAB inserted rather than taken as a
 /// completion request (see `init_and_wait_ready`).
-const SHELL_INPUT_AS_WRITTEN: &str = "set +H; bind 'set disable-completion on' 2>/dev/null\n";
+const SHELL_INPUT_AS_WRITTEN: &str = "set +H; unset CDPATH; bind 'set disable-completion on' 2>/dev/null\n";
 
 /// The prompt marker: `␞␞OCTO_DONE_<nonce>:<exit>:<cwd>␞␞`.
 fn done_re(nonce: &str) -> regex::Regex {
@@ -752,7 +753,7 @@ fn init_and_wait_ready(
         "__octo_ps() {{ printf '%s%sOCTO_DONE_{nonce}:%d:%s%s%s' \"$__OCTORS\" \"$__OCTORS\" \"$__octo_oc\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
     ));
     init.push_str("__octo_setps() { PS1='$(__octo_ps)'; }\n");
-    init.push_str("__octo_oc=0; PROMPT_COMMAND='__octo_oc=$?; set +H; __octo_setps'\n");
+    init.push_str("__octo_oc=0; PROMPT_COMMAND='__octo_oc=$?; set +H; unset CDPATH; __octo_setps'\n");
     init.push_str("__octo_setps\n");
     client.write(id, init.as_bytes())?;
 
@@ -839,6 +840,15 @@ mod tests {
 
     const RS: char = '\u{1e}';
     const N: &str = "abc123";
+
+    /// A `cd` goes where the path check reads it (#1229): no `CDPATH`.
+    #[test]
+    fn the_shell_runs_without_cdpath() {
+        assert!(SHELL_INPUT_AS_WRITTEN.starts_with("set +H; unset CDPATH;"), "{SHELL_INPUT_AS_WRITTEN}");
+        // Split, so this test's own text isn't what it finds.
+        let line = ["init.push_str(\"__octo_oc=0; PROMPT_COMMAND='", "__octo_oc=$?; set +H; unset CDPATH; __octo_setps'"].concat();
+        assert!(include_str!("talk_shell.rs").contains(&line), "every prompt clears it again");
+    }
 
     #[test]
     fn the_login_path_line_runs_once_and_quotes_the_path() {

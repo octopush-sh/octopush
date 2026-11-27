@@ -377,7 +377,7 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         reason: crate::talk_guard::sub_agent(label, reason),
         denial: denial.to_string(),
         sensitive: false,
-        remember: None,
+        grant: None,
         trust: None,
         diff,
         bound,
@@ -406,7 +406,7 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
 /// its diff: inside the workspace, and not named like an env file or a key.
 fn previewed(reach: &Reach, name: &str, input: &Value, path: &str) -> bool {
     let marked = crate::secret_scan::is_env_file(path) || crate::secret_scan::is_sensitive_name(path);
-    !marked && reach.outside_card(None, name, input, false).is_none()
+    !marked && reach.outside_card(None, name, input, false, &[]).is_none()
 }
 
 /// What an Ask first approval binds to (#1231): the SHA-256 of the file at
@@ -491,13 +491,15 @@ pub enum AskOutcome {
 /// shown. A change that moved meanwhile gets a new card that says so
 /// ([`CHANGED_WHILE_WAITING`]); one the tool would now refuse (`refused`)
 /// gets that refusal and no second card.
-pub async fn guard_ask_first<F, Fut>(
+pub async fn guard_ask_first<C, CFut, F, Fut>(
     mut card: ToolCard,
-    recheck: impl Fn() -> ToolCard,
+    recheck: C,
     refused: impl Fn() -> Option<String>,
     ask: F,
 ) -> AskOutcome
 where
+    C: Fn() -> CFut,
+    CFut: std::future::Future<Output = Option<ToolCard>>,
     F: Fn(ToolCard) -> Fut,
     Fut: std::future::Future<Output = crate::chat_engine::ApprovalDecision>,
 {
@@ -508,7 +510,7 @@ where
         if let Some(why) = refused() {
             return AskOutcome::Refused(why);
         }
-        let next = recheck();
+        let Some(next) = recheck().await else { return AskOutcome::Approved };
         let same = (next.kind, &next.shown, &next.diff, next.bound) == (card.kind, &card.shown, &card.diff, card.bound);
         if same {
             return AskOutcome::Approved;
@@ -1032,6 +1034,10 @@ impl ToolGate for ModeGate {
             None => None,
         }
     }
+
+    fn write_check(&self, name: &str, input: &Value) -> Option<crate::talk_guard::WriteCheck> {
+        self.inner.as_ref().and_then(|g| g.write_check(name, input))
+    }
 }
 
 #[cfg(test)]
@@ -1292,10 +1298,10 @@ mod tests {
         let write = json!({ "path": "a.rs", "content": "new\n" });
         let check = || Some(ask_card(None, "write_file", &write, &reach));
         let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
-        assert_eq!(guard_card(check().unwrap(), &check, deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
         let command = json!({ "command": "npm test" });
         let run = || Some(ask_card(None, "run_command", &command, &reach));
-        assert_eq!(guard_card(run().unwrap(), &run, deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
+        assert_eq!(guard_card(run().unwrap(), || std::future::ready(run()), deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
         assert_eq!(std::fs::read_to_string(ws.path().join("a.rs")).unwrap(), "old\n");
 
         // A sub-agent's gate asks through its approval gate before the guards.
@@ -1347,7 +1353,7 @@ mod tests {
             }
             std::future::ready(ApprovalDecision::Approve)
         };
-        assert_eq!(guard_card(check().unwrap(), &check, approve).await, None, "approved again, it runs");
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), approve).await, None, "approved again, it runs");
         let shown = shown.into_inner();
         assert_eq!(shown, ["@@ -1,1 +1,1 @@\n-old\n+new", "@@ -1,1 +1,1 @@\n-changed meanwhile\n+new"]);
     }
@@ -1371,7 +1377,8 @@ mod tests {
             }
             std::future::ready(ApprovalDecision::Approve)
         };
-        assert_eq!(guard_ask_first(first.clone(), check, || None, approve).await, AskOutcome::Approved);
+        let recheck = || std::future::ready(Some(check()));
+        assert_eq!(guard_ask_first(first.clone(), recheck, || None, approve).await, AskOutcome::Approved);
         let asked = asked.into_inner();
         assert_eq!(asked.len(), 2, "{asked:?}");
         assert_eq!(asked[1], format!("{} {CHANGED_WHILE_WAITING}", first.reason));
@@ -1423,7 +1430,7 @@ mod tests {
             std::future::ready(ApprovalDecision::Approve)
         };
         let now = || refused_before_card(&reach, "edit_file", &input, None);
-        let outcome = guard_ask_first(check(), check, now, approve).await;
+        let outcome = guard_ask_first(check(), || std::future::ready(Some(check())), now, approve).await;
         assert!(matches!(&outcome, AskOutcome::Refused(r) if r.starts_with("old_string not found")), "{outcome:?}");
         assert_eq!(*asked.lock(), 1);
     }
@@ -1796,12 +1803,13 @@ mod tests {
         for call in [
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
             "match crate::permissions::decide(mode, &call, &ctx) {",
-            "let grants = mode != crate::permissions::Mode::Ask;",
+            "let git_outside = mode == crate::permissions::Mode::Ask && !mode_denied && u.name == \"run_command\" && {",
             "crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))",
             "let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();",
             "if held && pre_refused.is_none() {",
-            "let check = || crate::permissions::ask_card(None, &u.name, &u.input, &reach);",
-            "match crate::permissions::guard_ask_first(check(), check, refused, ask).await {",
+            "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
+            "if !reach.checked(&granted).await {",
+            "match crate::permissions::guard_ask_first(card, &check, refused, ask).await {",
             "None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
@@ -1810,7 +1818,7 @@ mod tests {
             "self.talk_shell.available() && exec_roots.is_none()",
             "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
             "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
-            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await",
             "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
         ] {
             assert!(body.contains(call), "the director's loop no longer has: {call}");
@@ -1828,13 +1836,13 @@ mod tests {
         let attempts: Vec<&str> = run.lines().filter(|l| l.contains("run_attempt(")).collect();
         assert_eq!(attempts.len(), 3, "{attempts:?}");
         assert!(attempts.iter().all(|l| l.contains("&sink, &tool_gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
-        // In Ask first no grant answers a card (#1231): every card the
-        // director and a sub-agent gate raise says whether one may.
-        assert_eq!(body.matches("self.approvals.await_card(").count(), body.matches(", c, grants)").count(), "{body}");
-        assert!(body.contains("reason,\n                                grants,\n"), "the destructive-command card");
+        // In Ask first no "don't ask again" answers a card (#1231): every
+        // card the director and a sub-agent gate raise carries the mode.
+        assert_eq!(body.matches("self.approvals.await_card(").count(), body.matches(", c, mode)").count(), "{body}");
+        assert!(body.contains("command, reason, grant, mode)"), "the destructive-command card");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let gate = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        assert_eq!(gate.matches("self.broker.await_card(").count(), 3);
-        assert_eq!(gate.matches("self.mcp.grants())").count(), 4, "{gate}");
+        assert_eq!(gate.matches("self.broker.await_card(").count(), gate.matches(", c, mode)").count(), "{gate}");
+        assert!(gate.contains("&card_reason, grant, mode)"), "{gate}");
     }
 }

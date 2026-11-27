@@ -689,16 +689,20 @@ pub(crate) fn codex_home_dir(base: &Path, scope: &str, write_roots: &[String], t
 }
 
 /// `s` as an SBPL regex that matches it case-insensitively, the way a
-/// case-insensitive APFS volume compares names: each ASCII letter as a class
-/// of both cases, and `k` and `s` also as the Kelvin sign and the long s,
-/// which fold to them. Anything else is escaped. Pure.
+/// case-insensitive APFS volume compares names: each ASCII letter as every
+/// single character that folds to it (`name_fold::letter_forms`: both
+/// cases, and for `k` and `s` the Kelvin sign and the long s), a class when
+/// that's just the two cases. Anything else is escaped. Pure.
 fn ci_regex(s: &str) -> String {
     s.chars()
-        .map(|c| match c {
-            'k' | 'K' => "(k|K|\u{212A})".to_string(),
-            's' | 'S' => "(s|S|\u{017F})".to_string(),
-            c if c.is_ascii_alphabetic() => format!("[{}{}]", c.to_ascii_lowercase(), c.to_ascii_uppercase()),
-            c => regex_escape(&c.to_string()),
+        .map(|c| {
+            if !c.is_ascii_alphabetic() {
+                return regex_escape(&c.to_string());
+            }
+            match crate::name_fold::letter_forms(c).as_slice() {
+                [lower, upper] => format!("[{lower}{upper}]"),
+                forms => format!("({})", forms.iter().map(char::to_string).collect::<Vec<_>>().join("|")),
+            }
         })
         .collect()
 }
