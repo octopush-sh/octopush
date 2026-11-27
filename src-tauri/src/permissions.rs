@@ -219,6 +219,11 @@ pub fn ship_nothing_state_refusal(what: &str) -> String {
 pub const SHIP_NOTHING_HIDDEN: &str = "Not run: this mission ships nothing, and this command's program or subcommand comes \
      from a substitution, a variable or its input, so Octopush can't tell what it runs. Write the command out.";
 
+/// The one line a ship-nothing mission gives a command that isn't plain
+/// ([`plain_command`]).
+pub const SHIP_NOTHING_PLAIN: &str =
+    "Ship-nothing missions run plain commands only: no shell expansions, no nested shells. Use Build or Fix for this.";
+
 /// The fixed result a ship-nothing mission gives an MCP tool that isn't read-only.
 pub const SHIP_NOTHING_NET: &str = "Not called: this mission ships nothing, and this MCP tool's server doesn't mark it \
      read-only. Use a read-only tool, or note the step in your findings.";
@@ -256,6 +261,9 @@ pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
         match classify(call.name) {
             Class::Exec => {
                 let command = field("command");
+                if !plain_command(&command) {
+                    return Decision::Deny { message: SHIP_NOTHING_PLAIN.to_string() };
+                }
                 if let Some(message) = ship_nothing_shell_refusal(&command) {
                     return Decision::Deny { message };
                 }
@@ -791,6 +799,253 @@ fn remote_command(words: &[&str], scope: Scope) -> Option<&'static str> {
     (!(scope.loopback_ok && only_loopback(&name, rest))).then_some(what)
 }
 
+/// A word of a plain command: its text with quotes removed.
+#[derive(Default)]
+struct PlainWord {
+    text: String,
+    /// It has an unquoted glob character (`*`, `?`, `[`).
+    glob: bool,
+    /// It starts with a quote, so `"A=b"` is no assignment.
+    starts_quoted: bool,
+    /// Some of it was quoted.
+    quoted: bool,
+}
+
+/// Where a redirection's next word sends output.
+#[derive(Clone, Copy)]
+enum Target {
+    /// `>` or `>>`: `/dev/null`, or a path inside the workspace.
+    Out,
+    /// `2>`: `/dev/null` only.
+    Err,
+}
+
+/// A path that stays inside the workspace the command runs in: relative,
+/// literal, with no `..`.
+fn workspace_path(w: &PlainWord) -> bool {
+    !w.glob && !w.text.is_empty() && !w.text.starts_with(['/', '~']) && !w.text.split('/').any(|c| c == "..")
+}
+
+/// A Python virtual environment's activation script inside the workspace
+/// (`.venv/bin/activate`), the one thing a plain command may `source`.
+fn venv_activate(path: &str) -> bool {
+    let w = PlainWord { text: path.to_string(), ..PlainWord::default() };
+    workspace_path(&w) && (path == "bin/activate" || path.ends_with("/bin/activate"))
+}
+
+/// The simple commands of `command` when its shape is plain: joined by `|`,
+/// `&&`, `||`, `;` or newlines; every word bare, `'single'`, or `"double"`
+/// with no `$`, backtick, backslash or `!`; no brace expansion (`{}` alone,
+/// as `find -exec` takes it, is a word); no `<` of any kind, `(`, `)` or a
+/// lone `&`; and only `>/dev/null`, `2>/dev/null`, `2>&1`, and `>`/`>>` to a
+/// [`workspace_path`]. `None` when it isn't.
+fn plain_commands(command: &str) -> Option<Vec<Vec<PlainWord>>> {
+    let chars: Vec<char> = command.chars().collect();
+    let boundary = |j: usize| chars.get(j).is_none_or(|c| c.is_whitespace() || ";|&<>()".contains(*c));
+    let mut commands: Vec<Vec<PlainWord>> = vec![Vec::new()];
+    let mut word: Option<PlainWord> = None;
+    let mut target: Option<Target> = None;
+    let mut i = 0;
+    loop {
+        let c = chars.get(i).copied();
+        // `2>/dev/null`: digits right before `>` are its fd, not a word.
+        let digits = c == Some('>') && word.as_ref().is_some_and(|w| !w.quoted && w.text.bytes().all(|b| b.is_ascii_digit()));
+        let fd = if digits { word.take().map(|w| w.text) } else { None };
+        if c.is_none_or(|c| c.is_whitespace() || ";|&<>()".contains(c)) {
+            if let Some(w) = word.take() {
+                match target.take() {
+                    Some(Target::Out) if w.text == "/dev/null" || workspace_path(&w) => {}
+                    Some(Target::Err) if w.text == "/dev/null" => {}
+                    Some(_) => return None,
+                    None => commands.last_mut()?.push(w),
+                }
+            }
+        }
+        let Some(c) = c else { break };
+        let next = chars.get(i + 1).copied();
+        match c {
+            '\n' | ';' | '|' | '&' => {
+                if target.is_some() {
+                    return None;
+                }
+                i += match (c, next) {
+                    (';', Some(';')) | ('|', Some('&')) => return None,
+                    ('&', Some('&')) | ('|', Some('|')) => 2,
+                    ('&', _) => return None,
+                    _ => 1,
+                };
+                commands.push(Vec::new());
+            }
+            '>' => {
+                if target.is_some() {
+                    return None;
+                }
+                i += 1;
+                let append = chars.get(i) == Some(&'>');
+                if append {
+                    i += 1;
+                }
+                if chars.get(i) == Some(&'&') {
+                    // `2>&1` only.
+                    if fd.as_deref() == Some("2") && !append && chars.get(i + 1) == Some(&'1') && boundary(i + 2) {
+                        i += 2;
+                        continue;
+                    }
+                    return None;
+                }
+                target = match fd.as_deref() {
+                    None | Some("1") => Some(Target::Out),
+                    Some("2") if !append => Some(Target::Err),
+                    _ => return None,
+                };
+            }
+            c if c.is_whitespace() => i += 1,
+            '<' | '(' | ')' | '$' | '`' | '\\' | '!' => return None,
+            '#' if word.is_none() => {
+                while chars.get(i).is_some_and(|c| *c != '\n') {
+                    i += 1;
+                }
+            }
+            '\'' => {
+                let end = (i + 1..chars.len()).find(|&j| chars[j] == '\'')?;
+                let w = word.get_or_insert_with(|| PlainWord { starts_quoted: true, ..PlainWord::default() });
+                w.quoted = true;
+                w.text.extend(&chars[i + 1..end]);
+                i = end + 1;
+            }
+            '"' => {
+                let end = (i + 1..chars.len()).find(|&j| chars[j] == '"')?;
+                if chars[i + 1..end].iter().any(|c| "$`\\!".contains(*c)) {
+                    return None;
+                }
+                let w = word.get_or_insert_with(|| PlainWord { starts_quoted: true, ..PlainWord::default() });
+                w.quoted = true;
+                w.text.extend(&chars[i + 1..end]);
+                i = end + 1;
+            }
+            '{' | '}' => {
+                if c == '{' && word.is_none() && next == Some('}') && boundary(i + 2) {
+                    word = Some(PlainWord { text: "{}".into(), ..PlainWord::default() });
+                    i += 2;
+                } else {
+                    return None;
+                }
+            }
+            c => {
+                let w = word.get_or_insert_with(PlainWord::default);
+                w.glob |= "*?[".contains(c);
+                w.text.push(c);
+                i += 1;
+            }
+        }
+    }
+    target.is_none().then_some(commands)
+}
+
+/// Shell keywords: a plain command is a simple one, with none of them.
+const KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "select", "in", "function",
+    "{", "}", "[[", "]]", "!", "time", "coproc",
+];
+
+/// Programs that run another command, past [`WRAPPERS`] (`arch -x86_64 git`,
+/// `setsid git push`).
+const RUNS_COMMANDS: &[&str] = &[
+    "xargs", "parallel", "setsid", "flock", "ionice", "taskset", "chrt", "unbuffer", "script", "su", "runuser", "pkexec",
+    "chroot", "entr", "chronic", "nsenter", "fakeroot", "firejail", "sandbox-exec", "arch",
+];
+
+/// A shell or interpreter that would run code the command doesn't name as a
+/// file: from `-c`/`-e`, from its input, or from `/dev/*`.
+fn runs_inline_code(name: &str, args: &[PlainWord]) -> bool {
+    let shell = SHELLS.contains(&name) || name == "fish";
+    let python = name.starts_with("python");
+    let (code, valued): (&str, &[&str]) = match name {
+        _ if shell => ("c", &["-o", "+o", "-O", "+O", "-C", "--init-command"][..]),
+        _ if python => ("c", &["-W", "-X"][..]),
+        "node" | "nodejs" => ("ep", &["-r", "--require", "--import", "--loader"][..]),
+        "ruby" => ("e", &["-r", "-I"][..]),
+        "perl" => ("eE", &["-M", "-I"][..]),
+        _ => return false,
+    };
+    let mut it = args.iter().map(|w| w.text.as_str());
+    while let Some(a) = it.next() {
+        if a == "-" || a.starts_with("/dev/") {
+            return true;
+        }
+        if a == "--" {
+            return it.next().is_none_or(|n| n == "-" || n.starts_with("/dev/"));
+        }
+        if valued.contains(&a) {
+            it.next();
+        } else if matches!(a, "--eval" | "--print" | "--command") {
+            return true;
+        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+            if cluster.contains(|c| code.contains(c)) || (shell && cluster.contains(['s', 'i'])) {
+                return true;
+            }
+            if python && cluster.contains('m') {
+                return false;
+            }
+        } else if !a.starts_with('-') && !a.starts_with('+') {
+            return false;
+        }
+    }
+    true
+}
+
+/// One simple command of a plain line: its program is named plainly (no
+/// glob), isn't a keyword, a wrapper (`env`, `nohup`, `xargs`, `timeout`,
+/// `nice`, `sudo`…), `eval`, `fc` or `history`, nor a shell or interpreter
+/// running inline code ([`runs_inline_code`]); the subcommand of a tool that
+/// ships is literal (`git p?sh` isn't); and `source`/`.` only activates a
+/// virtual environment in the workspace.
+fn plain_simple_command(words: &[PlainWord]) -> bool {
+    let assignment = |w: &PlainWord| !w.starts_quoted && w.text.split_once('=').is_some_and(|(n, _)| is_identifier(n));
+    let Some(at) = words.iter().position(|w| !assignment(w)) else { return true };
+    let (prog, args) = (&words[at], &words[at + 1..]);
+    if prog.glob {
+        return false;
+    }
+    let name = program(&prog.text);
+    if KEYWORDS.contains(&prog.text.as_str())
+        || WRAPPERS.contains(&name.as_str())
+        || RUNS_COMMANDS.contains(&name.as_str())
+        || matches!(name.as_str(), "eval" | "fc" | "history")
+    {
+        return false;
+    }
+    if matches!(name.as_str(), "source" | ".") {
+        return args.len() == 1 && venv_activate(&args[0].text);
+    }
+    if runs_inline_code(&name, args) {
+        return false;
+    }
+    let valued: &[&str] = match name.as_str() {
+        "git" => GIT_VALUED,
+        "gh" | "hub" | "glab" => &["-R", "--repo"],
+        _ => &[],
+    };
+    let mut operands = Vec::new();
+    let mut it = args.iter();
+    while let Some(w) = it.next() {
+        if valued.contains(&w.text.as_str()) {
+            it.next();
+        } else if !w.text.starts_with('-') {
+            operands.push(w);
+        }
+    }
+    !operands.iter().take(verb_depth(&name)).any(|w| w.glob)
+}
+
+/// Whether a mission that ships nothing may run `command` at all (#1241):
+/// its shape is plain ([`plain_commands`]) and each of its simple commands
+/// is ([`plain_simple_command`]). The checks for what it does elsewhere
+/// apply on top.
+pub fn plain_command(command: &str) -> bool {
+    plain_commands(command).is_some_and(|commands| commands.iter().all(|c| plain_simple_command(c)))
+}
+
 /// The command line `env -S <string>` runs, with the words after it:
 /// `-S` anywhere in an option cluster (`-S`, `-vS`, `-iS'…'`) or
 /// `--split-string`, among the options before the command.
@@ -1073,7 +1328,7 @@ fn refused_feature(seg: &Segment) -> Option<&'static str> {
     match name.as_str() {
         "eval" => Some("eval"),
         "trap" if args.iter().any(|a| !matches!(*a, "-l" | "-p" | "-P" | "--")) => Some("trap with an action"),
-        "source" | "." => Some("source"),
+        "source" | "." if !(args.len() == 1 && venv_activate(args[0])) => Some("source"),
         "hash" if flags().iter().any(|c| c.contains('p')) => Some("hash -p"),
         "enable" => Some("enable"),
         "builtin" => Some("builtin"),
@@ -2164,9 +2419,6 @@ mod tests {
         assert_eq!(d(Mode::Plan, "run_command", cmd(post)), deny(Refused::Remote(remote_effect(post).unwrap())), "Plan only keeps the strict check");
         let refused = [
             ("git push origin test/ENG-42", "git push"),
-            ("bash -c 'git push'", "git push"),
-            ("sudo git push", "git push"),
-            ("env GIT_TRACE=1 git push", "git push"),
             ("gh pr create --fill", "a gh command that changes GitHub"),
             ("npm publish", "publishes a package or a release"),
             ("docker push registry.example.com/app:1", "docker push"),
@@ -2176,6 +2428,10 @@ mod tests {
         for mode in [Mode::Edit, Mode::Plan] {
             for (command, what) in refused {
                 assert_eq!(d(mode, "run_command", cmd(command)), Decision::Deny { message: ship_nothing_refusal(what) }, "{command} in {mode:?}");
+            }
+            // Through a nested shell or a wrapper, it isn't a plain command.
+            for command in ["bash -c 'git push'", "sudo git push", "env GIT_TRACE=1 git push"] {
+                assert_eq!(d(mode, "run_command", cmd(command)), Decision::Deny { message: SHIP_NOTHING_PLAIN.to_string() }, "{command}");
             }
             let net = Decision::Deny { message: SHIP_NOTHING_NET.to_string() };
             assert_eq!(d(mode, "mcp__jira__create_issue", json!({})), net, "{mode:?}");
@@ -2399,7 +2655,7 @@ mod tests {
             assert_eq!(ship_nothing_shell_refusal(command), message, "{command}");
             let input = json!({ "command": command });
             let decided = decide(Mode::Edit, &ToolCall { name: "run_command", input: &input }, &ctx);
-            assert_eq!(decided, Decision::Deny { message: message.unwrap() }, "refused, never asked: {command}");
+            assert!(matches!(decided, Decision::Deny { .. }), "refused, never asked: {command}");
         }
         for text in [ship_nothing_state_refusal("an alias"), SHIP_NOTHING_HIDDEN.to_string()] {
             assert!(text.contains("this mission ships nothing") && !text.contains("Edit freely") && !text.contains("switch"), "{text}");
@@ -2492,6 +2748,95 @@ mod tests {
         ] {
             assert_eq!(ship_nothing_shell_refusal(command), None, "{command}");
         }
+    }
+
+    /// A mission that ships nothing runs plain commands only, an allowlist on
+    /// the command's shape (#1241 review, round 5). Build and Fix missions
+    /// are untouched.
+    #[test]
+    fn a_ship_nothing_mission_runs_plain_commands_only() {
+        let ro = HashSet::new();
+        let decide_in = |ships_nothing: bool, command: &str| {
+            let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing };
+            let input = json!({ "command": command });
+            decide(Mode::Edit, &ToolCall { name: "run_command", input: &input }, &ctx)
+        };
+        let plain = Decision::Deny { message: SHIP_NOTHING_PLAIN.to_string() };
+        let bypasses = [
+            // The review's four.
+            "bash /dev/stdin <<< 'git push'",
+            "bash <(echo 'git push')",
+            "fc -s status=push",
+            "{git,push,origin,HEAD}",
+            "/usr/bin/gi? push",
+            // Expansions, nesting and the rest of the shape rules.
+            "echo $(whoami)",
+            "echo \"$HOME\"",
+            "ls \\*",
+            "echo !!",
+            "cat <<EOF\nx\nEOF",
+            "(cd app && git status)",
+            "npm test &",
+            "npm test |& tail",
+            "sudo npm test",
+            "env X=1 npm test",
+            "nohup npm test",
+            "arch -x86_64 git status",
+            "bash -c 'npm test'",
+            "bash -s",
+            "sh",
+            "python3 -c 'print(1)'",
+            "cat run.py | python3",
+            "node",
+            "node -e 'x'",
+            "perl -e 'x'",
+            "git p?sh origin main",
+            "echo x > /tmp/out.txt",
+            "echo x > ../out.txt",
+            "echo x >&2",
+            "npm test 2> err.log",
+            "npm test &> all.log",
+            "history",
+            "if true; then npm test; fi",
+            "for f in a b; do echo $f; done",
+            "source .env",
+            "source ../venv/bin/activate",
+            ". .venv/bin/activate extra",
+            "echo 'unclosed",
+        ];
+        for command in bypasses {
+            assert_eq!(decide_in(true, command), plain, "{command}");
+            assert!(!plain_command(command), "{command}");
+        }
+        // Build and Fix missions behave as before: Edit freely runs them.
+        for command in ["bash <(echo 'git push')", "{git,push,origin,HEAD}", "/usr/bin/gi? push", "fc -s status=push"] {
+            assert_eq!(decide_in(false, command), Decision::Allow, "{command}");
+        }
+        for command in [
+            "npm test 2>&1 | tail -50",
+            "git status",
+            "source .venv/bin/activate",
+            ". venv/bin/activate && pytest -q",
+            "cd app && npm ci && npm test",
+            "git commit -m \"fix: keep the return path\"",
+            "curl -X POST http://localhost:3000/api/x -H 'Content-Type: application/json' -d '{\"a\":1}'",
+            "ls src/*.ts",
+            "npm run build > build.log 2>&1",
+            "npm test >> logs/test.log",
+            "cargo test 2>/dev/null",
+            "python3 -m pytest -q",
+            "python3 scripts/check.py",
+            "bash scripts/test.sh",
+            "NODE_ENV=test npm test",
+            "grep -rn TODO src || true",
+            "find . -name '*.ts' -exec grep -n TODO {} +",
+            "npm test # the unit suite",
+            "git status\ngit diff --stat",
+        ] {
+            assert_eq!(decide_in(true, command), Decision::Allow, "{command}");
+        }
+        // Delivering effects are still refused on top.
+        assert_eq!(decide_in(true, "git push origin main"), Decision::Deny { message: ship_nothing_refusal("git push") });
     }
 
     /// A redirect can take a request's body or method to another host:

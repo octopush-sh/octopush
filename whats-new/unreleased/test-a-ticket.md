@@ -10,4 +10,4 @@ steps:
 ---
 Choose **Test a ticket** in the new-mission wizard, or **Test this ticket** in a backlog ticket's menu. Talk's
 agents build and run the ticket's branch locally, and Octopush refuses the git pushes, pull requests and publishes
-their commands ask for; ssh, scp, rsync and deploy CLIs aren't checked yet. Crews don't run in these missions yet.
+their commands ask for. Talk runs plain commands only there, and ssh, scp, rsync and deploy CLIs aren't checked yet.
