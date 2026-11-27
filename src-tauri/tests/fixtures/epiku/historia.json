@@ -1,0 +1,31 @@
+{
+  "id": "ST-1.1",
+  "titulo": "Sample story title",
+  "epica": { "id": "EP-1", "titulo": "Sample epic", "objetivo": "Sample epic goal", "sprint": "1" },
+  "historiaDeUsuario": { "como": "sample role", "quiero": "sample capability", "para": "sample benefit" },
+  "estadoActualDelCodigo": "",
+  "talla": "M",
+  "tallaDetalle": "M",
+  "prioridad": "alta",
+  "estado": "bloqueada",
+  "asignado": "sample-person",
+  "nota": "",
+  "actualizado": "2026-11-20T10:00:00.000Z",
+  "alcance": ["Sample scope item"],
+  "subtareas": [
+    { "indice": 0, "texto": "Sample acceptance criterion", "hecha": true },
+    { "indice": 1, "texto": "Another sample criterion", "hecha": false }
+  ],
+  "progreso": { "subtareasHechas": 1, "subtareasTotal": 2, "pct": 50 },
+  "bloqueantes": [
+    { "id": "ST-1.2", "tipo": "historia", "titulo": "Sample blocking story", "estado": "curso", "resuelto": false },
+    { "id": "EXT-1", "tipo": "externo", "titulo": "Sample external dependency", "estado": null, "resuelto": false }
+  ],
+  "bloqueantesPendientes": ["ST-1.2"],
+  "listaParaEmpezar": false,
+  "desbloquea": [
+    { "id": "ST-1.3", "tipo": "historia", "titulo": "Sample dependent story", "estado": "backlog", "resuelto": false }
+  ],
+  "dependenciasTexto": "",
+  "markdown": "Sample story markdown"
+}

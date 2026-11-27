@@ -1,19 +1,22 @@
-//! Tracker-agnostic issue model + helpers. Jira is the first adapter
-//! (`jira.rs`); the normalized `Issue` here is what the UI and (later) the
-//! Octopush MCP consume, independent of the provider.
+//! Tracker-agnostic issue model + helpers. The adapters are Jira
+//! (`jira.rs`) and Epiku (`epiku.rs`, read-only); the normalized `Issue` here
+//! is what the UI and (later) the Octopush MCP consume, independent of the
+//! provider.
 
+pub mod epiku;
 pub mod jira;
 
 use serde::Serialize;
 
 /// Where a ticket sits in its workflow, normalized from the provider's status
 /// category so the UI can color it without knowing provider specifics.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum StatusCategory {
     Todo,
     InProgress,
     Done,
+    #[default]
     Unknown,
 }
 
@@ -32,8 +35,10 @@ pub struct LinkedIssueRef {
     pub url: String,
 }
 
-/// A tracker-agnostic ticket.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+/// A tracker-agnostic ticket. `Default` lets an adapter fill only the fields
+/// its tracker has (`..Default::default()`), so a field added for one tracker
+/// doesn't break the others.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue {
     pub key: String,
@@ -88,11 +93,21 @@ pub fn my_issues_jql() -> &'static str {
     "assignee = currentUser() AND statusCategory != Done ORDER BY status, priority"
 }
 
-/// Extract the first Jira-style key (`[A-Z][A-Z0-9]+-<digits>`) from a branch
-/// name, e.g. `feat/PROJ-123-login` → `PROJ-123`. No regex dependency.
+/// Extract the first issue key from a branch name: a Jira key
+/// (`[A-Z][A-Z0-9]+-<digits>`, e.g. `feat/PROJ-123-login` → `PROJ-123`) or an
+/// Epiku story id, which adds dotted numbers (`ST-2.3`, `HU-1.1`): the
+/// pattern is `[A-Z][A-Z0-9]+-\d+(\.\d+)*`. A dot extends the key only when
+/// a digit follows it, so `PROJ-123.fix` and `PROJ-123.` still give
+/// `PROJ-123`. No regex dependency.
 pub fn detect_issue_key(branch: &str) -> Option<String> {
     let b = branch.as_bytes();
     let n = b.len();
+    let digits_end = |mut k: usize| {
+        while k < n && b[k].is_ascii_digit() {
+            k += 1;
+        }
+        k
+    };
     let mut i = 0;
     while i < n {
         let boundary = i == 0 || !b[i - 1].is_ascii_alphanumeric();
@@ -102,15 +117,15 @@ pub fn detect_issue_key(branch: &str) -> Option<String> {
             while j < n && (b[j].is_ascii_uppercase() || b[j].is_ascii_digit()) {
                 j += 1;
             }
-            // Jira project keys are ≥ 2 chars (letter + ≥1 alnum), matching the
-            // TS `detectIssueKey` regex `[A-Z][A-Z0-9]+-\d+`.
+            // Project prefixes are ≥ 2 chars (letter + ≥1 alnum), matching the
+            // TS `detectIssueKey` regex `[A-Z][A-Z0-9]+-\d+(?:\.\d+)*`.
             if (j - start) >= 2 && j < n && b[j] == b'-' {
                 let num_start = j + 1;
-                let mut k = num_start;
-                while k < n && b[k].is_ascii_digit() {
-                    k += 1;
-                }
+                let mut k = digits_end(num_start);
                 if k > num_start {
+                    while k + 1 < n && b[k] == b'.' && b[k + 1].is_ascii_digit() {
+                        k = digits_end(k + 1);
+                    }
                     return Some(branch[start..k].to_string());
                 }
             }
@@ -141,6 +156,27 @@ mod tests {
         assert_eq!(detect_issue_key("proj-123"), None); // lowercase project
         assert_eq!(detect_issue_key("PROJ-"), None);    // no number
         assert_eq!(detect_issue_key("A-1"), None);      // 1-char project (Jira keys are ≥2)
+        assert_eq!(detect_issue_key("A-1.1"), None);    // the same for a dotted id
+    }
+
+    #[test]
+    fn detects_dotted_epiku_ids_whole() {
+        assert_eq!(detect_issue_key("feat/ST-2.3-login").as_deref(), Some("ST-2.3"));
+        assert_eq!(detect_issue_key("HU-1.1").as_deref(), Some("HU-1.1"));
+        assert_eq!(detect_issue_key("ST-1.2.3-deep").as_deref(), Some("ST-1.2.3"));
+        assert_eq!(detect_issue_key("fix/[ST-10.12]").as_deref(), Some("ST-10.12"));
+    }
+
+    #[test]
+    fn jira_keys_match_exactly_as_before() {
+        // A dot extends a key only when a digit follows it.
+        assert_eq!(detect_issue_key("feat/PROJ-123.fix").as_deref(), Some("PROJ-123"));
+        assert_eq!(detect_issue_key("Fix PROJ-123.").as_deref(), Some("PROJ-123"));
+        assert_eq!(detect_issue_key("PROJ-12..3").as_deref(), Some("PROJ-12"));
+        assert_eq!(detect_issue_key("PROJ-123-login.v2").as_deref(), Some("PROJ-123"));
+        assert_eq!(detect_issue_key("ABC-9_x").as_deref(), Some("ABC-9"));
+        assert_eq!(detect_issue_key("release/1.2-PROJ-7").as_deref(), Some("PROJ-7"));
+        assert_eq!(detect_issue_key("ST-.1"), None);
     }
 
     #[test]

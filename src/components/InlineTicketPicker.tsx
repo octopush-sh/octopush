@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Issue, StatusCategory } from "../lib/types";
 import { ipc } from "../lib/ipc";
+import { isIssueKey } from "../lib/detectIssueKey";
 
 const STATUS_DOT: Record<StatusCategory, string> = {
   todo: "text-octo-mute",
@@ -8,8 +9,6 @@ const STATUS_DOT: Record<StatusCategory, string> = {
   done: "text-octo-verdigris",
   unknown: "text-octo-sage",
 };
-
-const KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
 
 interface Props {
   candidates: Issue[];
@@ -40,7 +39,7 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
 
   useEffect(() => { setHighlight(0); }, [query, scope]);
 
-  const showFallback = results.length === 0 && KEY_RE.test(query);
+  const showFallback = results.length === 0 && isIssueKey(query);
 
   async function pickFallback() {
     try {
