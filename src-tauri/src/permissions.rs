@@ -964,7 +964,8 @@ mod tests {
             "let mut was_denied = denied.is_some() || mode_denied;",
             "self.talk_shell.available() && exec_roots.is_none()",
             "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
-            "execute_tool(&workspace_path, &u.name, &u.input, exec_roots.as_deref())",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await",
+            "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
         ] {
             assert!(body.contains(call), "the director's loop no longer has: {call}");
         }
