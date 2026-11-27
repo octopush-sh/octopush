@@ -20,6 +20,7 @@ vi.mock("../lib/ipc", () => ({
     saveIssueTrackerConfig: saveIssueTrackerConfigMock,
     listRecentProjects: listRecentProjectsMock,
     updateProjectJiraKey: updateProjectJiraKeyMock,
+    getEpikuConfig: vi.fn().mockResolvedValue(null),
     // stub the rest so Settings doesn't throw on other panes mounting
     listProviders: vi.fn().mockResolvedValue([]),
     getSettings: vi.fn().mockResolvedValue({ providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} }),
