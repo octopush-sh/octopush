@@ -173,7 +173,12 @@ pub fn export(db: &Db, pipeline_id: &str) -> AppResult<CrewFile> {
         .into_iter()
         .find(|p| p.id == pipeline_id)
         .ok_or_else(|| AppError::Other("pipeline not found".into()))?;
-    let stages = db.pipeline_stage_drafts(pipeline_id)?;
+    let mut stages = db.pipeline_stage_drafts(pipeline_id)?;
+    // Which MCP servers a stage may use is this Mac's choice (#1134): the
+    // names mean nothing elsewhere, so they never travel in a crew file.
+    for s in &mut stages {
+        s.mcp_servers.clear();
+    }
     let mut roles: Vec<RoleDef> = Vec::new();
     for s in &stages {
         if roles.iter().any(|r| r.key == s.role) {
@@ -761,6 +766,9 @@ fn plan(db: &Db, crew: &CrewFile, model_swaps: &[(String, String)]) -> AppResult
             }
             s.agent_model = swap(&s.agent_model);
             s.escalate_model = s.escalate_model.as_deref().map(&swap);
+            // A crew file can't turn on this Mac's MCP servers (#1134): the
+            // user chooses them per stage after the import.
+            s.mcp_servers.clear();
             s
         })
         .collect();

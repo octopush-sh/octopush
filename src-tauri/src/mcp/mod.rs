@@ -264,6 +264,24 @@ pub fn load_server_configs(worktree: &Path) -> HashMap<String, McpServerConfig> 
     merged
 }
 
+/// The servers of Settings › Integrations (`~/.claude/mcp.json`) as they
+/// run, remote bridges rebuilt as in [`load_server_configs`], and never a
+/// worktree's own `.claude/mcp.json`. What a Direct run pins when it is
+/// created (#1134): a stage can only use a server the user configured.
+pub fn load_user_servers() -> HashMap<String, McpServerConfig> {
+    remote::with_bridges(load_user_config())
+}
+
+/// Where a call finds its server's config.
+#[derive(Clone, Debug)]
+pub enum CallConfigs {
+    /// The worktree's servers as they read now (Talk, sub-agents).
+    Worktree(std::path::PathBuf),
+    /// Configs fixed beforehand and never re-read from a file: a Direct
+    /// run's servers, pinned when the run was created.
+    Pinned(Arc<HashMap<String, McpServerConfig>>),
+}
+
 /// The servers a worktree's own `.claude/mcp.json` defines, as written.
 pub fn project_config(worktree: &Path) -> HashMap<String, McpServerConfig> {
     std::fs::read_to_string(worktree.join(".claude/mcp.json")).map(|c| parse_mcp_config(&c)).unwrap_or_default()
@@ -959,11 +977,25 @@ pub async fn call_bounded(
     input: Value,
     bound: std::time::Duration,
 ) -> Result<content::McpOutput, String> {
+    call_bounded_from(registry, CallConfigs::Worktree(worktree), namespaced, input, bound).await
+}
+
+/// [`call_bounded`] with the server's config taken from `configs`.
+pub async fn call_bounded_from(
+    registry: Arc<McpRegistry>,
+    configs: CallConfigs,
+    namespaced: String,
+    input: Value,
+    bound: std::time::Duration,
+) -> Result<content::McpOutput, String> {
     let reg = Arc::clone(&registry);
     let name = namespaced.clone();
     let target = CallTarget::default();
     let t = Arc::clone(&target);
-    let work = tokio::task::spawn_blocking(move || reg.call_on(&worktree, &name, &input, Some(&t)));
+    let work = tokio::task::spawn_blocking(move || match &configs {
+        CallConfigs::Worktree(worktree) => reg.call_on(&load_server_configs(worktree), &name, &input, Some(&t)),
+        CallConfigs::Pinned(pinned) => reg.call_on(pinned, &name, &input, Some(&t)),
+    });
     match tokio::time::timeout(bound, work).await {
         Ok(Ok(Ok(out))) => Ok(out),
         Ok(Ok(Err(e))) => Err(e.to_string()),
@@ -1377,21 +1409,21 @@ impl McpRegistry {
     /// payloads as short placeholders: `content::render_call_result`). A tool
     /// that reports its own failure (`isError`) is a result like any other.
     pub fn call(&self, worktree: &Path, namespaced: &str, input: &Value) -> Result<String, McpCallError> {
-        self.call_on(worktree, namespaced, input, None).map(|out| out.text)
+        self.call_on(&load_server_configs(worktree), namespaced, input, None).map(|out| out.text)
     }
 
-    /// [`Self::call`], recording the process it uses in `target` before the
-    /// request goes out (`call_bounded`'s abort stops that one).
+    /// [`Self::call`] with the server's config looked up in `cfgs`,
+    /// recording the process it uses in `target` before the request goes out
+    /// (`call_bounded`'s abort stops that one).
     fn call_on(
         &self,
-        worktree: &Path,
+        cfgs: &HashMap<String, McpServerConfig>,
         namespaced: &str,
         input: &Value,
         target: Option<&CallTarget>,
     ) -> Result<content::McpOutput, McpCallError> {
         let (server, tool) =
             parse_namespaced(namespaced).ok_or_else(|| McpCallError::NotMcpTool(namespaced.to_string()))?;
-        let cfgs = load_server_configs(worktree);
         let Some(cfg) = cfgs.get(&server) else {
             return Err(McpCallError::NotConfigured { server });
         };
@@ -2191,7 +2223,8 @@ done
         // A call that the server never answers, on its own thread.
         let target = CallTarget::default();
         let (r2, wt, t2) = (Arc::clone(&reg), dir.path().to_path_buf(), Arc::clone(&target));
-        let worker = std::thread::spawn(move || r2.call_on(&wt, "mcp__hang__slow", &json!({}), Some(&t2)));
+        let worker =
+            std::thread::spawn(move || r2.call_on(&load_server_configs(&wt), "mcp__hang__slow", &json!({}), Some(&t2)));
         wait_for(&log, "call", 1);
         assert!(!worker.is_finished(), "the call is blocked on the server");
         let started = std::time::Instant::now();
