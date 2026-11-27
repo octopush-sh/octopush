@@ -6571,7 +6571,8 @@ mod tests {
             None,
         );
         assert!(ok);
-        assert!(out.contains("(lines 3-4 of 10)"), "window header: {out}");
+        // The read stops at line 4, so the total isn't known: lines follow.
+        assert!(out.contains("(lines 3-4; more follow)"), "window header: {out}");
         assert!(out.contains("line3") && out.contains("line4") && !out.contains("line5"), "{out}");
     }
 
