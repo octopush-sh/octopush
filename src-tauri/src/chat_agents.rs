@@ -2575,7 +2575,6 @@ mod tests {
         assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
     }
 
-<<<<<<< HEAD
     /// Answers its scripted turns, then fails every request with an error
     /// that is not retried (a context 400). Panics past `max_calls`, so a
     /// loop that never stops fails the test instead of hanging it.
@@ -2737,8 +2736,8 @@ mod tests {
         assert_eq!(budget_share(Some(3.0), 3), Some(1.0), "the headroom is split across the fan-out");
         assert_eq!(budget_share(Some(-1.0), 2), Some(0.0), "a spent budget leaves nothing");
         assert_eq!(budget_share(Some(1.0), 0), Some(1.0));
-||||||| f60356b3
-=======
+    }
+
     #[tokio::test]
     async fn stopped_subagent_reads_as_stopped_and_keeps_its_transcript() {
         // Stop landed before the sub-agent's next round (#1148).
@@ -2758,6 +2757,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let cancel = Arc::new(AtomicBool::new(true));
@@ -2783,7 +2783,6 @@ mod tests {
         let mut one = AgentOutcome { tool_calls: 1, ..AgentOutcome::default() };
         mark_stopped(&mut one);
         assert!(one.report.contains("after 1 tool call,"), "{}", one.report);
->>>>>>> origin/main
     }
 
     /// A sub-agent's `run_command` gets the PATH CLI stages spawn with (#1087).
