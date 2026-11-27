@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type CodexTrustNote, type PipelineWithStages, type RepoCrew, type RepoHooksNotice, type RunEstimate } from "../lib/ipc";
-import { repoHooksItems, repoHooksLine } from "../lib/repoHooks";
+import { repoHooksItems, repoHooksLine, SKILL_SHELL_OFF_LABEL, SKILL_SHELL_OFF_NOTE } from "../lib/repoHooks";
+import { Switch } from "./settings/shared";
 import { dragHasFiles, openDroppedCrew } from "../lib/crew";
 import { useCrewImportStore } from "../stores/crewImportStore";
 import {
@@ -288,6 +289,23 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
       .catch(() => {});
     return () => { alive = false; };
   }, [usesClaudeCode, workspacePath]);
+  // The project's "Don't run skill shell commands in crews": offered when the
+  // repo's skills run some, and kept in view while it is on.
+  const [skillShellOff, setSkillShellOff] = useState(false);
+  useEffect(() => {
+    setSkillShellOff(false);
+    if (!usesClaudeCode || !workspaceId) return;
+    let alive = true;
+    ipc.skillShellOff(workspaceId)
+      .then((v) => { if (alive) setSkillShellOff(v); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [usesClaudeCode, workspaceId]);
+  const changeSkillShellOff = (off: boolean) => {
+    setSkillShellOff(off);
+    ipc.setSkillShellOff(workspaceId, off).catch(() => setSkillShellOff(!off));
+  };
+  const skillShellOpt = usesClaudeCode && (skillShellOff || (repoHooks?.skillShells.length ?? 0) > 0);
   const sandboxed = execIsolation === "sandbox" || gitIsolation === "readonly";
   // An Action stage on Codex outside a sandboxed mission can't commit.
   const codexCommitLine = selected ? codexCommitNote(selected.stages, overrides, roles, execIsolation) : null;
@@ -670,6 +688,20 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                     <li key={i} title={item} className="truncate font-mono text-[10px] text-octo-mute">{item}</li>
                   ))}
                 </ul>
+              </div>
+            )}
+            {skillShellOpt && (
+              <div data-tour="direct-launcher-skill-shell-off" className="octo-rise-in mt-2 flex items-start gap-2.5">
+                <Switch
+                  checked={skillShellOff}
+                  onChange={changeSkillShellOff}
+                  testId="launcher-skill-shell-off"
+                  ariaLabel={SKILL_SHELL_OFF_LABEL}
+                />
+                <div className="min-w-0">
+                  <p className="m-0 text-[11px] leading-[1.55] text-octo-sage">{SKILL_SHELL_OFF_LABEL}</p>
+                  <p className="m-0 text-[10px] leading-[1.55] text-octo-mute">{SKILL_SHELL_OFF_NOTE}</p>
+                </div>
               </div>
             )}
             {cliNote && cli?.version && (

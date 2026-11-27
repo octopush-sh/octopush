@@ -397,6 +397,22 @@ export interface McpToolInfo {
   description: string;
 }
 
+/** What the user trusts to run without an MCP approval card in Edit freely
+ *  (#1243), app-wide: the whole server (`all`, "Trust <server>") and the
+ *  tools allowed one by one (`tools`, "Always allow this tool"), bound to
+ *  the server's user-level entry (`config`, its fingerprint). A tool its
+ *  server marks destructive asks whatever this says. */
+export interface McpTrust {
+  server: string;
+  config: string;
+  all: boolean;
+  tools: string[];
+}
+
+/** An answer to an approval card: "tool" and "server" are an MCP card's
+ *  lasting answers (#1243). */
+export type ApprovalAnswer = "approve" | "always" | "deny" | "tool" | "server";
+
 /** What Talk's MCP registry knows about one configured server
  *  (`list_mcp_server_status`): running with N tools, not started yet (it
  *  starts on first use), or failed with the first line of why. `tools` is

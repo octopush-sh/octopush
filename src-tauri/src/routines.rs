@@ -1148,14 +1148,16 @@ impl Orchestrator {
     async fn dispatch_run(self: &Arc<Self>, r: &RoutineRow, workspace_id: &str) -> crate::error::AppResult<FireOutcome> {
         self.emit_phase(r, PHASE_LAUNCHING);
         let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
-        let run_id = self.db().lock().create_run(
-            workspace_id,
-            &r.pipeline_id,
-            &r.task,
-            r.reference_model.as_deref(),
-            None,
-            &overrides,
-        )?;
+        let run_id = {
+            let db = self.db().lock();
+            let run_id =
+                db.create_run(workspace_id, &r.pipeline_id, &r.task, r.reference_model.as_deref(), None, &overrides)?;
+            // Under the same lock, so no drive sees the run unmarked: the
+            // run stays a Routine's (it skips MCP servers) after this
+            // Routine fires again or is deleted.
+            db.stamp_run_routine(&run_id, &r.id)?;
+            run_id
+        };
 
         self.db()
             .lock()

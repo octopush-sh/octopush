@@ -29,6 +29,7 @@ fn sample_request() -> LlmRequest {
         tool_choice: None,
         effort: None,
         cache: false,
+        cache_key: None,
     }
 }
 
@@ -365,6 +366,7 @@ fn openai_assistant_with_tools_emits_tool_calls() {
         tool_choice: None,
         effort: None,
         cache: false,
+        cache_key: None,
     };
     let body = openai_compat::build_request(&req);
     let m = &body["messages"][0];
@@ -396,6 +398,7 @@ fn openai_tool_results_become_role_tool_messages() {
         tool_choice: None,
         effort: None,
         cache: false,
+        cache_key: None,
     };
     let body = openai_compat::build_request(&req);
     let msgs = body["messages"].as_array().unwrap();
@@ -2634,6 +2637,22 @@ mod openai_streaming {
         let body = request_json(&seen);
         assert_eq!(body["stream"], json!(true));
         assert!(body.get("stream_options").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_requests_send_no_beta_header() {
+        // The 128k-output beta served only Claude 3.7 Sonnet; no catalog model needs it.
+        let body = json!({"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}}).to_string();
+        let (addr, seen) = serve(vec![ok("application/json", body)]).await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let provider = super::super::anthropic::AnthropicProvider;
+        let resp = provider.complete(&base, Some("key"), &super::sample_request(), &reqwest::Client::new()).await.unwrap();
+        assert_eq!(resp.text, "hi");
+        let seen = seen.await.unwrap().remove(0).to_ascii_lowercase();
+        assert!(seen.starts_with("post /v1/messages "), "{seen}");
+        assert!(seen.contains("anthropic-version: 2023-06-01"), "{seen}");
+        assert!(!seen.contains("anthropic-beta"), "{seen}");
     }
 
     #[tokio::test]

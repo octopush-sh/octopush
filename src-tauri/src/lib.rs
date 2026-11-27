@@ -24,7 +24,9 @@ pub mod entitlement;
 pub mod entitlement_token;
 pub mod error;
 mod file_open;
+mod file_seen;
 mod fleet_status;
+pub mod fs_safe;
 mod menu_bar;
 pub mod gateway;
 pub mod git_ops;
@@ -304,6 +306,9 @@ pub fn run() {
             commands::list_project_mcp_servers,
             commands::list_project_mcp_approvals,
             commands::revoke_project_mcp_server,
+            commands::list_mcp_trust,
+            commands::revoke_mcp_trust,
+            commands::list_user_mcp_server_status,
             commands::list_project_instructions,
             commands::get_thread_mcp_disabled,
             commands::set_thread_mcp_server,
@@ -490,6 +495,8 @@ pub fn run() {
             commands::claude_known_bad_note,
             commands::codex_trust_note,
             commands::repo_hooks_notice,
+            commands::skill_shell_off,
+            commands::set_skill_shell_off,
             commands::model_retirements,
             commands::readiness_check,
             // Role commands
@@ -620,13 +627,23 @@ pub fn run() {
                     Ok(n) => tracing::info!(count = n, "recovered interrupted run stages"),
                     Err(e) => tracing::error!(error = %e, "failed to recover interrupted runs"),
                 }
+                // Talk turns a restart cut off mid-turn end with a note
+                // saying so, instead of no final row at all.
+                let running = |thread: &str| st.chat.is_running(thread);
+                match st.db.lock().note_interrupted_talk_turns(chat_engine::RESTART_NOTE, &running) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "noted Talk turns interrupted by a restart"),
+                    Err(e) => tracing::error!(error = %e, "failed to note interrupted Talk turns"),
+                }
                 let sink = std::sync::Arc::new(orchestrator::events::TauriEventSink {
                     app: app.handle().clone(),
                 });
-                let orch = std::sync::Arc::new(orchestrator::Orchestrator::new(
-                    std::sync::Arc::clone(&st.db),
-                    sink,
-                ));
+                // API stages reach the MCP servers they chose through Talk's
+                // registry (#1134).
+                let orch = std::sync::Arc::new(
+                    orchestrator::Orchestrator::new(std::sync::Arc::clone(&st.db), sink)
+                        .with_mcp(std::sync::Arc::clone(&st.chat.mcp)),
+                );
                 // Detached bridge: re-emits worker-driven runs' persisted
                 // progress as live run://* events, repairs runs whose worker
                 // died, and adopts leases from a previous app session.

@@ -8,7 +8,7 @@ use crate::orchestrator::types::{BlockedAsk, BlockedQuestion, ToolCallLog};
 use crate::providers::{
     complete_with_retry, interruptible_sleep, retry_notice, Effort, LlmContent, LlmMessage,
     LlmProvider, LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmTool, LlmToolResult,
-    LlmToolUse, DEFAULT_MAX_RETRIES,
+    LlmToolUse, truncated_round_turn, DEFAULT_MAX_RETRIES,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +24,8 @@ pub(crate) const TOOL_RESULT_CAP_BYTES: usize = 24_000;
 
 /// The `max_tokens` floor for a stage given its effort. High-effort thinking
 /// spends its own tokens before the answer, so the output cap must clear that
-/// or a deep-thinking stage truncates mid-answer. (The `output-128k` beta is
-/// already sent, so 64k is safe.) `None`/low/medium keep the historical 32768.
+/// or a deep-thinking stage truncates mid-answer. (Every catalog model takes
+/// 64k output, so 64k is safe.) `None`/low/medium keep the historical 32768.
 pub fn max_tokens_for(effort: Option<Effort>) -> u32 {
     match effort {
         None | Some(Effort::Least) | Some(Effort::Low) | Some(Effort::Medium) => 32768,
@@ -447,6 +447,7 @@ async fn answer_ask_stage(
         tool_choice: None,
         effort: None,
         cache: false,
+        cache_key: None,
     };
     let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
         emitter.notice(&retry_notice(attempt, of, delay, kind));
@@ -840,6 +841,9 @@ pub async fn run_agentic_loop_billed(
     }
     let mut messages: Vec<LlmMessage> = initial_messages;
     let mut out = AgenticResult::default();
+    // The files this loop's tools read or wrote, as they saw them, so a
+    // `write_file` never overwrites a file blind (`file_seen`).
+    let file_seen = std::sync::Arc::new(parking_lot::Mutex::new(crate::file_seen::FileSeen::default()));
     // Why the loop left its turn budget: the iteration cap (default) or a
     // mid-stage budget stop. Drives the forced-close notice below.
     let mut budget_stopped = false;
@@ -903,6 +907,7 @@ pub async fn run_agentic_loop_billed(
             // Agentic stage loop: system prompt, tool schemas and accumulated
             // history are re-sent every iteration — cache the stable prefix.
             cache: true,
+            cache_key: None,
         };
         // Transient failures (rate limit, overload, 5xx, a connection that never opened) are
         // retried in place with backoff — the accumulated message history is
@@ -994,16 +999,10 @@ pub async fn run_agentic_loop_billed(
         if matches!(resp.stop_reason, LlmStopReason::MaxTokens) && !resp.tool_uses.is_empty() {
             // Truncation path: do NOT replay raw_content verbatim. A turn cut off
             // at max_tokens can carry an unsigned/partial trailing thinking block,
-            // and replaying it 400s the next request. Empty raw makes the
-            // serializer rebuild from text + tool_uses instead (per the design).
-            messages.push(LlmMessage {
-                role: LlmRole::Assistant,
-                content: LlmContent::AssistantWithTools {
-                    raw: vec![],
-                    text: resp.text.clone(),
-                    tool_uses: resp.tool_uses.clone(),
-                },
-            });
+            // and replaying it 400s the next request. The turn is rebuilt from
+            // text + tool_uses, its leading signed thinking kept in front (a
+            // budget-thinking model 400s an assistant turn without it).
+            messages.push(truncated_round_turn(&resp));
             let errs: Vec<LlmToolResult> = resp
                 .tool_uses
                 .iter()
@@ -1162,8 +1161,16 @@ pub async fn run_agentic_loop_billed(
                 let input = u.input.clone();
                 let roots = sandbox_roots.map(|r| r.to_vec());
                 let cancel_flag = std::sync::Arc::clone(cancel);
+                let seen = std::sync::Arc::clone(&file_seen);
                 tokio::task::spawn_blocking(move || {
-                    execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag))
+                    // A write over a file this loop hasn't read, or that
+                    // changed since, is refused (#1165).
+                    if let Some(refusal) = crate::file_seen::refusal(&seen, &wp, &name, &input) {
+                        return (refusal, false);
+                    }
+                    let (result, ok) = execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag));
+                    crate::file_seen::note(&seen, &wp, &name, &input, ok);
+                    (result, ok)
                 })
                 .await
                 .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
@@ -1249,6 +1256,7 @@ pub async fn run_agentic_loop_billed(
             tool_choice: None,
             effort,
             cache: true,
+            cache_key: None,
         };
         let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
             emitter.notice(&retry_notice(attempt, of, delay, kind));

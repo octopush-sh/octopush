@@ -2359,6 +2359,16 @@ pub async fn revoke_project_mcp_server(
     Ok(had)
 }
 
+/// The Settings › Integrations servers only (`~/.claude/mcp.json`), with
+/// what the registry knows about each: the servers a Direct stage can
+/// choose (#1134). Spawns nothing.
+#[tauri::command]
+pub async fn list_user_mcp_server_status(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::mcp::scope::McpServerStatus>> {
+    Ok(state.chat.mcp.status_of(&crate::mcp::load_user_servers()))
+}
+
 /// The instruction files Talk and its sub-agents follow in a worktree (its
 /// CLAUDE.md chain, or AGENTS.md), with the tokens each adds, for the
 /// Companion's "follows" row. Reads only.
@@ -2372,6 +2382,39 @@ pub async fn list_project_instructions(
     })
     .await
     .map_err(|e| AppError::Other(format!("project instructions: {e}")))
+}
+
+/// What the user trusts to run without an MCP card in Edit freely (#1243),
+/// per server, that still holds for its user-level entry (Settings ›
+/// Integrations); with a worktree, without the servers its own
+/// `.claude/mcp.json` defines, where trust never applies (the Companion).
+#[tauri::command]
+pub async fn list_mcp_trust(
+    state: State<'_, AppState>,
+    workspace_path: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let project = workspace_path.map(|w| crate::mcp::project_config(std::path::Path::new(&w))).unwrap_or_default();
+    let user = crate::mcp::load_user_config();
+    Ok(crate::mcp::trust::listed(&state.db.lock(), &user, &project))
+}
+
+/// Revoke the trust in `server`'s `tool`, or in the whole server (no tool).
+/// The next call to it asks again. Returns what is left.
+#[tauri::command]
+pub async fn revoke_mcp_trust(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    tool: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let user = crate::mcp::load_user_config();
+    let left = {
+        let db = state.db.lock();
+        crate::mcp::trust::revoke(&db, &server, tool.as_deref())?;
+        crate::mcp::trust::listed(&db, &user, &Default::default())
+    };
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+    Ok(left)
 }
 
 /// The MCP servers switched off in one Talk conversation (none by default).
@@ -2466,12 +2509,17 @@ pub async fn save_mcp_config(
             }
             // A new secret value leaves the entry as it reads: restart it too.
             registry.apply_save(&old, &saved, &touched);
+            // Trust given to an entry that changed or went lapses (#1243).
+            if let Err(e) = crate::mcp::trust::prune(&db.lock(), &crate::mcp::load_user_config()) {
+                tracing::warn!(error = %e, "couldn't drop the MCP trust of a changed server");
+            }
             Ok(saved)
         },
     )
     .await
     .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
     let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ()); // Companion "can use" reloads
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
     Ok(saved)
 }
 
@@ -2742,14 +2790,20 @@ pub async fn create_run(
     stage_overrides: Option<Vec<(i64, String)>>,
 ) -> AppResult<String> {
     let overrides = stage_overrides.unwrap_or_default();
-    state.db.lock().create_run(
+    // The stages' chosen MCP servers run with their Settings configs as
+    // they are now (#1134), never a worktree's `.claude/mcp.json`.
+    let user_servers = tokio::task::spawn_blocking(crate::mcp::load_user_servers).await.unwrap_or_default();
+    let db = state.db.lock();
+    let run_id = db.create_run(
         &workspace_id,
         &pipeline_id,
         &task,
         reference_model.as_deref(),
         linked_issue_key.as_deref(),
         &overrides,
-    )
+    )?;
+    db.pin_run_mcp_servers(&run_id, &user_servers)?;
+    Ok(run_id)
 }
 
 #[tauri::command]
@@ -5879,17 +5933,15 @@ pub struct WriteResult {
     pub mtime: i64,
 }
 
-/// Sync core of `read_file_checked` (testable without a tokio runtime).
+/// Sync core of `read_file_checked` (testable without a tokio runtime). A
+/// named pipe, socket or device is refused, never read (`fs_safe`, #1190).
 pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<FileReadResult> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
+    let (bytes, meta) = match crate::fs_safe::read_regular(std::path::Path::new(path), max_bytes)? {
+        crate::fs_safe::Capped::TooLarge { size } => return Ok(FileReadResult::TooLarge { size }),
+        crate::fs_safe::Capped::Read { bytes, meta } => (bytes, meta),
+    };
     let size = meta.len();
     let mtime = mtime_millis(&meta);
-    if size > max_bytes {
-        return Ok(FileReadResult::TooLarge { size });
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
     if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(FileReadResult::Binary { size, mtime });
     }
@@ -5902,7 +5954,9 @@ pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<F
 #[tauri::command]
 pub async fn read_file_checked(path: String, max_bytes: Option<u64>) -> AppResult<FileReadResult> {
     let path = expand_tilde(&path);
-    read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES))
+    tokio::task::spawn_blocking(move || read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES)))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file_checked: {e}")))?
 }
 
 /// Lines `start..=end` of a file, for Talk's `@path#L10-40` (#1046).
@@ -5927,7 +5981,8 @@ pub(crate) fn read_file_lines_inner(path: &str, start: u32, end: u32, max_bytes:
     let io = |e: std::io::Error| AppError::Other(format!("read_file_lines({path}): {e}"));
     let start = start.max(1);
     let end = end.max(start);
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+    let (file, _) = crate::fs_safe::open_regular(std::path::Path::new(path))?;
+    let mut reader = std::io::BufReader::new(file);
     if reader.fill_buf().map_err(io)?.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(LineRangeResult::Binary);
     }
@@ -6001,12 +6056,14 @@ pub async fn read_file_lines(path: String, start: u32, end: u32, max_bytes: usiz
         .map_err(|e| AppError::Other(format!("read_file_lines: {e}")))?
 }
 
-/// Kept for any non-editor callers that want a plain string read.
+/// Kept for any non-editor callers that want a plain string read. Capped
+/// like `read_file_checked`; a named pipe, socket or device is refused.
 #[tauri::command]
 pub async fn read_file(path: String) -> AppResult<String> {
     let path = expand_tilde(&path);
-    std::fs::read_to_string(&path)
-        .map_err(|e| AppError::Other(format!("read_file({}): {e}", path)))
+    tokio::task::spawn_blocking(move || crate::fs_safe::read_regular_text(std::path::Path::new(&path), READ_CAP_BYTES))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file: {e}")))?
 }
 
 /// Sync core of `write_file` (testable; returns the post-write mtime).
@@ -8062,6 +8119,7 @@ pub fn build_ai_request(
         // One-shot: the prefix is never re-sent, so a cache write would just be a
         // wasted 1.25× surcharge with no read to repay it. Keep caching off.
         cache: false,
+        cache_key: None,
     }
 }
 
@@ -8646,6 +8704,25 @@ pub async fn repo_hooks_notice(workspace_path: String) -> AppResult<Option<crate
     tokio::task::spawn_blocking(move || crate::repo_hooks::read(std::path::Path::new(&workspace_path)))
         .await
         .map_err(|e| AppError::Other(format!("repo hooks task failed: {e}")))
+}
+
+/// Direct launcher: whether the project of `workspace_id` turned on "Don't
+/// run skill shell commands in crews" (#1188). False for an unknown workspace.
+#[tauri::command]
+pub async fn skill_shell_off(state: State<'_, AppState>, workspace_id: String) -> AppResult<bool> {
+    state.db.lock().workspace_skill_shell_off(&workspace_id)
+}
+
+/// Direct launcher: turn "Don't run skill shell commands in crews" on or off
+/// for the project of `workspace_id`; every Claude CLI stage of its crews and
+/// Routines reads it when it starts.
+#[tauri::command]
+pub async fn set_skill_shell_off(state: State<'_, AppState>, workspace_id: String, off: bool) -> AppResult<()> {
+    let db = state.db.lock();
+    let ws = db
+        .get_workspace(&workspace_id)?
+        .ok_or_else(|| AppError::Other(format!("no workspace {workspace_id}")))?;
+    db.set_project_skill_shell_off(&ws.project_id, off)
 }
 
 /// Direct launcher, Readiness and Routines: the models among `models` with a
