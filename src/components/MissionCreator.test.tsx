@@ -877,11 +877,12 @@ describe("MissionCreator", () => {
       expect(await screen.findByText(`${CONDUCTOR_LINE} · 9 lines`)).toBeInTheDocument();
     });
 
-    it("notes CONDUCTOR_PORT when the script reads it", async () => {
+    it("adds no port note when the script reads CONDUCTOR_PORT", async () => {
       vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm run dev -- --port $CONDUCTOR_PORT");
       render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
       await gotoSetup();
-      expect(await screen.findByText(`${CONDUCTOR_LINE} · CONDUCTOR_PORT isn't set in Octopush`)).toBeInTheDocument();
+      expect(await screen.findByText(CONDUCTOR_LINE)).toBeInTheDocument();
+      expect(screen.queryByText(/isn't set/)).not.toBeInTheDocument();
     });
 
     it("never asks when the project has a remembered template", async () => {
