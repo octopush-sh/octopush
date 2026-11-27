@@ -189,15 +189,49 @@ fn tail_bytes(s: &str, max: usize) -> &str {
 /// `recall_hint` is appended inside the gap marker so a truncated excerpt
 /// tells the model how to get the rest.
 pub fn excerpt_head_tail(s: &str, budget: usize, recall_hint: &str) -> String {
+    excerpt_split(s, budget, 7, recall_hint)
+}
+
+/// [`excerpt_head_tail`] with the head given `head_tenths` of the budget.
+fn excerpt_split(s: &str, budget: usize, head_tenths: usize, recall_hint: &str) -> String {
     if s.len() <= budget {
         return s.to_string();
     }
-    let head_max = budget * 7 / 10;
+    let head_max = budget * head_tenths / 10;
     let tail_max = budget - head_max;
     let head = head_bytes(s, head_max);
     let tail = tail_bytes(s, tail_max);
     let omitted = s.len().saturating_sub(head.len() + tail.len());
     format!("{head}\n… [{omitted} chars omitted{recall_hint}]\n{tail}")
+}
+
+/// Most of one `run_command` output that is captured and kept for recall
+/// (4 MB): a longer output keeps its head and tail.
+pub const COMMAND_KEEP_BYTES: usize = 4_000_000;
+
+/// Room within [`COMMAND_KEEP_BYTES`] for what a capture adds after its
+/// cut: the gap marker, the exit code, and the not-found, read-only and
+/// isolated-shell notes. Each of them is a short line.
+pub const COMMAND_NOTE_ROOM: usize = 8_000;
+
+/// Most of one `run_command` output a capture keeps before its notes, so
+/// the stored copy, notes and all, fits in [`COMMAND_KEEP_BYTES`] and
+/// recall ends where the command's output ended.
+pub const COMMAND_CAPTURE_BYTES: usize = COMMAND_KEEP_BYTES - COMMAND_NOTE_ROOM;
+
+/// Most of one `run_command` output its tool row and the model's copy carry.
+pub const COMMAND_SHOWN_BYTES: usize = 50_000;
+
+/// The gap-marker suffix of a cut `run_command` output on its tool row, whose
+/// id isn't known yet when the row is written; later turns name the row as
+/// `[Tool #id: …]`.
+pub const COMMAND_KEPT_HINT: &str = " — the full output is kept: call recall_tool_output with this tool row's message_id";
+
+/// A command's output within `budget`, head and tail: 70/30 when it
+/// succeeded, 30/70 when it `failed`, where the failing assertion and the
+/// summary sit at the end.
+pub fn command_excerpt(s: &str, budget: usize, failed: bool, recall_hint: &str) -> String {
+    excerpt_split(s, budget, if failed { 3 } else { 7 }, recall_hint)
 }
 
 /// Char-window over `s` for `recall_tool_output`: `offset` bytes in (snapped
@@ -356,7 +390,12 @@ pub const ORIGINAL_CAP_BYTES: usize = 1_000_000;
 /// The part of `original` that is kept: its first [`ORIGINAL_CAP_BYTES`],
 /// cut on a char boundary.
 pub fn capped_original(original: &str) -> &str {
-    head_bytes(original, ORIGINAL_CAP_BYTES)
+    capped_original_within(original, ORIGINAL_CAP_BYTES)
+}
+
+/// The first `cap` bytes of `original`, cut on a char boundary.
+pub fn capped_original_within(original: &str, cap: usize) -> &str {
+    head_bytes(original, cap)
 }
 
 /// What `recall_tool_output` returns for a stored `role="tool"` row: the
@@ -478,6 +517,18 @@ pub(crate) fn summarize_tool_row(id: i64, content: &str, budget: usize) -> Optio
 ///
 /// Consecutive same-role turns are merged, so the output alternates.
 pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
+    build_history_landing(rows, &std::collections::HashSet::new()).0
+}
+
+/// [`build_history`], and for each turn the user rows of `with_images`
+/// (asks that carry images, #1159) it holds, so `chat_attachments::attach`
+/// can put their images back. Such an ask makes a turn even when its text
+/// is empty (an image sent alone); with no such ask the turns are
+/// [`build_history`]'s.
+pub fn build_history_landing(
+    rows: &[HistoryRow<'_>],
+    with_images: &std::collections::HashSet<i64>,
+) -> (Vec<HistoryTurn>, Vec<Vec<i64>>) {
     // Pass 1 — how many turns ago each tool row ran. The row being sent is
     // already persisted as the trailing user row, so "user rows after this
     // one, minus that one" counts completed turns since the tool ran.
@@ -514,17 +565,28 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
 
     // Pass 2 — assemble.
     let mut turns: Vec<HistoryTurn> = Vec::new();
+    let mut landing: Vec<Vec<i64>> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
-    let push_turn = |turns: &mut Vec<HistoryTurn>, role: HistoryRole, text: String| {
-        if text.is_empty() {
+    let push_turn = |turns: &mut Vec<HistoryTurn>, landing: &mut Vec<Vec<i64>>, role: HistoryRole, text: String, ask: Option<i64>| {
+        if text.is_empty() && ask.is_none() {
             return;
         }
         match turns.last_mut() {
             Some(last) if last.role == role => {
-                last.text.push_str("\n\n");
-                last.text.push_str(&text);
+                if !text.is_empty() {
+                    if !last.text.is_empty() {
+                        last.text.push_str("\n\n");
+                    }
+                    last.text.push_str(&text);
+                }
+                if let (Some(id), Some(asks)) = (ask, landing.last_mut()) {
+                    asks.push(id);
+                }
             }
-            _ => turns.push(HistoryTurn { role, text }),
+            _ => {
+                turns.push(HistoryTurn { role, text });
+                landing.push(ask.into_iter().collect());
+            }
         }
     };
     let flush = |pending: &mut Vec<String>, tail: &str| -> String {
@@ -556,14 +618,15 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
             }
             "assistant" => {
                 let text = flush(&mut pending, row.content.trim());
-                push_turn(&mut turns, HistoryRole::Assistant, text);
+                push_turn(&mut turns, &mut landing, HistoryRole::Assistant, text, None);
             }
             "user" => {
                 let text = match row.context {
                     Some(ctx) if Some(i) != current => flush(&mut pending, &abridge_context(row.id, row.content, ctx)),
                     _ => flush(&mut pending, row.content),
                 };
-                push_turn(&mut turns, HistoryRole::User, text);
+                let ask = Some(row.id).filter(|id| with_images.contains(id));
+                push_turn(&mut turns, &mut landing, HistoryRole::User, text, ask);
             }
             _ => {}
         }
@@ -571,8 +634,8 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
     // A turn continued with no new message (the error card's "Try again"):
     // what it did before it failed rides on its ask, as on a next one.
     let rest = flush(&mut pending, "");
-    push_turn(&mut turns, HistoryRole::User, rest);
-    turns
+    push_turn(&mut turns, &mut landing, HistoryRole::User, rest, None);
+    (turns, landing)
 }
 
 #[cfg(test)]

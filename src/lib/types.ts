@@ -1135,6 +1135,9 @@ export interface ModelInfo {
   /** The builtin model that replaces this one (Fable 5.1 → Fable 5.2);
    *  absent for every other model. The launcher offers the switch. */
   supersededBy?: string | null;
+  /** The most output tokens one request may ask for; every request is
+   *  clamped to it. Absent for a custom model, which isn't clamped. */
+  maxOutput?: number | null;
 }
 
 export interface ModelWithProvider {

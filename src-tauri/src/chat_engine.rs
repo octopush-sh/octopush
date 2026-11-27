@@ -13,7 +13,7 @@ use crate::chat_agents::{
     mcp_off_refusal, thread_mcp_off,
 };
 use crate::chat_history::{
-    build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
+    build_history_landing, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
 };
 use crate::context::budget;
 use crate::db::Db;
@@ -22,7 +22,7 @@ use crate::providers::{
     anthropic::AnthropicProvider,
     complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
-    retry_notice, Completion, Effort, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
+    retry_notice, Completion, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
     LlmRole, LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
@@ -98,6 +98,48 @@ pub(crate) fn director_system_prompt(
     prompt
 }
 
+/// The output budget of every request a Talk turn makes: the composer's
+/// `max_tokens`, at least 4096, within the model's output cap.
+fn turn_max_tokens(request: &ChatRequest) -> u32 {
+    crate::provider_router::clamp_output(request.max_tokens.max(4096), request.max_output)
+}
+
+/// The quiet note after a final answer the model stopped at the output
+/// limit (`max_tokens`): it reads complete otherwise. `None` for any other
+/// stop.
+fn cut_answer_note(stop: &LlmStopReason) -> Option<&'static str> {
+    matches!(stop, LlmStopReason::MaxTokens)
+        .then_some("The answer reached the output limit. Say continue to get the rest.")
+}
+
+/// Tool rounds in a row cut at the output limit before the turn ends
+/// instead of asking the model to retry smaller.
+const MAX_TRUNCATED_ROUNDS: u32 = 2;
+
+/// The quiet note a turn ends with after [`MAX_TRUNCATED_ROUNDS`] cut rounds.
+const TRUNCATED_ROUNDS_NOTE: &str = "Stopped: two replies in a row were cut at the output limit mid tool call, \
+     so those calls didn't run. Ask for smaller steps, such as one file at a time.";
+
+/// Counts the tool rounds in a row cut at the output limit. Turns are
+/// unlimited by default, so without it a model that keeps writing oversized
+/// `write_file` bodies would retry at the full output cap forever.
+#[derive(Default, Debug)]
+struct TruncationStreak(u32);
+
+impl TruncationStreak {
+    /// One more cut round. True once [`MAX_TRUNCATED_ROUNDS`] came in a
+    /// row: end the turn rather than retry.
+    fn cut(&mut self) -> bool {
+        self.0 += 1;
+        self.0 >= MAX_TRUNCATED_ROUNDS
+    }
+
+    /// A round that wasn't cut ends the streak.
+    fn clear(&mut self) {
+        self.0 = 0;
+    }
+}
+
 /// One request of a Talk turn: every round and the forced close carry the
 /// same model, output cap and reasoning effort (`ChatRequest::effort`), so
 /// the thinking config holds across the turn's tool loop (Anthropic requires
@@ -106,14 +148,9 @@ fn director_request(request: &ChatRequest, system: &str, messages: &[LlmMessage]
     LlmRequest {
         model: request.model.clone(),
         // Honor the caller's requested budget (the EffortSelector sets it)
-        // with a sane floor; the old code force-clamped to 32768, silently
-        // ignoring the request.
-        // FOLLOW-UP: some providers cap output below the Deep preset (e.g.
-        // gpt-4o at 16384) and will 400 on a larger value. A proper per-model
-        // ceiling needs a `max_output_tokens` field on ModelInfo; until then
-        // the budget is forwarded as-is (this was already the case
-        // pre-change, which force-sent 32768).
-        max_tokens: request.max_tokens.max(4096),
+        // with a sane floor, within the model's output cap: a model that
+        // takes less (GPT-4o at 16,384) refuses a larger value outright.
+        max_tokens: turn_max_tokens(request),
         system: system.to_string(),
         messages: messages.to_vec(),
         tools: tools.to_vec(),
@@ -366,7 +403,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub skill: Option<String>,
     /// Inline image attachments for THIS turn (base64). Sent as multimodal
-    /// content blocks alongside the user text. Not persisted in history.
+    /// content blocks alongside the user text, and kept with the ask
+    /// (`chat_attachments`) so later turns send them again.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
     /// Regenerate: the prior turn was already truncated and history ends with the
@@ -384,6 +422,11 @@ pub struct ChatRequest {
     /// re-send the blocks abridged.
     #[serde(default)]
     pub context_blocks: Option<String>,
+    /// The model's output cap (`ModelInfo::max_output`), looked up once the
+    /// turn's model is known: every request's `max_tokens` stays within it.
+    /// Never sent by the frontend.
+    #[serde(skip)]
+    pub max_output: Option<u32>,
 }
 
 /// A base64 image attachment sent with a user turn.
@@ -432,6 +475,30 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
         s.push_str(&not_found_note(output));
     }
     s
+}
+
+/// Room a gap marker and its recall hint take past an excerpt's budget, so
+/// a copy cut to fit a cap stays within it.
+const COMMAND_MARKER_ROOM: usize = 200;
+
+/// A Talk `run_command` output over `chat_history::COMMAND_SHOWN_BYTES`: the
+/// copy its row keeps, head and tail (more of the tail when it `failed`), and
+/// the whole output, to keep for recall. Any other result comes back as is.
+fn cut_command_output(tool: &str, result: String, failed: bool) -> (String, Option<String>) {
+    use crate::chat_history::{command_excerpt, COMMAND_KEPT_HINT, COMMAND_SHOWN_BYTES};
+    if tool != "run_command" || result.len() <= COMMAND_SHOWN_BYTES {
+        return (result, None);
+    }
+    (command_excerpt(&result, COMMAND_SHOWN_BYTES, failed, COMMAND_KEPT_HINT), Some(result))
+}
+
+/// The model's copy of a cut command output `full` kept on row `row`: head
+/// and tail within `COMMAND_SHOWN_BYTES` and `cap` (a v2 turn's view cap),
+/// with the hint that recalls the rest from that row.
+fn command_model_copy(full: &str, failed: bool, row: i64, cap: usize) -> String {
+    use crate::chat_history::{command_excerpt, recall_hint, COMMAND_SHOWN_BYTES};
+    let budget = COMMAND_SHOWN_BYTES.min(cap.saturating_sub(COMMAND_MARKER_ROOM));
+    command_excerpt(full, budget, failed, &recall_hint(row))
 }
 
 /// How a call ended, as the engine knows it, for its row (`stamp_outcome`).
@@ -2331,6 +2398,50 @@ fn kill_process_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// A command's stdout and stderr in the order their lines arrived, each
+/// stderr line tagged `[stderr] `. A stream's unfinished line waits for its
+/// newline, so the two never splice mid-line.
+#[derive(Default, Clone)]
+struct MergedOutput {
+    out: Vec<u8>,
+    pending: [Vec<u8>; 2],
+}
+
+impl MergedOutput {
+    const STDOUT: usize = 0;
+    const STDERR: usize = 1;
+
+    fn push(&mut self, stream: usize, bytes: &[u8]) {
+        self.pending[stream].extend_from_slice(bytes);
+        while let Some(nl) = self.pending[stream].iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending[stream].drain(..=nl).collect();
+            self.emit(stream, &line);
+        }
+    }
+
+    fn emit(&mut self, stream: usize, line: &[u8]) {
+        if stream == Self::STDERR {
+            self.out.extend_from_slice(b"[stderr] ");
+        }
+        self.out.extend_from_slice(line);
+    }
+
+    /// Everything, the unfinished lines last (stdout's, then stderr's).
+    fn finish(mut self) -> Vec<u8> {
+        for stream in [Self::STDOUT, Self::STDERR] {
+            let rest = std::mem::take(&mut self.pending[stream]);
+            if rest.is_empty() {
+                continue;
+            }
+            if !self.out.is_empty() && !self.out.ends_with(b"\n") {
+                self.out.push(b'\n');
+            }
+            self.emit(stream, &rest);
+        }
+        self.out
+    }
+}
+
 /// Spawn `command` and wait for it, bounded by `timeout_secs` and (when given)
 /// the caller's cancel flag — polled every ~100ms so a director stop lands
 /// promptly instead of waiting on a process that may never exit. stdout/stderr
@@ -2361,12 +2472,12 @@ fn wait_command_bounded(
     // Drain into SHARED buffers (not thread return values): if a killed
     // command's grandchild escaped the process group and still holds a pipe
     // write-end, `read_to_end` never returns — a blocking `join()` would then
-    // hang this function forever. With shared buffers we can snapshot what
-    // arrived and DETACH a stuck drain thread after a bounded wait.
-    let out_buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
-    let err_buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
-    let drain_into = |buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-                      mut pipe: Option<Box<dyn std::io::Read + Send>>| {
+    // hang this function forever. With a shared buffer we can snapshot what
+    // arrived and DETACH a stuck drain thread after a bounded wait. Both
+    // pipes feed ONE buffer, line by line, so stderr reads where it happened.
+    let merged: std::sync::Arc<std::sync::Mutex<MergedOutput>> = Default::default();
+    let drain_into = |stream: usize, mut pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let buf = std::sync::Arc::clone(&merged);
         std::thread::spawn(move || {
             use std::io::Read;
             if let Some(p) = pipe.as_mut() {
@@ -2374,20 +2485,14 @@ fn wait_command_bounded(
                 loop {
                     match p.read(&mut chunk) {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                        Ok(n) => buf.lock().unwrap().push(stream, &chunk[..n]),
                     }
                 }
             }
         })
     };
-    let out_task = drain_into(
-        std::sync::Arc::clone(&out_buf),
-        stdout.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-    );
-    let err_task = drain_into(
-        std::sync::Arc::clone(&err_buf),
-        stderr.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-    );
+    let out_task = drain_into(MergedOutput::STDOUT, stdout.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let err_task = drain_into(MergedOutput::STDERR, stderr.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let started = std::time::Instant::now();
     let ended = loop {
         match child.try_wait() {
@@ -2421,32 +2526,22 @@ fn wait_command_bounded(
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
-    let stdout_buf = out_buf.lock().unwrap().clone();
-    let stderr_buf = err_buf.lock().unwrap().clone();
-    let stdout = String::from_utf8_lossy(&stdout_buf);
-    let stderr = String::from_utf8_lossy(&stderr_buf);
-    drop((out_task, err_task)); // detach — a live thread only appends to buffers we've copied
-    let mut result = String::new();
-    if !stdout.is_empty() {
-        result.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !result.is_empty() {
-            result.push('\n');
-        }
-        result.push_str("[stderr] ");
-        result.push_str(&stderr);
-    }
+    let bytes = merged.lock().unwrap().clone().finish();
+    drop((out_task, err_task)); // detach — a live thread only appends to the buffer we've copied
+    let mut result = String::from_utf8_lossy(&bytes).into_owned();
     match ended {
         Ok(status) => {
             if result.is_empty() {
                 result = format!("(exit code {})", status.code().unwrap_or(-1));
             }
             let note = (status.code() == Some(NOT_FOUND_EXIT)).then(|| not_found_note(&result));
-            if result.len() > 50_000 {
-                let cut = truncate_char_safe(&result, 50_000).len();
-                result.truncate(cut);
-                result.push_str("\n... (truncated)");
+            if result.len() > crate::chat_history::COMMAND_CAPTURE_BYTES {
+                result = crate::chat_history::command_excerpt(
+                    &result,
+                    crate::chat_history::COMMAND_CAPTURE_BYTES,
+                    !status.success(),
+                    "",
+                );
             }
             if let Some(note) = note {
                 if !result.ends_with('\n') {
@@ -2462,8 +2557,7 @@ fn wait_command_bounded(
             let mut s = msg;
             if !result.is_empty() {
                 s.push_str("\n— output before the stop —\n");
-                let capped = truncate_char_safe(&result, 20_000);
-                s.push_str(capped);
+                s.push_str(&crate::chat_history::command_excerpt(&result, 20_000, true, ""));
             }
             (s, false)
         }
@@ -2474,6 +2568,20 @@ fn wait_command_bounded(
 /// mission) says when a refused write broke it, so the model stops trying.
 pub(crate) const READ_ONLY_NOTE: &str = "(This command ran under the read-only sandbox: it can read the workspace \
      and write temp files, but it can't change the workspace.)";
+
+/// [`READ_ONLY_NOTE`] when a read-only mission forced Plan only (#1230).
+pub(crate) const READ_ONLY_MISSION_NOTE: &str = "(This command ran under the read-only sandbox because this workspace's \
+     mission is read-only: it can read the workspace and write temp files, but it can't change the workspace.)";
+
+/// `out` with its read-only note naming the read-only mission when one
+/// forced the sandbox (`forced`), as the policy's refusals do. Pure.
+pub(crate) fn name_forced_mission(out: String, forced: bool) -> String {
+    if forced {
+        out.replace(READ_ONLY_NOTE, READ_ONLY_MISSION_NOTE)
+    } else {
+        out
+    }
+}
 
 /// `out` with [`READ_ONLY_NOTE`] when a command on the read-only profile
 /// (`Some([])`) failed on a refused write.
@@ -2487,16 +2595,20 @@ fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String
     out
 }
 
-/// `run_command` with `input` in `workspace` under `roots`, on a blocking
-/// thread, so the turn's runtime thread stays free; `cancel` (Stop) kills
-/// it mid-run.
+/// Talk's `run_command` with `input` in `workspace` under `roots`, on a
+/// blocking thread, so the turn's runtime thread stays free; `cancel` (Stop)
+/// kills it mid-run. The output comes back as kept (`run_command_kept`): the
+/// turn cuts the copy its row and the model read.
 pub(crate) async fn run_confined(
     workspace: &Path,
     input: &serde_json::Value,
     roots: Option<Vec<String>>,
     cancel: &std::sync::Arc<AtomicBool>,
 ) -> (String, bool) {
-    run_builtin(workspace, "run_command", input, roots, cancel).await
+    let (wp, input, flag) = (workspace.to_path_buf(), input.clone(), std::sync::Arc::clone(cancel));
+    tokio::task::spawn_blocking(move || run_command_kept(&wp, &input, roots.as_deref(), Some(&flag)))
+        .await
+        .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
 }
 
 /// The built-in tool `name` on a blocking thread, so a long walk or command
@@ -2639,6 +2751,60 @@ pub(crate) fn execute_tool(
     execute_tool_cancellable(workspace_path, name, input, sandbox_roots, None)
 }
 
+/// Run `run_command`'s `input` and return its output as captured: up to
+/// `chat_history::COMMAND_CAPTURE_BYTES`, stdout and stderr in arrival order,
+/// then its exit and sandbox notes (all within `COMMAND_KEEP_BYTES`). Under `sandbox_roots` it runs under
+/// seatbelt, fail-closed; `cancel` kills its process group.
+fn run_command_kept(
+    workspace_path: &Path,
+    input: &serde_json::Value,
+    sandbox_roots: Option<&[String]>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> (String, bool) {
+    let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+    let timeout_secs = input
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(RUN_COMMAND_TIMEOUT_SECS)
+        .clamp(1, RUN_COMMAND_TIMEOUT_MAX);
+    // The PATH CLI stages spawn with (the login shell's, the app's and
+    // the common bin dirs), and no other login-shell variable: an app
+    // opened from the Dock has launchd's minimal PATH, where Homebrew,
+    // nvm and similar tools aren't found.
+    let path = crate::orchestrator::cli_runner::resolved_cli_path();
+    let mut command = if let Some(roots) = sandbox_roots {
+        let scope = workspace_path.to_string_lossy();
+        match crate::orchestrator::sandbox::prepare(
+            roots,
+            Some(&*scope),
+            std::ffi::OsStr::new(crate::talk_shell::TALK_BASH),
+            &["-c".to_string(), cmd.to_string()],
+        ) {
+            Ok(p) => {
+                let mut c = std::process::Command::new(&p.program);
+                c.args(&p.args);
+                // Redirect build-tool caches into the workspace's own
+                // cache root, not the user's real ~/.cargo etc. (which
+                // the profile doesn't expose). PATH is set after
+                // them, so it is the login PATH whatever they carry.
+                c.envs(p.env);
+                c.env("PATH", &path);
+                c
+            }
+            Err(e) => {
+                return (format!("Sandbox unavailable — refusing to run the command unconfined: {e}"), false);
+            }
+        }
+    } else {
+        let mut c = std::process::Command::new(crate::talk_shell::TALK_BASH);
+        c.arg("-c").arg(cmd).env("PATH", &path);
+        c
+    };
+    command.current_dir(workspace_path);
+    let (out, ok) = wait_command_bounded(command, timeout_secs, cancel);
+    (with_read_only_note(out, ok, sandbox_roots), ok)
+}
+
 /// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
 /// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
 /// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
@@ -2654,52 +2820,11 @@ pub(crate) fn execute_tool_cancellable(
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> (String, bool) {
     match name {
+        // Sub-agents and stages read the head and tail; Talk keeps the
+        // whole output for recall (`run_command_kept`).
         "run_command" => {
-            let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
-            let timeout_secs = input
-                .get("timeout_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(RUN_COMMAND_TIMEOUT_SECS)
-                .clamp(1, RUN_COMMAND_TIMEOUT_MAX);
-            // The PATH CLI stages spawn with (the login shell's, the app's and
-            // the common bin dirs), and no other login-shell variable: an app
-            // opened from the Dock has launchd's minimal PATH, where Homebrew,
-            // nvm and similar tools aren't found.
-            let path = crate::orchestrator::cli_runner::resolved_cli_path();
-            let mut command = if let Some(roots) = sandbox_roots {
-                let scope = workspace_path.to_string_lossy();
-                match crate::orchestrator::sandbox::prepare(
-                    roots,
-                    Some(&*scope),
-                    std::ffi::OsStr::new(crate::talk_shell::TALK_BASH),
-                    &["-c".to_string(), cmd.to_string()],
-                ) {
-                    Ok(p) => {
-                        let mut c = std::process::Command::new(&p.program);
-                        c.args(&p.args);
-                        // Redirect build-tool caches into the workspace's own
-                        // cache root, not the user's real ~/.cargo etc. (which
-                        // the profile doesn't expose). PATH is set after
-                        // them, so it is the login PATH whatever they carry.
-                        c.envs(p.env);
-                        c.env("PATH", &path);
-                        c
-                    }
-                    Err(e) => {
-                        return (
-                            format!("Sandbox unavailable — refusing to run the command unconfined: {e}"),
-                            false,
-                        );
-                    }
-                }
-            } else {
-                let mut c = std::process::Command::new(crate::talk_shell::TALK_BASH);
-                c.arg("-c").arg(cmd).env("PATH", &path);
-                c
-            };
-            command.current_dir(workspace_path);
-            let (out, ok) = wait_command_bounded(command, timeout_secs, cancel);
-            (with_read_only_note(out, ok, sandbox_roots), ok)
+            let (out, ok) = run_command_kept(workspace_path, input, sandbox_roots, cancel);
+            (crate::chat_history::command_excerpt(&out, crate::chat_history::COMMAND_SHOWN_BYTES, !ok, ""), ok)
         }
         "read_file" => {
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
@@ -3375,7 +3500,10 @@ impl ChatEngine {
     /// cut would take rows the turn is still writing.
     pub fn truncate_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
         self.ensure_idle(thread_id)?;
-        self.db.lock().truncate_chat_after(thread_id, message_id)
+        let freed = self.db.lock().truncate_chat_after(thread_id, message_id)?;
+        // The images of the rows it took, unless another row names them.
+        crate::chat_attachments::remove(&freed);
+        Ok(())
     }
 
     /// Which of `thread_ids` have a turn or a sub-agent continuation
@@ -4281,6 +4409,10 @@ impl ChatEngine {
         } else {
             (request, None)
         };
+        // The model's output cap, from the catalog: every request of the
+        // turn stays within it (`turn_max_tokens`).
+        let max_output = crate::provider_router::model_max_output(&request.model);
+        let request = ChatRequest { max_output, ..request };
         let policy_auto = doctrine.is_some();
         let (provider, api_base, api_key) = resolve_provider(&request.model)?;
 
@@ -4337,6 +4469,17 @@ impl ChatEngine {
                     tracing::warn!(error = %e, message_id = id, "failed to save the ask's @ context blocks");
                 }
             }
+            // Its images are kept with it (#1159), so later turns send them
+            // again. One that can't be saved still goes with this turn.
+            let dir = crate::chat_attachments::dir();
+            for att in &request.attachments {
+                let saved = crate::chat_attachments::save(&dir, att)
+                    .map_err(AppError::from)
+                    .and_then(|name| self.db.lock().add_chat_attachment(id, &name, &att.media_type));
+                if let Err(e) = saved {
+                    tracing::warn!(error = %e, message_id = id, "failed to keep an image attachment");
+                }
+            }
         }
 
         // Build conversation history (this thread only) as normalized
@@ -4371,14 +4514,24 @@ impl ChatEngine {
             }
         }
 
-        let mut messages: Vec<LlmMessage> = match &transcript {
-            Some(rows) => crate::context::transcript::build(rows, &request.model),
+        // The thread's images (#1159): the asks that carry some make their
+        // turns, and go back on them once the context budget is known.
+        let stored_images = self.db.lock().list_chat_attachments(&request.thread_id).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to read the conversation's image attachments");
+            Vec::new()
+        });
+        let current_ask = history.iter().rev().find(|m| m.role == "user").map(|m| m.id);
+        let with_images = crate::chat_attachments::asks_with_images(&stored_images, current_ask, &request.attachments);
+
+        let (mut messages, landing): (Vec<LlmMessage>, Vec<Vec<i64>>) = match &transcript {
+            Some(rows) => crate::context::transcript::build_landing(rows, &request.model, &with_images),
             None => {
                 let rows: Vec<HistoryRow<'_>> = history
                     .iter()
                     .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_blocks.as_deref() })
                     .collect();
-                build_history(&rows)
+                let (turns, landing) = build_history_landing(&rows, &with_images);
+                let messages = turns
                     .into_iter()
                     .map(|t| LlmMessage {
                         role: match t.role {
@@ -4387,44 +4540,10 @@ impl ChatEngine {
                         },
                         content: LlmContent::Text(t.text),
                     })
-                    .collect()
+                    .collect();
+                (messages, landing)
             }
         };
-
-        // Attach this turn's images: replace the current (last) user turn with a
-        // multimodal block carrying the text + image blocks. Attachments aren't
-        // persisted, so they only ride along on the turn that sent them.
-        if !request.attachments.is_empty() {
-            // The just-persisted user message is the last entry. Guard on its
-            // role; warn (rather than silently drop) if it's somehow not a user
-            // turn. The text block is omitted when empty (image-only sends),
-            // since providers reject empty text blocks.
-            match messages.last_mut() {
-                Some(last) if last.role == LlmRole::User => {
-                    // Use the turn's already-built text, not request.user_message:
-                    // the former includes any merged `$`-direct command context
-                    // prepended above, which would otherwise be dropped here.
-                    let text = match &last.content {
-                        LlmContent::Text(t) => t.clone(),
-                        _ => request.user_message.clone(),
-                    };
-                    let mut blocks: Vec<LlmBlock> = Vec::new();
-                    if !text.trim().is_empty() {
-                        blocks.push(LlmBlock::Text(text));
-                    }
-                    for att in &request.attachments {
-                        blocks.push(LlmBlock::Image {
-                            media_type: att.media_type.clone(),
-                            data: att.data.clone(),
-                        });
-                    }
-                    last.content = LlmContent::Multimodal(blocks);
-                }
-                _ => tracing::warn!(
-                    "attachments present but the last message isn't a user turn; images dropped"
-                ),
-            }
-        }
 
         // The project's CLAUDE.md chain (or AGENTS.md), re-read every turn so
         // an edit applies at once; unchanged files give the same text, so the
@@ -4574,7 +4693,7 @@ impl ChatEngine {
         let fixed_chars = budget::fixed_chars(&system_prompt, &tools);
         let mut model_budget = budget::ContextBudget::for_model(
             crate::orchestrator::cli_runner::catalog_context_window(&request.model),
-            request.max_tokens.max(4096),
+            turn_max_tokens(&request),
             request.effort,
         );
         // An id that names its window (`[1m]`) is never lowered.
@@ -4582,6 +4701,24 @@ impl ChatEngine {
             model_budget = model_budget.with_fixed_window();
         }
         let mut context_guard = budget::ContextGuard::new(model_budget, budget::load_learned(&self.db.lock(), &request.model));
+        // Each ask's images back on its turn (#1159), byte-stable inside the
+        // cached prefix. The ask being answered always carries its own; the
+        // earlier ones stay while the history with them fits in half the
+        // window (where the guard aims), and past that go first, oldest
+        // first, each replaced by a note, before any tool result is stubbed.
+        if !with_images.is_empty() {
+            let base = context_guard.estimate(fixed_chars, &messages);
+            let limit = context_guard.budget().share(budget::TARGET_PCT);
+            let blocks = crate::chat_attachments::for_history(
+                &crate::chat_attachments::dir(),
+                &stored_images,
+                current_ask,
+                &request.attachments,
+                base,
+                limit,
+            );
+            crate::chat_attachments::attach(&mut messages, &landing, &blocks);
+        }
         // Each tool call's stored row, which a stub names for recall (the
         // transcript's earlier calls among them).
         let mut tool_rows: HashMap<String, i64> =
@@ -4616,6 +4753,9 @@ impl ChatEngine {
         // rule): riding out a nearly spent input-token window beats charging
         // into a 429.
         let mut pending_throttle: Option<u64> = None;
+
+        // Tool rounds in a row cut at the output limit: two end the turn.
+        let mut truncations = TruncationStreak::default();
 
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
@@ -4746,6 +4886,16 @@ impl ChatEngine {
 
             // Handle max_tokens truncation during tool use.
             if matches!(response.stop_reason, LlmStopReason::MaxTokens) && !response.tool_uses.is_empty() {
+                // The second cut round in a row ends the turn: retrying again
+                // would most likely spend the full output cap once more.
+                if truncations.cut() {
+                    tracing::warn!("Response truncated at max_tokens during tool_use again — ending the turn");
+                    self.finish_with_note(
+                        &app, &request.workspace_id, &request.thread_id, &request.model, &usage,
+                        TRUNCATED_ROUNDS_NOTE,
+                    )?;
+                    return Ok(());
+                }
                 tracing::warn!("Response truncated at max_tokens during tool_use — providing error tool_results and retrying");
                 // Add the truncated assistant message to history, its leading
                 // signed thinking kept.
@@ -4762,6 +4912,7 @@ impl ChatEngine {
                 });
                 continue;
             }
+            truncations.clear();
 
             // If no tool use, we're done — this was the final response.
             if is_final {
@@ -4780,6 +4931,13 @@ impl ChatEngine {
                         &request.model,
                         &usage,
                     )?;
+                }
+                // An answer cut at the output limit says so. Its tokens sit
+                // on the answer row; with no answer text, on the note.
+                if let Some(note) = cut_answer_note(&response.stop_reason) {
+                    let none = TurnUsage::default();
+                    let note_usage = if final_text.is_empty() { &usage } else { &none };
+                    self.finish_with_note(&app, &request.workspace_id, &request.thread_id, &request.model, note_usage, note)?;
                 }
 
                 // `send_agentic` sends `done` (pure metadata) once the turn
@@ -5254,9 +5412,9 @@ impl ChatEngine {
                 } else if u.name == "run_command" {
                     // On the sandbox (Plan only, a sandboxed mission) or without
                     // the shared shell: off the runtime thread, and Stop kills it.
-                    let ran = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
+                    let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
-                    ran
+                    (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
                 } else {
                     // Every other built-in tool, off the runtime thread too: a
                     // long grep never stalls another workspace's turn, and a
@@ -5265,6 +5423,11 @@ impl ChatEngine {
                     interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
                     ran
                 };
+                // A long command's output: its row and the model read the
+                // head and tail (more of the tail when it failed); the whole
+                // output, as captured, is kept for recall.
+                let failed = run_command_exit.map_or(!ok, |code| code != 0);
+                let (result, command_full) = cut_command_output(&u.name, result, failed);
 
                 // ── Live card: announce completion (timing + status) ──
                 let _ = app.emit("chat://tool-end", &ToolEndEvent {
@@ -5354,6 +5517,17 @@ impl ChatEngine {
                                     tracing::warn!(error = %e, "failed to keep the original MCP output for recall");
                                 }
                             }
+                            if let Some(full) = &command_full {
+                                let kept = self.db.lock().set_chat_tool_original_within(
+                                    id,
+                                    &request.thread_id,
+                                    full,
+                                    crate::chat_history::COMMAND_KEEP_BYTES,
+                                );
+                                if let Err(e) = kept {
+                                    tracing::warn!(error = %e, "failed to keep the full command output for recall");
+                                }
+                            }
                         }
                         Err(e) => {
                             tracing::error!(tool = %u.name, error = %e, "failed to persist tool execution");
@@ -5378,6 +5552,18 @@ impl ChatEngine {
                 // A loaded skill is instructions to follow, as the same skill
                 // named with `/name` is: it carries no untrusted mark.
                 let mark = (!was_denied && !is_skill).then_some(source.as_str());
+                // A cut command output: the model's copy names its row.
+                let result = match (&command_full, row_id) {
+                    (Some(full), Some(id)) => {
+                        let cap = if v2 {
+                            crate::context::transcript::view_cap(context_guard.budget().window)
+                        } else {
+                            usize::MAX
+                        };
+                        command_model_copy(full, failed, id, cap)
+                    }
+                    _ => result,
+                };
                 let content = if v2 {
                     let window = context_guard.budget().window;
                     let view = crate::context::transcript::model_view(&u.name, &result, row_id, window, mark);
@@ -5976,6 +6162,102 @@ mod continuation_tests {
         assert_eq!(crate::chat_history::untrusted_header(&from), "[untrusted output from mcp:github]");
         assert_eq!(engine.recalled_tool(&thread, &serde_json::json!({"message_id": ask, "block": 1})), None);
     }
+
+    /// A db with one thread, and the engine over it.
+    fn recall_fixture() -> (tempfile::NamedTempFile, Arc<Mutex<Db>>, ChatEngine, String) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let thread = {
+            let d = db.lock();
+            d.insert_project("p", "P", "/tmp/p").unwrap();
+            d.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+            d.create_chat_thread("ws", "T").unwrap().id
+        };
+        (tmp, db, engine, thread)
+    }
+
+    /// Every page of `limit` chars `recall_tool_output` returns for row `id`,
+    /// joined.
+    fn recall_in_pages(engine: &ChatEngine, thread: &str, id: i64, limit: usize) -> String {
+        let mut joined = String::new();
+        loop {
+            let input = serde_json::json!({"message_id": id, "offset": joined.len(), "limit": limit});
+            let (page, ok) = engine.recall_tool_output(thread, &input, RECALL_MAX_LIMIT);
+            assert!(ok, "{page}");
+            let (position, body) = page.split_once('\n').expect("a paged window says where it is");
+            assert!(position.starts_with("(chars "), "{position}");
+            joined.push_str(body);
+            if position.ends_with(&format!("-{} of {})", joined.len(), joined.len())) {
+                return joined;
+            }
+        }
+    }
+
+    #[test]
+    fn recall_returns_full_stored_output() {
+        let (_tmp, db, engine, thread) = recall_fixture();
+        let full: String = (1..=40_000).map(|n| format!("line {n}\n")).collect::<String>() + "test result: FAILED. 1 failed";
+        let (shown, kept) = cut_command_output("run_command", full.clone(), true);
+        let kept = kept.expect("a long output is kept whole");
+        assert!(shown.len() < full.len() && shown.ends_with("test result: FAILED. 1 failed"), "the row keeps the tail");
+        let row = serde_json::json!({"callId": "c", "toolName": "run_command", "toolInput": {"command": "cargo test"}, "result": shown}).to_string();
+        let id = {
+            let d = db.lock();
+            let id = d.insert_chat_message("ws", &thread, "tool", &row, None, None, None, None).unwrap();
+            d.set_chat_tool_original_within(id, &thread, &kept, crate::chat_history::COMMAND_KEEP_BYTES).unwrap();
+            id
+        };
+        assert_eq!(recall_in_pages(&engine, &thread, id, RECALL_DEFAULT_LIMIT), full, "paging the recall returns every byte");
+        let (first, _) = engine.recall_tool_output(&thread, &serde_json::json!({"message_id": id}), RECALL_MAX_LIMIT);
+        assert!(first.starts_with(&format!("(chars 1-{RECALL_DEFAULT_LIMIT} of {})\nline 1\n", full.len())), "{}", &first[..80]);
+        assert!(!first.contains("truncated"), "nothing of it was cut");
+    }
+
+    #[test]
+    fn output_over_the_keep_cap_recalls_its_end() {
+        use crate::chat_history::{command_excerpt, COMMAND_CAPTURE_BYTES, COMMAND_KEEP_BYTES};
+        // A real capture over 4 MB keeps its last line with room to spare.
+        let ws = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({"command": "head -c 4500000 /dev/zero | tr '\\0' x; echo; echo 'error: LAST LINE'; exit 3"});
+        let (out, ok) = run_command_kept(ws.path(), &input, None, None);
+        assert!(!ok && out.len() <= COMMAND_CAPTURE_BYTES + 100, "{}", out.len());
+        assert!(out.ends_with("error: LAST LINE\n"), "{:?}", &out[out.len().saturating_sub(80)..]);
+        // The shared shell's capture, its exit code and the isolated-shell
+        // prefix on top still fit, so the stored copy ends on the exit code.
+        let raw = format!("{}\nerror: LAST LINE", "y".repeat(4_500_000));
+        let captured = format_command_output(&command_excerpt(&raw, COMMAND_CAPTURE_BYTES, true, ""), 1);
+        let full = format!("(ran in an isolated shell at the workspace root — busy)\n{captured}");
+        assert!(full.len() <= COMMAND_KEEP_BYTES, "{}", full.len());
+        let (_tmp, db, engine, thread) = recall_fixture();
+        let (shown, kept) = cut_command_output("run_command", full.clone(), true);
+        let row = serde_json::json!({"callId": "c", "toolName": "run_command", "toolInput": {}, "result": shown}).to_string();
+        let id = {
+            let d = db.lock();
+            let id = d.insert_chat_message("ws", &thread, "tool", &row, None, None, None, None).unwrap();
+            d.set_chat_tool_original_within(id, &thread, &kept.expect("kept"), COMMAND_KEEP_BYTES).unwrap();
+            id
+        };
+        let recalled = recall_in_pages(&engine, &thread, id, RECALL_MAX_LIMIT);
+        assert_eq!(recalled, full);
+        assert!(recalled.ends_with("error: LAST LINE\n(exit code 1)"), "{:?}", &recalled[recalled.len() - 80..]);
+        let (first, _) = engine.recall_tool_output(&thread, &serde_json::json!({"message_id": id}), RECALL_MAX_LIMIT);
+        assert!(!first.contains("truncated"), "the stored copy wasn't cut again");
+    }
+
+    #[test]
+    fn old_rows_without_full_result_recall_as_before() {
+        let (_tmp, db, engine, thread) = recall_fixture();
+        // A row written before the full output was kept: its `result` alone.
+        let old = format!("HEAD{}\n... (truncated)", "x".repeat(30_000));
+        let row = serde_json::json!({"callId": "c", "toolName": "run_command", "toolInput": {}, "result": old}).to_string();
+        let id = db.lock().insert_chat_message("ws", &thread, "tool", &row, None, None, None, None).unwrap();
+        assert_eq!(engine.recall_tool_output(&thread, &serde_json::json!({"message_id": id}), RECALL_MAX_LIMIT), (old.clone(), true));
+        assert_eq!(recall_in_pages(&engine, &thread, id, 10_000), old);
+        let small = serde_json::json!({"callId": "d", "toolName": "run_command", "toolInput": {}, "result": "ok\n(exit code 0)"}).to_string();
+        let id = db.lock().insert_chat_message("ws", &thread, "tool", &small, None, None, None, None).unwrap();
+        assert_eq!(engine.recall_tool_output(&thread, &serde_json::json!({"message_id": id}), RECALL_MAX_LIMIT), ("ok\n(exit code 0)".to_string(), true));
+    }
 }
 
 #[cfg(test)]
@@ -6015,6 +6297,48 @@ mod tests {
         }
         // `least` is internal: a request can't ask for it.
         assert!(serde_json::from_value::<Effort>(serde_json::json!("least")).is_err());
+    }
+
+    #[test]
+    fn max_tokens_clamped_to_model_cap() {
+        // Deep on GPT-4o: every round and the forced close ask for 16,384.
+        let mut request = chat_request_on("gpt-4o", DEEP);
+        assert_eq!(request.max_output, None, "never read from the frontend");
+        request.max_output = Some(16_384);
+        assert_eq!(director_request(&request, "sys", &[], &[]).max_tokens, 16_384);
+        let mut messages = Vec::new();
+        assert_eq!(forced_close_request(&request, "sys", &mut messages, &[]).max_tokens, 16_384);
+        // Under the cap, the budget is sent as asked, floor included.
+        request.max_tokens = 1_000;
+        assert_eq!(director_request(&request, "sys", &[], &[]).max_tokens, 4096);
+        // A model with no cap (a custom one) isn't clamped.
+        let uncapped = chat_request_on("my-custom-model", DEEP);
+        assert_eq!(director_request(&uncapped, "sys", &[], &[]).max_tokens, 64000);
+    }
+
+    #[test]
+    fn truncated_final_answer_gets_note() {
+        assert_eq!(
+            cut_answer_note(&LlmStopReason::MaxTokens),
+            Some("The answer reached the output limit. Say continue to get the rest.")
+        );
+        for stop in [LlmStopReason::EndTurn, LlmStopReason::ToolUse] {
+            assert_eq!(cut_answer_note(&stop), None, "{stop:?}");
+        }
+    }
+
+    #[test]
+    fn two_truncations_end_the_turn() {
+        let mut streak = TruncationStreak::default();
+        assert!(!streak.cut(), "the first cut round is retried");
+        assert!(streak.cut(), "the second in a row ends the turn");
+        // A round that went through in between starts the count again.
+        let mut streak = TruncationStreak::default();
+        assert!(!streak.cut());
+        streak.clear();
+        assert!(!streak.cut());
+        assert!(streak.cut());
+        assert!(TRUNCATED_ROUNDS_NOTE.contains("output limit"));
     }
 
     #[test]
@@ -6323,7 +6647,7 @@ mod tests {
             .take_while(|m| m.id <= ask)
             .map(|m| HistoryRow { id: m.id, role: &m.role, content: &m.content, context: m.context_blocks.as_deref() })
             .collect();
-        let legacy: Vec<LlmMessage> = build_history(&legacy_rows)
+        let legacy: Vec<LlmMessage> = crate::chat_history::build_history(&legacy_rows)
             .into_iter()
             .map(|h| LlmMessage {
                 role: if h.role == HistoryRole::User { LlmRole::User } else { LlmRole::Assistant },
@@ -6656,6 +6980,61 @@ mod tests {
         assert!(!ok);
         assert!(started.elapsed().as_secs() < 30, "cancel lands promptly");
         assert!(out.contains("stopped by the director"), "{out}");
+    }
+
+    #[test]
+    fn long_output_keeps_tail_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // ~590 KB, then (once stdout is drained) the failure on stderr.
+        let input = serde_json::json!({"command": "seq 1 100000; sleep 0.5; echo 'assertion failed: LAST' >&2; exit 1"});
+        let (out, ok) = execute_tool(dir.path(), "run_command", &input, None);
+        assert!(!ok);
+        assert!(out.starts_with("1\n2\n") && out.ends_with("[stderr] assertion failed: LAST\n"), "both ends reach a sub-agent");
+        let marker = out.find(" chars omitted]").expect("the gap is marked");
+        assert!(out.len() - marker > crate::chat_history::COMMAND_SHOWN_BYTES / 2, "a failure keeps more of the end");
+
+        // Talk: the whole output comes back, and the row and the model keep the tail.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (full, ok) = rt.block_on(run_confined(dir.path(), &input, None, &cancel));
+        assert!(!ok && full.starts_with("1\n") && full.contains("\n100000\n") && full.ends_with("assertion failed: LAST\n"));
+        let (row, kept) = cut_command_output("run_command", full.clone(), true);
+        assert_eq!(kept.as_deref(), Some(full.as_str()), "kept for recall");
+        assert!(row.len() <= crate::chat_history::COMMAND_SHOWN_BYTES + COMMAND_MARKER_ROOM);
+        assert!(row.ends_with("assertion failed: LAST\n") && row.contains(crate::chat_history::COMMAND_KEPT_HINT));
+        let window = crate::context::transcript::view_cap(200_000);
+        let model = command_model_copy(&full, true, 42, window);
+        assert!(model.ends_with("assertion failed: LAST\n") && model.contains("recall_tool_output with message_id 42"));
+        assert_eq!(crate::context::transcript::model_view("run_command", &model, Some(42), 200_000, None), model, "a v2 view doesn't cut it again");
+        // A short or successful output is left alone; success keeps more of the head.
+        assert_eq!(cut_command_output("run_command", "ok".into(), true), ("ok".to_string(), None));
+        assert_eq!(cut_command_output("read_file", full.clone(), true).1, None);
+        let fine = command_model_copy(&full, false, 42, usize::MAX);
+        assert!(fine.find(" chars omitted").unwrap() > crate::chat_history::COMMAND_SHOWN_BYTES / 2);
+    }
+
+    #[test]
+    fn stderr_interleaved_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({
+            "command": "echo one; sleep 0.3; echo two >&2; sleep 0.3; echo three; sleep 0.3; printf partial >&2"
+        });
+        let (out, ok) = execute_tool(dir.path(), "run_command", &input, None);
+        assert!(ok, "{out}");
+        assert_eq!(out, "one\n[stderr] two\nthree\n[stderr] partial");
+    }
+
+    #[test]
+    fn merged_output_tags_stderr_lines_and_never_splices_mid_line() {
+        let mut m = MergedOutput::default();
+        m.push(MergedOutput::STDOUT, b"compiling a");
+        m.push(MergedOutput::STDERR, b"warning: x\nwarn");
+        m.push(MergedOutput::STDOUT, b"nd b\n");
+        m.push(MergedOutput::STDERR, b"ing: y\n");
+        m.push(MergedOutput::STDOUT, b"done");
+        m.push(MergedOutput::STDERR, b"error: z");
+        let out = String::from_utf8(m.finish()).unwrap();
+        assert_eq!(out, "[stderr] warning: x\ncompiling and b\n[stderr] warning: y\ndone\n[stderr] error: z");
     }
 
     /// Runs `run` on a one-thread runtime, raising `cancel` 300ms in, and

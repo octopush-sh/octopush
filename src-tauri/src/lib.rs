@@ -4,6 +4,7 @@ pub mod agent_adapter;
 pub mod auth;
 pub mod billing;
 pub mod chat_agents;
+pub mod chat_attachments;
 pub mod chat_engine;
 pub mod chat_history;
 pub mod collisions;
