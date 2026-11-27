@@ -8044,6 +8044,7 @@ pub fn build_ai_request(
         // One-shot: the prefix is never re-sent, so a cache write would just be a
         // wasted 1.25× surcharge with no read to repay it. Keep caching off.
         cache: false,
+        cache_key: None,
     }
 }
 

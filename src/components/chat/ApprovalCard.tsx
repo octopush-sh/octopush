@@ -6,6 +6,10 @@ import { tourId } from "../../lib/tour/ids";
 interface Props {
   approval: PendingApproval;
   onRespond: (decision: "approve" | "always" | "grant" | "deny") => void;
+  /** Talk is the mode on screen. A card the user focused can keep the focus
+   *  after a mode switch hides Talk (WebKit may leave it on a hidden
+   *  element), so its keys answer only while Talk shows. */
+  talkActive?: boolean;
 }
 
 const QUICK = "transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)]";
@@ -76,7 +80,7 @@ export const RUN_CHECK_LIMITS =
  * click, Tab, or ⌘⌥A (`FOCUS_CARD_CHORD`), which focuses the oldest card in
  * the conversation on screen.
  */
-export function ApprovalCard({ approval, onRespond }: Props) {
+export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) {
   const secret = approval.secret === true;
   const run = approval.kind === "run";
   const outside = approval.kind === "read" || approval.kind === "write" || run;
@@ -95,7 +99,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       ? { label: "Allow this command for this conversation", title: COMMAND_GRANT_TITLE }
       : null;
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    const answer = cardKeyAnswer(e, safeLead);
+    const answer = cardKeyAnswer(e, safeLead, talkActive);
     if (!answer) return;
     e.preventDefault();
     e.stopPropagation();
@@ -113,6 +117,11 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       data-tour={secret ? tourId("talk-secret-approval") : tourId("talk-approval")}
       className="octo-rise-in my-2 rounded-md border border-[var(--rouge-border)] bg-[var(--rouge-ghost)] px-3 py-2.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
     >
+      {/* Tells a screen reader the turn waits, as the card appears; the
+          group's label names what it waits on. */}
+      <span role="alert" className="sr-only">
+        The turn is waiting on your answer.
+      </span>
       <div className="flex items-center gap-2">
         <ShieldAlert size={14} aria-hidden className="shrink-0 text-octo-rouge" />
         <span className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-rouge">{copy.eyebrow}</span>
@@ -202,15 +211,18 @@ export function focusOldestCard(root: ParentNode = document): boolean {
 
 /** The answer a key gives a focused card, or null for a key it leaves alone.
  *  Only the card's own focus counts (a key on a button inside it is the
- *  button's), and never a held key, an IME composition, or a chord other
- *  than ⌘↵. `safeLead`: the safe answer leads (the secret card, a
- *  credentials location). Pure. */
+ *  button's), only while Talk is the mode on screen (`talkActive`), and
+ *  never a held key, an IME composition, or a chord other than ⌘↵.
+ *  `safeLead`: the safe answer leads (the secret card, a credentials
+ *  location). Pure. */
 export function cardKeyAnswer(
   e: Pick<KeyboardEvent<HTMLElement>, "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat" | "target" | "currentTarget"> & {
     nativeEvent?: { isComposing?: boolean };
   },
   safeLead: boolean,
+  talkActive = true,
 ): "approve" | "deny" | null {
+  if (!talkActive) return null;
   if (e.target !== e.currentTarget || e.repeat || e.nativeEvent?.isComposing) return null;
   if (e.ctrlKey || e.altKey || e.shiftKey) return null;
   const lead = safeLead ? "deny" : "approve";
