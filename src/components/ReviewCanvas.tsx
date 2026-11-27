@@ -39,7 +39,7 @@ import { DiffView } from "./review/DiffView";
 import { AiReviewPanel } from "./review/AiReviewPanel";
 import { TestDrawer } from "./review/TestDrawer";
 import { baseName, commitCount, sinceBaseLabel, type ReviewSource } from "../lib/reviewSource";
-import type { TurnScope } from "../lib/turnChanges";
+import { isStaleHunkError, type TurnReadState, type TurnScope } from "../lib/turnChanges";
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -84,6 +84,9 @@ interface Props {
   /** The Talk turn of the This turn scope (#1152); its segment shows only
    *  while one is set. In that view `x` reverts a hunk in the working tree. */
   turn?: TurnScope | null;
+  /** The turn's diff is still being read, or couldn't be: the empty state
+   *  says that instead of "this turn left the files as they were". */
+  turnRead?: TurnReadState;
   onSourceChange?: (source: ReviewSource) => void;
   /** Callback to request parent to re-fetch diff (after Accept/Reject). */
   onDiffChange?: () => void;
@@ -119,6 +122,7 @@ export function ReviewCanvas({
   base = null,
   mergeBase = null,
   turn = null,
+  turnRead = null,
   onSourceChange,
   onDiffChange,
   initialTestCommand,
@@ -387,8 +391,16 @@ export function ReviewCanvas({
       onDiffChange?.();
     } catch (e) {
       console.error("revert hunk failed:", e);
-      if (turnView) {
+      // Only a reverse that no longer applies means the hunk changed, and
+      // with whitespace ignored the hunk itself may not reverse: say which.
+      if (turnView && isStaleHunkError(e) && !ignoreWhitespace) {
         pushToast({ level: "info", title: "This hunk changed since the turn.", body: "The files were left as they are." });
+      } else if (turnView && isStaleHunkError(e)) {
+        pushToast({
+          level: "info",
+          title: "This hunk can't be reverted with whitespace ignored.",
+          body: "Turn off ±WS and try again. The files were left as they are.",
+        });
       } else {
         pushToast({ level: "error", title: "Couldn't reject hunk", body: String(e) });
       }
@@ -763,7 +775,7 @@ export function ReviewCanvas({
             // The committed side matches the disk only while the tree is
             // clean; a turn's side, only until something changes after it.
             diskContext={turnView ? false : !readOnly || workingCount === 0}
-            empty={{ source, commitsAhead, base, workingCount, ignoreWhitespace }}
+            empty={{ source, commitsAhead, base, workingCount, ignoreWhitespace, turnRead: turnView ? turnRead : null }}
             onShowCommitted={() => onSourceChange?.("committed")}
             stagedCount={
               gitStatus?.changedFiles.filter((f) => f.staged).length ?? 0

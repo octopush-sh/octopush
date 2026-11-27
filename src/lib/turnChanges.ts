@@ -21,6 +21,17 @@ export interface TurnScope {
   label: string;
 }
 
+/** The turn view's diff is still being read, or the read failed (its
+ *  error); `null` once the diff is on screen. */
+export type TurnReadState = "loading" | { error: string } | null;
+
+/** `revert_hunk`'s error when the reverse no longer applies (the backend's
+ *  `friendly_git_error` for "patch does not apply"). Any other failure (git,
+ *  permissions, a missing file) is not the hunk having changed. */
+export function isStaleHunkError(e: unknown): boolean {
+  return String(e).includes("no longer matches the file");
+}
+
 /** "4 files changed · +38 −6" (the counts are left out when both are 0). */
 export function turnChangesSummary(changes: TurnChange[]): string {
   const n = changes.length;

@@ -1487,7 +1487,17 @@ function App() {
   // base to the working tree mid-read. Leaving Review drops the pins.
   useReviewDefaultPin(activeMode, activeWorkspaceId, reviewAnswers);
   const reviewDiff =
-    reviewSource === "committed" ? committed?.diff ?? "" : reviewSource === "turn" ? turnDiff ?? "" : gitDiff;
+    reviewSource === "committed"
+      ? committed?.diff ?? ""
+      : reviewSource === "turn"
+        ? turnDiff && "diff" in turnDiff
+          ? turnDiff.diff
+          : ""
+        : gitDiff;
+  // Until the turn's diff is read, or when it can't be, the view says so
+  // rather than showing the empty "left the files as they were" state.
+  const turnRead =
+    reviewSource !== "turn" ? null : turnDiff === null ? "loading" : "error" in turnDiff ? turnDiff : null;
   const reviewDiffStat = useMemo(() => diffStat(reviewDiff), [reviewDiff]);
   const reviewChangedCount =
     reviewSource === "working" ? gitStatus?.changedFiles.length ?? 0 : diffFileCount(reviewDiff);
@@ -2671,6 +2681,7 @@ function App() {
                         base={committed?.base ?? null}
                         mergeBase={committed?.mergeBase ?? null}
                         turn={reviewTurn}
+                        turnRead={turnRead}
                         onSourceChange={(src) => useReviewSource.getState().pick(activeWorkspaceId!, src)}
                         viewMode={reviewViewMode}
                         onViewModeChange={setReviewViewMode}

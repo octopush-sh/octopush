@@ -60,7 +60,9 @@ export function TurnChanges({
       data-testid="talk-turn-changes"
       className="octo-rise-in -mt-3 flex min-w-0 items-center gap-2 rounded-md border border-octo-hairline bg-octo-panel px-3 py-1.5"
     >
-      <FileDiff size={13} className="shrink-0 text-octo-mute" aria-hidden />
+      <span title="Files this turn changed" className="flex shrink-0">
+        <FileDiff size={13} className="text-octo-mute" aria-hidden />
+      </span>
       <span className="shrink-0 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.15em] text-octo-sage octo-tabular">
         {turnChangesSummary(changes)}
       </span>

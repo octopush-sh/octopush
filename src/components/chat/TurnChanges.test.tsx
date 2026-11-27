@@ -33,10 +33,11 @@ describe("TurnChanges", () => {
     expect(ipc.talkTurnChanges).toHaveBeenCalledWith("t1", 7);
     const row = screen.getByTestId("talk-turn-changes");
     expect(row.className).toContain("octo-rise-in");
-    // The names are mid-truncated; their tooltip holds every full path.
-    expect(row.querySelector("[title]")?.getAttribute("title")).toBe(
-      "src/a.ts\nsrc/b.ts\ndocs/new.md\nscripts/made-by-shell.sh",
-    );
+    // The icon carries a tooltip; the names are mid-truncated and their
+    // tooltip holds every full path.
+    const titles = [...row.querySelectorAll("[title]")].map((el) => el.getAttribute("title"));
+    expect(titles[0]).toBe("Files this turn changed");
+    expect(titles[1]).toBe("src/a.ts\nsrc/b.ts\ndocs/new.md\nscripts/made-by-shell.sh");
     expect(row.textContent).toContain("made-by-shell.sh");
   });
 

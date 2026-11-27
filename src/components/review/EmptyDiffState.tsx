@@ -1,5 +1,6 @@
 import { CheckCircle } from "lucide-react";
 import { baseName, commitCount, type ReviewSource } from "../../lib/reviewSource";
+import type { TurnReadState } from "../../lib/turnChanges";
 
 /** Which view is empty and what the other one holds (#851). */
 export interface EmptyDiffContext {
@@ -12,15 +13,24 @@ export interface EmptyDiffContext {
   /** ±WS is on: whitespace-only changes are hidden, so commits that only
    *  re-indent leave an empty committed diff (#903). */
   ignoreWhitespace?: boolean;
+  /** This turn's diff is still being read, or couldn't be (#1152). */
+  turnRead?: TurnReadState;
 }
 
-/** The empty state's title and line, by case. Exported for tests. */
+/** The empty state's title and line, by case. Exported for tests. A `quiet`
+ *  copy is a wait, not an outcome: one muted line, no mark. */
 export function emptyDiffCopy(
   stagedCount: number,
   ctx: EmptyDiffContext | undefined,
-): { title: string; body: string; showCommitted: boolean } {
+): { title: string; body: string; showCommitted: boolean; quiet?: boolean } {
   const commits = ctx?.commitsAhead ?? 0;
   const base = baseName(ctx?.base);
+  if (ctx?.source === "turn" && ctx.turnRead === "loading") {
+    return { title: "", body: "Reading this turn's changes…", showCommitted: false, quiet: true };
+  }
+  if (ctx?.source === "turn" && typeof ctx.turnRead === "object" && ctx.turnRead) {
+    return { title: "This turn's changes couldn't be read.", body: ctx.turnRead.error, showCommitted: false };
+  }
   if (ctx?.source === "turn") {
     return {
       title: "Nothing to review.",
@@ -72,6 +82,13 @@ export function EmptyDiffState({
   onShowCommitted?: () => void;
 }) {
   const copy = emptyDiffCopy(stagedCount, context);
+  if (copy.quiet) {
+    return (
+      <div className="octo-fade-in flex h-full items-center justify-center font-mono text-[11px] text-octo-mute" role="status">
+        {copy.body}
+      </div>
+    );
+  }
   return (
     <div className="octo-fade-in flex h-full flex-col items-center justify-center gap-4 text-center">
       <CheckCircle size={24} className="text-octo-brass opacity-60" />

@@ -10,6 +10,7 @@ import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
 import { keyboardHelpLine } from "./review/DiffView";
 import { emptyDiffCopy } from "./review/EmptyDiffState";
+import { useReviewPrefs } from "../stores/reviewPrefsStore";
 
 vi.mock("./Toasts", () => ({ pushToast: vi.fn() }));
 vi.mock("../lib/ipc", () => ({
@@ -48,6 +49,10 @@ const STATUS = {
 
 const TURN = { threadId: "t1", messageId: 7, label: "Make y three" };
 
+// `revert_hunk`'s error when the reverse no longer applies (friendly_git_error).
+const STALE =
+  "other: This change no longer matches the file — it may have changed since. Refresh the diff and try again.";
+
 function renderCanvas(overrides?: Partial<Parameters<typeof ReviewCanvas>[0]>) {
   return render(
     <ReviewCanvas workspaceId="ws-1" workspacePath="/tmp/ws" gitStatus={STATUS} gitDiff={TURN_DIFF} {...overrides} />,
@@ -58,6 +63,7 @@ beforeEach(() => {
   vi.mocked(ipc.revertHunk).mockReset().mockResolvedValue(undefined);
   vi.mocked(ipc.stageHunk).mockReset().mockResolvedValue(undefined);
   vi.mocked(pushToast).mockReset();
+  useReviewPrefs.setState({ ignoreWhitespace: false });
 });
 
 describe("ReviewCanvas · This turn scope", () => {
@@ -109,7 +115,7 @@ describe("ReviewCanvas · This turn scope", () => {
   });
 
   it("a reverse hunk that no longer applies says so and offers no undo", async () => {
-    vi.mocked(ipc.revertHunk).mockRejectedValue("other: That change no longer applies cleanly.");
+    vi.mocked(ipc.revertHunk).mockRejectedValue(STALE);
     renderCanvas({ source: "turn", turn: TURN });
     fireEvent.click(screen.getByRole("button", { name: "Revert hunk" }));
     await waitFor(() =>
@@ -117,6 +123,57 @@ describe("ReviewCanvas · This turn scope", () => {
     );
     expect(screen.queryByText("Hunk reverted in the working tree.")).toBeNull();
     expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  it("any other revert failure shows its own error, not 'changed since the turn'", async () => {
+    vi.mocked(ipc.revertHunk).mockRejectedValue("other: error: src/foo.ts: Permission denied");
+    renderCanvas({ source: "turn", turn: TURN });
+    fireEvent.click(screen.getByRole("button", { name: "Revert hunk" }));
+    await waitFor(() =>
+      expect(pushToast).toHaveBeenCalledWith({
+        level: "error",
+        title: "Couldn't reject hunk",
+        body: "other: error: src/foo.ts: Permission denied",
+      }),
+    );
+    expect(pushToast).not.toHaveBeenCalledWith(expect.objectContaining({ title: "This hunk changed since the turn." }));
+  });
+
+  it("with whitespace ignored, a hunk that won't reverse is not blamed on a change", async () => {
+    useReviewPrefs.setState({ ignoreWhitespace: true });
+    vi.mocked(ipc.revertHunk).mockRejectedValue(STALE);
+    renderCanvas({ source: "turn", turn: TURN });
+    fireEvent.click(screen.getByRole("button", { name: "Revert hunk" }));
+    await waitFor(() =>
+      expect(pushToast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "This hunk can't be reverted with whitespace ignored." }),
+      ),
+    );
+    expect(pushToast).not.toHaveBeenCalledWith(expect.objectContaining({ title: "This hunk changed since the turn." }));
+  });
+
+  it("while the turn's diff loads, says so and never claims the turn changed nothing", () => {
+    renderCanvas({ source: "turn", turn: TURN, gitDiff: "", turnRead: "loading" });
+    expect(screen.getByRole("status")).toHaveTextContent("Reading this turn's changes…");
+    expect(screen.queryByText("This turn left the files as they were.")).toBeNull();
+    expect(screen.queryByText("Nothing to review.")).toBeNull();
+  });
+
+  it("when the turn's diff can't be read, says that with the error", () => {
+    renderCanvas({
+      source: "turn",
+      turn: TURN,
+      gitDiff: "",
+      turnRead: { error: "other: That conversation no longer exists." },
+    });
+    expect(screen.getByText("This turn's changes couldn't be read.")).toBeInTheDocument();
+    expect(screen.getByText("other: That conversation no longer exists.")).toBeInTheDocument();
+    expect(screen.queryByText("This turn left the files as they were.")).toBeNull();
+  });
+
+  it("a read turn with no changes still says it left the files as they were", () => {
+    renderCanvas({ source: "turn", turn: TURN, gitDiff: "", turnRead: null });
+    expect(screen.getByText("This turn left the files as they were.")).toBeInTheDocument();
   });
 
   it("words the keys and the empty state for the turn view", () => {
