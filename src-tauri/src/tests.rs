@@ -1147,6 +1147,99 @@ mod workspace_tests {
         assert!(db.list_archived_workspaces("p").unwrap().is_empty());
     }
 
+    // ── Workspace ports (#1219) ─────────────────────────────────────────
+
+    use crate::workspace_ports::{BLOCK_SIZE, RANGE_START};
+
+    #[test]
+    fn workspace_ports_are_unique_and_stable() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", Some("/tmp/octo-ports/a"), "", None).unwrap();
+        db.insert_workspace("w2", "p", "b", "", "feat/b", Some("/tmp/octo-ports/b"), "", None).unwrap();
+        let a = db.ensure_workspace_port_base("w1", |_| true).unwrap();
+        let b = db.ensure_workspace_port_base("w2", |_| true).unwrap();
+        assert_eq!(a, Some(RANGE_START));
+        assert_eq!(b, Some(RANGE_START + BLOCK_SIZE));
+        // Asking again returns the same block, whatever the bind test says now.
+        assert_eq!(db.ensure_workspace_port_base("w1", |_| false).unwrap(), a);
+        // No workspace, no block.
+        assert_eq!(db.ensure_workspace_port_base("nope", |_| true).unwrap(), None);
+    }
+
+    #[test]
+    fn workspace_ports_skip_a_base_in_use() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports2-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+        let got = db.ensure_workspace_port_base("w1", |b| b != RANGE_START).unwrap();
+        assert_eq!(got, Some(RANGE_START + BLOCK_SIZE));
+    }
+
+    #[test]
+    fn archiving_keeps_the_ports_and_deleting_frees_them() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports3-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+        db.insert_workspace("w2", "p", "b", "", "feat/b", None, "", None).unwrap();
+        db.insert_workspace("w3", "p", "c", "", "feat/c", None, "", None).unwrap();
+        let a = db.ensure_workspace_port_base("w1", |_| true).unwrap();
+        db.archive_workspace("w1").unwrap();
+        // The archived workspace still holds its block…
+        assert_ne!(db.ensure_workspace_port_base("w2", |_| true).unwrap(), a);
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(db.ensure_workspace_port_base("w1", |_| true).unwrap(), a);
+        // …and a deleted one gives it back.
+        db.delete_workspace("w1").unwrap();
+        assert_eq!(db.ensure_workspace_port_base("w3", |_| true).unwrap(), a);
+    }
+
+    #[test]
+    fn workspace_ports_survive_a_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("octopush.db");
+        let base = {
+            let db = Db::open(&path).unwrap();
+            db.insert_project("p", "P", "/tmp/octo-ports4-p").unwrap();
+            db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+            db.ensure_workspace_port_base("w1", |b| b != RANGE_START).unwrap()
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.ensure_workspace_port_base("w1", |_| true).unwrap(), base);
+    }
+
+    #[test]
+    fn two_workspaces_can_never_share_a_block() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports5-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+        db.insert_workspace("w2", "p", "b", "", "feat/b", None, "", None).unwrap();
+        db.ensure_workspace_port_base("w1", |_| true).unwrap();
+        let dup = db.conn_ref().execute(
+            "UPDATE workspaces SET port_base = ?1 WHERE id = 'w2'",
+            rusqlite::params![RANGE_START as i64],
+        );
+        assert!(dup.is_err(), "the unique index must refuse a second holder");
+    }
+
+    #[test]
+    fn a_run_session_on_a_worktree_gets_its_workspace_ports() {
+        let db = test_db();
+        let wt = tempfile::TempDir::new().unwrap();
+        let root = wt.path().to_string_lossy().into_owned();
+        db.insert_project("p", "P", "/tmp/octo-ports6-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", Some(&root), "", None).unwrap();
+        let block = crate::workspace_ports::ensure_for_root(&db, &root).expect("a block");
+        let mut guard = crate::context_guard::ContextGuard::auto_configure("s-ports", wt.path());
+        guard.set_ports(block);
+        let env = crate::commands::run_terminal_env(&guard, "claude-sonnet-5");
+        assert_eq!(env["OCTOPUSH_PORT"], block.base.to_string());
+        assert_eq!(env["OCTOPUSH_PORT_COUNT"], BLOCK_SIZE.to_string());
+        assert_eq!(env["CONDUCTOR_PORT"], block.base.to_string());
+        // A root that is no workspace's worktree gets none.
+        assert_eq!(crate::workspace_ports::ensure_for_root(&db, "/tmp/elsewhere"), None);
+    }
+
     #[test]
     fn from_branch_roundtrips_through_insert_list_get_and_archive() {
         let db = test_db();
