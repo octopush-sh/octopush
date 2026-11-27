@@ -1959,6 +1959,9 @@ impl Orchestrator {
     }
 
     async fn drive_inner(&self, run_id: &str, mut skip_budget_once: bool) -> AppResult<RunStatus> {
+        // No crew drives in a mission that ships nothing (#1239), whatever
+        // started the drive.
+        crate::orchestrator::launch::refuse_in_ship_nothing(&self.db, run_id)?;
         let run0 = self
             .db
             .lock()

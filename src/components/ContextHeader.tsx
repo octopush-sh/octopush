@@ -234,7 +234,7 @@ export function ContextHeader({
           {shipsNothing(missionIntent, missionGitIsolation) && (
             <span
               data-tour="context-ships-nothing"
-              title="Runs locally, ships nothing: pushes, pull requests and publishes an agent asks for are refused"
+              title="Runs locally, ships nothing: the git pushes, pull requests and publishes an agent's commands ask for are refused (ssh, scp, rsync and deploy CLIs aren't checked yet)"
               className="octo-pop-in flex flex-none items-center"
             >
               <PackageX size={10} aria-hidden />

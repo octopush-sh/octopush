@@ -2092,6 +2092,33 @@ mod tests {
         assert_eq!(listed["missions"].as_array().unwrap().len(), 1);
     }
 
+    /// `create_workspace` on the branch of a read-only or ship-nothing
+    /// mission can't re-pair it as a code mission (#1235, #1239): the
+    /// mission keeps its posture, and a read-only one its empty sandbox.
+    #[test]
+    fn create_workspace_never_loosens_an_existing_mission() {
+        use tempfile::TempDir;
+        let repo = TempDir::new().unwrap();
+        let path = repo.path();
+        octopush_lib::git_ops::init_repo(path).unwrap();
+        octopush_lib::git_ops::ensure_initial_commit(path).unwrap();
+        let db = parking_lot::Mutex::new(test_db());
+        db.lock().insert_project("p1", "P", path.to_str().unwrap()).unwrap();
+        for (branch, intent, git) in [("audit-x", "review", "readonly"), ("test/ENG-42", "test", "ephemeral")] {
+            let first = create_workspace(&db, &json!({ "projectId": "p1", "task": "t", "branch": branch })).unwrap();
+            let ws_id = first["workspace"]["id"].as_str().unwrap().to_string();
+            let mid = db.lock().active_mission_for_workspace(&ws_id).unwrap().unwrap().id;
+            db.lock().update_mission_axes(&mid, intent, git).unwrap();
+            let err = create_workspace(&db, &json!({ "projectId": "p1", "task": "t", "branch": branch, "intent": "build" })).unwrap_err();
+            assert!(err.contains("can only get stricter"), "{branch}: {err}");
+            let m = db.lock().active_mission_for_workspace(&ws_id).unwrap().unwrap();
+            assert_eq!((m.intent.as_str(), m.git_isolation.as_str()), (intent, git), "{branch}");
+        }
+        let ws = db.lock().list_workspaces("p1").unwrap().into_iter().find(|w| w.branch == "audit-x").unwrap();
+        let m = db.lock().active_mission_for_workspace(&ws.id).unwrap().unwrap();
+        assert_eq!(octopush_lib::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, "/ws"), Some(vec![]));
+    }
+
     #[test]
     fn create_workspace_rejects_a_non_code_intent_before_any_git_work() {
         let db = parking_lot::Mutex::new(test_db());

@@ -601,7 +601,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                           data-tour="mission-ships-nothing"
                           className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage"
                         >
-                          <span className="text-octo-brass">Runs locally, ships nothing.</span> This workspace is thrown away when the mission is done. Talk&apos;s agents can build, run and edit config here. A push, pull request or publish they ask for is refused by Octopush, not asked of them. Crews don&apos;t run in this mission.
+                          <span className="text-octo-brass">Runs locally, ships nothing.</span> This workspace is thrown away when the mission is done. Talk&apos;s agents can build, run and edit config here. Octopush refuses the git pushes, pull requests, publishes, image pushes and cluster changes their commands ask for. It reads the commands, so ssh, scp, rsync, deploy CLIs and a script that pushes on its own aren&apos;t caught yet. Crews don&apos;t run in this mission.
                         </div>
                       ) : fromPr ? (
                         <div className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage">

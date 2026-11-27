@@ -271,8 +271,69 @@ pub fn remote_effect_local(command: &str) -> Option<&'static str> {
 }
 
 fn remote_walk(command: &str, loopback_ok: bool) -> Option<&'static str> {
+    // Something anywhere in the command that can reroute a request (a proxy
+    // variable for `bash -c '…'`, a config file) means no request is local.
+    let loopback_ok = loopback_ok && !matches!(crate::chat_engine::each_command(command, |l| reroutes(l).then_some(())), Ok(Some(())));
     crate::chat_engine::each_command(command, |line| remote_line(line, loopback_ok))
         .unwrap_or(Some("nests more commands than the check reads"))
+}
+
+/// Builtins that set variables for what runs after them, or read them from a file.
+const SETS_VARIABLES: &[&str] = &["export", "declare", "typeset", "local", "readonly", "source", "."];
+/// Config files of curl, wget and httpie, which can name a proxy or another host.
+const HTTP_CONFIG: &[&str] = &["curlrc", "wgetrc", ".httpie", "httpie/config"];
+
+/// Whether a line sets a variable or reads a config file that can send a
+/// request somewhere other than its URL (`http_proxy`, `ALL_PROXY`,
+/// `CURL_HOME`, `WGETRC`, `HOME`…): any assignment before a program or after
+/// a wrapper (`X=1 curl`, `env X=1 curl`, `sudo X=1 curl`), `export` and
+/// its kin, sourcing a file, or naming a curl, wget or httpie config file.
+/// Stricter than it needs to be on purpose: such a line gets no loopback
+/// carve-out at all.
+fn reroutes(line: &str) -> bool {
+    let assigns = |w: &str| {
+        w.split_once('=').is_some_and(|(n, _)| {
+            n.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()) && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+        })
+    };
+    let (mut segment, mut program): (Option<usize>, Option<String>) = (None, None);
+    for w in crate::chat_engine::command_words(line) {
+        if segment != Some(w.segment) {
+            (segment, program) = (Some(w.segment), None);
+        }
+        let current = program.clone();
+        let lower = w.word.to_ascii_lowercase();
+        if HTTP_CONFIG.iter().any(|c| lower.contains(c)) {
+            return true;
+        }
+        if w.redirect || w.role == crate::chat_engine::WordRole::Data {
+            continue;
+        }
+        match current.as_deref() {
+            // `X=1 curl`: before the program.
+            None if w.role != crate::chat_engine::WordRole::Program && assigns(w.word.as_str()) => return true,
+            None if w.role == crate::chat_engine::WordRole::Program => {
+                let name = self::program(&w.word);
+                if SETS_VARIABLES.contains(&name.as_str()) {
+                    return true;
+                }
+                program = Some(name);
+            }
+            // `env X=1 curl`, `sudo -u x X=1 curl`, `then X=1 curl`: the
+            // wrapper's words count until the program it runs.
+            Some(p) if WRAPPERS.contains(&p) => {
+                if assigns(w.word.as_str()) {
+                    return true;
+                }
+                let next = self::program(&w.word);
+                if remote_rule(&next).is_some() || WRAPPERS.contains(&next.as_str()) {
+                    program = Some(next);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Shell keywords and programs that run the command after them
@@ -334,6 +395,10 @@ struct HttpFlags {
     short_reroute: &'static str,
     long_valued: &'static [&'static str],
     long_reroute: &'static [&'static str],
+    /// The long flags that take no value. When set, a long flag in none of
+    /// these lists is never local: httpie and xh accept abbreviations
+    /// (`--prox` for `--proxy`), so a flag the check doesn't know could be one.
+    long_known: Option<&'static [&'static str]>,
 }
 
 const CURL_FLAGS: HttpFlags = HttpFlags {
@@ -349,6 +414,7 @@ const CURL_FLAGS: HttpFlags = HttpFlags {
         "--config", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5", "--socks5-hostname", "--resolve",
         "--connect-to", "--doh-url", "--dns-servers",
     ],
+    long_known: None,
 };
 
 const WGET_FLAGS: HttpFlags = HttpFlags {
@@ -359,6 +425,7 @@ const WGET_FLAGS: HttpFlags = HttpFlags {
         "--header", "--user", "--password", "--user-agent", "--referer", "--timeout", "--tries",
     ],
     long_reroute: &["--config", "--execute", "--input-file", "--base"],
+    long_known: None,
 };
 
 const HTTPIE_FLAGS: HttpFlags = HttpFlags {
@@ -366,9 +433,16 @@ const HTTPIE_FLAGS: HttpFlags = HttpFlags {
     short_reroute: "",
     long_valued: &[
         "--auth", "--auth-type", "--output", "--print", "--pretty", "--style", "--session", "--session-read-only",
-        "--timeout", "--verify", "--cert", "--cert-key",
+        "--timeout", "--verify", "--cert", "--cert-key", "--max-redirects", "--history-print", "--format-options",
+        "--response-charset", "--response-mime", "--boundary", "--raw", "--bearer", "--default-scheme", "--http-version",
+        "--ssl",
     ],
-    long_reroute: &["--proxy"],
+    long_reroute: &["--proxy", "--resolve"],
+    long_known: Some(&[
+        "--json", "--form", "--multipart", "--verbose", "--headers", "--body", "--meta", "--follow", "--check-status",
+        "--ignore-stdin", "--offline", "--stream", "--download", "--continue", "--quiet", "--all", "--compress",
+        "--chunked", "--sorted", "--unsorted", "--ignore-netrc", "--debug", "--traceback", "--path-as-is",
+    ]),
 };
 
 const HTTPIE_METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -389,6 +463,9 @@ fn only_loopback(name: &str, args: &[&str]) -> bool {
         if a.starts_with("--") {
             let (flag, value) = a.split_once('=').map_or((a, None), |(f, v)| (f, Some(v)));
             if flags.long_reroute.contains(&flag) {
+                return false;
+            }
+            if flags.long_known.is_some_and(|k| !k.contains(&flag) && !flags.long_valued.contains(&flag) && flag != "--") {
                 return false;
             }
             if flag == "--url" && !httpie {
@@ -453,6 +530,9 @@ fn remote_rule(program: &str) -> Option<RemoteRule> {
     let rule: RemoteRule = match program {
         "git" => git_remote,
         "gh" => gh_remote,
+        "glab" => glab_remote,
+        "mvn" | "mvnw" => maven_remote,
+        "gradle" | "gradlew" => gradle_remote,
         "hub" => hub_remote,
         "curl" => curl_remote,
         "wget" => wget_remote,
@@ -460,7 +540,7 @@ fn remote_rule(program: &str) -> Option<RemoteRule> {
         "npm" | "pnpm" | "yarn" | "bun" | "npx" | "pnpx" | "bunx" | "cargo" | "pip" | "pip3" | "poetry" | "uv" | "uvx" | "twine"
         | "gem" => publish_remote,
         "python" | "python3" | "py" => python_remote,
-        "docker" | "podman" => docker_remote,
+        "docker" | "podman" | "docker-compose" | "podman-compose" => docker_remote,
         "kubectl" | "oc" | "helm" | "terraform" | "tofu" => deploy_remote,
         _ => return None,
     };
@@ -486,10 +566,20 @@ fn is_read_method(m: &str) -> bool {
 }
 
 fn git_remote(args: &[&str]) -> Option<&'static str> {
-    let ops = operands(args, &["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
-    match ops.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-        Some("push") => Some("git push"),
-        Some("send-email") => Some("git send-email"),
+    // An alias set on the command line can run any of these (`-c alias.p=push`).
+    let alias = args.windows(2).any(|w| matches!(w[0], "-c" | "--config-env") && w[1].to_ascii_lowercase().starts_with("alias."))
+        || args.iter().any(|a| a.to_ascii_lowercase().starts_with("--config-env=alias."));
+    if alias {
+        return Some("a git alias set on the command line");
+    }
+    let ops = operands(args, &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"]);
+    let op = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
+    match (op(0).as_deref(), op(1).as_deref()) {
+        (Some("push"), _) => Some("git push"),
+        (Some("send-email"), _) => Some("git send-email"),
+        (Some("send-pack"), _) => Some("git send-pack"),
+        (Some("subtree"), Some("push")) => Some("git subtree push"),
+        (Some("lfs"), Some("push")) => Some("git lfs push"),
         _ => None,
     }
 }
@@ -525,6 +615,44 @@ fn gh_remote(args: &[&str]) -> Option<&'static str> {
     let local = matches!(group.as_deref(), Some("alias" | "config" | "extension" | "ext" | "completion" | "auth" | "help"));
     let verb = ops.get(1).map(|s| s.to_ascii_lowercase());
     (!local && verb.is_some_and(|v| GH_WRITES.contains(&v.as_str()))).then_some("a gh command that changes GitHub")
+}
+
+/// `glab` verbs that change GitLab beyond `gh`'s (`glab mr approve`, `glab ci retry`).
+const GLAB_WRITES: &[&str] = &["approve", "revoke", "note", "update", "rebase", "retry", "trigger", "subscribe", "unsubscribe"];
+
+fn glab_remote(args: &[&str]) -> Option<&'static str> {
+    let ops = operands(args, &["-R", "--repo", "-g", "--group"]);
+    let group = ops.first().map(|s| s.to_ascii_lowercase());
+    if group.as_deref() == Some("api") {
+        return api_sends(args).then_some("glab api with a method other than GET");
+    }
+    let local = matches!(group.as_deref(), Some("alias" | "config" | "completion" | "auth" | "help" | "check-update" | "version"));
+    let verb = ops.get(1).map(|s| s.to_ascii_lowercase());
+    let writes = verb.is_some_and(|v| GH_WRITES.contains(&v.as_str()) || GLAB_WRITES.contains(&v.as_str()));
+    (!local && writes).then_some("a glab command that changes GitLab")
+}
+
+/// Maven goals that deploy or release (`mvn deploy`, `mvn release:perform`, `mvn jib:build`).
+fn maven_remote(args: &[&str]) -> Option<&'static str> {
+    let ops = operands(args, &["-f", "--file", "-s", "--settings", "-P", "--activate-profiles", "-pl", "--projects"]);
+    ops.iter()
+        .any(|o| {
+            let o = o.to_ascii_lowercase();
+            o == "deploy" || o.starts_with("deploy:") || matches!(o.as_str(), "site-deploy" | "release:prepare" | "release:perform" | "jib:build")
+        })
+        .then_some("a Maven goal that deploys or releases")
+}
+
+/// Gradle tasks that publish (`gradle publish`, `:lib:publishAllPublicationsToX`)
+/// or push an image (`jib`), but not `publishToMavenLocal`.
+fn gradle_remote(args: &[&str]) -> Option<&'static str> {
+    let ops = operands(args, &["-p", "--project-dir", "-b", "--build-file", "-x", "--exclude-task"]);
+    ops.iter()
+        .any(|o| {
+            let task = o.rsplit(':').next().unwrap_or(o).to_ascii_lowercase();
+            (task.starts_with("publish") && task != "publishtomavenlocal") || task == "jib"
+        })
+        .then_some("a Gradle task that publishes")
 }
 
 /// `hub` wraps git and adds GitHub commands of its own.
@@ -617,7 +745,9 @@ fn publish_remote(args: &[&str]) -> Option<&'static str> {
         };
         matches!(o.as_str(), "publish" | "unpublish" | "deprecate" | "yank" | "owner" | "upload" | "push") || RELEASERS.contains(&name)
     };
-    ops.iter().any(publishes).then_some("publishes a package or a release")
+    // `cargo release` (the cargo-release plugin) tags, pushes and publishes.
+    let cargo_release = ops.first().is_some_and(|o| o.eq_ignore_ascii_case("release"));
+    (ops.iter().any(publishes) || cargo_release).then_some("publishes a package or a release")
 }
 
 /// `python -m <module>` runs the module as the program (`python -m twine upload`).
@@ -1091,6 +1221,89 @@ mod tests {
         ];
         for command in remote {
             assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+    }
+
+    /// A variable or config file that can reroute a request takes the
+    /// loopback carve-out away, wherever it sits on the line (#1239 review).
+    #[test]
+    fn a_request_something_can_reroute_is_never_local() {
+        let rerouted = [
+            "http_proxy=http://proxy.example.com curl -X POST http://localhost/x",
+            "HTTPS_PROXY=http://proxy.example.com curl -X POST https://localhost/x",
+            "ALL_PROXY=socks5://proxy.example.com curl -X POST http://localhost/x",
+            "env all_proxy=socks5://proxy.example.com curl -X POST http://localhost/x",
+            "sudo -u ci http_proxy=http://proxy.example.com curl -X POST http://localhost/x",
+            "export http_proxy=http://proxy.example.com; curl -X POST http://localhost/x",
+            "declare -x HTTPS_PROXY=http://proxy.example.com && curl -X POST https://localhost/x",
+            "http_proxy=http://proxy.example.com bash -c 'curl -X POST http://localhost/x'",
+            "bash -c 'export http_proxy=http://proxy.example.com; curl -X POST http://localhost/x'",
+            "CURL_HOME=. curl -X POST http://localhost/x",
+            "HOME=/tmp/rc curl -X POST http://localhost/x",
+            "XDG_CONFIG_HOME=/tmp/rc curl -X POST http://localhost/x",
+            "WGETRC=./rc wget --post-data=a=1 http://localhost/x",
+            "source .env && curl -X POST http://localhost/x",
+            ". ./proxy.sh; curl -X POST http://localhost/x",
+            "echo 'proxy = proxy.example.com' > .curlrc && curl -X POST http://localhost/x",
+            "curl -K ./req.cfg -X POST http://localhost/x",
+            "curl --config=./req.cfg -X POST http://localhost/x",
+            "if true; then http_proxy=http://proxy.example.com curl -X POST http://localhost/x; fi",
+            "HTTPIE_CONFIG_DIR=./h http POST localhost:3000/x a=b",
+        ];
+        for command in rerouted {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        // xh and httpie: `--resolve` anywhere, and a long flag the check
+        // doesn't know (an abbreviation could be `--proxy`), are never local.
+        for command in [
+            "xh --resolve localhost:203.0.113.5 POST localhost/x a=b",
+            "xh POST localhost/x a=b --resolve=localhost:203.0.113.5",
+            "http --prox http:http://proxy.example.com POST localhost/x a=b",
+            "http POST localhost/x a=b --some-new-flag",
+        ] {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        // What a local test needs still runs.
+        for command in [
+            "curl -X POST -d a=1 http://localhost:3000/x",
+            "sudo curl -X POST -d a=1 http://localhost/x",
+            "http --json --follow POST localhost:3000/items name=x",
+            "cd app && npm ci && curl -X POST http://127.0.0.1:3000/api/x",
+        ] {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+    }
+
+    /// More pushing, publishing and deploying tools, for Plan only and a
+    /// mission that ships nothing alike.
+    #[test]
+    fn more_tools_that_ship_are_remote() {
+        let refused = [
+            ("a glab command that changes GitLab", "glab mr create --fill"),
+            ("a glab command that changes GitLab", "glab mr approve 12"),
+            ("a glab command that changes GitLab", "glab mr note 12 -m hi"),
+            ("a glab command that changes GitLab", "glab release create v1.0"),
+            ("a glab command that changes GitLab", "glab ci retry 99"),
+            ("glab api with a method other than GET", "glab api -X POST projects/1/issues"),
+            ("git subtree push", "git subtree push --prefix=lib origin main"),
+            ("git lfs push", "git lfs push origin main"),
+            ("git send-pack", "git send-pack origin main"),
+            ("a git alias set on the command line", "git -c alias.p=push p origin main"),
+            ("a git alias set on the command line", "git --config-env=alias.p=PUSH p"),
+            ("a Maven goal that deploys or releases", "mvn -B clean deploy"),
+            ("a Maven goal that deploys or releases", "./mvnw release:perform"),
+            ("a Gradle task that publishes", "./gradlew publish"),
+            ("a Gradle task that publishes", "gradle :lib:publishAllPublicationsToMavenRepository"),
+            ("docker push", "docker-compose push web"),
+            ("docker push", "docker compose push"),
+            ("publishes a package or a release", "cargo release minor --execute"),
+        ];
+        for (why, command) in refused {
+            assert_eq!(remote_effect(command), Some(why), "{command}");
+            assert_eq!(remote_effect_local(command), Some(why), "{command}");
+        }
+        for command in ["glab mr list", "glab mr view 12", "glab api projects/1", "git subtree split --prefix=lib", "git lfs pull", "mvn -B verify", "./gradlew build publishToMavenLocal", "gradle build -x publish", "docker compose up -d", "cargo build --release"] {
+            assert_eq!(remote_effect(command), None, "{command}");
         }
     }
 

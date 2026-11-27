@@ -62,6 +62,13 @@ pub fn ships_nothing(intent: &str, git_isolation: &str) -> bool {
     !delivers(intent) && git_isolation != "readonly"
 }
 
+/// Whether moving a mission from one pair of axes to another loosens it. A
+/// mission's posture only gets stricter: a read-only one stays read-only
+/// (#1235), and one that ships nothing never becomes one that delivers.
+pub fn loosens(intent: &str, git_isolation: &str, to_intent: &str, to_git_isolation: &str) -> bool {
+    (git_isolation == "readonly" && to_git_isolation != "readonly") || (ships_nothing(intent, git_isolation) && delivers(to_intent))
+}
+
 fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResult<()> {
     if !INTENTS.contains(&intent) {
         return Err(AppError::Other(format!("unknown mission intent '{intent}'")));
@@ -152,6 +159,15 @@ pub fn ensure_for_workspace(
         // intent/isolation updates the mission in place, so the picked values
         // are never silently discarded. Idempotent when nothing changed.
         if existing.intent != intent || existing.git_isolation != git_isolation {
+            // Every re-pair comes through here (the app's wizard and the MCP
+            // binary's `create_workspace`), so none can lift a posture.
+            if loosens(&existing.intent, &existing.git_isolation, intent, git_isolation) {
+                return Err(AppError::Other(format!(
+                    "this workspace's mission is '{}' on '{}', and a mission can only get stricter, so it can't \
+                     become '{intent}' on '{git_isolation}'. Start that mission on a branch of its own.",
+                    existing.intent, existing.git_isolation
+                )));
+            }
             db.update_mission_axes(&existing.id, intent, git_isolation)?;
             return Ok(db.get_mission(&existing.id)?.unwrap_or(existing));
         }
@@ -209,5 +225,49 @@ mod tests {
         let m = db.get_mission("m1").unwrap().expect("the old row loads");
         assert!(ships_nothing(&m.intent, &m.git_isolation));
         assert!(create(&db, "p1", "review", "New review", "worktree", "none", None, None).is_err(), "a new one is refused");
+    }
+
+    /// Re-pairing a workspace's mission only ever makes it stricter, on the
+    /// one path the app's wizard and `octopush-mcp`'s `create_workspace` share.
+    #[test]
+    fn a_re_pair_never_loosens_a_mission() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.insert_project("p1", "P", "/tmp/octo-mission-repair").unwrap();
+        let refused = [
+            (("review", "readonly"), ("build", "worktree")),
+            (("probe", "readonly"), ("test", "ephemeral")),
+            (("perf", "readonly"), ("fix", "pr")),
+            (("test", "ephemeral"), ("build", "worktree")),
+            (("test", "ephemeral"), ("fix", "ephemeral")),
+            (("review", "worktree"), ("build", "worktree")),
+        ];
+        let allowed = [
+            (("build", "worktree"), ("fix", "worktree")),
+            (("build", "worktree"), ("test", "ephemeral")),
+            (("test", "ephemeral"), ("review", "readonly")),
+            (("test", "ephemeral"), ("review", "ephemeral")),
+        ];
+        for (i, ((from_i, from_g), (to_i, to_g))) in refused.iter().chain(allowed.iter()).enumerate() {
+            let ws = format!("w{i}");
+            db.insert_workspace(&ws, "p1", &ws, "t", &format!("b{i}"), None, "", None).unwrap();
+            db.insert_mission(&format!("m{i}"), Some(ws.as_str()), "p1", from_i, "t", "active", None, from_g, "none", "{}").unwrap();
+            let row = db.get_workspace(&ws).unwrap().unwrap();
+            let result = ensure_for_workspace(&db, &row, to_i, to_g);
+            let m = db.active_mission_for_workspace(&ws).unwrap().unwrap();
+            if i < refused.len() {
+                let err = result.expect_err(&format!("{from_i}/{from_g} → {to_i}/{to_g}")).to_string();
+                assert!(err.contains("can only get stricter"), "{err}");
+                assert_eq!((m.intent.as_str(), m.git_isolation.as_str()), (*from_i, *from_g), "the mission is untouched");
+            } else {
+                result.unwrap();
+                assert_eq!((m.intent.as_str(), m.git_isolation.as_str()), (*to_i, *to_g));
+            }
+        }
+        // A read-only mission stays sandboxed with no write roots.
+        let m = db.active_mission_for_workspace("w0").unwrap().unwrap();
+        assert_eq!(crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, "/ws"), Some(vec![]));
+        // The app's command pairs through the same function.
+        assert!(include_str!("commands.rs").contains("crate::mission::ensure_for_workspace(&db, &ws, intent, git_isolation)?;"));
     }
 }
