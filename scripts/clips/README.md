@@ -79,6 +79,7 @@ with `scenario:` (default: `default`).
 | `talk-mcp` | `default` with three MCP servers in the Companion's "can use" row: `docs-server` connected with 12 tools, `example-remote` failed to start, `issue-tracker` not started yet and off in the open conversation. Toggles last until the page reloads. |
 | `talk-outcomes` | `default` with a Talk thread whose calls end every way: a `cargo test` that fails (exit 101), the fix and a pass, a `git push --force` you denied, and a round of six calls (it folds) with a failed lint in it. |
 | `talk-approval` | `default` with a Talk turn parked on an approval card in the active workspace: the agent ran the tests and asks to force-push a rebased branch. The card comes back through `pending_approvals`, as after a reload, and waits until it is answered. |
+| `talk-mention-chats` | `default` with an older conversation in the active workspace ("Auth refactor": one ask and its answer, with a digest for `@chat:`) and a `parseToken` definition in `src/lib/tokens.ts` that a whole-word search finds, so Talk's `@` popover shows its Conversations and Definitions groups. |
 
 Adding one: create `scenarios/<name>.ts` exporting a `Scenario` (`types.ts`), register
 it in `scenarios/index.ts`, and run a recording with `--verbose` to see which commands

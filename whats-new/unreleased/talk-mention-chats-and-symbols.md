@@ -2,6 +2,7 @@
 title: "@ can name an earlier conversation or a definition"
 kind: feature
 area: app
+scenario: talk-mention-chats
 steps:
   - open: mode/talk
     target: talk-composer-input

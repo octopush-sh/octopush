@@ -276,6 +276,7 @@ cover.
 | `direct-running` | `default` with a crew at work in the active workspace: its Implement stage runs on Claude Code (the CLI substrate) with a context reading of 142k / 200k (`ctx 71%`), and no effort, escalation or ran-on note, so the run card shows the reading. |
 | `talk-work` | `default` with a longer Talk thread in the active workspace: an ask, narration and two rounds of tool calls (the second, six calls, folds into one summary row), a long answer with code and a list, then a short follow-up and its answer. Turn times are minutes before the page loads. |
 | `talk-mcp` | `default` with three MCP servers in the Companion's "can use" row: `docs-server` connected with 12 tools, `example-remote` failed to start, `issue-tracker` not started yet and off in the open conversation. Toggles last until the page reloads. |
+| `talk-mention-chats` | `default` with an older conversation in the active workspace ("Auth refactor": one ask and its answer, with a digest for `@chat:`) and a `parseToken` definition in `src/lib/tokens.ts` that a whole-word search finds, so Talk's `@` popover shows its Conversations and Definitions groups. |
 
 Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/clips/README.md).
 
