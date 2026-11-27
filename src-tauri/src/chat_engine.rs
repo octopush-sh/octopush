@@ -597,7 +597,127 @@ fn not_found_note(output: &str) -> String {
 /// level. A command word is matched by its basename (`/bin/rm`), with quotes
 /// dropped.
 pub(crate) fn dangerous_command(command: &str) -> Option<&'static str> {
+    // A line continued with `\` reads as the shell joins it (#1231): `rm -r\⏎f`
+    // is `rm -rf`. Where the join can't be followed, it asks.
+    if command.contains("\\\n") {
+        match bash_joined(command) {
+            Some(joined) => {
+                if let Some(reason) = each_command(&joined, dangerous_line).unwrap_or(Some(TOO_NESTED)) {
+                    return Some(reason);
+                }
+            }
+            None => return Some(UNFOLLOWED_CONTINUATION),
+        }
+    }
     each_command(command, dangerous_line).unwrap_or(Some(TOO_NESTED))
+}
+
+/// The reason when a command continues a line with `\` where the check
+/// can't follow the join (a here-document, a nested command or backticks in
+/// it).
+const UNFOLLOWED_CONTINUATION: &str = "continues a line with a backslash where the check can't follow it";
+
+/// `command` as bash reads it once each line continuation (`\` then a
+/// newline) is removed, or `None` where this can't be sure: bash removes it
+/// unquoted and in double quotes, keeps it in single quotes, in `$'…'` and
+/// in a comment. A here-document, a `$(…)`, `${…}` or backtick inside double
+/// quotes, or backticks anywhere change how quotes nest, so they give
+/// `None`, as does a quote left open. Pure.
+pub(crate) fn bash_joined(command: &str) -> Option<String> {
+    #[derive(PartialEq)]
+    enum At {
+        Plain,
+        Single,
+        AnsiC,
+        Double,
+        Comment,
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut at = At::Plain;
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        let next = chars.get(i + 1).copied();
+        match at {
+            At::Plain => match c {
+                '\\' if next == Some('\n') => {
+                    i += 2;
+                    continue;
+                }
+                '\\' => {
+                    out.push(c);
+                    out.extend(next);
+                    i += 2;
+                    continue;
+                }
+                '\'' => at = At::Single,
+                '$' if next == Some('\'') => {
+                    out.push_str("$'");
+                    at = At::AnsiC;
+                    i += 2;
+                    continue;
+                }
+                '"' => at = At::Double,
+                '`' => return None,
+                '<' if next == Some('<') => return None,
+                '#' if out.chars().last().is_none_or(|p| p.is_whitespace() || ";|&()<>".contains(p)) => at = At::Comment,
+                _ => {}
+            },
+            At::Single if c == '\'' => at = At::Plain,
+            At::AnsiC if c == '\\' => {
+                out.push(c);
+                out.extend(next);
+                i += 2;
+                continue;
+            }
+            At::AnsiC if c == '\'' => at = At::Plain,
+            At::Double => match c {
+                '\\' if next == Some('\n') => {
+                    i += 2;
+                    continue;
+                }
+                '\\' => {
+                    out.push(c);
+                    out.extend(next);
+                    i += 2;
+                    continue;
+                }
+                '"' => at = At::Plain,
+                '`' => return None,
+                '$' if matches!(next, Some('(' | '{')) => return None,
+                _ => {}
+            },
+            At::Comment if c == '\n' => at = At::Plain,
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    matches!(at, At::Plain | At::Comment).then_some(out)
+}
+
+/// What an agent command gets when it holds a control character the shell
+/// would take as a keystroke (#1231), or `None`. The command is typed into
+/// the shared shell's line editor, where `\r` ends the line and `\x15`
+/// erases it, so what would run isn't what every check read. Only a tab
+/// and a newline pass, in every mode. Pure.
+pub(crate) fn control_refusal(command: &str) -> Option<String> {
+    let c = command.chars().find(|&c| c.is_control() && c != '\t' && c != '\n')?;
+    let named = match c {
+        '\r' => " (carriage return)",
+        '\x1b' => " (escape)",
+        '\x03' => " (Ctrl-C)",
+        '\x04' => " (Ctrl-D)",
+        '\x15' => " (Ctrl-U)",
+        '\x7f' => " (delete)",
+        _ => "",
+    };
+    Some(format!(
+        "Not run: the command holds the control character U+{:04X}{named}, which the shell would take as a keystroke, \
+         so what ran wouldn't be what was checked. Nothing ran. Write the command without control characters; \
+         to produce one, use an escape such as printf '\\r'.",
+        c as u32
+    ))
 }
 
 /// How deep [`each_command`] follows commands nested in commands.
@@ -5400,8 +5520,13 @@ impl ChatEngine {
                 // inside the workspace: the shared shell may sit elsewhere
                 // after an earlier `cd`, in a repository whose config runs code.
                 let git_outside = !grants && !mode_denied && u.name == "run_command" && {
+                    // In the shared shell, where it now is: unknown until a
+                    // reattached shell reports it, which asks. Elsewhere, the root.
                     let shared = self.talk_shell.available() && exec_roots.is_none();
-                    let cwd = shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
+                    let cwd = match shared {
+                        true => self.talk_shell.cwd(&request.thread_id),
+                        false => Some(request.workspace_path.clone()),
+                    };
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))
                 };
@@ -5417,11 +5542,15 @@ impl ChatEngine {
                     crate::permissions::refused_before_card(&reach, &u.name, &u.input, exec_roots.as_deref())
                         .or_else(|| inside().then(|| crate::file_seen::refusal(&seen, &workspace_path, &u.name, &u.input)).flatten())
                 };
+                // A write outside a sandboxed mission is refused before any
+                // card in every mode.
                 let mut pre_refused = if held {
                     match crate::permissions::refused_before_card(&reach, &u.name, &u.input, exec_roots.as_deref()) {
                         None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,
                         other => other,
                     }
+                } else if denied.is_none() && skill_refusal.is_none() {
+                    crate::permissions::sandbox_refusal(&reach, &u.name, &u.input, exec_roots.as_deref())
                 } else {
                     None
                 };
@@ -7872,6 +8001,29 @@ mod tests {
         let fresh = ApprovalBroker::default();
         assert_eq!(fresh.record("u", ApprovalDecision::ApproveAlways, !CardKind::Write.grantable()), ApprovalDecision::Approve);
         assert!(!fresh.auto_approves("u"));
+    }
+
+    /// The command check reads a line continued with `\` as bash joins it
+    /// (#1231): unquoted and in double quotes, not in single quotes, `$'…'`
+    /// or a comment. Where the join can't be followed, it asks.
+    #[test]
+    fn the_command_check_follows_a_line_continuation() {
+        assert_eq!(dangerous_command("rm -r\\\nf /"), Some("recursive force delete (rm)"));
+        assert_eq!(dangerous_command("# c \\\nr\\\nm -rf /"), Some("recursive force delete (rm)"), "a comment ends at its newline");
+        assert_eq!(bash_joined("a\\\nb \"c\\\nd\" 'e\\\nf' $'g\\\nh' # i \\\nj").as_deref(), Some("ab \"cd\" 'e\\\nf' $'g\\\nh' # i \\\nj"));
+        for unsure in ["cat <<EOF\\\nx\nEOF", "echo \"$(echo ')')\"\\\nx", "echo `a`\\\nb", "echo 'open\\\n"] {
+            assert_eq!(bash_joined(unsure), None, "{unsure:?}");
+            assert_eq!(dangerous_command(unsure), Some(UNFOLLOWED_CONTINUATION), "{unsure:?}");
+        }
+        assert_eq!(dangerous_command("cargo build \\\n  --release"), None, "a plain continuation still passes");
+    }
+
+    /// A control character other than a tab or a newline is refused, named.
+    #[test]
+    fn a_control_character_names_itself() {
+        let why = control_refusal("echo hi\rtouch x").unwrap();
+        assert!(why.starts_with("Not run: the command holds the control character U+000D (carriage return)") && why.contains("Nothing ran."), "{why}");
+        assert_eq!(control_refusal("cargo test\t--all\nls"), None);
     }
 
     #[test]
