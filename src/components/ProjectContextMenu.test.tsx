@@ -181,7 +181,7 @@ describe("ProjectContextMenu", () => {
     container.remove();
   });
 
-  it("renders Set Jira project key item and calls onSetJiraProjectKey when clicked", () => {
+  it("renders the Issue tracking item and calls onSetJiraProjectKey when clicked", () => {
     const onSetJiraProjectKey = vi.fn();
     const onDismiss = vi.fn();
     render(
@@ -191,16 +191,16 @@ describe("ProjectContextMenu", () => {
         onDismiss={onDismiss}
       />,
     );
-    const item = screen.getByText(/Set Jira project key/);
+    const item = screen.getByText(/Issue tracking…/);
     expect(item).toBeInTheDocument();
     fireEvent.click(item);
     expect(onSetJiraProjectKey).toHaveBeenCalled();
     expect(onDismiss).toHaveBeenCalled();
   });
 
-  it("does not render Set Jira project key item when prop is not provided", () => {
+  it("does not render the Issue tracking item when prop is not provided", () => {
     render(<ProjectContextMenu {...baseProps} />);
-    expect(screen.queryByText(/Set Jira project key/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Issue tracking…/)).not.toBeInTheDocument();
   });
 
   it("offers New mission group only when wired, runs it and dismisses", () => {
