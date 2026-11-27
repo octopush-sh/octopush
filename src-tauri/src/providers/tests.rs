@@ -1669,6 +1669,8 @@ mod cancellable {
         PartThenSilence,
         /// Sends the head and part of the body, then closes the connection.
         PartThenClose,
+        /// Sends this whole response (status line, headers, body) and closes.
+        Whole(&'static str),
     }
 
     /// A local test server, and the address to resolve a REMOTE-looking host
@@ -1689,6 +1691,16 @@ mod cancellable {
                             Ok(0) | Err(_) => return,
                             Ok(n) => seen.extend_from_slice(&buf[..n]),
                         }
+                    }
+                    if let Reply::Whole(response) = reply {
+                        let _ = sock.write_all(response.as_bytes()).await;
+                        let _ = sock.shutdown().await;
+                        // Read the rest of the request until the client hangs
+                        // up, so closing with unread bytes can't reset the
+                        // answer away.
+                        let drain = async { while matches!(sock.read(&mut buf).await, Ok(n) if n > 0) {} };
+                        let _ = tokio::time::timeout(Duration::from_secs(2), drain).await;
+                        return;
                     }
                     if !matches!(reply, Reply::Nothing) {
                         let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4000\r\n\r\n{\"content\":[{\"type\":\"text\",";
@@ -1744,16 +1756,102 @@ mod cancellable {
     }
 
     #[tokio::test]
-    async fn an_answer_cut_off_mid_body_is_not_a_json_error_and_is_final() {
-        for (reply, how) in [(Reply::PartThenClose, "was lost"), (Reply::PartThenSilence, "went silent")] {
-            let addr = test_server(reply).await;
-            let err = send(&remote_client(addr), &format!("http://llm.test:{}", addr.port())).await;
-            let text = err.to_string();
-            assert!(!text.contains("JSON parse error"), "{text}");
-            assert!(text.contains(&format!("the connection {how} while the answer was arriving")), "{text}");
-            assert!(text.contains("It was not retried"), "{text}");
-            assert_eq!(err.transient_retry(), None, "{text}");
-        }
+    async fn an_answer_that_went_silent_mid_body_is_not_a_json_error_and_is_final() {
+        let addr = test_server(Reply::PartThenSilence).await;
+        let err = send(&remote_client(addr), &format!("http://llm.test:{}", addr.port())).await;
+        let text = err.to_string();
+        assert!(!text.contains("JSON parse error"), "{text}");
+        assert!(text.contains("the connection went silent while the answer was arriving"), "{text}");
+        assert!(text.contains("It was not retried"), "{text}");
+        assert_eq!(err.transient_retry(), None, "{text}");
+    }
+
+    #[tokio::test]
+    async fn body_read_error_is_transient() {
+        // A 200 whose connection resets mid-body: the answer is gone, so the
+        // request is sent again, as a network error.
+        let addr = test_server(Reply::PartThenClose).await;
+        let err = send(&remote_client(addr), &format!("http://llm.test:{}", addr.port())).await;
+        let text = err.to_string();
+        assert!(!text.contains("JSON parse error"), "{text}");
+        assert!(text.contains("the connection was lost while the answer was arriving"), "{text}");
+        assert!(!text.contains("It was not retried"), "{text}");
+        assert_eq!(err.transient_retry().map(|(k, _)| k), Some(ProviderErrorKind::Network), "{text}");
+    }
+
+    /// The director's call against a server that answers every request
+    /// with `response`, and how many requests it made.
+    async fn call_answered_with(response: &'static str) -> (Completion, Retries) {
+        let addr = test_server(Reply::Whole(response)).await;
+        let (client, base) = (remote_client(addr), format!("http://llm.test:{}", addr.port()));
+        let cancel = AtomicBool::new(false);
+        tokio::time::timeout(Duration::from_secs(5), call(&AnthropicProvider, &client, &base, &cancel, DEFAULT_MAX_RETRIES))
+            .await
+            .expect("a final error returns at once, with no backoff")
+    }
+
+    #[tokio::test]
+    async fn should_retry_false_is_not_retried() {
+        let (out, retries) = call_answered_with(
+            "HTTP/1.1 529 Site Overloaded\r\nx-should-retry: false\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await;
+        assert!(retries.lock().unwrap().is_empty(), "no wait announced");
+        let error = match out {
+            Completion::Failed { error, retries: 0 } => error,
+            other => panic!("expected a failure with no retry, got {other:?}"),
+        };
+        assert_eq!(error.provider_kind(), ProviderErrorKind::Other, "{error}");
+        assert!(error.to_string().starts_with("Anthropic API error 529"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn spend_cap_429_without_retry_after_fails_fast() {
+        let (out, retries) = call_answered_with(concat!(
+            // No Content-Length: the body runs to the close.
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"You have reached your specified API usage limits. You will regain access on 2026-12-01."}}"#,
+        ))
+        .await;
+        assert!(retries.lock().unwrap().is_empty(), "a cap no wait can lift is not retried");
+        let error = match out {
+            Completion::Failed { error, retries: 0 } => error,
+            other => panic!("expected a failure with no retry, got {other:?}"),
+        };
+        assert_eq!(error.provider_kind(), ProviderErrorKind::SpendCap, "{error}");
+        assert!(error.to_string().contains("usage limits"), "the provider's words stay: {error}");
+    }
+
+    #[test]
+    fn statuses_are_classified_with_what_the_provider_says_about_retrying() {
+        use super::super::classify_status;
+        use ProviderErrorKind::*;
+        let capped = r#"{"error":{"type":"rate_limit_error","message":"You have reached your specified API usage limits."}}"#;
+        let quota = r#"{"error":{"message":"You exceeded your current quota.","type":"insufficient_quota"}}"#;
+        assert_eq!(classify_status(429, None, None, capped), SpendCap);
+        assert_eq!(classify_status(429, None, None, quota), SpendCap);
+        // A per-minute limit stays a rate limit: it has a retry-after, or
+        // its body names no cap.
+        assert_eq!(classify_status(429, Some(20), None, capped), RateLimit);
+        assert_eq!(classify_status(429, None, None, r#"{"error":{"message":"Number of request tokens has exceeded your per-minute rate limit"}}"#), RateLimit);
+        // The provider's own word.
+        assert_eq!(classify_status(529, None, Some(false), "{}"), Other);
+        assert_eq!(classify_status(500, None, Some(false), "{}"), Other);
+        assert_eq!(classify_status(529, None, Some(true), "{}"), Overloaded);
+        assert_eq!(classify_status(401, None, Some(true), "{}"), Auth);
+    }
+
+    #[test]
+    fn should_retry_header_is_read_as_a_boolean() {
+        use super::super::parse_should_retry;
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_should_retry(&headers), None);
+        headers.insert("x-should-retry", " False ".parse().unwrap());
+        assert_eq!(parse_should_retry(&headers), Some(false));
+        headers.insert("x-should-retry", "true".parse().unwrap());
+        assert_eq!(parse_should_retry(&headers), Some(true));
+        headers.insert("x-should-retry", "maybe".parse().unwrap());
+        assert_eq!(parse_should_retry(&headers), None);
     }
 
     /// A port nothing listens on.

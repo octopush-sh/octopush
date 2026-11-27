@@ -371,6 +371,8 @@ pub struct ChatRequest {
     pub attachments: Vec<Attachment>,
     /// Regenerate: the prior turn was already truncated and history ends with the
     /// user message, so DON'T insert a new user row — just re-run the loop.
+    /// Also the error card's "Try again", which truncates nothing: the failed
+    /// turn continues from the thread as it is.
     #[serde(default)]
     pub regenerate: bool,
     /// Per-turn budget override: when true, the backend budget gate is skipped
@@ -2033,6 +2035,9 @@ pub struct MessageAddedEvent {
     pub cache_read_tokens: Option<i64>,
     pub cache_creation_tokens: Option<i64>,
     pub context_tokens: Option<i64>,
+    /// How an `error` row's turn failed (`ProviderErrorKind::as_str`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
 }
 
 /// Emitted when a persisted message's content changes in place — a
@@ -3467,10 +3472,11 @@ impl ChatEngine {
     }
 
     /// End a turn on a provider failure: persist it as the turn's `error`
-    /// row and hand back the error the command rejects with. Both carry the
-    /// same text, so the frontend shows one card. After retries ran out, the
-    /// text says so and how to go on (`final_failure_text`); the thread is
-    /// untouched and takes the next message as usual.
+    /// row, with its kind (which picks the error card's action), and hand
+    /// back the error the command rejects with. Both carry the same text, so
+    /// the frontend shows one card. After retries ran out, the text says so
+    /// and how to go on (`final_failure_text`); the thread is untouched and
+    /// takes the next message, or the card's "Try again", as usual.
     fn fail_turn(&self, app: &AppHandle, workspace_id: &str, thread_id: &str, error: AppError, retries: u32) -> AppError {
         let error = match error.transient_retry() {
             Some((kind, retry_after)) if retries > 0 => {
@@ -3478,13 +3484,14 @@ impl ChatEngine {
             }
             _ => error,
         };
-        if let Err(persist_err) = self.insert_and_emit_message(
+        if let Err(persist_err) = self.insert_and_emit_row(
             app,
             workspace_id,
             thread_id,
             "error",
             &error.to_string(),
             None, None, None, None,
+            Some(error.provider_kind().as_str()),
         ) {
             tracing::error!(error = %persist_err, "failed to persist error message");
         }
@@ -3602,6 +3609,7 @@ impl ChatEngine {
             cache_read_tokens: Some(usage.cache_read as i64),
             cache_creation_tokens: Some(usage.cache_creation as i64),
             context_tokens: Some(usage.last_context as i64),
+            error_kind: None,
         });
         Ok(id)
     }
@@ -3621,10 +3629,38 @@ impl ChatEngine {
         output_tokens: Option<i64>,
         cost_usd: Option<f64>,
     ) -> AppResult<i64> {
+        self.insert_and_emit_row(app, workspace_id, thread_id, role, content, model, input_tokens, output_tokens, cost_usd, None)
+    }
+
+    /// [`Self::insert_and_emit_message`], with an `error` row's kind kept
+    /// on the row and in the event.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_and_emit_row(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        role: &str,
+        content: &str,
+        model: Option<&str>,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        cost_usd: Option<f64>,
+        error_kind: Option<&str>,
+    ) -> AppResult<i64> {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        let id = self.db.lock().insert_chat_message(
-            workspace_id, thread_id, role, content, model, input_tokens, output_tokens, cost_usd,
-        )?;
+        let id = {
+            let db = self.db.lock();
+            let id = db.insert_chat_message(
+                workspace_id, thread_id, role, content, model, input_tokens, output_tokens, cost_usd,
+            )?;
+            if let Some(kind) = error_kind {
+                if let Err(e) = db.set_chat_error_kind(id, kind) {
+                    tracing::warn!(error = %e, "failed to keep the error row's kind");
+                }
+            }
+            id
+        };
         let _ = app.emit("chat://message-added", &MessageAddedEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
@@ -3639,6 +3675,7 @@ impl ChatEngine {
             cache_read_tokens: None,
             cache_creation_tokens: None,
             context_tokens: None,
+            error_kind: error_kind.map(str::to_string),
         });
         Ok(id)
     }
@@ -4060,6 +4097,7 @@ impl ChatEngine {
                         cache_read_tokens: None,
                         cache_creation_tokens: None,
                         context_tokens: None,
+                        error_kind: None,
                     });
                 }
             })
@@ -4155,6 +4193,9 @@ impl ChatEngine {
         // Persist user message and emit message-added so the frontend learns the
         // DB id. Skipped on regenerate: history already ends with the user turn
         // (the old assistant turn was truncated), so we just re-run the loop.
+        // The error card's "Try again" sends the same flag with nothing
+        // truncated: the failed turn continues from its rows, its rounds
+        // riding on its ask (`build_history`), with no second ask.
         if !request.regenerate {
             let id = self.insert_and_emit_message(
                 &app,

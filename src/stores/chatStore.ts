@@ -331,6 +331,8 @@ export interface MessageAddedEvent {
   cacheReadTokens?: number | null;
   cacheCreationTokens?: number | null;
   contextTokens?: number | null;
+  /** How an `error` row's turn failed. */
+  errorKind?: string | null;
 }
 
 /** A persisted row's content changed in place (a sub-agent's report after a
@@ -641,6 +643,11 @@ interface ChatState {
     assistantMessageId: number,
     systemPrompt?: string,
   ) => Promise<void>;
+  /** The error card's "Try again": continue the active thread's failed turn
+   *  from its rows as they are. Nothing is truncated and no user row is
+   *  added (the backend's `regenerate` path); the failed turn's rounds ride
+   *  on its ask. */
+  continueTurn: (workspaceId: string, workspacePath: string) => Promise<void>;
   /** Edit a user message and resend: truncate from it, then dispatch the new
    *  text as a fresh turn (with its `@` blocks' spans, when it has any). */
   editAndResend: (
@@ -908,6 +915,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         cacheCreationTokens: payload.cacheCreationTokens ?? null,
         contextTokens: payload.contextTokens ?? null,
       };
+      if (payload.errorKind) newMessage.errorKind = payload.errorKind;
       const sent = payload.threadId ? pendingContext.get(payload.threadId) : undefined;
       if (payload.role === "user" && sent && sent.content === payload.content) {
         newMessage.contextBlocks = sent.contextBlocks;
@@ -1623,6 +1631,24 @@ export const useChatStore = create<ChatState>((set, get) => {
         userMessage: "",
         systemPrompt,
         regenerate: true,
+      });
+    },
+
+    continueTurn: async (workspaceId, workspacePath) => {
+      const threadId = get().activeThreadByWs[workspaceId];
+      if (!threadId) return;
+      // A thread with no ask has no turn to continue (an empty history 400s).
+      const msgs = get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES;
+      if (!msgs.some((m) => m.role === "user")) return;
+      const gate = budgetGate(workspaceId);
+      if (gate.blocked) {
+        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG } }));
+        return;
+      }
+      await get().runTurn(workspaceId, workspacePath, threadId, {
+        userMessage: "",
+        regenerate: true,
+        overrideBudget: gate.overrode,
       });
     },
 

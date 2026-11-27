@@ -10,6 +10,16 @@ import { useTourStore } from "../../stores/tourStore";
 import type { ChatMessage as StoredMessage } from "../../lib/types";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
+import {
+  ACTION_LABEL,
+  bannerErrorKind,
+  errorAction,
+  errorHeadline,
+  errorKindOf,
+  keptLine,
+  roundsKept,
+  type TalkErrorKind,
+} from "../../lib/talkError";
 import { parseSentContext, typedText } from "../../lib/sentContext";
 import { expandDraft } from "../../lib/talkContextResolve";
 import { sessionRefs } from "../../lib/talkContext";
@@ -67,6 +77,7 @@ export function ChatCanvas({
   const skillNames = useChatStore((s) => s.getSkillNames(workspaceId));
   const respondSubagentCap = useChatStore((s) => s.respondSubagentCap);
   const regenerate = useChatStore((s) => s.regenerate);
+  const continueTurn = useChatStore((s) => s.continueTurn);
   const editAndResend = useChatStore((s) => s.editAndResend);
   const forkThread = useChatStore((s) => s.forkThread);
   const model = useChatStore((s) => s.model);
@@ -310,10 +321,17 @@ export function ChatCanvas({
               );
             }
             if (item.kind === "error") {
+              const at = messages.indexOf(item.message);
+              // Only the turn's latest word can be continued, and not while
+              // a turn runs.
+              const canRetry = at === messages.length - 1 && !streaming;
               return (
                 <ErrorBlock
                   key={`error-${item.message.id}`}
                   error={item.message.content}
+                  kind={errorKindOf(item.message.errorKind)}
+                  kept={keptLine(roundsKept(messages, at))}
+                  onRetry={canRetry ? () => void continueTurn(workspaceId, workspacePath) : null}
                   onConfigureApiKey={onOpenSettings ?? null}
                 />
               );
@@ -414,6 +432,9 @@ export function ChatCanvas({
           ) : error ? (
             <ErrorBlock
               error={error}
+              kind={bannerErrorKind(error)}
+              kept={null}
+              onRetry={null}
               onConfigureApiKey={
                 onOpenSettings
                   ? () => {
@@ -710,37 +731,58 @@ function EmptyState({ areaRef }: { areaRef: React.RefObject<HTMLDivElement | nul
   );
 }
 
+/** A turn that ended on an error: what failed, what of the turn is kept, and
+ *  one action for its kind (`lib/talkError`). An action that can't run here
+ *  ("Try again" on an earlier error, no settings to open) falls back to
+ *  copying the details. */
 function ErrorBlock({
   error,
+  kind,
+  kept,
+  onRetry,
   onConfigureApiKey,
 }: {
   error: string;
+  kind: TalkErrorKind;
+  /** What of the turn survives ("Work up to round 14 is kept."); null for
+   *  an error that was never part of a turn. */
+  kept: string | null;
+  onRetry: (() => void) | null;
   onConfigureApiKey: (() => void) | null;
 }) {
+  const { copied, copy } = useCopyFeedback();
+  const wanted = errorAction(kind);
+  const action =
+    (wanted === "retry" && !onRetry) || (wanted === "configure" && !onConfigureApiKey) ? "copy" : wanted;
+  const run = action === "retry" ? onRetry : action === "configure" ? onConfigureApiKey : () => copy(error);
+  const icon =
+    action === "retry" ? <RefreshCw size={11} /> : action === "configure" ? <Settings size={11} /> : copied ? <Check size={11} className="text-octo-verdigris" /> : <Copy size={11} />;
   return (
     <div
-      className="mx-auto max-w-lg rounded-md p-4"
+      data-error-kind={kind}
+      className="octo-fade-in mx-auto max-w-lg rounded-md p-4"
       style={{
         borderLeft: "1px solid var(--color-octo-rouge)",
-        background: "rgba(209, 139, 139, 0.08)",
+        background: "var(--rouge-ghost)",
       }}
     >
       <div className="flex items-start gap-2">
         <AlertTriangle size={14} className="mt-0.5 shrink-0 text-octo-rouge" />
         <div className="min-w-0 flex-1">
           <div className="font-serif text-[14px] text-octo-rouge">
-            Something went wrong.
+            {errorHeadline(kind)}
+            {kept && <span className="text-octo-ivory"> {kept}</span>}
           </div>
-          <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{error}</div>
-          {error.includes("API key") && onConfigureApiKey && (
-            <button
-              onClick={onConfigureApiKey}
-              className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage transition-colors hover:text-octo-brass"
-            >
-              <Settings size={11} />
-              Configure API key
-            </button>
-          )}
+          <div className="mt-1 break-words text-[12px] leading-[1.55] text-octo-sage">{error}</div>
+          <button
+            type="button"
+            data-tour="talk-error-action"
+            onClick={() => run?.()}
+            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          >
+            {icon}
+            {action === "copy" && copied ? "Copied" : ACTION_LABEL[action]}
+          </button>
         </div>
       </div>
     </div>
@@ -753,7 +795,7 @@ function BudgetErrorBlock({ onOverride }: { onOverride: () => void }) {
       className="mx-auto max-w-lg rounded-md p-4"
       style={{
         borderLeft: "1px solid var(--color-octo-rouge)",
-        background: "rgba(209, 139, 139, 0.08)",
+        background: "var(--rouge-ghost)",
       }}
     >
       <div className="flex items-start gap-2">

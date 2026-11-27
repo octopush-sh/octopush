@@ -1479,6 +1479,28 @@ mod workspace_tests {
         );
         let err_msg = messages.iter().find(|m| m.role == "error").unwrap();
         assert!(err_msg.content.contains("401 unauthorized"));
+        // A row from before the kind was kept reads as NULL (`other`).
+        assert_eq!(err_msg.error_kind, None);
+    }
+
+    #[test]
+    fn an_error_row_keeps_its_kind_and_only_an_error_row_takes_one() {
+        let db = test_db();
+        db.insert_project("proj-kind", "P", "/tmp/proj-kind").unwrap();
+        db.insert_workspace("ws-kind", "proj-kind", "ws", "", "main", None, "", None).unwrap();
+        let thread = db.create_chat_thread("ws-kind", "Conversation").unwrap();
+        let ask = db.insert_chat_message("ws-kind", &thread.id, "user", "hello", None, None, None, None).unwrap();
+        let err = db.insert_chat_message("ws-kind", &thread.id, "error", "Model overloaded", None, None, None, None).unwrap();
+        let kind = crate::error::ProviderErrorKind::Overloaded.as_str();
+        db.set_chat_error_kind(err, kind).unwrap();
+        db.set_chat_error_kind(ask, kind).unwrap();
+
+        let messages = db.list_chat_messages(&thread.id).unwrap();
+        assert_eq!(messages.iter().map(|m| m.error_kind.as_deref()).collect::<Vec<_>>(), vec![None, Some("overloaded")]);
+        assert_eq!(db.get_chat_message(err).unwrap().unwrap().error_kind.as_deref(), Some("overloaded"));
+        // The webview reads it as `errorKind`.
+        let json = serde_json::to_value(&messages[1]).unwrap();
+        assert_eq!(json["errorKind"], "overloaded");
     }
 }
 
