@@ -86,6 +86,20 @@ pub struct LlmRequest {
     /// Anthropic-only: the OpenAI-compatible provider caches automatically and
     /// ignores this (see `openai_compat::build_request`).
     pub cache: bool,
+    /// A stable key for the conversation this request continues (a Talk
+    /// thread's `prompt_cache_key`, [`prompt_cache_key`]), so OpenAI routes
+    /// its requests together and their shared prefix hits the cache. Sent
+    /// only to OpenAI's own API (`openai_compat`); `None` for one-shot calls.
+    pub cache_key: Option<String>,
+}
+
+/// The `prompt_cache_key` of a Talk thread: a hash of its id, so the key is
+/// stable for the thread's life and says nothing about it (never its title).
+pub fn prompt_cache_key(thread_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("octopush-talk:{thread_id}").as_bytes());
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("talk-{hex}")
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

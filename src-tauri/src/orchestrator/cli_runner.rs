@@ -1723,6 +1723,39 @@ pub fn turn_off_inner_sandbox(dialect: CliDialect, exec_isolation: &str, args: &
     true
 }
 
+/// The launch line's note on a Claude stage whose project turned skill shell
+/// commands off ([`disable_skill_shell`]).
+pub const SKILL_SHELL_OFF_LABEL: &str =
+    "skill shell commands off for this project: skills and commands load without running them";
+
+/// When the project turned on "Don't run skill shell commands in crews"
+/// (#1188), merge `"disableSkillShellExecution":true` into a Claude stage's
+/// `--settings` value (fresh or resumed argv), beside the guards. Claude Code
+/// then puts a fixed placeholder where each `` !`…` `` or ```` ```! ```` block
+/// of a skill or command would have run, for the repo's, the user's and
+/// plugin skills alike. A settings key, not a `PreSkillShellCommand` hook:
+/// before 2.1.332 a settings file naming that hook opens a dialog at start,
+/// which no one answers under `-p`. Call it after [`confine_reads_in_sandbox`],
+/// which replaces the value. Returns whether it did; Codex stages are left as
+/// they are. Pure.
+pub fn disable_skill_shell(dialect: CliDialect, off: bool, args: &mut [String]) -> bool {
+    if dialect != CliDialect::Claude || !off {
+        return false;
+    }
+    let Some(i) = args.iter().position(|a| a == "--settings").filter(|i| i + 1 < args.len()) else {
+        return false;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&args[i + 1]) else {
+        return false;
+    };
+    let Some(map) = v.as_object_mut() else {
+        return false;
+    };
+    map.insert("disableSkillShellExecution".to_string(), Value::Bool(true));
+    args[i + 1] = v.to_string();
+    true
+}
+
 /// The phrase Claude Code (≥ 2.1.328) puts in a sandboxed Bash command's
 /// refusal when its own sandbox couldn't start, matched case-insensitively.
 const INNER_SANDBOX_OFF_PHRASE: &str = "sandbox is off for the session";
@@ -3678,6 +3711,9 @@ impl CliRunner {
         // readonly mission's forced sandbox too) turns Claude Code's own Bash
         // sandbox off: it can't nest in the profile.
         let inner_sandbox_off = turn_off_inner_sandbox(dialect, &ctx.exec_isolation, &mut args);
+        // The project's "Don't run skill shell commands in crews"; the launch
+        // line records it in the run journal.
+        let skill_shell_off = disable_skill_shell(dialect, ctx.skill_shell_off, &mut args);
         // Claude Code meters its own spend: cap the stage at its share of the
         // run's remaining budget so one long stage can't run far past it (the
         // API substrate stops at the same headroom in `run_agentic_loop`).
@@ -3873,7 +3909,7 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}{}{}{}{}{}",
+            "launching {} · {}{}{}{}{}{}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
@@ -3883,6 +3919,7 @@ impl CliRunner {
                 .map(|s| format!(" · {s}"))
                 .unwrap_or_default(),
             if inner_sandbox_off { format!(" · {INNER_SANDBOX_OFF_LABEL}") } else { String::new() },
+            if skill_shell_off { format!(" · {SKILL_SHELL_OFF_LABEL}") } else { String::new() },
             if resuming { " · resuming session" } else { "" },
             crate::orchestrator::sandbox::left_out_label(&left_out).map(|s| format!(" · {s}")).unwrap_or_default(),
             dialect.version_label(codex_version.as_deref()).map(|s| format!(" · {s}")).unwrap_or_default(),
