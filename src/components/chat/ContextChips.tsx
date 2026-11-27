@@ -1,4 +1,4 @@
-import { FileText, Folder, GitCompare, SquareTerminal, X } from "lucide-react";
+import { FileText, Folder, GitCompare, MessagesSquare, SquareTerminal, X } from "lucide-react";
 import { formatTokenCount } from "../../lib/cost";
 import { tourId } from "../../lib/tour/ids";
 import { MAX_MENTIONS, chipLabel, quoteToken, type ContextRef } from "../../lib/talkContext";
@@ -12,19 +12,26 @@ interface Props {
   over?: number;
 }
 
-export const ICON = { file: FileText, folder: Folder, session: SquareTerminal, diff: GitCompare } as const;
+export const ICON = {
+  file: FileText,
+  folder: Folder,
+  session: SquareTerminal,
+  diff: GitCompare,
+  chat: MessagesSquare,
+} as const;
 
 export const WHAT = {
   file: "File",
   folder: "Folder listing",
   session: "Run session output",
   diff: "Diff",
+  chat: "Earlier conversation",
 } as const;
 
 /**
  * The context riding with this draft (#962): one chip per `@` token that
  * resolved — a file or line range, a folder listing, a Run session's output,
- * the diff — with its token estimate. The chips mirror the text: removing
+ * the diff, an earlier conversation (titled) — with its token estimate. The chips mirror the text: removing
  * one removes its token from the draft. Past MAX_MENTIONS (#1046) a quiet
  * line says how many go as plain text. Renders nothing when empty.
  */

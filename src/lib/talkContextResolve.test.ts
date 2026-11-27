@@ -7,15 +7,16 @@ const getGitDiff = vi.fn();
 const getStagedDiff = vi.fn();
 const secretScanText = vi.fn();
 const listWorkspaceFiles = vi.fn();
+const chatThreadDigest = vi.fn();
 vi.mock("./ipc", () => ({
-  ipc: { readFileChecked, readFileLines, fileMeta, getGitDiff, getStagedDiff, secretScanText, listWorkspaceFiles },
+  ipc: { readFileChecked, readFileLines, fileMeta, getGitDiff, getStagedDiff, secretScanText, listWorkspaceFiles, chatThreadDigest },
 }));
 
 const { expandDraft, joinBlocks, resolveContextBlock, resolveContextBlocks, scanContextBlocks, withContext } =
   await import("./talkContextResolve");
 const { blockBody, parseSentContext, typedText } = await import("./sentContext");
 const { registerTerminalBuffer } = await import("./terminalBuffers");
-const { dirsOf, extractContextRefs, sessionRefs } = await import("./talkContext");
+const { chatRefs, dirsOf, extractContextRefs, sessionRefs } = await import("./talkContext");
 
 const files = ["src/a.ts", "src/lib/b.ts", "docs/my notes.md"];
 const cat = {
@@ -288,5 +289,78 @@ describe("scanContextBlocks", () => {
     expect(sent.content).toBe("look @src/a.ts\n\nsrc/a.ts _(not included: possible secret)_");
     expect(sent.context).toEqual([expect.objectContaining({ notIncluded: "possible secret" })]);
     expect(await expandDraft("no tokens here", "/w", [])).toEqual({ content: "no tokens here", context: [] });
+  });
+});
+
+describe("@chat: an earlier conversation (#1162)", () => {
+  const chats = chatRefs([{ id: "th-1", title: "Auth refactor" }], null);
+  const withChats = { ...cat, chats };
+  const ref = () => extractContextRefs("@chat:auth-refactor", withChats)[0];
+
+  beforeEach(() => {
+    chatThreadDigest.mockReset();
+    secretScanText.mockReset();
+  });
+
+  it("is the thread's asks and last answer when it has no summary", async () => {
+    chatThreadDigest.mockResolvedValue({ summary: null, asks: ["fix login"], lastAnswer: "Done." });
+    const block = await resolveContextBlock(ref(), "/w", files, { workspaceId: "ws-1" });
+    expect(chatThreadDigest).toHaveBeenCalledWith("ws-1", "th-1");
+    expect(block.text).toBe(
+      '\n\nConversation "Auth refactor" · asks and last answer\n```\n## Asks\n1. fix login\n\n## Last answer\nDone.\n```',
+    );
+    expect(block.scan).toEqual([{ label: "@chat:auth-refactor", text: "## Asks\n1. fix login\n\n## Last answer\nDone." }]);
+  });
+
+  it("is the thread's summary when it has one", async () => {
+    chatThreadDigest.mockResolvedValue({ summary: "We chose JWT.", asks: [], lastAnswer: null });
+    const block = await resolveContextBlock(ref(), "/w", files, { workspaceId: "ws-1" });
+    expect(block.text).toBe('\n\nConversation "Auth refactor" · summary\n```\n## Summary\nWe chose JWT.\n```');
+  });
+
+  it("is capped at 64k like every block", async () => {
+    chatThreadDigest.mockResolvedValue({ summary: null, asks: ["x".repeat(70_000)], lastAnswer: null });
+    const block = await resolveContextBlock(ref(), "/w", files, { workspaceId: "ws-1" });
+    expect(block.scan[0].text.length).toBeLessThan(64_100);
+    expect(block.text).toContain("… (cut at 64k characters)");
+  });
+
+  it("goes through the secret guard and is left out when it holds one", async () => {
+    chatThreadDigest.mockResolvedValue({ summary: null, asks: ["token here"], lastAnswer: null });
+    secretScanText.mockResolvedValue({
+      findings: [{ file: "@chat:auth-refactor", line: 2, rule: "github-token", kind: "GitHub token", yours: false }],
+      total: 1,
+      partial: false,
+    });
+    const blocks = await resolveContextBlocks([ref()], "/w", files, "ws-1");
+    const verdict = await scanContextBlocks(blocks);
+    expect(verdict?.flagged).toEqual(new Set([0]));
+    const { content, context } = withContext("see", blocks, verdict!.flagged);
+    expect(content).toBe("see\n\nchat:auth-refactor _(not included: possible secret)_");
+    expect(context[0]).toMatchObject({ kind: "chat", label: "Auth refactor", notIncluded: "possible secret" });
+  });
+
+  it("reads only the sending workspace's conversations", async () => {
+    // No workspace to scope to: nothing is read.
+    const none = await resolveContextBlock(ref(), "/w", files);
+    expect(chatThreadDigest).not.toHaveBeenCalled();
+    expect(none.missing).toBe("not in this workspace");
+    // The backend refuses a thread of another workspace: the block says so.
+    chatThreadDigest.mockRejectedValue(new Error("that conversation isn't in this workspace"));
+    const refused = await resolveContextBlock(ref(), "/w", files, { workspaceId: "ws-2" });
+    expect(refused.missing).toBe("unreadable");
+    expect(refused.scan).toEqual([]);
+    // A resend resolves against the conversations it is given, in its workspace.
+    listWorkspaceFiles.mockResolvedValue(files);
+    chatThreadDigest.mockResolvedValue({ summary: "S", asks: [], lastAnswer: null });
+    secretScanText.mockResolvedValue(null);
+    const sent = await expandDraft("@chat:auth-refactor", "/w", [], chats, "ws-1");
+    expect(chatThreadDigest).toHaveBeenLastCalledWith("ws-1", "th-1");
+    expect(sent.context).toEqual([expect.objectContaining({ kind: "chat", token: "chat:auth-refactor" })]);
+    // A conversation not in the catalog (another workspace's) is prose.
+    expect(await expandDraft("@chat:auth-refactor", "/w", [], [], "ws-1")).toEqual({
+      content: "@chat:auth-refactor",
+      context: [],
+    });
   });
 });

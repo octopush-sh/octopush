@@ -311,6 +311,60 @@ pub fn context_block<'a>(content: &'a str, context_blocks: &str, block: usize) -
     Some(&content[start..end])
 }
 
+/// A user row's typed text: its content without the `@` blocks appended to
+/// it (the whole content when it has no readable record).
+pub fn typed_text<'a>(content: &'a str, context_blocks: Option<&str>) -> std::borrow::Cow<'a, str> {
+    let Some(spans) = context_blocks.and_then(|ctx| context_spans(content, ctx)) else {
+        return std::borrow::Cow::Borrowed(content);
+    };
+    let mut out = String::new();
+    let mut at = 0;
+    for (start, end) in spans {
+        out.push_str(&content[at..start]);
+        at = end;
+    }
+    out.push_str(&content[at..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// What `@chat:<slug>` attaches of another conversation (#1162).
+#[derive(serde::Serialize, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadDigest {
+    /// The thread's newest `summary` row (compaction), when it has one.
+    pub summary: Option<String>,
+    /// The asks after that summary (every ask without one), typed text only:
+    /// the `@` blocks they carried are left out.
+    pub asks: Vec<String>,
+    /// The thread's last answer, when it comes after the summary.
+    pub last_answer: Option<String>,
+}
+
+/// A conversation as another one reads it: its summary row if it has one,
+/// then the asks and the last answer that came after it.
+pub fn thread_digest(rows: &[HistoryRow<'_>]) -> ThreadDigest {
+    let from = rows.iter().rposition(|r| r.role == "summary");
+    let mut digest = ThreadDigest {
+        summary: from.map(|i| rows[i].content.trim().to_string()),
+        ..ThreadDigest::default()
+    };
+    for row in &rows[from.map_or(0, |i| i + 1)..] {
+        match row.role {
+            "user" => {
+                let ask = typed_text(row.content, row.context);
+                if !ask.trim().is_empty() {
+                    digest.asks.push(ask.trim().to_string());
+                }
+            }
+            "assistant" if !row.content.trim().is_empty() => {
+                digest.last_answer = Some(row.content.trim().to_string());
+            }
+            _ => {}
+        }
+    }
+    digest
+}
+
 /// The smallest `@` block that is ever shortened; anything under it is
 /// re-sent whole on every turn.
 pub const CONTEXT_BLOCK_SHORTEN_MIN: usize = 8_000;
@@ -643,6 +697,44 @@ mod tests {
             "result": result,
         })
         .to_string()
+    }
+
+    fn row<'a>(id: i64, role: &'a str, content: &'a str) -> HistoryRow<'a> {
+        HistoryRow { id, role, content, context: None }
+    }
+
+    #[test]
+    fn a_thread_digest_is_its_asks_and_last_answer_without_their_blocks() {
+        let ctx = r#"[{"token":"a.ts","kind":"file","label":"a.ts","tokens":4,"start":9,"end":25}]"#;
+        let rows = [
+            HistoryRow { context: Some(ctx), ..row(1, "user", "fix @a.ts\n\na.ts\n```\nx\n```") },
+            row(2, "tool", "{}"),
+            row(3, "assistant", "first answer"),
+            row(4, "user", "  and the tests?  "),
+            row(5, "assistant", "last answer\n"),
+            row(6, "error", "boom"),
+        ];
+        let d = thread_digest(&rows);
+        assert_eq!(d.summary, None);
+        assert_eq!(d.asks, vec!["fix @a.ts".to_string(), "and the tests?".to_string()]);
+        assert_eq!(d.last_answer.as_deref(), Some("last answer"));
+        assert_eq!(thread_digest(&[]), ThreadDigest::default());
+    }
+
+    #[test]
+    fn a_thread_digest_starts_from_its_newest_summary() {
+        let rows = [
+            row(1, "user", "old ask"),
+            row(2, "assistant", "old answer"),
+            row(3, "summary", "first summary"),
+            row(4, "user", "middle ask"),
+            row(5, "summary", " what was decided "),
+            row(6, "user", "new ask"),
+        ];
+        let d = thread_digest(&rows);
+        assert_eq!(d.summary.as_deref(), Some("what was decided"));
+        assert_eq!(d.asks, vec!["new ask".to_string()]);
+        assert_eq!(d.last_answer, None, "the answer before the summary is in it");
     }
 
     #[test]

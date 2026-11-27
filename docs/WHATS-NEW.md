@@ -132,6 +132,7 @@ Current anchors:
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focused only by a click, Tab or ⌘⌥A, never by itself; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
 | `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
+| `talk-mention-chats` · `talk-mention-symbols` | Talk composer, `@` popover: the Conversations group (the workspace's other conversations; only while one is listed) · the Definitions group (where the identifier typed is defined; only once the search found one) | `chat/MentionPopover.tsx` via `chat/Composer.tsx` |
 | `talk-context-cap` | Talk composer, at the end of the context chips: "10 at most · 2 more sent as text" (only while the draft names more than 10 mentions) | `chat/ContextChips.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
 | `run-session-waiting` | Session line: the brass dot of the first session Claude Code's hooks say waits on you while it isn't in focus: on its cell, or on the `+N` / `N sessions` button when it has no cell (only while one does) | `run/SessionLine.tsx` |
