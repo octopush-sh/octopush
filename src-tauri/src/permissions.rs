@@ -1736,7 +1736,9 @@ mod tests {
             "let spec = &mode_spec(&db, &planned);",
             "let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)))",
             ".with_asker(Box::new(SubagentAsk::new(approvals, app.clone(), spec)));",
-            ".with_mode(crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone()));",
+            "let mode = crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone());",
+            ".with_mcp(mcp_tools, Arc::clone(&mode))",
+            ".with_mode(mode);",
             "persist_run(&db, &planned, &outcome);",
         ] {
             assert!(run.contains(call), "the sub-agent runner no longer has: {call}");

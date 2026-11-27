@@ -639,6 +639,8 @@ import type {
   McpToolInfo,
   McpServerConfig,
   McpServerStatus,
+  McpTrust,
+  ApprovalAnswer,
   InstructionList,
   CreateSessionArgs,
   DirectoryEntry,
@@ -1065,12 +1067,12 @@ export const ipc = {
   /** The approval cards still waiting on a thread, oldest first (a reloaded
    *  webview shows them again: a card waits until it is answered). */
   pendingApprovals: (threadId: string) =>
-    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run" | "ask" | "ask-run"; sensitive?: boolean; rememberDir?: string; diff?: string; previewNote?: string; askFirst?: boolean }>>(
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run" | "ask" | "ask-run"; sensitive?: boolean; rememberDir?: string; diff?: string; previewNote?: string; askFirst?: boolean; trustServer?: string; trustTool?: string }>>(
       "pending_approvals",
       { threadId },
     ),
   /** Resolve an inline approval for a dangerous agent command. */
-  respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
+  respondApproval: (callId: string, decision: ApprovalAnswer) =>
     invoke<void>("respond_approval", { callId, decision }),
   /** Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
    *  command + output into the conversation; returns cwd/exit for the badge.
@@ -1163,6 +1165,15 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** What the user trusts to run without an MCP card in Edit freely, per
+   *  server (#1243), that still holds for its user-level entry. With a
+   *  worktree, without the servers its own `.claude/mcp.json` defines. */
+  listMcpTrust: (workspacePath?: string) =>
+    invoke<McpTrust[]>("list_mcp_trust", { workspacePath: workspacePath ?? null }),
+  /** Revoke the trust in a server's tool, or in the whole server (`tool`
+   *  null); resolves to what is left. The next call asks again. */
+  revokeMcpTrust: (server: string, tool: string | null) =>
+    invoke<McpTrust[]>("revoke_mcp_trust", { server, tool }),
   /** The instruction files Talk follows in a worktree (its CLAUDE.md chain,
    *  or AGENTS.md), each with its token estimate, and how many skipped files
    *  weren't listed. Reads only. */
@@ -1183,13 +1194,15 @@ export const ipc = {
   /** Set a conversation's permission mode; resolves to the mode stored. */
   setThreadPermissionMode: (threadId: string, mode: PermissionMode) =>
     invoke<PermissionMode>("set_thread_permission_mode", { threadId, mode }),
-  /** Settings saved the MCP config, Reconnect restarted a server, or Talk's
-   *  discovery started (or failed to start) servers. If either subscription
-   *  fails, the other is dropped and the promise rejects. */
+  /** Settings saved the MCP config, Reconnect restarted a server, Talk's
+   *  discovery started (or failed to start) servers, or the MCP trust changed
+   *  (a card's lasting answer, a revoke). If any subscription fails, the
+   *  others are dropped and the promise rejects. */
   onMcpChanged: async (handler: () => void) => {
     const subs = await Promise.allSettled([
       listen("mcp://config-changed", () => handler()),
       listen("mcp://status-changed", () => handler()),
+      listen("mcp://trust-changed", () => handler()),
     ]);
     const offs = subs.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
     const failed = subs.find((r): r is PromiseRejectedResult => r.status === "rejected");

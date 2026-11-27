@@ -132,6 +132,7 @@ Current anchors:
 | `talk-tool-verdict` | Talk, on a resolved tool row that failed or was denied: its mono verdict after the summary (`exit 1`, `timed out`, `denied`; every such row carries it, a tour finds the first) | `ToolCallCard.tsx` |
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focused only by a click, Tab or ⌘⌥A, never by itself; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
 | `talk-ask-first-approval` | Talk: an Ask first card waiting on you, a file change with its diff or a command that may write (only while one waits; never focused by itself) | `chat/ApprovalCard.tsx` |
+| `talk-approval-trust` | Talk: an MCP approval card's lasting answers, "Always allow this tool" and "Trust <server>" (only in Edit freely, on a tool not marked destructive, while the card waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
 | `talk-permission-mode` | Talk composer bar: the permission-mode chip (Plan only · Ask first · Edit freely; a lock while a read-only mission forces Plan only) | `chat/PermissionModeControl.tsx` |
 | `talk-empty-starters` | Talk, in a conversation with no messages yet: the row of starters ("Review what changed" · "Ask about a file" · "Explain this workspace"), each filling the draft without sending | `chat/ChatCanvas.tsx` |
@@ -180,6 +181,7 @@ Current anchors:
 | `settings-models-list` | Settings › Models: the selected provider's list of models (only while it has one) | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
+| `settings-mcp-servers` · `settings-mcp-trust` | Settings › Integrations › MCP Servers: the whole section · a server's trust lines with their revoke buttons (only with something trusted) | `settings/McpServersSection.tsx` |
 | `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
 | `settings-mcp-edit` | Settings › Integrations › MCP Servers: the first server's Edit icon button (only with a server configured and no form open on it) | `settings/McpServersSection.tsx` |
 | `settings-mcp-add` · `settings-mcp-type` | Settings › Integrations › MCP Servers: "Add MCP server" (disabled while a form is open) · the open form's Local command / Remote URL choice (only while the add or edit form is open) | `settings/McpServersSection.tsx` · `settings/McpServerForm.tsx` |

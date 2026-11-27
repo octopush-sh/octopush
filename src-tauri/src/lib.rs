@@ -26,6 +26,7 @@ pub mod error;
 mod file_open;
 mod file_seen;
 mod fleet_status;
+pub mod fs_safe;
 mod menu_bar;
 pub mod gateway;
 pub mod git_ops;
@@ -303,6 +304,8 @@ pub fn run() {
             commands::read_attachment,
             commands::list_mcp_tools,
             commands::list_mcp_server_status,
+            commands::list_mcp_trust,
+            commands::revoke_mcp_trust,
             commands::list_project_instructions,
             commands::get_thread_mcp_disabled,
             commands::set_thread_mcp_server,

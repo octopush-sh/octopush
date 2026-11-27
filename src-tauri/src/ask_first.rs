@@ -59,6 +59,8 @@ impl AskCard {
             diff: self.diff.clone(),
             preview_note: self.note.clone(),
             ask_first: true,
+            trust_server: None,
+            trust_tool: None,
         }
     }
 }
