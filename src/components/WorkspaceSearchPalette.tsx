@@ -206,11 +206,13 @@ export function WorkspaceSearchPalette({
     else onOpenFile(path, at.line, at.col);
   };
 
+  const toggleMode = () => setMode((m) => (m === "files" ? "text" : "files"));
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     // Escape is handled by ModalShell; Tab toggles files/text mode.
     if (e.key === "Tab") {
       e.preventDefault();
-      setMode((m) => (m === "files" ? "text" : "files"));
+      toggleMode();
       return;
     }
     // The virtualized file list keeps its own selection (cmdk only sees the
@@ -253,11 +255,17 @@ export function WorkspaceSearchPalette({
           shouldFilter={false}
           className="overflow-hidden rounded-xl"
         >
-          {/* Header — eyebrow, input, esc hint. */}
+          {/* Header — mode prefix, input, esc hint. */}
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
-            <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-              {mode === "files" ? "⌘ P" : "⌘ ⇧ F"}
-            </span>
+            <button
+              type="button"
+              onClick={toggleMode}
+              data-tour="file-finder-mode"
+              title={mode === "files" ? "Search text instead (Tab)" : "Find files instead (Tab)"}
+              className="shrink-0 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass transition-colors duration-[220ms] hover:text-octo-ivory"
+            >
+              {mode === "files" ? "Files" : "Text"}
+            </button>
             {mode === "files" ? (
               // A plain combobox: cmdk's input would overwrite
               // aria-activedescendant with its own (empty) selection, and
@@ -299,33 +307,6 @@ export function WorkspaceSearchPalette({
             </button>
           </div>
 
-          {/* Mode toggle */}
-          <div className="flex items-center gap-1 border-b border-octo-hairline px-2 py-1.5">
-            <ModeTab
-              active={mode === "files"}
-              label="Files"
-              count={files.length || undefined}
-              onClick={() => setMode("files")}
-            />
-            <ModeTab
-              active={mode === "text"}
-              label="Text"
-              count={mode === "text" && query ? hits.length : undefined}
-              onClick={() => setMode("text")}
-            />
-            {mode === "files" && capped && (
-              <span
-                data-tour="file-finder-capped"
-                className="ml-2 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute"
-              >
-                Showing the first {FILE_LIST_CAP.toLocaleString("en-US")} files
-              </span>
-            )}
-            <span className="ml-auto font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
-              Tab to toggle
-            </span>
-          </div>
-
           {/* Results */}
           {mode === "files" ? (
             <FilesResults
@@ -356,43 +337,21 @@ export function WorkspaceSearchPalette({
               />
             </Command.List>
           )}
+
+          {/* Footer — cap notice, where Tab goes. */}
+          <div className="flex items-center gap-3 border-t border-octo-hairline px-4 py-2 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
+            {mode === "files" && capped && (
+              <span data-tour="file-finder-capped">
+                Showing the first {FILE_LIST_CAP.toLocaleString("en-US")} files
+              </span>
+            )}
+            <span data-tour="file-finder-tab-hint" className="ml-auto">
+              Tab · {mode === "files" ? "search text" : "find files"}
+            </span>
+          </div>
         </Command>
       </div>
     </ModalShell>
-  );
-}
-
-// ─── Mode tab ──────────────────────────────────────────────────────
-
-function ModeTab({
-  active,
-  label,
-  count,
-  onClick,
-}: {
-  active: boolean;
-  label: string;
-  count?: number;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="flex items-center gap-1.5 rounded px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.18em] transition-colors"
-      style={{
-        color: active ? "var(--color-octo-brass)" : "var(--color-octo-mute)",
-        background: active ? "var(--brass-ghost)" : "transparent",
-        border: active
-          ? "1px solid var(--brass-dim)"
-          : "1px solid transparent",
-      }}
-    >
-      <span>{label}</span>
-      {typeof count === "number" && (
-        <span className="font-mono text-[9px] opacity-70">· {count}</span>
-      )}
-    </button>
   );
 }
 

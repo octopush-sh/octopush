@@ -196,7 +196,8 @@ Current anchors:
 | `palette-workspaces` | Command palette: the Workspaces group (every open project's workspaces, needs-you first) | `CommandPalette.tsx` |
 | `palette-groups` | Command palette: the Groups section (every rail group of the open projects, in rail order; only when there is one) | `CommandPalette.tsx` |
 | `file-finder-input` · `file-finder-results` | ⌘P / ⌘⇧F palette: the query input · the virtualized file list (files mode, with matches) | `WorkspaceSearchPalette.tsx` |
-| `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
+| `file-finder-mode` · `file-finder-tab-hint` | ⌘P / ⌘⇧F palette: the brass `FILES` / `TEXT` mode prefix in the search line (a click switches mode) · the footer's "Tab · search text" / "Tab · find files" | `WorkspaceSearchPalette.tsx` |
+| `file-finder-capped` | ⌘P footer: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
 | `companion-run-context` · `companion-run-changes` · `companion-run-read-diff` · `companion-run-mission` | Run Companion: the Context section (only while the focused pane is an agent session Octopush has usage for) · the Changes section · its "Read the diff" link (only with something to read in Review) · the Mission section (only with a mission) | `CompanionRun.tsx` |
 | `companion-chats-list` | Companion › Chats: the conversation list | `CompanionHistory.tsx` |
 | `companion-follows` | Talk Companion › Conversation: the "follows" row, one name per instruction file Talk and its sub-agents follow (the CLAUDE.md chain, or AGENTS.md; only while the worktree has one) | `CompanionInstructions.tsx` via `CompanionContext.tsx` |

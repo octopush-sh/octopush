@@ -98,6 +98,50 @@ describe("WorkspaceSearchPalette — file mode", () => {
   });
 });
 
+describe("WorkspaceSearchPalette — mode prefix and footer", () => {
+  function renderFilesMode() {
+    render(
+      <WorkspaceSearchPalette
+        workspacePath="/w"
+        initialMode="files"
+        open
+        onClose={vi.fn()}
+        onOpenFile={vi.fn()}
+      />,
+    );
+  }
+
+  it("names the mode in the search line, with no tab strip and no repeated count", async () => {
+    renderFilesMode();
+    await waitFor(() => expect(screen.getByText("ipc.ts")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Files" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Text" })).toBeNull();
+    expect(screen.queryByText(/· 2/)).toBeNull();
+    expect(screen.queryByText("Tab to toggle")).toBeNull();
+    expect(screen.getByText("Tab · search text")).toBeTruthy();
+  });
+
+  it("the prefix switches modes and the footer says where Tab goes", async () => {
+    const user = userEvent.setup();
+    renderFilesMode();
+    await user.click(screen.getByRole("button", { name: "Files" }));
+    expect(screen.getByPlaceholderText("Search text in every file…")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Text" })).toBeTruthy();
+    expect(screen.getByText("Tab · find files")).toBeTruthy();
+  });
+
+  it("Tab toggles the mode and keeps the query", async () => {
+    const user = userEvent.setup();
+    renderFilesMode();
+    await user.type(screen.getByRole("combobox"), "total");
+    await user.keyboard("{Tab}");
+    const text = screen.getByPlaceholderText("Search text in every file…") as HTMLInputElement;
+    expect(text.value).toBe("total");
+    await user.keyboard("{Tab}");
+    expect((screen.getByRole("combobox") as HTMLInputElement).value).toBe("total");
+  });
+});
+
 describe("WorkspaceSearchPalette — file finder matching", () => {
   function renderFiles(paths: string[], onOpenFile = vi.fn(), onClose = vi.fn()) {
     listWorkspaceFiles.mockResolvedValue(paths);
