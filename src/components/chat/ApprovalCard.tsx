@@ -1,11 +1,16 @@
 import type { KeyboardEvent } from "react";
 import { ShieldAlert } from "lucide-react";
 import type { PendingApproval } from "../../stores/chatStore";
+import type { ApprovalAnswer } from "../../lib/types";
 import { tourId } from "../../lib/tour/ids";
 
 interface Props {
   approval: PendingApproval;
-  onRespond: (decision: "approve" | "always" | "deny") => void;
+  onRespond: (decision: ApprovalAnswer) => void;
+  /** Talk is the mode on screen. A card the user focused can keep the focus
+   *  after a mode switch hides Talk (WebKit may leave it on a hidden
+   *  element), so its keys answer only while Talk shows. */
+  talkActive?: boolean;
 }
 
 const QUICK = "transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)]";
@@ -27,6 +32,13 @@ export const FOCUS_CARD_CHORD = "⌘⌥A";
 /** Every card carries this attribute, so the chord can find the oldest one
  *  and Talk's Esc can leave a card's focus alone (`talkEscape`). */
 export const APPROVAL_CARD_SELECTOR = "[data-approval-card]";
+
+/** Why a card offers no conversation grant in Plan only (#1229). */
+export const PLAN_ONLY_COPY = "In Plan only, nothing is allowed for the conversation: this asks every time.";
+
+/** The per-command grant's tooltip (#1229). */
+export const COMMAND_GRANT_TITLE =
+  "Run this, and run exactly this command again from this folder without asking for the rest of this conversation: the same words, quotes, operators and redirections. A credentials location, or a place that runs code, still asks. Revoke it in the Companion.";
 
 /** What a command's path card can't promise (#1201), on its tooltip. */
 export const RUN_CHECK_LIMITS =
@@ -50,8 +62,14 @@ export const RUN_CHECK_LIMITS =
  * outside the workspace or in a credentials location (`kind: "run"`) asks
  * the same way, showing the command, and its tooltip says the check is a
  * net, not a sandbox. A read outside that isn't a credentials location also
- * offers "Allow reading <folder> for this conversation" (`rememberDir`,
- * answered as "always").
+ * offers "Allow reading <folder> for this conversation" (`rememberDir`). Since
+ * #1229 a write outside offers "Allow writing <folder>…", a command card with
+ * no folder "Allow this command…" (`rememberCommand`), each answered "grant";
+ * in Plan only the card says it offers none (`planOnly`). Since #1243 an MCP
+ * card in Edit freely (`trustServer`/`trustTool`) instead offers two lasting
+ * answers, app-wide and revocable in Settings › Integrations: "Always allow
+ * this tool" ("tool") and "Trust <server>" ("server"); an MCP card never
+ * offers a conversation grant. The reason line wraps, never cut.
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -67,17 +85,31 @@ export const RUN_CHECK_LIMITS =
  * click, Tab, or ⌘⌥A (`FOCUS_CARD_CHORD`), which focuses the oldest card in
  * the conversation on screen.
  */
-export function ApprovalCard({ approval, onRespond }: Props) {
+export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) {
   const secret = approval.secret === true;
   const run = approval.kind === "run";
   const outside = approval.kind === "read" || approval.kind === "write" || run;
   const sensitive = outside && approval.sensitive === true;
   const copy = COPY[secret ? "secret" : sensitive ? "sensitive" : outside ? "outside" : "command"];
+  // An MCP card in Edit freely offers to stop asking for good (#1243).
+  const trust =
+    approval.kind === "mcp" && approval.trustServer && approval.trustTool
+      ? { server: approval.trustServer, tool: approval.trustTool }
+      : null;
   // Where the safe answer leads, it is the first button and Enter takes it.
   const safeLead = secret || sensitive;
   const lead = safeLead ? "deny" : "approve";
+  // The grant the card offers for the conversation (#1229): a folder, or the command itself.
+  const dir = !secret && !sensitive && (run || approval.kind === "write") ? approval.rememberDir : undefined;
+  const grant = dir
+    ? run
+      ? { label: `Allow reading ${dir} for this conversation`, title: `Run this, and let commands read ${dir} without asking for the rest of this conversation (a credentials location still asks). Revoke it in the Companion.` }
+      : { label: `Allow writing ${dir} for this conversation`, title: `Allow this, and let the agent's file tools write in ${dir} without asking for the rest of this conversation (reads there still ask). Revoke it in the Companion.` }
+    : !secret && !sensitive && approval.rememberCommand && approval.kind !== "mcp" && (run || !outside)
+      ? { label: "Allow this command for this conversation", title: COMMAND_GRANT_TITLE }
+      : null;
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    const answer = cardKeyAnswer(e, safeLead);
+    const answer = cardKeyAnswer(e, safeLead, talkActive);
     if (!answer) return;
     e.preventDefault();
     e.stopPropagation();
@@ -95,10 +127,15 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       data-tour={secret ? tourId("talk-secret-approval") : tourId("talk-approval")}
       className="octo-rise-in my-2 rounded-md border border-[var(--rouge-border)] bg-[var(--rouge-ghost)] px-3 py-2.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
     >
-      <div className="flex items-center gap-2">
-        <ShieldAlert size={14} aria-hidden className="shrink-0 text-octo-rouge" />
-        <span className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-rouge">{copy.eyebrow}</span>
-        <span className="ml-auto truncate font-mono text-[10px] text-octo-mute" title={approval.reason}>
+      {/* Tells a screen reader the turn waits, as the card appears; the
+          group's label names what it waits on. */}
+      <span role="alert" className="sr-only">
+        The turn is waiting on your answer.
+      </span>
+      <div className="flex items-baseline gap-2">
+        <ShieldAlert size={14} aria-hidden className="shrink-0 self-center text-octo-rouge" />
+        <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-rouge">{copy.eyebrow}</span>
+        <span data-testid="approval-reason" className="ml-auto min-w-0 break-words text-right font-mono text-[10px] text-octo-mute">
           {approval.reason}
         </span>
       </div>
@@ -107,6 +144,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
         {approval.command}
       </pre>
+      {approval.planOnly && !secret && <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">{PLAN_ONLY_COPY}</p>}
       {secret && (
         <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">
           {approval.coversUncommitted
@@ -123,10 +161,10 @@ export function ApprovalCard({ approval, onRespond }: Props) {
             : run
               ? "Allowing runs it once, and its output goes to your AI provider. "
               : "Allowing lets the agent write it once. "}
-          {run ? "A credentials location always asks." : "Every access outside the workspace asks again."}
+          {run || dir ? "A credentials location always asks." : "Every access outside the workspace asks again."}
         </p>
       )}
-      <div className="mt-2 flex items-center gap-2">
+      <div className={`mt-2 flex items-center gap-2 ${trust ? "flex-wrap" : ""}`}>
         {/* Where the safe answer leads, it is the first button. */}
         <button
           type="button"
@@ -146,25 +184,45 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         >
           {copy.other[0]}
         </button>
+        {grant && (
+          <button
+            type="button"
+            onClick={() => onRespond("grant")}
+            title={grant.title}
+            className={`ml-auto truncate font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
+          >
+            {grant.label}
+          </button>
+        )}
         {!secret && !outside && (
           <button
             type="button"
             onClick={() => onRespond("always")}
             title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)"
-            className={`ml-auto font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
+            className={`${grant ? "shrink-0" : "ml-auto"} font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
           >
             Approve &amp; don't ask again
           </button>
         )}
-        {run && !sensitive && approval.rememberDir && (
-          <button
-            type="button"
-            onClick={() => onRespond("always")}
-            title={`Run this, and let commands read ${approval.rememberDir} without asking for the rest of this conversation (a credentials location still asks)`}
-            className={`ml-auto truncate font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
-          >
-            Allow reading {approval.rememberDir} for this conversation
-          </button>
+        {trust && (
+          <span className="flex w-full flex-wrap items-center gap-x-4 gap-y-1 pt-0.5" data-tour={tourId("talk-approval-trust")}>
+            <button
+              type="button"
+              onClick={() => onRespond("tool")}
+              title={`Run this, and let ${trust.tool} run without asking in Edit freely, in every conversation, until you revoke it in Settings › Integrations`}
+              className={`font-serif text-[12px] text-octo-sage hover:text-octo-ivory ${QUICK}`}
+            >
+              Always allow this tool
+            </button>
+            <button
+              type="button"
+              onClick={() => onRespond("server")}
+              title={`Run this, and let every ${trust.server} tool run without asking in Edit freely, in every conversation, until you revoke it in Settings › Integrations (a tool it marks destructive still asks)`}
+              className={`font-serif text-[12px] text-octo-sage hover:text-octo-ivory ${QUICK}`}
+            >
+              Trust {trust.server}
+            </button>
+          </span>
         )}
       </div>
     </div>
@@ -183,15 +241,18 @@ export function focusOldestCard(root: ParentNode = document): boolean {
 
 /** The answer a key gives a focused card, or null for a key it leaves alone.
  *  Only the card's own focus counts (a key on a button inside it is the
- *  button's), and never a held key, an IME composition, or a chord other
- *  than ⌘↵. `safeLead`: the safe answer leads (the secret card, a
- *  credentials location). Pure. */
+ *  button's), only while Talk is the mode on screen (`talkActive`), and
+ *  never a held key, an IME composition, or a chord other than ⌘↵.
+ *  `safeLead`: the safe answer leads (the secret card, a credentials
+ *  location). Pure. */
 export function cardKeyAnswer(
   e: Pick<KeyboardEvent<HTMLElement>, "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat" | "target" | "currentTarget"> & {
     nativeEvent?: { isComposing?: boolean };
   },
   safeLead: boolean,
+  talkActive = true,
 ): "approve" | "deny" | null {
+  if (!talkActive) return null;
   if (e.target !== e.currentTarget || e.repeat || e.nativeEvent?.isComposing) return null;
   if (e.ctrlKey || e.altKey || e.shiftKey) return null;
   const lead = safeLead ? "deny" : "approve";

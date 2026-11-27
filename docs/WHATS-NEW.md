@@ -71,6 +71,8 @@ Current anchors:
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |
+| `header-ports` | Workspace header, at the eyebrow's right end: the workspace's port range (`40020–40029`; only once the workspace has a block) | `ContextHeader.tsx` |
+| `header-sandbox` · `header-sandbox-confirm` | Workspace header, with a mission: the sandbox toggle (`Shield` while the sandbox is in effect, `ShieldOff` otherwise; disabled for a read-only mission) · the dialog that confirms turning it off | `HeaderSandbox.tsx` via `ContextHeader.tsx` |
 | `pr-chip-checks` | Workspace header, PR chip: the CI checks glyph (only on an open/draft PR whose checks could be read; failing adds "Fix failing checks…" beside it) | `ContextHeader.tsx` |
 | `genesis-key-save` · `genesis-begin` · `genesis-sketch` | Genesis block (Welcome / New-project "From a prompt"): the inline API-key field (only with no key) · the one primary CTA ("Set a crew on it", or "Wake the crew" with a key and no brief) · "or think it through first" | `GenesisPrompt.tsx` |
 | `welcome-new-study` | Welcome: "Begin a new study" on the secondary line | `WelcomeScreen.tsx` |
@@ -84,7 +86,8 @@ Current anchors:
 | `direct-launcher-codex-read-only` | Direct launcher: the amber "A read-only Codex stage can't run in a sandboxed mission yet." line (only when a read-only CLI stage runs on Codex in a sandboxed or readonly mission) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-commit` | Direct launcher: the amber "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push." line (only when an Action-role CLI stage runs on Codex outside a sandboxed mission) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-trust` | Direct launcher: the amber "Codex will ignore this repo's .codex/ settings and MCP servers" line and how to trust the project (only when a Codex CLI stage would skip a `.codex/` dir in an untrusted project) | `PipelineSetup.tsx` |
-| `direct-launcher-repo-hooks` | Direct launcher, under the launch line: "This repo's own Claude Code config runs 2 hooks and 1 MCP server." and one row per entry (only when a Claude Code CLI stage is in the crew and the worktree's `.claude/settings.json` or `.mcp.json` runs something) | `PipelineSetup.tsx` |
+| `direct-launcher-repo-hooks` | Direct launcher, under the launch line: "This repo's own Claude Code config runs 2 hooks and 1 MCP server." and one row per entry (only when a Claude Code CLI stage is in the crew and the worktree's `.claude/settings.json`, `.mcp.json`, skills or commands run something) | `PipelineSetup.tsx` |
+| `direct-launcher-skill-shell-off` | Direct launcher, under the repo-config notice: the "Don't run skill shell commands in crews" switch and its line (only when a Claude Code CLI stage is in the crew and the repo's skills or commands run shell commands, or the project has it on) | `PipelineSetup.tsx` |
 | `pipeline-model-superseded` | Direct launcher, above the selected crew's description: "Fable 5.1 → Fable 5.2: about 20% cheaper per token." with "Switch this crew" / "Keep 5.1" (only while a stage or escalation of that crew uses a superseded model and the user hasn't kept it) | `direct/SupersededModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-model-retirement` | Direct launcher, under the foot: "Sonnet 4.5 retires Nov 30, so a stage on it will fail from then on." with "Switch to Sonnet 5.5" (only while a stage, launcher pick or escalation of the selected crew uses a model within 30 days of its retirement, or past it) | `direct/RetiringModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
@@ -106,6 +109,7 @@ Current anchors:
 | `palette-talk` | Command palette: the Talk group (New conversation · Switch conversation… · Copy conversation as Markdown · Focus the waiting approval card, only while one waits; only with an active workspace) | `CommandPalette.tsx` |
 | `talk-switcher-input` · `talk-switcher-row` | ⌘⌥K in Talk, while open: the conversation switcher's query input · its first conversation row (only with one) | `chat/ConversationSwitcher.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
+| `builder-stage-mcp` | Pipeline builder, Stage inspector: the "MCP servers" field (one toggle chip per server, all off by default; disabled on a CLI stage) | `builder/StageMcpServers.tsx` via `StageInspector.tsx` |
 | `builder-stage-track-record` | Pipeline builder, Stage inspector of a saved stage: the Track record section (its toggle, the record, the micro-history and suggestions) | `builder/TrackRecord.tsx` via `StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
 | `run-session-line` · `run-session-cell` | Run mode band, right track: the session line (session cells, `+`, the layout button) · the focused session's cell (hover or keyboard focus opens its instant label) | `run/SessionLine.tsx` |
@@ -129,7 +133,9 @@ Current anchors:
 | `talk-error-action` | Talk: an error card's one action ("Try again", "Configure API key" or "Copy error details"; only on a turn that ended on an error, a tour finds the first) | `chat/ChatCanvas.tsx` |
 | `talk-tool-verdict` | Talk, on a resolved tool row that failed or was denied: its mono verdict after the summary (`exit 1`, `timed out`, `denied`; every such row carries it, a tour finds the first) | `ToolCallCard.tsx` |
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focused only by a click, Tab or ⌘⌥A, never by itself; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
+| `talk-approval-trust` | Talk: an MCP approval card's lasting answers, "Always allow this tool" and "Trust <server>" (only in Edit freely, on a tool not marked destructive, while the card waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
+| `talk-empty-starters` | Talk, in a conversation with no messages yet: the row of starters ("Review what changed" · "Ask about a file" · "Explain this workspace"), each filling the draft without sending | `chat/ChatCanvas.tsx` |
 | `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
 | `talk-context-cap` | Talk composer, at the end of the context chips: "10 at most · 2 more sent as text" (only while the draft names more than 10 mentions) | `chat/ContextChips.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
@@ -175,6 +181,9 @@ Current anchors:
 | `settings-models-list` | Settings › Models: the selected provider's list of models (only while it has one) | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
+| `settings-integrations-epiku` · `settings-epiku-status` | Settings › Integrations › Issue tracking: the Epiku entry in the tracker list · its connection status line ("Connected · 2 stories", only once Epiku is selected) | `settings/IssueTrackingSection.tsx` |
+| `project-issue-tracker` | Project menu › Issue tracking…, while open: the Jira · Epiku · None choice | `JiraProjectKeyModal.tsx` |
+| `settings-mcp-servers` · `settings-mcp-trust` | Settings › Integrations › MCP Servers: the whole section · a server's trust lines with their revoke buttons (only with something trusted) | `settings/McpServersSection.tsx` |
 | `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
 | `settings-mcp-edit` | Settings › Integrations › MCP Servers: the first server's Edit icon button (only with a server configured and no form open on it) | `settings/McpServersSection.tsx` |
 | `settings-mcp-add` · `settings-mcp-type` | Settings › Integrations › MCP Servers: "Add MCP server" (disabled while a form is open) · the open form's Local command / Remote URL choice (only while the add or edit form is open) | `settings/McpServersSection.tsx` · `settings/McpServerForm.tsx` |
@@ -210,6 +219,7 @@ Current anchors:
 | `companion-follows` | Talk Companion › Conversation: the "follows" row, one name per instruction file Talk and its sub-agents follow (the CLAUDE.md chain, or AGENTS.md; only while the worktree has one) | `CompanionInstructions.tsx` via `CompanionContext.tsx` |
 | `companion-can-use` | Talk Companion › Conversation: the "can use" row, one toggle chip per MCP server, then the skills and agents counts (only while the workspace has a server, a skill or a sub-agent type) | `CompanionMcpScope.tsx` via `CompanionContext.tsx` |
 | `companion-can-use-skills` · `companion-can-use-agents` | Talk Companion › Conversation, "can use" row: `skills · N`, which opens the skills (a click adds `/name` to the draft; only with a skill) · `agents · N`, which opens the sub-agent types with their tier or model and tools (only with one) | `CompanionCatalog.tsx` via `CompanionMcpScope.tsx` |
+| `companion-grants` | Talk Companion › Conversation: the "allowed" row, one entry per grant the conversation holds, each with a revoke button (only while it holds one) | `CompanionGrants.tsx` via `CompanionContext.tsx` |
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-headline` | Settings › Usage: the headline stats row (Cost · Per active day · Last 24 hours · Cache hit), also while the ledger is read | `settings/UsagePane.tsx` |
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |

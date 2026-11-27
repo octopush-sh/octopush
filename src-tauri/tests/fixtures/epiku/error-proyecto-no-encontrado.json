@@ -1,0 +1,1 @@
+{ "error": "proyecto_no_encontrado", "id": "sample-project", "pista": "GET /api/proyectos lista los existentes" }

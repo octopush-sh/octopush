@@ -33,6 +33,8 @@ const floorNoteMock = vi.hoisted(() => vi.fn());
 const knownBadMock = vi.hoisted(() => vi.fn());
 const codexTrustMock = vi.hoisted(() => vi.fn());
 const repoHooksMock = vi.hoisted(() => vi.fn());
+const skillShellOffMock = vi.hoisted(() => vi.fn());
+const setSkillShellOffMock = vi.hoisted(() => vi.fn());
 const repoCrewsMock = vi.hoisted(() => vi.fn());
 const readRepoCrewMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -41,6 +43,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
     ...actual,
     ipc: {
       ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock, claudeKnownBadNote: knownBadMock, codexTrustNote: codexTrustMock, repoHooksNotice: repoHooksMock,
+      skillShellOff: skillShellOffMock, setSkillShellOff: setSkillShellOffMock,
       listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock,
     },
   };
@@ -82,6 +85,10 @@ beforeEach(() => {
   codexTrustMock.mockResolvedValue(null);
   repoHooksMock.mockReset();
   repoHooksMock.mockResolvedValue(null);
+  skillShellOffMock.mockReset();
+  skillShellOffMock.mockResolvedValue(false);
+  setSkillShellOffMock.mockReset();
+  setSkillShellOffMock.mockResolvedValue(undefined);
 });
 
 describe("PipelineSetup crews from the repo", () => {
@@ -673,6 +680,7 @@ describe("PipelineSetup Claude Code version preflight", () => {
         { event: "statusLine", matcher: null, kind: "status_line", runs: "~/.claude/status.sh" },
       ],
       servers: [{ name: "db", runs: "npx -y db-mcp" }],
+      skillShells: [],
       hash: "ab".repeat(32),
     });
     storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
@@ -693,12 +701,53 @@ describe("PipelineSetup Claude Code version preflight", () => {
   });
 
   it("does not read the repo's hooks for a crew without a Claude Code stage", async () => {
-    repoHooksMock.mockResolvedValue({ hooks: [], servers: [{ name: "db", runs: "npx db" }], hash: "h" });
+    repoHooksMock.mockResolvedValue({ hooks: [], servers: [{ name: "db", runs: "npx db" }], skillShells: [{ skill: "s", command: "ls" }], hash: "h" });
+    skillShellOffMock.mockResolvedValue(true);
     storeState.pipelines = [cliPipe("gpt-5-codex")];
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
     await act(async () => {});
     expect(repoHooksMock).not.toHaveBeenCalled();
+    expect(skillShellOffMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId("launcher-repo-hooks")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("launcher-skill-shell-off")).not.toBeInTheDocument();
+  });
+
+  it("lists the repo's skill shell commands and offers to turn them off for the project's crews", async () => {
+    repoHooksMock.mockResolvedValue({
+      hooks: [],
+      servers: [],
+      skillShells: [{ skill: "deploy", command: "git status --short" }],
+      hash: "cd".repeat(32),
+    });
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-repo-hooks");
+    expect(note).toHaveTextContent("This repo's own Claude Code config runs 1 skill shell command.");
+    expect(note).toHaveTextContent("Runs as the skill loads · /deploy · git status --short");
+    expect(skillShellOffMock).toHaveBeenCalledWith("w1");
+    const toggle = await screen.findByTestId("launcher-skill-shell-off");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(toggle).toHaveAccessibleName("Don't run skill shell commands in crews");
+    expect(screen.getByText(/your own and plugin skills in those stages too/)).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(setSkillShellOffMock).toHaveBeenCalledWith("w1", true);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("keeps the opt-in in view while it is on, and hides it when nothing asks for it", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    const { unmount } = render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await act(async () => {});
+    expect(screen.queryByTestId("launcher-skill-shell-off")).not.toBeInTheDocument();
+    unmount();
+    skillShellOffMock.mockResolvedValue(true);
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const toggle = await screen.findByTestId("launcher-skill-shell-off");
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+    setSkillShellOffMock.mockRejectedValueOnce(new Error("db"));
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+    expect(setSkillShellOffMock).toHaveBeenCalledWith("w1", false);
   });
 
   it("tells a project marked untrusted in Codex to change its trust_level, not to run --trust", async () => {

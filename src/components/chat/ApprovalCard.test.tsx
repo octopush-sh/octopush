@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { ApprovalCard, FOCUS_CARD_CHORD, RUN_CHECK_LIMITS, focusOldestCard } from "./ApprovalCard";
+import { ApprovalCard, COMMAND_GRANT_TITLE, FOCUS_CARD_CHORD, PLAN_ONLY_COPY, RUN_CHECK_LIMITS, focusOldestCard } from "./ApprovalCard";
 import { matchShortcut, type ShortcutContext } from "../../hooks/useGlobalShortcuts";
 
 const base = { callId: "c", threadId: "t", command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3" };
@@ -17,6 +17,50 @@ describe("ApprovalCard", () => {
       "title",
       "Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)",
     );
+  });
+
+  it("a flagged command may be allowed for the conversation, exactly as written (#1229)", () => {
+    const onRespond = vi.fn();
+    render(<ApprovalCard approval={{ ...base, command: "rm -rf build", reason: "rm -rf", rememberCommand: true }} onRespond={onRespond} />);
+    const grant = screen.getByRole("button", { name: "Allow this command for this conversation" });
+    expect(grant).toHaveAttribute("title", COMMAND_GRANT_TITLE);
+    expect(COMMAND_GRANT_TITLE).toMatch(/exactly this command/);
+    fireEvent.click(grant);
+    expect(onRespond).toHaveBeenLastCalledWith("grant");
+    expect(screen.getByText(/don't ask again/)).toBeInTheDocument();
+  });
+
+  it("a force push offers no grant, and keeps don't ask again as before (#1229)", () => {
+    render(<ApprovalCard approval={{ ...base, command: "git push --force", reason: "force-push rewrites remote history" }} onRespond={() => {}} />);
+    expect(screen.queryByText(/for this conversation/)).toBeNull();
+    expect(screen.getByText(/don't ask again/)).toBeInTheDocument();
+  });
+
+  it("in Plan only a card offers no grant and says so (#1229)", () => {
+    render(<ApprovalCard approval={{ ...base, kind: "run", command: "cat /tmp/x", reason: "reaches /tmp/x outside the workspace", planOnly: true }} onRespond={() => {}} />);
+    expect(screen.getByText(PLAN_ONLY_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(/for this conversation/)).toBeNull();
+  });
+
+  it("a write outside may be allowed in its folder for the conversation, a credentials location never (#1229)", () => {
+    const onRespond = vi.fn();
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "write", command: "~/notes/out.md", reason: "writes a file outside the workspace", rememberDir: "~/notes" }}
+        onRespond={onRespond}
+      />,
+    );
+    expect(screen.getByText(/A credentials location always asks/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Allow writing ~/notes for this conversation" }));
+    expect(onRespond).toHaveBeenLastCalledWith("grant");
+    cleanup();
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "write", sensitive: true, command: "~/.ssh/config", reason: "writes a file", rememberDir: "~/.ssh", rememberCommand: true }}
+        onRespond={() => {}}
+      />,
+    );
+    expect(screen.queryByText(/for this conversation/)).toBeNull();
   });
 
   it("the secret guard's card has no don't ask again, and says when it read uncommitted changes (#819)", () => {
@@ -44,6 +88,35 @@ describe("ApprovalCard", () => {
     expect(container.querySelector("pre")?.textContent).toBe('mcp__github__merge_pr {"number":7}');
     fireEvent.click(screen.getByText(/don't ask again/));
     expect(onRespond).toHaveBeenCalledWith("always");
+    // No trust offered (Plan only, Ask first, a destructive tool): no lasting answer.
+    expect(screen.queryByText("Always allow this tool")).toBeNull();
+  });
+
+  it("an MCP card in Edit freely offers to allow the tool or trust its server, app-wide (#1243)", () => {
+    const onRespond = vi.fn();
+    const reason = "MCP tool `mcp__sample-server__post_report` may change external state (its server does not mark it read-only)";
+    const { container } = render(
+      <ApprovalCard
+        approval={{ ...base, kind: "mcp", command: "mcp__sample-server__post_report {}", reason, trustServer: "sample-server", trustTool: "post_report" }}
+        onRespond={onRespond}
+      />,
+    );
+    // The reason wraps whole: never cut with an ellipsis.
+    const line = screen.getByTestId("approval-reason");
+    expect(line.textContent).toBe(reason);
+    expect(line.className).not.toContain("truncate");
+    expect(container.querySelector('[data-tour="talk-approval-trust"]')).not.toBeNull();
+    const tool = screen.getByRole("button", { name: "Always allow this tool" });
+    expect(tool).toHaveClass("font-serif");
+    expect(tool.getAttribute("title")).toContain("let post_report run without asking in Edit freely, in every conversation");
+    fireEvent.click(tool);
+    expect(onRespond).toHaveBeenLastCalledWith("tool");
+    const server = screen.getByRole("button", { name: "Trust sample-server" });
+    expect(server.getAttribute("title")).toContain("until you revoke it in Settings › Integrations (a tool it marks destructive still asks)");
+    fireEvent.click(server);
+    expect(onRespond).toHaveBeenLastCalledWith("server");
+    // The thread-wide answer stays.
+    expect(screen.getByText(/don't ask again/)).toBeInTheDocument();
   });
 
   it("a file outside the workspace names the path, allows once, and never offers don't ask again (#1147)", () => {
@@ -123,7 +196,19 @@ describe("ApprovalCard", () => {
     expect(screen.getAllByRole("button")[0]).toHaveTextContent("Allow once");
     expect(screen.getByText(/A credentials location always asks/)).toBeInTheDocument();
     fireEvent.click(screen.getByText("Allow reading /tmp for this conversation"));
-    expect(onRemember).toHaveBeenLastCalledWith("always");
+    expect(onRemember).toHaveBeenLastCalledWith("grant");
+    cleanup();
+    // A write outside, with no folder to offer: the command itself (#1229).
+    const onGrant = vi.fn();
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "run", command: "echo x > /tmp/out.log", reason: "reaches /tmp/out.log outside the workspace", rememberCommand: true }}
+        onRespond={onGrant}
+      />,
+    );
+    fireEvent.click(screen.getByText("Allow this command for this conversation"));
+    expect(onGrant).toHaveBeenLastCalledWith("grant");
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
   });
 
   it("a plain commit's secret card doesn't mention uncommitted changes", () => {
@@ -176,6 +261,27 @@ describe("ApprovalCard at the keyboard", () => {
     // The composer's own ⌘↵ never reaches the card.
     fireEvent.keyDown(screen.getByRole("textbox", { name: "composer" }), { key: "Enter", metaKey: true });
     expect(onRespond).not.toHaveBeenCalled();
+  });
+
+  it("tells a screen reader the turn is waiting, as it appears", () => {
+    render(<ApprovalCard approval={plain} onRespond={vi.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("The turn is waiting on your answer.");
+    // The card itself stays the named group its keys answer on.
+    expect(screen.getByRole("group", { name: "Approval needed: git push --force" })).toContainElement(screen.getByRole("alert"));
+  });
+
+  it("answers no key while Talk is hidden, even with the focus left on it", () => {
+    const onRespond = vi.fn();
+    const { rerender } = render(<ApprovalCard approval={plain} onRespond={onRespond} talkActive={false} />);
+    const card = screen.getByRole("group");
+    card.focus();
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
+    fireEvent.keyDown(card, { key: "Escape" });
+    expect(onRespond).not.toHaveBeenCalled();
+    // Back in Talk, the same focus answers again.
+    rerender(<ApprovalCard approval={plain} onRespond={onRespond} talkActive />);
+    fireEvent.keyDown(screen.getByRole("group"), { key: "Escape" });
+    expect(onRespond).toHaveBeenCalledWith("deny");
   });
 
   it("ignores held keys, other chords and IME composition", () => {

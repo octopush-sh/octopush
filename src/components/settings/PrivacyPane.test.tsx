@@ -51,6 +51,7 @@ describe("PrivacyPane", () => {
       "the project's name and the mission's title (the start of its task)",
       "never code, diffs, the crew's questions or agent output",
       "Jira",
+      "Epiku",
       "GitHub",
       "LiteLLM gateway",
       "MCP servers",
@@ -86,13 +87,13 @@ describe("PrivacyPane", () => {
  *  the owner to approve at merge). */
 const APPROVED_INVENTORY = [
   "Stored on this Mac: projects, workspaces, chats, tool executions, Direct runs, token usage — in ~/Library/Application Support/octopush/octopush.db. Runs and custom pipelines leave it only if you turn on sync.",
-  "API keys: stored in ~/.octopush/settings.json. MCP servers you add in Settings: ~/.claude/mcp.json. A Token sign-in, an OAuth client secret and the values you mark Keep in Keychain go to the macOS Keychain, and mcp-remote keeps a browser sign-in in ~/.mcp-auth. A project's own .claude/mcp.json stays as written. Your account session lives in the macOS Keychain too.",
+  "API keys: stored in ~/.octopush/settings.json. MCP servers you add in Settings: ~/.claude/mcp.json. A Token sign-in, an OAuth client secret, the values you mark Keep in Keychain and your Epiku token go to the macOS Keychain, and mcp-remote keeps a browser sign-in in ~/.mcp-auth. A project's own .claude/mcp.json stays as written. Your account session lives in the macOS Keychain too.",
   "Outbound traffic, only to:" +
     "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models." +
     "Clerk for sign-in and Dodo Payments for checkout, when you use your account." +
     "Octopush's sync service, only if you turn on sync in Account." +
     "A webhook URL you set in Notify me elsewhere, only if you turn it on or send a test — a fixed label, the project's name and the mission's title (the start of its task), never code, diffs, the crew's questions or agent output." +
-    "Integrations you connect — Jira, GitHub, a LiteLLM gateway, MCP servers — and your git remotes." +
+    "Integrations you connect — Jira, Epiku, GitHub, a LiteLLM gateway, MCP servers — and your git remotes." +
     "Update checks — octopush.sh/update/latest.json and GitHub releases." +
     "LiteLLM's public pricing table on GitHub, when you refresh pricing.",
   "No analytics, no telemetry.",

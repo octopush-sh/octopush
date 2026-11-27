@@ -277,6 +277,23 @@ pub fn stage_read_only(
     }
 }
 
+/// Why a stage that chose MCP servers runs without them (its journal notice),
+/// or `None` when it gets them (#1134). Only the API substrate in the app's
+/// own drive has them for now: Claude Code and Codex stages use their CLI's
+/// servers, and a Routine or detached run would need the Keychain in the
+/// worker. Pure.
+pub fn mcp_skip_reason(api: bool, headless: bool, routine: bool) -> Option<&'static str> {
+    if !api {
+        Some("Claude Code and Codex stages use their own MCP servers for now, so the servers chosen for this stage aren't added.")
+    } else if routine {
+        Some("MCP servers aren't available in Routines yet, so this stage runs without them.")
+    } else if headless {
+        Some("MCP servers aren't available in detached runs yet, so this stage runs without them.")
+    } else {
+        None
+    }
+}
+
 /// Drives runs: one stage at a time, pausing at checkpoints.
 pub struct Orchestrator {
     db: Arc<Mutex<Db>>,
@@ -315,6 +332,10 @@ pub struct Orchestrator {
     /// session rows a mid-run ingest pass metered are dropped from it the
     /// moment the stage reports its session (#863).
     transcripts_root: std::path::PathBuf,
+    /// Talk's MCP registry, for the API stages that chose servers (#1134).
+    /// Set by the app only (`with_mcp`): the detached worker never reads the
+    /// Keychain, so its stages run without MCP and say so.
+    mcp: Option<Arc<crate::mcp::McpRegistry>>,
 }
 
 impl Orchestrator {
@@ -347,7 +368,17 @@ impl Orchestrator {
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
             transcripts_root: crate::transcripts::projects_root(),
+            mcp: None,
         }
+    }
+
+    /// Give API stages the MCP servers they chose, through `registry` (the
+    /// app's, shared with Talk). Ignored in worker mode.
+    pub fn with_mcp(mut self, registry: Arc<crate::mcp::McpRegistry>) -> Self {
+        if !self.headless {
+            self.mcp = Some(registry);
+        }
+        self
     }
 
     /// Read Claude Code transcripts from `root` instead of
@@ -388,6 +419,7 @@ impl Orchestrator {
             transcripts_root: std::env::temp_dir()
                 .join(format!("octopush-test-transcripts-{}", std::process::id()))
                 .join("none"),
+            mcp: None,
         }
     }
 
@@ -1254,6 +1286,33 @@ impl Orchestrator {
                 reference_text.push_str(extra);
             }
             let skills = crate::skills::referenced_skills(&workspace_path, &reference_text);
+            // The MCP servers the stage chose (#1134), on an API stage the app
+            // drives, started from the Settings configs pinned when the run
+            // was created. A read-only role or mission gets only read-only
+            // tools. A Routine's run is known by the `routine_id` stamped at
+            // dispatch, which outlives the Routine and its later fires.
+            let mcp_servers = self.db.lock().get_stage_mcp_servers(&stage.id)?;
+            let mcp = if mcp_servers.is_empty() {
+                None
+            } else {
+                let routine = self.db.lock().run_routine_id(&run.id)?.is_some();
+                match mcp_skip_reason(matches!(spec.substrate, AgentSubstrate::Api), self.headless, routine) {
+                    Some(why) => {
+                        self.journal_notice(&run.id, &stage.id, why);
+                        None
+                    }
+                    None => match &self.mcp {
+                        Some(registry) => Some(crate::orchestrator::runner::StageMcp {
+                            registry: Arc::clone(registry),
+                            servers: mcp_servers,
+                            pinned: Arc::new(self.db.lock().get_stage_mcp_pinned(&stage.id)?),
+                            read_only: stage_read_only || git_isolation == "readonly",
+                        }),
+                        None => None,
+                    },
+                }
+            };
+            let skill_shell_off = self.db.lock().workspace_skill_shell_off(&run.workspace_id).unwrap_or(false);
             let ctx = StageContext {
                 workspace_path,
                 task: run.task.clone(),
@@ -1269,6 +1328,8 @@ impl Orchestrator {
                 spend_limit,
                 peers,
                 quiet_claude_code: crate::settings::quiet_claude_code(),
+                mcp,
+                skill_shell_off,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

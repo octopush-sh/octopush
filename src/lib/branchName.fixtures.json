@@ -15,6 +15,9 @@
     { "task": "the a an", "key": null, "projectKey": null, "expect": "the-a-an" },
     { "task": "***", "key": null, "projectKey": null, "expect": "" },
     { "task": "", "key": "OCT-12", "projectKey": null, "expect": "OCT-12" },
+    { "task": "PROJ-12.5: add the login form", "key": null, "projectKey": "PROJ", "expect": "PROJ-12-5-add-login-form" },
+    { "task": "Wire the sample story", "key": "ST-1.1", "projectKey": null, "expect": "ST-1.1-wire-sample-story" },
+    { "task": "GUIDE-3753.fix the thing", "key": null, "projectKey": "GUIDE", "expect": "GUIDE-3753-fix" },
     { "task": "İstanbul café naïve résumé", "key": null, "projectKey": null, "expect": "istanbul-caf-nave-rsum" },
     { "task": "supercalifragilisticexpialidocious antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis floccinaucinihilipilification", "key": "VERYLONGPROJECTKEY-123456", "projectKey": null, "expect": "VERYLONGPROJECTKEY-123456-supercalifragilisticexpi" }
   ]

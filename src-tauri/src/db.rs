@@ -84,6 +84,9 @@ fn unknown_group_item_kind(kind: &str) -> crate::error::AppError {
 /// What a mission can wait for on its prerequisite (`workspaces.after_condition`).
 pub const PREREQUISITE_CONDITIONS: [&str; 2] = ["run_finished", "pr_merged"];
 
+/// How many grants one Talk conversation keeps (#1229).
+pub const MAX_THREAD_GRANTS: usize = 64;
+
 /// A refusal from the prerequisite ("Starts after") layer, worded for the user.
 fn prerequisite_error(message: impl Into<String>) -> crate::error::AppError {
     crate::error::AppError::Other(message.into())
@@ -121,6 +124,24 @@ fn parse_tools(raw: Option<String>) -> Option<Vec<String>> {
 /// Serialize an optional tool allowlist back to JSON text for storage.
 fn tools_to_json(tools: &Option<Vec<String>>) -> Option<String> {
     tools.as_ref().and_then(|t| serde_json::to_string(t).ok())
+}
+
+/// A stage's stored MCP server names (#1134); NULL or unreadable ⇒ none.
+fn parse_mcp_servers(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default()
+}
+
+/// A stage's MCP server names as stored: trimmed, sorted, each once; NULL
+/// when there are none.
+fn mcp_servers_to_json(servers: &[String]) -> Option<String> {
+    let mut names: Vec<&str> = servers.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&names).ok()
+    }
 }
 
 pub struct Db {
@@ -489,6 +510,17 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN share_with_missions TEXT NOT NULL DEFAULT ''",
         )?;
+        // "Don't run skill shell commands in crews" (#1188): 1 adds
+        // `disableSkillShellExecution` to every Claude CLI stage's `--settings`.
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN skill_shell_off INTEGER NOT NULL DEFAULT 0",
+        )?;
+        // Which issue tracker a project reads (#1127): NULL = the default
+        // (Jira where it is configured), else `jira` / `epiku` / `none`; and
+        // the Epiku project it reads, NULL = the one in Settings.
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN issue_tracker TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN epiku_project TEXT")?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -715,6 +747,10 @@ impl Db {
         // `plan` or `edit`. NULL, which every row from before the column
         // has, is Edit freely: what Talk always did.
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN permission_mode TEXT")?;
+        // A conversation's grants (`talk_guard::Grant`, #1229): a JSON array
+        // of `{kind, value, shown}`. NULL, which every row from before the
+        // column has, is none: every such call asks, as it always did.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN talk_grants TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
@@ -842,6 +878,19 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalate_model TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalate_effort TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalated INTEGER NOT NULL DEFAULT 0")?;
+        // #1134: the MCP servers a stage may use (JSON array of server
+        // names). NULL ⇒ none, the default for every stage: crews run
+        // unattended, so access is opt-in per stage.
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN mcp_servers TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN mcp_servers TEXT")?;
+        // The chosen servers' Settings configs, pinned when the run is
+        // created (JSON object name → config; `pin_run_mcp_servers`). NULL ⇒
+        // nothing pinned, so the stage starts no server.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN mcp_pinned TEXT")?;
+        // The Routine that dispatched the run, stamped once at dispatch and
+        // kept after the Routine fires again or is deleted. NULL ⇒ not a
+        // Routine's run.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN routine_id TEXT")?;
         // The escape valve: a parked stage's `ask_director` questions (JSON
         // `BlockedAsk`), NULL unless the stage is blocked awaiting the director.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_questions TEXT")?;
@@ -1176,6 +1225,23 @@ impl Db {
             );
             "#,
         )?;
+        // A Talk ask's image attachments (#1159): `path` is the file's name
+        // (`<sha256>.<ext>`) in `chat_attachments::dir()`, which several rows
+        // may share. A row goes with its message; the file goes once no row
+        // names it (`chat_attachments::remove`).
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_attachments (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id      INTEGER NOT NULL,
+                path            TEXT NOT NULL,
+                media_type      TEXT NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_attachments_message ON chat_attachments(message_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_attachments_path ON chat_attachments(path);
+            "#,
+        )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_spend_mission ON spend_events(mission_id, ts_utc);",
         )?;
@@ -1360,6 +1426,15 @@ impl Db {
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        // ── Workspace ports (#1219): the first port of the workspace's block,
+        // NULL until it first needs one (`ensure_workspace_port_base`). The
+        // partial index keeps two rows from ever holding the same block.
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN port_base INTEGER")?;
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_port_base
+                 ON workspaces(port_base) WHERE port_base IS NOT NULL;",
         )?;
 
         self.backfill_default_threads()?;
@@ -1766,6 +1841,33 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// The first port of workspace `id`'s block (#1219), allocating the lowest
+    /// free block (`workspace_ports::pick_base`, with `is_free` as the bind
+    /// test) when it has none. `None` when the workspace doesn't exist or the
+    /// range is used up. Every row counts as holding its block, archived ones
+    /// too; a deleted row's block is free again.
+    pub fn ensure_workspace_port_base(&self, id: &str, is_free: impl Fn(u16) -> bool) -> AppResult<Option<u16>> {
+        let current: Option<Option<i64>> = self
+            .conn
+            .query_row("SELECT port_base FROM workspaces WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        let Some(current) = current else { return Ok(None) };
+        if let Some(base) = current.and_then(|b| u16::try_from(b).ok()) {
+            return Ok(Some(base));
+        }
+        let taken: std::collections::HashSet<u16> = {
+            let mut stmt = self.conn.prepare("SELECT port_base FROM workspaces WHERE port_base IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            rows.filter_map(|b| b.ok().and_then(|b| u16::try_from(b).ok())).collect()
+        };
+        let Some(base) = crate::workspace_ports::pick_base(&taken, is_free) else { return Ok(None) };
+        self.conn.execute(
+            "UPDATE workspaces SET port_base = ?2 WHERE id = ?1 AND port_base IS NULL",
+            params![id, base as i64],
+        )?;
+        Ok(Some(base))
     }
 
     /// Every RUN session opened on `project_root`.
@@ -2551,6 +2653,35 @@ impl Db {
         Ok(())
     }
 
+    /// A project's issue-tracker choice and Epiku project override (#1127),
+    /// both `None` for a project that never chose (or doesn't exist).
+    pub fn project_issue_tracker(&self, project_id: &str) -> AppResult<(Option<String>, Option<String>)> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT issue_tracker, epiku_project FROM projects WHERE id = ?1",
+                params![project_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Store a project's issue-tracker choice; callers validate it
+    /// (`issue_tracker::validate_project_choice`).
+    pub fn update_project_issue_tracker(
+        &self,
+        project_id: &str,
+        tracker: Option<&str>,
+        epiku_project: Option<&str>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET issue_tracker = ?1, epiku_project = ?2 WHERE id = ?3",
+            params![tracker, epiku_project, project_id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_project_by_path(&self, path: &str) -> AppResult<Option<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, path FROM projects WHERE path = ?1",
@@ -2614,6 +2745,33 @@ impl Db {
             params![raw, id],
         )?;
         Ok(())
+    }
+
+    /// Whether the project turns off skill shell commands in its crews
+    /// (false when unset, or no such project).
+    pub fn get_project_skill_shell_off(&self, id: &str) -> AppResult<bool> {
+        let off: Option<i64> = self
+            .conn
+            .query_row("SELECT skill_shell_off FROM projects WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        Ok(off.unwrap_or(0) != 0)
+    }
+
+    pub fn set_project_skill_shell_off(&self, id: &str, off: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET skill_shell_off = ?1 WHERE id = ?2",
+            params![off as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::get_project_skill_shell_off`] for the project `workspace_id`
+    /// belongs to; false for an unknown workspace.
+    pub fn workspace_skill_shell_off(&self, workspace_id: &str) -> AppResult<bool> {
+        match self.get_workspace(workspace_id)? {
+            Some(ws) => self.get_project_skill_shell_off(&ws.project_id),
+            None => Ok(false),
+        }
     }
 
     pub fn update_project(&self, id: &str, name: Option<&str>, tint: Option<&str>) -> AppResult<()> {
@@ -2684,9 +2842,16 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn delete_project(&self, id: &str) -> AppResult<()> {
+    /// Delete a project; its workspaces (archived ones too) and their chat rows
+    /// cascade with it. Returns the attachment files no row names any more,
+    /// for `chat_attachments::remove`.
+    pub fn delete_project(&self, id: &str) -> AppResult<Vec<String>> {
+        let paths = self.chat_attachment_paths(
+            "m.workspace_id IN (SELECT id FROM workspaces WHERE project_id = ?1)",
+            params![id],
+        )?;
         self.conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
-        Ok(())
+        self.unreferenced_attachments(paths)
     }
 
     // ─── Rail groups ──────────────────────────────────────────────
@@ -3794,7 +3959,10 @@ impl Db {
         Ok(created.map(|c| c != 0).unwrap_or(false))
     }
 
-    pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
+    /// Delete a workspace; its chat rows cascade with it. Returns the
+    /// attachment files no row names any more, for `chat_attachments::remove`.
+    pub fn delete_workspace(&self, id: &str) -> AppResult<Vec<String>> {
+        let paths = self.chat_attachment_paths("m.workspace_id = ?1", params![id])?;
         // Cascade to missions in lockstep. `missions` has no FK on workspace_id
         // (it is nullable for design/probe missions), so a deleted workspace's
         // missions must be removed explicitly or they linger as active orphans.
@@ -3802,7 +3970,7 @@ impl Db {
             .execute("DELETE FROM missions WHERE workspace_id = ?1", params![id])?;
         self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
-        Ok(())
+        self.unreferenced_attachments(paths)
     }
 
     /// Mark a workspace archived (worktree removed, branch kept). The row
@@ -4023,6 +4191,34 @@ impl Db {
         Ok(raw.flatten())
     }
 
+    /// A conversation's grants (#1229), oldest first. NULL, or a value this
+    /// build can't read, is none: a grant only ever skips a card, so losing
+    /// one makes Talk ask again, never less.
+    pub fn thread_grants(&self, thread_id: &str) -> AppResult<Vec<crate::talk_guard::Grant>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT talk_grants FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+    }
+
+    /// Keep `grant` in a conversation, or revoke it (`keep: false`), and
+    /// return its grants. A grant is its kind and value: keeping one again
+    /// moves it to the end. Past [`MAX_THREAD_GRANTS`] the oldest goes.
+    pub fn set_thread_grant(&self, thread_id: &str, grant: &crate::talk_guard::Grant, keep: bool) -> AppResult<Vec<crate::talk_guard::Grant>> {
+        let mut grants = self.thread_grants(thread_id)?;
+        grants.retain(|g| !g.same(grant));
+        if keep {
+            grants.push(grant.clone());
+        }
+        let extra = grants.len().saturating_sub(MAX_THREAD_GRANTS);
+        grants.drain(..extra);
+        let value = (!grants.is_empty()).then(|| serde_json::to_string(&grants).ok()).flatten();
+        self.conn.execute("UPDATE chat_threads SET talk_grants = ?2 WHERE id = ?1", params![thread_id, value])?;
+        Ok(grants)
+    }
+
     /// The workspace a conversation belongs to, `None` once it's gone.
     pub fn chat_thread_workspace(&self, thread_id: &str) -> AppResult<Option<String>> {
         Ok(self
@@ -4121,12 +4317,57 @@ impl Db {
     }
 
     /// Delete a thread and its messages (messages are removed explicitly since
-    /// chat_messages has no FK to chat_threads).
-    pub fn delete_chat_thread(&self, thread_id: &str) -> AppResult<()> {
+    /// chat_messages has no FK to chat_threads). Returns the attachment files
+    /// no row names any more, for `chat_attachments::remove`.
+    pub fn delete_chat_thread(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let paths = self.chat_attachment_paths("m.thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_agent_log WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
+        self.unreferenced_attachments(paths)
+    }
+
+    /// The attachment files of the messages `filter` (over `chat_messages m`)
+    /// selects, each once.
+    fn chat_attachment_paths(&self, filter: &str, args: impl rusqlite::Params) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT a.path FROM chat_attachments a JOIN chat_messages m ON m.id = a.message_id WHERE {filter}"
+        ))?;
+        let rows = stmt.query_map(args, |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Those of `paths` that no attachment row names.
+    fn unreferenced_attachments(&self, paths: Vec<String>) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT EXISTS(SELECT 1 FROM chat_attachments WHERE path = ?1)")?;
+        let mut out = Vec::new();
+        for path in paths {
+            if !stmt.query_row(params![path], |r| r.get::<_, bool>(0))? {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record an image attachment of user row `message_id`.
+    pub fn add_chat_attachment(&self, message_id: i64, path: &str, media_type: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO chat_attachments (message_id, path, media_type) VALUES (?1, ?2, ?3)",
+            params![message_id, path, media_type],
+        )?;
         Ok(())
+    }
+
+    /// A thread's attachments as `(message_id, path, media_type)`, in the
+    /// order they were sent.
+    pub fn list_chat_attachments(&self, thread_id: &str) -> AppResult<Vec<(i64, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.message_id, a.path, a.media_type FROM chat_attachments a
+               JOIN chat_messages m ON m.id = a.message_id
+             WHERE m.thread_id = ?1 ORDER BY a.message_id, a.id",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// The worktree of the workspace a thread belongs to (its checkpoints
@@ -4142,6 +4383,21 @@ impl Db {
             )
             .optional()?;
         Ok(path.flatten())
+    }
+
+    /// The folder a Talk turn in `workspace_id` works in: its worktree, or
+    /// its project's root while it has none. `None` for an unknown workspace.
+    pub fn talk_workspace_path(&self, workspace_id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(NULLIF(w.worktree_path, ''), p.path) FROM workspaces w
+                   JOIN projects p ON p.id = w.project_id
+                 WHERE w.id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// The workspace a thread belongs to and its worktree, when it has one.
@@ -4262,7 +4518,14 @@ impl Db {
                  FROM chat_messages WHERE id = ?2",
                 params![thread.id, old],
             )?;
-            pairs.push((old, tx.last_insert_rowid()));
+            let new = tx.last_insert_rowid();
+            // Its images too: the copies name the same files.
+            tx.execute(
+                "INSERT INTO chat_attachments (message_id, path, media_type)
+                 SELECT ?1, path, media_type FROM chat_attachments WHERE message_id = ?2 ORDER BY id",
+                params![new, old],
+            )?;
+            pairs.push((old, new));
         }
         tx.commit()?;
         Ok((thread, draft, pairs))
@@ -4275,7 +4538,8 @@ impl Db {
     /// refused unless `message_id` is one of this thread's: an id from
     /// another thread (a view that showed the wrong rows) would cut from
     /// wherever its number falls here.
-    pub fn truncate_chat_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
+    /// Returns the attachment files no row names any more.
+    pub fn truncate_chat_after(&self, thread_id: &str, message_id: i64) -> AppResult<Vec<String>> {
         let owner: Option<Option<String>> = self
             .conn
             .query_row("SELECT thread_id FROM chat_messages WHERE id = ?1", params![message_id], |r| r.get(0))
@@ -4285,11 +4549,12 @@ impl Db {
                 "That message isn't part of this conversation, so nothing was deleted.".into(),
             ));
         }
+        let paths = self.chat_attachment_paths("m.thread_id = ?1 AND m.id >= ?2", params![thread_id, message_id])?;
         self.conn.execute(
             "DELETE FROM chat_messages WHERE thread_id = ?1 AND id >= ?2",
             params![thread_id, message_id],
         )?;
-        Ok(())
+        self.unreferenced_attachments(paths)
     }
 
     /// Record a `$`-direct command in the workspace's recall history (upsert:
@@ -5468,14 +5733,47 @@ impl Db {
         result
     }
 
-    /// List a single thread's messages in chronological order. (Scoped by
-    /// thread, not workspace — a workspace can hold several conversations.)
+    /// Close every conversation an app restart cut off mid-turn: a thread
+    /// whose last row is a turn's own `user`, `tool` or `assistant_tool_use`
+    /// row, and whose turn `running` doesn't report as still running, gets a
+    /// `stopped` row reading `note`. A `$` command's row (a `shell-` call id)
+    /// is a finished exchange, not a turn cut short. Returns the threads noted.
+    pub fn note_interrupted_talk_turns(&self, note: &str, running: &dyn Fn(&str) -> bool) -> AppResult<usize> {
+        let last: Vec<(String, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT workspace_id, thread_id, role, content FROM chat_messages
+                 WHERE id IN (SELECT MAX(id) FROM chat_messages WHERE thread_id IS NOT NULL GROUP BY thread_id)
+                   AND role IN ('user', 'tool', 'assistant_tool_use')",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut noted = 0;
+        for (workspace_id, thread_id, role, content) in last {
+            let shell = role == "tool"
+                && serde_json::from_str::<serde_json::Value>(&content)
+                    .ok()
+                    .and_then(|v| v.get("callId")?.as_str().map(|id| id.starts_with("shell-")))
+                    .unwrap_or(false);
+            if shell || running(&thread_id) {
+                continue;
+            }
+            self.insert_chat_message(&workspace_id, &thread_id, "stopped", note, None, None, None, None)?;
+            noted += 1;
+        }
+        Ok(noted)
+    }
+
+    /// List a single thread's messages in the order they were written. (Scoped
+    /// by thread, not workspace — a workspace can hold several conversations.)
+    /// Ordered by `id`, never `created_at`: a clock that steps back mid-turn
+    /// must not reorder the history.
     pub fn list_chat_messages(&self, thread_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
                     cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks,
                     raw_json, tool_use_id, model_view, error_kind
-             FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at",
+             FROM chat_messages WHERE thread_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
             Ok(ChatMessageRow {
@@ -5524,11 +5822,12 @@ impl Db {
             "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                     pos_x, pos_y, parents, tools, custom_name, instructions, effort,
-                    escalate_model, escalate_effort
+                    escalate_model, escalate_effort, mcp_servers
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
             Ok(PipelineStageRow {
+                mcp_servers: parse_mcp_servers(r.get(20)?),
                 id: r.get(0)?,
                 pipeline_id: r.get(1)?,
                 position: r.get(2)?,
@@ -5918,8 +6217,8 @@ impl Db {
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      pos_x, pos_y, parents, tools, custom_name, instructions, effort,
-                     escalate_model, escalate_effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                     escalate_model, escalate_effort, mcp_servers)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 params![Uuid::new_v4().to_string(), saved_id, i as i64, s.role, s.agent_model,
                         s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
@@ -5927,7 +6226,8 @@ impl Db {
                         s.pos_x, s.pos_y, parents_json, tools_json, custom_name, instructions,
                         s.effort.as_ref().map(|e| e.as_str()),
                         s.escalate_model.as_deref().map(str::trim).filter(|t| !t.is_empty()),
-                        s.escalate_effort.as_ref().map(|e| e.as_str())],
+                        s.escalate_effort.as_ref().map(|e| e.as_str()),
+                        mcp_servers_to_json(&s.mcp_servers)],
             )?;
         }
         tx.commit()?;
@@ -6007,15 +6307,16 @@ impl Db {
                     (id, run_id, position, role, agent_model, substrate, checkpoint, status,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      parents, tools, custom_name, instructions, effort,
-                     escalate_model, escalate_effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                     escalate_model, escalate_effort, mcp_servers)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
                         s.max_iterations,
                         parents_json, tools_json, s.custom_name, s.instructions,
                         s.effort.as_ref().map(|e| e.as_str()),
                         s.escalate_model.as_deref(),
-                        s.escalate_effort.as_ref().map(|e| e.as_str())],
+                        s.escalate_effort.as_ref().map(|e| e.as_str()),
+                        mcp_servers_to_json(&s.mcp_servers)],
             )?;
         }
         Ok(id)
@@ -6393,13 +6694,14 @@ impl Db {
             "SELECT role, agent_model, substrate, checkpoint, loop_target_position,
                     loop_max_iterations, loop_mode, max_iterations, pos_x, pos_y,
                     parents, tools, custom_name, instructions, effort,
-                    escalate_model, escalate_effort
+                    escalate_model, escalate_effort, mcp_servers
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
             let parents_json: Option<String> = r.get(10)?;
             let tools_json: Option<String> = r.get(11)?;
             Ok(StageDraft {
+                mcp_servers: parse_mcp_servers(r.get(17)?),
                 role: r.get(0)?,
                 agent_model: r.get(1)?,
                 substrate: r.get(2)?,
@@ -6487,8 +6789,8 @@ impl Db {
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      pos_x, pos_y, parents, tools, custom_name, instructions, effort,
-                     escalate_model, escalate_effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                     escalate_model, escalate_effort, mcp_servers)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 params![Uuid::new_v4().to_string(), sp.id, i as i64, st.role, st.agent_model,
                         st.substrate, st.checkpoint as i64,
                         st.loop_target_position, st.loop_max_iterations, st.loop_mode,
@@ -6499,7 +6801,8 @@ impl Db {
                         // synced `escalate_model = ""` isn't treated as a real
                         // policy that escalates to an empty model id.
                         st.escalate_model.as_deref().map(str::trim).filter(|t| !t.is_empty()),
-                        st.escalate_effort.as_ref().map(|e| e.as_str())],
+                        st.escalate_effort.as_ref().map(|e| e.as_str()),
+                        mcp_servers_to_json(&st.mcp_servers)],
             )?;
         }
         tx.commit()?;
@@ -8222,6 +8525,71 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// The MCP servers a run stage may use (copied from its template; #1134).
+    pub fn get_stage_mcp_servers(&self, stage_id: &str) -> AppResult<Vec<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT mcp_servers FROM run_stages WHERE id = ?1", params![stage_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(parse_mcp_servers(raw))
+    }
+
+    /// Pin each stage's chosen MCP servers (#1134) to their config in
+    /// `user` (the Settings servers, `mcp::load_user_servers`), once, when
+    /// the run is created. A chosen server `user` doesn't have isn't pinned,
+    /// so the stage reports it and runs without it. An existing pin is never
+    /// replaced, so the run keeps the configs from its creation whatever is
+    /// written to any file later.
+    pub fn pin_run_mcp_servers(
+        &self,
+        run_id: &str,
+        user: &std::collections::HashMap<String, crate::mcp::McpServerConfig>,
+    ) -> AppResult<()> {
+        let mut stmt = self.conn.prepare("SELECT id, mcp_servers FROM run_stages WHERE run_id = ?1 AND mcp_pinned IS NULL")?;
+        let stages = stmt
+            .query_map(params![run_id], |r| Ok((r.get::<_, String>(0)?, parse_mcp_servers(r.get::<_, Option<String>>(1)?))))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (stage_id, chosen) in stages.into_iter().filter(|(_, c)| !c.is_empty()) {
+            let pinned: std::collections::BTreeMap<&String, &crate::mcp::McpServerConfig> =
+                chosen.iter().filter_map(|name| user.get(name).map(|cfg| (name, cfg))).collect();
+            let json = serde_json::to_string(&pinned).map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+            self.conn.execute("UPDATE run_stages SET mcp_pinned = ?2 WHERE id = ?1", params![stage_id, json])?;
+        }
+        Ok(())
+    }
+
+    /// The configs pinned for a run stage's MCP servers; NULL or unreadable
+    /// ⇒ none.
+    pub fn get_stage_mcp_pinned(
+        &self,
+        stage_id: &str,
+    ) -> AppResult<std::collections::HashMap<String, crate::mcp::McpServerConfig>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT mcp_pinned FROM run_stages WHERE id = ?1", params![stage_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default())
+    }
+
+    /// Mark a run as dispatched by the Routine `routine_id`.
+    pub fn stamp_run_routine(&self, run_id: &str, routine_id: &str) -> AppResult<()> {
+        self.conn.execute("UPDATE runs SET routine_id = ?2 WHERE id = ?1", params![run_id, routine_id])?;
+        Ok(())
+    }
+
+    /// The Routine that dispatched a run (`stamp_run_routine`), if one did.
+    /// Kept after that Routine fires again or is deleted.
+    pub fn run_routine_id(&self, run_id: &str) -> AppResult<Option<String>> {
+        let id: Option<String> = self
+            .conn
+            .query_row("SELECT routine_id FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(id)
+    }
+
     /// Override a stage's tool-turn budget (used by Resume/Re-run with N turns).
     pub fn set_stage_max_iterations(&self, stage_id: &str, max_iterations: i64) -> AppResult<()> {
         self.conn.execute(
@@ -8999,6 +9367,11 @@ pub struct StageDraft {
     /// like `effort`). `None` ⇒ keep the base effort on the retry.
     #[serde(default)]
     pub escalate_effort: Option<crate::providers::Effort>,
+    /// The MCP servers (by name) an API stage may use; empty ⇒ none, the
+    /// default (#1134). Omitted from the JSON when empty, so payloads from
+    /// before it read and write as they did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
 }
 
 fn default_max_iterations() -> i64 {
@@ -9234,6 +9607,8 @@ pub struct PipelineStageRow {
     pub escalate_model: Option<String>,
     /// Escalation policy — the effort to bump to on the failed-retry (API only).
     pub escalate_effort: Option<crate::providers::Effort>,
+    /// The MCP servers an API stage may use; empty ⇒ none (#1134).
+    pub mcp_servers: Vec<String>,
 }
 
 /// A row for the canonical `spend_events` ledger.

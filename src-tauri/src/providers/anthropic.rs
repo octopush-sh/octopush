@@ -84,11 +84,13 @@ async fn post_messages(
     // A model server on this Mac gets the loopback client (no read bound).
     let client = super::client_for(api_base, client);
 
+    // No `anthropic-beta` header: the 128k-output beta served only Claude
+    // 3.7 Sonnet, which no catalog model is; every model since takes its
+    // full output cap without one.
     let resp = client
         .post(&url)
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", "output-128k-2025-02-19")
         .header("content-type", "application/json")
         .json(body)
         .send()

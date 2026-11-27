@@ -64,7 +64,12 @@ pub async fn create_session(
     }
 
     // Auto-configure context from project root.
-    let guard = ContextGuard::auto_configure(&id, root_path);
+    let mut guard = ContextGuard::auto_configure(&id, root_path);
+    // The workspace's port block (#1219), when the root is a workspace's worktree.
+    let ports = crate::workspace_ports::ensure_for_root(&state.db.lock(), &session.project_root);
+    if let Some(block) = ports {
+        guard.set_ports(block);
+    }
     // Store detected context files in the session record.
     session.context_files = guard
         .context_files
@@ -1440,6 +1445,17 @@ pub async fn project_collisions(
     .map_err(|e| AppError::Other(format!("collision scan: {e}")))
 }
 
+/// The workspace's port block (#1219), allocated now if it has none: the
+/// header shows the same range its terminals and Talk shell get. `None` when
+/// the workspace is gone or every block is taken.
+#[tauri::command]
+pub async fn workspace_ports(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<crate::workspace_ports::PortBlock>> {
+    Ok(crate::workspace_ports::ensure(&state.db.lock(), &workspace_id))
+}
+
 /// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
 /// for Mission Control's settled and needs-you cards. `None` when the
 /// workspace or its worktree is gone, it isn't a git repo, or the diff timed
@@ -1622,7 +1638,9 @@ pub async fn delete_workspace(
     // If the row can't go, the workspace stays: reinstate it in the approval
     // broker, so its next approval card isn't denied unseen.
     let deleted = state.db.lock().delete_workspace(&workspace_id);
-    state.chat.finish_workspace_delete(&workspace_id, deleted)?;
+    // Its Talk images go with its messages (#1159), unless another row names them.
+    let freed = state.chat.finish_workspace_delete(&workspace_id, deleted)?;
+    crate::chat_attachments::remove(&freed);
     crate::fleet_status::refresh_later(&app);
 
     // Its sandbox build caches go with it, unless another workspace still
@@ -1967,7 +1985,10 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
         })
         .await?;
     }
-    state.db.lock().delete_chat_thread(&thread_id)
+    // And its images, unless another conversation's row names them (#1159).
+    let freed = state.db.lock().delete_chat_thread(&thread_id)?;
+    crate::chat_attachments::remove(&freed);
+    Ok(())
 }
 
 // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
@@ -2314,6 +2335,16 @@ pub async fn list_mcp_server_status(
     Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
 }
 
+/// The Settings › Integrations servers only (`~/.claude/mcp.json`), with
+/// what the registry knows about each: the servers a Direct stage can
+/// choose (#1134). Spawns nothing.
+#[tauri::command]
+pub async fn list_user_mcp_server_status(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<crate::mcp::scope::McpServerStatus>> {
+    Ok(state.chat.mcp.status_of(&crate::mcp::load_user_servers()))
+}
+
 /// The instruction files Talk and its sub-agents follow in a worktree (its
 /// CLAUDE.md chain, or AGENTS.md), with the tokens each adds, for the
 /// Companion's "follows" row. Reads only.
@@ -2327,6 +2358,39 @@ pub async fn list_project_instructions(
     })
     .await
     .map_err(|e| AppError::Other(format!("project instructions: {e}")))
+}
+
+/// What the user trusts to run without an MCP card in Edit freely (#1243),
+/// per server, that still holds for its user-level entry (Settings ›
+/// Integrations); with a worktree, without the servers its own
+/// `.claude/mcp.json` defines, where trust never applies (the Companion).
+#[tauri::command]
+pub async fn list_mcp_trust(
+    state: State<'_, AppState>,
+    workspace_path: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let project = workspace_path.map(|w| crate::mcp::project_config(std::path::Path::new(&w))).unwrap_or_default();
+    let user = crate::mcp::load_user_config();
+    Ok(crate::mcp::trust::listed(&state.db.lock(), &user, &project))
+}
+
+/// Revoke the trust in `server`'s `tool`, or in the whole server (no tool).
+/// The next call to it asks again. Returns what is left.
+#[tauri::command]
+pub async fn revoke_mcp_trust(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    tool: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let user = crate::mcp::load_user_config();
+    let left = {
+        let db = state.db.lock();
+        crate::mcp::trust::revoke(&db, &server, tool.as_deref())?;
+        crate::mcp::trust::listed(&db, &user, &Default::default())
+    };
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+    Ok(left)
 }
 
 /// The MCP servers switched off in one Talk conversation (none by default).
@@ -2364,15 +2428,37 @@ pub async fn get_thread_permission_mode(state: State<'_, AppState>, thread_id: S
     Ok(ThreadPermissionMode { stored: stored.as_str(), effective: effective.as_str() })
 }
 
-/// Set a Talk conversation's permission mode, `plan` or `edit`; a turn that
-/// is running takes it from its next round. Ask first isn't settable yet.
+/// Set a Talk conversation's permission mode, `plan`, `ask` or `edit`; a
+/// turn that is running takes it from its next round, and notes the switch.
 #[tauri::command]
 pub async fn set_thread_permission_mode(state: State<'_, AppState>, thread_id: String, mode: String) -> AppResult<String> {
     let Some(mode) = crate::permissions::Mode::settable(&mode) else {
-        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan` or `edit`.")));
+        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan`, `ask` or `edit`.")));
     };
     state.db.lock().set_thread_permission_mode(&thread_id, mode)?;
     Ok(mode.as_str().to_string())
+}
+
+/// The grants a Talk conversation holds (#1229), oldest first: the folders
+/// its commands read and its file tools write, and the exact commands it
+/// runs, without asking. None applies in Plan only.
+#[tauri::command]
+pub async fn list_thread_grants(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<crate::talk_guard::Grant>> {
+    state.db.lock().thread_grants(&thread_id)
+}
+
+/// Revoke one of a conversation's grants and return the rest; the next
+/// call it covered asks again. Emits `chat://grants-changed`, like keeping one.
+#[tauri::command]
+pub async fn revoke_thread_grant(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    grant: crate::talk_guard::Grant,
+) -> AppResult<Vec<crate::talk_guard::Grant>> {
+    let rest = state.db.lock().set_thread_grant(&thread_id, &grant, false)?;
+    let _ = app.emit(crate::chat_engine::GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
+    Ok(rest)
 }
 
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
@@ -2421,12 +2507,17 @@ pub async fn save_mcp_config(
             }
             // A new secret value leaves the entry as it reads: restart it too.
             registry.apply_save(&old, &saved, &touched);
+            // Trust given to an entry that changed or went lapses (#1243).
+            if let Err(e) = crate::mcp::trust::prune(&db.lock(), &crate::mcp::load_user_config()) {
+                tracing::warn!(error = %e, "couldn't drop the MCP trust of a changed server");
+            }
             Ok(saved)
         },
     )
     .await
     .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
     let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ()); // Companion "can use" reloads
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
     Ok(saved)
 }
 
@@ -2697,14 +2788,20 @@ pub async fn create_run(
     stage_overrides: Option<Vec<(i64, String)>>,
 ) -> AppResult<String> {
     let overrides = stage_overrides.unwrap_or_default();
-    state.db.lock().create_run(
+    // The stages' chosen MCP servers run with their Settings configs as
+    // they are now (#1134), never a worktree's `.claude/mcp.json`.
+    let user_servers = tokio::task::spawn_blocking(crate::mcp::load_user_servers).await.unwrap_or_default();
+    let db = state.db.lock();
+    let run_id = db.create_run(
         &workspace_id,
         &pipeline_id,
         &task,
         reference_model.as_deref(),
         linked_issue_key.as_deref(),
         &overrides,
-    )
+    )?;
+    db.pin_run_mcp_servers(&run_id, &user_servers)?;
+    Ok(run_id)
 }
 
 #[tauri::command]
@@ -4084,6 +4181,13 @@ fn spawn_terminal_session(
     // terminal's span growing while output flows, with negligible cost during
     // heavy output; the span closes on its own after the idle window).
     let ws_for_activity = state.db.lock().workspace_for_terminal(&id).ok().flatten();
+    // The workspace's port block (#1219); a value the caller set wins.
+    if let Some(ws) = &ws_for_activity {
+        let ports = crate::workspace_ports::ensure(&state.db.lock(), ws);
+        if let Some(block) = ports {
+            block.apply_env(&mut env);
+        }
+    }
     let db_for_activity = std::sync::Arc::clone(&state.db);
     let last_beat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, seq, bytes| {
@@ -4914,7 +5018,9 @@ pub async fn delete_project(
 
     // Remove from database. Workspaces not listed above (archived ones) and
     // their runs cascade with the project, so refresh the Dock badge too.
-    state.db.lock().delete_project(&project_id)?;
+    // Their Talk images go too, unless another row names them (#1159).
+    let freed = state.db.lock().delete_project(&project_id)?;
+    crate::chat_attachments::remove(&freed);
     crate::fleet_status::refresh_later(&app);
     Ok(())
 }
@@ -5605,28 +5711,173 @@ fn jira_client() -> AppResult<crate::issue_tracker::jira::JiraClient> {
     Ok(crate::issue_tracker::jira::JiraClient::new(cfg))
 }
 
-/// The current user's assigned, not-done issues (the backlog).
+/// The tracker a project reads, ready to call (#1127).
+enum ProjectTracker {
+    Jira(crate::issue_tracker::jira::JiraClient),
+    Epiku(crate::issue_tracker::epiku::EpikuClient),
+}
+
+/// Whether Jira and Epiku each have a saved connection. Epiku's token is
+/// looked up only when its client is built (a Keychain read).
+fn trackers_configured(settings: &crate::settings::AppSettings) -> (bool, bool) {
+    let jira = settings.issue_tracker.as_ref().is_some_and(|j| j.is_complete());
+    let epiku = settings
+        .epiku
+        .as_ref()
+        .is_some_and(|e| !e.base_url.trim().is_empty() && !e.project.trim().is_empty());
+    (jira, epiku)
+}
+
+/// The client for `project_id`'s tracker (`resolve_tracker`). Without a
+/// project, Jira, as before projects could choose.
+fn project_tracker(state: &AppState, project_id: Option<&str>) -> AppResult<ProjectTracker> {
+    use crate::issue_tracker::TrackerKind;
+    let Some(project_id) = project_id else {
+        return Ok(ProjectTracker::Jira(jira_client()?));
+    };
+    let (choice, epiku_project) = state.db.lock().project_issue_tracker(project_id)?;
+    let settings = crate::settings::load_settings()?;
+    let (jira, epiku) = trackers_configured(&settings);
+    match crate::issue_tracker::resolve_tracker(choice.as_deref(), jira, epiku) {
+        Some(TrackerKind::Jira) => Ok(ProjectTracker::Jira(jira_client()?)),
+        Some(TrackerKind::Epiku) => {
+            let mut cfg = settings.epiku.unwrap_or_default();
+            if let Some(project) = epiku_project {
+                cfg.project = project;
+            }
+            let store = crate::issue_tracker::epiku::token_store();
+            Ok(ProjectTracker::Epiku(crate::issue_tracker::epiku::client_from(&cfg, &*store)?))
+        }
+        None => Err(AppError::Other("This project has no issue tracker.".into())),
+    }
+}
+
+/// The backlog: the user's assigned, not-done Jira issues, or the Epiku
+/// project's stories that aren't done (Epiku has no assignee filter yet).
 #[tauri::command]
-pub async fn list_my_issues() -> AppResult<Vec<crate::issue_tracker::Issue>> {
+pub async fn list_my_issues(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> AppResult<Vec<crate::issue_tracker::Issue>> {
     use crate::issue_tracker::IssueTracker;
-    jira_client()?.list_my_issues().await
+    match project_tracker(&state, project_id.as_deref())? {
+        ProjectTracker::Jira(c) => c.list_my_issues().await,
+        ProjectTracker::Epiku(c) => c.list_my_issues().await,
+    }
 }
 
 /// A single issue by key (for the active workspace's linked ticket).
 #[tauri::command]
-pub async fn get_issue(key: String) -> AppResult<crate::issue_tracker::Issue> {
+pub async fn get_issue(
+    state: State<'_, AppState>,
+    key: String,
+    project_id: Option<String>,
+) -> AppResult<crate::issue_tracker::Issue> {
     use crate::issue_tracker::IssueTracker;
-    jira_client()?.get_issue(&key).await
+    match project_tracker(&state, project_id.as_deref())? {
+        ProjectTracker::Jira(c) => c.get_issue(&key).await,
+        ProjectTracker::Epiku(c) => c.get_issue(&key).await,
+    }
 }
 
 /// All open tickets under `epic_key` (regardless of assignee). Backs the
 /// WorkContext "Epic" pill.
 #[tauri::command]
 pub async fn list_issues_in_epic(
+    state: State<'_, AppState>,
     epic_key: String,
+    project_id: Option<String>,
 ) -> AppResult<Vec<crate::issue_tracker::Issue>> {
     use crate::issue_tracker::IssueTracker;
-    jira_client()?.list_issues_in_epic(&epic_key).await
+    match project_tracker(&state, project_id.as_deref())? {
+        ProjectTracker::Jira(c) => c.list_issues_in_epic(&epic_key).await,
+        ProjectTracker::Epiku(c) => c.list_issues_in_epic(&epic_key).await,
+    }
+}
+
+/// A project's issue-tracker choice (#1127) and the tracker it reads now.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIssueTracker {
+    /// `jira`, `epiku`, `none`, or `None` for the default.
+    pub choice: Option<String>,
+    /// The Epiku project it reads; `None` = the one in Settings.
+    pub epiku_project: Option<String>,
+    /// The choice resolved against what is configured; `None` = no tracker.
+    pub active: Option<crate::issue_tracker::TrackerKind>,
+}
+
+#[tauri::command]
+pub async fn get_project_issue_tracker(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<ProjectIssueTracker> {
+    let (choice, epiku_project) = state.db.lock().project_issue_tracker(&project_id)?;
+    let (jira, epiku) = trackers_configured(&crate::settings::load_settings()?);
+    let active = crate::issue_tracker::resolve_tracker(choice.as_deref(), jira, epiku);
+    Ok(ProjectIssueTracker { choice, epiku_project, active })
+}
+
+#[tauri::command]
+pub async fn set_project_issue_tracker(
+    state: State<'_, AppState>,
+    project_id: String,
+    choice: Option<String>,
+    epiku_project: Option<String>,
+) -> AppResult<()> {
+    let (choice, epiku_project) =
+        crate::issue_tracker::validate_project_choice(choice.as_deref(), epiku_project.as_deref())
+            .map_err(AppError::Other)?;
+    state
+        .db
+        .lock()
+        .update_project_issue_tracker(&project_id, choice.as_deref(), epiku_project.as_deref())
+}
+
+/// Settings' view of the Epiku connection: base URL, project, and whether a
+/// token is kept in the Keychain. The token itself never comes back.
+#[tauri::command]
+pub async fn get_epiku_config() -> AppResult<Option<crate::issue_tracker::epiku::EpikuSettingsView>> {
+    let cfg = crate::settings::load_settings()?.epiku;
+    crate::issue_tracker::epiku::settings_view(cfg, &*crate::issue_tracker::epiku::token_store())
+}
+
+/// Keep the Epiku connection: the token (when given) in the Keychain, the
+/// base URL and project in settings.json. No token keeps the saved one, for
+/// the same base URL only. Nothing is sent to Epiku here.
+#[tauri::command]
+pub async fn save_epiku_config(
+    base_url: String,
+    project: String,
+    token: Option<String>,
+) -> AppResult<crate::issue_tracker::epiku::EpikuSettingsView> {
+    use crate::issue_tracker::epiku;
+    let prev = crate::settings::load_settings()?.epiku;
+    let store = epiku::token_store();
+    let cfg = epiku::save_connection(prev.as_ref(), &base_url, &project, token.as_deref(), &*store)
+        .map_err(AppError::Other)?;
+    crate::settings::save_epiku_config(Some(cfg.clone()))?;
+    Ok(epiku::EpikuSettingsView { base_url: cfg.base_url, project: cfg.project, has_token: true })
+}
+
+/// Forget the Epiku connection and its token.
+#[tauri::command]
+pub async fn remove_epiku_config() -> AppResult<()> {
+    let prev = crate::settings::load_settings()?.epiku;
+    let store = crate::issue_tracker::epiku::token_store();
+    crate::issue_tracker::epiku::remove_connection(prev.as_ref(), &*store).map_err(AppError::Other)?;
+    crate::settings::save_epiku_config(None)
+}
+
+/// Settings' "Connected" gate: one read of the configured project's stories
+/// with the kept token. Returns how many stories the project has.
+#[tauri::command]
+pub async fn check_epiku_connection() -> AppResult<usize> {
+    let cfg = crate::settings::load_settings()?
+        .epiku
+        .ok_or_else(|| AppError::Other("Epiku isn't set up yet.".into()))?;
+    let client = crate::issue_tracker::epiku::client_from(&cfg, &*crate::issue_tracker::epiku::token_store())?;
+    client.check_connection().await
 }
 
 /// Read the saved tracker config (token included so the Settings form can
@@ -5832,17 +6083,15 @@ pub struct WriteResult {
     pub mtime: i64,
 }
 
-/// Sync core of `read_file_checked` (testable without a tokio runtime).
+/// Sync core of `read_file_checked` (testable without a tokio runtime). A
+/// named pipe, socket or device is refused, never read (`fs_safe`, #1190).
 pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<FileReadResult> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
+    let (bytes, meta) = match crate::fs_safe::read_regular(std::path::Path::new(path), max_bytes)? {
+        crate::fs_safe::Capped::TooLarge { size } => return Ok(FileReadResult::TooLarge { size }),
+        crate::fs_safe::Capped::Read { bytes, meta } => (bytes, meta),
+    };
     let size = meta.len();
     let mtime = mtime_millis(&meta);
-    if size > max_bytes {
-        return Ok(FileReadResult::TooLarge { size });
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
     if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(FileReadResult::Binary { size, mtime });
     }
@@ -5855,7 +6104,9 @@ pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<F
 #[tauri::command]
 pub async fn read_file_checked(path: String, max_bytes: Option<u64>) -> AppResult<FileReadResult> {
     let path = expand_tilde(&path);
-    read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES))
+    tokio::task::spawn_blocking(move || read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES)))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file_checked: {e}")))?
 }
 
 /// Lines `start..=end` of a file, for Talk's `@path#L10-40` (#1046).
@@ -5880,7 +6131,8 @@ pub(crate) fn read_file_lines_inner(path: &str, start: u32, end: u32, max_bytes:
     let io = |e: std::io::Error| AppError::Other(format!("read_file_lines({path}): {e}"));
     let start = start.max(1);
     let end = end.max(start);
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+    let (file, _) = crate::fs_safe::open_regular(std::path::Path::new(path))?;
+    let mut reader = std::io::BufReader::new(file);
     if reader.fill_buf().map_err(io)?.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(LineRangeResult::Binary);
     }
@@ -5954,12 +6206,14 @@ pub async fn read_file_lines(path: String, start: u32, end: u32, max_bytes: usiz
         .map_err(|e| AppError::Other(format!("read_file_lines: {e}")))?
 }
 
-/// Kept for any non-editor callers that want a plain string read.
+/// Kept for any non-editor callers that want a plain string read. Capped
+/// like `read_file_checked`; a named pipe, socket or device is refused.
 #[tauri::command]
 pub async fn read_file(path: String) -> AppResult<String> {
     let path = expand_tilde(&path);
-    std::fs::read_to_string(&path)
-        .map_err(|e| AppError::Other(format!("read_file({}): {e}", path)))
+    tokio::task::spawn_blocking(move || crate::fs_safe::read_regular_text(std::path::Path::new(&path), READ_CAP_BYTES))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file: {e}")))?
 }
 
 /// Sync core of `write_file` (testable; returns the post-write mtime).
@@ -8015,6 +8269,7 @@ pub fn build_ai_request(
         // One-shot: the prefix is never re-sent, so a cache write would just be a
         // wasted 1.25× surcharge with no read to repay it. Keep caching off.
         cache: false,
+        cache_key: None,
     }
 }
 
@@ -8599,6 +8854,25 @@ pub async fn repo_hooks_notice(workspace_path: String) -> AppResult<Option<crate
     tokio::task::spawn_blocking(move || crate::repo_hooks::read(std::path::Path::new(&workspace_path)))
         .await
         .map_err(|e| AppError::Other(format!("repo hooks task failed: {e}")))
+}
+
+/// Direct launcher: whether the project of `workspace_id` turned on "Don't
+/// run skill shell commands in crews" (#1188). False for an unknown workspace.
+#[tauri::command]
+pub async fn skill_shell_off(state: State<'_, AppState>, workspace_id: String) -> AppResult<bool> {
+    state.db.lock().workspace_skill_shell_off(&workspace_id)
+}
+
+/// Direct launcher: turn "Don't run skill shell commands in crews" on or off
+/// for the project of `workspace_id`; every Claude CLI stage of its crews and
+/// Routines reads it when it starts.
+#[tauri::command]
+pub async fn set_skill_shell_off(state: State<'_, AppState>, workspace_id: String, off: bool) -> AppResult<()> {
+    let db = state.db.lock();
+    let ws = db
+        .get_workspace(&workspace_id)?
+        .ok_or_else(|| AppError::Other(format!("no workspace {workspace_id}")))?;
+    db.set_project_skill_shell_off(&ws.project_id, off)
 }
 
 /// Direct launcher, Readiness and Routines: the models among `models` with a

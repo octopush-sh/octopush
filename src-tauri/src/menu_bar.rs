@@ -322,7 +322,8 @@ pub fn talk_label(t: &TalkWaiting) -> String {
         (false, Some(CardKind::Mcp)) => "an MCP tool call wants approval",
         (false, Some(CardKind::Read | CardKind::Write)) => "a file outside the workspace wants approval",
         (false, Some(CardKind::Run)) => "a command reaching outside the workspace wants approval",
-        (false, None) => "a command wants approval",
+        (false, Some(CardKind::Edit)) => "a file change wants approval",
+        (false, Some(CardKind::Exec) | None) => "a command wants approval",
     };
     format!("{} · Talk — {what}", clip(t.name.trim(), NAME_MAX_CHARS))
 }

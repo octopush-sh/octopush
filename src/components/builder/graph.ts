@@ -137,6 +137,9 @@ export interface StageNodeData {
   /** Tool allowlist; null = the full workspace set (also the legacy default). */
   tools: string[] | null;
   instructions: string | null;
+  /** The MCP servers an API stage may use; absent/empty = none (the default:
+   *  crews run unattended, so access is opt-in per stage). */
+  mcpServers?: string[];
   // @xyflow requires node data to be an index signature record.
   [key: string]: unknown;
 }
@@ -195,6 +198,7 @@ export function newStageData(role: string): StageNodeData {
     maxIterations: DEFAULT_MAX_TURNS,
     tools: [...a.defaultTools],
     instructions: null,
+    mcpServers: [],
   };
 }
 
@@ -219,6 +223,7 @@ function dataFromStage(s: PipelineStage): StageNodeData {
     maxIterations: s.maxIterations ?? DEFAULT_MAX_TURNS,
     tools: s.tools ?? null,
     instructions: s.instructions ?? null,
+    mcpServers: s.mcpServers ?? [],
   };
 }
 
@@ -393,6 +398,8 @@ export function graphToStageDrafts(nodes: StageNode[], edges: StageEdge[]): Stag
       tools: d.substrate === "cli" ? null : d.tools && d.tools.length > 0 ? d.tools : null,
       customName: name && name.length > 0 ? name : null,
       instructions: instr && instr.length > 0 ? instr : null,
+      // Only the API substrate is given the stage's MCP servers for now.
+      mcpServers: d.substrate === "cli" ? [] : [...(d.mcpServers ?? [])].sort(),
     };
   });
 }

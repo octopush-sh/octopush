@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Issue, StatusCategory } from "../lib/types";
 import { ipc } from "../lib/ipc";
+import { isIssueKey } from "../lib/detectIssueKey";
 
 const STATUS_DOT: Record<StatusCategory, string> = {
   todo: "text-octo-mute",
@@ -9,16 +10,16 @@ const STATUS_DOT: Record<StatusCategory, string> = {
   unknown: "text-octo-sage",
 };
 
-const KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
-
 interface Props {
   candidates: Issue[];
   projectKey: string | null;
+  /** The project whose tracker verifies a typed key (#1127). */
+  projectId?: string | null;
   onPick: (key: string) => void;
   onCancel: () => void;
 }
 
-export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }: Props) {
+export function InlineTicketPicker({ candidates, projectKey, projectId = null, onPick, onCancel }: Props) {
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<"project" | "all">(projectKey ? "project" : "all");
   const [highlight, setHighlight] = useState(0);
@@ -40,11 +41,11 @@ export function InlineTicketPicker({ candidates, projectKey, onPick, onCancel }:
 
   useEffect(() => { setHighlight(0); }, [query, scope]);
 
-  const showFallback = results.length === 0 && KEY_RE.test(query);
+  const showFallback = results.length === 0 && isIssueKey(query);
 
   async function pickFallback() {
     try {
-      await ipc.getIssue(query);
+      await ipc.getIssue(query, projectId);
       onPick(query);
     } catch {
       // Quiet — surface remains the picker; user can clear and retry.

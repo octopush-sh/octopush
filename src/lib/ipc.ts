@@ -25,6 +25,16 @@ export type UpdateDownloadEvent =
 
 // ─── Starts after (#960) — types ───────────────────────────────────────────
 
+/** What a Talk conversation may do without asking again (#1229): read in a
+ *  folder with its commands, write in a folder with the file tools, or run
+ *  one exact command. `value` is the folder, or the command's key; `shown`
+ *  is how the Companion names it. */
+export interface TalkGrant {
+  kind: "read" | "write" | "command";
+  value: string;
+  shown: string;
+}
+
 export type PrerequisiteCondition = "run_finished" | "pr_merged";
 
 /** A mission waiting on another of its project (the Rust `PrerequisiteRow`). */
@@ -84,6 +94,8 @@ export interface PipelineStage {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none. */
+  mcpServers?: string[];
 }
 export interface Pipeline {
   id: string;
@@ -201,6 +213,9 @@ export interface StageDraft {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none,
+   *  the default. Never carried in a crew file. */
+  mcpServers?: string[];
 }
 /** One stage of a crew import's review sheet (mirrors Rust `crew::CrewStagePreview`). */
 export interface CrewStagePreview {
@@ -568,6 +583,13 @@ export interface CommittedDiff {
   diff: string;
 }
 
+/** `workspace_ports::PortBlock`: the workspace's ports, `base` up to
+ *  `base + count - 1`. */
+export interface PortBlock {
+  base: number;
+  count: number;
+}
+
 /** `git_ops::DiffSize`: files and lines from the merge base with `base` to
  *  the working tree (commits, edits and untracked files). `base` is null when
  *  the workspace has none that resolves: the size is then the uncommitted
@@ -638,6 +660,8 @@ import type {
   McpToolInfo,
   McpServerConfig,
   McpServerStatus,
+  McpTrust,
+  ApprovalAnswer,
   InstructionList,
   CreateSessionArgs,
   DirectoryEntry,
@@ -645,6 +669,8 @@ import type {
   GitStatus,
   Issue,
   IssueTrackerConfig,
+  ProjectIssueTracker,
+  EpikuConfigView,
   Mission,
   UpdatedMission,
   LogbookMissionRow,
@@ -1064,13 +1090,25 @@ export const ipc = {
   /** The approval cards still waiting on a thread, oldest first (a reloaded
    *  webview shows them again: a card waits until it is answered). */
   pendingApprovals: (threadId: string) =>
-    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run"; sensitive?: boolean; rememberDir?: string }>>(
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run"; sensitive?: boolean; rememberDir?: string; rememberCommand?: boolean; planOnly?: boolean; trustServer?: string; trustTool?: string }>>(
       "pending_approvals",
       { threadId },
     ),
-  /** Resolve an inline approval for a dangerous agent command. */
-  respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
+  /** Resolve an inline approval for a dangerous agent command. `grant` also
+   *  keeps the grant the card offers for the conversation (#1229); "tool"
+   *  and "server" an MCP card's app-wide trust (#1243). */
+  respondApproval: (callId: string, decision: ApprovalAnswer) =>
     invoke<void>("respond_approval", { callId, decision }),
+  /** A Talk conversation's grants (#1229), oldest first: the folders its
+   *  commands read and its file tools write, and the exact commands it runs,
+   *  without asking. None applies in Plan only. */
+  listThreadGrants: (threadId: string) => invoke<TalkGrant[]>("list_thread_grants", { threadId }),
+  /** Revoke one grant; resolves to the conversation's remaining grants. */
+  revokeThreadGrant: (threadId: string, grant: TalkGrant) =>
+    invoke<TalkGrant[]>("revoke_thread_grant", { threadId, grant }),
+  /** A conversation gained a grant (answered on a card). */
+  onGrantsChanged: (handler: (threadId: string) => void) =>
+    listen<{ threadId: string }>("chat://grants-changed", (e) => handler(e.payload.threadId)),
   /** Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
    *  command + output into the conversation; returns cwd/exit for the badge.
    *  Secret guard (#819): a command that commits, pushes or opens a PR
@@ -1162,6 +1200,18 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The Settings › Integrations servers only, with their live status: what
+   *  a Direct stage can choose. Spawns nothing. */
+  listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
+  /** What the user trusts to run without an MCP card in Edit freely, per
+   *  server (#1243), that still holds for its user-level entry. With a
+   *  worktree, without the servers its own `.claude/mcp.json` defines. */
+  listMcpTrust: (workspacePath?: string) =>
+    invoke<McpTrust[]>("list_mcp_trust", { workspacePath: workspacePath ?? null }),
+  /** Revoke the trust in a server's tool, or in the whole server (`tool`
+   *  null); resolves to what is left. The next call asks again. */
+  revokeMcpTrust: (server: string, tool: string | null) =>
+    invoke<McpTrust[]>("revoke_mcp_trust", { server, tool }),
   /** The instruction files Talk follows in a worktree (its CLAUDE.md chain,
    *  or AGENTS.md), each with its token estimate, and how many skipped files
    *  weren't listed. Reads only. */
@@ -1174,21 +1224,24 @@ export const ipc = {
   setThreadMcpServer: (threadId: string, server: string, off: boolean) =>
     invoke<string[]>("set_thread_mcp_server", { threadId, server, off }),
   /** A Talk conversation's permission mode, as stored and as its turns run
-   *  it: `plan` (Plan only), `edit` (Edit freely, the default) or `ask` (Ask
-   *  first, stored by a newer build). `effective` is `plan` while the
-   *  workspace's mission is read-only. Talk reads it at each round boundary. */
+   *  it: `plan` (Plan only), `ask` (Ask first) or `edit` (Edit freely, the
+   *  default). `effective` is `plan` while the workspace's mission is
+   *  read-only. Talk reads it at each round boundary. */
   getThreadPermissionMode: (threadId: string) =>
     invoke<{ stored: "plan" | "ask" | "edit"; effective: "plan" | "ask" | "edit" }>("get_thread_permission_mode", { threadId }),
-  /** Set a conversation's permission mode; resolves to the mode stored. */
-  setThreadPermissionMode: (threadId: string, mode: "plan" | "edit") =>
-    invoke<"plan" | "edit">("set_thread_permission_mode", { threadId, mode }),
-  /** Settings saved the MCP config, Reconnect restarted a server, or Talk's
-   *  discovery started (or failed to start) servers. If either subscription
-   *  fails, the other is dropped and the promise rejects. */
+  /** Set a conversation's permission mode; resolves to the mode stored. A
+   *  turn that is running takes it from its next round and notes the switch. */
+  setThreadPermissionMode: (threadId: string, mode: "plan" | "ask" | "edit") =>
+    invoke<"plan" | "ask" | "edit">("set_thread_permission_mode", { threadId, mode }),
+  /** Settings saved the MCP config, Reconnect restarted a server, Talk's
+   *  discovery started (or failed to start) servers, or the MCP trust changed
+   *  (a card's lasting answer, a revoke). If any subscription fails, the
+   *  others are dropped and the promise rejects. */
   onMcpChanged: async (handler: () => void) => {
     const subs = await Promise.allSettled([
       listen("mcp://config-changed", () => handler()),
       listen("mcp://status-changed", () => handler()),
+      listen("mcp://trust-changed", () => handler()),
     ]);
     const offs = subs.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
     const failed = subs.find((r): r is PromiseRejectedResult => r.status === "rejected");
@@ -1230,6 +1283,11 @@ export const ipc = {
    *  null when the workspace or its worktree is gone. */
   workspaceDiffSize: (workspaceId: string) =>
     invoke<DiffSize | null>("workspace_diff_size", { workspaceId }),
+  /** The workspace's block of local ports (#1219), allocated on first ask;
+   *  its Run terminals and Talk shell get it as `OCTOPUSH_PORT` and
+   *  `OCTOPUSH_PORT_COUNT`. null when the workspace is gone or none is free. */
+  workspacePorts: (workspaceId: string) =>
+    invoke<PortBlock | null>("workspace_ports", { workspaceId }),
   /** What the workspace committed since its base (Review's "Since base");
    *  null when the worktree is gone or git timed out. */
   getCommittedDiff: (workspaceId: string, ignoreWhitespace?: boolean) =>
@@ -1692,10 +1750,24 @@ export const ipc = {
     invoke<WorkspaceCacheSizes>("get_workspace_cache_sizes", { workspacePath }),
 
   // ─── Issue Tracker ────────────────────────────────────────────
-  listMyIssues: () => invoke<Issue[]>("list_my_issues"),
-  getIssue: (key: string) => invoke<Issue>("get_issue", { key }),
-  listIssuesInEpic: (epicKey: string) =>
-    invoke<Issue[]>("list_issues_in_epic", { epicKey }),
+  // `projectId` picks that project's tracker (Jira, Epiku); none = Jira.
+  listMyIssues: (projectId?: string | null) =>
+    invoke<Issue[]>("list_my_issues", { projectId: projectId ?? null }),
+  getIssue: (key: string, projectId?: string | null) =>
+    invoke<Issue>("get_issue", { key, projectId: projectId ?? null }),
+  listIssuesInEpic: (epicKey: string, projectId?: string | null) =>
+    invoke<Issue[]>("list_issues_in_epic", { epicKey, projectId: projectId ?? null }),
+  getProjectIssueTracker: (projectId: string) =>
+    invoke<ProjectIssueTracker>("get_project_issue_tracker", { projectId }),
+  setProjectIssueTracker: (projectId: string, choice: string | null, epikuProject: string | null) =>
+    invoke<void>("set_project_issue_tracker", { projectId, choice, epikuProject }),
+  getEpikuConfig: () => invoke<EpikuConfigView | null>("get_epiku_config"),
+  /** `token` null keeps the saved one (same base URL only). */
+  saveEpikuConfig: (baseUrl: string, project: string, token: string | null) =>
+    invoke<EpikuConfigView>("save_epiku_config", { baseUrl, project, token }),
+  removeEpikuConfig: () => invoke<void>("remove_epiku_config"),
+  /** The "Connected" gate: the project's story count, or the reason it failed. */
+  checkEpikuConnection: () => invoke<number>("check_epiku_connection"),
   getIssueTrackerConfig: () =>
     invoke<IssueTrackerConfig | null>("get_issue_tracker_config"),
   saveIssueTrackerConfig: (config: IssueTrackerConfig) =>
@@ -1997,9 +2069,15 @@ export const ipc = {
   /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
   codexTrustNote: (workspacePath: string) =>
     invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
-  /** The hooks and MCP servers the repo's own Claude Code config runs, or null. Read-only. */
+  /** The hooks, MCP servers and skill shell commands the repo's own Claude Code config runs, or null. Read-only. */
   repoHooksNotice: (workspacePath: string) =>
     invoke<RepoHooksNotice | null>("repo_hooks_notice", { workspacePath }),
+  /** Whether the workspace's project turned on "Don't run skill shell commands in crews". */
+  skillShellOff: (workspaceId: string) =>
+    invoke<boolean>("skill_shell_off", { workspaceId }),
+  /** Turn "Don't run skill shell commands in crews" on or off for the workspace's project. */
+  setSkillShellOff: (workspaceId: string, off: boolean) =>
+    invoke<void>("set_skill_shell_off", { workspaceId, off }),
   /** The models among `models` with a published retirement date
    *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
   modelRetirements: (models: string[]) =>
@@ -2175,12 +2253,15 @@ export interface CodexTrustNote {
   how: string;
 }
 
-/** What a worktree's committed `.claude/settings.json` (hooks, status line)
- *  and `.mcp.json` (servers) run in a Claude Code stage
- *  (`commands::repo_hooks_notice`). */
+/** What a worktree's committed `.claude/settings.json` (hooks, status line),
+ *  `.mcp.json` (servers) and skills and commands (inline shell commands) run
+ *  in a Claude Code stage (`commands::repo_hooks_notice`). */
 export interface RepoHooksNotice {
   hooks: { event: string; matcher: string | null; kind: "command" | "http" | "mcp_tool" | "status_line"; runs: string }[];
   servers: { name: string; runs: string }[];
+  /** Each `!`…`` or ```! block of `.claude/skills/<skill>/SKILL.md` or
+   *  `.claude/commands/<skill>.md`, run as the skill loads. */
+  skillShells: { skill: string; command: string }[];
   /** SHA-256 over the canonical JSON of every entry. */
   hash: string;
 }

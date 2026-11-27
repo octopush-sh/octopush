@@ -397,6 +397,22 @@ export interface McpToolInfo {
   description: string;
 }
 
+/** What the user trusts to run without an MCP approval card in Edit freely
+ *  (#1243), app-wide: the whole server (`all`, "Trust <server>") and the
+ *  tools allowed one by one (`tools`, "Always allow this tool"), bound to
+ *  the server's user-level entry (`config`, its fingerprint). A tool its
+ *  server marks destructive asks whatever this says. */
+export interface McpTrust {
+  server: string;
+  config: string;
+  all: boolean;
+  tools: string[];
+}
+
+/** An answer to an approval card: "tool" and "server" are an MCP card's
+ *  lasting answers (#1243). */
+export type ApprovalAnswer = "approve" | "always" | "grant" | "deny" | "tool" | "server";
+
 /** What Talk's MCP registry knows about one configured server
  *  (`list_mcp_server_status`): running with N tools, not started yet (it
  *  starts on first use), or failed with the first line of why. `tools` is
@@ -1258,12 +1274,34 @@ export interface Issue {
   blockedBy?: LinkedIssueRef[];
   /** Direct children of this ticket. */
   subtasks?: LinkedIssueRef[];
+  /** The ticket's description as plain text (Jira's ADF converted, cut at
+   *  8,000 characters). Populated by getIssue; null for list payloads. */
+  description?: string | null;
 }
 
 export interface IssueTrackerConfig {
   baseUrl: string;
   email: string;
   apiToken: string;
+}
+
+/** The trackers a project can read (#1127). */
+export type TrackerKind = "jira" | "epiku";
+
+/** A project's tracker choice (`get_project_issue_tracker`): `choice` null is
+ *  the default (Jira where it's configured); `active` is what it reads now. */
+export interface ProjectIssueTracker {
+  choice: TrackerKind | "none" | null;
+  /** The Epiku project it reads; null = the one in Settings. */
+  epikuProject: string | null;
+  active: TrackerKind | null;
+}
+
+/** Settings' view of the Epiku connection. The token never comes back. */
+export interface EpikuConfigView {
+  baseUrl: string;
+  project: string;
+  hasToken: boolean;
 }
 
 // ─── Templates ────────────────────────────────────────────────────
