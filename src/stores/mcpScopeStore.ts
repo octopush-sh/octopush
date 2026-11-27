@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
-import type { McpServerStatus } from "../lib/types";
+import type { McpServerStatus, McpTrust } from "../lib/types";
 
 /** Which MCP servers each Talk conversation can use, and what Talk's registry
  *  knows about each server (the Companion's "can use" chips).
@@ -23,6 +23,18 @@ interface McpScopeState {
    *  server, and the last one's answer is the list shown. A failed write
    *  re-reads the list. Resolves false when ignored or failed. */
   toggle: (threadId: string, server: string) => Promise<boolean>;
+  /** What the user trusts to run without an MCP card in Edit freely
+   *  (#1243), app-wide (Settings › Integrations, the Companion's chips). */
+  trust: McpTrust[];
+  loadTrust: () => Promise<void>;
+  /** Revoke a server's tool, or the whole server (`tool` null); the list
+   *  becomes what the backend kept. A failure re-reads it and resolves false. */
+  revokeTrust: (server: string, tool: string | null) => Promise<boolean>;
+}
+
+/** The trust for `server`, if any. */
+export function trustFor(trust: McpTrust[], server: string): McpTrust | undefined {
+  return trust.find((t) => t.server === server && (t.all || t.tools.length > 0));
 }
 
 /** Bumped per path by every status load, so a slower, older answer never
@@ -34,10 +46,35 @@ const statusSeq: Record<string, number> = {};
 const offSeq: Record<string, number> = {};
 /** The tail of each thread's queue of writes. */
 const writeTail: Record<string, Promise<unknown>> = {};
+/** Bumped by every trust read and revoke: only the newest answer is kept. */
+let trustSeq = 0;
 
 export const useMcpScopeStore = create<McpScopeState>((set, get) => ({
   statusByPath: {},
   offByThread: {},
+  trust: [],
+
+  loadTrust: async () => {
+    const seq = ++trustSeq;
+    try {
+      const trust = await ipc.listMcpTrust();
+      if (seq === trustSeq && Array.isArray(trust)) set({ trust });
+    } catch {
+      // Keep the last reading.
+    }
+  },
+
+  revokeTrust: async (server, tool) => {
+    const seq = ++trustSeq;
+    try {
+      const trust = await ipc.revokeMcpTrust(server, tool);
+      if (seq === trustSeq) set({ trust });
+      return true;
+    } catch {
+      await get().loadTrust();
+      return false;
+    }
+  },
 
   loadStatus: async (worktreePath) => {
     const seq = (statusSeq[worktreePath] = (statusSeq[worktreePath] ?? 0) + 1);

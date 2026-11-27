@@ -10,9 +10,12 @@ import {
   ChevronRight,
   Copy,
   Globe,
+  ShieldCheck,
+  X,
 } from "lucide-react";
 import { ipc } from "../../lib/ipc";
-import type { McpFailure, McpServerConfig } from "../../lib/types";
+import type { McpFailure, McpServerConfig, McpTrust } from "../../lib/types";
+import { trustFor, useMcpScopeStore } from "../../stores/mcpScopeStore";
 import { tourId } from "../../lib/tour/ids";
 import { copyToClipboard } from "../../lib/clipboard";
 import { pushToast } from "../Toasts";
@@ -65,6 +68,10 @@ export function mcpFailureFrom(e: unknown): McpFailure {
  *
  * Project-level `.claude/mcp.json` in a repo is also honored at runtime but
  * is edited in the repo, not here.
+ *
+ * What the user trusts to run without a Talk card (#1243) is listed on its
+ * server's row, each line revocable; a trusted server with no row here (a
+ * project's own) gets a row of its own, so every trust can be revoked.
  */
 export function McpServersSection() {
   const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
@@ -72,6 +79,7 @@ export function McpServersSection() {
   const [tests, setTests] = useState<Record<string, TestState>>({});
   const [form, setForm] = useState<FormState | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
+  const trust = useMcpScopeStore((s) => s.trust);
   // Per server, bumped when its entry is saved, renamed or removed: a Test
   // or Reconnect started before then reports on an entry that's gone, so
   // its result is dropped.
@@ -88,7 +96,14 @@ export function McpServersSection() {
       .then((cfg) => setServers(cfg ?? {}))
       .catch((e) => pushToast({ level: "error", title: "Couldn't load MCP config", body: String(e) }))
       .finally(() => setLoaded(true));
+    void useMcpScopeStore.getState().loadTrust();
   }, []);
+
+  async function revoke(server: string, tool: string | null) {
+    if (!(await useMcpScopeStore.getState().revokeTrust(server, tool))) {
+      pushToast({ level: "error", title: "Couldn't revoke the trust", body: "Nothing changed. Try again." });
+    }
+  }
 
   /** Save the entries; `secrets` (server → env name → typed value) go to the
    *  Keychain, `renamed` (new name → old) moves a renamed server's items and its
@@ -223,6 +238,7 @@ export function McpServersSection() {
   if (!loaded) return null;
 
   const entries = Object.entries(servers).sort(([a], [b]) => a.localeCompare(b));
+  const elsewhere = trust.filter((t) => !Object.hasOwn(servers, t.server) && trustFor(trust, t.server));
   const formFor = (mode: FormState) => {
     const original = mode.mode === "edit" ? mode.original : null;
     const oauth = original !== null && servers[original]?.remote?.auth === "oauth";
@@ -240,7 +256,7 @@ export function McpServersSection() {
   };
 
   return (
-    <div className="mt-10">
+    <div className="mt-10" data-tour="settings-mcp-servers">
       <SectionLabel>MCP Servers</SectionLabel>
       <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
         Model Context Protocol servers whose tools become available to Talk: a
@@ -331,9 +347,17 @@ export function McpServersSection() {
                 </div>
               )}
               {test.kind === "error" && <FailureLine failure={test.failure} />}
+              <TrustLines trust={trustFor(trust, key)} onRevoke={(tool) => void revoke(key, tool)} />
             </div>
           );
         })}
+        {elsewhere.map((t) => (
+          <div key={t.server} className="octo-rise-in rounded-md border border-octo-hairline bg-octo-panel px-3 py-2.5">
+            <span className="font-mono text-[12px] text-octo-brass">{t.server}</span>
+            <span className="ml-3 text-[11px] text-octo-mute">not configured here (a project&apos;s own server, or removed)</span>
+            <TrustLines trust={t} onRevoke={(tool) => void revoke(t.server, tool)} />
+          </div>
+        ))}
       </div>
 
       {form?.mode === "add" ? (
@@ -349,6 +373,37 @@ export function McpServersSection() {
           <Plus size={12} /> Add MCP server
         </button>
       )}
+    </div>
+  );
+}
+
+/** What the user trusts on a server (#1243): the whole server and the tools
+ *  allowed one by one, from a Talk card's lasting answers, each with a
+ *  revoke button. Nothing when there is none. */
+export function TrustLines({ trust, onRevoke }: { trust: McpTrust | undefined; onRevoke: (tool: string | null) => void }) {
+  if (!trust) return null;
+  const lines: Array<[string | null, string]> = [
+    ...(trust.all ? [[null, "every tool (one it marks destructive still asks)"] as [null, string]] : []),
+    ...trust.tools.map((t): [string, string] => [t, t]),
+  ];
+  return (
+    <div className="octo-fade-in mt-1.5 text-[11px] leading-[1.5]" data-tour="settings-mcp-trust">
+      <div className="text-octo-mute">Runs without asking in Talk&apos;s Edit freely, in every conversation:</div>
+      {lines.map(([tool, label]) => (
+        <div key={tool ?? "*"} className="flex items-center gap-1.5">
+          <ShieldCheck size={11} aria-hidden className="shrink-0 text-octo-mute" />
+          <span className={tool ? "font-mono text-octo-sage" : "text-octo-sage"}>{label}</span>
+          <button
+            type="button"
+            onClick={() => onRevoke(tool)}
+            aria-label={tool ? `Revoke ${tool}` : `Revoke the trust in ${trust.server}`}
+            title="Revoke: its next call asks again"
+            className={iconButtonClass}
+          >
+            <X size={11} />
+          </button>
+        </div>
+      ))}
     </div>
   );
 }

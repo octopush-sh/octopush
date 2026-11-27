@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { Server } from "lucide-react";
+import { Server, ShieldCheck } from "lucide-react";
 import { ipc } from "../lib/ipc";
-import type { McpServerStatus } from "../lib/types";
+import type { McpServerStatus, McpTrust } from "../lib/types";
 import { useChatStore } from "../stores/chatStore";
-import { useMcpScopeStore } from "../stores/mcpScopeStore";
+import { trustFor, useMcpScopeStore } from "../stores/mcpScopeStore";
 import { CompanionCatalogCounts, useTalkCatalog } from "./CompanionCatalog";
 
 // Stable empties so the selectors never hand React a fresh array per render.
@@ -12,9 +12,16 @@ const NONE_OFF: string[] = [];
 
 const EASE = "transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)]";
 
-/** A chip's tooltip: the server, what Talk knows about it, and what a click
- *  does. Pure so the copy is tested. */
-export function chipTitle(s: McpServerStatus, off: boolean, canToggle: boolean): string {
+/** What the user trusts on a server (#1243), as a chip's tooltip says it. */
+export function trustTitle(t: McpTrust | undefined): string {
+  if (!t) return "";
+  const what = [t.all ? "every tool" : "", t.tools.length ? t.tools.join(", ") : ""].filter(Boolean).join(" and ");
+  return ` · runs ${what} without asking in Edit freely (Settings › Integrations revokes it)`;
+}
+
+/** A chip's tooltip: the server, what Talk knows about it, what the user
+ *  trusts on it, and what a click does. Pure so the copy is tested. */
+export function chipTitle(s: McpServerStatus, off: boolean, canToggle: boolean, trust?: McpTrust): string {
   if (off) return `${s.name} · off in this conversation${canToggle ? " · click to turn it back on" : ""}`;
   const state =
     s.state === "connected"
@@ -24,7 +31,7 @@ export function chipTitle(s: McpServerStatus, off: boolean, canToggle: boolean):
       : s.state === "failed"
         ? `failed${s.reason ? `: ${s.reason}` : ""}`
         : "not started yet · it starts on first use";
-  return `${s.name} · ${state}${canToggle ? " · click to turn off in this conversation" : ""}`;
+  return `${s.name} · ${state}${trustTitle(trust)}${canToggle ? " · click to turn off in this conversation" : ""}`;
 }
 
 /** The server icon's colour carries the state (its title says it in words):
@@ -44,6 +51,7 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
   const streaming = useChatStore((s) => s.streamingByWs[workspaceId] ?? false);
   const status = useMcpScopeStore((s) => (worktreePath ? s.statusByPath[worktreePath] : undefined) ?? NO_STATUS);
   const loadedOff = useMcpScopeStore((s) => (threadId ? s.offByThread[threadId] : undefined));
+  const trust = useMcpScopeStore((s) => s.trust);
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
@@ -64,6 +72,7 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
 
   useEffect(() => {
     if (worktreePath) void useMcpScopeStore.getState().loadStatus(worktreePath);
+    void useMcpScopeStore.getState().loadTrust();
   }, [worktreePath, threadId, streaming, tick]);
 
   useEffect(() => {
@@ -72,7 +81,7 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
 
   // Clicks wait for the thread's own list: a list still loading (a thread
   // switch) would otherwise be toggled from another conversation's state.
-  return { threadId, status, off: loadedOff ?? NONE_OFF, loaded: loadedOff !== undefined };
+  return { threadId, status, trust, off: loadedOff ?? NONE_OFF, loaded: loadedOff !== undefined };
 }
 
 /**
@@ -84,7 +93,7 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
  * is no server, skill or agent.
  */
 export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?: string; workspaceId?: string }) {
-  const { threadId, status, off, loaded } = useMcpScope(worktreePath, workspaceId ?? "");
+  const { threadId, status, trust, off, loaded } = useMcpScope(worktreePath, workspaceId ?? "");
   const catalog = useTalkCatalog(worktreePath, workspaceId ?? "");
   if (status.length === 0 && catalog.skills.length === 0 && catalog.agents.length === 0) return null;
   return (
@@ -101,7 +110,8 @@ export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?
       </span>
       {status.map((s) => {
         const isOff = off.includes(s.name);
-        const title = chipTitle(s, isOff, !!threadId);
+        const trusted = trustFor(trust, s.name);
+        const title = chipTitle(s, isOff, !!threadId, trusted);
         const body = (
           <>
             <Server size={10} aria-hidden className={`shrink-0 ${EASE} ${chipTone(s.state, isOff)}`} />
@@ -112,6 +122,7 @@ export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?
             >
               {s.name}
             </span>
+            {trusted && !isOff && <ShieldCheck size={9} aria-hidden data-testid="chip-trusted" className="octo-pop-in shrink-0 text-octo-mute" />}
           </>
         );
         if (!threadId) {

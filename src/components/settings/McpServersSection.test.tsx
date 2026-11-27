@@ -6,6 +6,8 @@ const saveMcpConfig = vi.fn();
 const testMcpServer = vi.fn();
 const reconnectMcpServer = vi.fn();
 const clearMcpSignIn = vi.fn();
+const listMcpTrust = vi.fn();
+const revokeMcpTrust = vi.fn();
 const copyToClipboard = vi.fn();
 const pushToast = vi.fn();
 vi.mock("../../lib/ipc", () => ({
@@ -15,6 +17,8 @@ vi.mock("../../lib/ipc", () => ({
     testMcpServer: (...a: unknown[]) => testMcpServer(...a),
     reconnectMcpServer: (...a: unknown[]) => reconnectMcpServer(...a),
     clearMcpSignIn: (...a: unknown[]) => clearMcpSignIn(...a),
+    listMcpTrust: () => listMcpTrust(),
+    revokeMcpTrust: (...a: unknown[]) => revokeMcpTrust(...a),
   },
 }));
 vi.mock("../../lib/clipboard", () => ({ copyToClipboard: (...a: unknown[]) => copyToClipboard(...a) }));
@@ -752,5 +756,29 @@ describe("McpServersSection", () => {
       expect(servers["example-remote"].secret_env).toEqual(["OCTOPUSH_MCP_H_AUTHORIZATION"]);
       expect(secrets).toEqual({ "example-remote": {} });
     });
+  });
+});
+
+describe("McpServersSection trust (#1243)", () => {
+  it("lists what each server is trusted with, a project's own server too, and revokes a line at once", async () => {
+    getMcpConfig.mockReset().mockResolvedValue({ "sample-server": { command: "sample", args: [] } });
+    listMcpTrust.mockReset().mockResolvedValue([
+      { server: "sample-server", all: true, tools: ["post_report"] },
+      { server: "project-server", all: false, tools: ["create_note"] },
+    ]);
+    revokeMcpTrust.mockReset().mockResolvedValue([{ server: "sample-server", all: true, tools: [] }, { server: "project-server", all: false, tools: ["create_note"] }]);
+    render(<McpServersSection />);
+    await settle();
+    await settle();
+    expect(screen.getByText("every tool (one it marks destructive still asks)")).toBeInTheDocument();
+    expect(screen.getByText("post_report")).toBeInTheDocument();
+    expect(screen.getByText("create_note")).toBeInTheDocument();
+    expect(screen.getByText(/not configured here/)).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Revoke post_report" }));
+    });
+    expect(revokeMcpTrust).toHaveBeenCalledWith("sample-server", "post_report");
+    expect(screen.queryByText("post_report")).toBeNull();
+    expect(screen.getByRole("button", { name: "Revoke the trust in sample-server" })).toBeInTheDocument();
   });
 });

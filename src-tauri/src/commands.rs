@@ -2334,6 +2334,31 @@ pub async fn list_project_instructions(
     .map_err(|e| AppError::Other(format!("project instructions: {e}")))
 }
 
+/// What the user trusts to run without an MCP card in Edit freely (#1243),
+/// per server: Settings › Integrations and the Companion list it.
+#[tauri::command]
+pub async fn list_mcp_trust(state: State<'_, AppState>) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    Ok(crate::mcp::trust::load(&state.db.lock()))
+}
+
+/// Revoke the trust in `server`'s `tool`, or in the whole server (no tool).
+/// The next call to it asks again. Returns what is left.
+#[tauri::command]
+pub async fn revoke_mcp_trust(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    tool: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let left = {
+        let db = state.db.lock();
+        crate::mcp::trust::revoke(&db, &server, tool.as_deref())?;
+        crate::mcp::trust::load(&db)
+    };
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+    Ok(left)
+}
+
 /// The MCP servers switched off in one Talk conversation (none by default).
 #[tauri::command]
 pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<String>> {

@@ -840,10 +840,13 @@ pub struct SubagentGate {
     pub label: String,
     /// The worktree the secret guard scans before a commit or push (#819).
     pub workspace_path: String,
-    /// MCP tools (namespaced) the server did not mark read-only: a call
-    /// may change external state (create an issue, post a comment), so it
-    /// asks the user first — nobody is watching a sub-agent otherwise.
-    pub mcp_writes: std::collections::HashSet<String>,
+    /// The MCP tools the fan-out discovered: one that may change external
+    /// state (create an issue, post a comment) asks the user first, as the
+    /// director's does (`talk_guard::McpTools::card`, #1243): nobody is
+    /// watching a sub-agent otherwise.
+    mcp: crate::talk_guard::McpTools,
+    /// The thread's mode, read at each call (Edit freely when unset).
+    mode: Option<crate::permissions::ModeSource>,
     /// Where the file tools may go without asking: the workspace.
     reach: crate::talk_guard::Reach,
     /// The mission's sandbox refuses a write outside the workspace itself.
@@ -861,7 +864,8 @@ impl SubagentGate {
             call_id: spec.call_id.clone(),
             label: spec.call.description.clone(),
             workspace_path: spec.workspace_path.clone(),
-            mcp_writes: std::collections::HashSet::new(),
+            mcp: crate::talk_guard::McpTools::default(),
+            mode: None,
             reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
             writes_confined: spec.sandbox_roots.is_some(),
             seq: AtomicU64::new(1),
@@ -875,17 +879,21 @@ impl SubagentGate {
         self
     }
 
-    /// Gate the MCP tools among `discovered` that are not read-only.
-    pub fn with_mcp_writes(mut self, discovered: &[crate::mcp::McpToolInfo]) -> Self {
-        self.mcp_writes = discovered.iter().filter(|t| !t.read_only).map(|t| t.namespaced.clone()).collect();
+    /// Gate the MCP tools among `discovered` that may write, in the thread's
+    /// `mode` as it is at each call.
+    pub fn with_mcp(mut self, discovered: &[crate::mcp::McpToolInfo], mode: crate::permissions::ModeSource) -> Self {
+        self.mcp = crate::talk_guard::McpTools::new(discovered);
+        self.mode = Some(mode);
         self
     }
 }
 
-/// The reason and denial for an MCP tool the server did not mark read-only.
-/// `label` names the sub-agent that asks; the director's card has none.
-pub fn mcp_gate_texts(label: Option<&str>, tool: &str) -> (String, String) {
-    let reason = format!("MCP tool `{tool}` may change external state (its server does not mark it read-only)");
+/// The reason and denial for an MCP tool the server did not mark read-only
+/// (or marked destructive). `label` names the sub-agent that asks; the
+/// director's card has none.
+pub fn mcp_gate_texts(label: Option<&str>, tool: &str, destructive: bool) -> (String, String) {
+    let why = if destructive { "its server marks it destructive" } else { "its server does not mark it read-only" };
+    let reason = format!("MCP tool `{tool}` may change external state ({why})");
     (
         match label {
             Some(label) => format!("Sub-agent \u{201c}{label}\u{201d}: {reason}"),
@@ -949,8 +957,9 @@ impl ToolGate for SubagentGate {
             // checked again once approved (`guard_card`).
             let label = Some(self.label.as_str());
             let check = || {
-                if self.mcp_writes.contains(name) {
-                    Some(crate::talk_guard::mcp_card(label, name, input))
+                if self.mcp.contains(name) {
+                    let mode = self.mode.as_ref().map_or(crate::permissions::Mode::Edit, |m| m());
+                    self.mcp.card(label, name, input, mode, &self.broker.mcp_trust())
                 } else {
                     self.reach.outside_card(label, name, input, self.writes_confined)
                 }
@@ -966,8 +975,8 @@ impl ToolGate for SubagentGate {
             .await_approval(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason)
             .await
         {
-            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => None,
             ApprovalDecision::Deny => Some(denial),
+            _ => None,
         }
     }
 }
@@ -1371,8 +1380,9 @@ pub async fn run_one_subagent(
     let planned = SubagentSpec { plan: Some(plan.clone()), ..spec.clone() };
     let spec = &mode_spec(&db, &planned);
     let model = plan.model.clone();
+    let mode = crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone());
     let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
-        .with_mcp_writes(mcp_tools)
+        .with_mcp(mcp_tools, mode)
         .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
     let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));
     let external = McpSubagentTools::granted(
@@ -2376,7 +2386,7 @@ mod tests {
         assert_eq!(calls.len(), 1, "the denied write never reached the server: {calls:?}");
         assert_eq!(calls[0].0, "mcp__jira__get_issue");
         // The gate's write set comes from the servers' read-only annotations.
-        let (reason, denial) = mcp_gate_texts(Some("Ticket"), "mcp__jira__add_comment");
+        let (reason, denial) = mcp_gate_texts(Some("Ticket"), "mcp__jira__add_comment", false);
         assert!(reason.starts_with("Sub-agent \u{201c}Ticket\u{201d}: MCP tool"));
         assert!(reason.contains("may change external state") && denial.contains("do not retry"));
     }
@@ -2454,8 +2464,8 @@ mod tests {
     fn mcp_tools_are_filtered_by_the_definition_grant() {
         use crate::mcp::{McpRegistry, McpToolInfo};
         let discovered = vec![
-            McpToolInfo { server: "jira".into(), name: "get_issue".into(), namespaced: "mcp__jira__get_issue".into(), description: String::new(), input_schema: serde_json::json!({}), read_only: true },
-            McpToolInfo { server: "github".into(), name: "list_prs".into(), namespaced: "mcp__github__list_prs".into(), description: String::new(), input_schema: serde_json::json!({}), read_only: false },
+            McpToolInfo { server: "jira".into(), name: "get_issue".into(), namespaced: "mcp__jira__get_issue".into(), read_only: true, ..Default::default() },
+            McpToolInfo { server: "github".into(), name: "list_prs".into(), namespaced: "mcp__github__list_prs".into(), ..Default::default() },
         ];
         let reg = Arc::new(McpRegistry::new());
         let names = |d: Option<&AgentDefinition>| -> Vec<String> {
@@ -2988,6 +2998,7 @@ mod tests {
             description: String::new(),
             input_schema: serde_json::json!({"type": "object"}),
             read_only,
+            ..Default::default()
         }
     }
 

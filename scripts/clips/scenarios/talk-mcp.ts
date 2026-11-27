@@ -1,7 +1,8 @@
 // `talk-mcp` — `default`, with three MCP servers configured for the active
 // workspace: `docs-server` connected with 12 tools, `example-remote` failed to
 // start, `issue-tracker` not started yet and switched off in the open
-// conversation. Shows the Companion's "can use" chips and their states.
+// conversation; `docs-server`'s `search_docs` is always allowed (#1243). Shows
+// the Companion's "can use" chips and their states.
 import type { Scenario } from "./types";
 import type { McpServerStatus } from "../../../src/lib/types";
 import { defaultScenario, DEFAULT_FIXTURES } from "./default";
@@ -24,6 +25,7 @@ export const talkMcp: Scenario = {
   commands: {
     ...defaultScenario.commands,
     list_mcp_server_status: STATUS,
+    list_mcp_trust: [{ server: "docs-server", all: false, tools: ["search_docs"] }],
     get_thread_mcp_disabled: (a) => off[String(a.threadId)] ?? [],
     set_thread_mcp_server: (a) => {
       const t = String(a.threadId);

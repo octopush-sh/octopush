@@ -1,15 +1,17 @@
 //! What a Talk agent's tool call may reach without asking (#1147): the file
-//! tools stay in the workspace, and an MCP tool its server doesn't mark
-//! read-only asks first. Each check returns the card the call must pass
+//! tools stay in the workspace, and an MCP tool that may write asks first
+//! ([`McpTools::card`], #1243). Each check returns the card the call must pass
 //! ([`ToolCard`]) or `None`; the `ApprovalBroker` asks. A `run_command` that
 //! names a path outside the workspace or in a credentials location asks too
 //! (#1201, [`Reach::command_card`]): a net over the words of the command,
 //! not a sandbox, since a shell can build a path no check sees.
 
 use crate::chat_engine::{CommandWord, WordRole};
+use crate::mcp::trust::McpTrust;
+use crate::permissions::Mode;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 /// What a card asks about when it isn't a destructive shell command.
@@ -50,6 +52,9 @@ pub struct ToolCard {
     /// thread's commands read from then on, and how the card names it
     /// (#1201): only on a command's card for a read outside the workspace.
     pub remember: Option<(PathBuf, String)>,
+    /// The server and tool an MCP card offers to trust for good (#1243):
+    /// only in Edit freely, and never for a tool marked destructive.
+    pub trust: Option<(String, String)>,
 }
 
 /// An MCP card shows a string argument up to this long, a longer one (a
@@ -57,11 +62,94 @@ pub struct ToolCard {
 const MCP_ARG_SHOWN: usize = 160;
 const MCP_ARGS_MAX: usize = 400;
 
-/// The card for an MCP tool its server does not mark read-only. `label`
-/// names the sub-agent that asks.
-pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value) -> ToolCard {
-    let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool);
-    ToolCard { kind: CardKind::Mcp, shown: format!("{tool} {}", mcp_args_shown(input)), reason, denial, sensitive: false, remember: None }
+/// The card for an MCP tool its server does not mark read-only (or marks
+/// `destructive`). `label` names the sub-agent that asks.
+pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value, destructive: bool) -> ToolCard {
+    let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool, destructive);
+    let shown = format!("{tool} {}", mcp_args_shown(input));
+    ToolCard { kind: CardKind::Mcp, shown, reason, denial, sensitive: false, remember: None, trust: None }
+}
+
+/// What an MCP tool's server says about it, as a card reads it (#1243).
+/// Hints and names are the server's own claims; nothing here checks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpClass {
+    /// `readOnlyHint: true`: no card in any mode.
+    ReadOnly,
+    /// `destructiveHint: false`, or neither hint and a read verb name
+    /// ([`read_verb_name`]): no card in Edit freely.
+    Reads,
+    /// Anything else: asks, unless the user trusts it (Edit freely only).
+    Writes,
+    /// `destructiveHint: true`: always asks, whatever the name or trust.
+    Destructive,
+}
+
+pub fn mcp_class(t: &crate::mcp::McpToolInfo) -> McpClass {
+    match t.destructive {
+        Some(true) => McpClass::Destructive,
+        _ if t.read_only => McpClass::ReadOnly,
+        Some(false) => McpClass::Reads,
+        None if !t.annotated && read_verb_name(&t.name) => McpClass::Reads,
+        None => McpClass::Writes,
+    }
+}
+
+/// The verbs a tool's name may start with to read as a read (#1243).
+const READ_VERBS: &[&str] =
+    &["get", "list", "search", "read", "fetch", "describe", "query", "show", "find", "count", "view", "lookup", "check"];
+
+/// Whether a server's tool name starts with a read verb followed by `_`,
+/// `-` or a camelCase capital: `get_report`, `list-items`, `searchCode`,
+/// but not `search`, `checkout_branch` or `budget_get`.
+pub fn read_verb_name(name: &str) -> bool {
+    READ_VERBS.iter().any(|verb| {
+        name.strip_prefix(*verb)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c == '_' || c == '-' || c.is_ascii_uppercase())
+    })
+}
+
+/// The MCP tools a turn discovered, by namespaced name: the server, its own
+/// tool name and its class.
+#[derive(Clone, Debug, Default)]
+pub struct McpTools(HashMap<String, (String, String, McpClass)>);
+
+impl McpTools {
+    pub fn new(discovered: &[crate::mcp::McpToolInfo]) -> Self {
+        Self(discovered.iter().map(|t| (t.namespaced.clone(), (t.server.clone(), t.name.clone(), mcp_class(t)))).collect())
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    /// The card a call to `name` must pass in `mode`, or `None`. Edit freely
+    /// lets a [`McpClass::Reads`] tool run, and a trusted one (`trust`, read
+    /// at the call); Plan only and Ask first skip only `readOnlyHint` tools,
+    /// whatever the trust. A tool the turn didn't discover asks.
+    pub fn card(&self, label: Option<&str>, name: &str, input: &Value, mode: Mode, trust: &[McpTrust]) -> Option<ToolCard> {
+        let Some((server, tool, class)) = self.0.get(name) else { return Some(mcp_card(label, name, input, false)) };
+        let edit = mode == Mode::Edit;
+        let asks = match class {
+            McpClass::ReadOnly => false,
+            McpClass::Destructive => true,
+            McpClass::Reads => !edit,
+            McpClass::Writes => !(edit && crate::mcp::trust::covers(trust, server, tool)),
+        };
+        let destructive = *class == McpClass::Destructive;
+        let offer = (edit && !destructive).then(|| (server.clone(), tool.clone()));
+        asks.then(|| ToolCard { trust: offer, ..mcp_card(label, name, input, destructive) })
+    }
+}
+
+/// What the director's MCP card reads at each call: the turn's tools, the
+/// round's mode, and the user's trust (read at the call, so a revoke applies
+/// to the very next one).
+pub struct McpCheck<'a> {
+    pub tools: &'a McpTools,
+    pub mode: Mode,
+    pub trust: &'a (dyn Fn() -> Vec<McpTrust> + Sync),
 }
 
 /// An MCP call's arguments as its card shows them: JSON, with each long
@@ -85,17 +173,11 @@ pub fn mcp_args_shown(input: &Value) -> String {
 }
 
 /// The director's card for a tool call other than a command: an MCP tool
-/// not in `mcp_read_only` (those this turn discovered with `readOnlyHint`,
-/// so an undiscovered one asks too), or a file tool reaching outside.
-pub fn director_card(
-    name: &str,
-    input: &Value,
-    mcp_read_only: &HashSet<String>,
-    reach: &Reach,
-    writes_confined: bool,
-) -> Option<ToolCard> {
+/// that may write ([`McpTools::card`]; an undiscovered one asks too), or a
+/// file tool reaching outside.
+pub fn director_card(name: &str, input: &Value, mcp: &McpCheck, reach: &Reach, writes_confined: bool) -> Option<ToolCard> {
     if crate::mcp::is_mcp_tool(name) {
-        return (!mcp_read_only.contains(name)).then(|| mcp_card(None, name, input));
+        return mcp.tools.card(None, name, input, mcp.mode, &(mcp.trust)());
     }
     reach.outside_card(None, name, input, writes_confined)
 }
@@ -235,7 +317,7 @@ impl Reach {
              Work inside the workspace, or ask the user for what you need; do not retry it.",
             r.shown, r.place
         );
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None })
+        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None, trust: None })
     }
 
     /// Where `joined` leads, resolved as a tool opening it gets there
@@ -333,7 +415,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember })
+        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember, trust: None })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
@@ -1138,27 +1220,114 @@ mod tests {
         assert_eq!(project_root(&db, "missing"), None);
     }
 
+    /// A tool as its server lists it, with `readOnlyHint` and `destructiveHint`.
+    fn tool(server: &str, name: &str, read_only: Option<bool>, destructive: Option<bool>) -> crate::mcp::McpToolInfo {
+        crate::mcp::McpToolInfo {
+            server: server.into(),
+            name: name.into(),
+            namespaced: crate::mcp::namespaced_name(server, name),
+            read_only: read_only == Some(true),
+            destructive,
+            annotated: read_only.is_some() || destructive.is_some(),
+            ..Default::default()
+        }
+    }
+
+    fn no_trust() -> Vec<McpTrust> {
+        Vec::new()
+    }
+
     #[test]
     fn director_mcp_write_requires_approval() {
         let (_d, ws, home) = setup();
         let reach = Reach::new(&ws, None, Some(&home));
-        let read_only: HashSet<String> = ["mcp__github__get_issue".to_string()].into();
-        let c = director_card("mcp__github__merge_pr", &json!({"number": 7}), &read_only, &reach, false)
-            .expect("a tool without readOnlyHint asks");
+        let tools = McpTools::new(&[tool("github", "get_issue", Some(true), None), tool("github", "merge_pr", None, None)]);
+        let mcp = McpCheck { tools: &tools, mode: Mode::Edit, trust: &no_trust };
+        let c = director_card("mcp__github__merge_pr", &json!({"number": 7}), &mcp, &reach, false).expect("a write asks");
         assert_eq!((c.kind, c.shown.as_str()), (CardKind::Mcp, "mcp__github__merge_pr {\"number\":7}"));
         assert!(c.reason.starts_with("MCP tool `mcp__github__merge_pr` may change external state"));
         assert!(c.kind.grantable(), "the thread's \"don't ask again\" may answer it");
-        assert!(director_card("mcp__other__thing", &json!({}), &read_only, &reach, false).is_some(), "an undiscovered tool asks");
+        assert_eq!(c.trust, Some(("github".to_string(), "merge_pr".to_string())), "Edit freely offers to trust it");
+        assert!(director_card("mcp__other__thing", &json!({}), &mcp, &reach, false).is_some(), "an undiscovered tool asks");
+        for (name, input) in [("mcp__github__get_issue", json!({"number": 7})), ("read_file", json!({"path": "a.txt"}))] {
+            assert_eq!(director_card(name, &input, &mcp, &reach, false), None, "{name}");
+        }
     }
 
     #[test]
-    fn director_mcp_readonly_runs_without_card() {
+    fn edit_freely_runs_read_tools_and_asks_for_writes_and_destructive_ones() {
+        let tools = McpTools::new(&[
+            tool("s", "get_x", None, None),
+            tool("s", "delete_x", None, None),
+            tool("s", "get_y", None, Some(true)),
+            tool("s", "get_z", Some(false), None),
+            tool("s", "sync", None, Some(false)),
+            tool("s", "wipe", Some(true), Some(true)),
+        ]);
+        let asks = |name: &str, trust: &[McpTrust]| tools.card(None, &format!("mcp__s__{name}"), &json!({}), Mode::Edit, trust);
+        assert_eq!(asks("get_x", &[]), None, "a get_ tool without hints runs with no card");
+        assert!(asks("delete_x", &[]).is_some(), "a delete_ tool asks");
+        assert!(asks("get_z", &[]).is_some(), "readOnlyHint: false is the server's word, whatever the name");
+        assert_eq!(asks("sync", &[]), None, "destructiveHint: false runs");
+        let all = vec![McpTrust { server: "s".into(), all: true, tools: vec!["get_y".into()] }];
+        for name in ["get_y", "wipe"] {
+            let c = asks(name, &all).expect("destructiveHint: true asks, even with a get_ name or trust");
+            assert!(c.reason.contains("its server marks it destructive") && c.trust.is_none(), "{c:?}");
+        }
+        assert_eq!(asks("delete_x", &all), None, "a trusted server's write runs");
+    }
+
+    #[test]
+    fn a_read_verb_needs_a_separator_or_a_capital() {
+        for name in ["get_report", "list-items", "searchCode", "lookup_user", "check_status", "countRows"] {
+            assert!(read_verb_name(name), "{name}");
+        }
+        for name in ["search", "getaway", "checkout_branch", "budget_get", "Get_report", "create_report"] {
+            assert!(!read_verb_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn plan_only_and_ask_first_ignore_trust() {
+        let tools = McpTools::new(&[tool("s", "get_x", None, None), tool("s", "post_x", None, None), tool("s", "read_y", Some(true), None)]);
+        let trust = vec![McpTrust { server: "s".into(), all: true, tools: vec!["post_x".into()] }];
+        for mode in [Mode::Ask, Mode::Plan] {
+            for name in ["mcp__s__get_x", "mcp__s__post_x"] {
+                let c = tools.card(None, name, &json!({}), mode, &trust).unwrap_or_else(|| panic!("{name} asks in {mode:?}"));
+                assert!(c.trust.is_none(), "no lasting answer is offered outside Edit freely");
+            }
+            assert_eq!(tools.card(None, "mcp__s__read_y", &json!({}), mode, &trust), None, "readOnlyHint runs");
+        }
+        // Plan only refuses them before any card: it reads `readOnlyHint` alone.
+        let read_only: HashSet<String> = ["mcp__s__read_y".to_string()].into();
+        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+        let input = json!({});
+        for name in ["mcp__s__get_x", "mcp__s__post_x"] {
+            let decision = crate::permissions::decide(Mode::Plan, &crate::permissions::ToolCall { name, input: &input }, &ctx);
+            assert!(matches!(decision, crate::permissions::Decision::Deny { .. }), "{name}");
+        }
+    }
+
+    #[test]
+    fn trust_holds_in_every_conversation_and_a_revoke_applies_at_once() {
         let (_d, ws, home) = setup();
         let reach = Reach::new(&ws, None, Some(&home));
-        let read_only: HashSet<String> = ["mcp__github__get_issue".to_string()].into();
-        for (tool, input) in [("mcp__github__get_issue", json!({"number": 7})), ("read_file", json!({"path": "a.txt"}))] {
-            assert_eq!(director_card(tool, &input, &read_only, &reach, false), None, "{tool}");
-        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(tmp.path()).unwrap());
+        let tools = McpTools::new(&[tool("sample-server", "post_report", None, None)]);
+        let trust = || crate::mcp::trust::load(&db.lock());
+        // The check names no conversation: trust from one card holds in all.
+        let mcp = McpCheck { tools: &tools, mode: Mode::Edit, trust: &trust };
+        let call = || director_card("mcp__sample-server__post_report", &json!({}), &mcp, &reach, false);
+        assert!(call().is_some());
+        crate::mcp::trust::grant(&db.lock(), "sample-server", Some("post_report")).unwrap();
+        assert_eq!(call(), None, "trusted: no card");
+        crate::mcp::trust::revoke(&db.lock(), "sample-server", Some("post_report")).unwrap();
+        assert!(call().is_some(), "revoked: the very next call asks");
+        crate::mcp::trust::grant(&db.lock(), "sample-server", None).unwrap();
+        assert_eq!(call(), None, "the whole server trusted");
+        crate::mcp::trust::revoke(&db.lock(), "sample-server", None).unwrap();
+        assert!(call().is_some());
     }
 
     #[test]

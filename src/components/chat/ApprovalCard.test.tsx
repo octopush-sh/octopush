@@ -44,6 +44,35 @@ describe("ApprovalCard", () => {
     expect(container.querySelector("pre")?.textContent).toBe('mcp__github__merge_pr {"number":7}');
     fireEvent.click(screen.getByText(/don't ask again/));
     expect(onRespond).toHaveBeenCalledWith("always");
+    // No trust offered (Plan only, Ask first, a destructive tool): no lasting answer.
+    expect(screen.queryByText("Always allow this tool")).toBeNull();
+  });
+
+  it("an MCP card in Edit freely offers to allow the tool or trust its server, app-wide (#1243)", () => {
+    const onRespond = vi.fn();
+    const reason = "MCP tool `mcp__sample-server__post_report` may change external state (its server does not mark it read-only)";
+    const { container } = render(
+      <ApprovalCard
+        approval={{ ...base, kind: "mcp", command: "mcp__sample-server__post_report {}", reason, trustServer: "sample-server", trustTool: "post_report" }}
+        onRespond={onRespond}
+      />,
+    );
+    // The reason wraps whole: never cut with an ellipsis.
+    const line = screen.getByTestId("approval-reason");
+    expect(line.textContent).toBe(reason);
+    expect(line.className).not.toContain("truncate");
+    expect(container.querySelector('[data-tour="talk-approval-trust"]')).not.toBeNull();
+    const tool = screen.getByRole("button", { name: "Always allow this tool" });
+    expect(tool).toHaveClass("font-serif");
+    expect(tool.getAttribute("title")).toContain("let post_report run without asking in Edit freely, in every conversation");
+    fireEvent.click(tool);
+    expect(onRespond).toHaveBeenLastCalledWith("tool");
+    const server = screen.getByRole("button", { name: "Trust sample-server" });
+    expect(server.getAttribute("title")).toContain("until you revoke it in Settings › Integrations (a tool it marks destructive still asks)");
+    fireEvent.click(server);
+    expect(onRespond).toHaveBeenLastCalledWith("server");
+    // The thread-wide answer stays.
+    expect(screen.getByText(/don't ask again/)).toBeInTheDocument();
   });
 
   it("a file outside the workspace names the path, allows once, and never offers don't ask again (#1147)", () => {
