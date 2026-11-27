@@ -29,6 +29,13 @@ import { GROUP_VALUE_PREFIX, paletteGroups, type PaletteGroup } from "../lib/pal
 import { useGroupsStore } from "../stores/groupsStore";
 import { groupMarkColor } from "./RailMissionGroup";
 import { ChevronDown } from "lucide-react";
+import {
+  MODE_CHORD,
+  PERMISSION_MODES,
+  PERMISSION_MODE_LABELS,
+  nextPermissionMode,
+  type PermissionMode,
+} from "../lib/permissionModes";
 
 interface Props {
   open: boolean;
@@ -48,8 +55,16 @@ interface Props {
   onRevealGroup?: (groupId: string) => void;
   /** The Talk group's commands, for the active workspace; absent without
    *  one. `onCopy` is absent with no conversation, `onFocusApproval` while
-   *  no approval card waits in the conversation Talk shows. */
-  talk?: { onNew: () => void; onSwitch: () => void; onCopy?: () => void; onFocusApproval?: () => void };
+   *  no approval card waits in the conversation Talk shows, and `mode`
+   *  (the conversation's permission mode, #1231) while it is unknown or a
+   *  read-only mission forces it. */
+  talk?: {
+    onNew: () => void;
+    onSwitch: () => void;
+    onCopy?: () => void;
+    onFocusApproval?: () => void;
+    mode?: { current: PermissionMode; onSet: (mode: PermissionMode) => void };
+  };
 }
 
 export function CommandPalette({
@@ -248,6 +263,17 @@ export function CommandPalette({
                     onSelect={() => run(talk.onFocusApproval!)}
                   />
                 )}
+                {/* The other two modes; the Composer's chord takes the next. */}
+                {talk.mode &&
+                  PERMISSION_MODES.filter((m) => m !== talk.mode!.current).map((m) => (
+                    <Item
+                      key={m}
+                      glyph="◐"
+                      label={`Permission mode: ${PERMISSION_MODE_LABELS[m]}`}
+                      shortcut={m === nextPermissionMode(talk.mode!.current) ? MODE_CHORD : undefined}
+                      onSelect={() => run(() => talk.mode!.onSet(m))}
+                    />
+                  ))}
               </Group>
             )}
 

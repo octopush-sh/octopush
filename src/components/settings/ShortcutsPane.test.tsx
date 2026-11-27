@@ -39,6 +39,7 @@ describe("ShortcutsPane", () => {
       "⌘⌥K Switch conversation",
       "⌘⌥K Switch session",
       "⌘⌥A Focus the oldest waiting approval card",
+      "⌘⌥P Next permission mode, with the composer focused",
       "Esc Approval card focused: deny",
     ]) {
       expect(rows).toContain(row);

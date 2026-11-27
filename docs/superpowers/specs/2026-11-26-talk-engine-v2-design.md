@@ -264,7 +264,7 @@ Two director-only Meta tools (our names):
 
 **Failure and cancel.** Stop on a parked plan card leaves the plan `draft`; the card persists and can start a new turn. A step left `doing` when a turn ends is marked `blocked` and its after-ref is still captured, so partial work can be reviewed or rewound. Fork copies plans up to the fork point. Compaction never summarizes the plan.
 
-**UI.** The mode control sits in the composer bar (lucide icon, label, `title`; ⇧⇥ cycles). A `TurnPlan` strip above the Player shows `StageDots` and the current step in serif (the `doing` dot holds the scope's one beacon), and folds into a ledger row after the turn. A Companion › Conversation section lists steps with cost and two icon actions: Review, Rewind.
+**UI.** The mode control sits in the composer bar (lucide icon, label, `title`). ⌘⌥P cycles the modes, only while the focus is in the Composer (#1231). It isn't ⇧⇥, which moves the focus backwards in forms and dialogs (the PM's decision on #1145). A `TurnPlan` strip above the Player shows `StageDots` and the current step in serif (the `doing` dot holds the scope's one beacon), and folds into a ledger row after the turn. A Companion › Conversation section lists steps with cost and two icon actions: Review, Rewind.
 
 ### Slices
 

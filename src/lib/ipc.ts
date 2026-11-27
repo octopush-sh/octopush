@@ -2,6 +2,7 @@
 import type { SecretHold, SecretPreview } from "./secretGuard";
 import type { RewindOutcome, RewindPreview, TalkCheckpoints } from "./talkRewind";
 import type { TurnChange } from "./turnChanges";
+import type { PermissionMode } from "./permissionModes";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -1073,7 +1074,7 @@ export const ipc = {
   /** The approval cards still waiting on a thread, oldest first (a reloaded
    *  webview shows them again: a card waits until it is answered). */
   pendingApprovals: (threadId: string) =>
-    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run"; sensitive?: boolean; rememberDir?: string; trustServer?: string; trustTool?: string }>>(
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run" | "edit" | "exec"; sensitive?: boolean; rememberDir?: string; diff?: string; askFirst?: boolean; trustServer?: string; trustTool?: string }>>(
       "pending_approvals",
       { threadId },
     ),
@@ -1196,11 +1197,11 @@ export const ipc = {
    *  default). `effective` is `plan` while the workspace's mission is
    *  read-only. Talk reads it at each round boundary. */
   getThreadPermissionMode: (threadId: string) =>
-    invoke<{ stored: "plan" | "ask" | "edit"; effective: "plan" | "ask" | "edit" }>("get_thread_permission_mode", { threadId }),
+    invoke<{ stored: PermissionMode; effective: PermissionMode }>("get_thread_permission_mode", { threadId }),
   /** Set a conversation's permission mode; resolves to the mode stored. A
    *  turn that is running takes it from its next round and notes the switch. */
-  setThreadPermissionMode: (threadId: string, mode: "plan" | "ask" | "edit") =>
-    invoke<"plan" | "ask" | "edit">("set_thread_permission_mode", { threadId, mode }),
+  setThreadPermissionMode: (threadId: string, mode: PermissionMode) =>
+    invoke<PermissionMode>("set_thread_permission_mode", { threadId, mode }),
   /** Settings saved the MCP config, Reconnect restarted a server, Talk's
    *  discovery started (or failed to start) servers, or the MCP trust changed
    *  (a card's lasting answer, a revoke). If any subscription fails, the

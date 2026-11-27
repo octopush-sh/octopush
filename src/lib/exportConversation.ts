@@ -1,4 +1,5 @@
 import type { ChatMessage } from "./types";
+import { isModeNote } from "./permissionModes";
 
 /**
  * Render a conversation's messages as portable Markdown for export (copy to
@@ -16,6 +17,8 @@ export function conversationToMarkdown(title: string, messages: ChatMessage[]): 
       lines.push(`## Octopush${model}`, "", m.content.trim(), "");
     } else if (m.role === "error") {
       lines.push("> **Error:** " + m.content.trim(), "");
+    } else if (m.role === "stopped" && isModeNote(m.content)) {
+      lines.push(`> _(mode changed)_ ${m.content.trim()}`, "");
     } else if (m.role === "stopped") {
       lines.push("> _(stopped)_", "");
     } else if (m.role === "tool") {

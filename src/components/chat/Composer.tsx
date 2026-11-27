@@ -29,6 +29,10 @@ import { useTerminalsStore } from "../../stores/terminalsStore";
 import { ContextChips } from "./ContextChips";
 import { ModelPicker } from "../ModelPicker";
 import { EffortSelector } from "./EffortSelector";
+import { PermissionModeControl } from "./PermissionModeControl";
+import { usePermissionModeStore } from "../../stores/permissionModeStore";
+import { isModeChord } from "../../lib/permissionModes";
+import { isModalOpen } from "../ModalShell";
 import { MentionPopover } from "./MentionPopover";
 import { SlashMenu, matchingSkipped } from "./SlashMenu";
 import { ComposerEstimate } from "./ComposerEstimate";
@@ -77,6 +81,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const addAttachment = useChatStore((s) => s.addAttachment);
   const removeAttachment = useChatStore((s) => s.removeAttachment);
   const overrideActive = useBudgetsStore((s) => s.overrideActive);
+  const threadId = useChatStore((s) => s.getActiveThread(workspaceId));
+  const cycleMode = usePermissionModeStore((s) => s.cycle);
 
   const [input, setInputState] = useState("");
   // Ref mirrors input so key handlers always read the latest value without a
@@ -834,7 +840,16 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           : undefined;
 
   return (
-    <div className="px-6 pb-4 pt-3">
+    <div
+      className="px-6 pb-4 pt-3"
+      // The permission mode's chord (#1231) answers only inside the Composer.
+      onKeyDown={(e) => {
+        if (!isModeChord(e) || isModalOpen()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (threadId) void cycleMode(threadId);
+      }}
+    >
       <div
         onDrop={handleDrop}
         onDragOver={(e) => e.preventDefault()}
@@ -946,6 +961,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         <div className="octo-composerbar flex flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2.5">
           <ModelPicker activeModel={model} onSelectModel={setModel} autoOption />
           <EffortSelector />
+          {threadId && <PermissionModeControl threadId={threadId} streaming={streaming} />}
           <button
             type="button"
             onClick={pickAttachments}
@@ -1057,6 +1073,7 @@ function ComposerHelp({ onClose }: { onClose: () => void }) {
     { key: "$ cmd", desc: "Run a command in the shared shell (also /run cmd)" },
     { key: "\\$ …", desc: "Send a literal $… to the agent instead of running it" },
     { key: "Enter", desc: "Send · ⇧↵ newline · ↑ ↓ history" },
+    { key: "⌘⌥P", desc: "Next permission mode: Plan only, Ask first, Edit freely" },
   ];
   return (
     <>
