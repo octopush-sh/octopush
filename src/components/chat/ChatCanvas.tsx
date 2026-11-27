@@ -755,6 +755,7 @@ function ErrorBlock({
   const action =
     (wanted === "retry" && !onRetry) || (wanted === "configure" && !onConfigureApiKey) ? "copy" : wanted;
   const run = action === "retry" ? onRetry : action === "configure" ? onConfigureApiKey : () => copy(error);
+  const label = action === "copy" && copied ? "Copied" : ACTION_LABEL[action];
   const icon =
     action === "retry" ? <RefreshCw size={11} /> : action === "configure" ? <Settings size={11} /> : copied ? <Check size={11} className="text-octo-verdigris" /> : <Copy size={11} />;
   return (
@@ -777,11 +778,12 @@ function ErrorBlock({
           <button
             type="button"
             data-tour="talk-error-action"
+            title={label}
             onClick={() => run?.()}
-            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-octo-hairline px-3 py-1.5 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-octo-border-strong px-3 py-1.5 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
           >
             {icon}
-            {action === "copy" && copied ? "Copied" : ACTION_LABEL[action]}
+            {label}
           </button>
         </div>
       </div>

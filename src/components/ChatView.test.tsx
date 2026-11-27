@@ -1023,6 +1023,10 @@ describe("ChatView — the error card names the failure and offers the next step
     const buttons = within(card).getAllByRole("button");
     expect(buttons.map((b) => b.textContent)).toEqual([action]);
     expect(buttons[0].getAttribute("data-tour")).toBe("talk-error-action");
+    expect(buttons[0].getAttribute("title")).toBe(action);
+    expect(buttons[0].className).toContain("border-octo-border-strong");
+    expect(buttons[0].className).toContain("hover:text-octo-ivory");
+    expect(buttons[0].className).not.toContain("hover:text-octo-brass");
   });
 
   it("says how much of the turn is kept", async () => {
