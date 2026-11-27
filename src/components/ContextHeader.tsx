@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Shield, Wrench } from "lucide-react";
+import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { INTENT_ICON } from "../lib/missionIntent";
 import { checksTitle } from "../lib/prChecks";
@@ -11,6 +11,7 @@ import { issueTypeToken } from "../lib/issueTrackerSelectors";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { copyToClipboard } from "../lib/clipboard";
 import { MidTruncate } from "./primitives/MidTruncate";
+import { HeaderSandbox } from "./HeaderSandbox";
 
 const STATUS_TOKEN: Record<StatusCategory, string> = {
   inProgress: "text-state-blue",
@@ -114,9 +115,12 @@ interface Props {
   /** The active mission's intent (build/fix/…). Opens the eyebrow with a small
    *  mute glyph + label; null falls back to "Workspace". */
   missionIntent?: string | null;
-  /** The active mission's execution isolation. `sandbox` adds a mute Shield glyph
-   *  to the intent eyebrow. */
+  /** The active mission, whose sandbox the eyebrow's Shield toggles (#1230). */
+  missionId?: string | null;
+  /** The active mission's Execution axis: `sandbox` or `none`. */
   missionExecIsolation?: string | null;
+  /** The active mission's Git axis: `readonly` forces the sandbox on. */
+  missionGitIsolation?: string | null;
 }
 
 /**
@@ -149,7 +153,9 @@ export function ContextHeader({
   issueTrackerConfigured = false,
   jiraProjectKey = null,
   missionIntent = null,
+  missionId = null,
   missionExecIsolation = null,
+  missionGitIsolation = null,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const manualKey = workspace?.linkedIssueKey ?? null;
@@ -221,14 +227,7 @@ export function ContextHeader({
             !activeIssue && <span className="flex-none">Workspace</span>
           )}
 
-          {missionExecIsolation === "sandbox" && (
-            <span
-              title="Sandboxed execution — this mission's agents run write-confined to the workspace"
-              className="octo-pop-in flex flex-none items-center"
-            >
-              <Shield size={10} aria-hidden />
-            </span>
-          )}
+          <HeaderSandbox missionId={missionId} execIsolation={missionExecIsolation} gitIsolation={missionGitIsolation} />
 
           {activeIssue && (
             <>
