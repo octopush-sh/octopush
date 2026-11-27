@@ -110,6 +110,7 @@ Current anchors:
 | `palette-talk` | Command palette: the Talk group (New conversation · Switch conversation… · Copy conversation as Markdown · Focus the waiting approval card, only while one waits; only with an active workspace) | `CommandPalette.tsx` |
 | `talk-switcher-input` · `talk-switcher-row` | ⌘⌥K in Talk, while open: the conversation switcher's query input · its first conversation row (only with one) | `chat/ConversationSwitcher.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
+| `builder-stage-mcp` | Pipeline builder, Stage inspector: the "MCP servers" field (one toggle chip per server, all off by default; disabled on a CLI stage) | `builder/StageMcpServers.tsx` via `StageInspector.tsx` |
 | `builder-stage-track-record` | Pipeline builder, Stage inspector of a saved stage: the Track record section (its toggle, the record, the micro-history and suggestions) | `builder/TrackRecord.tsx` via `StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
 | `run-session-line` · `run-session-cell` | Run mode band, right track: the session line (session cells, `+`, the layout button) · the focused session's cell (hover or keyboard focus opens its instant label) | `run/SessionLine.tsx` |
