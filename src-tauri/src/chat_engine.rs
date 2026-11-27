@@ -120,6 +120,15 @@ const MAX_TRUNCATED_ROUNDS: u32 = 2;
 const TRUNCATED_ROUNDS_NOTE: &str = "Stopped: two replies in a row were cut at the output limit mid tool call, \
      so those calls didn't run. Ask for smaller steps, such as one file at a time.";
 
+/// The quiet note a turn the user stopped ends with: what the stop left in
+/// place, and how to undo it.
+pub(crate) const STOPPED_NOTE: &str =
+    "Stopped. Changes made before the stop stay; rewind files from your last message to undo them.";
+
+/// The quiet note a turn the app's restart cut off ends with, added on boot
+/// (`Db::note_interrupted_talk_turns`).
+pub const RESTART_NOTE: &str = "Interrupted by an app restart.";
+
 /// Counts the tool rounds in a row cut at the output limit. Turns are
 /// unlimited by default, so without it a model that keeps writing oversized
 /// `write_file` bodies would retry at the full output cap forever.
@@ -162,6 +171,9 @@ fn director_request(request: &ChatRequest, system: &str, messages: &[LlmMessage]
         // Agentic loop + multi-turn chat: the system prompt, tool schemas and
         // prior turns are re-sent every iteration, so cache them.
         cache: true,
+        // Every request of the thread shares one key, so OpenAI routes them
+        // to the same cache.
+        cache_key: Some(crate::providers::prompt_cache_key(&request.thread_id)),
     }
 }
 
@@ -334,7 +346,11 @@ pub struct ChatMsg {
 pub struct ChatRequest {
     pub workspace_id: String,
     pub thread_id: String, // The conversation this turn belongs to
-    pub workspace_path: String, // The directory where tools execute
+    /// The directory where tools execute. Whatever the webview sends is
+    /// replaced with the workspace's own folder from the database
+    /// (`with_workspace_path_from_db`) before the turn runs.
+    #[serde(default)]
+    pub workspace_path: String,
     pub model: String,
     pub user_message: String,
     pub system: Option<String>,
@@ -384,6 +400,16 @@ pub struct ChatRequest {
     /// Never sent by the frontend.
     #[serde(skip)]
     pub max_output: Option<u32>,
+}
+
+/// `request` with its `workspace_path` read from the database by its
+/// `workspace_id` (`Db::talk_workspace_path`): a request can't point a turn's
+/// tools at a folder of its choosing. An unknown workspace runs nothing.
+pub(crate) fn with_workspace_path_from_db(db: &Db, request: ChatRequest) -> AppResult<ChatRequest> {
+    let path = db
+        .talk_workspace_path(&request.workspace_id)?
+        .ok_or_else(|| AppError::Other("This conversation's workspace no longer exists.".into()))?;
+    Ok(ChatRequest { workspace_path: path, ..request })
 }
 
 /// A base64 image attachment sent with a user turn.
@@ -3863,10 +3889,7 @@ impl ChatEngine {
         model: &str,
         usage: &TurnUsage,
     ) -> AppResult<()> {
-        self.finish_with_note(
-            app, workspace_id, thread_id, model, usage,
-            "Generation stopped.",
-        )
+        self.finish_with_note(app, workspace_id, thread_id, model, usage, STOPPED_NOTE)
     }
 
     /// Like `finish_stopped`, but the quiet note explains that a budget cap —
@@ -4481,6 +4504,12 @@ impl ChatEngine {
         request: ChatRequest,
         held: &mut TurnHold,
     ) -> AppResult<()> {
+        // The folder the turn's tools work in comes from the database, as the
+        // checkpoint commands' does, never from the webview.
+        let request = {
+            let db = self.db.lock();
+            with_workspace_path_from_db(&db, request)?
+        };
         // The Auto policy (economy director): the composer sends `auto`; the
         // turn runs on the strong tier's model under the lean-context
         // doctrine, and sub-agents take their tier by role. Resolved once,
@@ -5690,7 +5719,9 @@ impl ChatEngine {
                         None => content,
                     }
                 };
-                tool_results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error: false });
+                // A failed or denied call says so (`is_error`), as its row does.
+                let is_error = crate::context::transcript::tool_row_is_error(&tool_record);
+                tool_results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error });
             }
 
             // ── Catch-all file-edit attribution ───────────────────
@@ -6407,6 +6438,35 @@ mod tests {
         }
         // `least` is internal: a request can't ask for it.
         assert!(serde_json::from_value::<Effort>(serde_json::json!("least")).is_err());
+    }
+
+    #[test]
+    fn a_thread_sends_openai_one_stable_prompt_cache_key() {
+        use crate::providers::openai_compat;
+        let mut request = chat_request_on("gpt-5", DEEP);
+        request.thread_id = "thread-42".into();
+        let key = crate::providers::prompt_cache_key("thread-42");
+        // Every request of the turn, the forced close included, carries it.
+        assert_eq!(director_request(&request, "sys", &[], &[]).cache_key.as_deref(), Some(key.as_str()));
+        let mut messages = Vec::new();
+        assert_eq!(forced_close_request(&request, "sys", &mut messages, &[]).cache_key.as_deref(), Some(key.as_str()));
+        // Stable per thread, distinct across threads, and a hash: never the id or a title.
+        assert_eq!(key, crate::providers::prompt_cache_key("thread-42"));
+        assert_ne!(key, crate::providers::prompt_cache_key("thread-43"));
+        assert!(!key.contains("thread-42") && key.len() <= 64, "{key}");
+
+        // OpenAI's own host gets it, on Chat Completions and Responses alike.
+        let req = director_request(&request, "sys", &[], &[]);
+        let mut body = openai_compat::build_request(&req);
+        openai_compat::with_cache_key(&mut body, &req, "https://api.openai.com/v1");
+        assert_eq!(body["prompt_cache_key"], serde_json::json!(key));
+        let mut responses = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
+        openai_compat::with_cache_key(&mut responses, &req, "https://api.openai.com/v1");
+        assert_eq!(responses["prompt_cache_key"], serde_json::json!(key));
+        // Another OpenAI-compatible server may refuse a field it doesn't know.
+        let mut other = openai_compat::build_request(&req);
+        openai_compat::with_cache_key(&mut other, &req, "http://localhost:11434/v1");
+        assert!(other.get("prompt_cache_key").is_none(), "{other}");
     }
 
     #[test]

@@ -59,12 +59,14 @@ impl<'a> Api<'a> {
 
     /// The request body and the endpoint it is POSTed to.
     fn request(&self, req: &LlmRequest, api_base: &str) -> (Value, String) {
-        match self {
+        let (mut body, url) = match self {
             Api::Chat => (build_request(req), chat_completions_url(api_base)),
             Api::Responses { provider, .. } => {
                 (build_responses_request(req, provider, api_base), responses_url(api_base))
             }
-        }
+        };
+        with_cache_key(&mut body, req, api_base);
+        (body, url)
     }
 
     /// A whole response body, parsed by this API's parser.
@@ -223,6 +225,17 @@ fn is_gpt6(model_id: &str) -> bool {
 /// the pre-Responses behaviour (Chat Completions).
 pub fn uses_responses_api(model_id: &str, api_base: &str) -> bool {
     is_gpt6(model_id) && is_openai_api_host(api_base)
+}
+
+/// Put the request's conversation key on `body` as `prompt_cache_key`, which
+/// both of OpenAI's APIs take: the prompt-caching guide says it feeds request
+/// routing, so a thread's turns land together and its prefix hits the cache.
+/// Only on OpenAI's own host: another OpenAI-compatible server may refuse a
+/// field it doesn't know.
+pub fn with_cache_key(body: &mut Value, req: &LlmRequest, api_base: &str) {
+    if let Some(key) = req.cache_key.as_deref().filter(|_| is_openai_api_host(api_base)) {
+        body["prompt_cache_key"] = json!(key);
+    }
 }
 
 /// Whether a configured base URL points at `api.openai.com` (host compared

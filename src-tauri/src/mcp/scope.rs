@@ -223,6 +223,7 @@ done
                 tool_choice: None,
                 effort: None,
                 cache: true,
+                cache_key: None,
             };
             (
                 crate::providers::anthropic::build_request(&req)["tools"].to_string(),

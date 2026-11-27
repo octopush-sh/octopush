@@ -207,6 +207,27 @@ describe("ApprovalCard at the keyboard", () => {
     expect(onRespond).not.toHaveBeenCalled();
   });
 
+  it("tells a screen reader the turn is waiting, as it appears", () => {
+    render(<ApprovalCard approval={plain} onRespond={vi.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("The turn is waiting on your answer.");
+    // The card itself stays the named group its keys answer on.
+    expect(screen.getByRole("group", { name: "Approval needed: git push --force" })).toContainElement(screen.getByRole("alert"));
+  });
+
+  it("answers no key while Talk is hidden, even with the focus left on it", () => {
+    const onRespond = vi.fn();
+    const { rerender } = render(<ApprovalCard approval={plain} onRespond={onRespond} talkActive={false} />);
+    const card = screen.getByRole("group");
+    card.focus();
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
+    fireEvent.keyDown(card, { key: "Escape" });
+    expect(onRespond).not.toHaveBeenCalled();
+    // Back in Talk, the same focus answers again.
+    rerender(<ApprovalCard approval={plain} onRespond={onRespond} talkActive />);
+    fireEvent.keyDown(screen.getByRole("group"), { key: "Escape" });
+    expect(onRespond).toHaveBeenCalledWith("deny");
+  });
+
   it("ignores held keys, other chords and IME composition", () => {
     const onRespond = vi.fn();
     render(<ApprovalCard approval={plain} onRespond={onRespond} />);
