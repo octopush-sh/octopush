@@ -588,7 +588,14 @@ pub fn should_escalate(outcome: &AgentOutcome) -> bool {
 /// Whether a sub-agent can change the workspace: its definition grants a
 /// write/edit tool or the shell, or it has the full set.
 pub fn spec_can_write(spec: &SubagentSpec) -> bool {
-    match spec.definition.as_ref().and_then(|d| d.tools.as_deref()) {
+    definition_can_write(spec.definition.as_ref())
+}
+
+/// [`spec_can_write`] for an agent type: no definition (an untyped call, or
+/// a type nobody defined) is the full tool set. Plan only starts only the
+/// types this says can't write (#1146).
+pub fn definition_can_write(definition: Option<&AgentDefinition>) -> bool {
+    match definition.and_then(|d| d.tools.as_deref()) {
         None => true,
         Some(tools) => tools.iter().any(|t| t == "write_file" || t == "edit_file" || t == "run_command"),
     }
@@ -1241,17 +1248,15 @@ pub async fn run_one_subagent(
     // The plan was decided at fan-out (so the card could say it); a caller
     // without one (a continuation, a test) gets it decided here.
     let plan = spec.plan.clone().unwrap_or_else(|| plan_subagent(spec, known_models, tiers));
-    let spec_owned;
-    let spec: &SubagentSpec = if spec.plan.is_some() {
-        spec
-    } else {
-        spec_owned = SubagentSpec { plan: Some(plan.clone()), ..spec.clone() };
-        &spec_owned
-    };
+    // What is saved for a continuation keeps the mission's roots; what runs
+    // is narrowed by the thread's mode now.
+    let planned = SubagentSpec { plan: Some(plan.clone()), ..spec.clone() };
+    let spec = &mode_spec(&db, &planned);
     let model = plan.model.clone();
     let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
         .with_mcp_writes(mcp_tools)
         .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
+    let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));
     let external = McpSubagentTools::granted(
         mcp,
         Path::new(&spec.workspace_path),
@@ -1278,7 +1283,7 @@ pub async fn run_one_subagent(
             }
         }
     }
-    let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &approval_gate, external_ref, started).await;
+    let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &tool_gate, external_ref, started).await;
     // The definition's `escalate`: one retry on the stronger model when the
     // cheap attempt failed — unless the director stopped the turn. A
     // continuation never escalates: the user chose to give THIS run more
@@ -1304,7 +1309,7 @@ pub async fn run_one_subagent(
             });
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
                 .notice(&format!("running on {}", plan_line(retry.plan.as_ref().unwrap())));
-            let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
+            let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &tool_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_escalated(outcome, second);
         }
     }
@@ -1364,14 +1369,50 @@ pub async fn run_one_subagent(
                 &BlockedTranscript { messages: outcome.transcript.clone(), ask_tool_use_id: outcome.ask_tool_use_id.clone() },
                 &continuation_note(None, Some(extra)),
             ));
-            let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
+            let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &tool_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_continued(outcome, second);
             turns_used += extra;
         }
     }
     outcome.tier = tier_for_outcome(spec, &outcome.model, tiers);
-    persist_run(&db, spec, &outcome);
+    persist_run(&db, &planned, &outcome);
     outcome
+}
+
+/// `spec` in its thread's permission mode (#1146), as it starts: under Plan
+/// only its commands run on the read-only sandbox for the whole run. A
+/// continuation started after a switch to Plan only is narrowed the same way.
+pub fn mode_spec(db: &Mutex<Db>, spec: &SubagentSpec) -> SubagentSpec {
+    let mode = crate::permissions::effective(crate::permissions::thread_mode(db, &spec.thread_id), spec.sandbox_roots.as_deref());
+    SubagentSpec { sandbox_roots: crate::permissions::exec_roots(mode, spec.sandbox_roots.as_deref()), ..spec.clone() }
+}
+
+/// The gate of a sub-agent `spec` runs (narrowed by [`mode_spec`]): each
+/// call is decided in the thread's mode, read at the call, then what the
+/// mode allows goes to `inner` (its approval gate). `mission_roots`, the
+/// mission's own, say whether a read-only mission forces Plan only. Its
+/// read-only MCP tools are the ones their server marks so.
+pub fn mode_gate(
+    db: &Arc<Mutex<Db>>,
+    spec: &SubagentSpec,
+    mission_roots: Option<&[String]>,
+    mcp_tools: &[crate::mcp::McpToolInfo],
+    inner: Option<Box<dyn ToolGate>>,
+) -> crate::permissions::ModeGate {
+    crate::permissions::ModeGate::new(
+        crate::permissions::thread_mode_source(Arc::clone(db), spec.thread_id.clone(), spec.sandbox_roots.clone()),
+        spec.sandbox_roots.clone(),
+        crate::permissions::forced(mission_roots),
+        mcp_tools.iter().filter(|t| t.read_only).map(|t| t.namespaced.clone()).collect(),
+        inner,
+    )
+}
+
+/// What Plan only refuses to start (#1146): a defined agent type whose tools
+/// can write. An untyped call, or a type nobody defined, runs: its sub-agent
+/// inherits the mode through [`mode_gate`] and the sandbox.
+pub fn delegate_writes(definition: Option<&AgentDefinition>) -> bool {
+    definition.is_some() && definition_can_write(definition)
 }
 
 /// Whether a sub-agent may change files: its definition grants `write_file`
@@ -1478,7 +1519,7 @@ async fn run_attempt(
     client: &reqwest::Client,
     cancel: &Arc<AtomicBool>,
     sink: &ChatAgentSink,
-    gate: &SubagentGate,
+    gate: &dyn ToolGate,
     external: Option<&dyn ExternalTools>,
     started: std::time::Instant,
 ) -> AgentOutcome {
@@ -2483,5 +2524,211 @@ mod tests {
         assert!(out.ok && out.finished, "{}", out.report);
         let seen = std::fs::read_to_string(dir.path().join("path.txt")).unwrap();
         assert_eq!(seen, crate::orchestrator::cli_runner::resolved_cli_path());
+    }
+
+    /// A provider that records each request's tools and messages as sent.
+    struct Capturing {
+        inner: ScriptedProvider,
+        sent: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for Capturing {
+        async fn complete(&self, b: &str, k: Option<&str>, req: &LlmRequest, c: &reqwest::Client) -> AppResult<LlmResponse> {
+            let json = |v: serde_json::Result<String>| v.unwrap_or_default();
+            self.sent.lock().push((json(serde_json::to_string(&req.tools)), json(serde_json::to_string(&req.messages))));
+            self.inner.complete(b, k, req, c).await
+        }
+    }
+
+    fn capturing(turns: Vec<LlmResponse>) -> Capturing {
+        Capturing { inner: ScriptedProvider { turns: Mutex::new(VecDeque::from(turns)) }, sent: Mutex::new(vec![]) }
+    }
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> LlmToolUse {
+        LlmToolUse { id: id.into(), name: name.into(), input }
+    }
+
+    /// A database with one conversation in `mode`, and an untyped sub-agent
+    /// of it working in `dir`.
+    fn mode_thread(mode: crate::permissions::Mode, dir: &Path) -> (tempfile::NamedTempFile, Arc<Mutex<Db>>, SubagentSpec) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.insert_project("p-mode", "P", "/tmp/octo-mode-project").unwrap();
+        db.insert_workspace("w-mode", "p-mode", "ws", "", "main", None, "", None).unwrap();
+        let thread = db.create_chat_thread("w-mode", "Plan it").unwrap().id;
+        db.set_thread_permission_mode(&thread, mode).unwrap();
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Look".into(), prompt: "look".into(), subagent_type: None, model: None },
+            workspace_id: "w-mode".into(),
+            thread_id: thread,
+            workspace_path: dir.to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None, definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+        };
+        (tmp, Arc::new(Mutex::new(db)), spec)
+    }
+
+    fn mcp_info(server: &str, name: &str, read_only: bool) -> crate::mcp::McpToolInfo {
+        crate::mcp::McpToolInfo {
+            server: server.into(),
+            name: name.into(),
+            namespaced: format!("mcp__{server}__{name}"),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only,
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_inherits_mode() {
+        use crate::permissions::{plan_refusal, Mode, Refused};
+        let plan_write = plan_refusal(Refused::Write, false);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+        let (_tmp, db, base) = mode_thread(Mode::Plan, dir.path());
+        // The run is narrowed as it starts: its commands go on the read-only sandbox.
+        let spec = mode_spec(&db, &base);
+        assert_eq!(spec.sandbox_roots, Some(vec![]));
+        let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &[], None);
+        let provider = capturing(vec![
+            resp("", vec![
+                call("t1", "write_file", serde_json::json!({"path": "plan.md", "content": "x"})),
+                call("t2", "edit_file", serde_json::json!({"path": "seed.txt", "old_string": "seed", "new_string": "gone"})),
+                call("t3", "read_file", serde_json::json!({"path": "seed.txt"})),
+            ], LlmStopReason::ToolUse),
+            resp("Report: planned.", vec![], LlmStopReason::EndTurn),
+        ]);
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), None).await.unwrap();
+        assert!(out.ok, "{}", out.report);
+        assert!(!dir.path().join("plan.md").exists(), "nothing was written");
+        assert_eq!(std::fs::read_to_string(dir.path().join("seed.txt")).unwrap(), "seed", "nothing was edited");
+        // Both writes got the mode's fixed result, and the read ran.
+        let sent = provider.sent.lock().clone();
+        let results = &sent[1].1;
+        assert_eq!(results.matches(plan_write.as_str()).count(), 2, "{results}");
+        assert!(results.contains("seed"), "{results}");
+        // The gate reads the thread's mode at each call; a run that started
+        // in Edit freely is not narrowed.
+        db.lock().set_thread_permission_mode(&base.thread_id, Mode::Edit).unwrap();
+        let edit = mode_spec(&db, &base);
+        assert_eq!(edit.sandbox_roots, None);
+        let gate = mode_gate(&db, &edit, base.sandbox_roots.as_deref(), &[], None);
+        assert_eq!(gate.check("write_file", &serde_json::json!({"path": "a"})).await, None);
+        db.lock().set_thread_permission_mode(&base.thread_id, Mode::Plan).unwrap();
+        assert_eq!(gate.check("write_file", &serde_json::json!({"path": "a"})).await, Some(plan_write));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_unhinted_mcp() {
+        use crate::permissions::{plan_refusal, Mode, Refused};
+        let plan_net = plan_refusal(Refused::Net, false);
+        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, db, base) = mode_thread(Mode::Plan, dir.path());
+        let discovered = vec![mcp_info("jira", "get_issue", true), mcp_info("jira", "add_comment", false)];
+        let mcp = FakeMcp { tools: discovered.iter().map(mcp_llm_tool).collect(), calls: Mutex::new(vec![]) };
+        let spec = mode_spec(&db, &base);
+        let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &discovered, None);
+        let provider = capturing(vec![
+            resp("", vec![
+                call("t1", "mcp__jira__add_comment", serde_json::json!({"body": "hi"})),
+                call("t2", "mcp__jira__get_issue", serde_json::json!({"key": "PROJ-1"})),
+            ], LlmStopReason::ToolUse),
+            resp("done", vec![], LlmStopReason::EndTurn),
+        ]);
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), Some(&mcp)).await.unwrap();
+        assert!(out.ok);
+        let calls: Vec<String> = mcp.calls.lock().iter().map(|c| c.0.clone()).collect();
+        assert_eq!(calls, vec!["mcp__jira__get_issue".to_string()], "the unhinted tool never reached its server");
+        assert!(provider.sent.lock()[1].1.contains(plan_net.as_str()));
+        // An MCP name nobody discovered is refused too.
+        assert_eq!(gate.check("mcp__other__delete", &serde_json::json!({})).await, Some(plan_net));
+    }
+
+    #[tokio::test]
+    async fn tool_list_identical_across_modes() {
+        use crate::permissions::Mode;
+        let mut lists: Vec<String> = Vec::new();
+        for mode in [Mode::Plan, Mode::Edit] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+            let (_tmp, db, base) = mode_thread(mode, dir.path());
+            let discovered = vec![mcp_info("jira", "get_issue", true), mcp_info("jira", "add_comment", false)];
+            let mcp = FakeMcp { tools: discovered.iter().map(mcp_llm_tool).collect(), calls: Mutex::new(vec![]) };
+            let spec = mode_spec(&db, &base);
+            let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &discovered, None);
+            let provider = capturing(vec![
+                resp("", vec![call("t1", "write_file", serde_json::json!({"path": "b.txt", "content": "b"}))], LlmStopReason::ToolUse),
+                resp("done", vec![], LlmStopReason::EndTurn),
+            ]);
+            let rec = Recorder { entries: Mutex::new(vec![]) };
+            run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+                &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), Some(&mcp)).await.unwrap();
+            assert_eq!(dir.path().join("b.txt").exists(), mode == Mode::Edit, "{mode:?}");
+            lists.extend(provider.sent.lock().iter().map(|(tools, _)| tools.clone()));
+        }
+        assert_eq!(lists.len(), 4);
+        assert!(lists.iter().all(|l| l == &lists[0]), "the tools sent differ between modes");
+        assert!(lists[0].contains("write_file") && lists[0].contains("mcp__jira__add_comment"), "every tool is still offered");
+    }
+
+    /// Plan only starts an untyped `Agent` call again; its sub-agent gets the
+    /// full tool set, bound by the mode and the read-only sandbox. Forced by
+    /// a read-only mission, its refusals name the mission.
+    #[tokio::test]
+    async fn an_untyped_agent_in_plan_only_cannot_write() {
+        use crate::permissions::{decide, plan_refusal, Decision, Mode, PolicyCtx, Refused, ToolCall};
+        let (none, sandboxed): (std::collections::HashSet<String>, &[String]) = (Default::default(), &[]);
+        assert!(!delegate_writes(None) && delegate_writes(Some(&def("implementer", Some(vec!["edit_file"]), None))));
+        assert!(!delegate_writes(Some(&def("explorer", Some(vec!["read_file", "grep"]), None))));
+        let ctx = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &none, delegate_writes: delegate_writes(None), forced: false };
+        let untyped = serde_json::json!({"prompt": "look around"});
+        assert_eq!(decide(Mode::Plan, &ToolCall { name: "Agent", input: &untyped }, &ctx), Decision::Allow);
+
+        let script = || {
+            capturing(vec![
+                resp("", vec![
+                    call("t1", "write_file", serde_json::json!({"path": "plan.md", "content": "x"})),
+                    call("t2", "edit_file", serde_json::json!({"path": "seed.txt", "old_string": "seed", "new_string": "gone"})),
+                    call("t3", "run_command", serde_json::json!({"command": "echo x > cmd.txt"})),
+                    call("t4", "run_command", serde_json::json!({"command": "git push origin main"})),
+                ], LlmStopReason::ToolUse),
+                resp("Report: looked.", vec![], LlmStopReason::EndTurn),
+            ])
+        };
+        // Chosen by the conversation, and forced by a read-only mission on a
+        // conversation left in Edit freely.
+        for (mode, mission, forced) in [(Mode::Plan, None, false), (Mode::Edit, Some(vec![]), true)] {
+            // Outside `$TMPDIR`, which the read-only profile keeps writable.
+            let caches = dirs::cache_dir().unwrap();
+            std::fs::create_dir_all(&caches).unwrap();
+            let dir = tempfile::Builder::new().prefix("octopush-plan-agent-").tempdir_in(&caches).unwrap();
+            std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+            let (_tmp, db, mut base) = mode_thread(mode, dir.path());
+            base.sandbox_roots = mission;
+            let spec = mode_spec(&db, &base);
+            assert_eq!(spec.sandbox_roots, Some(vec![]), "its commands run on the read-only sandbox");
+            let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &[], None);
+            let provider = script();
+            let rec = Recorder { entries: Mutex::new(vec![]) };
+            let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+                &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), None).await.unwrap();
+            assert!(out.ok, "{}", out.report);
+            for f in ["plan.md", "cmd.txt"] {
+                assert!(!dir.path().join(f).exists(), "{f} was written ({mode:?})");
+            }
+            assert_eq!(std::fs::read_to_string(dir.path().join("seed.txt")).unwrap(), "seed");
+            let results = provider.sent.lock()[1].1.clone();
+            assert_eq!(results.matches(plan_refusal(Refused::Write, forced).as_str()).count(), 2, "{results}");
+            assert!(results.contains(plan_refusal(Refused::Remote("git push"), forced).as_str()), "{results}");
+            assert_eq!(results.contains("mission is read-only"), forced, "{results}");
+            assert_eq!(results.contains("Edit freely"), !forced, "{results}");
+        }
     }
 }

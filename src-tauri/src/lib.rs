@@ -46,6 +46,7 @@ mod state;
 pub mod sync;
 pub mod talk_checkpoints;
 pub mod talk_guard;
+pub mod permissions;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
@@ -299,6 +300,8 @@ pub fn run() {
             commands::list_project_instructions,
             commands::get_thread_mcp_disabled,
             commands::set_thread_mcp_server,
+            commands::get_thread_permission_mode,
+            commands::set_thread_permission_mode,
             commands::get_mcp_config,
             commands::save_mcp_config,
             commands::test_mcp_server,
