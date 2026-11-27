@@ -4561,6 +4561,29 @@ impl Db {
     /// rows and `period_spend` figures the UI uses. Returns the first breached
     /// scope, else `Allow`. A scope with no budget (or limit ≤ 0) never blocks.
     pub fn check_budget(&self, workspace_id: Option<&str>) -> AppResult<BudgetVerdict> {
+        for (scope, spent, limit) in self.budget_spend(workspace_id)? {
+            if spent >= limit {
+                return Ok(BudgetVerdict::Block { scope, spent, limit });
+            }
+        }
+        Ok(BudgetVerdict::Allow)
+    }
+
+    /// What is left to spend under every configured budget that covers this
+    /// workspace (its own, its project's, global; daily and monthly): the
+    /// smallest `limit − spent`, never below zero. `None` when no budget is
+    /// set — spend there is unbounded. The same rows `check_budget` reads.
+    pub fn budget_headroom(&self, workspace_id: Option<&str>) -> AppResult<Option<f64>> {
+        Ok(self
+            .budget_spend(workspace_id)?
+            .into_iter()
+            .map(|(_, spent, limit)| (limit - spent).max(0.0))
+            .reduce(f64::min))
+    }
+
+    /// Each configured budget covering this workspace, widest scope first:
+    /// `("<scope> <period>", spent, limit)`. A limit ≤ 0 is no budget.
+    fn budget_spend(&self, workspace_id: Option<&str>) -> AppResult<Vec<(String, f64, f64)>> {
         let project_id: Option<String> = match workspace_id {
             Some(ws) => self
                 .conn
@@ -4581,6 +4604,7 @@ impl Db {
             scopes.push(("workspace", ws.to_string()));
         }
         let budgets = self.list_budgets()?;
+        let mut out = Vec::new();
         for (scope_type, scope_id) in &scopes {
             for period in ["daily", "monthly"] {
                 let Some(b) = budgets.iter().find(|b| {
@@ -4592,16 +4616,10 @@ impl Db {
                     continue;
                 }
                 let (spent, _) = self.period_spend(scope_type, scope_id, period)?;
-                if spent >= b.limit_usd {
-                    return Ok(BudgetVerdict::Block {
-                        scope: format!("{scope_type} {period}"),
-                        spent,
-                        limit: b.limit_usd,
-                    });
-                }
+                out.push((format!("{scope_type} {period}"), spent, b.limit_usd));
             }
         }
-        Ok(BudgetVerdict::Allow)
+        Ok(out)
     }
 
     /// Return a breakdown of cloud vs local token usage within a time range.
