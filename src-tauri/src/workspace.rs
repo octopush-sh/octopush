@@ -96,7 +96,9 @@ pub fn branch_from_task(task: &str, issue_key: Option<&str>, project_key: Option
             if project.is_empty() {
                 return None;
             }
-            crate::issue_tracker::detect_issue_key(task).filter(|k| k.starts_with(&format!("{project}-")))
+            crate::issue_tracker::detect_issue_key(task)
+                .filter(|k| k.starts_with(&format!("{project}-")))
+                .map(|k| crate::issue_tracker::jira_key(&k).to_string())
         })
         .unwrap_or_default()
         .trim()

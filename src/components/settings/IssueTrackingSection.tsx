@@ -1,13 +1,14 @@
 // Settings → Integrations → Issue tracking. A master-detail over the supported
 // trackers: pick a provider on the left, configure its connection and per-project
-// links on the right. Only Jira is wired today; Linear and Azure DevOps are shown
-// as upcoming so the layout is honestly built to scale (linking depends on the
-// tracker, so project links live inside the tracker's own detail, not beside it).
+// links on the right. Jira and Epiku (read-only, #1127) are wired; Linear and
+// Azure DevOps are shown as upcoming so the layout is honestly built to scale
+// (linking depends on the tracker, so project links live inside the tracker's
+// own detail, not beside it).
 import { useEffect, useRef, useState } from "react";
 import { Check } from "lucide-react";
 import { ipc } from "../../lib/ipc";
 import { tourId } from "../../lib/tour/ids";
-import type { ProjectInfo } from "../../lib/types";
+import type { EpikuConfigView, ProjectInfo } from "../../lib/types";
 import { pushToast } from "../Toasts";
 import { MidTruncate } from "../primitives/MidTruncate";
 import { SectionLabel } from "./shared";
@@ -17,7 +18,7 @@ import { SectionLabel } from "./shared";
 // the bullets aren't persisted as the actual credential.
 const MASKED_TOKEN_PLACEHOLDER = "••••••••••••••••";
 
-type TrackerId = "jira" | "linear" | "azure";
+type TrackerId = "jira" | "epiku" | "linear" | "azure";
 
 interface Tracker {
   id: TrackerId;
@@ -27,6 +28,7 @@ interface Tracker {
 
 const TRACKERS: Tracker[] = [
   { id: "jira", name: "Jira", available: true },
+  { id: "epiku", name: "Epiku", available: true },
   { id: "linear", name: "Linear", available: false },
   { id: "azure", name: "Azure DevOps", available: false },
 ];
@@ -37,6 +39,8 @@ export function IssueTrackingSection({ onConfigSaved }: { onConfigSaved?: () => 
   // unconfigured tracker doesn't read as connected. Seeded from the saved config
   // and updated when the detail saves.
   const [jiraConnected, setJiraConnected] = useState(false);
+  // Epiku reads as connected only once a read of its project answered.
+  const epiku = useEpikuConnection();
 
   useEffect(() => {
     ipc.getIssueTrackerConfig()
@@ -60,8 +64,9 @@ export function IssueTrackingSection({ onConfigSaved }: { onConfigSaved?: () => 
               key={t.id}
               tracker={t}
               active={selected === t.id}
-              connected={t.id === "jira" && jiraConnected}
+              connected={t.id === "jira" ? jiraConnected : t.id === "epiku" && epiku.status.kind === "connected"}
               onSelect={t.available ? () => setSelected(t.id) : undefined}
+              dataTour={t.id === "epiku" ? tourId("settings-integrations-epiku") : undefined}
             />
           ))}
         </div>
@@ -71,6 +76,10 @@ export function IssueTrackingSection({ onConfigSaved }: { onConfigSaved?: () => 
         <div className="min-w-0">
           {selected === "jira" ? (
             <JiraDetail onConfigSaved={onConfigSaved} onConnectedChange={setJiraConnected} />
+          ) : selected === "epiku" ? (
+            // Remounted when a saved connection appears or goes, so the form
+            // starts from it.
+            <EpikuDetail key={epiku.config ? "saved" : "new"} connection={epiku} onConfigSaved={onConfigSaved} />
           ) : null}
         </div>
       </div>
@@ -78,11 +87,12 @@ export function IssueTrackingSection({ onConfigSaved }: { onConfigSaved?: () => 
   );
 }
 
-function TrackerListItem({ tracker, active, connected, onSelect }: {
+function TrackerListItem({ tracker, active, connected, onSelect, dataTour }: {
   tracker: Tracker;
   active: boolean;
   connected: boolean;
   onSelect?: () => void;
+  dataTour?: string;
 }) {
   const disabled = !tracker.available;
   return (
@@ -91,6 +101,7 @@ function TrackerListItem({ tracker, active, connected, onSelect }: {
       onClick={onSelect}
       disabled={disabled}
       aria-pressed={active}
+      data-tour={dataTour}
       title={disabled ? `${tracker.name} — coming soon` : connected ? `${tracker.name} — connected` : undefined}
       className={`flex items-center gap-2.5 rounded-md px-3 py-2 text-left transition-colors duration-[180ms] ${
         disabled ? "cursor-default" : ""
@@ -311,6 +322,174 @@ function JiraDetail({ onConfigSaved, onConnectedChange }: {
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+type EpikuStatus =
+  | { kind: "none" }
+  | { kind: "checking" }
+  | { kind: "connected"; stories: number }
+  | { kind: "failed"; reason: string };
+
+const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^other: /, "");
+
+/** The saved Epiku connection and its "Connected" gate: one read of the
+ *  project's stories with the kept token (`check_epiku_connection`). */
+function useEpikuConnection() {
+  const [config, setConfig] = useState<EpikuConfigView | null>(null);
+  const [status, setStatus] = useState<EpikuStatus>({ kind: "none" });
+  async function check() {
+    setStatus({ kind: "checking" });
+    try {
+      setStatus({ kind: "connected", stories: await ipc.checkEpikuConnection() });
+    } catch (e) {
+      setStatus({ kind: "failed", reason: errorText(e) });
+    }
+  }
+  useEffect(() => {
+    ipc.getEpikuConfig()
+      .then((cfg) => {
+        setConfig(cfg);
+        if (cfg?.hasToken) void check();
+      })
+      .catch(() => { /* leave as not set up */ });
+  }, []);
+  return { config, setConfig, status, setStatus, check };
+}
+
+function EpikuDetail({ connection, onConfigSaved }: {
+  connection: ReturnType<typeof useEpikuConnection>;
+  onConfigSaved?: () => void;
+}) {
+  const { config, setConfig, status, setStatus, check } = connection;
+  const [baseUrl, setBaseUrl] = useState(config?.baseUrl ?? "");
+  const [project, setProject] = useState(config?.project ?? "");
+  const [token, setToken] = useState("");
+  const [showToken, setShowToken] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  async function afterChange() {
+    onConfigSaved?.();
+    const { useIssuesStore } = await import("../../stores/issuesStore");
+    const issues = useIssuesStore.getState();
+    await issues.setProject(issues.projectId);
+    void issues.load();
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      const view = await ipc.saveEpikuConfig(baseUrl, project, token.trim() === "" ? null : token);
+      setConfig(view);
+      setBaseUrl(view.baseUrl);
+      setToken("");
+      await check();
+      await afterChange();
+    } catch (e) {
+      pushToast({ level: "error", title: "Epiku wasn't saved", body: errorText(e) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleForget() {
+    try {
+      await ipc.removeEpikuConfig();
+      setConfig(null);
+      setStatus({ kind: "none" });
+      await afterChange();
+    } catch (e) {
+      pushToast({ level: "error", title: "Epiku wasn't removed", body: errorText(e) });
+    }
+  }
+
+  return (
+    <div className="octo-fade-in">
+      <div className="flex items-baseline gap-2.5">
+        <h3 className="font-serif text-[17px] text-octo-ivory">Epiku</h3>
+        <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">Read-only</span>
+      </div>
+      <p className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
+        Octopush reads the project&apos;s stories for the backlog and the ticket chip, and never writes to
+        Epiku. Requests carry only the token, the project id and a story or epic id. The token is kept in
+        the macOS Keychain.
+      </p>
+
+      <div className="mt-4 space-y-3">
+        <Field label="Base URL">
+          <input
+            type="text"
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder="https://epiku.your-domain.com"
+            className={inputClass}
+          />
+        </Field>
+        <Field label="Project">
+          <input
+            type="text"
+            value={project}
+            onChange={(e) => setProject(e.target.value)}
+            placeholder="your-project"
+            className={inputClass}
+          />
+        </Field>
+        <Field label="Token">
+          <div className="relative">
+            <input
+              type={showToken ? "text" : "password"}
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder={config?.hasToken ? "Kept in the Keychain. Leave blank to keep it" : "Epiku token"}
+              aria-label="Epiku token"
+              className={`${inputClass} pr-12`}
+            />
+            <button
+              type="button"
+              onClick={() => setShowToken((v) => !v)}
+              className="absolute right-2 top-1/2 -translate-y-1/2 px-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute hover:text-octo-brass"
+            >
+              {showToken ? "Hide" : "Show"}
+            </button>
+          </div>
+        </Field>
+        <div
+          data-tour="settings-epiku-status"
+          aria-live="polite"
+          className={`min-h-[16px] font-mono text-[10px] ${
+            status.kind === "connected" ? "text-octo-verdigris" : status.kind === "failed" ? "text-octo-rouge" : "text-octo-mute"
+          }`}
+        >
+          {status.kind === "connected" && `Connected · ${status.stories} ${status.stories === 1 ? "story" : "stories"}`}
+          {status.kind === "checking" && "Checking the connection…"}
+          {status.kind === "failed" && `Not connected: ${status.reason}`}
+          {status.kind === "none" && "Not connected yet."}
+        </div>
+        <div className="flex items-center gap-3 pt-1">
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="inline-flex min-w-[140px] items-center justify-center gap-1.5 rounded-md px-4 py-2 font-serif text-[13px] text-octo-brass transition-colors disabled:opacity-50"
+            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+          >
+            {saving ? "Connecting…" : "Save and connect"}
+          </button>
+          {config && (
+            <button
+              type="button"
+              onClick={() => void handleForget()}
+              className="octo-fade-in rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory"
+            >
+              Forget this connection
+            </button>
+          )}
+        </div>
+        <p className="text-[12px] leading-[1.55] text-octo-mute">
+          A project reads Epiku once you choose it in the project&apos;s menu, under Issue tracking.
+        </p>
       </div>
     </div>
   );

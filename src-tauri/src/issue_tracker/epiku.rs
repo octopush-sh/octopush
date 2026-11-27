@@ -13,7 +13,9 @@
 
 use super::{Issue, IssueTracker, LinkedIssueRef, StatusCategory};
 use crate::error::{AppError, AppResult};
+use crate::mcp::secrets::{Keychain, SecretStore};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 /// How long one Epiku read may take.
@@ -25,7 +27,7 @@ const STORY: &str = "Story";
 /// The answer was a success but not an Epiku body.
 const NOT_EPIKU: &str = "That URL didn't answer like Epiku. Check the base URL.";
 
-const INVALID_PROJECT: &str =
+pub const INVALID_PROJECT: &str =
     "Epiku project ids are lowercase letters, digits and hyphens, 2 to 40 characters.";
 
 /// What Settings keeps for Epiku in settings.json. The token isn't here: it
@@ -190,6 +192,85 @@ pub fn describe_failure(status: u16, body: &str) -> String {
         }
         (s, _) => format!("Epiku answered HTTP {s}."),
     }
+}
+
+/// The Keychain service Epiku tokens are kept under. The account is the base
+/// URL a token was saved for, so a token is only ever sent to that Epiku.
+pub const TOKEN_SERVICE: &str = "octopush-epiku";
+
+static TOKENS: LazyLock<Arc<Keychain>> = LazyLock::new(|| Arc::new(Keychain::for_service(TOKEN_SERVICE)));
+
+/// The app's one store of Epiku tokens (the login Keychain).
+pub fn token_store() -> Arc<dyn SecretStore> {
+    Arc::clone(&*TOKENS) as Arc<dyn SecretStore>
+}
+
+/// What Settings shows for Epiku. The token itself never goes back to the
+/// frontend; `has_token` says whether one is kept for this base URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpikuSettingsView {
+    pub base_url: String,
+    pub project: String,
+    pub has_token: bool,
+}
+
+/// The saved connection as Settings shows it, `None` when there is none.
+pub fn settings_view(cfg: Option<EpikuConfig>, store: &dyn SecretStore) -> AppResult<Option<EpikuSettingsView>> {
+    let Some(cfg) = cfg else { return Ok(None) };
+    let has_token = match normalized_base_url(&cfg.base_url) {
+        Ok(base) => store.get(&base).map_err(AppError::Other)?.is_some(),
+        Err(_) => false,
+    };
+    Ok(Some(EpikuSettingsView { base_url: cfg.base_url, project: cfg.project, has_token }))
+}
+
+/// Check and keep a connection: the token (when given) goes to the
+/// Keychain, and the returned config is what settings.json keeps. With no
+/// token the kept one stays, for the same base URL only: a token is never
+/// carried to another URL. A new URL drops the old URL's token.
+pub fn save_connection(
+    prev: Option<&EpikuConfig>,
+    base_url: &str,
+    project: &str,
+    token: Option<&str>,
+    store: &dyn SecretStore,
+) -> Result<EpikuConfig, String> {
+    let base = normalized_base_url(base_url)?;
+    let project = project.trim();
+    if !valid_project_id(project) {
+        return Err(INVALID_PROJECT.into());
+    }
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => store.set(&base, t)?,
+        None => {
+            if store.get(&base)?.is_none() {
+                return Err("Enter the token for this Epiku.".into());
+            }
+        }
+    }
+    if let Some(old) = prev.and_then(|p| normalized_base_url(&p.base_url).ok()).filter(|old| *old != base) {
+        store.delete(&old)?;
+    }
+    Ok(EpikuConfig { base_url: base, project: project.to_string() })
+}
+
+/// Forget the connection's token (settings.json drops the rest).
+pub fn remove_connection(prev: Option<&EpikuConfig>, store: &dyn SecretStore) -> Result<(), String> {
+    match prev.and_then(|p| normalized_base_url(&p.base_url).ok()) {
+        Some(base) => store.delete(&base),
+        None => Ok(()),
+    }
+}
+
+/// A client for `cfg` with the token kept for its base URL.
+pub fn client_from(cfg: &EpikuConfig, store: &dyn SecretStore) -> AppResult<EpikuClient> {
+    let base = normalized_base_url(&cfg.base_url).map_err(AppError::Other)?;
+    let token = store
+        .get(&base)
+        .map_err(AppError::Other)?
+        .ok_or_else(|| AppError::Other("Add your Epiku token in Settings › Integrations › Issue tracking.".into()))?;
+    EpikuClient::new(cfg, &token)
 }
 
 /// The HTTP client for Epiku. It never follows a redirect: the bearer token
@@ -587,6 +668,38 @@ mod tests {
         ] {
             assert!(normalized_base_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_token_is_kept_per_base_url_and_never_carried_to_another() {
+        let store = crate::mcp::secrets::MemoryStore::default();
+        let saved = save_connection(None, "https://epiku.example.com/", "sample-project", Some(" epk_sample "), &store).unwrap();
+        assert_eq!(saved, EpikuConfig { base_url: "https://epiku.example.com".into(), project: "sample-project".into() });
+        assert_eq!(store.items.lock().get("https://epiku.example.com").map(String::as_str), Some("epk_sample"));
+        let view = settings_view(Some(saved.clone()), &store).unwrap().unwrap();
+        assert!(view.has_token);
+        assert!(!serde_json::to_string(&view).unwrap().contains("epk_sample"));
+
+        // Same URL, no token: the kept one stays; the project may change.
+        let kept = save_connection(Some(&saved), "https://epiku.example.com", "other-project", None, &store).unwrap();
+        assert_eq!(kept.project, "other-project");
+        assert_eq!(client_from(&kept, &store).unwrap().board_url(), "https://epiku.example.com/?proyecto=other-project");
+
+        // Another URL needs its own token, and the old URL's token goes.
+        let err = save_connection(Some(&kept), "https://elsewhere.example.com", "sample-project", None, &store).unwrap_err();
+        assert_eq!(err, "Enter the token for this Epiku.");
+        let moved = save_connection(Some(&kept), "https://elsewhere.example.com", "sample-project", Some("epk_2"), &store).unwrap();
+        assert!(!store.items.lock().contains_key("https://epiku.example.com"));
+        assert!(client_from(&kept, &store).is_err());
+        assert!(client_from(&moved, &store).is_ok());
+
+        assert_eq!(save_connection(None, "https://epiku.example.com", "Bad_Id", Some("t"), &store).unwrap_err(), INVALID_PROJECT);
+        assert!(save_connection(None, "http://epiku.example.com", "sample-project", Some("t"), &store).is_err());
+
+        remove_connection(Some(&moved), &store).unwrap();
+        assert!(store.items.lock().is_empty());
+        assert!(!settings_view(Some(moved), &store).unwrap().unwrap().has_token);
+        assert_eq!(settings_view(None, &store).unwrap(), None);
     }
 
     #[test]

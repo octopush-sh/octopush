@@ -84,6 +84,8 @@ export interface PipelineStage {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none. */
+  mcpServers?: string[];
 }
 export interface Pipeline {
   id: string;
@@ -201,6 +203,9 @@ export interface StageDraft {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none,
+   *  the default. Never carried in a crew file. */
+  mcpServers?: string[];
 }
 /** One stage of a crew import's review sheet (mirrors Rust `crew::CrewStagePreview`). */
 export interface CrewStagePreview {
@@ -654,6 +659,8 @@ import type {
   GitStatus,
   Issue,
   IssueTrackerConfig,
+  ProjectIssueTracker,
+  EpikuConfigView,
   Mission,
   UpdatedMission,
   LogbookMissionRow,
@@ -1171,6 +1178,9 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The Settings › Integrations servers only, with their live status: what
+   *  a Direct stage can choose. Spawns nothing. */
+  listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
   /** What the user trusts to run without an MCP card in Edit freely, per
    *  server (#1243), that still holds for its user-level entry. With a
    *  worktree, without the servers its own `.claude/mcp.json` defines. */
@@ -1718,10 +1728,24 @@ export const ipc = {
     invoke<WorkspaceCacheSizes>("get_workspace_cache_sizes", { workspacePath }),
 
   // ─── Issue Tracker ────────────────────────────────────────────
-  listMyIssues: () => invoke<Issue[]>("list_my_issues"),
-  getIssue: (key: string) => invoke<Issue>("get_issue", { key }),
-  listIssuesInEpic: (epicKey: string) =>
-    invoke<Issue[]>("list_issues_in_epic", { epicKey }),
+  // `projectId` picks that project's tracker (Jira, Epiku); none = Jira.
+  listMyIssues: (projectId?: string | null) =>
+    invoke<Issue[]>("list_my_issues", { projectId: projectId ?? null }),
+  getIssue: (key: string, projectId?: string | null) =>
+    invoke<Issue>("get_issue", { key, projectId: projectId ?? null }),
+  listIssuesInEpic: (epicKey: string, projectId?: string | null) =>
+    invoke<Issue[]>("list_issues_in_epic", { epicKey, projectId: projectId ?? null }),
+  getProjectIssueTracker: (projectId: string) =>
+    invoke<ProjectIssueTracker>("get_project_issue_tracker", { projectId }),
+  setProjectIssueTracker: (projectId: string, choice: string | null, epikuProject: string | null) =>
+    invoke<void>("set_project_issue_tracker", { projectId, choice, epikuProject }),
+  getEpikuConfig: () => invoke<EpikuConfigView | null>("get_epiku_config"),
+  /** `token` null keeps the saved one (same base URL only). */
+  saveEpikuConfig: (baseUrl: string, project: string, token: string | null) =>
+    invoke<EpikuConfigView>("save_epiku_config", { baseUrl, project, token }),
+  removeEpikuConfig: () => invoke<void>("remove_epiku_config"),
+  /** The "Connected" gate: the project's story count, or the reason it failed. */
+  checkEpikuConnection: () => invoke<number>("check_epiku_connection"),
   getIssueTrackerConfig: () =>
     invoke<IssueTrackerConfig | null>("get_issue_tracker_config"),
   saveIssueTrackerConfig: (config: IssueTrackerConfig) =>

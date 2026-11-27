@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 
 const { ipcMock } = vi.hoisted(() => ({
   ipcMock: {
@@ -7,6 +7,11 @@ const { ipcMock } = vi.hoisted(() => ({
     listRecentProjects: vi.fn(async () => [{ id: "p1", name: "octopush", jiraProjectKey: null }]),
     updateProjectJiraKey: vi.fn(async () => {}),
     saveIssueTrackerConfig: vi.fn(async () => {}),
+    getEpikuConfig: vi.fn(async (): Promise<unknown> => null),
+    saveEpikuConfig: vi.fn(async (baseUrl: string, project: string) => ({ baseUrl, project, hasToken: true })),
+    removeEpikuConfig: vi.fn(async () => {}),
+    checkEpikuConnection: vi.fn(async (): Promise<number> => 2),
+    listMyIssues: vi.fn(async () => []),
   },
 }));
 vi.mock("../../lib/ipc", () => ({ ipc: ipcMock }));
@@ -32,5 +37,36 @@ describe("IssueTrackingSection — project links", () => {
 
     const brassButtons = [...container.querySelectorAll("button.font-serif.text-octo-brass")];
     expect(brassButtons.map((b) => b.textContent)).toEqual(["Save changes"]);
+  });
+});
+
+describe("IssueTrackingSection — Epiku", () => {
+  const view = { baseUrl: "https://epiku.example.com", project: "sample-project", hasToken: true };
+
+  it("saves the connection and says Connected only once the project's read answered", async () => {
+    render(<IssueTrackingSection />);
+    fireEvent.click(screen.getByRole("button", { name: "Epiku" }));
+    expect(screen.getByText("Not connected yet.")).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("https://epiku.your-domain.com"), { target: { value: view.baseUrl } });
+    fireEvent.change(screen.getByPlaceholderText("your-project"), { target: { value: view.project } });
+    fireEvent.change(screen.getByLabelText("Epiku token"), { target: { value: "epk_sample" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save and connect" }));
+    expect(await screen.findByText("Connected · 2 stories")).toBeInTheDocument();
+    expect(ipcMock.saveEpikuConfig).toHaveBeenCalledWith(view.baseUrl, view.project, "epk_sample");
+    expect(screen.getByLabelText("Epiku token")).toHaveValue("");
+    // "Forget this connection" appears with the shared fade primitive.
+    expect(screen.getByRole("button", { name: "Forget this connection" })).toHaveClass("octo-fade-in");
+  });
+
+  it("checks a saved connection on open, says why it failed, and keeps the saved token on a blank save", async () => {
+    ipcMock.getEpikuConfig.mockResolvedValueOnce(view);
+    ipcMock.checkEpikuConnection.mockRejectedValueOnce("other: Epiku rejected the token.");
+    render(<IssueTrackingSection />);
+    fireEvent.click(screen.getByRole("button", { name: "Epiku" }));
+    expect(await screen.findByText("Not connected: Epiku rejected the token.")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("your-project")).toHaveValue("sample-project");
+    fireEvent.click(screen.getByRole("button", { name: "Save and connect" }));
+    expect(await screen.findByText("Connected · 2 stories")).toBeInTheDocument();
+    expect(ipcMock.saveEpikuConfig).toHaveBeenLastCalledWith(view.baseUrl, view.project, null);
   });
 });
