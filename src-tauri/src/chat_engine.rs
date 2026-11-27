@@ -1595,17 +1595,6 @@ impl ApprovalDecision {
     }
 }
 
-/// Why a card offers no grant at all (#1229).
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum EveryTime {
-    /// The command changes something outside this Mac
-    /// (`permissions::remote_effect`): it asks every time in Edit freely.
-    Remote,
-    /// The conversation is in Plan only, where no grant applies.
-    Plan,
-}
-
 /// What a card offers beyond allowing once (#1229).
 #[derive(Default)]
 struct Offer {
@@ -1613,26 +1602,22 @@ struct Offer {
     dir: Option<String>,
     /// "Allow this command for this conversation".
     command: bool,
-    every_time: Option<EveryTime>,
+    /// Plan only withheld the grant the card would offer.
+    plan_only: bool,
 }
 
 impl Offer {
-    fn of(grant: Option<&Grant>, every_time: Option<EveryTime>) -> Self {
+    fn of(grant: Option<&Grant>, plan_only: bool) -> Self {
         match grant {
-            Some(g) if g.kind == GrantKind::Command => Offer { command: true, every_time, ..Offer::default() },
-            Some(g) => Offer { dir: Some(g.shown.clone()), every_time, ..Offer::default() },
-            None => Offer { every_time, ..Offer::default() },
+            Some(g) if g.kind == GrantKind::Command => Offer { command: true, plan_only, ..Offer::default() },
+            Some(g) => Offer { dir: Some(g.shown.clone()), plan_only, ..Offer::default() },
+            None => Offer { plan_only, ..Offer::default() },
         }
     }
 }
 
 /// Emitted when a conversation gains a grant, so the Companion lists it.
 pub const GRANTS_CHANGED_EVENT: &str = "chat://grants-changed";
-
-/// The reason a command with a remote side effect asks for (#1229).
-pub(crate) fn remote_reason(what: &str) -> String {
-    format!("changes something outside this Mac ({what})")
-}
 
 /// Emitted when the agent wants to run a command flagged as destructive — the
 /// frontend shows an inline Approve/Deny card; the turn waits for the decision.
@@ -1666,9 +1651,9 @@ pub struct ApprovalRequestEvent {
     /// The card offers "Allow this command for this conversation" (#1229).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub remember_command: bool,
-    /// The card offers no grant and no "don't ask again", and why.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub every_time: Option<EveryTime>,
+    /// Plan only withheld the conversation grant the card would offer.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub plan_only: bool,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1833,12 +1818,11 @@ impl ApprovalBroker {
         rx
     }
 
-    /// Ask the user to approve a command `dangerous_command` flags, or one
-    /// with a remote side effect (`remote`), and wait for the answer. The
-    /// card waits as long as it takes (see the type's doc): never a silent
-    /// denial. Outside Plan only, the thread's "don't ask again" or a grant
-    /// for this exact command (#1229) answers it unseen, except a remote
-    /// one, which asks every time and offers neither.
+    /// Ask the user to approve a command `dangerous_command` flags and wait
+    /// for the answer. The card waits as long as it takes (see the type's
+    /// doc): never a silent denial. The thread's "don't ask again" answers
+    /// it unseen, and outside Plan only so does a grant for this exact
+    /// command (#1229), which a remote side effect never has.
     #[allow(clippy::too_many_arguments)]
     pub async fn await_command(
         &self,
@@ -1848,16 +1832,14 @@ impl ApprovalBroker {
         call_id: &str,
         command: &str,
         reason: &str,
-        remote: bool,
         mode: crate::permissions::Mode,
     ) -> ApprovalDecision {
-        let (answered, offer) = self.command_offer(thread_id, command, remote, mode);
+        let (answered, offer) = self.command_offer(thread_id, command, mode);
         if answered {
             return ApprovalDecision::Approve;
         }
-        let every_time = offer.every_time;
         let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, &offer).await;
-        let settled = self.settle_command(thread_id, decision, command, offer.command, every_time.is_some());
+        let settled = self.settle_command(thread_id, decision, command, offer.command);
         if decision == ApprovalDecision::Grant {
             let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
         }
@@ -1866,36 +1848,30 @@ impl ApprovalBroker {
 
     /// Whether a flagged command is answered unseen, and what its card
     /// offers otherwise (#1229). Pure but for the grants it reads.
-    fn command_offer(&self, thread_id: &str, command: &str, remote: bool, mode: crate::permissions::Mode) -> (bool, Offer) {
-        let every_time = match (remote, mode == crate::permissions::Mode::Plan) {
-            (true, _) => Some(EveryTime::Remote),
-            (false, true) => Some(EveryTime::Plan),
-            (false, false) => None,
-        };
-        // `Grant::command` has none for a remote side effect either.
-        let grant = Grant::command(command).filter(|_| every_time.is_none());
+    fn command_offer(&self, thread_id: &str, command: &str, mode: crate::permissions::Mode) -> (bool, Offer) {
+        let plan = mode == crate::permissions::Mode::Plan;
+        // None for a remote side effect, or an expansion the check can't follow.
+        let grant = Grant::command(command);
         let held = grant.as_ref().is_some_and(|g| self.grants(thread_id, mode).iter().any(|h| h.same(g)));
-        let answered = every_time.is_none() && (held || self.auto_approve.lock().contains(thread_id));
-        (answered, Offer { command: grant.is_some(), every_time, ..Offer::default() })
+        let answered = held || self.auto_approve.lock().contains(thread_id);
+        (answered, Offer { command: grant.is_some() && !plan, plan_only: grant.is_some() && plan, ..Offer::default() })
     }
 
     /// What an answer to a flagged command's card does: "grant" keeps this
-    /// exact command for the thread, "always" the thread's "don't ask
-    /// again"; on a card that offers neither (`every_time`) each is one
-    /// approval.
-    pub(crate) fn settle_command(&self, thread_id: &str, decision: ApprovalDecision, command: &str, offered: bool, every_time: bool) -> ApprovalDecision {
+    /// exact command for the thread when the card offered it, "always" the
+    /// thread's "don't ask again" (as [`Self::record`]).
+    pub(crate) fn settle_command(&self, thread_id: &str, decision: ApprovalDecision, command: &str, offered: bool) -> ApprovalDecision {
         if let Some(g) = Grant::command(command).filter(|_| offered && decision == ApprovalDecision::Grant) {
             self.keep(thread_id, &g);
         }
-        self.record(thread_id, decision, every_time)
+        self.record(thread_id, decision, false)
     }
 
     /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
     /// thread's "don't ask again" answers like a command, or a path outside
     /// the workspace, which asks every time unless the thread holds the
     /// grant that covers it (a folder or this command, #1201 and #1229,
-    /// which the card's check reads). In Plan only nothing answers it and
-    /// it offers no grant.
+    /// which the card's check reads). In Plan only it offers no grant.
     pub async fn await_card(
         &self,
         app: &AppHandle,
@@ -1905,14 +1881,13 @@ impl ApprovalBroker {
         mut card: ToolCard,
         mode: crate::permissions::Mode,
     ) -> ApprovalDecision {
-        let plan = mode == crate::permissions::Mode::Plan;
-        if !plan && self.grant_answers(thread_id, Some(card.kind)) {
+        if self.grant_answers(thread_id, Some(card.kind)) {
             return ApprovalDecision::Approve;
         }
         // A card that would offer a grant says why it doesn't.
-        let withheld = plan && card.grant.take().is_some();
+        let withheld = mode == crate::permissions::Mode::Plan && card.grant.take().is_some();
         let marks = Some((card.kind, card.sensitive));
-        let offer = Offer::of(card.grant.as_ref(), withheld.then_some(EveryTime::Plan));
+        let offer = Offer::of(card.grant.as_ref(), withheld);
         let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, &offer).await;
         if decision == ApprovalDecision::Grant && card.grant.is_some() {
             let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
@@ -1960,9 +1935,9 @@ impl ApprovalBroker {
     }
 
     /// Keep a "don't ask again" grant, except from a card that grants nothing
-    /// (`secret`: the secret card, a file outside the workspace, a card that
-    /// asks every time), whose approval reads as a plain one. A "grant"
-    /// answer here offered nothing to keep. Returns the decision to act on.
+    /// (`secret`: the secret card, a file outside the workspace), whose
+    /// approval reads as a plain one. A "grant" answer is one approval here.
+    /// Returns the decision to act on.
     pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
         match decision {
             ApprovalDecision::ApproveAlways if secret => ApprovalDecision::Approve,
@@ -2013,7 +1988,7 @@ impl ApprovalBroker {
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: offer.dir.clone(),
             remember_command: offer.command,
-            every_time: offer.every_time,
+            plan_only: offer.plan_only,
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -5369,14 +5344,10 @@ impl ChatEngine {
                             denied = guard_card(card, &check, ask).await;
                         }
                     }
-                    // A command with a remote side effect asks every time in
-                    // Edit freely (#1229); Plan only refused it above.
-                    let remote = crate::permissions::remote_effect(command);
-                    let flagged = dangerous_command(command).map(str::to_string).or_else(|| remote.map(remote_reason));
-                    if let Some(reason) = flagged.filter(|_| denied.is_none()) {
+                    if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         match self
                             .approvals
-                            .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, &reason, remote.is_some(), mode)
+                            .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, mode)
                             .await
                         {
                             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => {}
@@ -7400,7 +7371,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None, remember_command: false, every_time: None,
+            remember_dir: None, remember_command: false, plan_only: false,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7414,11 +7385,9 @@ mod tests {
         let run = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Run), remember_dir: Some("~/notes".into()), ..ev(false, false) }).unwrap();
         assert_eq!((run["kind"].as_str(), run["rememberDir"].as_str()), (Some("run"), Some("~/notes")));
         // A card's command grant and why it offers none (#1229).
-        assert!(plain.get("rememberCommand").is_none() && plain.get("everyTime").is_none());
-        let offer = serde_json::to_value(ApprovalRequestEvent { remember_command: true, ..ev(false, false) }).unwrap();
-        assert_eq!(offer["rememberCommand"].as_bool(), Some(true));
-        let remote = serde_json::to_value(ApprovalRequestEvent { every_time: Some(EveryTime::Remote), ..ev(false, false) }).unwrap();
-        assert_eq!(remote["everyTime"].as_str(), Some("remote"));
+        assert!(plain.get("rememberCommand").is_none() && plain.get("planOnly").is_none());
+        let offer = serde_json::to_value(ApprovalRequestEvent { remember_command: true, plan_only: true, ..ev(false, false) }).unwrap();
+        assert_eq!((offer["rememberCommand"].as_bool(), offer["planOnly"].as_bool()), (Some(true), Some(true)));
     }
 
     /// A database from before `talk_grants` holding one conversation, `t-old`.
@@ -7455,7 +7424,7 @@ mod tests {
         broker.settle_card("t-old", ApprovalDecision::Grant, &ToolCard { grant: None, ..card });
         assert_eq!(broker.grants("t-old", Mode::Edit).len(), 1);
         // A command grant shows as written; a fork starts with none; a revoke forgets one.
-        broker.settle_command("t-old", ApprovalDecision::Grant, "npm  run build", true, false);
+        broker.settle_command("t-old", ApprovalDecision::Grant, "npm  run build", true);
         let held = db.lock().thread_grants("t-old").unwrap();
         assert_eq!((held.len(), held[1].kind, held[1].shown.as_str()), (2, GrantKind::Command, "npm run build"));
         let id = db.lock().insert_chat_message("w1", "t-old", "user", "go on", None, None, None, None).unwrap();
@@ -7466,28 +7435,45 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_side_effect_asks_every_time_and_a_command_grant_is_for_that_command_only() {
+    fn a_command_grant_is_for_that_command_only_and_never_for_a_remote_side_effect() {
         use crate::permissions::Mode::{Edit, Plan};
         let (_tmp, db) = old_thread_db();
         let broker = ApprovalBroker::with_db(Arc::clone(&db));
-        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", false, Edit);
-        assert!(!answered && offer.command && offer.every_time.is_none(), "a flagged command offers itself");
-        broker.settle_command("t-old", ApprovalDecision::Grant, "rm -rf build", true, false);
-        assert!(broker.command_offer("t-old", "rm  -rf 'build'", false, Edit).0, "the same command, spelled another way");
+        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", Edit);
+        assert!(!answered && offer.command && !offer.plan_only, "a flagged command offers itself");
+        broker.settle_command("t-old", ApprovalDecision::Grant, "rm -rf build", true);
+        assert!(broker.command_offer("t-old", "rm  -rf 'build'", Edit).0, "the same command, spelled another way");
         for other in ["rm -rf build && rm -rf ~", "rm -rf build2", "rm -rf build; ls", "sudo rm -rf build", "rm -rf build &"] {
-            assert!(!broker.command_offer("t-old", other, false, Edit).0, "{other}");
+            assert!(!broker.command_offer("t-old", other, Edit).0, "{other}");
         }
-        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", false, Plan);
-        assert!(!answered && !offer.command && offer.every_time == Some(EveryTime::Plan), "never in Plan only");
-        // Neither a grant nor "don't ask again" answers a remote side effect, or is kept from its card.
-        broker.record("t-old", ApprovalDecision::ApproveAlways, false);
-        let (answered, offer) = broker.command_offer("t-old", "git push --force origin main", true, Edit);
-        assert!(!answered && !offer.command && offer.every_time == Some(EveryTime::Remote));
-        for answer in [ApprovalDecision::Grant, ApprovalDecision::ApproveAlways] {
-            assert_eq!(broker.settle_command("t-old", answer, "git push origin main", false, true), ApprovalDecision::Approve);
-        }
+        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", Plan);
+        assert!(!answered && !offer.command && offer.plan_only, "never in Plan only, and the card says so");
+        // A force push asks as on main, and its card never offers a grant nor keeps one.
+        let (answered, offer) = broker.command_offer("t-old", "git push --force origin main", Edit);
+        assert!(!answered && !offer.command && !offer.plan_only);
+        assert_eq!(broker.settle_command("t-old", ApprovalDecision::Grant, "git push --force origin main", false), ApprovalDecision::Approve);
         assert!(db.lock().thread_grants("t-old").unwrap().iter().all(|g| !g.shown.contains("push")));
-        assert!(broker.command_offer("t-old", "git clean -fd", false, Edit).0, "\"don't ask again\" still answers a flagged one");
+        // "Don't ask again" works as on main, in either mode.
+        assert_eq!(broker.settle_command("t-old", ApprovalDecision::ApproveAlways, "git clean -fd", false), ApprovalDecision::ApproveAlways);
+        for (command, mode) in [("git push --force origin main", Edit), ("git clean -fd", Plan)] {
+            assert!(broker.command_offer("t-old", command, mode).0, "{command}");
+        }
+    }
+
+    /// Edit freely gains no card (#1229): a plain push, a `gh` write and a
+    /// publish run without one, as on main, and none can be granted.
+    #[test]
+    fn a_plain_push_in_edit_freely_asks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, home) = (dir.path().join("ws"), dir.path().join("home"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let reach = crate::talk_guard::Reach::new(&ws, None, Some(&home));
+        for c in ["git push origin main", "git push", "gh pr create --fill", "npm publish"] {
+            assert_eq!(dangerous_command(c), None, "{c}: no flagged-command card");
+            assert_eq!(reach.command_card(None, c, None, &[]), None, "{c}: no path card");
+            assert!(crate::talk_guard::Grant::command(c).is_none(), "{c}: never a grant");
+        }
     }
 
     #[test]
@@ -7550,14 +7536,16 @@ mod tests {
         // A command's paths are read before the command check (#1201).
         let paths = gate.find("reach.command_card(").expect("the director reads a command's paths");
         assert!(paths < gate.find("dangerous_command(command)").unwrap(), "{gate}");
-        // A remote side effect asks too, and the mode decides the grants (#1229).
-        for call in ["permissions::remote_effect(command)", "await_command(", "grants(&request.thread_id, mode)"] {
+        // The mode decides the grants (#1229); a remote side effect adds no card.
+        for call in ["await_command(", "grants(&request.thread_id, mode)"] {
             assert!(gate.contains(call), "the director calls {call}");
         }
+        assert!(!gate.contains("remote_effect"), "{gate}");
         let agents = include_str!("chat_agents.rs");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check", "permissions::remote_effect(command)", "await_command(", "grants(&self.thread_id, mode)"] {
+        assert!(!body.contains("remote_effect"), "{body}");
+        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check", "await_command(", "grants(&self.thread_id, mode)"] {
             assert!(body.contains(call), "the sub-agent gate calls {call}");
         }
     }
@@ -7805,7 +7793,7 @@ mod tests {
             sensitive: false,
             remember_dir: None,
             remember_command: false,
-            every_time: None,
+            plan_only: false,
         }
     }
 

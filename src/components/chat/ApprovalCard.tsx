@@ -28,11 +28,8 @@ export const FOCUS_CARD_CHORD = "⌘⌥A";
  *  and Talk's Esc can leave a card's focus alone (`talkEscape`). */
 export const APPROVAL_CARD_SELECTOR = "[data-approval-card]";
 
-/** Why a card offers no grant (#1229), under its command. */
-export const EVERY_TIME_COPY = {
-  remote: "A command that changes something outside this Mac asks every time.",
-  plan: "In Plan only, nothing is remembered: every card asks.",
-} as const;
+/** Why a card offers no conversation grant in Plan only (#1229). */
+export const PLAN_ONLY_COPY = "In Plan only, nothing is allowed for the conversation: this asks every time.";
 
 /** The per-command grant's tooltip (#1229). */
 export const COMMAND_GRANT_TITLE =
@@ -63,7 +60,7 @@ export const RUN_CHECK_LIMITS =
  * offers "Allow reading <folder> for this conversation" (`rememberDir`). Since
  * #1229 a write outside offers "Allow writing <folder>…", a command card with
  * no folder "Allow this command…" (`rememberCommand`), each answered "grant";
- * a card with no grant says why (`everyTime`).
+ * in Plan only the card says it offers none (`planOnly`).
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -128,9 +125,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
         {approval.command}
       </pre>
-      {approval.everyTime && !secret && (
-        <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">{EVERY_TIME_COPY[approval.everyTime]}</p>
-      )}
+      {approval.planOnly && !secret && <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">{PLAN_ONLY_COPY}</p>}
       {secret && (
         <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">
           {approval.coversUncommitted
@@ -180,11 +175,11 @@ export function ApprovalCard({ approval, onRespond }: Props) {
             {grant.label}
           </button>
         )}
-        {!secret && !outside && !approval.everyTime && (
+        {!secret && !outside && (
           <button
             type="button"
             onClick={() => onRespond("always")}
-            title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, a command that changes something outside this Mac, or a file or command reaching outside the workspace, still asks)"
+            title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)"
             className={`${grant ? "shrink-0" : "ml-auto"} font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
           >
             Approve &amp; don't ask again

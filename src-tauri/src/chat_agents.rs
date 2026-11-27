@@ -928,7 +928,7 @@ pub fn gate_texts(label: &str, reason: &str) -> (String, String) {
 impl ToolGate for SubagentGate {
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let mode = self.mode();
-        let (shown, card_reason, denial, remote) = if name == "run_command" {
+        let (shown, card_reason, denial) = if name == "run_command" {
             let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
             // The secret guard first (#819); the thread's grant never answers it.
             let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
@@ -956,11 +956,9 @@ impl ToolGate for SubagentGate {
                     return Some(denial);
                 }
             }
-            // A remote side effect asks every time (#1229).
-            let remote = crate::permissions::remote_effect(command);
-            let reason = dangerous_command(command).map(str::to_string).or_else(|| remote.map(crate::chat_engine::remote_reason))?;
-            let (card_reason, denial) = gate_texts(&self.label, &reason);
-            (command.to_string(), card_reason, denial, remote.is_some())
+            let reason = dangerous_command(command)?;
+            let (card_reason, denial) = gate_texts(&self.label, reason);
+            (command.to_string(), card_reason, denial)
         } else {
             // An MCP write, or a file tool reaching outside the workspace,
             // checked again once approved (`guard_card`).
@@ -980,7 +978,7 @@ impl ToolGate for SubagentGate {
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         match self
             .broker
-            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, remote, mode)
+            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, mode)
             .await
         {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => None,

@@ -185,8 +185,8 @@ export interface PendingApproval {
   rememberDir?: string;
   /** The card offers "Allow this command for this conversation" (#1229). */
   rememberCommand?: boolean;
-  /** Why it offers no grant: a remote side effect, or Plan only (#1229). */
-  everyTime?: "remote" | "plan";
+  /** Plan only withheld the conversation grant it would offer (#1229). */
+  planOnly?: boolean;
 }
 
 export type ApprovalKind = "mcp" | "read" | "write" | "run";
@@ -199,7 +199,7 @@ function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command
     ...(c.sensitive ? { sensitive: true } : {}),
     ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
     ...(c.rememberCommand ? { rememberCommand: true } : {}),
-    ...(c.everyTime ? { everyTime: c.everyTime } : {}),
+    ...(c.planOnly ? { planOnly: true } : {}),
   };
 }
 
@@ -1218,7 +1218,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     sensitive?: boolean;
     rememberDir?: string;
     rememberCommand?: boolean;
-    everyTime?: "remote" | "plan";
+    planOnly?: boolean;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;

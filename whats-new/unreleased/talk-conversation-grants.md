@@ -10,4 +10,5 @@ steps:
 ---
 An approval card in Talk can now keep a narrow grant for the conversation: **Allow writing** a folder
 outside the workspace, or **Allow this command**, exactly as written. Credentials locations always
-ask, a command that changes something outside this Mac asks every time, and Plan only applies none.
+ask, a command that changes something outside this Mac is never allowed this way, and Plan only
+applies none.

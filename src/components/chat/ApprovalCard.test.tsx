@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { ApprovalCard, COMMAND_GRANT_TITLE, EVERY_TIME_COPY, FOCUS_CARD_CHORD, RUN_CHECK_LIMITS, focusOldestCard } from "./ApprovalCard";
+import { ApprovalCard, COMMAND_GRANT_TITLE, FOCUS_CARD_CHORD, PLAN_ONLY_COPY, RUN_CHECK_LIMITS, focusOldestCard } from "./ApprovalCard";
 import { matchShortcut, type ShortcutContext } from "../../hooks/useGlobalShortcuts";
 
 const base = { callId: "c", threadId: "t", command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3" };
@@ -15,7 +15,7 @@ describe("ApprovalCard", () => {
     // The grant's reach is said where it is offered.
     expect(screen.getByText(/don't ask again/)).toHaveAttribute(
       "title",
-      "Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, a command that changes something outside this Mac, or a file or command reaching outside the workspace, still asks)",
+      "Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)",
     );
   });
 
@@ -30,20 +30,16 @@ describe("ApprovalCard", () => {
     expect(screen.getByText(/don't ask again/)).toBeInTheDocument();
   });
 
-  it("a remote side effect, or Plan only, offers no grant and says why (#1229)", () => {
-    render(
-      <ApprovalCard
-        approval={{ ...base, command: "git push origin main", reason: "changes something outside this Mac (git push)", everyTime: "remote" }}
-        onRespond={() => {}}
-      />,
-    );
-    expect(screen.getByText(EVERY_TIME_COPY.remote)).toBeInTheDocument();
-    expect(screen.queryByText(/don't ask again/)).toBeNull();
+  it("a force push offers no grant, and keeps don't ask again as before (#1229)", () => {
+    render(<ApprovalCard approval={{ ...base, command: "git push --force", reason: "force-push rewrites remote history" }} onRespond={() => {}} />);
     expect(screen.queryByText(/for this conversation/)).toBeNull();
-    cleanup();
-    render(<ApprovalCard approval={{ ...base, command: "rm -rf build", reason: "rm -rf", everyTime: "plan" }} onRespond={() => {}} />);
-    expect(screen.getByText(EVERY_TIME_COPY.plan)).toBeInTheDocument();
-    expect(screen.queryByText(/don't ask again/)).toBeNull();
+    expect(screen.getByText(/don't ask again/)).toBeInTheDocument();
+  });
+
+  it("in Plan only a card offers no grant and says so (#1229)", () => {
+    render(<ApprovalCard approval={{ ...base, kind: "run", command: "cat /tmp/x", reason: "reaches /tmp/x outside the workspace", planOnly: true }} onRespond={() => {}} />);
+    expect(screen.getByText(PLAN_ONLY_COPY)).toBeInTheDocument();
+    expect(screen.queryByText(/for this conversation/)).toBeNull();
   });
 
   it("a write outside may be allowed in its folder for the conversation, a credentials location never (#1229)", () => {
