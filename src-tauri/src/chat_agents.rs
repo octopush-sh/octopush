@@ -907,6 +907,12 @@ impl SubagentMcp {
         self.tools.contains(name)
     }
 
+    /// Whether the thread's "don't ask again" may answer a card now: never in
+    /// Ask first (#1231), read at the call like the mode.
+    pub fn grants(&self) -> bool {
+        self.mode.as_ref().is_none_or(|m| m() != crate::permissions::Mode::Ask)
+    }
+
     /// The card a call to `name` must pass now, or `None`.
     pub fn card(&self, label: Option<&str>, name: &str, input: &serde_json::Value) -> Option<crate::talk_guard::ToolCard> {
         let mode = self.mode.as_ref().map_or(crate::permissions::Mode::Plan, |m| m());
@@ -954,7 +960,7 @@ impl ToolGate for SubagentGate {
         let check = || Some(crate::permissions::ask_card(label, name, input, &self.reach));
         let card = check()?;
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-        let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+        let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, self.mcp.grants());
         crate::chat_engine::guard_card(card, &check, ask).await
     }
 
@@ -982,7 +988,7 @@ impl ToolGate for SubagentGate {
             let check = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.read_dirs(&self.thread_id));
             if let Some(card) = check() {
                 let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, self.mcp.grants());
                 if let Some(denial) = crate::chat_engine::guard_card(card, &check, ask).await {
                     return Some(denial);
                 }
@@ -1003,13 +1009,13 @@ impl ToolGate for SubagentGate {
             };
             let card = check()?;
             let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, self.mcp.grants());
             return crate::chat_engine::guard_card(card, &check, ask).await;
         };
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         match self
             .broker
-            .await_approval(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason)
+            .await_approval(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, self.mcp.grants())
             .await
         {
             ApprovalDecision::Deny => Some(denial),
@@ -3182,6 +3188,19 @@ mod tests {
         for name in ["mcp__s__get_x", "mcp__s__post_x"] {
             assert_eq!(gate.check(name, &input).await, Some(plan_net.clone()), "{name}");
         }
+        // Ask first (#1231), read at the call: the trusted server's write and
+        // the read-named tool both ask, and no "don't ask again" answers them.
+        db.lock().set_thread_permission_mode(&base.thread_id, Mode::Ask).unwrap();
+        asked.lock().clear();
+        for name in ["mcp__s__get_x", "mcp__s__post_x"] {
+            assert!(gate.check(name, &input).await.is_some_and(|d| d.starts_with("asked")), "{name}");
+        }
+        assert_eq!(asked.lock().clone(), vec!["mcp__s__get_x".to_string(), "mcp__s__post_x".to_string()]);
+        let mode = crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone());
+        let probe = SubagentMcp::new(&discovered, mode, Arc::new(TrustView::default));
+        assert!(!probe.grants(), "Ask first: no grant answers the gate's cards");
+        db.lock().set_thread_permission_mode(&base.thread_id, Mode::Edit).unwrap();
+        assert!(probe.grants(), "read at the call");
     }
 
     #[tokio::test]

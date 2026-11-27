@@ -255,7 +255,55 @@ const GIT_READERS: &[&str] = &["status", "diff", "log", "show", "blame", "ls-fil
 /// variable or a path as the program, an assignment before it, a wrapper or
 /// a shell keyword, a script, or nesting past the check's caps.
 pub fn reads_only(command: &str) -> bool {
-    !command.trim().is_empty() && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+    !command.trim().is_empty()
+        && !runs_arithmetic(command)
+        && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+}
+
+/// Whether `command` holds arithmetic (`$((…))`, `$[…]`) or any `${…}` but a
+/// plain name or its length (`${name}`, `${#name}`), anywhere, quoted or
+/// not. Bash evaluates a substring offset or an array subscript
+/// (`${PWD:_}`, `${a[_]}`) and arithmetic as an expression, and a variable
+/// in it, such as `$_` after `echo 'a[$(cmd)]'`, runs the command it holds:
+/// a reader that runs code. So it asks.
+fn runs_arithmetic(command: &str) -> bool {
+    if command.contains("$((") || command.contains("$[") {
+        return true;
+    }
+    let mut rest = command;
+    while let Some(at) = rest.find("${") {
+        let inner = &rest[at + 2..];
+        let Some(end) = inner.find('}') else { return true };
+        let name = inner[..end].strip_prefix('#').unwrap_or(&inner[..end]);
+        let plain = name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+            && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric());
+        if !plain {
+            return true;
+        }
+        rest = &inner[end + 1..];
+    }
+    false
+}
+
+/// Whether `command` runs `git` from outside `workspace` (#1231): `cwd` is
+/// where it starts (the shared shell's directory, `None` for the workspace
+/// root), resolved on the disk, links followed. Ask first's git readers skip
+/// the card only inside the workspace: elsewhere a repository's own config
+/// (`core.fsmonitor`, a bare repository's) can run code. A directory that
+/// can't be resolved counts as outside.
+pub fn git_outside(command: &str, cwd: Option<&Path>, workspace: &Path) -> bool {
+    use crate::chat_engine::WordRole;
+    let runs_git = crate::chat_engine::each_command(command, |line| {
+        crate::chat_engine::command_words(line).iter().any(|w| w.role == WordRole::Program && w.word == "git").then_some(())
+    });
+    if matches!(runs_git, Ok(None)) {
+        return false;
+    }
+    let Some(cwd) = cwd else { return false };
+    match (std::fs::canonicalize(cwd), std::fs::canonicalize(workspace)) {
+        (Ok(at), Ok(workspace)) => !at.starts_with(workspace),
+        _ => true,
+    }
 }
 
 fn line_reads_only(line: &str) -> bool {
@@ -956,6 +1004,48 @@ mod tests {
         assert!(!reads_only(&format!("echo {}", "$(".repeat(6))), "past the nesting it reads, it asks");
     }
 
+    /// Arithmetic runs what a variable holds, `$_` included, so a reader
+    /// that expands it asks: `echo 'a[$(touch x)]'; echo ${PWD:_}` runs
+    /// `touch x` in bash.
+    #[test]
+    fn a_reader_that_expands_arithmetic_asks() {
+        for command in [
+            "echo 'a[$(touch x)]'; echo ${PWD:_}",
+            "echo 'a[$(touch x)]'; echo ${a[_]}",
+            "echo 'a[$(touch x)]'; echo $((_))",
+            "echo $[_]",
+            "cat ${!_}",
+            "echo ${x:=1}",
+            "cat ${f:-a.rs}",
+            "echo ${PWD",
+            "grep x '${a[_]}'",
+        ] {
+            assert!(!reads_only(command), "{command} should ask");
+        }
+        for command in ["cat \"${FILE}\"", "echo ${#PATH}", "cat \"$FILE\"", "echo $_", "ls ${HOME}/x"] {
+            assert!(reads_only(command), "{command} should run without a card");
+        }
+    }
+
+    /// A git reader skips the card only where it starts inside the
+    /// workspace, resolved on the disk.
+    #[test]
+    fn a_git_reader_outside_the_workspace_asks() {
+        let (ws, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir(ws.path().join("sub")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(other.path(), ws.path().join("out")).unwrap();
+        let w = ws.path();
+        assert!(!git_outside("git status", None, w), "at the workspace root");
+        assert!(!git_outside("git log -1", Some(&w.join("sub")), w));
+        assert!(git_outside("git status", Some(other.path()), w));
+        assert!(git_outside("ls && git diff", Some(other.path()), w), "any git in the command");
+        assert!(git_outside("git status", Some(&w.join("missing")), w), "unresolvable counts as outside");
+        #[cfg(unix)]
+        assert!(git_outside("git status", Some(&w.join("out")), w), "a link out of the workspace is outside");
+        assert!(!git_outside("cat a.rs", Some(other.path()), w), "only git is held");
+    }
+
     fn workspace_reach(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Reach) {
         let (ws, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         for (path, content) in files {
@@ -1433,7 +1523,9 @@ mod tests {
         for call in [
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
             "match crate::permissions::decide(mode, &call, &ctx) {",
-            "if mode_asks.contains(&u.id) && skill_refusal.is_none() {",
+            "let grants = mode != crate::permissions::Mode::Ask;",
+            "crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))",
+            "if (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none() {",
             "let check = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
@@ -1460,5 +1552,13 @@ mod tests {
         let attempts: Vec<&str> = run.lines().filter(|l| l.contains("run_attempt(")).collect();
         assert_eq!(attempts.len(), 3, "{attempts:?}");
         assert!(attempts.iter().all(|l| l.contains("&sink, &tool_gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
+        // In Ask first no grant answers a card (#1231): every card the
+        // director and a sub-agent gate raise says whether one may.
+        assert_eq!(body.matches("self.approvals.await_card(").count(), body.matches(", c, grants)").count(), "{body}");
+        assert!(body.contains("reason,\n                                grants,\n"), "the destructive-command card");
+        let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
+        let gate = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
+        assert_eq!(gate.matches("self.broker.await_card(").count(), 3);
+        assert_eq!(gate.matches("self.mcp.grants())").count(), 4, "{gate}");
     }
 }
