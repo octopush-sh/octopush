@@ -850,6 +850,14 @@ mod tests {
             decide(Mode::Plan, &ToolCall { name: "write_file", input: &input }, &forced),
             Decision::Deny { message: plan_refusal(Refused::Write, true) }
         );
+        // A command the forced sandbox stopped names the mission too (#1230);
+        // Plan only the user chose keeps the plain note.
+        use crate::chat_engine::{name_forced_mission, READ_ONLY_MISSION_NOTE, READ_ONLY_NOTE};
+        let stopped = format!("touch: a.rs: Operation not permitted\n{READ_ONLY_NOTE}");
+        let named = name_forced_mission(stopped.clone(), true);
+        assert!(named.ends_with(READ_ONLY_MISSION_NOTE) && named.contains("mission is read-only"), "{named}");
+        assert_eq!(name_forced_mission(stopped.clone(), false), stopped);
+        assert_eq!(name_forced_mission("ok".into(), true), "ok", "a command that ran is left as it is");
     }
 
     /// Plan only means no changes to the world: a command that pushes,
@@ -1275,6 +1283,7 @@ mod tests {
             "let mut was_denied = denied.is_some() || mode_denied;",
             "self.talk_shell.available() && exec_roots.is_none()",
             "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
+            "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
             "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await",
             "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),\n                        ships_nothing,\n",

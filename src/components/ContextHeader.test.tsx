@@ -94,32 +94,22 @@ describe("ContextHeader", () => {
     expect(screen.getByText("auth-refactor")).toBeInTheDocument();
   });
 
-  it("shows a Shield glyph when the mission's execution is sandboxed", () => {
-    render(
-      <ContextHeader
-        {...baseProps}
-        workspaceName="X"
-        branch="feat/x"
-        gitStatus={null}
-        missionIntent="build"
-        missionExecIsolation="sandbox"
-      />,
+  it("shows the mission's sandbox toggle in the eyebrow: Shield on, ShieldOff off (#1230)", () => {
+    const header = (exec: string, git = "worktree") => (
+      <ContextHeader {...baseProps} workspaceName="X" branch="feat/x" gitStatus={null} missionIntent="build" missionId="m1" missionExecIsolation={exec} missionGitIsolation={git} />
     );
-    expect(screen.getByTitle(/sandboxed execution/i)).toBeInTheDocument();
+    const { rerender } = render(header("sandbox"));
+    expect(screen.getByRole("button", { name: "Sandbox on" })).toHaveAttribute("data-tour", "header-sandbox");
+    rerender(header("none"));
+    expect(screen.getByRole("button", { name: "Sandbox off" })).toBeInTheDocument();
+    // A read-only mission forces it on, whatever its Execution axis says.
+    rerender(header("none", "readonly"));
+    expect(screen.getByRole("button", { name: "Sandbox on" })).toHaveAttribute("aria-disabled", "true");
   });
 
-  it("omits the sandbox glyph when execution is not sandboxed", () => {
-    render(
-      <ContextHeader
-        {...baseProps}
-        workspaceName="X"
-        branch="feat/x"
-        gitStatus={null}
-        missionIntent="build"
-        missionExecIsolation="none"
-      />,
-    );
-    expect(screen.queryByTitle(/sandboxed execution/i)).not.toBeInTheDocument();
+  it("shows no sandbox toggle without a mission", () => {
+    render(<ContextHeader {...baseProps} workspaceName="X" branch="feat/x" gitStatus={null} missionExecIsolation="sandbox" />);
+    expect(screen.queryByRole("button", { name: /^Sandbox/ })).not.toBeInTheDocument();
   });
 
   it("shows the test intent and the ship-nothing glyph, and no glyph for a read-only or delivering mission", () => {
