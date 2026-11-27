@@ -287,8 +287,13 @@ function CrewRow({
   const last = entries && entries.length > 0 ? entries[entries.length - 1] : undefined;
   const activity = !running ? "" : last?.kind === "notice" ? last.text : lastActivity(entries ?? []);
   const tokens = agent.meta ? agent.meta.inputTokens + agent.meta.outputTokens : 0;
-  const ending =
-    agent.meta?.closedAtCap ? "turn limit" : agent.meta?.blocked ? "needs a decision" : null;
+  const ending = agent.meta?.stopped
+    ? "stopped"
+    : agent.meta?.closedAtCap
+      ? "turn limit"
+      : agent.meta?.blocked
+        ? "needs a decision"
+        : null;
   const escalatedFrom = agent.meta?.escalatedFrom ?? null;
 
   return (
@@ -359,7 +364,10 @@ function CrewRow({
             </span>
           )}
           {ending && (
-            <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-warning">
+            <span
+              data-tour="talk-crew-ending"
+              className="shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-warning"
+            >
               {ending}
             </span>
           )}

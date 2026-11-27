@@ -54,6 +54,7 @@ export function directorAnsweredAfter(messages: ChatMessage[], callId: string | 
 export function statusWordFor(agent: CrewAgent, continuing: boolean): string {
   if (continuing) return "continuing";
   if (agent.status === "running") return "running";
+  if (agent.meta?.stopped) return "stopped";
   if (agent.meta?.closedAtCap) return "done · turn limit";
   if (agent.meta?.blocked) return "needs a decision";
   return agent.status;
@@ -130,7 +131,7 @@ export function CompanionCrewJournal({ workspaceId }: { workspaceId: string }) {
           className={`octo-tabular shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] ${
             statusWord === "running" || continuing
               ? "text-octo-brass"
-              : agent.status === "failed"
+              : agent.status === "failed" && statusWord !== "stopped"
                 ? "text-octo-rouge"
                 : "text-octo-mute"
           }`}

@@ -20,6 +20,10 @@ import { ModelTiersSection } from "./ModelTiersSection";
 
 const BUILTIN_PROVIDER_NAMES = new Set(["anthropic", "openai", "deepseek", "ollama"]);
 
+// The canonical quiet icon button (docs/design-system.md, "One canonical chrome per concept").
+const QUIET_ICON_BUTTON =
+  "flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
+
 type Snapshot = string; // stable serialization of { providers, keys, baseUrls }
 
 function serialize(providers: ProviderConfig[], keys: Record<string, string>, baseUrls: Record<string, string>): Snapshot {
@@ -509,11 +513,13 @@ function ProviderDetail({
             No models yet.
           </div>
         ) : (
-          <ul className="space-y-1">
+          // Plain rows on one hairline: the pane is already the frame, so a row
+          // brings none of its own, and its quiet actions show on hover or focus.
+          <ul data-tour="settings-models-list" className="divide-y divide-octo-hairline">
             {provider.models.map((m) => (
               <li
                 key={m.id}
-                className="octo-rise-in flex items-center justify-between gap-2 rounded-md border border-octo-hairline bg-octo-onyx px-3 py-2"
+                className="octo-rise-in group flex items-center justify-between gap-2 px-1 py-2"
               >
                 <div className="min-w-0 flex-1">
                   <span className="font-mono text-[11px] text-octo-ivory">{m.id}</span>
@@ -524,13 +530,28 @@ function ProviderDetail({
                     ${m.inputCostPerM}/{m.outputCostPerM} · {formatContextTokens(m.maxContext)} ctx
                   </span>
                 </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  <IconButton label={`Edit model ${m.id}`} onClick={() => onEditModel(m)}>
+                <div
+                  data-testid="model-row-actions"
+                  className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity duration-[220ms] ease-[var(--ease-octo)] group-hover:opacity-100 focus-within:opacity-100"
+                >
+                  <button
+                    type="button"
+                    title={`Edit model ${m.id}`}
+                    aria-label={`Edit model ${m.id}`}
+                    onClick={() => onEditModel(m)}
+                    className={QUIET_ICON_BUTTON}
+                  >
                     <Pencil size={12} />
-                  </IconButton>
-                  <IconButton label={`Remove model ${m.id}`} danger onClick={() => onRemoveModel(m.id)}>
+                  </button>
+                  <button
+                    type="button"
+                    title={`Remove model ${m.id}`}
+                    aria-label={`Remove model ${m.id}`}
+                    onClick={() => onRemoveModel(m.id)}
+                    className={QUIET_ICON_BUTTON}
+                  >
                     <X size={12} />
-                  </IconButton>
+                  </button>
                 </div>
               </li>
             ))}

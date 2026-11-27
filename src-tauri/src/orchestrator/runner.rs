@@ -2,7 +2,7 @@
 
 use crate::chat_engine::resolve_provider;
 use crate::error::AppResult;
-use crate::orchestrator::agentic::run_agentic_loop;
+use crate::orchestrator::agentic::{run_agentic_loop_billed, LoopFailure};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::types::{
     ArtifactKind, StageArtifact, StageInput, StageOutcome, StageSpec, StageStatus,
@@ -371,7 +371,7 @@ impl AgentRunner for ApiRunner {
         // clamp defensively so a corrupt row can never yield a zero-turn loop.
         let max_iterations = stage.max_iterations.max(1) as usize;
         let read_only_tools = read_only.then(|| crate::orchestrator::read_only::read_only_api_tools(stage.tools.as_deref()));
-        let result = run_agentic_loop(
+        let result = run_agentic_loop_billed(
             provider.as_ref(),
             &api_base,
             api_key.as_deref(),
@@ -514,27 +514,36 @@ impl AgentRunner for ApiRunner {
                     blocked_transcript: None,
                 })
             }
-            Err(e) => Ok(StageOutcome {
-                cli: Default::default(),
-                artifact: StageArtifact {
-                    kind: ArtifactKind::Note,
-                    text: String::new(),
-                    payload: None,
-                    refs_worktree: false,
-                },
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                cost_usd: 0.0,
-                status: StageStatus::Failed,
-                tool_calls: vec![],
-                error: Some(e.to_string()),
-                verdict: None,
-                session_id: None,
-                blocked: None,
-                    blocked_transcript: None,
-            }),
+            // A loop that errored after real rounds was billed for them: the
+            // stage keeps their usage and cost for the meter, and their
+            // conversation so a Resume continues instead of re-paying.
+            Err(f) => {
+                let LoopFailure { error, partial: r } = *f;
+                Ok(StageOutcome {
+                    cli: Default::default(),
+                    artifact: StageArtifact {
+                        kind: ArtifactKind::Note,
+                        text: String::new(),
+                        payload: None,
+                        refs_worktree: false,
+                    },
+                    input_tokens: r.input_tokens + r.peer_input_tokens,
+                    output_tokens: r.output_tokens + r.peer_output_tokens,
+                    cache_read_tokens: r.cache_read_tokens,
+                    cache_creation_tokens: r.cache_creation_tokens,
+                    cost_usd: r.cost_usd + r.peer_cost_usd,
+                    status: StageStatus::Failed,
+                    tool_calls: r.tool_calls,
+                    error: Some(error.to_string()),
+                    verdict: None,
+                    session_id: None,
+                    blocked: None,
+                    blocked_transcript: r
+                        .blocked_transcript
+                        .as_ref()
+                        .and_then(|t| serde_json::to_string(t).ok()),
+                })
+            }
         }
     }
 }

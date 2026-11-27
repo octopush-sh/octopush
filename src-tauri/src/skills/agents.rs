@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// A parsed agent definition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentDefinition {
     pub name: String,
     pub description: String,
@@ -66,6 +66,11 @@ pub struct AgentDefinition {
     /// medium, strong → high; see `chat_agents::default_effort_for_tier`).
     #[serde(default)]
     pub effort: Option<crate::providers::Effort>,
+    /// The frontmatter `max-cost` (USD, e.g. `0.50`): the most one run of
+    /// this sub-agent may spend before it closes with what it has. `None` =
+    /// no cap of its own (a budget's share still applies).
+    #[serde(default)]
+    pub max_cost: Option<f64>,
     /// "project", "user" or "builtin".
     pub source: String,
 }
@@ -125,6 +130,7 @@ pub struct AgentDefinitionMeta {
     pub escalate: Option<String>,
     pub max_turns: Option<u32>,
     pub effort: Option<crate::providers::Effort>,
+    pub max_cost: Option<f64>,
 }
 
 impl AgentDefinition {
@@ -138,6 +144,7 @@ impl AgentDefinition {
             escalate: self.escalate.clone(),
             max_turns: self.max_turns,
             effort: self.effort,
+            max_cost: self.max_cost,
         }
     }
 }
@@ -256,6 +263,7 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
     let mut escalate: Option<String> = None;
     let mut max_turns: Option<u32> = None;
     let mut effort: Option<crate::providers::Effort> = None;
+    let mut max_cost: Option<f64> = None;
     for (key, value) in pairs {
         match key.as_str() {
             "name" => name = value,
@@ -299,13 +307,24 @@ pub fn parse_agent_definition(content: &str, source: &str) -> Option<AgentDefini
                 // sub-agent that cannot take a single turn.
                 max_turns = value.trim().parse::<u32>().ok().filter(|n| *n > 0);
             }
+            "max-cost" | "max_cost" | "maxCost" => {
+                max_cost = parse_max_cost(&value);
+            }
             _ => {}
         }
     }
     if name.is_empty() {
         return None;
     }
-    Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, max_turns, effort, source: source.to_string() })
+    Some(AgentDefinition { name, description, body, tools, mcp, model, escalate, max_turns, effort, max_cost, source: source.to_string() })
+}
+
+/// A frontmatter `max-cost`: `0.50` or `$0.50`, in USD. Zero, negative or
+/// garbage means no cap of its own, never a sub-agent that cannot spend a cent.
+fn parse_max_cost(value: &str) -> Option<f64> {
+    let v = value.trim();
+    let v = v.strip_prefix('$').unwrap_or(v).trim();
+    v.parse::<f64>().ok().filter(|c| c.is_finite() && *c > 0.0)
 }
 
 /// Discover every agent definition for a worktree (project ∪ user ∪
@@ -385,6 +404,28 @@ mod tests {
         assert_eq!(d.max_turns, None);
         let d = parse_agent_definition("---\nname: a\n---\nbody", "project").unwrap();
         assert_eq!(d.max_turns, None);
+    }
+
+    #[test]
+    fn definition_max_cost_parsed() {
+        let d = parse_agent_definition("---\nname: a\nmax-cost: 0.50\n---\nbody", "project").unwrap();
+        assert_eq!(d.max_cost, Some(0.5));
+        assert_eq!(d.meta().max_cost, Some(0.5));
+        let d = parse_agent_definition("---\nname: a\nmax_cost: $2\n---\nbody", "project").unwrap();
+        assert_eq!(d.max_cost, Some(2.0));
+        for garbage in ["0", "-1", "lots", "", "NaN", "inf"] {
+            let d = parse_agent_definition(&format!("---\nname: a\nmax-cost: {garbage}\n---\nbody"), "project").unwrap();
+            assert_eq!(d.max_cost, None, "{garbage:?} is no cap of its own");
+        }
+        let d = parse_agent_definition("---\nname: a\n---\nbody", "project").unwrap();
+        assert_eq!(d.max_cost, None);
+        // A saved run's spec keeps the cap; one saved before it reads as none.
+        let d = parse_agent_definition("---\nname: a\nmax-cost: 0.25\n---\nbody", "project").unwrap();
+        let back: AgentDefinition = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back.max_cost, Some(0.25));
+        let mut old = serde_json::to_value(&d).unwrap();
+        old.as_object_mut().unwrap().remove("max_cost");
+        assert_eq!(serde_json::from_value::<AgentDefinition>(old).unwrap().max_cost, None);
     }
 
     #[test]

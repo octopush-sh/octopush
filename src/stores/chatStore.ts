@@ -59,6 +59,9 @@ export interface AgentMeta {
   /** The run was given more turns (or an answer) after its first ending;
    *  the report and figures cover every run. */
   continued?: boolean;
+  /** Stop on the turn ended the run before it reported; it can still be
+   *  continued from the crew journal. */
+  stopped?: boolean;
 }
 
 export { isAgentToolName };

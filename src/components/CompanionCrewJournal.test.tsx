@@ -88,6 +88,8 @@ describe("continueLabel / statusWordFor", () => {
     expect(statusWordFor(agentWith({ blocked: true }), false)).toBe("needs a decision");
     expect(statusWordFor(agentWith(null, "running"), false)).toBe("running");
     expect(statusWordFor(agentWith({ ok: false }, "failed"), false)).toBe("failed");
+    expect(statusWordFor(agentWith({ ok: false, finished: false, stopped: true }, "failed"), false)).toBe("stopped");
+    expect(continueLabel(agentWith({ ok: false, finished: false, stopped: true }, "failed"), false, null)).toBe("Let it finish");
     expect(statusWordFor(agentWith({}), true)).toBe("continuing");
   });
 });

@@ -921,6 +921,52 @@ mod tests {
     }
 
     #[test]
+    fn next_turn_history_contains_stopped_fanout_reports() {
+        // Stop during a fan-out (#1148): one explorer reported, one was
+        // stopped; then the user says "continue".
+        let agent = |id: &str, result: &str, ok: bool| {
+            let mut row = serde_json::json!({
+                "callId": id,
+                "toolName": "Agent",
+                "toolInput": {"description": format!("explore {id}")},
+                "result": result,
+                "ok": ok,
+                "outcome": if ok { "ok" } else { "failed" },
+                "agent": {"ok": ok, "finished": ok, "stopped": !ok},
+            });
+            if !ok {
+                row["reason"] = serde_json::json!("stopped");
+            }
+            row.to_string()
+        };
+        let done = agent("a1", "src/db.rs holds the schema.", true);
+        let stopped = agent("a2", "Sub-agent stopped: the user stopped the turn after 4 tool calls, before it reported.", false);
+        let rows = [
+            HistoryRow { id: 1, role: "user", content: "map the crate", context: None },
+            HistoryRow { id: 2, role: "assistant_tool_use", content: "[tool_calls: []]", context: None },
+            HistoryRow { id: 3, role: "tool", content: &done, context: None },
+            HistoryRow { id: 4, role: "tool", content: &stopped, context: None },
+            HistoryRow { id: 5, role: "stopped", content: "Generation stopped.", context: None },
+            HistoryRow { id: 6, role: "user", content: "continue", context: None },
+        ];
+        let turns = build_history(&rows);
+        assert_eq!(turns.len(), 1);
+        let text = &turns[0].text;
+        assert!(text.contains("[Tool #3: Agent") && text.contains("src/db.rs holds the schema."), "{text}");
+        assert!(text.contains("[Tool #4: Agent") && text.contains("Sub-agent stopped: the user stopped the turn"), "{text}");
+        assert!(!text.contains("Generation stopped."));
+        assert!(text.ends_with("\n\ncontinue"), "{text}");
+
+        // Talk engine v2 replays the stopped turn as text, with both reports.
+        let v2_rows: Vec<crate::context::transcript::Row<'_>> = rows
+            .iter()
+            .map(|r| crate::context::transcript::Row { id: r.id, role: r.role, content: r.content, ..Default::default() })
+            .collect();
+        let v2 = format!("{:?}", crate::context::transcript::build(&v2_rows, "m"));
+        assert!(v2.contains("src/db.rs holds the schema.") && v2.contains("Sub-agent stopped: the user stopped the turn"), "{v2}");
+    }
+
+    #[test]
     fn history_caps_a_huge_tool_input() {
         let content = serde_json::json!({
             "toolName": "run_command",

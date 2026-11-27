@@ -487,6 +487,25 @@ fn tool_row(call_id: &str, tool_name: &str, tool_input: serde_json::Value, resul
     record
 }
 
+/// Put a sub-agent's meta on its tool row (`agent` key): what the card's
+/// collapsed summary shows (tokens, cost, ending). The report already sits
+/// in `result`.
+fn attach_agent_meta(record: &mut serde_json::Value, meta: &AgentOutcome) {
+    let mut m = serde_json::to_value(meta).unwrap_or_default();
+    if let Some(obj) = m.as_object_mut() {
+        obj.remove("report");
+    }
+    record["agent"] = m;
+}
+
+/// Whether a call of a round Stop landed in is still persisted and fed back
+/// (#1148): a sub-agent whose outcome the fan-out holds (it reported, or
+/// was stopped), since its report and spend are real. Every other call not
+/// started yet is skipped.
+fn kept_after_stop(tool_name: &str, has_outcome: bool) -> bool {
+    is_agent_tool(tool_name) && has_outcome
+}
+
 /// The exit status bash gives a command it couldn't find.
 const NOT_FOUND_EXIT: i32 = 127;
 
@@ -2969,6 +2988,19 @@ pub fn merge_continued_meta(old: &serde_json::Value, new: &AgentOutcome) -> serd
     m
 }
 
+/// A continued sub-agent's tool row, rewritten in place: the continuation's
+/// report, both runs' meta, and the verdict of how it ended now, so a run
+/// stopped and then let finish no longer reads as stopped.
+fn restamp_continued(record: &mut serde_json::Value, outcome: &AgentOutcome) {
+    let old_meta = record.get("agent").cloned().unwrap_or_else(|| serde_json::json!({}));
+    record["agent"] = merge_continued_meta(&old_meta, outcome);
+    record["result"] = serde_json::Value::String(outcome.report.clone());
+    if let Some(obj) = record.as_object_mut() {
+        obj.remove("reason");
+    }
+    stamp_outcome(record, RowVerdict { ok: outcome.ok, stopped: outcome.stopped, ..RowVerdict::default() });
+}
+
 // ─── Engine ───────────────────────────────────────────────────────
 
 /// Removes a cancel flag from the registry when its turn ends, no matter
@@ -3256,13 +3288,29 @@ impl ChatEngine {
         let _ = self.db.lock().record_activity(workspace_id, "talk", "chat");
     }
 
+    /// Each of `n_agents` sub-agents' share of the workspace's budget
+    /// headroom (`chat_agents::budget_share`); `None` with no budget set. A
+    /// read error is logged and leaves the run unbounded, as before budgets
+    /// reached sub-agents.
+    fn subagent_budget_share(&self, workspace_id: &str, n_agents: usize) -> Option<f64> {
+        let headroom = self.db.lock().budget_headroom(Some(workspace_id));
+        match headroom {
+            Ok(h) => crate::chat_agents::budget_share(h, n_agents),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the budget headroom for sub-agents");
+                None
+            }
+        }
+    }
+
     /// Sub-agent spend goes to the ledger under ITS model (a `model`
     /// override may differ from the thread's) and under its call id, so the
     /// Companion's conversation cost splits director from crew. An escalated
     /// sub-agent bills every attempt at its own model's price, so each
     /// attempt is its own ledger row. The row takes the attempt's own cost,
     /// priced per request by the agentic loop (Haiku 5.5's long tier); a $0
-    /// attempt is priced (or marked unpriced) by the ledger.
+    /// attempt is priced (or marked unpriced) by the ledger. A failed
+    /// attempt bills the rounds it ran before the error.
     fn record_subagent_spend(&self, workspace_id: &str, thread_id: &str, call_id: &str, o: &AgentOutcome) {
         let origin = subagent_origin(call_id);
         for a in o.billed_attempts() {
@@ -3651,6 +3699,8 @@ impl ChatEngine {
         // the plan is that model, its tier, and the role's effort.
         spec.call.model = Some(run.model.clone());
         spec.max_iterations = extra_turns;
+        // The budget's headroom as it is now, all of it this run's.
+        spec.spend_limit = self.subagent_budget_share(&run.workspace_id, 1);
         {
             let (known_models, tiers) = model_catalog();
             let mut plan = plan_subagent(&SubagentSpec { policy_auto: false, ..spec.clone() }, &known_models, &tiers);
@@ -3716,9 +3766,7 @@ impl ChatEngine {
         // meta carries both runs.
         let mut record: serde_json::Value = serde_json::from_str(&row.content)
             .unwrap_or_else(|_| serde_json::json!({ "callId": call_id, "toolName": "Agent" }));
-        let old_meta = record.get("agent").cloned().unwrap_or_else(|| serde_json::json!({}));
-        record["agent"] = merge_continued_meta(&old_meta, &outcome);
-        record["result"] = serde_json::Value::String(outcome.report.clone());
+        restamp_continued(&mut record, &outcome);
         let content = record.to_string();
         self.db.lock().update_chat_message_content(message_id, &content)?;
         let _ = app.emit("chat://message-updated", &MessageUpdatedEvent {
@@ -4697,6 +4745,7 @@ impl ChatEngine {
                             policy_auto,
                             resume: None,
                             plan: None,
+                            spend_limit: None,
                         };
                         let plan = plan_subagent(&spec, &known_models, &tiers);
                         spec.plan = Some(plan.clone());
@@ -4734,6 +4783,19 @@ impl ChatEngine {
                 }
                 if !specs.is_empty() {
                     tracing::info!(agents = specs.len(), "fanning out sub-agents");
+                    // The budget gate above only runs between rounds, after
+                    // the whole fan-out returns: each sub-agent gets its share
+                    // of the headroom as its own spend limit, so together
+                    // they stop at the budget. No budget, or an overridden
+                    // turn, leaves them unbounded.
+                    let share = if request.override_budget {
+                        None
+                    } else {
+                        self.subagent_budget_share(&request.workspace_id, specs.len())
+                    };
+                    for spec in specs.iter_mut() {
+                        spec.spend_limit = share;
+                    }
                     let done = run_subagents(
                         app.clone(),
                         Arc::clone(&self.db),
@@ -4762,11 +4824,12 @@ impl ChatEngine {
             // Execute each tool, persist to DB, and collect results.
             let mut tool_results: Vec<LlmToolResult> = Vec::new();
             for u in &response.tool_uses {
-                // Honor a cancel that landed between tools — stop before
-                // kicking off another (possibly long) tool.
-                if cancel.load(Ordering::Relaxed) {
-                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
-                    return Ok(());
+                // Honor a cancel that landed between tools — never kick off
+                // another (possibly long) tool. A sub-agent the fan-out
+                // already ran is still persisted and fed back (#1148); the
+                // next check of the loop ends the turn as stopped.
+                if cancel.load(Ordering::Relaxed) && !kept_after_stop(&u.name, agent_outcomes.contains_key(&u.id)) {
+                    continue;
                 }
                 tracing::info!(tool = %u.name, "executing tool");
 
@@ -4912,6 +4975,7 @@ impl ChatEngine {
                         ..AgentOutcome::default()
                     });
                     let pair = (outcome.report.clone(), outcome.ok);
+                    interrupted = outcome.stopped;
                     agent_meta = Some(outcome);
                     pair
                 } else if u.name == RECALL_TOOL_NAME {
@@ -5100,13 +5164,7 @@ impl ChatEngine {
                     RowVerdict { ok, denied: was_denied, exit_code: run_command_exit, stopped: interrupted },
                 );
                 if let Some(meta) = &agent_meta {
-                    // Report already sits in `result`; the meta is what the
-                    // card's collapsed summary shows (tokens, cost, ending).
-                    let mut m = serde_json::to_value(meta).unwrap_or_default();
-                    if let Some(obj) = m.as_object_mut() {
-                        obj.remove("report");
-                    }
-                    tool_record["agent"] = m;
+                    attach_agent_meta(&mut tool_record, meta);
                 }
                 // The thread may have been deleted while the turn was parked (a
                 // tool running, or an approval card awaiting the user). Skip the
@@ -5463,6 +5521,96 @@ mod continuation_tests {
         assert_eq!(m["inputTokens"], 12);
     }
 
+    /// The row the tool loop writes for a sub-agent's outcome.
+    fn agent_row(call_id: &str, o: &AgentOutcome) -> serde_json::Value {
+        let mut row = tool_row(
+            call_id,
+            "Agent",
+            serde_json::json!({ "description": call_id }),
+            &o.report,
+            RowVerdict { ok: o.ok, stopped: o.stopped, ..RowVerdict::default() },
+        );
+        attach_agent_meta(&mut row, o);
+        row
+    }
+
+    fn stopped_outcome(tool_calls: usize) -> AgentOutcome {
+        let mut o = AgentOutcome { model: "haiku".into(), tool_calls, cost_usd: 0.02, ..AgentOutcome::default() };
+        crate::chat_agents::mark_stopped(&mut o);
+        o
+    }
+
+    #[test]
+    fn stop_during_fanout_persists_finished_reports() {
+        // Six explorers reported, the seventh was stopped; one read_file of
+        // the same round never started (#1148).
+        let mut outcomes: HashMap<String, AgentOutcome> = (1..=6)
+            .map(|i| (format!("a{i}"), AgentOutcome { report: format!("report {i}"), ok: true, finished: true, ..AgentOutcome::default() }))
+            .collect();
+        outcomes.insert("a7".into(), stopped_outcome(12));
+        let round: Vec<(&str, String)> = (1..=7)
+            .map(|i| ("Agent", format!("a{i}")))
+            .chain([("read_file", "r1".to_string()), ("Task", "lost".to_string())])
+            .collect();
+        let kept: Vec<&str> = round
+            .iter()
+            .filter(|(name, id)| kept_after_stop(name, outcomes.contains_key(id)))
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["a1", "a2", "a3", "a4", "a5", "a6", "a7"], "every sub-agent with an outcome, nothing else");
+        // Each finished report is on its row, as it passed.
+        let row = agent_row("a3", &outcomes["a3"]);
+        assert_eq!(row["result"], "report 3");
+        assert_eq!((row["ok"].as_bool(), row["outcome"].as_str()), (Some(true), Some("ok")));
+        assert!(row.get("reason").is_none());
+        assert_eq!(row["agent"]["finished"], true);
+        assert!(row["agent"].get("report").is_none(), "the report rides on `result`");
+    }
+
+    #[test]
+    fn stopped_subagent_row_marked_stopped() {
+        let o = stopped_outcome(12);
+        let row = agent_row("a7", &o);
+        assert_eq!((row["ok"].as_bool(), row["outcome"].as_str(), row["reason"].as_str()), (Some(false), Some("failed"), Some("stopped")));
+        assert_eq!(row["agent"]["stopped"], true);
+        assert_eq!(row["agent"]["ok"], false);
+        assert!(row["result"].as_str().unwrap().contains("the user stopped the turn after 12 tool calls"));
+    }
+
+    #[test]
+    fn stopped_fanout_runs_are_continuable() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute("INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)", [&now]).unwrap();
+        db.conn_ref()
+            .execute("INSERT INTO workspaces (id,project_id,name,branch,created_at,last_active) VALUES ('w1','p1','W','main',?1,?1)", [&now])
+            .unwrap();
+        let thread = db.create_chat_thread("w1", "t").unwrap();
+        // The fan-out saved the stopped run; the loop writes its row and links it.
+        db.upsert_chat_agent_run("a7", &thread.id, "w1", "{}", "{\"messages\":[{}],\"askToolUseId\":\"\"}", "haiku").unwrap();
+        let o = stopped_outcome(12);
+        let id = db.insert_chat_message("w1", &thread.id, "tool", &agent_row("a7", &o).to_string(), None, None, None, None).unwrap();
+        db.set_chat_agent_run_message("a7", id).unwrap();
+        // What `continue_subagent` reads first: the run, linked to a live row.
+        let run = db.get_chat_agent_run("a7").unwrap().unwrap();
+        assert_eq!(run.message_id, Some(id));
+        assert!(db.get_chat_message(id).unwrap().is_some());
+
+        // "Let it finish": the rewritten row no longer reads as stopped.
+        let mut record: serde_json::Value = serde_json::from_str(&db.get_chat_message(id).unwrap().unwrap().content).unwrap();
+        let done = AgentOutcome { report: "full map".into(), ok: true, finished: true, model: "haiku".into(), continued: true, ..AgentOutcome::default() };
+        restamp_continued(&mut record, &done);
+        assert_eq!(record["result"], "full map");
+        assert_eq!((record["ok"].as_bool(), record["outcome"].as_str()), (Some(true), Some("ok")));
+        assert!(record.get("reason").is_none());
+        assert_eq!(record["agent"]["stopped"], false);
+        assert_eq!(record["agent"]["toolCalls"], 12, "both runs' figures");
+        // Stopped again, it says so again.
+        restamp_continued(&mut record, &stopped_outcome(3));
+        assert_eq!(record["reason"], "stopped");
+    }
+
     #[test]
     fn turn_usage_prices_each_round_with_its_cache_split_and_keeps_the_last_prompt_size() {
         let r = |input: u64, output: u64, read: u64, write: u64| crate::providers::LlmResponse {
@@ -5551,6 +5699,99 @@ mod continuation_tests {
         engine.record_subagent_spend("ws-1", "t-2", "call-2", &unknown);
         let c = db.lock().thread_cost("t-2", None).unwrap();
         assert_eq!((c.unpriced_calls, c.subagents_usd), (1, 0.0));
+    }
+
+    /// Two tool rounds, then a request the provider refuses for good.
+    struct TwoRoundsThenRefuses {
+        left: std::sync::atomic::AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for TwoRoundsThenRefuses {
+        async fn complete(
+            &self,
+            _b: &str,
+            _k: Option<&str>,
+            _req: &crate::providers::LlmRequest,
+            _c: &reqwest::Client,
+        ) -> AppResult<crate::providers::LlmResponse> {
+            if self.left.fetch_sub(1, Ordering::Relaxed) == 0 {
+                return Err(AppError::Provider {
+                    kind: crate::error::ProviderErrorKind::BadRequest,
+                    retry_after: None,
+                    message: "prompt is too long".into(),
+                });
+            }
+            Ok(crate::providers::LlmResponse {
+                text: "reading".into(),
+                tool_uses: vec![crate::providers::LlmToolUse {
+                    id: format!("t{}", self.left.load(Ordering::Relaxed)),
+                    name: "list_files".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                stop_reason: crate::providers::LlmStopReason::ToolUse,
+                input_tokens: 10_000,
+                output_tokens: 100,
+                ..Default::default()
+            })
+        }
+    }
+    struct NoSink;
+    impl crate::orchestrator::events::EventSink for NoSink {
+        fn emit(&self, _e: &str, _p: serde_json::Value) {}
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn failed_subagent_spend_is_recorded() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let model = "claude-opus-5-5";
+        let round = token_engine::request_cost_for(model, 10_000, 100, 0, 0);
+        assert!(round > 0.0, "the model is priced");
+        // A budget the two rounds cross.
+        db.lock().upsert_budget("global", "", "daily", round * 1.5).unwrap();
+
+        let spec = SubagentSpec {
+            call_id: "call-1".into(),
+            call: crate::chat_agents::parse_agent_call(&serde_json::json!({"description": "Map", "prompt": "List the files."})).unwrap(),
+            workspace_id: "ws-1".into(),
+            thread_id: "t-1".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: model.into(),
+            max_iterations: None,
+            max_tokens: 4096,
+            sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        };
+        let provider = TwoRoundsThenRefuses { left: std::sync::atomic::AtomicU64::new(2) };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let o = crate::chat_agents::run_subagent_core(
+            &provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &NoSink, None, None,
+        )
+        .await
+        .unwrap();
+        assert!(!o.ok, "{}", o.report);
+        assert!((o.cost_usd - round * 2.0).abs() < 1e-9, "the outcome carries both rounds: {}", o.cost_usd);
+        // The thread receipt reads the outcome's figures from the tool row.
+        let row = serde_json::to_value(&o).unwrap();
+        assert_eq!(row["inputTokens"], 20_000);
+        assert!((row["costUsd"].as_f64().unwrap() - round * 2.0).abs() < 1e-9);
+
+        engine.record_subagent_spend("ws-1", "t-1", "call-1", &o);
+        let c = db.lock().thread_cost("t-1", None).unwrap();
+        assert_eq!(c.calls, 1, "the failed attempt is a ledger row");
+        assert!((c.subagents_usd - round * 2.0).abs() < 1e-9, "{}", c.subagents_usd);
+        // And the budget sees it.
+        let verdict = db.lock().check_budget(Some("ws-1")).unwrap();
+        assert!(matches!(verdict, crate::db::BudgetVerdict::Block { .. }), "{verdict:?}");
+        assert_eq!(db.lock().budget_headroom(Some("ws-1")).unwrap(), Some(0.0));
     }
 
     #[test]
