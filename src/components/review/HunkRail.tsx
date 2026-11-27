@@ -9,6 +9,9 @@ interface Props {
   /** Committed changes (#851): Why? only — Accept and Reject act on the
    *  working tree, which this hunk is not in. */
   readOnly?: boolean;
+  /** A Talk turn's change (#1152): Why? and Revert, which reverses the
+   *  hunk in the working tree. Nothing to accept: it is already there. */
+  revertOnly?: boolean;
   onAccept: () => void;
   onReject: () => void;
   onWhy: () => void;
@@ -23,6 +26,7 @@ export function HunkRail({
   focused,
   staged,
   readOnly = false,
+  revertOnly = false,
   onAccept,
   onReject,
   onWhy,
@@ -64,7 +68,17 @@ export function HunkRail({
             >
               <HelpCircle size={11} className="inline" /> Why?
             </button>
-            {!readOnly && (
+            {revertOnly && !readOnly && (
+              <button
+                onClick={onReject}
+                aria-label="Revert hunk"
+                title="Revert this hunk in the working tree (x), if it still applies"
+                className="rounded px-1.5 py-0.5 text-octo-sage transition-colors hover:text-octo-rouge focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                <XCircle size={11} className="inline" /> Revert
+              </button>
+            )}
+            {!readOnly && !revertOnly && (
             <>
             {onComment && (
               <button

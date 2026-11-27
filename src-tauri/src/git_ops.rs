@@ -1180,6 +1180,29 @@ pub fn committed_diff(path: &Path, base: Option<&str>, ignore_whitespace: bool) 
     Ok(out)
 }
 
+/// The unified diff between the trees of two commits, renames not paired,
+/// so each hunk reverses on its own path with `git apply -R`. Review's
+/// "This turn" scope (#1152) reads a Talk turn's two checkpoints through it.
+pub fn commits_diff(path: &Path, from: &str, to: &str, ignore_whitespace: bool) -> AppResult<String> {
+    fn commit_tree<'r>(repo: &'r Repository, sha: &str) -> AppResult<git2::Tree<'r>> {
+        let oid = git2::Oid::from_str(sha).map_err(|e| AppError::Other(format!("object id: {e}")))?;
+        repo.find_commit(oid)
+            .and_then(|c| c.tree())
+            .map_err(|e| AppError::Other(format!("checkpoint tree: {e}")))
+    }
+    let repo = open_repo(path)?;
+    let old_tree = commit_tree(&repo, from)?;
+    let new_tree = commit_tree(&repo, to)?;
+    let mut opts = git2::DiffOptions::new();
+    if ignore_whitespace {
+        opts.ignore_whitespace(true);
+    }
+    let diff = repo
+        .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut opts))
+        .map_err(|e| AppError::Other(format!("turn diff: {e}")))?;
+    diff_to_text(&diff)
+}
+
 /// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.
 pub fn last_commit(path: &Path) -> AppResult<Option<(String, String, String)>> {
     let repo = open_repo(path)?;

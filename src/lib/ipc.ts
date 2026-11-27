@@ -1,6 +1,7 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
 import type { SecretHold, SecretPreview } from "./secretGuard";
 import type { RewindOutcome, RewindPreview, TalkCheckpoints } from "./talkRewind";
+import type { TurnChange } from "./turnChanges";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -1120,6 +1121,12 @@ export const ipc = {
   /** The turns of a thread that can be rewound, the ones without a checkpoint, and whether an undo is on offer. */
   listTalkCheckpoints: (threadId: string) =>
     invoke<TalkCheckpoints>("list_talk_checkpoints", { threadId }),
+  /** The files a turn changed, between its two checkpoints (#1152); none without both. */
+  talkTurnChanges: (threadId: string, messageId: number) =>
+    invoke<TurnChange[]>("talk_turn_changes", { threadId, messageId }),
+  /** A turn's unified diff, between its two checkpoints: Review's This turn scope. */
+  talkTurnDiff: (threadId: string, messageId: number, ignoreWhitespace?: boolean) =>
+    invoke<string>("talk_turn_diff", { threadId, messageId, ignoreWhitespace }),
   /** What rewinding to a turn would change (nothing is written). */
   previewTalkRewind: (threadId: string, messageId: number) =>
     invoke<RewindPreview>("preview_talk_rewind", { threadId, messageId }),
