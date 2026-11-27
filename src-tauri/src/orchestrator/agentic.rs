@@ -892,7 +892,9 @@ pub async fn run_agentic_loop_billed(
 
         let req = LlmRequest {
             model: model.to_string(),
-            max_tokens: max_tokens_for(effort),
+            // Within the model's output cap, which a model like GPT-4o
+            // (16,384) enforces with a 400.
+            max_tokens: crate::provider_router::clamp_to_model_output(model, max_tokens_for(effort)),
             system: system.to_string(),
             messages: messages.clone(),
             tools: tools.clone(),
@@ -1240,7 +1242,7 @@ pub async fn run_agentic_loop_billed(
         // a response that calls tools anyway still yields its text below.
         let req = LlmRequest {
             model: model.to_string(),
-            max_tokens: max_tokens_for(effort),
+            max_tokens: crate::provider_router::clamp_to_model_output(model, max_tokens_for(effort)),
             system: system.to_string(),
             messages: messages.clone(),
             tools: tools.clone(),

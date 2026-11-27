@@ -98,6 +98,48 @@ pub(crate) fn director_system_prompt(
     prompt
 }
 
+/// The output budget of every request a Talk turn makes: the composer's
+/// `max_tokens`, at least 4096, within the model's output cap.
+fn turn_max_tokens(request: &ChatRequest) -> u32 {
+    crate::provider_router::clamp_output(request.max_tokens.max(4096), request.max_output)
+}
+
+/// The quiet note after a final answer the model stopped at the output
+/// limit (`max_tokens`): it reads complete otherwise. `None` for any other
+/// stop.
+fn cut_answer_note(stop: &LlmStopReason) -> Option<&'static str> {
+    matches!(stop, LlmStopReason::MaxTokens)
+        .then_some("The answer reached the output limit. Say continue to get the rest.")
+}
+
+/// Tool rounds in a row cut at the output limit before the turn ends
+/// instead of asking the model to retry smaller.
+const MAX_TRUNCATED_ROUNDS: u32 = 2;
+
+/// The quiet note a turn ends with after [`MAX_TRUNCATED_ROUNDS`] cut rounds.
+const TRUNCATED_ROUNDS_NOTE: &str = "Stopped: two replies in a row were cut at the output limit mid tool call, \
+     so those calls didn't run. Ask for smaller steps, such as one file at a time.";
+
+/// Counts the tool rounds in a row cut at the output limit. Turns are
+/// unlimited by default, so without it a model that keeps writing oversized
+/// `write_file` bodies would retry at the full output cap forever.
+#[derive(Default, Debug)]
+struct TruncationStreak(u32);
+
+impl TruncationStreak {
+    /// One more cut round. True once [`MAX_TRUNCATED_ROUNDS`] came in a
+    /// row: end the turn rather than retry.
+    fn cut(&mut self) -> bool {
+        self.0 += 1;
+        self.0 >= MAX_TRUNCATED_ROUNDS
+    }
+
+    /// A round that wasn't cut ends the streak.
+    fn clear(&mut self) {
+        self.0 = 0;
+    }
+}
+
 /// One request of a Talk turn: every round and the forced close carry the
 /// same model, output cap and reasoning effort (`ChatRequest::effort`), so
 /// the thinking config holds across the turn's tool loop (Anthropic requires
@@ -106,14 +148,9 @@ fn director_request(request: &ChatRequest, system: &str, messages: &[LlmMessage]
     LlmRequest {
         model: request.model.clone(),
         // Honor the caller's requested budget (the EffortSelector sets it)
-        // with a sane floor; the old code force-clamped to 32768, silently
-        // ignoring the request.
-        // FOLLOW-UP: some providers cap output below the Deep preset (e.g.
-        // gpt-4o at 16384) and will 400 on a larger value. A proper per-model
-        // ceiling needs a `max_output_tokens` field on ModelInfo; until then
-        // the budget is forwarded as-is (this was already the case
-        // pre-change, which force-sent 32768).
-        max_tokens: request.max_tokens.max(4096),
+        // with a sane floor, within the model's output cap: a model that
+        // takes less (GPT-4o at 16,384) refuses a larger value outright.
+        max_tokens: turn_max_tokens(request),
         system: system.to_string(),
         messages: messages.to_vec(),
         tools: tools.to_vec(),
@@ -384,6 +421,11 @@ pub struct ChatRequest {
     /// re-send the blocks abridged.
     #[serde(default)]
     pub context_blocks: Option<String>,
+    /// The model's output cap (`ModelInfo::max_output`), looked up once the
+    /// turn's model is known: every request's `max_tokens` stays within it.
+    /// Never sent by the frontend.
+    #[serde(skip)]
+    pub max_output: Option<u32>,
 }
 
 /// A base64 image attachment sent with a user turn.
@@ -4281,6 +4323,10 @@ impl ChatEngine {
         } else {
             (request, None)
         };
+        // The model's output cap, from the catalog: every request of the
+        // turn stays within it (`turn_max_tokens`).
+        let max_output = crate::provider_router::model_max_output(&request.model);
+        let request = ChatRequest { max_output, ..request };
         let policy_auto = doctrine.is_some();
         let (provider, api_base, api_key) = resolve_provider(&request.model)?;
 
@@ -4574,7 +4620,7 @@ impl ChatEngine {
         let fixed_chars = budget::fixed_chars(&system_prompt, &tools);
         let mut model_budget = budget::ContextBudget::for_model(
             crate::orchestrator::cli_runner::catalog_context_window(&request.model),
-            request.max_tokens.max(4096),
+            turn_max_tokens(&request),
             request.effort,
         );
         // An id that names its window (`[1m]`) is never lowered.
@@ -4616,6 +4662,9 @@ impl ChatEngine {
         // rule): riding out a nearly spent input-token window beats charging
         // into a 429.
         let mut pending_throttle: Option<u64> = None;
+
+        // Tool rounds in a row cut at the output limit: two end the turn.
+        let mut truncations = TruncationStreak::default();
 
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
@@ -4746,6 +4795,16 @@ impl ChatEngine {
 
             // Handle max_tokens truncation during tool use.
             if matches!(response.stop_reason, LlmStopReason::MaxTokens) && !response.tool_uses.is_empty() {
+                // The second cut round in a row ends the turn: retrying again
+                // would most likely spend the full output cap once more.
+                if truncations.cut() {
+                    tracing::warn!("Response truncated at max_tokens during tool_use again — ending the turn");
+                    self.finish_with_note(
+                        &app, &request.workspace_id, &request.thread_id, &request.model, &usage,
+                        TRUNCATED_ROUNDS_NOTE,
+                    )?;
+                    return Ok(());
+                }
                 tracing::warn!("Response truncated at max_tokens during tool_use — providing error tool_results and retrying");
                 // Add the truncated assistant message to history, its leading
                 // signed thinking kept.
@@ -4762,6 +4821,7 @@ impl ChatEngine {
                 });
                 continue;
             }
+            truncations.clear();
 
             // If no tool use, we're done — this was the final response.
             if is_final {
@@ -4780,6 +4840,13 @@ impl ChatEngine {
                         &request.model,
                         &usage,
                     )?;
+                }
+                // An answer cut at the output limit says so. Its tokens sit
+                // on the answer row; with no answer text, on the note.
+                if let Some(note) = cut_answer_note(&response.stop_reason) {
+                    let none = TurnUsage::default();
+                    let note_usage = if final_text.is_empty() { &usage } else { &none };
+                    self.finish_with_note(&app, &request.workspace_id, &request.thread_id, &request.model, note_usage, note)?;
                 }
 
                 // `send_agentic` sends `done` (pure metadata) once the turn
@@ -6015,6 +6082,48 @@ mod tests {
         }
         // `least` is internal: a request can't ask for it.
         assert!(serde_json::from_value::<Effort>(serde_json::json!("least")).is_err());
+    }
+
+    #[test]
+    fn max_tokens_clamped_to_model_cap() {
+        // Deep on GPT-4o: every round and the forced close ask for 16,384.
+        let mut request = chat_request_on("gpt-4o", DEEP);
+        assert_eq!(request.max_output, None, "never read from the frontend");
+        request.max_output = Some(16_384);
+        assert_eq!(director_request(&request, "sys", &[], &[]).max_tokens, 16_384);
+        let mut messages = Vec::new();
+        assert_eq!(forced_close_request(&request, "sys", &mut messages, &[]).max_tokens, 16_384);
+        // Under the cap, the budget is sent as asked, floor included.
+        request.max_tokens = 1_000;
+        assert_eq!(director_request(&request, "sys", &[], &[]).max_tokens, 4096);
+        // A model with no cap (a custom one) isn't clamped.
+        let uncapped = chat_request_on("my-custom-model", DEEP);
+        assert_eq!(director_request(&uncapped, "sys", &[], &[]).max_tokens, 64000);
+    }
+
+    #[test]
+    fn truncated_final_answer_gets_note() {
+        assert_eq!(
+            cut_answer_note(&LlmStopReason::MaxTokens),
+            Some("The answer reached the output limit. Say continue to get the rest.")
+        );
+        for stop in [LlmStopReason::EndTurn, LlmStopReason::ToolUse] {
+            assert_eq!(cut_answer_note(&stop), None, "{stop:?}");
+        }
+    }
+
+    #[test]
+    fn two_truncations_end_the_turn() {
+        let mut streak = TruncationStreak::default();
+        assert!(!streak.cut(), "the first cut round is retried");
+        assert!(streak.cut(), "the second in a row ends the turn");
+        // A round that went through in between starts the count again.
+        let mut streak = TruncationStreak::default();
+        assert!(!streak.cut());
+        streak.clear();
+        assert!(!streak.cut());
+        assert!(streak.cut());
+        assert!(TRUNCATED_ROUNDS_NOTE.contains("output limit"));
     }
 
     #[test]
