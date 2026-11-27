@@ -30,6 +30,7 @@ describe("prDraft", () => {
     expect(issueRef("#42")).toEqual({ closes: "#42" });
     expect(issueRef("acme/app#7")).toEqual({ closes: "acme/app#7" });
     expect(issueRef("OCTO-12")).toEqual({ titlePrefix: "OCTO-12" });
+    expect(issueRef("ST-1.1")).toEqual({ titlePrefix: "ST-1.1" });
     expect(issueRef(null)).toEqual({});
   });
 
