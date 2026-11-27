@@ -34,6 +34,25 @@ use std::time::{Duration, Instant};
 /// commands behave as the user's `$` commands do.
 pub(crate) const TALK_BASH: &str = "/bin/bash";
 
+/// Git's own hardening for every Talk command, in every mode (#1231): a
+/// bare repository is used only when named (`safe.bareRepository=explicit`),
+/// so one planted in a folder can't bring its config (hooks,
+/// `core.fsmonitor`) into a `git status`. Set by the engine through
+/// `GIT_CONFIG_COUNT`, after any entries the environment already holds.
+pub(crate) fn git_hardening_env() -> Vec<(String, String)> {
+    git_hardening_after(std::env::var("GIT_CONFIG_COUNT").ok().as_deref())
+}
+
+/// [`git_hardening_env`] after `count` entries already set. Pure.
+pub(crate) fn git_hardening_after(count: Option<&str>) -> Vec<(String, String)> {
+    let n = count.and_then(|c| c.trim().parse::<usize>().ok()).unwrap_or(0);
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), (n + 1).to_string()),
+        (format!("GIT_CONFIG_KEY_{n}"), "safe.bareRepository".to_string()),
+        (format!("GIT_CONFIG_VALUE_{n}"), "explicit".to_string()),
+    ]
+}
+
 /// Cap on a `$` command's captured output (bytes), so it can't bloat the DB
 /// row / chat render. The agent's capture keeps up to
 /// `chat_history::COMMAND_CAPTURE_BYTES`, leaving room for its notes within
@@ -382,6 +401,9 @@ impl TalkShell {
                 if has_login_path {
                     apply_login_path(client, &id, &rx, &nonce, &path);
                 }
+                // A reattached shell may predate the hardening, or a command
+                // in it may have dropped it (#1231).
+                apply_git_hardening(client, &id, &rx, &nonce);
                 Ok(Session {
                     id,
                     rx: Some(rx),
@@ -404,7 +426,9 @@ impl TalkShell {
     }
 
     fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str, env: &HashMap<String, String>) -> AppResult<()> {
-        client.spawn(id, cwd, env, Some(TALK_BASH), 40, 120)?;
+        let mut env = env.clone();
+        env.extend(git_hardening_env());
+        client.spawn(id, cwd, &env, Some(TALK_BASH), 40, 120)?;
         Ok(())
     }
 }
@@ -442,6 +466,30 @@ fn apply_login_path(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEven
     }
     if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. }) {
         tracing::warn!(id, "talk shell did not confirm the login PATH");
+    }
+}
+
+/// The line that gives a Talk shell git's hardening ([`git_hardening_env`])
+/// unless it holds it already: after the `GIT_CONFIG_*` entries it has, so
+/// writing it again changes nothing.
+const GIT_HARDENING_LINE: &str = "__octo_gh() { local i=0 n=\"${GIT_CONFIG_COUNT:-0}\" k v; \
+    case \"$n\" in ''|*[!0-9]*) n=0;; esac; \
+    while [ \"$i\" -lt \"$n\" ]; do k=GIT_CONFIG_KEY_$i; v=GIT_CONFIG_VALUE_$i; \
+    [ \"${!k}\" = safe.bareRepository ] && [ \"${!v}\" = explicit ] && return; i=$((i+1)); done; \
+    export GIT_CONFIG_KEY_$n=safe.bareRepository GIT_CONFIG_VALUE_$n=explicit GIT_CONFIG_COUNT=$((n+1)); }; \
+    __octo_gh; unset -f __octo_gh\n";
+
+/// Give the shell git's hardening once its prompt is up, as the login PATH
+/// is given (see [`apply_login_path`]): a shell an older build spawned, or
+/// one whose environment lost it, gets it back on reattach. Best effort, as
+/// that is.
+fn apply_git_hardening(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) {
+    drain_pending(rx);
+    if client.write(id, GIT_HARDENING_LINE.as_bytes()).is_err() {
+        return;
+    }
+    if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. }) {
+        tracing::warn!(id, "talk shell did not confirm git's hardening");
     }
 }
 
@@ -1242,6 +1290,40 @@ mod e2e {
         let r = cap(shell.run_capture("older", "/tmp", r#"echo "if (!x) ok""#, quick).unwrap());
         assert_eq!(r.output, "if (!x) ok");
         shell.close("older");
+    }
+
+    /// A conversation's shell started by an older build, without git's
+    /// bare-repository hardening, gets it on reattach; one whose environment
+    /// lost it gets it back, and it is never added twice (#1231).
+    #[test]
+    #[serial]
+    fn a_reattached_shell_gets_git_hardening() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        // Roomy: a busy CI runner can take seconds to bring a shell up.
+        let quick = Duration::from_secs(20);
+        let old = DaemonClient::connect_to(d.sock.to_str().unwrap()).unwrap();
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        old.spawn("talk-oldgit", "/tmp", &env, Some("/bin/bash"), 40, 120).unwrap();
+        with_login_shell_env(&[], || {
+            let probe = "printf '%s|%s' \"$(git config --get safe.bareRepository)\" \"$GIT_CONFIG_COUNT\"";
+            {
+                let shell = shell_on(&d.sock);
+                let r = cap(shell.run_capture("oldgit", "/tmp", probe, quick).unwrap());
+                assert_eq!(r.output, "explicit|1", "the reattached shell has the hardening");
+                done(shell.run("oldgit", "/tmp", "unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0", quick, true).unwrap());
+                // `shell` drops here, as at an Octopush restart.
+            }
+            {
+                let shell = shell_on(&d.sock);
+                let r = cap(shell.run_capture("oldgit", "/tmp", probe, quick).unwrap());
+                assert_eq!(r.output, "explicit|1", "a shell that lost it gets it back");
+            }
+            let shell = shell_on(&d.sock);
+            let r = cap(shell.run_capture("oldgit", "/tmp", probe, quick).unwrap());
+            assert_eq!(r.output, "explicit|1", "never added twice");
+            shell.close("oldgit");
+        });
     }
 
     /// A dir holding `octo-1087-tool`, an executable found only through it.

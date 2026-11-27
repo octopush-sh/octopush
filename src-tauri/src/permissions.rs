@@ -358,7 +358,7 @@ const PREVIEW_MAX_BYTES: u64 = 2_000_000;
 /// again": Edit freely is the mode for that.
 pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -> ToolCard {
     let field = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-    let card = |kind, shown: String, reason: String, denial: &str, diff| ToolCard {
+    let card = |kind, shown: String, reason: String, denial: &str, diff, bound| ToolCard {
         kind,
         shown,
         reason: crate::talk_guard::sub_agent(label, reason),
@@ -367,26 +367,140 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         remember: None,
         trust: None,
         diff,
+        bound,
     };
     if name == "run_command" {
-        return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None);
+        return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None, None);
     }
     let path = field("path");
-    let marked = crate::secret_scan::is_env_file(&path) || crate::secret_scan::is_sensitive_name(&path);
-    let (reason, diff) = match name {
-        "write_file" | "edit_file" if marked || reach.outside_card(None, name, input, false).is_some() => {
-            ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None)
+    let (reason, diff, bound) = match name {
+        "write_file" | "edit_file" if !previewed(reach, name, input, &path) => {
+            ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None, None)
         }
-        "write_file" | "edit_file" => change_preview(reach.workspace(), name, input, &path),
-        _ => (format!("calls {name}, which can change files"), None),
+        "write_file" | "edit_file" => {
+            // The user's own keys are redacted too, like any credential.
+            let known = crate::secret_scan::known_secrets_from(&crate::settings::load_settings().unwrap_or_default());
+            let (reason, diff) = change_preview(reach.workspace(), name, input, &path, &known);
+            (reason, diff, Some(change_bound(&reach.workspace().join(&path), input)))
+        }
+        _ => (format!("calls {name}, which can change files"), None, None),
     };
     let shown = if path.is_empty() { name.to_string() } else { path };
-    card(CardKind::Edit, shown, format!("{reason} (Ask first)"), ASK_DECLINED_CHANGE, diff)
+    card(CardKind::Edit, shown, format!("{reason} (Ask first)"), ASK_DECLINED_CHANGE, diff, bound)
+}
+
+/// Whether Ask first's card reads the file `name` changes at `path` to show
+/// its diff: inside the workspace, and not named like an env file or a key.
+fn previewed(reach: &Reach, name: &str, input: &Value, path: &str) -> bool {
+    let marked = crate::secret_scan::is_env_file(path) || crate::secret_scan::is_sensitive_name(path);
+    !marked && reach.outside_card(None, name, input, false).is_none()
+}
+
+/// What an Ask first approval binds to (#1231): the SHA-256 of the file at
+/// `full` as it is now (every byte, or that it can't be read) and of the
+/// call's input, which with it fixes the whole file the call leaves. The
+/// diff shows a part at most; this is all of it.
+fn change_bound(full: &Path, input: &Value) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut hasher = Sha256::new();
+    match std::fs::File::open(full) {
+        Ok(mut file) => {
+            hasher.update(b"file\0");
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => hasher.update(&buf[..n]),
+                    Err(e) => {
+                        hasher.update(format!("\0unreadable {}", e.kind()).as_bytes());
+                        break;
+                    }
+                }
+            }
+        }
+        Err(e) => hasher.update(format!("none\0{}", e.kind()).as_bytes()),
+    }
+    hasher.update(b"\0input\0");
+    hasher.update(input.to_string().as_bytes());
+    hasher.finalize().into()
+}
+
+/// The refusal a file change gets from the tool whatever the user answers,
+/// so Ask first returns it instead of a card nobody could approve (#1231):
+/// a write outside the mission's sandbox (`roots`), and an `edit_file` that
+/// can't apply to the file as it is. Read like the tool reads them, with the
+/// tool's own words; a file the card wouldn't preview isn't read here.
+pub fn refused_before_card(reach: &Reach, name: &str, input: &Value, roots: Option<&[String]>) -> Option<String> {
+    let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+    let full = reach.workspace().join(path);
+    let sandboxed = |verb: &str| {
+        let outside = roots.is_some_and(|roots| !crate::orchestrator::sandbox::is_write_allowed(&full, roots));
+        outside.then(|| format!("Sandboxed: refusing to {verb} outside the mission workspace ({path})"))
+    };
+    match name {
+        "write_file" => sandboxed("write"),
+        "edit_file" if !previewed(reach, name, input, path) => None,
+        "edit_file" => crate::chat_engine::edit_input_problem(input)
+            .or_else(|| match std::fs::read_to_string(&full) {
+                Ok(content) => crate::chat_engine::apply_edit(&content, input, path).err(),
+                Err(e) => Some(format!("Error reading {path}: {e}")),
+            })
+            .or_else(|| sandboxed("edit")),
+        _ => None,
+    }
+}
+
+/// What an Ask first card adds when the change it stood for moved while it
+/// waited, so the user sees why it asks again.
+pub const CHANGED_WHILE_WAITING: &str =
+    "The file changed while the last card waited, so that approval no longer holds: this is the change as it is now.";
+
+/// How an Ask first card ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AskOutcome {
+    Approved,
+    /// The user declined: the card's fixed result.
+    Declined(String),
+    /// Once approved, the tool would refuse the call anyway: its refusal.
+    Refused(String),
+}
+
+/// Ask about Ask first's `card` and, once it is approved, read the call
+/// again (#1231). The approval holds only for exactly the change approved:
+/// the whole file before and after (`ToolCard::bound`), not only the diff
+/// shown. A change that moved meanwhile gets a new card that says so
+/// ([`CHANGED_WHILE_WAITING`]); one the tool would now refuse (`refused`)
+/// gets that refusal and no second card.
+pub async fn guard_ask_first<F, Fut>(
+    mut card: ToolCard,
+    recheck: impl Fn() -> ToolCard,
+    refused: impl Fn() -> Option<String>,
+    ask: F,
+) -> AskOutcome
+where
+    F: Fn(ToolCard) -> Fut,
+    Fut: std::future::Future<Output = crate::chat_engine::ApprovalDecision>,
+{
+    loop {
+        if ask(card.clone()).await == crate::chat_engine::ApprovalDecision::Deny {
+            return AskOutcome::Declined(card.denial);
+        }
+        if let Some(why) = refused() {
+            return AskOutcome::Refused(why);
+        }
+        let next = recheck();
+        let same = (next.kind, &next.shown, &next.diff, next.bound) == (card.kind, &card.shown, &card.diff, card.bound);
+        if same {
+            return AskOutcome::Approved;
+        }
+        card = ToolCard { reason: format!("{} {CHANGED_WHILE_WAITING}", next.reason), ..next };
+    }
 }
 
 /// Why a file change asks, and its diff: the file at `path` under
 /// `workspace` now against what `name` would leave there.
-fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str) -> (String, Option<String>) {
+fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str, known: &[crate::secret_scan::KnownSecret]) -> (String, Option<String>) {
     let full = workspace.join(path);
     let no_preview = |why: &str| (format!("changes a file {why}, so the card doesn't preview it"), None);
     let current = match std::fs::metadata(&full) {
@@ -414,7 +528,7 @@ fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str) -> (S
         ("edit_file", _) => "edits a file",
         _ => "writes a file",
     };
-    let diff = unified_diff(current.as_deref().unwrap_or(""), &after);
+    let diff = unified_diff_redacting(current.as_deref().unwrap_or(""), &after, known);
     if diff.is_empty() {
         return (format!("{verb} without changing a line"), Some(diff));
     }
@@ -427,13 +541,18 @@ fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str) -> (S
 /// at most [`DIFF_MAX_LINES`] lines with the rest counted. Empty when no
 /// line changes. Pure.
 pub fn unified_diff(old: &str, new: &str) -> String {
+    unified_diff_redacting(old, new, &[])
+}
+
+/// [`unified_diff`], with `known` (the user's own keys) redacted as well.
+pub fn unified_diff_redacting(old: &str, new: &str, known: &[crate::secret_scan::KnownSecret]) -> String {
     let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
     let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
     let mut ops: Vec<(char, &str)> = a[..pre].iter().map(|l| (' ', *l)).collect();
     ops.extend(align(&a[pre..a.len() - suf], &b[pre..b.len() - suf]));
     ops.extend(a[a.len() - suf..].iter().map(|l| (' ', *l)));
-    hunks(&ops)
+    hunks(&ops, known)
 }
 
 /// The lines of `a` and `b` as kept (` `), removed (`-`) and added (`+`),
@@ -470,7 +589,7 @@ fn align<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
     ops
 }
 
-fn hunks(ops: &[(char, &str)]) -> String {
+fn hunks(ops: &[(char, &str)], known: &[crate::secret_scan::KnownSecret]) -> String {
     // Where each op stands in the old and the new file, before it.
     let (mut old_at, mut new_at) = (Vec::with_capacity(ops.len() + 1), Vec::with_capacity(ops.len() + 1));
     let (mut o, mut n) = (0usize, 0usize);
@@ -506,7 +625,7 @@ fn hunks(ops: &[(char, &str)]) -> String {
                 break 'all;
             }
             // Redacted whole, then cut, so a cut never leaves part of a value.
-            let redacted = crate::secret_scan::redact_line(line, &[]);
+            let redacted = crate::secret_scan::redact_line(line, known);
             let cut = crate::chat_engine::truncate_char_safe(&redacted, DIFF_LINE_MAX);
             let more = if cut.len() < redacted.len() { "\u{2026}" } else { "" };
             out.push(format!("{kind}{cut}{more}"));
@@ -1165,6 +1284,84 @@ mod tests {
         assert_eq!(shown, ["@@ -1,1 +1,1 @@\n-old\n+new", "@@ -1,1 +1,1 @@\n-changed meanwhile\n+new"]);
     }
 
+    /// The approval binds to the whole change, not the diff shown: a line
+    /// far past the preview that changes while the card waits asks again,
+    /// and the new card says why. A cut diff says how many lines it hides.
+    #[tokio::test]
+    async fn an_approval_binds_to_the_whole_change_not_the_diff_shown() {
+        use crate::chat_engine::ApprovalDecision;
+        let long: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let (ws, _home, reach) = workspace_reach(&[("a.txt", &long)]);
+        let edit = json!({ "path": "a.txt", "old_string": "line 0\n", "new_string": "first\n" });
+        let check = || ask_card(None, "edit_file", &edit, &reach);
+        let first = check();
+        let asked = Mutex::new(Vec::<String>::new());
+        let approve = |c: ToolCard| {
+            asked.lock().push(c.reason.clone());
+            if asked.lock().len() == 1 {
+                std::fs::write(ws.path().join("a.txt"), long.replace("line 900\n", "line 900, edited\n")).unwrap();
+            }
+            std::future::ready(ApprovalDecision::Approve)
+        };
+        assert_eq!(guard_ask_first(first.clone(), check, || None, approve).await, AskOutcome::Approved);
+        let asked = asked.into_inner();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert_eq!(asked[1], format!("{} {CHANGED_WHILE_WAITING}", first.reason));
+        let now = ask_card(None, "edit_file", &edit, &reach);
+        assert_eq!(now.diff, first.diff, "the diff shown is the same");
+        assert_ne!(now.bound, first.bound, "the change isn't");
+        // A rewrite too long to show says how many lines it leaves out.
+        let all: String = (0..1000).map(|i| format!("new {i}\n")).collect();
+        let big = ask_card(None, "write_file", &json!({ "path": "a.txt", "content": all }), &reach);
+        assert!(big.diff.as_deref().is_some_and(|d| d.lines().last().is_some_and(|l| l.starts_with('\u{2026}') && l.ends_with(" more lines"))), "{:?}", big.diff);
+    }
+
+    /// A change the tool refuses whatever the user answers gets that
+    /// refusal, in the tool's words, and never a card; once approved, one the
+    /// tool would now refuse gets the refusal, not a second card.
+    #[tokio::test]
+    async fn a_change_the_tool_would_refuse_gets_no_card() {
+        use crate::chat_engine::ApprovalDecision;
+        let (ws, _home, reach) = workspace_reach(&[("a.rs", "one\n"), (".env", "A=1\n")]);
+        let refused = |name: &str, input: Value, roots: Option<&[String]>| refused_before_card(&reach, name, &input, roots);
+        let edit = |path: &str, old: &str| json!({ "path": path, "old_string": old, "new_string": "x" });
+        assert!(refused("edit_file", edit("a.rs", "two"), None).is_some_and(|r| r.starts_with("old_string not found in a.rs")));
+        assert!(refused("edit_file", edit("b.rs", "one"), None).is_some_and(|r| r.starts_with("Error reading b.rs:")));
+        assert_eq!(refused("edit_file", edit("a.rs", ""), None).as_deref(), Some("edit_file needs a non-empty `old_string`"));
+        let roots = [ws.path().to_string_lossy().into_owned()];
+        let outside = json!({ "path": "../elsewhere.txt", "content": "x" });
+        assert_eq!(
+            refused("write_file", outside.clone(), Some(&roots)).as_deref(),
+            Some("Sandboxed: refusing to write outside the mission workspace (../elsewhere.txt)")
+        );
+        assert_eq!(refused("write_file", outside, None), None, "unconfined, the outside card asks");
+        assert_eq!(refused("edit_file", edit("a.rs", "one"), Some(&roots)), None, "an edit that applies");
+        assert_eq!(refused("edit_file", edit(".env", "B"), None), None, "a file the card won't read isn't read here");
+        // Approved, then the edit stopped applying: its refusal, asked once.
+        let input = edit("a.rs", "one");
+        let check = || ask_card(None, "edit_file", &input, &reach);
+        let asked = Mutex::new(0);
+        let approve = |_: ToolCard| {
+            *asked.lock() += 1;
+            std::fs::write(ws.path().join("a.rs"), "gone\n").unwrap();
+            std::future::ready(ApprovalDecision::Approve)
+        };
+        let now = || refused_before_card(&reach, "edit_file", &input, None);
+        let outcome = guard_ask_first(check(), check, now, approve).await;
+        assert!(matches!(&outcome, AskOutcome::Refused(r) if r.starts_with("old_string not found")), "{outcome:?}");
+        assert_eq!(*asked.lock(), 1);
+    }
+
+    /// The user's own keys are redacted from a diff like any credential.
+    #[test]
+    fn a_diff_redacts_the_users_own_keys() {
+        let key = "sample-own-key-0123456789abcdef";
+        let known = [crate::secret_scan::KnownSecret::new("your sample API key", key)];
+        let diff = unified_diff_redacting("", &format!("note {key}\n"), &known);
+        assert!(diff.starts_with("@@ -0,0 +1,1 @@\n+note ") && !diff.contains(key), "{diff}");
+        assert!(unified_diff("", &format!("note {key}\n")).contains(key), "no pattern marks it: only the known key does");
+    }
+
     /// A mode change during a turn applies at the next round, where the
     /// director reads it, and leaves one quiet note naming the mode now in
     /// force. An `AppHandle` can't be built in a test, so this reads the
@@ -1525,8 +1722,11 @@ mod tests {
             "match crate::permissions::decide(mode, &call, &ctx) {",
             "let grants = mode != crate::permissions::Mode::Ask;",
             "crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))",
-            "if (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none() {",
-            "let check = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
+            "let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();",
+            "if held && pre_refused.is_none() {",
+            "let check = || crate::permissions::ask_card(None, &u.name, &u.input, &reach);",
+            "match crate::permissions::guard_ask_first(check(), check, refused, ask).await {",
+            "None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",

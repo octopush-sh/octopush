@@ -1154,13 +1154,26 @@ pub async fn run_agentic_loop_billed(
             // a director stop interrupts a long `run_command` mid-flight.
             // The gate (when present) may park here on a human decision; a
             // denial never touches the workspace and reads as an error result.
-            let denial = match gate {
-                Some(g) => g.check(&u.name, &u.input).await,
-                None => None,
+            // A blind overwrite (#1165) inside the workspace is refused before
+            // the gate sees it, so no card asks about a write that won't run
+            // (#1231); one the gate lets through is checked again as it runs.
+            // Outside, the gate's card comes first: the refusal would tell
+            // the model whether a file exists there.
+            let inside = || crate::talk_guard::Reach::of_workspace(workspace_path, None).outside_card(None, &u.name, &u.input, false).is_none();
+            let blind = if crate::file_seen::guards(&u.name) && inside() {
+                crate::file_seen::refusal_off_thread(std::sync::Arc::clone(&file_seen), workspace_path, &u.name, &u.input).await
+            } else {
+                None
+            };
+            let denial = match (&blind, gate) {
+                (None, Some(g)) => g.check(&u.name, &u.input).await,
+                _ => None,
             };
             let denied = denial.is_some();
             let (result, _) = if let Some(msg) = denial {
                 (msg, false)
+            } else if let Some(refusal) = blind {
+                (refusal, false)
             } else {
                 let wp = workspace_path.to_path_buf();
                 let name = u.name.clone();

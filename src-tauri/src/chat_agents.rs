@@ -848,6 +848,8 @@ pub struct SubagentGate {
     reach: crate::talk_guard::Reach,
     /// The mission's sandbox refuses a write outside the workspace itself.
     writes_confined: bool,
+    /// Its roots, so Ask first returns that refusal instead of a card.
+    sandbox_roots: Option<Vec<String>>,
     seq: AtomicU64,
 }
 
@@ -864,6 +866,7 @@ impl SubagentGate {
             mcp: SubagentMcp::default(),
             reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
             writes_confined: spec.sandbox_roots.is_some(),
+            sandbox_roots: spec.sandbox_roots.clone(),
             seq: AtomicU64::new(1),
         }
     }
@@ -954,14 +957,22 @@ pub fn gate_texts(label: &str, reason: &str) -> (String, String) {
 #[async_trait::async_trait]
 impl ToolGate for SubagentGate {
     /// Ask first's card (#1231), on the director's broker with the
-    /// sub-agent's name on it, its diff checked again once approved.
+    /// sub-agent's name on it, the approval bound to the whole change. A
+    /// change the tool would refuse anyway gets that refusal and no card (the
+    /// loop refuses a blind overwrite before the gate is asked).
     async fn ask_first(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let label = Some(self.label.as_str());
-        let check = || Some(crate::permissions::ask_card(label, name, input, &self.reach));
-        let card = check()?;
+        let refused = || crate::permissions::refused_before_card(&self.reach, name, input, self.sandbox_roots.as_deref());
+        if let Some(why) = refused() {
+            return Some(why);
+        }
+        let check = || crate::permissions::ask_card(label, name, input, &self.reach);
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, self.mcp.grants());
-        crate::chat_engine::guard_card(card, &check, ask).await
+        match crate::permissions::guard_ask_first(check(), check, refused, ask).await {
+            crate::permissions::AskOutcome::Approved => None,
+            crate::permissions::AskOutcome::Declined(why) | crate::permissions::AskOutcome::Refused(why) => Some(why),
+        }
     }
 
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
@@ -2432,6 +2443,39 @@ mod tests {
         let (reason, denial) = mcp_gate_texts(Some("Ticket"), "mcp__jira__add_comment", false);
         assert!(reason.starts_with("Sub-agent \u{201c}Ticket\u{201d}: MCP tool"));
         assert!(reason.contains("may change external state") && denial.contains("do not retry"));
+    }
+
+    /// A blind overwrite (#1165) is refused before the sub-agent's gate, so
+    /// no card (Ask first's or another) asks about a write that won't run,
+    /// and nothing is written (#1231).
+    #[tokio::test]
+    async fn a_blind_overwrite_never_reaches_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "theirs\n").unwrap();
+        let provider = ScriptedProvider {
+            turns: Mutex::new(VecDeque::from(vec![
+                resp("", vec![LlmToolUse { id: "t1".into(), name: "write_file".into(), input: serde_json::json!({ "path": "a.txt", "content": "mine\n" }) }], LlmStopReason::ToolUse),
+                resp("done", vec![], LlmStopReason::EndTurn),
+            ])),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Writer".into(), prompt: "p".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(3), max_tokens: 1, sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        };
+        let gate = RecordingGate { seen: Mutex::new(vec![]), deny: vec![] };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), None).await.unwrap();
+        assert!(gate.seen.lock().is_empty(), "the gate was asked about a refused write: {:?}", gate.seen.lock());
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "theirs\n");
     }
 
     struct PromptRecordingScripted {
