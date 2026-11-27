@@ -5612,28 +5612,173 @@ fn jira_client() -> AppResult<crate::issue_tracker::jira::JiraClient> {
     Ok(crate::issue_tracker::jira::JiraClient::new(cfg))
 }
 
-/// The current user's assigned, not-done issues (the backlog).
+/// The tracker a project reads, ready to call (#1127).
+enum ProjectTracker {
+    Jira(crate::issue_tracker::jira::JiraClient),
+    Epiku(crate::issue_tracker::epiku::EpikuClient),
+}
+
+/// Whether Jira and Epiku each have a saved connection. Epiku's token is
+/// looked up only when its client is built (a Keychain read).
+fn trackers_configured(settings: &crate::settings::AppSettings) -> (bool, bool) {
+    let jira = settings.issue_tracker.as_ref().is_some_and(|j| j.is_complete());
+    let epiku = settings
+        .epiku
+        .as_ref()
+        .is_some_and(|e| !e.base_url.trim().is_empty() && !e.project.trim().is_empty());
+    (jira, epiku)
+}
+
+/// The client for `project_id`'s tracker (`resolve_tracker`). Without a
+/// project, Jira, as before projects could choose.
+fn project_tracker(state: &AppState, project_id: Option<&str>) -> AppResult<ProjectTracker> {
+    use crate::issue_tracker::TrackerKind;
+    let Some(project_id) = project_id else {
+        return Ok(ProjectTracker::Jira(jira_client()?));
+    };
+    let (choice, epiku_project) = state.db.lock().project_issue_tracker(project_id)?;
+    let settings = crate::settings::load_settings()?;
+    let (jira, epiku) = trackers_configured(&settings);
+    match crate::issue_tracker::resolve_tracker(choice.as_deref(), jira, epiku) {
+        Some(TrackerKind::Jira) => Ok(ProjectTracker::Jira(jira_client()?)),
+        Some(TrackerKind::Epiku) => {
+            let mut cfg = settings.epiku.unwrap_or_default();
+            if let Some(project) = epiku_project {
+                cfg.project = project;
+            }
+            let store = crate::issue_tracker::epiku::token_store();
+            Ok(ProjectTracker::Epiku(crate::issue_tracker::epiku::client_from(&cfg, &*store)?))
+        }
+        None => Err(AppError::Other("This project has no issue tracker.".into())),
+    }
+}
+
+/// The backlog: the user's assigned, not-done Jira issues, or the Epiku
+/// project's stories that aren't done (Epiku has no assignee filter yet).
 #[tauri::command]
-pub async fn list_my_issues() -> AppResult<Vec<crate::issue_tracker::Issue>> {
+pub async fn list_my_issues(
+    state: State<'_, AppState>,
+    project_id: Option<String>,
+) -> AppResult<Vec<crate::issue_tracker::Issue>> {
     use crate::issue_tracker::IssueTracker;
-    jira_client()?.list_my_issues().await
+    match project_tracker(&state, project_id.as_deref())? {
+        ProjectTracker::Jira(c) => c.list_my_issues().await,
+        ProjectTracker::Epiku(c) => c.list_my_issues().await,
+    }
 }
 
 /// A single issue by key (for the active workspace's linked ticket).
 #[tauri::command]
-pub async fn get_issue(key: String) -> AppResult<crate::issue_tracker::Issue> {
+pub async fn get_issue(
+    state: State<'_, AppState>,
+    key: String,
+    project_id: Option<String>,
+) -> AppResult<crate::issue_tracker::Issue> {
     use crate::issue_tracker::IssueTracker;
-    jira_client()?.get_issue(&key).await
+    match project_tracker(&state, project_id.as_deref())? {
+        ProjectTracker::Jira(c) => c.get_issue(&key).await,
+        ProjectTracker::Epiku(c) => c.get_issue(&key).await,
+    }
 }
 
 /// All open tickets under `epic_key` (regardless of assignee). Backs the
 /// WorkContext "Epic" pill.
 #[tauri::command]
 pub async fn list_issues_in_epic(
+    state: State<'_, AppState>,
     epic_key: String,
+    project_id: Option<String>,
 ) -> AppResult<Vec<crate::issue_tracker::Issue>> {
     use crate::issue_tracker::IssueTracker;
-    jira_client()?.list_issues_in_epic(&epic_key).await
+    match project_tracker(&state, project_id.as_deref())? {
+        ProjectTracker::Jira(c) => c.list_issues_in_epic(&epic_key).await,
+        ProjectTracker::Epiku(c) => c.list_issues_in_epic(&epic_key).await,
+    }
+}
+
+/// A project's issue-tracker choice (#1127) and the tracker it reads now.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectIssueTracker {
+    /// `jira`, `epiku`, `none`, or `None` for the default.
+    pub choice: Option<String>,
+    /// The Epiku project it reads; `None` = the one in Settings.
+    pub epiku_project: Option<String>,
+    /// The choice resolved against what is configured; `None` = no tracker.
+    pub active: Option<crate::issue_tracker::TrackerKind>,
+}
+
+#[tauri::command]
+pub async fn get_project_issue_tracker(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<ProjectIssueTracker> {
+    let (choice, epiku_project) = state.db.lock().project_issue_tracker(&project_id)?;
+    let (jira, epiku) = trackers_configured(&crate::settings::load_settings()?);
+    let active = crate::issue_tracker::resolve_tracker(choice.as_deref(), jira, epiku);
+    Ok(ProjectIssueTracker { choice, epiku_project, active })
+}
+
+#[tauri::command]
+pub async fn set_project_issue_tracker(
+    state: State<'_, AppState>,
+    project_id: String,
+    choice: Option<String>,
+    epiku_project: Option<String>,
+) -> AppResult<()> {
+    let (choice, epiku_project) =
+        crate::issue_tracker::validate_project_choice(choice.as_deref(), epiku_project.as_deref())
+            .map_err(AppError::Other)?;
+    state
+        .db
+        .lock()
+        .update_project_issue_tracker(&project_id, choice.as_deref(), epiku_project.as_deref())
+}
+
+/// Settings' view of the Epiku connection: base URL, project, and whether a
+/// token is kept in the Keychain. The token itself never comes back.
+#[tauri::command]
+pub async fn get_epiku_config() -> AppResult<Option<crate::issue_tracker::epiku::EpikuSettingsView>> {
+    let cfg = crate::settings::load_settings()?.epiku;
+    crate::issue_tracker::epiku::settings_view(cfg, &*crate::issue_tracker::epiku::token_store())
+}
+
+/// Keep the Epiku connection: the token (when given) in the Keychain, the
+/// base URL and project in settings.json. No token keeps the saved one, for
+/// the same base URL only. Nothing is sent to Epiku here.
+#[tauri::command]
+pub async fn save_epiku_config(
+    base_url: String,
+    project: String,
+    token: Option<String>,
+) -> AppResult<crate::issue_tracker::epiku::EpikuSettingsView> {
+    use crate::issue_tracker::epiku;
+    let prev = crate::settings::load_settings()?.epiku;
+    let store = epiku::token_store();
+    let cfg = epiku::save_connection(prev.as_ref(), &base_url, &project, token.as_deref(), &*store)
+        .map_err(AppError::Other)?;
+    crate::settings::save_epiku_config(Some(cfg.clone()))?;
+    Ok(epiku::EpikuSettingsView { base_url: cfg.base_url, project: cfg.project, has_token: true })
+}
+
+/// Forget the Epiku connection and its token.
+#[tauri::command]
+pub async fn remove_epiku_config() -> AppResult<()> {
+    let prev = crate::settings::load_settings()?.epiku;
+    let store = crate::issue_tracker::epiku::token_store();
+    crate::issue_tracker::epiku::remove_connection(prev.as_ref(), &*store).map_err(AppError::Other)?;
+    crate::settings::save_epiku_config(None)
+}
+
+/// Settings' "Connected" gate: one read of the configured project's stories
+/// with the kept token. Returns how many stories the project has.
+#[tauri::command]
+pub async fn check_epiku_connection() -> AppResult<usize> {
+    let cfg = crate::settings::load_settings()?
+        .epiku
+        .ok_or_else(|| AppError::Other("Epiku isn't set up yet.".into()))?;
+    let client = crate::issue_tracker::epiku::client_from(&cfg, &*crate::issue_tracker::epiku::token_store())?;
+    client.check_connection().await
 }
 
 /// Read the saved tracker config (token included so the Settings form can
