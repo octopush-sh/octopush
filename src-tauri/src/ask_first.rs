@@ -298,7 +298,7 @@ mod tests {
         assert!(!broker.grant_answers("t1", Some(CardKind::Ask)));
 
         // A command's card is its own kind, with no diff.
-        let run = serde_json::to_value(card(ws.path(), &reach, None, "run_command", &json!({ "command": "cargo fmt" })).request("w1", "t1", "c2")).unwrap();
+        let run = serde_json::to_value(super::card(ws.path(), &reach, None, "run_command", &json!({ "command": "cargo fmt" })).request("w1", "t1", "c2")).unwrap();
         assert_eq!((run["kind"].as_str(), run["command"].as_str(), run.get("diff")), (Some("ask-run"), Some("cargo fmt"), None));
         assert!(!CardKind::AskRun.grantable());
 
