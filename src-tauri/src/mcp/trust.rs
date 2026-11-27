@@ -41,9 +41,10 @@ pub struct McpTrust {
 }
 
 /// A user-level entry as trust is bound to it: its command, args, env names
-/// and remote URL, hashed. Changing any of them lapses the trust.
+/// and values (a Keychain value is `""` in the file) and remote URL, hashed.
+/// Changing any of them lapses the trust.
 pub fn fingerprint(cfg: &McpServerConfig) -> String {
-    let mut env: Vec<&str> = cfg.env.keys().map(String::as_str).collect();
+    let mut env: Vec<(&str, &str)> = cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     env.sort_unstable();
     let url = cfg.remote.as_ref().map_or("", |r| r.url.as_str());
     let canonical = serde_json::json!([cfg.command, cfg.args, env, url]).to_string();
@@ -216,6 +217,9 @@ mod tests {
         // Another command, args, env name or URL is another server.
         let mut env = entry("sample");
         env.env.insert("EXTRA".into(), String::new());
+        let mut value = env.clone();
+        value.env.insert("EXTRA".into(), "other".into());
+        assert_ne!(fingerprint(&env), fingerprint(&value), "an env value counts too");
         let mut remote = entry("sample");
         remote.remote = Some(crate::mcp::remote::RemoteConfig { url: "https://sample.invalid/mcp".into(), ..Default::default() });
         for changed in [entry("other"), McpServerConfig { args: vec![], ..entry("sample") }, env, remote] {

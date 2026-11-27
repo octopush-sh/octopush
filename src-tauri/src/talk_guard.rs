@@ -114,14 +114,16 @@ const READ_VERBS: &[&str] =
 /// may write (`get_or_create_issue`, `fetchAndDelete`).
 const NOT_A_READ: &[&str] = &[
     "and", "or", "then", "delete", "remove", "update", "set", "create", "write", "put", "post", "patch", "modify", "purge",
-    "drop", "insert", "upsert", "merge", "move", "rename", "send", "publish", "push", "apply", "run", "exec",
+    "drop", "insert", "upsert", "merge", "move", "rename", "send", "publish", "push", "apply", "run", "exec", "replace",
+    "execute", "edit", "save", "add", "reset", "clear", "store", "sync", "upload", "commit", "destroy", "wipe", "truncate",
 ];
 
 /// Whether a server's tool name starts with a read verb followed by `_`,
 /// `-` or a camelCase capital (`get_report`, `list-items`, `searchCode`)
-/// and no later word joins or names a write ([`NOT_A_READ`]); `check_in`
-/// and `checkOut` aren't reads. Not `search`, `checkout_branch` or
-/// `budget_get` either.
+/// and at least one word follows, none of which joins or names a write
+/// ([`NOT_A_READ`], without case: `get_AND_x`); `check_in` and `checkOut`
+/// aren't reads. Not `search`, `get_`, `checkout_branch` or `budget_get`
+/// either.
 pub fn read_verb_name(name: &str) -> bool {
     READ_VERBS.iter().any(|verb| {
         let Some(rest) = name.strip_prefix(*verb) else { return false };
@@ -129,20 +131,33 @@ pub fn read_verb_name(name: &str) -> bool {
             return false;
         }
         let words = name_words(rest);
+        if words.is_empty() {
+            return false;
+        }
         let checks_in_or_out = *verb == "check" && words.first().is_some_and(|w| w == "in" || w == "out");
         !checks_in_or_out && !words.iter().any(|w| NOT_A_READ.contains(&w.as_str()))
     })
 }
 
 /// A tool name's words, lowercase, split at anything not a letter or digit
-/// and before each capital (`OrCreate_x` → `or`, `create`, `x`).
+/// and where camelCase starts a word (`OrCreate_x` → `or`, `create`, `x`;
+/// `_AND_x` → `and`, `x`; `HTTPStatus` → `http`, `status`).
 fn name_words(name: &str) -> Vec<String> {
+    let chars: Vec<char> = name.chars().collect();
     let mut words = vec![String::new()];
-    for c in name.chars() {
-        if !c.is_ascii_alphanumeric() || c.is_ascii_uppercase() {
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_ascii_alphanumeric() {
+            words.push(String::new());
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| chars[j]);
+        let next_lower = chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+        let starts = c.is_ascii_uppercase()
+            && prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit() || (p.is_ascii_uppercase() && next_lower));
+        if starts {
             words.push(String::new());
         }
-        if let (true, Some(word)) = (c.is_ascii_alphanumeric(), words.last_mut()) {
+        if let Some(word) = words.last_mut() {
             word.push(c.to_ascii_lowercase());
         }
     }
@@ -1347,7 +1362,7 @@ mod tests {
 
     #[test]
     fn a_read_verb_needs_a_separator_or_a_capital_and_no_write_after_it() {
-        for name in ["get_report", "list-items", "searchCode", "lookup_user", "check_status", "countRows", "get_settings", "list_orders"] {
+        for name in ["get_report", "list-items", "searchCode", "lookup_user", "check_status", "countRows", "get_settings", "list_orders", "getHTTPStatus", "get_address"] {
             assert!(read_verb_name(name), "{name}");
         }
         let not_reads = [
@@ -1357,6 +1372,9 @@ mod tests {
             "find_and_replace_or_insert", "query_exec", "show_and_send", "lookup_then_remove", "get_and_set_flag",
             "view-and-post", "count_and_drop", "search_upsert", "describe_merge", "fetch_push", "read_write_file",
             "check_in", "checkIn", "check-out-member", "checkOut", "check_in_guest",
+            "search_replace", "query_execute", "view_edit", "get_AND_x", "fetchANDDelete", "list_OR_purge", "read_then_SAVE",
+            "get_and_add_tag", "find_reset", "lookup_clear", "show_store", "list_sync", "get_upload_url", "check_commit",
+            "describe_destroy", "count_wipe", "query_truncate", "get_", "list-", "show__",
         ];
         for name in not_reads {
             assert!(!read_verb_name(name), "{name}");
