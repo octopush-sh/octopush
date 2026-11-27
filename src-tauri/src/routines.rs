@@ -1125,7 +1125,8 @@ impl Orchestrator {
         if created_branch {
             let _ = crate::git_ops::delete_branch(repo, &ws.branch);
         }
-        let _ = self.db().lock().delete_workspace(&ws.id);
+        let freed = self.db().lock().delete_workspace(&ws.id).unwrap_or_default();
+        crate::chat_attachments::remove(&freed);
     }
 
     /// Map a condition evaluation to an optional skip reason (`None` ⇒ Met, fire
