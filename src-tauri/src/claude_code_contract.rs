@@ -16,6 +16,7 @@
 //! | transcript JSONL (`~/.claude/projects/<cwd>/<session>.jsonl`) | `transcripts` |
 //! | `Total cost:` PTY tail | `token_engine::scan_pty_output` (via `agent_adapter`) |
 //! | `SKILL.md` / `.claude/agents/*.md` frontmatter (incl. `effort:`) | `skills`, `skills::agents` |
+//! | skill shell commands (`` !`…` ``, ```` ```! ````) and `disableSkillShellExecution` | `repo_hooks::parse_skill_shell`, `cli_runner::disable_skill_shell` |
 //! | `claude mcp add octopush …` argv | `mcp_setup` |
 //! | `Notification` / `Stop` hook stdin payloads | `agent_adapter::parse_hook_event`, `claude_hooks::record_hook` |
 //! | `claude auth status --json` (`loggedIn`, `loginExpiresAt`) | `agent_adapter::parse_claude_auth_status` |
@@ -557,6 +558,57 @@ fn stream_json_refused_settings_name_the_setting() {
     let unrelated = "[Bootstrap] Gateway /v1/models failed validation: expected a list";
     let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, unrelated).unwrap();
     assert!(!is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
+}
+
+const SKILL_SHELL_OFF_VERSION: &str = "2.1.332";
+const SKILL_SHELL_OFF_REL: &str = "stream-json/skill-shell-disabled.jsonl";
+const SKILL_SHELL_OFF_SKILL_REL: &str = "skills/deploy-check/SKILL.md";
+/// What Claude Code puts where a skill's shell command would have run.
+const SKILL_SHELL_PLACEHOLDER: &str = "[shell command execution disabled by policy]";
+
+#[test]
+fn stream_json_skill_shell_off_is_accepted_and_runs_nothing() {
+    use crate::orchestrator::cli_runner::{disable_skill_shell, is_settings_refused};
+    // Synthetic (see the 2.1.332 README): a stage whose project turned skill
+    // shell commands off (#1188) loads a skill with two of them.
+    let rec = synthesized(SKILL_SHELL_OFF_VERSION);
+    let fx = rec.label(SKILL_SHELL_OFF_REL);
+    // The argv Octopush sends carries the key beside the write guard.
+    let mut args = build_cli_args("claude-sonnet-5-5", "sys", 10, false);
+    assert!(disable_skill_shell(CliDialect::Claude, true, &mut args));
+    let at = args.iter().position(|a| a == "--settings").expect("--settings");
+    let settings: Value = serde_json::from_str(&args[at + 1]).expect("--settings is JSON");
+    assert_eq!(settings["disableSkillShellExecution"], Value::Bool(true));
+    assert_eq!(settings["permissions"]["blockWritesOutsideWorkingDirectories"], Value::Bool(true));
+    // The launcher's scan names both commands of the skill.
+    let skill = rec.label(SKILL_SHELL_OFF_SKILL_REL);
+    let commands = crate::repo_hooks::parse_skill_shell(&rec.text(SKILL_SHELL_OFF_SKILL_REL));
+    assert_eq!(commands, ["git branch --show-current", "git status --short"], "[{skill}]");
+    // Claude Code accepts the key: the run ends well, no refused-settings stop.
+    let events = rec.jsonl(SKILL_SHELL_OFF_REL);
+    let line = serde_json::to_string(result_event(&fx, &events)).unwrap();
+    let outcome = parse_cli_result(&line, true, ArtifactKind::Note, "")
+        .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+    assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
+    assert!(!is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
+    // The skill loaded with the placeholder where each command would have run.
+    let loaded: Vec<String> = of_type(&events, "user")
+        .iter()
+        .filter_map(|e| e.pointer("/message/content").and_then(Value::as_array))
+        .flatten()
+        .map(|b| match b.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => {
+                parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<String>()
+            }
+            _ => b.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+        })
+        .collect();
+    let loaded = loaded.join("\n");
+    assert_eq!(loaded.matches(SKILL_SHELL_PLACEHOLDER).count(), commands.len(), "[{fx}] {loaded}");
+    for c in &commands {
+        assert!(!loaded.contains(c.as_str()), "[{fx}] {c} must not reach the model");
+    }
 }
 
 const INIT_ONLY_VERSION: &str = "2.1.326";

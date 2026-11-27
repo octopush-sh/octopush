@@ -260,7 +260,8 @@ fn paired(rows: &[Row<'_>], start: usize, model: &str) -> Option<(Vec<LlmMessage
                 let mut results = Vec::with_capacity(round.tool_uses.len());
                 for (k, call) in round.tool_uses.iter().enumerate() {
                     let r = rows.get(i + 1 + k).filter(|r| r.role == "tool" && r.tool_use_id == Some(call.id.as_str()))?;
-                    results.push(LlmToolResult { tool_use_id: call.id.clone(), content: r.model_view?.to_string(), is_error: false });
+                    let is_error = serde_json::from_str::<Value>(r.content).is_ok_and(|v| tool_row_is_error(&v));
+                    results.push(LlmToolResult { tool_use_id: call.id.clone(), content: r.model_view?.to_string(), is_error });
                 }
                 i += 1 + results.len();
                 turn.push(round.turn(model));
@@ -272,6 +273,15 @@ fn paired(rows: &[Row<'_>], start: usize, model: &str) -> Option<(Vec<LlmMessage
             _ => return None,
         }
     }
+}
+
+/// Whether a tool row's result goes to the model as an error: the call
+/// failed or was denied (the row's stamped `ok` is false). A row from before
+/// the stamp carries no `ok` and reads as it was sent then, not an error.
+/// The live round and its replay both read it here, so a later turn
+/// re-sends the round byte for byte and its cached prefix holds.
+pub(crate) fn tool_row_is_error(row: &Value) -> bool {
+    row.get("ok").and_then(Value::as_bool) == Some(false)
 }
 
 /// A stored tool row's result length, as `chat_history` plans it.
@@ -393,6 +403,7 @@ mod tests {
             tool_choice: None,
             effort,
             cache: false,
+            cache_key: None,
         };
         if openai { openai_compat::build_request(&req)["messages"].clone() } else { anthropic::build_request(&req)["messages"].clone() }
     }
@@ -590,6 +601,47 @@ mod tests {
             }
         }
         assert_eq!(assistants(&messages), before);
+    }
+
+    #[test]
+    fn a_failed_or_denied_call_replays_as_an_error() {
+        // One round of three calls: one passed, one failed, one from before
+        // the outcome stamp (no `ok`).
+        let mut owned = v2_turn(10, &["a".to_string(), "b".to_string(), "c".to_string()]);
+        let stamp = |row: &mut Owned, ok: bool| {
+            let mut v: Value = serde_json::from_str(&row.content).unwrap();
+            v["ok"] = json!(ok);
+            row.content = v.to_string();
+        };
+        stamp(&mut owned[2], true);
+        stamp(&mut owned[3], false);
+        owned.push(Owned { id: 20, role: "user", content: "next".into(), ..Owned::default() });
+        let rows: Vec<Row> = owned.iter().map(Owned::row).collect();
+        let messages = build(&rows, "m");
+        let flags: Vec<bool> = messages
+            .iter()
+            .flat_map(|m| match &m.content {
+                LlmContent::ToolResults(results) => results.iter().map(|r| r.is_error).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(flags, [false, true, false]);
+        // The live round reads the same row the same way.
+        assert!(tool_row_is_error(&json!({ "ok": false, "outcome": "denied" })));
+        assert!(!tool_row_is_error(&json!({ "ok": true })));
+        assert!(!tool_row_is_error(&json!({ "result": "legacy" })));
+        // Anthropic is told.
+        let sent = sent("claude-sonnet-5-5", &messages, false);
+        let failed = sent
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .find(|b| b["tool_use_id"] == "tu_10_1")
+            .cloned()
+            .expect("the failed call's result is sent");
+        assert_eq!(failed["is_error"], json!(true), "{sent}");
     }
 
     #[test]

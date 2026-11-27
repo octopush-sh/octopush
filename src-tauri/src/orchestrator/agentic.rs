@@ -24,8 +24,8 @@ pub(crate) const TOOL_RESULT_CAP_BYTES: usize = 24_000;
 
 /// The `max_tokens` floor for a stage given its effort. High-effort thinking
 /// spends its own tokens before the answer, so the output cap must clear that
-/// or a deep-thinking stage truncates mid-answer. (The `output-128k` beta is
-/// already sent, so 64k is safe.) `None`/low/medium keep the historical 32768.
+/// or a deep-thinking stage truncates mid-answer. (Every catalog model takes
+/// 64k output, so 64k is safe.) `None`/low/medium keep the historical 32768.
 pub fn max_tokens_for(effort: Option<Effort>) -> u32 {
     match effort {
         None | Some(Effort::Least) | Some(Effort::Low) | Some(Effort::Medium) => 32768,
@@ -447,6 +447,7 @@ async fn answer_ask_stage(
         tool_choice: None,
         effort: None,
         cache: false,
+        cache_key: None,
     };
     let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: crate::error::ProviderErrorKind| {
         emitter.notice(&retry_notice(attempt, of, delay, kind));
@@ -906,6 +907,7 @@ pub async fn run_agentic_loop_billed(
             // Agentic stage loop: system prompt, tool schemas and accumulated
             // history are re-sent every iteration — cache the stable prefix.
             cache: true,
+            cache_key: None,
         };
         // Transient failures (rate limit, overload, 5xx, a connection that never opened) are
         // retried in place with backoff — the accumulated message history is
@@ -1264,6 +1266,7 @@ pub async fn run_agentic_loop_billed(
             tool_choice: None,
             effort,
             cache: true,
+            cache_key: None,
         };
         let mut on_retry = |attempt: u32, of: u32, delay: u64, kind: ProviderErrorKind| {
             emitter.notice(&retry_notice(attempt, of, delay, kind));
