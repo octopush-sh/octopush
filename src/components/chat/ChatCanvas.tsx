@@ -5,6 +5,8 @@ import { ipc } from "../../lib/ipc";
 import { rewindError, skippedLabel } from "../../lib/talkRewind";
 import { pushToast } from "../Toasts";
 import { RewindDialog } from "./RewindDialog";
+import { TurnChanges } from "./TurnChanges";
+import { turnEnds } from "../../lib/turnChanges";
 import { tourId } from "../../lib/tour/ids";
 import { useTourStore } from "../../stores/tourStore";
 import type { ChatMessage as StoredMessage } from "../../lib/types";
@@ -102,6 +104,9 @@ export function ChatCanvas({
   );
   // Narration and tool calls in a row become one work block (lib/talkWork).
   const blocks = useMemo<TalkBlock[]>(() => groupWork(timeline), [timeline]);
+  // Where each turn ends, so its changes row (#1152) sits under its answer.
+  const ends = useMemo(() => turnEnds(blocks), [blocks]);
+  const askById = useMemo(() => new Map(messages.map((m) => [m.id, m.content])), [messages]);
   // The work of the turn in flight doesn't fold while it streams (it folds
   // when the turn ends). That work comes after the last user turn AND was
   // saved after the turn started: the backend saves the new user row a
@@ -284,6 +289,93 @@ export function ChatCanvas({
     return () => clearTimeout(t);
   }, [playerActive]);
 
+  const renderBlock = (item: TalkBlock, index: number) => {
+    if (item.kind === "crew") {
+      return (
+        <CrewCard
+          key={`crew-${item.id}`}
+          workspaceId={workspaceId}
+          agents={crewAgentsFromTools(item.agents)}
+        />
+      );
+    }
+    if (item.kind === "work") {
+      return (
+        <WorkBlock
+          key={`work-${item.id}`}
+          entries={item.entries}
+          calls={item.calls}
+          live={isLiveWork(item.id, index)}
+          workspacePath={workspacePath}
+          onOpenInEditor={onOpenInEditor}
+          onRunInTerminal={onRunInTerminal}
+        />
+      );
+    }
+    if (item.kind === "error") {
+      const at = messages.indexOf(item.message);
+      // Only the turn's latest word can be continued, and not while
+      // a turn runs.
+      const canRetry = at === messages.length - 1 && !streaming;
+      return (
+        <ErrorBlock
+          key={`error-${item.message.id}`}
+          error={item.message.content}
+          kind={errorKindOf(item.message.errorKind)}
+          kept={keptLine(roundsKept(messages, at))}
+          onRetry={canRetry ? () => void continueTurn(workspaceId, workspacePath) : null}
+          onConfigureApiKey={onOpenSettings ?? null}
+        />
+      );
+    }
+    return (
+      <MessageRow
+        key={item.message.id}
+        message={item.message}
+        skillNames={skillNames}
+        onOpenInEditor={onOpenInEditor}
+        onRegenerate={
+          item.message.role === "assistant" && item.message.id === lastAssistantId
+            ? (id) => regenerate(workspaceId, workspacePath, id)
+            : undefined
+        }
+        onEdit={
+          item.message.role === "user" && item.message.id === lastUserId
+            ? (id, content, hadContext) => void resendEdit(id, content, hadContext)
+            : undefined
+        }
+        onRewind={
+          item.message.role === "user" && checkpoints.has(item.message.id)
+            ? setRewindAt
+            : undefined
+        }
+        noCheckpoint={item.message.role === "user" ? skipped.get(item.message.id) : undefined}
+        onFork={item.message.role === "user" && activeThreadId ? handleFork : undefined}
+        disabled={streaming || resolving}
+      />
+    );
+  };
+
+  // A finished turn that took a checkpoint ends with what it changed
+  // (#1152); the turn in flight shows nothing until it ends, so its row
+  // mounts (and reads the turn's refs) once both checkpoints exist.
+  const turnChangesAfter = (index: number) => {
+    const ask = ends.get(index);
+    if (ask === undefined || !activeThreadId || !checkpoints.has(ask)) return null;
+    if (streaming && ask === lastUserId) return null;
+    return (
+      <TurnChanges
+        key={`changes-${ask}`}
+        workspaceId={workspaceId}
+        threadId={activeThreadId}
+        messageId={ask}
+        ask={askById.get(ask) ?? ""}
+        onRewind={setRewindAt}
+        disabled={streaming || resolving}
+      />
+    );
+  };
+
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
     <div
@@ -297,72 +389,7 @@ export function ChatCanvas({
         <EmptyState areaRef={scrollRef} />
       ) : (
         <section aria-label="Conversation" className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-          {blocks.map((item, index) => {
-            if (item.kind === "crew") {
-              return (
-                <CrewCard
-                  key={`crew-${item.id}`}
-                  workspaceId={workspaceId}
-                  agents={crewAgentsFromTools(item.agents)}
-                />
-              );
-            }
-            if (item.kind === "work") {
-              return (
-                <WorkBlock
-                  key={`work-${item.id}`}
-                  entries={item.entries}
-                  calls={item.calls}
-                  live={isLiveWork(item.id, index)}
-                  workspacePath={workspacePath}
-                  onOpenInEditor={onOpenInEditor}
-                  onRunInTerminal={onRunInTerminal}
-                />
-              );
-            }
-            if (item.kind === "error") {
-              const at = messages.indexOf(item.message);
-              // Only the turn's latest word can be continued, and not while
-              // a turn runs.
-              const canRetry = at === messages.length - 1 && !streaming;
-              return (
-                <ErrorBlock
-                  key={`error-${item.message.id}`}
-                  error={item.message.content}
-                  kind={errorKindOf(item.message.errorKind)}
-                  kept={keptLine(roundsKept(messages, at))}
-                  onRetry={canRetry ? () => void continueTurn(workspaceId, workspacePath) : null}
-                  onConfigureApiKey={onOpenSettings ?? null}
-                />
-              );
-            }
-            return (
-              <MessageRow
-                key={item.message.id}
-                message={item.message}
-                skillNames={skillNames}
-                onOpenInEditor={onOpenInEditor}
-                onRegenerate={
-                  item.message.role === "assistant" && item.message.id === lastAssistantId
-                    ? (id) => regenerate(workspaceId, workspacePath, id)
-                    : undefined
-                }
-                onEdit={
-                  item.message.role === "user" && item.message.id === lastUserId
-                    ? (id, content, hadContext) => void resendEdit(id, content, hadContext)
-                    : undefined
-                }
-                onRewind={
-                  item.message.role === "user" && checkpoints.has(item.message.id)
-                    ? setRewindAt
-                    : undefined
-                }
-                noCheckpoint={item.message.role === "user" ? skipped.get(item.message.id) : undefined}
-                onFork={item.message.role === "user" && activeThreadId ? handleFork : undefined}
-                disabled={streaming || resolving}
-              />
-            );
-          })}
+          {blocks.flatMap((item, index) => [renderBlock(item, index), turnChangesAfter(index)])}
 
           {/* Live sub-agents — every in-flight `Agent` call of the turn as ONE
               crew card (they run concurrently); retires as the resolved rows

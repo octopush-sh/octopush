@@ -288,6 +288,8 @@ pub fn run() {
             commands::set_thread_pinned,
             commands::delete_chat_thread,
             commands::list_talk_checkpoints,
+            commands::talk_turn_changes,
+            commands::talk_turn_diff,
             commands::preview_talk_rewind,
             commands::rewind_talk_files,
             commands::undo_talk_rewind,
@@ -474,6 +476,7 @@ pub fn run() {
             commands::save_issue_tracker_config,
             // AI primitive (G5)
             commands::ai_complete,
+            commands::generate_chat_title,
             // MCP server integration (Connect to Claude Code)
             commands::mcp_connection_status,
             commands::connect_claude_code,

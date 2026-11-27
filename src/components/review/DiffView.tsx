@@ -27,6 +27,9 @@ interface Props {
   stagedCount?: number;
   /** The committed view (#851): no Accept / Reject, by click or key. */
   readOnly?: boolean;
+  /** The This turn view (#1152): no Accept and no comments; `x` and the
+   *  rail's Revert reverse a hunk in the working tree. */
+  revertOnly?: boolean;
   /** Highlight hunks in the context of the file on disk (default true). Off
    *  when the disk no longer matches the diff's new side. */
   diskContext?: boolean;
@@ -44,7 +47,7 @@ interface Props {
 }
 
 export function DiffView(props: Props) {
-  const { files, stagedCount = 0, active = true, readOnly = false, diskContext = true } = props;
+  const { files, stagedCount = 0, active = true, readOnly = false, revertOnly = false, diskContext = true } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const [focused, setFocused] = useState(0);
   // A viewed file maps to the fingerprints of the hunks it had when marked, so
@@ -63,8 +66,8 @@ export function DiffView(props: Props) {
     setChanged({});
   }
 
-  // Comments act on the working tree only; the committed view is out of scope.
-  const commentWs = !readOnly ? props.workspaceId : undefined;
+  // Comments act on the working tree only; the committed and turn views are out of scope.
+  const commentWs = !readOnly && !revertOnly ? props.workspaceId : undefined;
   const comments = useReviewComments(selectComments(commentWs ?? ""));
   // The open "Ask for a change" draft: its hunk, the rows picked (if any),
   // the anchor taken at that moment and the note typed so far. It lives in
@@ -187,9 +190,10 @@ export function DiffView(props: Props) {
     setFocused,
     containerRef,
     actions: {
-      accept: () => !readOnly && cur && props.onAccept(files[cur.fileIdx].filePath, cur.hunkIdx),
+      accept: () => !readOnly && !revertOnly && cur && props.onAccept(files[cur.fileIdx].filePath, cur.hunkIdx),
       reject: () => !readOnly && cur && props.onReject(files[cur.fileIdx].filePath, cur.hunkIdx),
-      acceptFile: () => !readOnly && curFile && curFile.hunks.forEach((_, hi) => props.onAccept(curFile.filePath, hi)),
+      acceptFile: () =>
+        !readOnly && !revertOnly && curFile && curFile.hunks.forEach((_, hi) => props.onAccept(curFile.filePath, hi)),
       toggleViewed: () => curFile && toggleViewed(curFile),
       open: () => cur && props.onOpen(files[cur.fileIdx].filePath, firstChangedLine(files[cur.fileIdx], cur.hunkIdx)),
       why: () => cur && props.onWhy(files[cur.fileIdx].filePath, cur.hunkIdx),
@@ -224,6 +228,7 @@ export function DiffView(props: Props) {
             file={file}
             workspacePath={diskContext ? props.workspacePath : undefined}
             readOnly={readOnly}
+            revertOnly={revertOnly}
             focusedHunk={cur?.fileIdx === fi ? cur.hunkIdx : -1}
             viewed={!!viewed[file.filePath]}
             collapsed={!!collapsed[file.filePath]}
@@ -246,7 +251,7 @@ export function DiffView(props: Props) {
           />
         ))}
       </div>
-      {help && <KeyboardHelp readOnly={readOnly} onClose={() => setHelp(false)} />}
+      {help && <KeyboardHelp readOnly={readOnly} revertOnly={revertOnly} onClose={() => setHelp(false)} />}
       {anchor && props.anchorSlot?.(anchor, () => {
         /* clear handled when anchor selection lands in G5 */
       })}
@@ -260,14 +265,15 @@ function firstChangedLine(file: DiffFile, hunkIdx: number): number {
 }
 
 /** The `?` overlay. The committed view is read-only, so it leaves out the
- *  accept / reject keys it ignores (#903). Exported for tests. */
-export function keyboardHelpLine(readOnly: boolean): string {
-  const act = readOnly ? "" : " · a accept · x reject · A file";
-  const ask = readOnly ? "" : " · m ask for a change (in it, ⌥↑ ⌥↓ pick lines)";
+ *  accept / reject keys it ignores (#903); the turn view only reverts.
+ *  Exported for tests. */
+export function keyboardHelpLine(readOnly: boolean, revertOnly = false): string {
+  const act = readOnly ? "" : revertOnly ? " · x revert in the working tree" : " · a accept · x reject · A file";
+  const ask = readOnly || revertOnly ? "" : " · m ask for a change (in it, ⌥↑ ⌥↓ pick lines)";
   return `j/k move · ]/[ file · Space fold${act} · v viewed · o open · w why${ask}`;
 }
 
-function KeyboardHelp({ readOnly, onClose }: { readOnly: boolean; onClose: () => void }) {
+function KeyboardHelp({ readOnly, revertOnly, onClose }: { readOnly: boolean; revertOnly: boolean; onClose: () => void }) {
   return (
     <div
       className="octo-fade-in fixed bottom-4 right-4 z-50 rounded-md border border-octo-hairline bg-octo-panel p-3 font-mono text-[10px] text-octo-sage shadow-2xl"
@@ -275,7 +281,7 @@ function KeyboardHelp({ readOnly, onClose }: { readOnly: boolean; onClose: () =>
       aria-label="Keyboard shortcuts"
     >
       <div className="mb-1 text-octo-brass">Keyboard · press ? to close</div>
-      <div>{keyboardHelpLine(readOnly)}</div>
+      <div>{keyboardHelpLine(readOnly, revertOnly)}</div>
       <button onClick={onClose} className="sr-only">Close</button>
     </div>
   );

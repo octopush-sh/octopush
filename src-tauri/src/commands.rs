@@ -2024,6 +2024,44 @@ pub async fn list_talk_checkpoints(
     crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::checkpoints(&path, &thread_id)).await
 }
 
+/// The files a Talk turn changed, with their line counts (#1152). None when
+/// the turn has no checkpoint before or after it, or changed nothing.
+#[tauri::command]
+pub async fn talk_turn_changes(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<Vec<crate::talk_checkpoints::TurnChange>> {
+    let Ok((_, path)) = talk_thread_home(&state, &thread_id) else {
+        return Ok(Vec::new());
+    };
+    crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::turn_changes(&path, &thread_id, message_id)
+    })
+    .await
+}
+
+/// The unified diff of a Talk turn, between its two checkpoints: Review's
+/// "This turn" scope (#1152). Empty when either checkpoint is missing.
+#[tauri::command]
+pub async fn talk_turn_diff(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+    ignore_whitespace: Option<bool>,
+) -> AppResult<String> {
+    let (_, path) = talk_thread_home(&state, &thread_id)?;
+    crate::talk_checkpoints::off_runtime(move || {
+        match crate::talk_checkpoints::turn_refs(&path, &thread_id, message_id) {
+            Some((before, after)) => {
+                crate::git_ops::commits_diff(&path, &before, &after, ignore_whitespace.unwrap_or(false))
+            }
+            None => Ok(String::new()),
+        }
+    })
+    .await
+}
+
 /// What rewinding to a turn would change — shown before anything is written.
 #[tauri::command]
 pub async fn preview_talk_rewind(
@@ -8086,6 +8124,117 @@ pub async fn ai_complete(
         output_tokens,
         cost_usd: cost,
     })
+}
+
+/// Ledger origin of a Talk thread's generated title (#1137).
+pub const TITLE_ORIGIN: &str = "title";
+
+/// The fast tier on the provider of `model` (a Talk conversation's model;
+/// `auto` reads as the strong tier's), so a thread's title goes to the
+/// provider the conversation already uses: the tier map's `fast` when it is
+/// one of that provider's models, else that provider's current model named
+/// like `haiku`. `None` when the provider has no fast tier.
+pub fn fast_model_on_provider(
+    router: &crate::provider_router::ProviderRouter,
+    model: &str,
+    tiers: &HashMap<String, String>,
+) -> Option<String> {
+    let model = if model == crate::chat_agents::AUTO_MODEL { tiers.get("strong")?.as_str() } else { model };
+    let (provider, _) = router.find_model(model)?;
+    if let Some(mapped) = tiers.get("fast") {
+        if provider.models.iter().any(|m| m.id == *mapped) {
+            return Some(mapped.clone());
+        }
+    }
+    provider
+        .models
+        .iter()
+        .find(|m| !m.tags.is_empty() && m.superseded_by.is_none() && m.id.to_ascii_lowercase().contains("haiku"))
+        .map(|m| m.id.clone())
+}
+
+/// Record a title call's spend on its thread, as origin [`TITLE_ORIGIN`].
+pub(crate) fn record_title_spend(
+    tokens: &crate::token_engine::TokenEngine,
+    thread_id: &str,
+    event: TokenEvent,
+) -> AppResult<()> {
+    tokens.record_request_in_thread(event, "talk", Some(thread_id), Some(TITLE_ORIGIN))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedTitle {
+    pub text: String,
+    pub model: String,
+    pub cost_usd: f64,
+}
+
+/// Talk: one short call that titles a thread after its first answer (or on
+/// "Regenerate title"), on the fast tier of the conversation's own provider
+/// so nothing goes anywhere new. `None` when that provider has no fast tier;
+/// an error when the call fails or takes over 10 s. The frontend writes the
+/// prompt and keeps the derived title on anything but a clean answer.
+#[tauri::command]
+pub async fn generate_chat_title(
+    state: State<'_, AppState>,
+    thread_id: String,
+    workspace_id: String,
+    model: String,
+    system: String,
+    prompt: String,
+) -> AppResult<Option<GeneratedTitle>> {
+    if let crate::db::BudgetVerdict::Block { scope, spent, limit } =
+        state.db.lock().check_budget(Some(workspace_id.as_str()))?
+    {
+        return Err(AppError::BudgetExceeded { scope, spent, limit });
+    }
+    let tiers = crate::settings::load_settings().map(|s| s.model_tiers).unwrap_or_default();
+    let fast = {
+        let router = crate::provider_router::ProviderRouter::load()?;
+        fast_model_on_provider(&router, &model, &tiers)
+    };
+    let Some(fast) = fast else {
+        return Ok(None);
+    };
+    let (provider, api_base, api_key) = crate::chat_engine::resolve_provider(&fast)?;
+    let req = build_ai_request(&fast, system, prompt, 64, None);
+    let client = crate::chat_engine::shared_http_client();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        provider.complete(&api_base, api_key.as_deref(), &req, client),
+    )
+    .await
+    .map_err(|_| AppError::Other("The title took too long.".into()))??;
+    Ok(Some(bill_title_reply(&state.tokens, &thread_id, &workspace_id, fast, resp)))
+}
+
+/// Bill a title reply to its thread and keep its text. Every reply that came
+/// back is paid for, so this runs on all of them, a truncated one too: it is
+/// not rejected, because the frontend keeps only the first line and an empty
+/// cleanup keeps the derived title. Unit-testable.
+pub(crate) fn bill_title_reply(
+    tokens: &crate::token_engine::TokenEngine,
+    thread_id: &str,
+    workspace_id: &str,
+    model: String,
+    resp: crate::providers::LlmResponse,
+) -> GeneratedTitle {
+    let cost = crate::token_engine::request_cost_for(
+        &model,
+        resp.input_tokens,
+        resp.output_tokens,
+        resp.cache_read_tokens,
+        resp.cache_creation_tokens,
+    );
+    if resp.input_tokens > 0 || resp.output_tokens > 0 {
+        // Best-effort: a recording failure must not lose the title.
+        let event = ai_token_event(Some(workspace_id), &model, &resp, cost);
+        if let Err(e) = record_title_spend(tokens, thread_id, event) {
+            tracing::warn!(error = %e, "failed to record the title call's spend");
+        }
+    }
+    GeneratedTitle { text: ai_response_text(resp), model, cost_usd: cost }
 }
 
 // ─── G4 staging commands ──────────────────────────────────────────

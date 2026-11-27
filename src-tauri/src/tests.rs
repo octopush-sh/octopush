@@ -28796,6 +28796,115 @@ mod talk_checkpoint_tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(db.list_chat_messages(&fork.id).unwrap().len(), 2);
     }
+
+    // ── #1152: what a turn changed ────────────────────────────────
+
+    #[test]
+    fn numstat_parsing_reads_counts_and_binary_files() {
+        let out = b"3\t1\tsrc/a.ts\0-\t-\tlogo.png\0\x000\t2\tgone.txt\0garbage\0";
+        assert_eq!(
+            ck::parse_numstat(out),
+            vec![
+                ("src/a.ts".to_string(), 3, 1),
+                ("logo.png".to_string(), 0, 0),
+                ("gone.txt".to_string(), 0, 2),
+            ]
+        );
+        assert!(ck::parse_numstat(b"").is_empty());
+    }
+
+    /// A turn that edits, creates (as a shell command would, outside any
+    /// write tool) and deletes files reports each with its counts; the
+    /// snapshot covers the whole tree, so how a file changed doesn't matter.
+    #[test]
+    fn turn_changes_counts_every_file_the_turn_changed() {
+        let dir = repo("turn-changes");
+        write(&dir, "a.txt", "1\n2\n3\n");
+        write(&dir, "gone.txt", "x\ny\n");
+        write(&dir, "same.txt", "s\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+
+        assert!(ck::capture_before(&dir, THREAD, 20));
+        write(&dir, "a.txt", "1\ntwo\n3\n4\n");
+        write(&dir, "made/by-shell.txt", "a\nb\nc\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        AfterTurn::new(&dir, THREAD, 20).record();
+
+        let mut changes = ck::turn_changes(&dir, THREAD, 20).unwrap();
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        let got: Vec<(&str, &str, u32, u32)> =
+            changes.iter().map(|c| (c.path.as_str(), c.status, c.added, c.removed)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a.txt", "modified", 2, 1),
+                ("gone.txt", "deleted", 0, 2),
+                ("made/by-shell.txt", "added", 3, 0),
+            ]
+        );
+
+        // The turn's diff holds exactly those files.
+        let (before, after) = ck::turn_refs(&dir, THREAD, 20).unwrap();
+        let diff = crate::git_ops::commits_diff(&dir, &before, &after, false).unwrap();
+        assert_eq!(diff.matches("diff --git ").count(), 3, "{diff}");
+        assert!(diff.contains("+two"));
+        assert!(!diff.contains("same.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turn_changes_is_empty_for_a_read_only_turn_or_a_missing_checkpoint() {
+        let dir = repo("turn-none");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+
+        // A turn that only read.
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        AfterTurn::new(&dir, THREAD, 1).record();
+        assert!(ck::turn_changes(&dir, THREAD, 1).unwrap().is_empty());
+
+        // A turn that wrote but has no `-after` (interrupted hard).
+        assert!(ck::capture_before(&dir, THREAD, 2));
+        write(&dir, "a.txt", "changed\n");
+        assert!(ck::turn_changes(&dir, THREAD, 2).unwrap().is_empty());
+        assert!(ck::turn_refs(&dir, THREAD, 2).is_none());
+
+        // A turn with no checkpoint at all, and a bad thread id.
+        assert!(ck::turn_changes(&dir, THREAD, 99).unwrap().is_empty());
+        assert!(ck::turn_changes(&dir, "../x", 1).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `x` in the This turn scope reverses a hunk of the turn's diff in the
+    /// working tree: when the file moved on since the turn, the reverse no
+    /// longer applies, and the tree is left exactly as it was.
+    #[tokio::test]
+    async fn a_turn_hunk_that_no_longer_applies_leaves_the_tree_untouched() {
+        let dir = repo("turn-revert");
+        write(&dir, "a.txt", "1\n2\n3\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 5));
+        write(&dir, "a.txt", "1\nturn\n3\n");
+        AfterTurn::new(&dir, THREAD, 5).record();
+        let (before, after) = ck::turn_refs(&dir, THREAD, 5).unwrap();
+        let diff = crate::git_ops::commits_diff(&dir, &before, &after, false).unwrap();
+        let ws = dir.to_string_lossy().to_string();
+
+        // Someone edits the same line after the turn: the reverse can't apply.
+        write(&dir, "a.txt", "1\nlater\n3\n");
+        assert!(crate::commands::revert_hunk(ws.clone(), diff.clone()).await.is_err());
+        assert_eq!(read(&dir, "a.txt"), "1\nlater\n3\n", "the tree is untouched");
+
+        // Back as the turn left it, the same hunk reverts cleanly.
+        write(&dir, "a.txt", "1\nturn\n3\n");
+        crate::commands::revert_hunk(ws, diff).await.unwrap();
+        assert_eq!(read(&dir, "a.txt"), "1\n2\n3\n");
+        assert_eq!(git(&dir, &["diff", "--cached", "--name-only"]), "", "the index is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -30647,5 +30756,103 @@ mod crew_report_tests {
         assert_eq!(next_lighter_tier(&router, "claude-sonnet-5-5").as_deref(), Some("claude-haiku-5-5"));
         assert_eq!(next_lighter_tier(&router, "claude-haiku-5-5"), None);
         assert_eq!(next_lighter_tier(&router, "not-a-model"), None);
+    }
+}
+
+/// A Talk thread's generated title (#1137): the fast tier it runs on stays on
+/// the conversation's provider, and its spend lands on the thread as origin
+/// `title`.
+#[cfg(test)]
+mod chat_title_tests {
+    use crate::commands::{bill_title_reply, fast_model_on_provider, record_title_spend, TITLE_ORIGIN};
+    use crate::db::Db;
+    use crate::providers::{LlmResponse, LlmStopReason};
+    use crate::provider_router::{builtin_providers, ProviderRouter};
+    use crate::token_engine::{TokenEngine, TokenEvent};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn tiers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn the_title_runs_on_the_fast_tier_of_the_conversations_own_provider() {
+        let router = ProviderRouter::from_map(builtin_providers());
+        // Unmapped: the provider's current haiku.
+        let fast = fast_model_on_provider(&router, "claude-opus-5-5", &HashMap::new()).unwrap();
+        assert!(fast.contains("haiku"), "{fast}");
+        // A mapped fast tier on the same provider wins.
+        let mapped = tiers(&[("fast", "claude-sonnet-5-5")]);
+        assert_eq!(fast_model_on_provider(&router, "claude-opus-5-5", &mapped).as_deref(), Some("claude-sonnet-5-5"));
+        // A fast tier on another provider is never used: the title would go
+        // somewhere the conversation doesn't.
+        let elsewhere = tiers(&[("fast", "gpt-4o-mini")]);
+        let fast = fast_model_on_provider(&router, "claude-opus-5-5", &elsewhere).unwrap();
+        assert!(fast.contains("haiku"), "{fast}");
+        // Auto reads as the strong tier's provider.
+        let auto = tiers(&[("strong", "claude-opus-5-5"), ("fast", "claude-sonnet-5-5")]);
+        assert_eq!(fast_model_on_provider(&router, "auto", &auto).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(fast_model_on_provider(&router, "auto", &HashMap::new()), None);
+        // No fast tier on the provider, or an unknown model: no title call.
+        assert_eq!(fast_model_on_provider(&router, "gpt-6.2-astra", &HashMap::new()), None);
+        assert_eq!(fast_model_on_provider(&router, "not-a-model", &HashMap::new()), None);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_title_call_is_billed_to_its_thread_as_origin_title() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        let ev = |model: &str, cost: f64| TokenEvent {
+            id: None,
+            session_id: "ws-1".into(),
+            timestamp: String::new(),
+            input_tokens: 400,
+            output_tokens: 12,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: model.into(),
+            cost_usd: cost,
+        };
+        record_title_spend(&engine, "t-1", ev("claude-haiku-5-5", 0.0005)).unwrap();
+        let c = db.lock().thread_cost("t-1", None).unwrap();
+        assert_eq!(c.calls, 1);
+        assert!((c.spent_usd - 0.0005).abs() < 1e-12, "{}", c.spent_usd);
+        assert_eq!(c.subagents_usd, 0.0);
+        // The row carries the origin (read back through an unpriced row).
+        record_title_spend(&engine, "t-1", ev("mystery-title-model", 0.0)).unwrap();
+        let rows = db.lock().reprice_candidates(false).unwrap();
+        let row = rows.iter().find(|r| r.model == "mystery-title-model").unwrap();
+        assert_eq!((row.surface.as_str(), row.origin.as_deref()), ("talk", Some(TITLE_ORIGIN)));
+        assert_eq!(TITLE_ORIGIN, "title");
+        assert!(row.single_request());
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_truncated_title_reply_is_still_billed_and_kept() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        let resp = LlmResponse {
+            text: "GUIDE-123 · Waive virtualenv findings\nBecause the".into(),
+            stop_reason: LlmStopReason::MaxTokens,
+            input_tokens: 400,
+            output_tokens: 64,
+            ..Default::default()
+        };
+        let title = bill_title_reply(&engine, "t-2", "ws-1", "claude-haiku-5-5".into(), resp);
+        assert!(title.text.starts_with("GUIDE-123 · Waive virtualenv findings"), "{}", title.text);
+        assert_eq!(title.model, "claude-haiku-5-5");
+        let c = db.lock().thread_cost("t-2", None).unwrap();
+        assert_eq!(c.calls, 1);
+        assert!((c.spent_usd - title.cost_usd).abs() < 1e-12, "{} vs {}", c.spent_usd, title.cost_usd);
     }
 }
