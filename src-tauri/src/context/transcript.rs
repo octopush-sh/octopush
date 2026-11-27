@@ -328,7 +328,7 @@ mod tests {
     /// given `views`, and its answer.
     fn v2_turn(base: i64, views: &[String]) -> Vec<Owned> {
         let calls: Vec<LlmToolUse> =
-            (0..views.len()).map(|k| LlmToolUse { id: format!("tu_{base}_{k}"), name: "read_file".into(), input: json!({}) }).collect();
+            (0..views.len()).map(|k| LlmToolUse { id: format!("tu_{base}_{k}"), name: "read_file".into(), input: json!({}), input_error: None }).collect();
         let raw = calls.iter().map(|u| json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input })).collect();
         let record = RoundRecord { model: "m".into(), raw, text: String::new(), tool_uses: calls.clone() };
         let mut rows = vec![
@@ -423,7 +423,7 @@ mod tests {
             model: "m".into(),
             raw: vec![],
             text: "Looking.".into(),
-            tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({}) }],
+            tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({}), input_error: None }],
         })
         .unwrap();
         let record = tool_record("tu_1", "read_file", "contents");
@@ -464,8 +464,8 @@ mod tests {
             json!({ "type": "tool_use", "id": "tu_2", "name": "read_file", "input": { "path": "a_test.rs" } }),
         ];
         let calls = vec![
-            LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({ "path": "a.rs" }) },
-            LlmToolUse { id: "tu_2".into(), name: "read_file".into(), input: json!({ "path": "a_test.rs" }) },
+            LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({ "path": "a.rs" }), input_error: None },
+            LlmToolUse { id: "tu_2".into(), name: "read_file".into(), input: json!({ "path": "a_test.rs" }), input_error: None },
         ];
         let round = serde_json::to_string(&RoundRecord { model: "claude-opus-5-5".into(), raw: raw.clone(), text: "Checking.And its test.".into(), tool_uses: calls }).unwrap();
         let (r1, r2) = (tool_record("tu_1", "read_file", "fn a() {}"), tool_record("tu_2", "read_file", "#[test] fn t() {}"));

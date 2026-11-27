@@ -358,6 +358,7 @@ fn openai_assistant_with_tools_emits_tool_calls() {
                     id: "call_1".into(),
                     name: "read_file".into(),
                     input: json!({ "path": "x" }),
+                    input_error: None,
                 }],
             },
         }],
@@ -447,6 +448,81 @@ fn openai_parse_response_tool_calls() {
     assert_eq!(resp.tool_uses[0].name, "write_file");
     assert_eq!(resp.tool_uses[0].input, json!({ "path": "a.ts", "content": "hello" }));
     assert_eq!(resp.stop_reason, LlmStopReason::ToolUse);
+}
+
+/// A Chat Completions call whose `arguments` string is one tool call body.
+fn openai_call_with_arguments(arguments: &str, finish: &str) -> super::LlmResponse {
+    openai_compat::parse_response(json!({
+        "choices": [{
+            "message": { "content": null, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "write_file", "arguments": arguments }
+            }]},
+            "finish_reason": finish
+        }]
+    }))
+}
+
+#[test]
+fn openai_invalid_arguments_reported() {
+    // Cut mid-string, as a call at `finish_reason: length` is.
+    let raw = format!("{{\"path\":\"src/a.ts\",\"content\":\"{}", "x".repeat(400));
+    let resp = openai_call_with_arguments(&raw, "length");
+    let u = &resp.tool_uses[0];
+    assert_eq!(u.input, json!({}), "the replayable input stays an object");
+    let err = u.input_error.as_deref().expect("invalid arguments are reported");
+    assert!(err.starts_with("The arguments were not valid JSON: "), "{err}");
+    let head: String = raw.chars().take(200).collect();
+    assert!(err.contains(&format!("First 200 characters: {head}\n")), "{err}");
+    assert!(!err.contains(&raw[..201]), "only the first 200 characters: {err}");
+    // A local model's slip with a stop that says tool_calls.
+    let resp = openai_call_with_arguments("{path: 'a.ts'}", "tool_calls");
+    assert!(resp.tool_uses[0].input_error.is_some());
+    assert_eq!(resp.stop_reason, LlmStopReason::ToolUse);
+}
+
+#[test]
+fn valid_arguments_unchanged() {
+    let resp = openai_call_with_arguments("{\"path\":\"a.ts\",\"content\":\"hi\"}", "tool_calls");
+    assert_eq!(resp.tool_uses[0].input, json!({ "path": "a.ts", "content": "hi" }));
+    assert_eq!(resp.tool_uses[0].input_error, None);
+    // A call with no parameters may carry an empty string: that is `{}`.
+    let resp = openai_call_with_arguments("", "tool_calls");
+    assert_eq!((resp.tool_uses[0].input.clone(), resp.tool_uses[0].input_error.clone()), (json!({}), None));
+    let resp = parse_responses(json!({
+        "status": "completed",
+        "output": [{ "type": "function_call", "call_id": "c", "name": "read_file", "arguments": "{\"path\":\"a\"}" }]
+    }));
+    assert_eq!((resp.tool_uses[0].input.clone(), resp.tool_uses[0].input_error.clone()), (json!({ "path": "a" }), None));
+    // The field stays out of a stored round unless it is set.
+    let stored = serde_json::to_value(&resp.tool_uses[0]).unwrap();
+    assert!(stored.get("input_error").is_none(), "{stored}");
+    let old: LlmToolUse = serde_json::from_value(json!({ "id": "c", "name": "n", "input": {} })).unwrap();
+    assert_eq!(old.input_error, None, "rounds stored before the field still load");
+}
+
+#[test]
+fn responses_invalid_arguments_reported() {
+    let resp = parse_responses(json!({
+        "status": "completed",
+        "output": [{ "type": "function_call", "call_id": "call_3", "name": "run_command",
+                     "arguments": "{\"command\": \"ls" }]
+    }));
+    let u = &resp.tool_uses[0];
+    assert_eq!((u.id.as_str(), u.input.clone()), ("call_3", json!({})));
+    let err = u.input_error.as_deref().expect("invalid arguments are reported");
+    assert!(err.contains("not valid JSON") && err.contains("{\"command\": \"ls"), "{err}");
+}
+
+#[test]
+fn anthropic_tool_use_unaffected() {
+    let resp = anthropic::parse_response(json!({
+        "content": [{ "type": "tool_use", "id": "tu_1", "name": "read_file", "input": { "path": "a.ts" } }],
+        "stop_reason": "tool_use",
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    }));
+    assert_eq!(resp.tool_uses[0].input, json!({ "path": "a.ts" }));
+    assert_eq!(resp.tool_uses[0].input_error, None);
 }
 
 #[test]
@@ -744,7 +820,7 @@ mod effort {
             content: LlmContent::AssistantWithTools {
                 raw: raw.clone(),
                 text: "ignored when raw is present".into(),
-                tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({}) }],
+                tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({}), input_error: None }],
             },
         }];
         let body = build_request(&req);
@@ -762,7 +838,7 @@ mod effort {
             content: LlmContent::AssistantWithTools {
                 raw: vec![],
                 text: "reading".into(),
-                tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({ "path": "a" }) }],
+                tool_uses: vec![LlmToolUse { id: "tu_1".into(), name: "read_file".into(), input: json!({ "path": "a" }), input_error: None }],
             },
         }];
         let body = build_request(&req);
@@ -1217,8 +1293,8 @@ fn openai_responses_replays_tool_turns_by_call_id() {
             raw: vec![],
             text: "let me read it".into(),
             tool_uses: vec![
-                LlmToolUse { id: "call_1".into(), name: "read_file".into(), input: json!({ "path": "x" }) },
-                LlmToolUse { id: "call_2".into(), name: "read_file".into(), input: json!({ "path": "y" }) },
+                LlmToolUse { id: "call_1".into(), name: "read_file".into(), input: json!({ "path": "x" }), input_error: None },
+                LlmToolUse { id: "call_2".into(), name: "read_file".into(), input: json!({ "path": "y" }), input_error: None },
             ],
         },
     });
@@ -1300,6 +1376,7 @@ fn openai_parse_responses_stop_reasons() {
     }));
     assert_eq!(cut.stop_reason, LlmStopReason::MaxTokens);
     assert_eq!(cut.tool_uses[0].input, json!({}), "truncated arguments parse to {{}}");
+    assert!(cut.tool_uses[0].input_error.is_some(), "and say they were cut");
     let filtered = parse_responses(json!({
         "status": "incomplete",
         "incomplete_details": { "reason": "content_filter" },

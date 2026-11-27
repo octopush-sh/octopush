@@ -573,11 +573,12 @@ pub fn parse_responses_response(response: Value, model: &str, provider: &str, ap
             Some("function_call") => {
                 replay.push(item.clone());
                 let field = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or("");
-                let input: Value = serde_json::from_str(field("arguments")).unwrap_or_else(|_| json!({}));
+                let (input, input_error) = crate::providers::parse_tool_arguments(field("arguments"));
                 tool_uses.push(LlmToolUse {
                     id: field("call_id").to_string(),
                     name: field("name").to_string(),
                     input,
+                    input_error,
                 });
             }
             _ => {}
@@ -741,8 +742,8 @@ pub fn parse_response(response: Value) -> LlmResponse {
                     let func = call.get("function");
                     let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let args_str = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}");
-                    let input: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
-                    tool_uses.push(LlmToolUse { id, name, input });
+                    let (input, input_error) = crate::providers::parse_tool_arguments(args_str);
+                    tool_uses.push(LlmToolUse { id, name, input, input_error });
                 }
             }
         }

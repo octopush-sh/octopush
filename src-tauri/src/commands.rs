@@ -8753,6 +8753,7 @@ mod ai_complete_tests {
                 id: "tu_1".into(),
                 name: super::AI_RESULT_TOOL.into(),
                 input: serde_json::json!({ "summary": "ok", "findings": [] }),
+                input_error: None,
             }],
             stop_reason: LlmStopReason::ToolUse,
             input_tokens: 1,
