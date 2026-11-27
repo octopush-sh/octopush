@@ -137,7 +137,7 @@ import { ipc, type OpenInWorkspacePayload, type OpenRunPayload, type OpenTalkPay
 import { noticeUnreadableSettings } from "./lib/settingsNotice";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
-import type { GitStatus, TintName, Issue, ProjectInfo, Pr, Workspace } from "./lib/types";
+import type { GitStatus, TintName, Issue, ProjectInfo, Pr, Workspace, EpikuConfigView } from "./lib/types";
 import { archivableMissions, archiveMergedBody, runStatesByWs } from "./lib/railState";
 import { archiveMergedMissions } from "./lib/archiveMerged";
 import { prefillFixChecks } from "./lib/fixChecks";
@@ -500,8 +500,10 @@ function App() {
   );
   // Jira ticket picker modal (from workspace context menu)
   const [jiraTicketPickerOpen, setJiraTicketPickerOpen] = useState<{ workspaceId: string; mode: "link" | "change" } | null>(null);
-  // Jira project key editor modal (from project context menu)
+  // Issue tracking modal (from project context menu): the tracker choice and
+  // Jira key; Epiku's saved connection is read when it opens.
   const [jiraProjectKeyEditorOpen, setJiraProjectKeyEditorOpen] = useState<{ projectId: string } | null>(null);
+  const [epikuSettings, setEpikuSettings] = useState<EpikuConfigView | null>(null);
   // Pending delete confirmation
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   // Inline workspace creator shown from the empty-project state.
@@ -3236,7 +3238,10 @@ function App() {
               setProjectContextMenu(null);
             }}
             onSetJiraProjectKey={() => {
-              setJiraProjectKeyEditorOpen({ projectId: projectContextMenu.projectId });
+              const id = projectContextMenu.projectId;
+              void useIssuesStore.getState().loadTracker(id);
+              void ipc.getEpikuConfig().then(setEpikuSettings).catch(() => setEpikuSettings(null));
+              setJiraProjectKeyEditorOpen({ projectId: id });
               setProjectContextMenu(null);
             }}
             onViewArchived={() => {
@@ -3577,13 +3582,27 @@ function App() {
           ?? (project?.id === jiraProjectKeyEditorOpen.projectId ? project : null);
         if (!proj) return null;
         return (
-          <ErrorBoundary surface="Jira project key" variant="overlay" onDismiss={() => setJiraProjectKeyEditorOpen(null)}>
+          <ErrorBoundary surface="Issue tracking" variant="overlay" onDismiss={() => setJiraProjectKeyEditorOpen(null)}>
           <JiraProjectKeyModal
             initialValue={proj.jiraProjectKey ?? ""}
             projectName={proj.name}
-            onSave={async (value) => {
-              await ipc.updateProjectJiraKey(jiraProjectKeyEditorOpen.projectId, value);
+            tracker={{
+              choice: trackerByProject[proj.id]?.choice ?? null,
+              epikuProject: trackerByProject[proj.id]?.epikuProject ?? null,
+              epikuDefault: epikuSettings?.project ?? null,
+              epikuConnected: !!epikuSettings?.hasToken,
+            }}
+            onSave={async (value, tracker) => {
+              try {
+                await ipc.updateProjectJiraKey(proj.id, value);
+                if (tracker) await ipc.setProjectIssueTracker(proj.id, tracker.choice, tracker.epikuProject);
+              } catch (e) {
+                pushToast({ level: "error", title: "Issue tracking wasn't saved", body: String(e).replace(/^other: /, "") });
+                return;
+              }
               await loadRecentProjects();
+              await useIssuesStore.getState().loadTracker(proj.id);
+              await refreshIssueTrackerConfigured();
               setJiraProjectKeyEditorOpen(null);
             }}
             onClose={() => setJiraProjectKeyEditorOpen(null)}

@@ -17,7 +17,7 @@ export const OUTBOUND: readonly string[] = [
   "Clerk for sign-in and Dodo Payments for checkout, when you use your account.",
   "Octopush's sync service, only if you turn on sync in Account.",
   "A webhook URL you set in Notify me elsewhere, only if you turn it on or send a test — a fixed label, the project's name and the mission's title (the start of its task), never code, diffs, the crew's questions or agent output.",
-  "Integrations you connect — Jira, GitHub, a LiteLLM gateway, MCP servers — and your git remotes.",
+  "Integrations you connect — Jira, Epiku, GitHub, a LiteLLM gateway, MCP servers — and your git remotes.",
   "Update checks — octopush.sh/update/latest.json and GitHub releases.",
   "LiteLLM's public pricing table on GitHub, when you refresh pricing.",
 ];
@@ -77,8 +77,8 @@ export function PrivacyPane() {
           <span className={LEAD_IN_CLASS}>API keys:</span> stored in{" "}
           <code className={PATH_CHIP_CLASS}>~/.octopush/settings.json</code>. MCP servers you add in
           Settings: <code className={PATH_CHIP_CLASS}>~/.claude/mcp.json</code>. A Token sign-in, an
-          OAuth client secret and the values you mark Keep in Keychain go to the macOS Keychain, and
-          mcp-remote keeps a browser sign-in in{" "}
+          OAuth client secret, the values you mark Keep in Keychain and your Epiku token go to the macOS
+          Keychain, and mcp-remote keeps a browser sign-in in{" "}
           <code className={PATH_CHIP_CLASS}>~/.mcp-auth</code>. A project's own{" "}
           <code className={PATH_CHIP_CLASS}>.claude/mcp.json</code> stays as written; its servers start only
           once you approve them, and the approvals stay in octopush.db. Your account
