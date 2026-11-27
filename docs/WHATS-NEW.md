@@ -121,6 +121,7 @@ Current anchors:
 | `talk-turn-ask` | Talk: a message you sent, set on the panel surface with "— You" and the time (every such turn carries it; a tour finds the first) | `ChatMessage.tsx` |
 | `talk-turn-context` | Talk, under a message you sent with `@` context: its row of chips, one per block, each opening the block as sent (only on such a message; a tour finds the first) | `chat/SentContext.tsx` |
 | `talk-work` · `talk-work-fold` | Talk: the model's work in a turn, its narration and tool calls on one hairline (only when a turn has some) · the summary row of a round of more than five calls (only when one has) | `chat/WorkBlock.tsx` |
+| `talk-crew-ending` | Talk crew card, on a finished sub-agent's row: its ending word (`stopped`, `turn limit`, `needs a decision`; only on a row that ended one of those ways; a tour finds the first) | `chat/CrewCard.tsx` |
 | `talk-tool-verdict` | Talk, on a resolved tool row that failed or was denied: its mono verdict after the summary (`exit 1`, `timed out`, `denied`; every such row carries it, a tour finds the first) | `ToolCallCard.tsx` |
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focusable; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
