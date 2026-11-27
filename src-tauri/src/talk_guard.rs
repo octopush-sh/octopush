@@ -25,9 +25,13 @@ pub enum CardKind {
     /// A command naming a path outside the workspace or in a credentials
     /// location (#1201).
     Run,
-    /// A write Ask first holds (#1231): a file change, with its diff, or a
-    /// command that may write. Its approval grants nothing.
+    /// A write Ask first holds (#1231): a file change, with its diff when it
+    /// can be shown, or another tool that may change something. Its
+    /// approval grants nothing.
     Ask,
+    /// A command Ask first holds because it may write (#1231).
+    #[serde(rename = "ask-run")]
+    AskRun,
 }
 
 impl CardKind {

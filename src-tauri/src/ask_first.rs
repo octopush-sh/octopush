@@ -22,6 +22,8 @@ const LCS_CELLS: usize = 250_000;
 /// What an Ask first card shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AskCard {
+    /// `AskRun` for a command, `Ask` for a file or another tool.
+    pub kind: CardKind,
     pub reason: String,
     /// The path, the command, or the tool and its arguments.
     pub shown: String,
@@ -40,7 +42,7 @@ impl AskCard {
             reason: self.reason.clone(),
             secret: false,
             covers_uncommitted: false,
-            kind: Some(CardKind::Ask),
+            kind: Some(self.kind),
             sensitive: false,
             remember_dir: None,
             diff: self.diff.clone(),
@@ -57,15 +59,21 @@ pub fn card(workspace: &Path, reach: &Reach, label: Option<&str>, name: &str, in
         None => what,
     };
     match name {
-        "run_command" => AskCard { reason: says("runs a command that may change files".into()), shown: field("command"), diff: None },
+        "run_command" => AskCard {
+            kind: CardKind::AskRun,
+            reason: says("runs a command that may change files".into()),
+            shown: field("command"),
+            diff: None,
+        },
         "write_file" | "edit_file" => {
             let verb = if name == "write_file" { "writes a file" } else { "edits a file" };
             match file_diff(workspace, reach, name, input) {
-                Ok(diff) => AskCard { reason: says(verb.into()), shown: field("path"), diff: Some(diff) },
-                Err(why) => AskCard { reason: says(format!("{verb} \u{b7} {why}")), shown: field("path"), diff: None },
+                Ok(diff) => AskCard { kind: CardKind::Ask, reason: says(verb.into()), shown: field("path"), diff: Some(diff) },
+                Err(why) => AskCard { kind: CardKind::Ask, reason: says(format!("{verb} \u{b7} {why}")), shown: field("path"), diff: None },
             }
         }
         _ => AskCard {
+            kind: CardKind::Ask,
             reason: says("a tool that may change something".into()),
             shown: format!("{name} {}", crate::talk_guard::mcp_args_shown(input)),
             diff: None,
@@ -289,6 +297,11 @@ mod tests {
         assert_eq!(broker.record("t1", ApprovalDecision::ApproveAlways, !CardKind::Ask.grantable()), ApprovalDecision::Approve);
         assert!(!broker.grant_answers("t1", Some(CardKind::Ask)));
 
+        // A command's card is its own kind, with no diff.
+        let run = serde_json::to_value(card(ws.path(), &reach, None, "run_command", &json!({ "command": "cargo fmt" })).request("w1", "t1", "c2")).unwrap();
+        assert_eq!((run["kind"].as_str(), run["command"].as_str(), run.get("diff")), (Some("ask-run"), Some("cargo fmt"), None));
+        assert!(!CardKind::AskRun.grantable());
+
         // A sub-agent's card names it; a new file shows as added lines.
         let new = card_for_new(ws.path(), &reach);
         assert_eq!(new.diff.as_deref(), Some("@@ -0,0 +1,2 @@\n+one\n+two\n"));
@@ -305,8 +318,8 @@ mod tests {
     fn deny_returns_fixed_result() {
         let rt = runtime();
         let cards = [
-            AskCard { reason: "edits a file".into(), shown: "a.rs".into(), diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()) },
-            AskCard { reason: "runs a command that may change files".into(), shown: "cargo fmt".into(), diff: None },
+            AskCard { kind: CardKind::Ask, reason: "edits a file".into(), shown: "a.rs".into(), diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()) },
+            AskCard { kind: CardKind::AskRun, reason: "runs a command that may change files".into(), shown: "cargo fmt".into(), diff: None },
         ];
         for c in cards {
             let out = rt.block_on(ask_first(|| c.clone(), |_| async { ApprovalDecision::Deny }));
