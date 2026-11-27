@@ -103,6 +103,8 @@ Current anchors:
 | `builder-export-crew` | Pipeline builder, top-right toolbar: "Export crew…" (saved pipelines only) | `PipelineBuilder.tsx` |
 | `crew-import-sheet` · `crew-import-add` | Crew import review sheet, while open: the sheet · "Add this crew to my library" | `CrewImportSheet.tsx` |
 | `palette-import-crew` | Command palette, Actions: "Import a crew…" | `CommandPalette.tsx` |
+| `palette-talk` | Command palette: the Talk group (New conversation · Switch conversation… · Copy conversation as Markdown; only with an active workspace) | `CommandPalette.tsx` |
+| `talk-switcher-input` · `talk-switcher-row` | ⌘⌥K in Talk, while open: the conversation switcher's query input · its first conversation row (only with one) | `chat/ConversationSwitcher.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
 | `builder-stage-track-record` | Pipeline builder, Stage inspector of a saved stage: the Track record section (its toggle, the record, the micro-history and suggestions) | `builder/TrackRecord.tsx` via `StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
@@ -227,7 +229,7 @@ opening the step's surface, then skips the step.
 
 `open` takes a name from the surface registry in `src/lib/tour/surfaces.ts` (e.g.
 `settings/account`, `settings/privacy`, `mode/run`, `mode/direct`, `mode/review`,
-`palette`, `file-finder`, `run/open-beside`: Run's pairing switcher, only when Open beside would pair — it never leaves an empty seat). Each entry is a function that navigates the real app there. The tour runner and
+`palette`, `file-finder`, `talk/switcher` (Talk's ⌘⌥K conversation switcher), `run/open-beside`: Run's pairing switcher, only when Open beside would pair — it never leaves an empty seat). Each entry is a function that navigates the real app there. The tour runner and
 the clip recorder both call it, so a demo never depends on clicking through menus.
 
 ## 4. Scenarios

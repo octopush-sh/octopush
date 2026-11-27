@@ -35,6 +35,11 @@ export interface ShortcutContext {
   toggleCompanion: () => void;
   openSettings: (tab: "general" | "usage") => void;
   toggleSessionSwitcher: () => void;
+  /** ⌘⌥K in Talk: open or close the conversation switcher. */
+  toggleConversationSwitcher: () => void;
+  /** ⌘⌥N: a new Talk conversation in the active workspace, shown in Talk.
+   *  Returns false when it can't (no workspace, a dialog is open). */
+  newConversation: () => boolean;
   /** ⌘D in Run: open beside (the pairing switcher, or an empty seat).
    *  Returns false when there is nothing to open beside. */
   openBeside: () => boolean;
@@ -171,10 +176,23 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     },
   },
   {
+    // Before ⌘N, which would otherwise take it. The physical key: Option
+    // turns `n` into a dead key on macOS.
+    id: "new-conversation",
+    chords: ["⌘⌥N"],
+    scope: "global",
+    shift: false,
+    alt: true,
+    keys: ["n"],
+    codes: ["KeyN"],
+    run: (_e, c) => c.newConversation(),
+  },
+  {
     id: "new-workspace",
     chords: ["⌘N"],
     scope: "global",
     shift: false,
+    alt: false,
     keys: ["n"],
     run: (_e, c) => {
       if (c.hasProject) c.openCreator();
@@ -247,20 +265,23 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     run: (_e, c) => (c.openSettings("usage"), true),
   },
   {
-    // Run mode only: the switcher lists terminals and nothing else — in Talk
-    // it would silently switch a surface the user isn't looking at. `codes`
-    // so the shortcut follows the physical key when Option remaps the
-    // printed character.
-    id: "session-switcher",
+    // One switcher that follows the mode: Run's sessions, Talk's
+    // conversations, nothing elsewhere (each lists only the surface on
+    // screen). `codes` so the shortcut follows the physical key when Option
+    // remaps the printed character.
+    id: "switcher",
     chords: ["⌘⌥K"],
-    scope: "run",
+    scope: "global",
     shift: false,
     alt: true,
     keys: ["k", "K"],
     codes: ["KeyK"],
     run: (_e, c) => {
       if (!c.activeWorkspaceId) return false;
-      c.toggleSessionSwitcher();
+      const mode = c.mode();
+      if (mode === "run") c.toggleSessionSwitcher();
+      else if (mode === "talk") c.toggleConversationSwitcher();
+      else return false;
       return true;
     },
   },

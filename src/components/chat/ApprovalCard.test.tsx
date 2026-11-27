@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { ApprovalCard, RUN_CHECK_LIMITS } from "./ApprovalCard";
+import { ApprovalCard, RUN_CHECK_LIMITS, cardTakesFocus } from "./ApprovalCard";
 
 const base = { callId: "c", threadId: "t", command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3" };
 
@@ -199,6 +199,55 @@ describe("ApprovalCard at the keyboard", () => {
     fireEvent.keyDown(screen.getByRole("group"), { key: "Enter", metaKey: true });
     fireEvent.keyDown(screen.getByRole("group"), { key: "Escape" });
     expect(behind).not.toHaveBeenCalled();
+  });
+
+  it("takes the focus when it appears with nothing focused or an empty composer, so the keys answer at once (#1153)", () => {
+    const onRespond = vi.fn();
+    render(<ApprovalCard approval={plain} onRespond={onRespond} />);
+    const card = screen.getByRole("group");
+    expect(card).toHaveFocus();
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+    expect(onRespond).toHaveBeenLastCalledWith("deny");
+    cleanup();
+
+    render(
+      <div>
+        <textarea data-tour="talk-composer-input" aria-label="composer" autoFocus />
+        <ApprovalCard approval={plain} onRespond={() => {}} />
+      </div>,
+    );
+    expect(screen.getByRole("group")).toHaveFocus();
+  });
+
+  it("never takes the focus from a draft or from elsewhere", () => {
+    const { unmount } = render(
+      <div>
+        <textarea data-tour="talk-composer-input" aria-label="composer" defaultValue="half a thought" autoFocus />
+        <ApprovalCard approval={plain} onRespond={() => {}} />
+      </div>,
+    );
+    expect(screen.getByRole("textbox", { name: "composer" })).toHaveFocus();
+    unmount();
+
+    render(
+      <div>
+        <input aria-label="rail search" autoFocus />
+        <ApprovalCard approval={plain} onRespond={() => {}} />
+      </div>,
+    );
+    expect(screen.getByRole("textbox", { name: "rail search" })).toHaveFocus();
+  });
+
+  it("cardTakesFocus: only from nothing or an empty composer", () => {
+    const composer = document.createElement("textarea");
+    const other = document.createElement("button");
+    expect(cardTakesFocus(null, null)).toBe(true);
+    expect(cardTakesFocus(document.body, composer)).toBe(true);
+    expect(cardTakesFocus(composer, composer)).toBe(true);
+    expect(cardTakesFocus(other, composer)).toBe(false);
+    composer.value = "draft";
+    expect(cardTakesFocus(document.body, composer)).toBe(false);
+    expect(cardTakesFocus(composer, composer)).toBe(false);
   });
 
   it("on the secret card, Enter and ⌘↵ take the safe lead answer: leave it out", () => {

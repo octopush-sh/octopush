@@ -43,9 +43,18 @@ export function ShortcutsPane() {
           <Shortcut keys="Esc" desc="Clear the selection" />
         </ShortcutGroup>
 
-        <ShortcutGroup title="Chat">
+        <ShortcutGroup title="Talk">
           <Shortcut keys="↵" desc="Send message" />
           <Shortcut keys="⇧↵" desc="New line in message" />
+          <Shortcut keys="Esc" desc="Stop the running turn" />
+          <Shortcut keys="⌘⌥N" desc="New conversation" />
+          <Shortcut keys="⌘⌥K" desc="Switch conversation" />
+          <Shortcut keys="⌘↵" desc="Approval card focused: approve (on a credentials or secret card, the safe answer)" />
+          <Shortcut keys="Esc" desc="Approval card focused: deny" />
+        </ShortcutGroup>
+
+        <ShortcutGroup title="Run">
+          <Shortcut keys="⌘⌥K" desc="Switch session" />
         </ShortcutGroup>
       </div>
     </>

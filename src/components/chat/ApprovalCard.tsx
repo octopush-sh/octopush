@@ -1,4 +1,4 @@
-import type { KeyboardEvent } from "react";
+import { useEffect, useRef, type KeyboardEvent } from "react";
 import { ShieldAlert } from "lucide-react";
 import type { PendingApproval } from "../../stores/chatStore";
 import { tourId } from "../../lib/tour/ids";
@@ -51,8 +51,20 @@ export const RUN_CHECK_LIMITS =
  * also takes the safe answer. Held keys (auto-repeat) are ignored. A focused
  * button answers its own keys, as any button does, and the composer's ⌘↵
  * never reaches the card: the card answers only its own focus.
+ *
+ * The card takes the focus when it appears if nothing holds it and the
+ * composer is empty (`cardTakesFocus`), so the keys answer it at once; it
+ * never takes it from a draft, another card, a dialog, an editor or a
+ * terminal.
  */
 export function ApprovalCard({ approval, onRespond }: Props) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el && cardTakesFocus(document.activeElement, document.querySelector("[data-tour='talk-composer-input']"))) {
+      el.focus({ preventScroll: true });
+    }
+  }, []);
   const secret = approval.secret === true;
   const run = approval.kind === "run";
   const outside = approval.kind === "read" || approval.kind === "write" || run;
@@ -70,6 +82,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
   };
   return (
     <div
+      ref={ref}
       role="group"
       tabIndex={0}
       aria-label={`${copy.eyebrow}: ${approval.command}`}
@@ -153,6 +166,15 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       </div>
     </div>
   );
+}
+
+/** Whether a card that just appeared takes the focus: only from nothing (the
+ *  body) or from an empty composer, and never while the composer holds a
+ *  draft. Pure but for reading `document.body`. */
+export function cardTakesFocus(active: Element | null, composer: Element | null): boolean {
+  const draft = composer instanceof HTMLTextAreaElement ? composer.value.trim() : "";
+  if (draft !== "") return false;
+  return !active || active === document.body || (composer !== null && active === composer);
 }
 
 /** The answer a key gives a focused card, or null for a key it leaves alone.
