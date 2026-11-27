@@ -1568,6 +1568,14 @@ pub struct ApprovalRequestEvent {
     /// An Ask first card's file change, as a unified diff (#1231).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Why an Ask first card shows no diff (a binary file, one too large),
+    /// said plainly on the card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_note: Option<String>,
+    /// The conversation is in Ask first: no "don't ask again" answers this
+    /// card, and it offers none (#1231).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ask_first: bool,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1709,8 +1717,11 @@ impl ApprovalBroker {
     }
 
     /// Ask the user to approve a dangerous agent command and wait for the answer.
-    /// Auto-approved conversations skip the prompt. The card waits as long as
-    /// it takes (see the type's doc): never a silent denial.
+    /// Auto-approved conversations skip the prompt, unless `grants` is false:
+    /// in Ask first no "don't ask again" answers a card, and none is granted
+    /// (#1231). The card waits as long as it takes (see the type's doc):
+    /// never a silent denial.
+    #[allow(clippy::too_many_arguments)]
     pub async fn await_approval(
         &self,
         app: &AppHandle,
@@ -1719,17 +1730,18 @@ impl ApprovalBroker {
         call_id: &str,
         command: &str,
         reason: &str,
+        grants: bool,
     ) -> ApprovalDecision {
-        if self.auto_approve.lock().contains(thread_id) {
+        if self.silenced(thread_id, None, grants) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
-        self.record(thread_id, decision, false);
-        decision
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None, !grants).await;
+        self.record(thread_id, decision, !grants)
     }
 
     /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
-    /// thread's grant answers like a command, or a file outside the
+    /// thread's grant answers like a command (unless `grants` is false: in
+    /// Ask first every MCP write asks, #1231), or a file outside the
     /// workspace, which asks every time and whose approval grants nothing.
     pub async fn await_card(
         &self,
@@ -1738,26 +1750,29 @@ impl ApprovalBroker {
         thread_id: &str,
         call_id: &str,
         card: ToolCard,
+        grants: bool,
     ) -> ApprovalDecision {
-        if self.grant_answers(thread_id, Some(card.kind)) {
+        if self.silenced(thread_id, Some(card.kind), grants) {
             return ApprovalDecision::Approve;
         }
         let marks = Some((card.kind, card.sensitive));
         let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
-        self.settle_card(thread_id, decision, &card)
+        let decision =
+            self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, !grants).await;
+        self.settle_card(thread_id, decision, &card, grants)
     }
 
     /// What an answer to a `talk_guard` card does: "always" on a command's
     /// card that offers a folder lets the thread's commands read it from now
-    /// on and counts as one approval (#1201); any other as [`Self::record`].
-    pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard) -> ApprovalDecision {
+    /// on and counts as one approval (#1201); any other as [`Self::record`],
+    /// which grants nothing when `grants` is false (Ask first).
+    pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard, grants: bool) -> ApprovalDecision {
         match (decision, &card.remember) {
             (ApprovalDecision::ApproveAlways, Some((dir, _))) => {
                 self.read_dirs.lock().entry(thread_id.to_string()).or_default().push(dir.clone());
                 ApprovalDecision::Approve
             }
-            _ => self.record(thread_id, decision, !card.kind.grantable()),
+            _ => self.record(thread_id, decision, !card.kind.grantable() || !grants),
         }
     }
 
@@ -1770,6 +1785,12 @@ impl ApprovalBroker {
     /// a command's (`None`) or an MCP call's, never a file outside.
     pub(crate) fn grant_answers(&self, thread_id: &str, kind: Option<CardKind>) -> bool {
         kind.is_none_or(CardKind::grantable) && self.auto_approve.lock().contains(thread_id)
+    }
+
+    /// Whether a card is answered unseen: only by a grant, and never while
+    /// the conversation is in Ask first (`grants` false, #1231).
+    pub(crate) fn silenced(&self, thread_id: &str, kind: Option<CardKind>, grants: bool) -> bool {
+        grants && self.grant_answers(thread_id, kind)
     }
 
     /// Ask about a command the secret guard stopped (#819). Unlike
@@ -1787,7 +1808,7 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None, false)
             .await;
         self.record(thread_id, decision, true)
     }
@@ -1843,6 +1864,7 @@ impl ApprovalBroker {
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
+        ask_first: bool,
     ) -> ApprovalDecision {
         let request = ApprovalRequestEvent {
             workspace_id: workspace_id.to_string(),
@@ -1856,6 +1878,8 @@ impl ApprovalBroker {
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
             diff: None,
+            preview_note: None,
+            ask_first,
         };
         self.wait_on(app, request).await
     }
@@ -3427,7 +3451,8 @@ impl ChatEngine {
         self.approvals.respond(call_id, decision);
     }
 
-    /// Ask the user to approve a dangerous agent command and wait for the answer.
+    /// Ask the user to approve a dangerous agent command and wait for the
+    /// answer; `grants` is false in Ask first (#1231).
     #[allow(clippy::too_many_arguments)]
     async fn await_approval(
         &self,
@@ -3437,9 +3462,10 @@ impl ChatEngine {
         call_id: &str,
         command: &str,
         reason: &str,
+        grants: bool,
     ) -> ApprovalDecision {
         self.approvals
-            .await_approval(app, workspace_id, thread_id, call_id, command, reason)
+            .await_approval(app, workspace_id, thread_id, call_id, command, reason, grants)
             .await
     }
 
@@ -4704,6 +4730,8 @@ impl ChatEngine {
         // mission's own sandbox refuses a write outside the workspace.
         let main_checkout = crate::talk_guard::project_root(&self.db, &request.workspace_id);
         let reach = crate::talk_guard::Reach::of_workspace(&workspace_path, main_checkout.as_deref());
+        // The user's own credentials, redacted from an Ask first card's diff.
+        let known = saved_settings.as_ref().map(crate::secret_scan::known_secrets_from).unwrap_or_default();
         let writes_confined = sandbox_roots.is_some();
 
         let mut usage = TurnUsage::default();
@@ -4829,6 +4857,8 @@ impl ChatEngine {
                 sandbox_roots.as_deref(),
             );
             let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
+            // In Ask first no "don't ask again" answers a card (#1231).
+            let grants = mode != crate::permissions::Mode::Ask;
             if let Some(note) = mode_watch.at_round(mode) {
                 if let Err(e) = self.insert_and_emit_message(&app, &request.workspace_id, &request.thread_id, "stopped", &note, None, None, None, None) {
                     tracing::warn!(error = %e, "failed to note the mode change");
@@ -5227,7 +5257,7 @@ impl ChatEngine {
                 // Ask first: a write waits on its card, with its diff, before
                 // any guard; what the user approves still meets every guard.
                 if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {
-                    let preview = || crate::ask_first::card(&workspace_path, &reach, None, &u.name, &u.input);
+                    let preview = || crate::ask_first::card(&workspace_path, &reach, None, &u.name, &u.input, &known);
                     let ask = |c| self.approvals.await_ask_first(&app, &request.workspace_id, &request.thread_id, &u.id, c);
                     denied = crate::ask_first::ask_first(preview, ask).await;
                 }
@@ -5236,7 +5266,7 @@ impl ChatEngine {
                 let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
-                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants);
                     denied = guard_card(card, &check, ask).await;
                 }
                 // A command flagged destructive pauses for the user's OK before
@@ -5268,7 +5298,7 @@ impl ChatEngine {
                             reach.command_card(None, command, cwd.as_deref().map(Path::new), &allowed)
                         };
                         if let Some(card) = check() {
-                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants);
                             denied = guard_card(card, &check, ask).await;
                         }
                     }
@@ -5281,6 +5311,7 @@ impl ChatEngine {
                                 &u.id,
                                 command,
                                 reason,
+                                grants,
                             )
                             .await
                         {
@@ -7279,6 +7310,24 @@ mod tests {
         assert!(!wp.join("in_workspace.txt").exists(), "nothing was written");
     }
 
+    /// In Ask first an earlier "don't ask again" never answers a card, and
+    /// no answer there grants one (#1231): every MCP write and flagged
+    /// command asks.
+    #[test]
+    fn no_grant_silences_a_card_in_ask_first() {
+        let broker = ApprovalBroker::default();
+        assert_eq!(broker.record("t", ApprovalDecision::ApproveAlways, false), ApprovalDecision::ApproveAlways);
+        for kind in [None, Some(CardKind::Mcp)] {
+            assert!(broker.silenced("t", kind, true), "{kind:?}: Edit freely keeps the grant");
+            assert!(!broker.silenced("t", kind, false), "{kind:?}: Ask first asks anyway");
+        }
+        let mcp = crate::talk_guard::mcp_card(None, "mcp__github__merge_pr", &serde_json::json!({ "number": 7 }));
+        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &mcp, false), ApprovalDecision::Approve);
+        assert!(!broker.auto_approves("u"), "an Ask first answer grants nothing");
+        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &mcp, true), ApprovalDecision::ApproveAlways);
+        assert!(broker.auto_approves("u"));
+    }
+
     #[test]
     fn a_secret_card_never_grants_dont_ask_again() {
         let broker = ApprovalBroker::default();
@@ -7305,7 +7354,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None, diff: None,
+            remember_dir: None, diff: None, preview_note: None, ask_first: false,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7332,14 +7381,14 @@ mod tests {
             sensitive: false,
             remember: Some((dir.clone(), "/tmp/x".into())),
         };
-        assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
+        assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card, true), ApprovalDecision::Approve);
         assert_eq!(broker.read_dirs("t"), vec![dir]);
         assert!(broker.read_dirs("other").is_empty(), "for this conversation only");
         assert!(!broker.auto_approves("t"), "it grants no \"don't ask again\"");
         // Allowed once, or a card that offers no folder: nothing is remembered.
-        assert_eq!(broker.settle_card("u", ApprovalDecision::Approve, &card), ApprovalDecision::Approve);
+        assert_eq!(broker.settle_card("u", ApprovalDecision::Approve, &card, true), ApprovalDecision::Approve);
         let plain = ToolCard { remember: None, ..card };
-        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &plain), ApprovalDecision::Approve);
+        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &plain, true), ApprovalDecision::Approve);
         assert!(broker.read_dirs("u").is_empty() && !broker.auto_approves("u"));
     }
 
@@ -7632,6 +7681,8 @@ mod tests {
             sensitive: false,
             remember_dir: None,
             diff: None,
+            preview_note: None,
+            ask_first: false,
         }
     }
 

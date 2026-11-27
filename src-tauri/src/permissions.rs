@@ -191,7 +191,9 @@ pub const ASK_DECLINED: &str = "Not done: this conversation is in Ask first mode
 ///   when its server marks it read-only, and a sub-agent unless it names a
 ///   type that writes.
 /// - **Ask first:** writes ask, and so does a command unless all it runs
-///   only reads ([`reads_only`]).
+///   only reads ([`reads_only`]). An MCP tool its server doesn't mark
+///   read-only meets its own card (`talk_guard`), which no "don't ask
+///   again" answers in Ask first, so every change waits for the user.
 /// - **Edit freely:** everything runs, as before modes existed.
 pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
     let field = |key: &str| call.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
@@ -491,28 +493,217 @@ fn deploy_remote(args: &[&str]) -> Option<&'static str> {
 /// each nested one on its own ([`crate::chat_engine::each_command`]; past
 /// its caps, never), each word as the shell splits it
 /// ([`crate::chat_engine::command_words`]). A line only reads when it
-/// redirects no output (but to `/dev/null`) and each of its commands is a
-/// reader named bare ([`PLAIN_READERS`], or one of [`reader_reads`]'s with
-/// no flag that writes or runs something). Anything else asks: a wrapper,
-/// a keyword, a script, a path or a variable as the program. A net for a
-/// workflow aid, not a sandbox; what it lets through still meets the guards.
+/// redirects no output (but to `/dev/null`), sets no shell state, and each
+/// of its commands is a known reader ([`READERS`], `git` [`GIT_READS`])
+/// named bare, with only the flags its entry lists. Anything else asks: an
+/// unknown flag, an assignment (but a locale or display name before a
+/// program, [`ONE_PROGRAM_ENV`]), arithmetic, a wrapper, a keyword, a
+/// script, a path or a variable as the program. A net for a workflow aid,
+/// not a sandbox; what it lets through still meets the guards.
 pub fn reads_only(command: &str) -> bool {
-    matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+    !sets_state(command)
+        && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
 }
 
-/// Programs that only read, whatever their flags.
-const PLAIN_READERS: &[&str] = &[
-    "ls", "cat", "head", "tail", "wc", "pwd", "echo", "printf", "which", "type", "stat", "du", "df", "diff", "cmp",
-    "basename", "dirname", "realpath", "readlink", "grep", "egrep", "fgrep", "cut", "tr", "nl", "tac", "rev", "od",
-    "hexdump", "strings", "jq", "cd", "true", "false", "test", "[", "uname", "whoami", "printenv", "sleep",
+/// Arithmetic (`$((x=1))`, `$[x=1]`) and assigning expansions
+/// (`${x:=1}`, `${x=1}`) set shell variables wherever they sit.
+fn sets_state(command: &str) -> bool {
+    if command.contains("$((") || command.contains("$[") {
+        return true;
+    }
+    command.match_indices("${").any(|(at, _)| {
+        let rest = &command[at + 2..];
+        rest[..rest.find('}').unwrap_or(rest.len())].contains('=')
+    })
+}
+
+/// What may be set for one program: locale and display, never `PATH`,
+/// `PROMPT_COMMAND`, `GIT_*` or any other name.
+const ONE_PROGRAM_ENV: &[&str] = &["LANG", "TZ", "NO_COLOR", "TERM", "COLUMNS"];
+
+fn one_program_env(word: &str) -> bool {
+    let name = word.split('=').next().unwrap_or("");
+    name.starts_with("LC_") || ONE_PROGRAM_ENV.contains(&name)
+}
+
+/// A program that only reads, and the flags it may take. A flag it doesn't
+/// list asks, as does a long flag's abbreviation.
+struct Reader {
+    name: &'static str,
+    /// Short flags, alone or in a cluster (`-la`).
+    short: &'static str,
+    /// Short flags that take a value: the rest of the cluster, or the next
+    /// word unless it starts with `-` (then it is read as a flag).
+    short_valued: &'static str,
+    /// Long flags, bare or `--name=value`.
+    long: &'static [&'static str],
+    /// Long flags that also take the next word as their value.
+    long_valued: &'static [&'static str],
+    /// Whole words it takes (`find`'s primaries, `test`'s operators).
+    words: &'static [&'static str],
+    /// The most operands it takes: `uniq in out` writes `out`.
+    operands: Option<usize>,
+    /// It has flags that write or run something, so a word the shell may
+    /// expand into one asks.
+    risky: bool,
+}
+
+const R: Reader =
+    Reader { name: "", short: "", short_valued: "", long: &[], long_valued: &[], words: &[], operands: None, risky: false };
+
+const GREP: Reader = Reader {
+    short: "EFGPiyvwxclLnhHoqsrRaIbuzZU0123456789",
+    short_valued: "efmABCdD",
+    long: &[
+        "--extended-regexp", "--fixed-strings", "--basic-regexp", "--perl-regexp", "--ignore-case", "--invert-match",
+        "--word-regexp", "--line-regexp", "--count", "--color", "--colour", "--files-with-matches",
+        "--files-without-match", "--only-matching", "--quiet", "--silent", "--no-messages", "--byte-offset",
+        "--with-filename", "--no-filename", "--line-number", "--recursive", "--dereference-recursive", "--text",
+        "--null", "--null-data",
+    ],
+    long_valued: &[
+        "--regexp", "--file", "--max-count", "--after-context", "--before-context", "--context", "--include",
+        "--exclude", "--exclude-dir", "--binary-files", "--directories", "--devices", "--label",
+    ],
+    ..R
+};
+
+const READERS: &[Reader] = &[
+    Reader { name: "ls", short: "1@ABCFGHILOPRSTUWabcdefghiklmnopqrstuvwxy%,", short_valued: "w",
+        long: &["--all", "--almost-all", "--classify", "--color", "--colour", "--directory", "--dereference", "--full-time",
+            "--group-directories-first", "--human-readable", "--inode", "--numeric-uid-gid", "--recursive", "--reverse", "--size", "--si"],
+        long_valued: &["--sort", "--time", "--time-style", "--format", "--ignore", "--hide", "--width", "--block-size"], ..R },
+    Reader { name: "cat", short: "AbeEnstTuvl",
+        long: &["--show-all", "--number-nonblank", "--number", "--squeeze-blank", "--show-ends", "--show-tabs", "--show-nonprinting"], ..R },
+    Reader { name: "head", short: "qvz0123456789", short_valued: "nc", long: &["--quiet", "--silent", "--verbose", "--zero-terminated"],
+        long_valued: &["--lines", "--bytes"], ..R },
+    Reader { name: "tail", short: "fFqrvz0123456789", short_valued: "ncbs", long: &["--follow", "--retry", "--quiet", "--silent", "--verbose", "--zero-terminated"],
+        long_valued: &["--lines", "--bytes", "--pid", "--sleep-interval"], ..R },
+    Reader { name: "wc", short: "clmwL", long: &["--bytes", "--chars", "--lines", "--words", "--max-line-length"], ..R },
+    Reader { name: "pwd", short: "LP", ..R },
+    Reader { name: "echo", short: "neE", ..R },
+    // `printf -v name` sets a variable: no flag is listed.
+    Reader { name: "printf", risky: true, ..R },
+    Reader { name: "which", short: "as", ..R },
+    Reader { name: "type", short: "afptP", ..R },
+    Reader { name: "stat", short: "FLlnqrsx", short_valued: "fct", long: &["--dereference", "--terse", "--file-system"],
+        long_valued: &["--format", "--printf"], ..R },
+    Reader { name: "du", short: "aAcHhkLlmPsxg0", short_valued: "dBt",
+        long: &["--all", "--apparent-size", "--total", "--dereference", "--human-readable", "--si", "--summarize", "--one-file-system", "--null"],
+        long_valued: &["--max-depth", "--block-size", "--threshold", "--exclude"], ..R },
+    Reader { name: "df", short: "aghHiklmPT", short_valued: "tx",
+        long: &["--all", "--human-readable", "--si", "--inodes", "--local", "--portability", "--print-type", "--total"],
+        long_valued: &["--type", "--exclude-type"], ..R },
+    Reader { name: "diff", short: "abBdEilNpqrstTuwyZ", short_valued: "UCWxXIF",
+        long: &["--unified", "--context", "--recursive", "--brief", "--report-identical-files", "--side-by-side", "--ignore-case",
+            "--ignore-all-space", "--ignore-space-change", "--ignore-blank-lines", "--new-file", "--text", "--color",
+            "--no-dereference", "--strip-trailing-cr", "--suppress-common-lines", "--minimal", "--normal"],
+        long_valued: &["--exclude", "--width", "--ignore-matching-lines", "--label"], ..R },
+    Reader { name: "cmp", short: "blsx", short_valued: "in", ..R },
+    Reader { name: "basename", short: "az", short_valued: "s", ..R },
+    Reader { name: "dirname", short: "z", ..R },
+    Reader { name: "realpath", short: "eLmPqsz", ..R },
+    Reader { name: "readlink", short: "efmnqsvz", ..R },
+    Reader { name: "grep", ..GREP },
+    Reader { name: "egrep", ..GREP },
+    Reader { name: "fgrep", ..GREP },
+    Reader { name: "cut", short: "nsz", short_valued: "bcdf", long: &["--only-delimited", "--complement", "--zero-terminated"],
+        long_valued: &["--bytes", "--characters", "--delimiter", "--fields", "--output-delimiter"], ..R },
+    Reader { name: "tr", short: "cdsCt", ..R },
+    Reader { name: "nl", short: "p", short_valued: "bdfhilnsvw", ..R },
+    Reader { name: "tac", short: "br", short_valued: "s", ..R },
+    Reader { name: "rev", ..R },
+    Reader { name: "od", short: "bcdDefFhHiIlLoOsvxX", short_valued: "AjNtw", ..R },
+    Reader { name: "hexdump", short: "bcCdovx", short_valued: "efns", ..R },
+    Reader { name: "strings", short: "ao0123456789", short_valued: "nt", ..R },
+    Reader { name: "jq", short: "rjcnesSCMaR", short_valued: "fL",
+        long: &["--raw-output", "--join-output", "--compact-output", "--null-input", "--exit-status", "--slurp", "--sort-keys",
+            "--color-output", "--monochrome-output", "--ascii-output", "--raw-input", "--tab", "--args", "--jsonargs"],
+        long_valued: &["--indent", "--arg", "--argjson", "--slurpfile", "--rawfile", "--from-file"], ..R },
+    Reader { name: "cd", short: "LPe@", ..R },
+    Reader { name: "true", ..R },
+    Reader { name: "false", ..R },
+    Reader { name: "test", short: "0123456789", words: TEST_OPS, ..R },
+    Reader { name: "[", short: "0123456789", words: TEST_OPS, ..R },
+    Reader { name: "uname", short: "aimnoprsv", ..R },
+    Reader { name: "whoami", ..R },
+    Reader { name: "printenv", ..R },
+    Reader { name: "sleep", ..R },
+    // Not `--pre`, `--hostname-bin` or `-z`/`--search-zip`, which run programs.
+    Reader { name: "rg", risky: true, short: "iISsvwxcnNlLHoqFpPuUa0123456789.", short_valued: "egtTABCmMjrE",
+        long: &["--hidden", "--no-ignore", "--files", "--files-with-matches", "--files-without-match", "--count", "--count-matches",
+            "--line-number", "--no-line-number", "--column", "--heading", "--no-heading", "--with-filename", "--no-filename",
+            "--ignore-case", "--smart-case", "--case-sensitive", "--fixed-strings", "--word-regexp", "--line-regexp",
+            "--invert-match", "--only-matching", "--multiline", "--multiline-dotall", "--json", "--stats", "--trim",
+            "--vimgrep", "--follow", "--text", "--null", "--type-list", "--pretty", "--unrestricted", "--pcre2", "--passthru", "--quiet"],
+        long_valued: &["--glob", "--iglob", "--type", "--type-not", "--context", "--before-context", "--after-context", "--max-count",
+            "--max-depth", "--max-filesize", "--color", "--colors", "--sort", "--sortr", "--regexp", "--replace", "--threads",
+            "--encoding", "--engine"], ..R },
+    // Not `-o`/`--output`, `-T`, `--compress-program`.
+    Reader { name: "sort", risky: true, short: "bdfghiMmnRrsuVcCz", short_valued: "ktS",
+        long: &["--reverse", "--numeric-sort", "--unique", "--ignore-case", "--human-numeric-sort", "--version-sort", "--stable",
+            "--general-numeric-sort", "--month-sort", "--random-sort", "--check", "--merge", "--zero-terminated",
+            "--dictionary-order", "--ignore-leading-blanks", "--ignore-nonprinting"],
+        long_valued: &["--key", "--field-separator", "--buffer-size", "--parallel"], ..R },
+    Reader { name: "uniq", risky: true, operands: Some(1), short: "cdDiuz", short_valued: "fsw",
+        long: &["--count", "--repeated", "--all-repeated", "--unique", "--ignore-case", "--zero-terminated"],
+        long_valued: &["--skip-fields", "--skip-chars", "--check-chars"], ..R },
+    // Not `-o` (writes a file), `-R` (writes one per folder) or `-H`.
+    Reader { name: "tree", risky: true, short: "adlfxiqNQpugshDFvtcUrnCASJX", short_valued: "LPI",
+        long: &["--noreport", "--dirsfirst", "--gitignore", "--si", "--inodes", "--device", "--prune", "--matchdirs", "--ignore-case", "--du"],
+        long_valued: &["--charset", "--filelimit", "--timefmt", "--sort"], ..R },
+    // Not `-exec`, `-execdir`, `-ok`, `-delete`, `-fprint*` or `-fls`.
+    Reader { name: "find", risky: true, short: "0123456789",
+        words: &["-H", "-L", "-P", "-E", "-X", "-s", "-x", "-d", "-name", "-iname", "-path", "-ipath", "-wholename", "-type",
+            "-maxdepth", "-mindepth", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-newer", "-empty",
+            "-print", "-print0", "-printf", "-prune", "-not", "-and", "-or", "-a", "-o", "-regex", "-iregex", "-user",
+            "-group", "-perm", "-links", "-depth", "-follow", "-xdev", "-mount", "-readable", "-writable", "-executable",
+            "-samefile", "-inum", "-ls", "-true", "-false", "-nouser", "-nogroup", "-lname", "-ilname"], ..R },
+];
+
+const TEST_OPS: &[&str] = &[
+    "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-L", "-n", "-o", "-p", "-r", "-s", "-S", "-t", "-u", "-w",
+    "-x", "-z", "-O", "-G", "-N", "-v", "-nt", "-ot", "-ef", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
 ];
 
 /// Git subcommands that only read.
 const GIT_READS: &[&str] =
     &["status", "diff", "log", "show", "blame", "ls-files", "ls-tree", "rev-parse", "describe", "shortlog", "grep"];
 
-/// `find` actions that delete, write a file or run a program.
-const FIND_ACTS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"];
+/// The flags those subcommands may take, together. Not `--output`,
+/// `--ext-diff`, `--textconv`, `-O`/`--open-files-in-pager`.
+const GIT: Reader = Reader {
+    name: "git",
+    risky: true,
+    short: "abBcdEFhHiIklMNoprRstuvwWz0123456789",
+    short_valued: "ACeGfLmnSUxX",
+    long: &[
+        "--short", "--branch", "--porcelain", "--long", "--verbose", "--untracked-files", "--ignored", "--ahead-behind",
+        "--no-ahead-behind", "--renames", "--no-renames", "--show-stash", "--column", "--no-column", "--stat", "--numstat",
+        "--shortstat", "--name-only", "--name-status", "--cached", "--staged", "--patch", "--no-patch", "--unified", "--raw",
+        "--color", "--no-color", "--word-diff", "--color-words", "--ignore-all-space", "--ignore-space-change",
+        "--ignore-blank-lines", "--summary", "--check", "--minimal", "--patience", "--histogram", "--relative",
+        "--exit-code", "--quiet", "--text", "--abbrev", "--full-index", "--no-prefix", "--dirstat", "--no-index",
+        "--no-ext-diff", "--no-textconv", "--find-renames", "--find-copies", "--oneline", "--graph", "--decorate",
+        "--no-decorate", "--all", "--branches", "--tags", "--remotes", "--reverse", "--first-parent", "--merges",
+        "--no-merges", "--follow", "--abbrev-commit", "--left-right", "--cherry-pick", "--all-match", "--regexp-ignore-case",
+        "--extended-regexp", "--fixed-strings", "--perl-regexp", "--source", "--topo-order", "--date-order",
+        "--simplify-by-decoration", "--boundary", "--no-walk", "--show-signature", "--porcelain", "--line-porcelain",
+        "--show-email", "--root", "--incremental", "--others", "--modified", "--deleted", "--stage", "--unmerged",
+        "--exclude-standard", "--full-name", "--error-unmatch", "--directory", "--no-empty-directory", "--full-tree",
+        "--object-only", "--abbrev-ref", "--symbolic-full-name", "--verify", "--show-toplevel", "--git-dir",
+        "--is-inside-work-tree", "--show-prefix", "--show-cdup", "--git-common-dir", "--absolute-git-dir", "--always",
+        "--dirty", "--exact-match", "--contains", "--summary", "--numbered", "--email", "--committer", "--count",
+        "--files-with-matches", "--files-without-match", "--line-number", "--ignore-case", "--word-regexp", "--invert-match",
+        "--untracked", "--break", "--heading", "--show-function", "--function-context", "--null",
+    ],
+    long_valued: &[
+        "--format", "--pretty", "--author", "--grep", "--since", "--until", "--after", "--before", "--max-count", "--skip",
+        "--date", "--diff-filter", "--stat-width", "--match", "--exclude", "--group", "--max-depth", "--context",
+        "--after-context", "--before-context", "--ignore-submodules", "--word-diff-regex", "--anchored",
+    ],
+    ..R
+};
 
 fn line_reads_only(line: &str) -> bool {
     use crate::chat_engine::{CommandWord, WordRole};
@@ -534,69 +725,92 @@ fn line_reads_only(line: &str) -> bool {
         }
     }
     segments.iter().all(|seg| {
-        // Assignments before the program change only the shell's state.
-        let Some(at) = seg.iter().position(|w| w.role == WordRole::Program) else { return true };
+        // Assignments alone, or before a program, set shell state: they ask,
+        // but for a locale or display name set for one program.
+        let Some(at) = seg.iter().position(|w| w.role == WordRole::Program) else { return false };
         let name = seg[at].word.to_ascii_lowercase();
-        !seg[at].unmodeled && !name.contains('/') && reader_reads(&name, &seg[at + 1..])
+        seg[..at].iter().all(|w| one_program_env(&w.word))
+            && !seg[at].unmodeled
+            && !name.contains('/')
+            && program_reads(&name, &seg[at + 1..])
     })
 }
 
 /// Whether `program` with `args` only reads.
-fn reader_reads(program: &str, args: &[&crate::chat_engine::CommandWord]) -> bool {
-    if PLAIN_READERS.contains(&program) {
-        return true;
+fn program_reads(program: &str, args: &[&crate::chat_engine::CommandWord]) -> bool {
+    if program == "git" {
+        return git_reads(args);
     }
-    // The rest read unless a flag says otherwise, so a word that may expand
-    // into one asks.
-    if args.iter().any(|w| expands(w)) {
-        return false;
-    }
-    let args: Vec<&str> = args.iter().map(|w| w.word.as_str()).collect();
-    match program {
-        "rg" => !any_arg(&args, |a| long_flag(a, &["--pre"])),
-        "sort" => !any_arg(&args, |a| long_flag(a, &["--output", "--compress-program"]) || short_flag(a, 'o')),
-        "tree" => !any_arg(&args, |a| short_flag(a, 'o')),
-        // A second operand is the file it writes.
-        "uniq" => operands(&args, &["-f", "-s", "-w"]).len() <= 1,
-        "find" => !any_arg(&args, |a| FIND_ACTS.contains(&a)),
-        "git" => git_reads(&args),
-        _ => false,
-    }
-}
-
-fn any_arg(args: &[&str], bad: impl Fn(&str) -> bool) -> bool {
-    args.iter().any(|a| bad(a))
+    READERS.iter().find(|r| r.name == program).is_some_and(|r| takes_only_listed(r, args))
 }
 
 /// `git` past `-C <dir>` and `--no-pager` (any other option before the
 /// subcommand, such as `-c`, asks), running a subcommand that reads, with
-/// no flag that writes a file or runs a program.
-fn git_reads(mut args: &[&str]) -> bool {
+/// only the flags [`GIT`] lists.
+fn git_reads(mut args: &[&crate::chat_engine::CommandWord]) -> bool {
+    if args.iter().any(|w| expands(w)) {
+        return false;
+    }
     loop {
         match args {
-            ["-C", _, rest @ ..] | ["--no-pager", rest @ ..] => args = rest,
+            [c, _, rest @ ..] if c.word == "-C" => args = rest,
+            [p, rest @ ..] if p.word == "--no-pager" => args = rest,
             _ => break,
         }
     }
     match args.split_first() {
         None => true,
-        Some((sub, flags)) => {
-            GIT_READS.contains(sub)
-                && !flags.iter().any(|a| long_flag(a, &["--output", "--ext-diff", "--open-files-in-pager"]) || short_flag(a, 'O'))
-        }
+        Some((sub, flags)) => GIT_READS.contains(&sub.word.as_str()) && takes_only_listed(&GIT, flags),
     }
 }
 
-/// `word` is one of `longs`, with or without `=value`, or an abbreviation
-/// of one (GNU tools take any unambiguous prefix).
-fn long_flag(word: &str, longs: &[&str]) -> bool {
-    let name = word.split('=').next().unwrap_or(word);
-    name.len() > 2 && name.starts_with("--") && longs.iter().any(|l| l.starts_with(name))
-}
-
-/// `word` is a cluster of short flags holding `flag` (`-ro`).
-fn short_flag(word: &str, flag: char) -> bool {
-    word.len() > 1 && word.starts_with('-') && !word.starts_with("--") && word[1..].contains(flag)
+/// Whether every flag in `args` is one `reader` lists, and its operands fit.
+/// Past `--`, every word is an operand; so is `-`.
+fn takes_only_listed(reader: &Reader, args: &[&crate::chat_engine::CommandWord]) -> bool {
+    if reader.risky && args.iter().any(|w| expands(w)) {
+        return false;
+    }
+    // A value is the next word unless it looks like a flag, which is then
+    // read as one: a value can never hide a flag.
+    let value_next = |i: usize| args.get(i).is_some_and(|w| !w.word.starts_with('-'));
+    let (mut operands, mut ended, mut i) = (0, false, 0);
+    while let Some(w) = args.get(i) {
+        let a = w.word.as_str();
+        i += 1;
+        if ended || a == "-" || !a.starts_with('-') {
+            operands += 1;
+        } else if a == "--" {
+            ended = true;
+        } else if reader.words.contains(&a) {
+        } else if a.starts_with("--") {
+            let (name, valued) = match a.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (a, false),
+            };
+            if reader.long_valued.contains(&name) {
+                if !valued && value_next(i) {
+                    i += 1;
+                }
+            } else if !reader.long.contains(&name) {
+                return false;
+            }
+        } else {
+            // A cluster of short flags; one that takes a value ends it.
+            let cluster = &a[1..];
+            for (j, c) in cluster.char_indices() {
+                if reader.short_valued.contains(c) {
+                    if j + c.len_utf8() == cluster.len() && value_next(i) {
+                        i += 1;
+                    }
+                    break;
+                }
+                if !reader.short.contains(c) {
+                    return false;
+                }
+            }
+        }
+    }
+    reader.operands.is_none_or(|max| operands <= max)
 }
 
 /// A word the shell may turn into other words: a variable, a `$(…)`, or an
@@ -1163,6 +1377,15 @@ mod tests {
             "tree -L 2",
             "jq '.version' package.json",
             "cat <<'EOF'\nrm -rf / > x\nEOF",
+            "LC_ALL=C sort -u a.txt",
+            "TZ=UTC ls -l",
+            "NO_COLOR=1 TERM=dumb COLUMNS=80 LANG=C ls",
+            "head -n 20 a.txt && tail -5 a.txt",
+            "grep -A3 --include='*.rs' -rn x src",
+            "git log -n 5 --format=%H --stat",
+            "uniq -c -",
+            "printf '%s\\n' done",
+            "[ -f a.txt ] && echo yes",
         ];
         for c in readers {
             assert!(reads_only(c), "{c}");
@@ -1202,6 +1425,32 @@ mod tests {
             "xargs cat",
             "env ls",
             "for f in *.md; do cat \"$f\"; done",
+            // Shell state: assignments, `export`, `declare`, `printf -v`, arithmetic.
+            "PROMPT_COMMAND='touch x' ls",
+            "PATH=/tmp/evil ls",
+            "GIT_DIR=/tmp/x git status",
+            "x=1",
+            "x=1; ls",
+            "export PATH=/tmp/evil",
+            "declare -x A=1",
+            "printf -v PATH %s /tmp/evil",
+            "echo $((x=1))",
+            "echo $[x=1]",
+            "echo ${PROMPT_COMMAND:=x}",
+            "echo ${x=1}",
+            // Flags a reader doesn't list.
+            "rg --hostname-bin=/tmp/x foo",
+            "rg -z foo",
+            "rg --pr ./decode.sh x",
+            "uniq - out.txt",
+            "uniq -- in.txt out.txt",
+            "tree -R -H .",
+            "ls --some-new-flag",
+            "cat -Z a",
+            "grep --exclude-from-somewhere x",
+            "git log --textconv",
+            "git status -O x",
+            "sort -T /tmp a",
         ];
         for c in writers {
             assert!(!reads_only(c), "{c}");
@@ -1277,6 +1526,8 @@ mod tests {
             "if let Some(note) = mode_watch.at_round(mode) {",
             "if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {",
             "denied = crate::ask_first::ask_first(preview, ask).await;",
+            "let grants = mode != crate::permissions::Mode::Ask;",
+            "self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants)",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
@@ -1296,6 +1547,7 @@ mod tests {
             "let spec = &mode_spec(&db, &planned);",
             "let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)))",
             ".with_asker(Box::new(SubagentAsk::new(approvals, app.clone(), spec)));",
+            ".with_mode(crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone()));",
             "persist_run(&db, &planned, &outcome);",
         ] {
             assert!(run.contains(call), "the sub-agent runner no longer has: {call}");
