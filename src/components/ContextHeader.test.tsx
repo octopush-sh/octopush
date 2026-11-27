@@ -22,6 +22,7 @@ vi.mock("../lib/ipc", () => ({
   ipc: {
     getIssue: vi.fn().mockResolvedValue(null),
     openFileInSystem: vi.fn().mockResolvedValue(undefined),
+    workspacePorts: vi.fn().mockResolvedValue(null),
   },
 }));
 
@@ -107,6 +108,7 @@ describe("ContextHeader", () => {
     expect(screen.getByRole("button", { name: "Sandbox on" })).toHaveAttribute("aria-disabled", "true");
   });
 
+<<<<<<< HEAD
   it("shows the test intent and a mute ship-nothing glyph beside the sandbox (#1239)", () => {
     const header = (intent: string, git: string) => (
       <ContextHeader {...baseProps} workspaceName="X" branch="test/ENG-42" gitStatus={null} missionIntent={intent} missionId="m1" missionExecIsolation="none" missionGitIsolation={git} />
@@ -128,6 +130,30 @@ describe("ContextHeader", () => {
     // A stored review + worktree row reads as ship-nothing.
     rerender(header("review", "worktree"));
     expect(screen.getByRole("img", { name: "Ships nothing" })).toBeInTheDocument();
+||||||| 39ed3b2f
+=======
+  it("shows the workspace's port range in the eyebrow and the provenance popover (#1219)", async () => {
+    vi.mocked(ipc.workspacePorts).mockResolvedValueOnce({ base: 40020, count: 10 });
+    renderHeader({ workspace: makeWorkspace({ id: "w-ports" }) });
+    const chip = await waitFor(() => {
+      const el = document.querySelector('[data-tour="header-ports"]');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    expect(vi.mocked(ipc.workspacePorts)).toHaveBeenCalledWith("w-ports");
+    expect(chip).toHaveTextContent("40020–40029");
+    expect(chip.getAttribute("title")).toContain("OCTOPUSH_PORT=40020");
+    expect(document.getElementById("octo-branch-provenance")).toHaveTextContent("Ports40020–40029");
+  });
+
+  it("shows no port range without a workspace or when none is given", async () => {
+    vi.mocked(ipc.workspacePorts).mockClear();
+    render(<ContextHeader {...baseProps} workspaceName="X" branch="feat/x" gitStatus={null} />);
+    expect(vi.mocked(ipc.workspacePorts)).not.toHaveBeenCalled();
+    renderHeader({ workspace: makeWorkspace({ id: "w-none" }) });
+    await waitFor(() => expect(vi.mocked(ipc.workspacePorts)).toHaveBeenCalledWith("w-none"));
+    expect(document.querySelector('[data-tour="header-ports"]')).toBeNull();
+>>>>>>> origin/main
   });
 
   it("shows no sandbox toggle without a mission", () => {

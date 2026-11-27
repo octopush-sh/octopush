@@ -71,6 +71,7 @@ Current anchors:
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |
+| `header-ports` | Workspace header, at the eyebrow's right end: the workspace's port range (`40020–40029`; only once the workspace has a block) | `ContextHeader.tsx` |
 | `header-sandbox` · `header-sandbox-confirm` | Workspace header, with a mission: the sandbox toggle (`Shield` while the sandbox is in effect, `ShieldOff` otherwise; disabled for a read-only mission) · the dialog that confirms turning it off | `HeaderSandbox.tsx` via `ContextHeader.tsx` |
 | `context-ships-nothing` | Workspace header, beside the sandbox Shield: the mute `PackageX` glyph of a mission that ships nothing (only then) | `ContextHeader.tsx` |
 | `pr-chip-checks` | Workspace header, PR chip: the CI checks glyph (only on an open/draft PR whose checks could be read; failing adds "Fix failing checks…" beside it) | `ContextHeader.tsx` |

@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+<<<<<<< HEAD
 import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, PackageX, Wrench } from "lucide-react";
+||||||| 39ed3b2f
+import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Wrench } from "lucide-react";
+=======
+import { CircleCheck, CircleDashed, CircleX, Copy, EthernetPort, GitBranch, Hammer, Wrench } from "lucide-react";
+>>>>>>> origin/main
 import type { LucideIcon } from "lucide-react";
 import { INTENT_ICON, SHIPS_NOTHING_TITLE, shipsNothing } from "../lib/missionIntent";
 import { checksTitle } from "../lib/prChecks";
@@ -12,6 +18,7 @@ import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { copyToClipboard } from "../lib/clipboard";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { HeaderSandbox } from "./HeaderSandbox";
+import { portRange, useWorkspacePorts } from "../hooks/useWorkspacePorts";
 
 const STATUS_TOKEN: Record<StatusCategory, string> = {
   inProgress: "text-state-blue",
@@ -187,6 +194,11 @@ export function ContextHeader({
   // The name line: the ticket's summary when one resolves, else the workspace's
   // own name. Keyed so a workspace switch re-runs the entrance.
   const name = activeIssue ? activeIssue.summary : workspaceName;
+  // The workspace's own ports (#1219), the range its terminals are handed.
+  const ports = useWorkspacePorts(workspace?.id ?? null);
+  const portsTitle = ports
+    ? `Ports ${portRange(ports)} for this workspace · terminals and the Talk shell get OCTOPUSH_PORT=${ports.base} and OCTOPUSH_PORT_COUNT=${ports.count}`
+    : "";
 
   // "Fix failing checks…" reads up to 3 failed logs before the launcher
   // opens, so the button says so and ignores clicks until it is done. The
@@ -335,6 +347,16 @@ export function ContextHeader({
                     </dd>
                   </>
                 )}
+                {ports && (
+                  <>
+                    <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                      Ports
+                    </dt>
+                    <dd className="font-mono text-[11px] normal-case tracking-normal text-octo-ivory">
+                      <span className="octo-selectable">{portRange(ports)}</span>
+                    </dd>
+                  </>
+                )}
                 {/* Deliberately no working-tree row: the count is permanently
                     visible in the tail a few inches away, and a panel that
                     repeats what the band already states earns nothing. This
@@ -351,6 +373,19 @@ export function ContextHeader({
               title="Base branch this workspace was created from"
             >
               from {base}
+            </span>
+          )}
+
+          {/* The workspace's port range: short and fixed-width, so it never
+              demotes; the branch chip absorbs the squeeze. */}
+          {ports && (
+            <span
+              data-tour="header-ports"
+              title={portsTitle}
+              className="octo-fade-in flex flex-none items-center gap-1 normal-case tracking-normal text-[10px]"
+            >
+              <EthernetPort size={10} aria-hidden />
+              <span className="octo-tabular">{portRange(ports)}</span>
             </span>
           )}
         </div>
