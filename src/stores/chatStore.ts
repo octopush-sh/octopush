@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 import { ipc, type LiveEntry, type Effort as ReasoningEffort } from "../lib/ipc";
 import { isAgentToolName, CHAT_AGENT_LOG_EVENT } from "../lib/agentTools";
-import type { ChatMessage, ChatStreamEvent, ChatThread, Attachment } from "../lib/types";
+import type { ApprovalAnswer, ChatMessage, ChatStreamEvent, ChatThread, Attachment } from "../lib/types";
 import { useWorkspaceStore } from "./workspaceStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "./budgetsStore";
 import { isBudgetExceeded } from "../lib/budgetError";
@@ -187,6 +187,10 @@ export interface PendingApproval {
   rememberCommand?: boolean;
   /** Plan only withheld the conversation grant it would offer (#1229). */
   planOnly?: boolean;
+  /** An MCP card in Edit freely (#1243): the server and tool its "Always
+   *  allow this tool" and "Trust <server>" answers trust app-wide. */
+  trustServer?: string;
+  trustTool?: string;
 }
 
 export type ApprovalKind = "mcp" | "read" | "write" | "run";
@@ -194,6 +198,7 @@ export type ApprovalKind = "mcp" | "read" | "write" | "run";
 /** The card fields a request carries beyond its command and reason. */
 function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command" | "reason">) {
   return {
+    ...(c.trustServer && c.trustTool ? { trustServer: c.trustServer, trustTool: c.trustTool } : {}),
     ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
     ...(c.kind ? { kind: c.kind } : {}),
     ...(c.sensitive ? { sensitive: true } : {}),
@@ -699,11 +704,7 @@ interface ChatState {
    *  bar's way into a waiting card). No card, nothing to do. */
   showPendingApproval: (workspaceId: string) => void;
   /** Resolve a dangerous-command approval card (removes it + tells the backend). */
-  respondApproval: (
-    workspaceId: string,
-    callId: string,
-    decision: "approve" | "always" | "grant" | "deny",
-  ) => void;
+  respondApproval: (workspaceId: string, callId: string, decision: ApprovalAnswer) => void;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
   setSkillNames: (workspaceId: string, names: string[]) => void;
@@ -1219,6 +1220,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     rememberDir?: string;
     rememberCommand?: boolean;
     planOnly?: boolean;
+    trustServer?: string;
+    trustTool?: string;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;

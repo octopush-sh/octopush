@@ -1589,6 +1589,11 @@ pub enum ApprovalDecision {
     /// Approve and keep the grant the card offers (#1229): a folder, or
     /// this exact command, for this conversation.
     Grant,
+    /// An MCP card's "Always allow this tool" (#1243): approve, and trust the
+    /// tool app-wide in Edit freely. On any other card, one approval.
+    TrustTool,
+    /// An MCP card's "Trust <server>": the same for every tool of the server.
+    TrustServer,
 }
 
 impl ApprovalDecision {
@@ -1598,6 +1603,8 @@ impl ApprovalDecision {
             "approve" => ApprovalDecision::Approve,
             "always" => ApprovalDecision::ApproveAlways,
             "grant" => ApprovalDecision::Grant,
+            "tool" => ApprovalDecision::TrustTool,
+            "server" => ApprovalDecision::TrustServer,
             _ => ApprovalDecision::Deny,
         }
     }
@@ -1612,6 +1619,8 @@ struct Offer {
     command: bool,
     /// Plan only withheld the grant the card would offer.
     plan_only: bool,
+    /// An MCP card's app-wide trust (#1243), never a grant.
+    trust: Option<crate::talk_guard::TrustOffer>,
 }
 
 impl Offer {
@@ -1662,6 +1671,12 @@ pub struct ApprovalRequestEvent {
     /// Plan only withheld the conversation grant the card would offer.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub plan_only: bool,
+    /// An MCP card in Edit freely (#1243): the server and tool its "Trust
+    /// <server>" and "Always allow this tool" answers would trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_tool: Option<String>,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1709,13 +1724,14 @@ pub(crate) struct ApprovalBroker {
     /// Deleted workspaces: nobody can answer a card there any more, so a
     /// request from one is denied at once instead of parked.
     retired: Mutex<std::collections::HashSet<String>>,
-    /// Where each conversation's grants are kept (#1229,
-    /// `chat_threads.talk_grants`). A broker without one keeps none.
+    /// Where each conversation's grants (#1229, `chat_threads.talk_grants`)
+    /// and the app-wide MCP trust (`mcp::trust`, #1243) are kept. A broker
+    /// without one keeps neither.
     db: Option<Arc<Mutex<Db>>>,
 }
 
 impl ApprovalBroker {
-    /// A broker that keeps the conversations' grants in `db`.
+    /// A broker that keeps the conversations' grants and the MCP trust in `db`.
     pub(crate) fn with_db(db: Arc<Mutex<Db>>) -> Self {
         Self { db: Some(db), ..Self::default() }
     }
@@ -1737,6 +1753,14 @@ impl ApprovalBroker {
                 tracing::warn!(error = %e, "could not keep the conversation's grant; the next call asks again");
             }
         }
+    }
+
+    /// What the user trusts to run without an MCP card in Edit freely, in
+    /// `worktree`, read now, so a revoke in Settings or a changed entry
+    /// applies to the next call. Never a file tool's or a command's card:
+    /// those are the conversation's grants ([`Self::grants`]).
+    pub fn mcp_trust(&self, worktree: &std::path::Path) -> crate::mcp::trust::TrustView {
+        self.db.as_ref().map(|db| crate::mcp::trust::TrustView::read(db, worktree)).unwrap_or_default()
     }
 
     pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
@@ -1896,21 +1920,38 @@ impl ApprovalBroker {
         // A card that would offer a grant says why it doesn't.
         let withheld = mode == crate::permissions::Mode::Plan && card.grant.take().is_some();
         let marks = Some((card.kind, card.sensitive));
-        let offer = Offer::of(card.grant.as_ref(), withheld);
+        let offer = Offer { trust: card.trust.clone(), ..Offer::of(card.grant.as_ref(), withheld) };
         let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, &offer).await;
+        let settled = self.settle_card(thread_id, decision, &card);
         if decision == ApprovalDecision::Grant && card.grant.is_some() {
             let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
         }
-        self.settle_card(thread_id, decision, &card)
+        if card.trust.is_some() && matches!(decision, ApprovalDecision::TrustTool | ApprovalDecision::TrustServer) {
+            // Settings and the Companion list it.
+            let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+        }
+        settled
     }
 
-    /// What an answer to a `talk_guard` card does: "grant" keeps the grant
-    /// the card offers (#1229) and counts as one approval; any other as
-    /// [`Self::record`].
+    /// What an answer to a `talk_guard` card does: "grant" keeps the folder
+    /// or command grant a file or command card offers for the conversation
+    /// (#1229); "tool" or "server" keeps the app-wide trust an MCP card
+    /// offers (#1243). Each counts as one approval, and each only on the
+    /// card that offers it: a grant never covers an MCP tool, nor trust a
+    /// file or a command. Any other answer as [`Self::record`].
     pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard) -> ApprovalDecision {
-        match (decision, &card.grant) {
-            (ApprovalDecision::Grant, Some(grant)) => {
+        match (decision, &card.grant, &card.trust) {
+            (ApprovalDecision::Grant, Some(grant), _) => {
                 self.keep(thread_id, grant);
+                ApprovalDecision::Approve
+            }
+            (ApprovalDecision::TrustTool | ApprovalDecision::TrustServer, _, Some(offer)) => {
+                let tool = (decision == ApprovalDecision::TrustTool).then_some(offer.tool.as_str());
+                if let Some(db) = &self.db {
+                    if let Err(e) = crate::mcp::trust::grant(&db.lock(), &offer.server, &offer.config, tool) {
+                        tracing::warn!(error = %e, "could not keep the MCP trust; approved this call only");
+                    }
+                }
                 ApprovalDecision::Approve
             }
             _ => self.record(thread_id, decision, !card.kind.grantable()),
@@ -1945,10 +1986,12 @@ impl ApprovalBroker {
 
     /// Keep a "don't ask again" grant, except from a card that grants nothing
     /// (`secret`: the secret card, a file outside the workspace), whose
-    /// approval reads as a plain one. A "grant" answer is one approval here.
-    /// Returns the decision to act on.
+    /// approval reads as a plain one. A "grant" answer, and a trust answer,
+    /// on a card that offers none is one approval. Returns the decision to
+    /// act on.
     pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
         match decision {
+            ApprovalDecision::TrustTool | ApprovalDecision::TrustServer => ApprovalDecision::Approve,
             ApprovalDecision::ApproveAlways if secret => ApprovalDecision::Approve,
             ApprovalDecision::Grant => ApprovalDecision::Approve,
             ApprovalDecision::ApproveAlways => {
@@ -1998,6 +2041,8 @@ impl ApprovalBroker {
             remember_dir: offer.dir.clone(),
             remember_command: offer.command,
             plan_only: offer.plan_only,
+            trust_server: offer.trust.as_ref().map(|o| o.server.clone()),
+            trust_tool: offer.trust.as_ref().map(|o| o.tool.clone()),
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -5039,8 +5084,9 @@ impl ChatEngine {
         // the user switched off in this conversation (Companion "can use")
         // are left out and never started for it; the same path as
         // sub-agents'. What it offers is fixed for the turn. Any MCP tool it
-        // didn't discover with `readOnlyHint` asks first (#1147).
-        let mcp_read_only: std::collections::HashSet<String> = {
+        // didn't discover with `readOnlyHint` asks first (#1147), unless Edit
+        // freely lets it run (`talk_guard::McpTools`, #1243).
+        let (mcp_read_only, mcp_tools): (std::collections::HashSet<String>, crate::talk_guard::McpTools) = {
             let discovered = discover_thread_mcp_tools(
                 Arc::clone(&self.mcp),
                 &self.db,
@@ -5055,7 +5101,8 @@ impl ChatEngine {
             // gives the same tool bytes on every turn, so the provider's
             // prompt cache, which starts at the tool list, survives.
             tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
-            discovered.into_iter().filter(|t| t.read_only).map(|t| t.namespaced).collect()
+            let classes = crate::talk_guard::McpTools::new(&discovered);
+            (discovered.into_iter().filter(|t| t.read_only).map(|t| t.namespaced).collect(), classes)
         };
         // Where the file tools may go without asking (#1147). A sandboxed
         // mission's own sandbox refuses a write outside the workspace.
@@ -5570,9 +5617,13 @@ impl ChatEngine {
                 // the card just kept answers its recheck; none in Plan only.
                 // What a write was last checked against, to check again as it lands.
                 let write_check: Mutex<Option<crate::talk_guard::WriteCheck>> = Mutex::new(None);
+                // MCP trust (#1243) is read at each check too; it answers MCP
+                // cards only, and the grants file and command cards only.
+                let trust = || self.approvals.mcp_trust(Path::new(&request.workspace_path));
+                let mcp = crate::talk_guard::McpCheck { tools: &mcp_tools, mode, trust: &trust };
                 let place = || {
                     let grants = self.approvals.grants(&request.thread_id, mode);
-                    let card = crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined, &grants);
+                    let card = crate::talk_guard::director_card(&u.name, &u.input, &mcp, &reach, writes_confined, &grants);
                     *write_check.lock() = reach.write_check(&u.name, &u.input, writes_confined, &grants, card.is_some());
                     card
                 };
@@ -5627,7 +5678,6 @@ impl ChatEngine {
                             .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, grant, mode)
                             .await
                         {
-                            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => {}
                             ApprovalDecision::Deny => {
                                 denied = Some(format!(
                                     "Command not run — the user declined to approve it \
@@ -5635,6 +5685,7 @@ impl ChatEngine {
                                      a safer alternative."
                                 ));
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -7819,7 +7870,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None, remember_command: false, plan_only: false,
+            remember_dir: None, remember_command: false, plan_only: false, trust_server: None, trust_tool: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7836,6 +7887,10 @@ mod tests {
         assert!(plain.get("rememberCommand").is_none() && plain.get("planOnly").is_none());
         let offer = serde_json::to_value(ApprovalRequestEvent { remember_command: true, plan_only: true, ..ev(false, false) }).unwrap();
         assert_eq!((offer["rememberCommand"].as_bool(), offer["planOnly"].as_bool()), (Some(true), Some(true)));
+        assert!(plain.get("trustServer").is_none() && plain.get("trustTool").is_none());
+        let mcp = ApprovalRequestEvent { kind: Some(CardKind::Mcp), trust_server: Some("s".into()), trust_tool: Some("x".into()), ..ev(false, false) };
+        let mcp = serde_json::to_value(mcp).unwrap();
+        assert_eq!((mcp["trustServer"].as_str(), mcp["trustTool"].as_str()), (Some("s"), Some("x")));
     }
 
     /// A database from before `talk_grants` holding one conversation, `t-old`.
@@ -8096,6 +8151,7 @@ mod tests {
             denial: format!("declined {shown}"),
             sensitive: false,
             grant: None,
+            trust: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -8134,9 +8190,91 @@ mod tests {
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
         assert!(!body.contains("remote_effect"), "{body}");
-        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check", "await_command(", "grants(&self.thread_id, mode)"] {
+        for call in ["self.mcp.card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check", "await_command(", "grants(&self.thread_id, mode)"] {
             assert!(body.contains(call), "the sub-agent gate calls {call}");
         }
+    }
+
+    /// Each lasting answer is kept only from the card that offers it: a
+    /// "grant" on an MCP card keeps no conversation grant, and "tool" or
+    /// "server" on a write or command card keeps no trust (#1229, #1243).
+    #[test]
+    fn a_grant_answer_never_keeps_mcp_trust_and_a_trust_answer_never_keeps_a_grant() {
+        let (_tmp, db) = old_thread_db();
+        let broker = ApprovalBroker::with_db(Arc::clone(&db));
+        let card = |kind: CardKind, grant: Option<Grant>, trust: Option<crate::talk_guard::TrustOffer>| ToolCard {
+            kind,
+            shown: "s".into(),
+            reason: "r".into(),
+            denial: "d".into(),
+            sensitive: false,
+            grant,
+            trust,
+        };
+        let offer = crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: "c".into() };
+        let write = Grant { kind: GrantKind::Write, value: "/tmp/octo-sample/out".into(), shown: "/tmp/octo-sample/out".into() };
+        let trust = || crate::mcp::trust::load(&db.lock());
+        // An MCP card: "grant" is one approval, nothing kept.
+        assert_eq!(broker.settle_card("t-old", ApprovalDecision::Grant, &card(CardKind::Mcp, None, Some(offer.clone()))), ApprovalDecision::Approve);
+        assert!(db.lock().thread_grants("t-old").unwrap().is_empty() && trust().is_empty());
+        // A write card: "server" or "tool" is one approval, nothing kept.
+        for answer in [ApprovalDecision::TrustServer, ApprovalDecision::TrustTool] {
+            assert_eq!(broker.settle_card("t-old", answer, &card(CardKind::Write, Some(write.clone()), None)), ApprovalDecision::Approve);
+            assert_eq!(broker.settle_card("t-old", answer, &card(CardKind::Run, None, None)), ApprovalDecision::Approve);
+        }
+        assert!(db.lock().thread_grants("t-old").unwrap().is_empty() && trust().is_empty());
+        // Each from its own card.
+        broker.settle_card("t-old", ApprovalDecision::Grant, &card(CardKind::Write, Some(write.clone()), None));
+        broker.settle_card("t-old", ApprovalDecision::TrustTool, &card(CardKind::Mcp, None, Some(offer)));
+        assert_eq!(db.lock().thread_grants("t-old").unwrap(), vec![write]);
+        assert!(trust().iter().any(|t| t.server == "sample-server" && t.tools == ["post_report"]));
+    }
+
+    #[test]
+    fn an_mcp_card_trusted_in_one_thread_holds_in_every_thread_and_after_a_restart() {
+        use crate::mcp::trust::{fingerprint, load, TrustView};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let users: HashMap<String, crate::mcp::McpServerConfig> =
+            [("sample-server".to_string(), crate::mcp::McpServerConfig { command: "sample".into(), ..Default::default() })].into();
+        let config = fingerprint(&users["sample-server"]);
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let broker = ApprovalBroker::with_db(Arc::clone(&db));
+        let card = |trust: Option<crate::talk_guard::TrustOffer>| ToolCard {
+            kind: CardKind::Mcp,
+            shown: "mcp__sample-server__post_report {}".into(),
+            reason: "r".into(),
+            denial: "d".into(),
+            sensitive: false,
+            grant: None,
+            trust,
+        };
+        let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
+        assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone())), ApprovalDecision::Approve);
+        assert!(!broker.auto_approves("thread-a"), "no thread grant: the trust is app-wide");
+        // A trust answer where none was offered (Plan only, Ask first, a
+        // destructive tool, a project's server, a command) is one approval
+        // and keeps nothing.
+        assert_eq!(broker.settle_card("thread-b", ApprovalDecision::TrustServer, &card(None)), ApprovalDecision::Approve);
+        assert_eq!(broker.record("thread-b", ApprovalDecision::TrustServer, false), ApprovalDecision::Approve);
+        assert!(!load(&db.lock()).iter().any(|t| t.all) && !broker.auto_approves("thread-b"));
+        drop((broker, db));
+        // After a restart, any thread's next call to it runs without a card.
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let view = TrustView::from_configs(load(&db.lock()), &users, &HashMap::new());
+        let tool = crate::mcp::McpToolInfo {
+            server: "sample-server".into(),
+            name: "post_report".into(),
+            namespaced: "mcp__sample-server__post_report".into(),
+            ..Default::default()
+        };
+        let tools = crate::talk_guard::McpTools::new(&[tool]);
+        let edit = crate::permissions::Mode::Edit;
+        assert_eq!(tools.card(None, "mcp__sample-server__post_report", &serde_json::json!({}), edit, &view), None);
+        let restarted = ApprovalBroker::with_db(Arc::clone(&db));
+        assert_eq!(restarted.settle_card("t", ApprovalDecision::TrustServer, &card(offer)), ApprovalDecision::Approve);
+        assert!(load(&db.lock()).iter().any(|t| t.server == "sample-server" && t.all && t.config == config));
+        assert_eq!(ApprovalDecision::parse("tool"), ApprovalDecision::TrustTool);
+        assert_eq!(ApprovalDecision::parse("server"), ApprovalDecision::TrustServer);
     }
 
     #[test]
@@ -8383,6 +8521,8 @@ mod tests {
             remember_dir: None,
             remember_command: false,
             plan_only: false,
+            trust_server: None,
+            trust_tool: None,
         }
     }
 

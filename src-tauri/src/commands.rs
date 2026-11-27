@@ -2334,6 +2334,39 @@ pub async fn list_project_instructions(
     .map_err(|e| AppError::Other(format!("project instructions: {e}")))
 }
 
+/// What the user trusts to run without an MCP card in Edit freely (#1243),
+/// per server, that still holds for its user-level entry (Settings ›
+/// Integrations); with a worktree, without the servers its own
+/// `.claude/mcp.json` defines, where trust never applies (the Companion).
+#[tauri::command]
+pub async fn list_mcp_trust(
+    state: State<'_, AppState>,
+    workspace_path: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let project = workspace_path.map(|w| crate::mcp::project_config(std::path::Path::new(&w))).unwrap_or_default();
+    let user = crate::mcp::load_user_config();
+    Ok(crate::mcp::trust::listed(&state.db.lock(), &user, &project))
+}
+
+/// Revoke the trust in `server`'s `tool`, or in the whole server (no tool).
+/// The next call to it asks again. Returns what is left.
+#[tauri::command]
+pub async fn revoke_mcp_trust(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    tool: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let user = crate::mcp::load_user_config();
+    let left = {
+        let db = state.db.lock();
+        crate::mcp::trust::revoke(&db, &server, tool.as_deref())?;
+        crate::mcp::trust::listed(&db, &user, &Default::default())
+    };
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+    Ok(left)
+}
+
 /// The MCP servers switched off in one Talk conversation (none by default).
 #[tauri::command]
 pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<String>> {
@@ -2448,12 +2481,17 @@ pub async fn save_mcp_config(
             }
             // A new secret value leaves the entry as it reads: restart it too.
             registry.apply_save(&old, &saved, &touched);
+            // Trust given to an entry that changed or went lapses (#1243).
+            if let Err(e) = crate::mcp::trust::prune(&db.lock(), &crate::mcp::load_user_config()) {
+                tracing::warn!(error = %e, "couldn't drop the MCP trust of a changed server");
+            }
             Ok(saved)
         },
     )
     .await
     .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
     let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ()); // Companion "can use" reloads
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
     Ok(saved)
 }
 
