@@ -270,70 +270,149 @@ pub fn remote_effect_local(command: &str) -> Option<&'static str> {
     remote_walk(command, true)
 }
 
-fn remote_walk(command: &str, loopback_ok: bool) -> Option<&'static str> {
+/// How a walk reads a command: for a mission that ships nothing (which also
+/// refuses git configuration that can redirect, [`git_rebinds`]), and
+/// whether a request to loopback may count as local.
+#[derive(Clone, Copy)]
+struct Scope {
+    ship_nothing: bool,
+    loopback_ok: bool,
+}
+
+fn remote_walk(command: &str, ship_nothing: bool) -> Option<&'static str> {
     // Something anywhere in the command that can reroute a request (a proxy
-    // variable for `bash -c '…'`, a config file) means no request is local.
-    let loopback_ok = loopback_ok && !matches!(crate::chat_engine::each_command(command, |l| reroutes(l).then_some(())), Ok(Some(())));
-    crate::chat_engine::each_command(command, |line| remote_line(line, loopback_ok))
+    // variable for `bash -c '…'`, a function or alias named `curl`) means
+    // no request is local.
+    let rerouted = matches!(crate::chat_engine::each_command(command, |l| reroutes(l).then_some(())), Ok(Some(())));
+    walk(command, Scope { ship_nothing, loopback_ok: ship_nothing && !rerouted })
+}
+
+fn walk(command: &str, scope: Scope) -> Option<&'static str> {
+    crate::chat_engine::each_command(command, |line| remote_line(line, scope))
         .unwrap_or(Some("nests more commands than the check reads"))
 }
 
-/// Builtins that set variables for what runs after them, or read them from a file.
-const SETS_VARIABLES: &[&str] = &["export", "declare", "typeset", "local", "readonly", "source", "."];
+/// Builtins that set or export variables.
+const EXPORTS: &[&str] = &["export", "declare", "typeset", "local", "readonly"];
+/// Builtins that change the shell in ways the check can't follow: run a
+/// string, unset or read into variables, define an alias or a function,
+/// source a file.
+const OPAQUE: &[&str] = &["eval", "unset", "read", "alias", "function", "source", "."];
 /// Config files of curl, wget and httpie, which can name a proxy or another host.
 const HTTP_CONFIG: &[&str] = &["curlrc", "wgetrc", ".httpie", "httpie/config"];
 
-/// Whether a line sets a variable or reads a config file that can send a
-/// request somewhere other than its URL (`http_proxy`, `ALL_PROXY`,
-/// `CURL_HOME`, `WGETRC`, `HOME`…): any assignment before a program or after
-/// a wrapper (`X=1 curl`, `env X=1 curl`, `sudo X=1 curl`), `export` and
-/// its kin, sourcing a file, or naming a curl, wget or httpie config file.
-/// Stricter than it needs to be on purpose: such a line gets no loopback
-/// carve-out at all.
-fn reroutes(line: &str) -> bool {
-    let assigns = |w: &str| {
-        w.split_once('=').is_some_and(|(n, _)| {
-            n.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()) && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
-        })
-    };
+/// What a line does to the shell around the commands it runs.
+#[derive(Default)]
+struct Bindings {
+    /// The variables it sets or exports: before a program (`X=1 curl`),
+    /// after a wrapper (`env X=1 curl`, `sudo -u x X=1 curl`), or through
+    /// `export` and its kin, with or without a value.
+    names: Vec<String>,
+    /// It runs a builtin from [`OPAQUE`], `printf -v`, `env -u`/`env -S`,
+    /// `export -f`, or defines a function (`curl() { …; }`).
+    opaque: bool,
+    /// It names a curl, wget or httpie config file.
+    http_config: bool,
+}
+
+fn is_identifier(n: &str) -> bool {
+    n.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()) && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+}
+
+fn bindings(line: &str) -> Bindings {
+    let assigned = |w: &str| w.split_once('=').map(|(n, _)| n).filter(|n| is_identifier(n)).map(str::to_string);
+    let mut b = Bindings { opaque: defines_function(line), ..Bindings::default() };
     let (mut segment, mut program): (Option<usize>, Option<String>) = (None, None);
     for w in crate::chat_engine::command_words(line) {
         if segment != Some(w.segment) {
             (segment, program) = (Some(w.segment), None);
         }
-        let current = program.clone();
-        let lower = w.word.to_ascii_lowercase();
-        if HTTP_CONFIG.iter().any(|c| lower.contains(c)) {
-            return true;
-        }
+        let word = w.word.as_str();
+        let lower = word.to_ascii_lowercase();
+        b.http_config |= HTTP_CONFIG.iter().any(|c| lower.contains(c));
         if w.redirect || w.role == crate::chat_engine::WordRole::Data {
             continue;
         }
+        let current = program.clone();
         match current.as_deref() {
-            // `X=1 curl`: before the program.
-            None if w.role != crate::chat_engine::WordRole::Program && assigns(w.word.as_str()) => return true,
-            None if w.role == crate::chat_engine::WordRole::Program => {
-                let name = self::program(&w.word);
-                if SETS_VARIABLES.contains(&name.as_str()) {
-                    return true;
-                }
+            None if w.role != crate::chat_engine::WordRole::Program => b.names.extend(assigned(word)),
+            None => {
+                let name = self::program(word);
+                b.opaque |= OPAQUE.contains(&name.as_str());
                 program = Some(name);
             }
-            // `env X=1 curl`, `sudo -u x X=1 curl`, `then X=1 curl`: the
-            // wrapper's words count until the program it runs.
+            Some(p) if EXPORTS.contains(&p) => match word.strip_prefix('-') {
+                Some(flags) => b.opaque |= !flags.starts_with('-') && flags.contains('f'),
+                None => b.names.push(word.split_once('=').map_or(word, |(n, _)| n).to_string()),
+            },
+            Some("printf") => b.opaque |= word.starts_with("-v"),
+            // The wrapper's words count until the program it runs.
             Some(p) if WRAPPERS.contains(&p) => {
-                if assigns(w.word.as_str()) {
-                    return true;
+                let cluster = word.strip_prefix('-').filter(|c| !c.starts_with('-'));
+                if p == "env" && (cluster.is_some_and(|c| c.contains(['u', 'S'])) || word.starts_with("--unset") || word.starts_with("--split-string")) {
+                    b.opaque = true;
                 }
-                let next = self::program(&w.word);
-                if remote_rule(&next).is_some() || WRAPPERS.contains(&next.as_str()) {
+                if let Some(name) = assigned(word) {
+                    b.names.push(name);
+                    continue;
+                }
+                let next = self::program(word);
+                b.opaque |= OPAQUE.contains(&next.as_str());
+                if remote_rule(&next).is_some() || WRAPPERS.contains(&next.as_str()) || EXPORTS.contains(&next.as_str()) || next == "printf" {
                     program = Some(next);
                 }
             }
             _ => {}
         }
     }
+    b
+}
+
+/// An empty `()` outside quotes: a function definition (`curl() { …; }`).
+fn defines_function(line: &str) -> bool {
+    let (mut quote, mut escaped, mut open) = (None::<char>, false, false);
+    for c in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => escaped = true,
+            (Some(_), '"') => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '(') => {
+                open = true;
+                continue;
+            }
+            (None, ')') if open => return true,
+            (None, c) if open && c.is_whitespace() => continue,
+            _ => {}
+        }
+        open = false;
+    }
     false
+}
+
+/// A variable that can send a request or a push somewhere other than where
+/// it says: a proxy (`*_proxy`, `NO_PROXY`), what decides which config file
+/// curl, wget, httpie or git reads, or git configuration itself.
+fn reroute_variable(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with("_proxy")
+        || matches!(name, "CURL_HOME" | "WGETRC" | "SYSTEM_WGETRC" | "HOME" | "XDG_CONFIG_HOME" | "HTTPIE_CONFIG_DIR")
+        || name.starts_with("GIT_CONFIG")
+}
+
+/// Whether a line can send a request somewhere other than its URL, so none
+/// of its requests is local: it sets a variable that can
+/// ([`reroute_variable`]), changes the shell in a way the check can't
+/// follow ([`Bindings::opaque`]), or names an HTTP tool's config file.
+/// `PORT=3000 node app` doesn't count.
+fn reroutes(line: &str) -> bool {
+    let b = bindings(line);
+    b.opaque || b.http_config || b.names.iter().any(|n| reroute_variable(n))
 }
 
 /// Shell keywords and programs that run the command after them
@@ -345,8 +424,15 @@ const WRAPPERS: &[&str] = &[
 
 type RemoteRule = fn(&[&str]) -> Option<&'static str>;
 
-fn remote_line(line: &str, loopback_ok: bool) -> Option<&'static str> {
+fn remote_line(line: &str, scope: Scope) -> Option<&'static str> {
+    // In a mission that ships nothing, git configuration through the
+    // environment is refused on a line that runs git:
+    // `GIT_CONFIG_PARAMETERS` can alias `push`.
     let words = crate::chat_engine::command_words(line);
+    let runs_git = || words.iter().any(|w| w.role != crate::chat_engine::WordRole::Data && program(&w.word) == "git");
+    if scope.ship_nothing && bindings(line).names.iter().any(|n| n.starts_with("GIT_CONFIG")) && runs_git() {
+        return Some(GIT_CONFIG_ENV);
+    }
     let mut segments: Vec<Vec<&str>> = Vec::new();
     let mut last = None;
     for w in &words {
@@ -364,7 +450,7 @@ fn remote_line(line: &str, loopback_ok: bool) -> Option<&'static str> {
             }
         }
     }
-    segments.iter().find_map(|seg| remote_command(seg, loopback_ok))
+    segments.iter().find_map(|seg| remote_command(seg, scope))
 }
 
 fn program(w: &str) -> String {
@@ -372,19 +458,83 @@ fn program(w: &str) -> String {
 }
 
 /// `words` from the program on.
-fn remote_command(words: &[&str], loopback_ok: bool) -> Option<&'static str> {
+fn remote_command(words: &[&str], scope: Scope) -> Option<&'static str> {
     let (first, rest) = words.split_first()?;
     let name = program(first);
     if name == "eval" {
-        return remote_walk(&rest.join(" "), loopback_ok);
+        return walk(&rest.join(" "), scope);
+    }
+    // `env -S 'git push'` runs its string as a command line, as `eval` does.
+    if name == "env" {
+        if let Some(line) = env_split_string(rest) {
+            return walk(&line, scope);
+        }
     }
     if WRAPPERS.contains(&name.as_str()) {
         // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come first.
         let at = rest.iter().position(|&w| program(w) == "eval" || remote_rule(&program(w)).is_some())?;
-        return remote_command(&rest[at..], loopback_ok);
+        return remote_command(&rest[at..], scope);
+    }
+    if scope.ship_nothing && name == "git" {
+        if let Some(what) = git_rebinds(rest) {
+            return Some(what);
+        }
     }
     let what = remote_rule(&name)?(rest)?;
-    (!(loopback_ok && only_loopback(&name, rest))).then_some(what)
+    (!(scope.loopback_ok && only_loopback(&name, rest))).then_some(what)
+}
+
+/// The command line `env -S <string>` (or `--split-string`) runs, with the
+/// words after it.
+fn env_split_string(args: &[&str]) -> Option<String> {
+    let at = args.iter().position(|a| *a == "-S" || *a == "--split-string" || a.starts_with("--split-string=") || (a.starts_with("-S") && a.len() > 2))?;
+    let a = args[at];
+    let (split, after) = match a {
+        "-S" | "--split-string" => (args.get(at + 1).copied().unwrap_or(""), args.get(at + 2..).unwrap_or(&[])),
+        _ => (a.strip_prefix("--split-string=").unwrap_or_else(|| &a[2..]), &args[at + 1..]),
+    };
+    Some([split].iter().chain(after).copied().collect::<Vec<_>>().join(" "))
+}
+
+/// What a mission that ships nothing gets for `GIT_CONFIG_*` set on a line.
+const GIT_CONFIG_ENV: &str = "git configuration set through GIT_CONFIG_* variables";
+/// What a mission that ships nothing gets for a git config change that can redirect.
+const GIT_CONFIG_REDIRECT: &str = "git configuration that can send a push or a request elsewhere";
+
+/// Git keys that can send a push or a request somewhere else, or run
+/// something in its place: aliases, includes, URL rewrites, `http.*`, the
+/// ssh command.
+fn redirecting_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    ["alias", "include", "url.", "http", "core.sshcommand"].iter().any(|p| k.starts_with(p))
+}
+
+/// In a mission that ships nothing: a git command that sets a redirecting
+/// key, for itself (`-c url.x.insteadOf=…`) or in a config file
+/// (`git config alias.p push`, `git config set …`, `--unset`, `--edit`).
+/// Reading the config passes.
+fn git_rebinds(args: &[&str]) -> Option<&'static str> {
+    if args.windows(2).any(|w| matches!(w[0], "-c" | "--config-env") && redirecting_key(w[1])) {
+        return Some(GIT_CONFIG_REDIRECT);
+    }
+    let ops = operands(args, GIT_VALUED);
+    if !ops.first().is_some_and(|o| o.eq_ignore_ascii_case("config")) {
+        return None;
+    }
+    let at = args.iter().position(|a| a.eq_ignore_ascii_case("config"))?;
+    let rest = &args[at + 1..];
+    let ops = operands(rest, &["--file", "-f", "--blob", "--type", "--default", "--comment", "--value"]);
+    let edits = rest.iter().any(|a| matches!(*a, "-e" | "--edit"));
+    let flag_writes = edits
+        || rest.iter().any(|a| matches!(*a, "--unset" | "--unset-all" | "--add" | "--replace-all" | "--rename-section" | "--remove-section"));
+    let flag_reads = rest.iter().any(|a| a.starts_with("--get") || matches!(*a, "-l" | "--list"));
+    let (writes, key) = match ops.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("set" | "unset" | "rename-section" | "remove-section") => (true, ops.get(1).copied()),
+        Some("edit") => return Some(GIT_CONFIG_REDIRECT),
+        Some("get" | "list") => (false, None),
+        _ => (flag_writes || (!flag_reads && ops.len() >= 2), ops.first().copied()),
+    };
+    (writes && (edits || key.is_some_and(redirecting_key))).then_some(GIT_CONFIG_REDIRECT)
 }
 
 /// How a request tool's flags read, for [`only_loopback`]: the flags that
@@ -403,7 +553,8 @@ struct HttpFlags {
 
 const CURL_FLAGS: HttpFlags = HttpFlags {
     short_valued: "dHouAebcmwrEDCYyzUQtPXFT",
-    short_reroute: "xK",
+    // `-L`: a redirect can take the body or the method to another host.
+    short_reroute: "xKL",
     long_valued: &[
         "--request", "--header", "--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json",
         "--form", "--form-string", "--output", "--user", "--user-agent", "--referer", "--cookie", "--cookie-jar",
@@ -412,7 +563,7 @@ const CURL_FLAGS: HttpFlags = HttpFlags {
     ],
     long_reroute: &[
         "--config", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5", "--socks5-hostname", "--resolve",
-        "--connect-to", "--doh-url", "--dns-servers",
+        "--connect-to", "--doh-url", "--dns-servers", "--location", "--location-trusted",
     ],
     long_known: None,
 };
@@ -422,7 +573,7 @@ const WGET_FLAGS: HttpFlags = HttpFlags {
     short_reroute: "ieB",
     long_valued: &[
         "--method", "--body-data", "--body-file", "--post-data", "--post-file", "--output-document", "--output-file",
-        "--header", "--user", "--password", "--user-agent", "--referer", "--timeout", "--tries",
+        "--header", "--user", "--password", "--user-agent", "--referer", "--timeout", "--tries", "--max-redirect",
     ],
     long_reroute: &["--config", "--execute", "--input-file", "--base"],
     long_known: None,
@@ -430,16 +581,17 @@ const WGET_FLAGS: HttpFlags = HttpFlags {
 
 const HTTPIE_FLAGS: HttpFlags = HttpFlags {
     short_valued: "aAopsP",
-    short_reroute: "",
+    // `-F`/`--follow`: a redirect can take the request to another host.
+    short_reroute: "F",
     long_valued: &[
         "--auth", "--auth-type", "--output", "--print", "--pretty", "--style", "--session", "--session-read-only",
         "--timeout", "--verify", "--cert", "--cert-key", "--max-redirects", "--history-print", "--format-options",
         "--response-charset", "--response-mime", "--boundary", "--raw", "--bearer", "--default-scheme", "--http-version",
         "--ssl",
     ],
-    long_reroute: &["--proxy", "--resolve"],
+    long_reroute: &["--proxy", "--resolve", "--follow"],
     long_known: Some(&[
-        "--json", "--form", "--multipart", "--verbose", "--headers", "--body", "--meta", "--follow", "--check-status",
+        "--json", "--form", "--multipart", "--verbose", "--headers", "--body", "--meta", "--check-status",
         "--ignore-stdin", "--offline", "--stream", "--download", "--continue", "--quiet", "--all", "--compress",
         "--chunked", "--sorted", "--unsorted", "--ignore-netrc", "--debug", "--traceback", "--path-as-is",
     ]),
@@ -458,12 +610,19 @@ fn only_loopback(name: &str, args: &[&str]) -> bool {
         _ => return false,
     };
     let mut urls = Vec::new();
+    // wget follows redirects, which can take its body to another host,
+    // unless told not to.
+    let mut no_redirect = name != "wget";
     let mut it = args.iter();
     while let Some(&a) = it.next() {
         if a.starts_with("--") {
             let (flag, value) = a.split_once('=').map_or((a, None), |(f, v)| (f, Some(v)));
             if flags.long_reroute.contains(&flag) {
                 return false;
+            }
+            if name == "wget" && flag == "--max-redirect" {
+                no_redirect = value.or_else(|| it.next().copied()) == Some("0");
+                continue;
             }
             if flags.long_known.is_some_and(|k| !k.contains(&flag) && !flags.long_valued.contains(&flag) && flag != "--") {
                 return false;
@@ -491,7 +650,7 @@ fn only_loopback(name: &str, args: &[&str]) -> bool {
             urls.push(a);
         }
     }
-    !urls.is_empty() && urls.iter().all(|u| is_loopback_url(u, httpie))
+    no_redirect && !urls.is_empty() && urls.iter().all(|u| is_loopback_url(u, httpie))
 }
 
 /// `http(s)://host[:port][/…]`, or the same without a scheme, where the host
@@ -572,17 +731,25 @@ fn git_remote(args: &[&str]) -> Option<&'static str> {
     if alias {
         return Some("a git alias set on the command line");
     }
-    let ops = operands(args, &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"]);
+    let ops = operands(args, GIT_VALUED);
     let op = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
     match (op(0).as_deref(), op(1).as_deref()) {
         (Some("push"), _) => Some("git push"),
         (Some("send-email"), _) => Some("git send-email"),
         (Some("send-pack"), _) => Some("git send-pack"),
-        (Some("subtree"), Some("push")) => Some("git subtree push"),
         (Some("lfs"), Some("push")) => Some("git lfs push"),
+        (Some("subtree"), _) => {
+            // Past subtree's own options (`git subtree -P lib push origin main`).
+            let at = args.iter().position(|a| a.eq_ignore_ascii_case("subtree"))?;
+            let sub = operands(&args[at + 1..], &["-P", "--prefix", "-m", "--message", "-b", "--branch", "--onto", "--annotate"]);
+            sub.first().is_some_and(|o| o.eq_ignore_ascii_case("push")).then_some("git subtree push")
+        }
         _ => None,
     }
 }
+
+/// Git's global options that take a value.
+const GIT_VALUED: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"];
 
 /// `gh` verbs that change GitHub, in groups other than the local ones.
 const GH_WRITES: &[&str] = &[
@@ -632,13 +799,14 @@ fn glab_remote(args: &[&str]) -> Option<&'static str> {
     (!local && writes).then_some("a glab command that changes GitLab")
 }
 
-/// Maven goals that deploy or release (`mvn deploy`, `mvn release:perform`, `mvn jib:build`).
+/// Maven goals that deploy or release: any goal naming `deploy` (`deploy`,
+/// `site:deploy`, `deploy:deploy-file`, `tomcat7:undeploy`), `release:*`, `jib:build`.
 fn maven_remote(args: &[&str]) -> Option<&'static str> {
     let ops = operands(args, &["-f", "--file", "-s", "--settings", "-P", "--activate-profiles", "-pl", "--projects"]);
     ops.iter()
         .any(|o| {
             let o = o.to_ascii_lowercase();
-            o == "deploy" || o.starts_with("deploy:") || matches!(o.as_str(), "site-deploy" | "release:prepare" | "release:perform" | "jib:build")
+            o.contains("deploy") || matches!(o.as_str(), "release:prepare" | "release:perform" | "jib:build")
         })
         .then_some("a Maven goal that deploys or releases")
 }
@@ -1181,8 +1349,8 @@ mod tests {
             "curl -X POST https://api.localhost/v1/items",
             "curl -X POST localhost:3000/x",
             "curl --request=PATCH --url http://localhost/x",
-            "wget --post-data=a=1 http://localhost:3000/form",
-            "wget -qO- --method=DELETE http://127.0.0.1/x",
+            "wget --max-redirect=0 --post-data=a=1 http://localhost:3000/form",
+            "wget -qO- --max-redirect 0 --method=DELETE http://127.0.0.1/x",
             "http POST localhost:3000/items name=x",
             "http -f POST :3000/upload file@a.png",
             "https PUT api.localhost/items/1 count:=2",
@@ -1267,8 +1435,98 @@ mod tests {
         for command in [
             "curl -X POST -d a=1 http://localhost:3000/x",
             "sudo curl -X POST -d a=1 http://localhost/x",
-            "http --json --follow POST localhost:3000/items name=x",
+            "http --json POST localhost:3000/items name=x",
             "cd app && npm ci && curl -X POST http://127.0.0.1:3000/api/x",
+        ] {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+    }
+
+    /// Builtins that change the shell in ways the check can't follow take the
+    /// carve-out away; ordinary assignments don't (#1241 review, round 2).
+    #[test]
+    fn a_line_the_check_cant_follow_gets_no_carve_out() {
+        let post = "curl -X POST http://localhost/x";
+        let opaque = [
+            format!("eval '{post}'"),
+            format!("unset no_proxy; {post}"),
+            format!("printf -v http_proxy %s http://proxy.example.com; {post}"),
+            format!("read http_proxy < proxy.txt; {post}"),
+            format!("env -u no_proxy {post}"),
+            format!("env -S '{post}'"),
+            format!("alias curl='curl -x http://proxy.example.com'; {post}"),
+            format!("curl() {{ command curl -x http://proxy.example.com \"$@\"; }}; {post}"),
+            format!("function curl {{ command curl --proxy http://proxy.example.com \"$@\"; }}; {post}"),
+            format!("export -f curl; {post}"),
+            format!("source ./env.sh && {post}"),
+            format!(". ./env.sh; {post}"),
+            format!("NO_PROXY= {post}"),
+            format!("GIT_CONFIG_GLOBAL=/tmp/g {post}"),
+        ];
+        for command in &opaque {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        // `env -S` runs its string, in Plan only too.
+        assert_eq!(remote_effect("env -S 'git push origin main'"), Some("git push"));
+        for command in [
+            "PORT=3000 node app & curl -X POST localhost:3000/x",
+            "export PORT=3000 NODE_ENV=test && curl -X POST http://localhost:3000/x",
+            "env PORT=3000 curl -X POST http://127.0.0.1:3000/x",
+            "curl -X POST -d '{\"fn\":\"f()\"}' http://localhost/x",
+        ] {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+    }
+
+    /// A redirect can take a request's body or method to another host:
+    /// curl `-L`, httpie and xh `--follow`, and wget unless `--max-redirect=0`.
+    #[test]
+    fn a_request_that_follows_redirects_is_not_local() {
+        for command in [
+            "curl -L -X POST http://localhost/x",
+            "curl -sSL -d x http://localhost/x",
+            "curl --location -X PUT http://localhost/x",
+            "wget --post-data=a=1 http://localhost/x",
+            "wget --max-redirect=3 --post-data=a=1 http://localhost/x",
+            "http --follow POST localhost/x a=b",
+            "xh -F POST localhost/x a=b",
+        ] {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        assert_eq!(remote_effect_local("wget --max-redirect=0 --post-data=a=1 http://localhost/x"), None);
+        assert_eq!(remote_effect_local("curl -L http://localhost/x"), None, "a GET only reads");
+    }
+
+    /// A mission that ships nothing refuses git configuration that can
+    /// redirect a push or a request, in a file, for one command, or through
+    /// the environment. Reading the config, and other keys, pass.
+    #[test]
+    fn a_ship_nothing_mission_refuses_git_configuration_that_redirects() {
+        let refused = [
+            ("git config alias.p push", GIT_CONFIG_REDIRECT),
+            ("git config --global url.git@example.com:.insteadOf https://example.com/", GIT_CONFIG_REDIRECT),
+            ("git config --global url.ssh://example.com/.pushInsteadOf https://example.com/", GIT_CONFIG_REDIRECT),
+            ("git config set include.path ../shared.cfg", GIT_CONFIG_REDIRECT),
+            ("git config --add includeIf.gitdir:/x/.path ../shared.cfg", GIT_CONFIG_REDIRECT),
+            ("git config http.proxy http://proxy.example.com", GIT_CONFIG_REDIRECT),
+            ("git config core.sshCommand 'ssh -i key'", GIT_CONFIG_REDIRECT),
+            ("git config --unset alias.p", GIT_CONFIG_REDIRECT),
+            ("git config --edit", GIT_CONFIG_REDIRECT),
+            ("git -c url.git@example.com:.insteadOf=https://example.com/ fetch", GIT_CONFIG_REDIRECT),
+            ("GIT_CONFIG_PARAMETERS=\"'alias.p=push'\" git p", GIT_CONFIG_ENV),
+            ("env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.p GIT_CONFIG_VALUE_0=push git p", GIT_CONFIG_ENV),
+            ("export GIT_CONFIG_COUNT=1; git p", GIT_CONFIG_ENV),
+        ];
+        for (command, why) in refused {
+            assert_eq!(remote_effect_local(command), Some(why), "{command}");
+        }
+        assert_eq!(remote_effect("git config http.proxy http://proxy.example.com"), None, "Plan only's own sandbox stops the write");
+        for command in [
+            "git config user.email test@example.com",
+            "git config --get alias.p",
+            "git config get url.x.insteadOf",
+            "git config --list",
+            "GIT_CONFIG_GLOBAL=/dev/null npm test",
         ] {
             assert_eq!(remote_effect_local(command), None, "{command}");
         }
@@ -1286,12 +1544,16 @@ mod tests {
             ("a glab command that changes GitLab", "glab ci retry 99"),
             ("glab api with a method other than GET", "glab api -X POST projects/1/issues"),
             ("git subtree push", "git subtree push --prefix=lib origin main"),
+            ("git subtree push", "git subtree -P lib push origin main"),
+            ("git subtree push", "git subtree --prefix lib -q push origin main"),
             ("git lfs push", "git lfs push origin main"),
             ("git send-pack", "git send-pack origin main"),
             ("a git alias set on the command line", "git -c alias.p=push p origin main"),
             ("a git alias set on the command line", "git --config-env=alias.p=PUSH p"),
             ("a Maven goal that deploys or releases", "mvn -B clean deploy"),
             ("a Maven goal that deploys or releases", "./mvnw release:perform"),
+            ("a Maven goal that deploys or releases", "mvn site:deploy"),
+            ("a Maven goal that deploys or releases", "mvn deploy:deploy-file -Dfile=app.jar"),
             ("a Gradle task that publishes", "./gradlew publish"),
             ("a Gradle task that publishes", "gradle :lib:publishAllPublicationsToMavenRepository"),
             ("docker push", "docker-compose push web"),
@@ -1302,7 +1564,7 @@ mod tests {
             assert_eq!(remote_effect(command), Some(why), "{command}");
             assert_eq!(remote_effect_local(command), Some(why), "{command}");
         }
-        for command in ["glab mr list", "glab mr view 12", "glab api projects/1", "git subtree split --prefix=lib", "git lfs pull", "mvn -B verify", "./gradlew build publishToMavenLocal", "gradle build -x publish", "docker compose up -d", "cargo build --release"] {
+        for command in ["glab mr list", "glab mr view 12", "glab api projects/1", "git subtree split --prefix=lib", "git subtree -P lib split", "git lfs pull", "mvn -B verify", "mvn dependency:tree", "./gradlew build publishToMavenLocal", "gradle build -x publish", "docker compose up -d", "cargo build --release"] {
             assert_eq!(remote_effect(command), None, "{command}");
         }
     }
