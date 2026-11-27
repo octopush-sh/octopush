@@ -220,6 +220,9 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
             _ => {}
         }
     }
+    // A turn continued with no new message (the error card's "Try again"):
+    // what it did before it failed rides on its ask, as on a next one.
+    push_text(&mut out, LlmRole::User, flush(&mut pending, ""));
     out
 }
 

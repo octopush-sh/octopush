@@ -1139,6 +1139,10 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN raw_json TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN tool_use_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN model_view TEXT")?;
+        // How a Talk `error` row's turn failed (`ProviderErrorKind::as_str`),
+        // which picks the error card's action. NULL on older rows, which
+        // read as `other`.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN error_kind TEXT")?;
         // A finished sub-agent's conversation, kept so the user can give it
         // more turns or an answer and it CONTINUES instead of starting over.
         self.conn.execute_batch(
@@ -4834,7 +4838,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
                     cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks,
-                    raw_json, tool_use_id, model_view
+                    raw_json, tool_use_id, model_view, error_kind
              FROM chat_messages WHERE id = ?1",
         )?;
         let row = stmt
@@ -4852,6 +4856,7 @@ impl Db {
                     raw_json: r.get(13)?,
                     tool_use_id: r.get(14)?,
                     model_view: r.get(15)?,
+                    error_kind: r.get(16)?,
                     input_tokens: r.get(5)?,
                     output_tokens: r.get(6)?,
                     cost_usd: r.get(7)?,
@@ -4920,6 +4925,15 @@ impl Db {
         self.conn.execute(
             "UPDATE chat_messages SET context_blocks = ?2 WHERE id = ?1",
             params![message_id, context_blocks],
+        )?;
+        Ok(())
+    }
+
+    /// Record how a Talk `error` row's turn failed.
+    pub fn set_chat_error_kind(&self, message_id: i64, kind: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET error_kind = ?2 WHERE id = ?1 AND role = 'error'",
+            params![message_id, kind],
         )?;
         Ok(())
     }
@@ -5454,7 +5468,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
                     cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks,
-                    raw_json, tool_use_id, model_view
+                    raw_json, tool_use_id, model_view, error_kind
              FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
@@ -5475,6 +5489,7 @@ impl Db {
                 raw_json: r.get(13)?,
                 tool_use_id: r.get(14)?,
                 model_view: r.get(15)?,
+                error_kind: r.get(16)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -8576,6 +8591,9 @@ pub struct ChatMessageRow {
     pub tool_use_id: Option<String>,
     #[serde(skip)]
     pub model_view: Option<String>,
+    /// How an `error` row's turn failed (`ProviderErrorKind::as_str`); NULL
+    /// on other rows and on error rows from before it was kept.
+    pub error_kind: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

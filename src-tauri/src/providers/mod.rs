@@ -349,11 +349,13 @@ pub async fn interruptible_sleep(secs: u64, cancel: &AtomicBool) -> bool {
 }
 
 /// Call `provider.complete`, automatically retrying *transient* failures (429,
-/// 529, 5xx, a connection that couldn't be opened) with capped exponential
-/// backoff that honors a server `retry-after`. Everything else returns at
-/// once: auth and bad requests, which retrying can't fix, and a connection
-/// lost or timed out after the request was sent ([`request_error`]), which the
-/// provider may still be working on. A model server on this Mac that refuses
+/// 529, 5xx, a connection that couldn't be opened or dropped mid-body) with
+/// capped exponential backoff that honors a server `retry-after`. Everything
+/// else returns at once: auth and bad requests, which retrying can't fix; a
+/// spend-cap 429 and any status the provider marks `x-should-retry: false`
+/// ([`classify_status`]); and a connection lost or timed out after the
+/// request was sent ([`request_error`]), which the provider may still be
+/// working on. A model server on this Mac that refuses
 /// the connection gets [`LOCAL_CONNECT_RETRIES`] retry, then fails with the
 /// message that it isn't reachable. The backoff is interruptible:
 /// a raised `cancel` aborts the wait and surfaces the last error so the stage
@@ -606,13 +608,85 @@ pub fn request_error(what: &str, api_base: &str, e: &reqwest::Error) -> AppError
     final_error(format!("{what}: the connection was lost after the request was sent ({detail}). {NOT_RETRIED}"))
 }
 
-/// Build the error for an answer whose body couldn't be read in full (the
-/// connection dropped or went silent mid-answer). Final, like a send that
-/// was cut off after the request went out: never reported as a JSON error.
+/// Build the error for an answer whose body couldn't be read in full, never
+/// reported as a JSON error. A connection that dropped after the 200 (a
+/// reset mid-body) is [`network_error`], transient: the answer it carried
+/// is gone, so the retry layer sends the request again. One that went
+/// silent hit the read bound and is final, like a send that timed out.
 pub fn body_error(what: &str, e: &reqwest::Error) -> AppError {
     let detail = crate::tls::describe_request_error(e);
-    let how = if e.is_timeout() { "went silent" } else { "was lost" };
-    final_error(format!("{what}: the connection {how} while the answer was arriving ({detail}). {NOT_RETRIED}"))
+    if e.is_timeout() {
+        return final_error(format!("{what}: the connection went silent while the answer was arriving ({detail}). {NOT_RETRIED}"));
+    }
+    network_error(format!("{what}: the connection was lost while the answer was arriving ({detail})"))
+}
+
+/// Parse a `retry-after` header (delta-seconds form, per RFC 9110) into a
+/// whole-second delay, as Anthropic and OpenAI send it on a 429.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+/// The provider's `x-should-retry` header, when it sends one (`true` or
+/// `false`): its own word on whether the same request can succeed.
+pub(crate) fn parse_should_retry(headers: &reqwest::header::HeaderMap) -> Option<bool> {
+    let value = headers.get("x-should-retry")?.to_str().ok()?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// What a 429's body says when the limit is one the account set or ran out
+/// of, rather than a per-minute rate (Anthropic's usage limit, OpenAI's
+/// quota), lowercased.
+const SPEND_CAP_MARKERS: [&str; 6] = [
+    "usage limit",
+    "spend limit",
+    "spending limit",
+    "insufficient_quota",
+    "exceeded your current quota",
+    "credit balance",
+];
+
+/// Classify a non-success answer: its status, then what the provider says
+/// about retrying it. A transient status marked `x-should-retry: false` is
+/// final (`Other`). A 429 with no `retry-after` whose body names a spend or
+/// usage limit is [`ProviderErrorKind::SpendCap`]: it keeps failing however
+/// long the backoff waits.
+pub(crate) fn classify_status(status: u16, retry_after: Option<u64>, should_retry: Option<bool>, body: &str) -> ProviderErrorKind {
+    let kind = ProviderErrorKind::from_http_status(status);
+    if kind == ProviderErrorKind::RateLimit && retry_after.is_none() {
+        let body = body.to_ascii_lowercase();
+        if SPEND_CAP_MARKERS.iter().any(|m| body.contains(m)) {
+            return ProviderErrorKind::SpendCap;
+        }
+    }
+    if kind.is_transient() && should_retry == Some(false) {
+        return ProviderErrorKind::Other;
+    }
+    kind
+}
+
+/// The error for a non-success answer: `label` (how the provider's errors
+/// open), the status and the body as sent, classified by [`classify_status`].
+pub(crate) async fn status_error(label: &str, resp: reqwest::Response) -> AppError {
+    let status = resp.status();
+    // Read the headers BEFORE the body consumes the response.
+    let retry_after = parse_retry_after(resp.headers());
+    let should_retry = parse_should_retry(resp.headers());
+    let text = resp.text().await.unwrap_or_default();
+    AppError::Provider {
+        kind: classify_status(status.as_u16(), retry_after, should_retry, &text),
+        retry_after,
+        // Keep the historical message shape — the UI and journals already
+        // key off the embedded status + body text.
+        message: format!("{label} {status}: {text}"),
+    }
 }
 
 /// The error for a stream that sent nothing for `idle` after its 200. Final,

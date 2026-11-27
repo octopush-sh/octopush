@@ -73,8 +73,11 @@ async fn post_messages(
     body: &Value,
     client: &reqwest::Client,
 ) -> AppResult<reqwest::Response> {
-    let key = api_key.ok_or_else(|| {
-        AppError::Other("Anthropic API key not configured.".into())
+    // An auth failure, so Talk's error card offers to configure the key.
+    let key = api_key.ok_or_else(|| AppError::Provider {
+        kind: ProviderErrorKind::Auth,
+        retry_after: None,
+        message: "Anthropic API key not configured.".into(),
     })?;
 
     let url = messages_url(api_base);
@@ -96,17 +99,7 @@ async fn post_messages(
         .map_err(|e| super::request_error(WHAT, api_base, &e))?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        // Read `retry-after` BEFORE the body consumes the response.
-        let retry_after = parse_retry_after(resp.headers());
-        let text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Provider {
-            kind: ProviderErrorKind::from_http_status(status.as_u16()),
-            retry_after,
-            // Keep the historical message shape — the UI and journals
-            // already key off the embedded status + body text.
-            message: format!("Anthropic API error {status}: {text}"),
-        });
+        return Err(super::status_error("Anthropic API error", resp).await);
     }
     Ok(resp)
 }
@@ -287,15 +280,6 @@ pub fn messages_url(api_base: &str) -> String {
         .or_else(|| base.strip_suffix("/v1"))
         .unwrap_or(base);
     format!("{base}/v1/messages")
-}
-
-/// Parse a `retry-after` header (delta-seconds form, per RFC 9110) into a
-/// whole-second delay. Anthropic sends an integer-seconds value on 429.
-fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
 }
 
 /// Extract Anthropic's input-token rate-limit headroom: how many input tokens
