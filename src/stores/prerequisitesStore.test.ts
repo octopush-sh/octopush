@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Prerequisite, Run, RunStage } from "../lib/ipc";
 import type { Workspace } from "../lib/types";
+import type { LauncherPrefill } from "./runsStore";
 
 const mockIpc = {
   listWorkspacePrerequisites: vi.fn<(projectId: string) => Promise<Prerequisite[]>>(),
@@ -21,7 +22,11 @@ vi.mock("../components/Toasts", () => ({ pushToast: (t: unknown) => pushToast(t)
 const { begin, setLauncherPrefill, selectRun } = vi.hoisted(() => ({ begin: vi.fn(), setLauncherPrefill: vi.fn(), selectRun: vi.fn() }));
 vi.mock("./runsStore", async () => {
   const { create } = await import("zustand");
-  return { useRunsStore: create(() => ({ activeRunIdByWs: {} as Record<string, string | null>, begin, setLauncherPrefill, selectRun })) };
+  return {
+    useRunsStore: create(() => ({
+      activeRunIdByWs: {} as Record<string, string | null>, launcherPrefill: null as unknown, begin, setLauncherPrefill, selectRun,
+    })),
+  };
 });
 
 const { usePrerequisitesStore, __resetPrerequisites } = await import("./prerequisitesStore");
@@ -48,7 +53,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   __resetPrerequisites();
   usePrerequisitesStore.setState({ byWs: {}, holdByWs: {} });
-  useRunsStore.setState({ activeRunIdByWs: {} });
+  useRunsStore.setState({ activeRunIdByWs: {}, launcherPrefill: null });
+  setLauncherPrefill.mockImplementation((p: LauncherPrefill | null) => useRunsStore.setState({ launcherPrefill: p }));
   useWorkspaceStore.setState({
     workspacesByProjectId: { p1: [workspace("w1", "Ship the docs"), workspace("w2", "Wire the token store")] },
   });
@@ -126,5 +132,67 @@ describe("prerequisitesStore", () => {
     expect(await usePrerequisitesStore.getState().save("p1", "w1", "w2", "run_finished", false)).toBe(false);
     expect(usePrerequisitesStore.getState().byWs.w1).toBeUndefined();
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "error", body: "These missions would wait on each other." }));
+  });
+
+  it("stages one mission at a time when two links are met at once", async () => {
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [workspace("w1"), workspace("w2", "Wire the token store"), workspace("w3", "Write the guide")] },
+    });
+    mockIpc.listRuns.mockResolvedValue([run("completed")]);
+    await load([link(), link({ workspaceId: "w3" })]);
+
+    // w2's seed holds the one prefill slot: w3 keeps its link, nothing replaces w2's seed.
+    expect(setLauncherPrefill).toHaveBeenCalledTimes(1);
+    expect(useRunsStore.getState().launcherPrefill).toEqual(expect.objectContaining({ workspaceId: "w2" }));
+    expect(mockIpc.clearWorkspacePrerequisite).toHaveBeenCalledWith("w2");
+    expect(mockIpc.clearWorkspacePrerequisite).not.toHaveBeenCalledWith("w3");
+    expect(usePrerequisitesStore.getState().byWs.w3).toEqual(link({ workspaceId: "w3" }));
+    expect(pushToast).toHaveBeenCalledTimes(1);
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "w2 is ready to start" }));
+
+    // w2's launcher took its seed: the next check stages w3.
+    useRunsStore.setState({ launcherPrefill: null });
+    await usePrerequisitesStore.getState().check();
+    expect(useRunsStore.getState().launcherPrefill).toEqual(expect.objectContaining({ workspaceId: "w3", task: "Write the guide" }));
+    expect(usePrerequisitesStore.getState().byWs).toEqual({});
+    expect(pushToast).toHaveBeenLastCalledWith(expect.objectContaining({ title: "w3 is ready to start" }));
+  });
+
+  it("doesn't claim a seed for a refused auto-start while another mission's seed holds the slot", async () => {
+    useRunsStore.setState({ launcherPrefill: { task: "x", pipelineId: "p", overrides: [], workspaceId: "w1" } });
+    mockIpc.listRuns.mockResolvedValue([run("completed")]);
+    begin.mockResolvedValue(undefined);
+    await load([link({ autoStart: true })]);
+
+    expect(begin).toHaveBeenCalled();
+    expect(setLauncherPrefill).not.toHaveBeenCalled();
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({
+      title: "w2 is ready to start", body: expect.stringContaining("didn't start on its own"),
+    }));
+  });
+
+  it("keeps waiting on a pr_merged prerequisite with no worktree of its own", async () => {
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [{ ...workspace("w1"), worktreePath: null }, workspace("w2", "Wire the token store")] },
+    });
+    mockIpc.findPrForBranch.mockResolvedValue(pr("merged"));
+    await load([link({ afterCondition: "pr_merged" })]);
+
+    expect(mockIpc.findPrForBranch).not.toHaveBeenCalled();
+    expect(mockIpc.clearWorkspacePrerequisite).not.toHaveBeenCalled();
+    expect(usePrerequisitesStore.getState().byWs.w2).toBeDefined();
+  });
+
+  it("clear resolves to whether the link was cleared", async () => {
+    mockIpc.listRuns.mockResolvedValue([]);
+    await load([link()]);
+
+    mockIpc.clearWorkspacePrerequisite.mockRejectedValueOnce("other: The database is busy.");
+    expect(await usePrerequisitesStore.getState().clear("w2")).toBe(false);
+    expect(usePrerequisitesStore.getState().byWs.w2).toBeDefined();
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ level: "error", body: "The database is busy." }));
+
+    expect(await usePrerequisitesStore.getState().clear("w2")).toBe(true);
+    expect(usePrerequisitesStore.getState().byWs.w2).toBeUndefined();
   });
 });

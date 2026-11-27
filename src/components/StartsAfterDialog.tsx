@@ -3,6 +3,8 @@ import type { PrerequisiteCondition } from "../lib/ipc";
 import type { Workspace } from "../lib/types";
 import { usePrerequisitesStore } from "../stores/prerequisitesStore";
 import { Switch } from "./settings/shared";
+import { Listbox } from "./controls/Listbox";
+import { SegmentedControl, type SegmentedOption } from "./controls/SegmentedControl";
 
 interface Props {
   /** The mission that will wait. */
@@ -12,9 +14,9 @@ interface Props {
   onClose: () => void;
 }
 
-const CONDITIONS: [PrerequisiteCondition, string][] = [
-  ["run_finished", "Its run passes the last gate"],
-  ["pr_merged", "Its pull request merges"],
+const CONDITIONS: SegmentedOption<PrerequisiteCondition>[] = [
+  { value: "run_finished", label: "Run passes last gate", title: "Its run passes the last gate" },
+  { value: "pr_merged", label: "Pull request merges", title: "Its pull request merges" },
 ];
 const EYEBROW = "block font-mono text-[8px] uppercase tracking-[0.25em] text-octo-mute";
 
@@ -39,6 +41,15 @@ export function StartsAfterDialog({ workspace, candidates, onClose }: Props) {
     if (ok) onClose();
   };
 
+  // A refused clear keeps the link, so the dialog stays open on it.
+  const stopWaiting = async () => {
+    if (saving) return;
+    setSaving(true);
+    const ok = await store().clear(workspace.id);
+    setSaving(false);
+    if (ok) onClose();
+  };
+
   return (
     <form
       onSubmit={submit}
@@ -51,31 +62,20 @@ export function StartsAfterDialog({ workspace, candidates, onClose }: Props) {
         <p className="mt-3 text-[12px] text-octo-mute">This project has no other mission to wait on.</p>
       ) : (
         <>
-          <label htmlFor="starts-after-mission" className={`mt-3 ${EYEBROW}`}>Mission</label>
-          <select
-            id="starts-after-mission"
-            autoFocus
-            value={after}
-            onChange={(e) => setAfter(e.target.value)}
-            className="mt-1 w-full rounded-md border border-octo-border-strong bg-octo-onyx px-2 py-1.5 text-[13px] text-octo-ivory outline-none focus:border-octo-brass"
-          >
-            {candidates.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-          <fieldset className="mt-3">
-            <legend className={EYEBROW}>When</legend>
-            {CONDITIONS.map(([id, label]) => (
-              <label key={id} className="mt-1.5 flex cursor-pointer items-center gap-2 text-[12px] text-octo-ivory">
-                <input
-                  type="radio"
-                  name="starts-after-condition"
-                  checked={condition === id}
-                  onChange={() => setCondition(id)}
-                  className="accent-octo-brass"
-                />
-                {label}
-              </label>
-            ))}
-          </fieldset>
+          <span className={`mt-3 ${EYEBROW}`}>Mission</span>
+          <div className="mt-1">
+            <Listbox
+              value={after}
+              options={candidates.map((c) => ({ value: c.id, label: c.name }))}
+              onChange={setAfter}
+              ariaLabel="Mission"
+              className="w-full"
+            />
+          </div>
+          <span className={`mt-3 ${EYEBROW}`}>When</span>
+          <div className="mt-1">
+            <SegmentedControl options={CONDITIONS} value={condition} onChange={setCondition} ariaLabel="When" fill />
+          </div>
           <div className="mt-3 flex items-start gap-3" data-tour="starts-after-auto-start">
             <Switch checked={autoStart} onChange={setAutoStart} ariaLabel="Start the run on its own" testId="starts-after-auto-start" />
             <span className="flex flex-col text-[12px] text-octo-ivory">
@@ -97,7 +97,7 @@ export function StartsAfterDialog({ workspace, candidates, onClose }: Props) {
           </button>
         )}
         {existing && (
-          <button type="button" onClick={() => void store().clear(workspace.id).then(onClose)} className="rounded-md px-3 py-1.5 text-[12px] text-octo-sage hover:text-octo-ivory">
+          <button type="button" onClick={() => void stopWaiting()} disabled={saving} className="rounded-md px-3 py-1.5 text-[12px] text-octo-sage hover:text-octo-ivory disabled:opacity-40">
             Stop waiting
           </button>
         )}

@@ -4,7 +4,6 @@ import { prVerdict, runVerdict, type PrerequisiteHold, type PrerequisiteVerdict 
 import type { Workspace } from "../lib/types";
 import { pushToast } from "../components/Toasts";
 import { useWorkspaceStore } from "./workspaceStore";
-import { useProjectStore } from "./projectStore";
 import { useRunsStore } from "./runsStore";
 
 // "Starts after" (#960, slice 2). The links live in the backend
@@ -24,7 +23,8 @@ interface PrerequisitesState {
   /** Save a link; a refusal is toasted. Resolves to whether it was saved. */
   save: (projectId: string, workspaceId: string, afterWorkspaceId: string,
          condition: PrerequisiteCondition, autoStart: boolean) => Promise<boolean>;
-  clear: (workspaceId: string) => Promise<void>;
+  /** Clear a link; a refusal is toasted. Resolves to whether it was cleared. */
+  clear: (workspaceId: string) => Promise<boolean>;
   /** Check every link; start the missions whose prerequisite is met. */
   check: () => Promise<void>;
 }
@@ -52,6 +52,12 @@ export const __resetPrerequisites = (): void => {
 const refusalText = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/^other: /, "");
 const findWorkspace = (id: string): Workspace | undefined =>
   Object.values(useWorkspaceStore.getState().workspacesByProjectId).flat().find((w) => w.id === id);
+/** The launcher prefill is one slot: while it holds another mission's
+ *  unopened seed, staging this one would replace that seed. */
+const slotTaken = (workspaceId: string): boolean => {
+  const held = useRunsStore.getState().launcherPrefill;
+  return !!held && held.workspaceId !== workspaceId;
+};
 
 /** The prerequisite's newest run that is more than a draft. */
 async function newestRun(workspaceId: string) {
@@ -60,9 +66,10 @@ async function newestRun(workspaceId: string) {
 
 async function verdictFor(link: Prerequisite, after: Workspace): Promise<PrerequisiteVerdict> {
   if (link.afterCondition === "pr_merged") {
-    const { current, recent } = useProjectStore.getState();
-    const path = after.worktreePath ?? [current, ...recent].find((p) => p?.id === after.projectId)?.path;
-    return prVerdict(path ? await ipc.findPrForBranch(path) : null);
+    // `find_pr_for_branch` reads the branch checked out at the path: only the
+    // prerequisite's own worktree has its branch. Without one, it's unreadable.
+    if (!after.worktreePath) throw new Error("The prerequisite has no worktree.");
+    return prVerdict(await ipc.findPrForBranch(after.worktreePath));
   }
   const run = await newestRun(after.id);
   const live = run && (run.status === "running" || run.status === "paused");
@@ -83,6 +90,9 @@ export const usePrerequisitesStore = create<PrerequisitesState>((set, get) => {
   const offerStart = async (link: Prerequisite, afterName: string) => {
     const ws = findWorkspace(link.workspaceId);
     if (!ws || starting.has(ws.id)) return;
+    // Staging needs the prefill slot; while another mission's seed holds it,
+    // keep the link and offer this start on a later check.
+    if (!link.autoStart && slotTaken(ws.id)) return;
     starting.add(ws.id);
     try {
       await ipc.clearWorkspacePrerequisite(ws.id);
@@ -106,6 +116,18 @@ export const usePrerequisitesStore = create<PrerequisitesState>((set, get) => {
         pushToast({ level: "success", title: `${ws.name} started`, body: `${reason} Its crew is at work.`, action: open });
         return;
       }
+    }
+    if (slotTaken(ws.id)) {
+      // An auto-start refused while another mission's seed holds the slot:
+      // nothing is seeded, so the toast doesn't say it is.
+      pushToast({
+        level: "info",
+        title: `${ws.name} is ready to start`,
+        body: `${reason} It didn't start on its own; open it to begin the run.`,
+        timeout: 15_000,
+        action: open,
+      });
+      return;
     }
     runs.setLauncherPrefill({ task: ws.task, pipelineId: crew, overrides: [], workspaceId: ws.id });
     runs.selectRun(ws.id, null);
@@ -185,8 +207,10 @@ export const usePrerequisitesStore = create<PrerequisitesState>((set, get) => {
       try {
         await ipc.clearWorkspacePrerequisite(workspaceId);
         forget(workspaceId);
+        return true;
       } catch (e) {
         pushToast({ level: "error", title: "Couldn't stop the wait", body: refusalText(e) });
+        return false;
       }
     },
 

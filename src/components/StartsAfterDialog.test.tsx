@@ -38,8 +38,9 @@ describe("StartsAfterDialog", () => {
 
     expect(screen.getByTestId("starts-after-auto-start")).toHaveAttribute("aria-checked", "false");
     expect(screen.queryByText("Stop waiting")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Mission"), { target: { value: "docs" } });
-    fireEvent.click(screen.getByLabelText("Its pull request merges"));
+    fireEvent.click(screen.getByRole("combobox", { name: "Mission" }));
+    fireEvent.click(screen.getByRole("option", { name: "docs" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Pull request merges" }));
     fireEvent.click(screen.getByText("Wait for it"));
 
     await waitFor(() => expect(onClose).toHaveBeenCalled());
@@ -50,16 +51,31 @@ describe("StartsAfterDialog", () => {
     usePrerequisitesStore.setState({
       byWs: { billing: { workspaceId: "billing", afterWorkspaceId: "docs", afterCondition: "pr_merged", branchFromPrerequisite: false, autoStart: true } },
     });
-    clear.mockResolvedValue(undefined);
+    clear.mockResolvedValue(true);
     const onClose = vi.fn();
     open(onClose);
 
-    expect(screen.getByLabelText("Mission")).toHaveValue("docs");
-    expect(screen.getByLabelText("Its pull request merges")).toBeChecked();
+    expect(screen.getByRole("combobox", { name: "Mission" })).toHaveTextContent("docs");
+    expect(screen.getByRole("radio", { name: "Pull request merges" })).toHaveAttribute("aria-checked", "true");
     expect(screen.getByTestId("starts-after-auto-start")).toHaveAttribute("aria-checked", "true");
     fireEvent.click(screen.getByText("Stop waiting"));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(clear).toHaveBeenCalledWith("billing");
+  });
+
+  it("stays open when stopping the wait is refused", async () => {
+    usePrerequisitesStore.setState({
+      byWs: { billing: { workspaceId: "billing", afterWorkspaceId: "docs", afterCondition: "run_finished", branchFromPrerequisite: false, autoStart: false } },
+    });
+    clear.mockResolvedValue(false);
+    const onClose = vi.fn();
+    open(onClose);
+
+    fireEvent.click(screen.getByText("Stop waiting"));
+    await waitFor(() => expect(clear).toHaveBeenCalledWith("billing"));
+    await waitFor(() => expect(screen.getByText("Stop waiting")).not.toBeDisabled());
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByText("Stop waiting")).toBeInTheDocument();
   });
 
   it("says so when there is nothing to wait on", () => {
