@@ -23,7 +23,7 @@ use crate::providers::{
     complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
     retry_notice, Completion, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
-    LlmRole, LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
+    LlmRole, LlmStopReason, LlmTool, LlmToolResult, truncated_round_turn, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
 use crate::orchestrator::agentic::{
@@ -225,49 +225,6 @@ fn tool_round_turn(response: &LlmResponse) -> LlmMessage {
         role: LlmRole::Assistant,
         content: LlmContent::AssistantWithTools {
             raw: response.raw_content.clone(),
-            text: response.text.clone(),
-            tool_uses: response.tool_uses.clone(),
-        },
-    }
-}
-
-/// The leading complete thinking blocks of a response's content: signed
-/// `thinking` and `redacted_thinking` blocks, up to the first other block.
-/// Empty for an OpenAI Responses turn or a response without thinking.
-fn leading_signed_thinking(raw: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    if crate::providers::openai_compat::is_responses_raw(raw) {
-        return Vec::new();
-    }
-    let nonempty = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.is_empty());
-    raw.iter()
-        .take_while(|b| match b["type"].as_str() {
-            Some("thinking") => nonempty(&b["signature"]),
-            Some("redacted_thinking") => nonempty(&b["data"]),
-            _ => false,
-        })
-        .cloned()
-        .collect()
-}
-
-/// The assistant turn of a round cut off at `max_tokens` mid-tool-use. It is
-/// rebuilt from its text and tool calls, since a cut-off turn can end in a
-/// partial block, but its leading signed thinking blocks are kept in front:
-/// with a thinking budget on, the API rejects a final assistant turn that
-/// doesn't start with one.
-fn truncated_round_turn(response: &LlmResponse) -> LlmMessage {
-    let mut raw = leading_signed_thinking(&response.raw_content);
-    if !raw.is_empty() {
-        if !response.text.is_empty() {
-            raw.push(serde_json::json!({ "type": "text", "text": response.text }));
-        }
-        for u in &response.tool_uses {
-            raw.push(serde_json::json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input }));
-        }
-    }
-    LlmMessage {
-        role: LlmRole::Assistant,
-        content: LlmContent::AssistantWithTools {
-            raw,
             text: response.text.clone(),
             tool_uses: response.tool_uses.clone(),
         },

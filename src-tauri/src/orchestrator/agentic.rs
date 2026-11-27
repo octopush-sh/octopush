@@ -8,7 +8,7 @@ use crate::orchestrator::types::{BlockedAsk, BlockedQuestion, ToolCallLog};
 use crate::providers::{
     complete_with_retry, interruptible_sleep, retry_notice, Effort, LlmContent, LlmMessage,
     LlmProvider, LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmTool, LlmToolResult,
-    LlmToolUse, DEFAULT_MAX_RETRIES,
+    LlmToolUse, truncated_round_turn, DEFAULT_MAX_RETRIES,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -997,16 +997,10 @@ pub async fn run_agentic_loop_billed(
         if matches!(resp.stop_reason, LlmStopReason::MaxTokens) && !resp.tool_uses.is_empty() {
             // Truncation path: do NOT replay raw_content verbatim. A turn cut off
             // at max_tokens can carry an unsigned/partial trailing thinking block,
-            // and replaying it 400s the next request. Empty raw makes the
-            // serializer rebuild from text + tool_uses instead (per the design).
-            messages.push(LlmMessage {
-                role: LlmRole::Assistant,
-                content: LlmContent::AssistantWithTools {
-                    raw: vec![],
-                    text: resp.text.clone(),
-                    tool_uses: resp.tool_uses.clone(),
-                },
-            });
+            // and replaying it 400s the next request. The turn is rebuilt from
+            // text + tool_uses, its leading signed thinking kept in front (a
+            // budget-thinking model 400s an assistant turn without it).
+            messages.push(truncated_round_turn(&resp));
             let errs: Vec<LlmToolResult> = resp
                 .tool_uses
                 .iter()
