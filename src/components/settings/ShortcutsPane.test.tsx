@@ -28,6 +28,24 @@ describe("ShortcutsPane", () => {
     expect(container.querySelector('[data-tour="settings-shortcuts-modes"]')).toHaveTextContent("Run mode");
   });
 
+  it("lists Talk's keys, and ⌘⌥K in both modes it answers", () => {
+    const { container } = render(<ShortcutsPane />);
+    const rows = Array.from(container.querySelectorAll("li")).map(
+      (li) => `${li.querySelector("kbd")?.textContent} ${li.querySelector("span")?.textContent}`,
+    );
+    for (const row of [
+      "Esc Stop the running turn",
+      "⌘⌥N New conversation",
+      "⌘⌥K Switch conversation",
+      "⌘⌥K Switch session",
+      "⌘⌥A Focus the oldest waiting approval card",
+      "Esc Approval card focused: deny",
+    ]) {
+      expect(rows).toContain(row);
+    }
+    expect(rows.some((r) => r.startsWith("⌘↵ Approval card focused: approve"))).toBe(true);
+  });
+
   it("shows each key exactly once, with no escape leaking into a label", () => {
     const { container } = render(<ShortcutsPane />);
     const labels = Array.from(container.querySelectorAll("kbd")).map((k) => k.textContent);
