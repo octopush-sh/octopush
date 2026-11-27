@@ -476,7 +476,8 @@ fn remote_command(words: &[&str], scope: Scope) -> Option<&'static str> {
         return remote_command(&rest[at..], scope);
     }
     if scope.ship_nothing && name == "git" {
-        if let Some(what) = git_rebinds(rest) {
+        // What both modes refuse names itself first (`-c alias.p=push`).
+        if let Some(what) = git_remote(rest).or_else(|| git_rebinds(rest)) {
             return Some(what);
         }
     }
