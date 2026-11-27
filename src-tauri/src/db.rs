@@ -489,6 +489,12 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN share_with_missions TEXT NOT NULL DEFAULT ''",
         )?;
+        // "Don't run skill shell commands in crews" (#1188): 1 adds
+        // `disableSkillShellExecution` to every Claude CLI stage's `--settings`.
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN skill_shell_off INTEGER NOT NULL DEFAULT 0",
+        )?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -2631,6 +2637,33 @@ impl Db {
             params![raw, id],
         )?;
         Ok(())
+    }
+
+    /// Whether the project turns off skill shell commands in its crews
+    /// (false when unset, or no such project).
+    pub fn get_project_skill_shell_off(&self, id: &str) -> AppResult<bool> {
+        let off: Option<i64> = self
+            .conn
+            .query_row("SELECT skill_shell_off FROM projects WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        Ok(off.unwrap_or(0) != 0)
+    }
+
+    pub fn set_project_skill_shell_off(&self, id: &str, off: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET skill_shell_off = ?1 WHERE id = ?2",
+            params![off as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::get_project_skill_shell_off`] for the project `workspace_id`
+    /// belongs to; false for an unknown workspace.
+    pub fn workspace_skill_shell_off(&self, workspace_id: &str) -> AppResult<bool> {
+        match self.get_workspace(workspace_id)? {
+            Some(ws) => self.get_project_skill_shell_off(&ws.project_id),
+            None => Ok(false),
+        }
     }
 
     pub fn update_project(&self, id: &str, name: Option<&str>, tint: Option<&str>) -> AppResult<()> {
