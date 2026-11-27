@@ -144,6 +144,10 @@ describe("ApprovalCard", () => {
     const card = screen.getByRole("group", { name: "Project MCP server: docs: node docs.js · env DOCS_TOKEN" });
     expect(screen.getByText(/any change asks again/)).toBeInTheDocument();
     expect(screen.queryByText("$")).toBeNull();
+    // A long command wraps in view instead of scrolling out of it.
+    const shown = screen.getByTestId("approval-shown");
+    expect(shown.className).toContain("whitespace-pre-wrap");
+    expect(shown.className).not.toContain("overflow-x-auto");
     expect(screen.getAllByRole("button")[0]).toHaveTextContent("Deny");
     fireEvent.keyDown(card, { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Allow" }));

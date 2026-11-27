@@ -351,6 +351,31 @@ impl Reach {
         })
     }
 
+    /// [`Reach::runs_code`] for a glob `pattern` from `base`: the first of
+    /// the workspace's [`RUNS_CODE`] files, or their `.claude` folder, that it
+    /// could match, whether or not it exists yet. Component by component as
+    /// bash matches (a `*` never matches a leading `.`), without case.
+    fn glob_runs_code(&self, base: &Path, pattern: &str) -> Option<Reached> {
+        let root = self.root.as_deref()?;
+        let parts: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        let matches = |name: &str, part: &str| {
+            if !has_glob(part) {
+                return unescape(part).eq_ignore_ascii_case(name);
+            }
+            let glob = globset::GlobBuilder::new(part).backslash_escape(true).case_insensitive(true).build();
+            (part.starts_with('.') || !name.starts_with('.')) && glob.is_ok_and(|g| g.compile_matcher().is_match(name))
+        };
+        let candidates = RUNS_CODE.iter().copied().chain([".claude"]);
+        let hit = candidates.map(|f| root.join(f)).find(|target| {
+            let Ok(rest) = target.strip_prefix(base) else { return false };
+            let names: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            names.len() == parts.len() && names.iter().zip(&parts).all(|(n, p)| matches(n, p))
+        })?;
+        let mut r = self.runs_code(&hit, true)?;
+        r.shown = format!("{} (a pattern that can match {})", unescape(pattern), r.shown);
+        Some(r)
+    }
+
     /// The card an agent's `run_command` must pass (#1201), or `None`. Every
     /// command it runs, nested ones included
     /// ([`crate::chat_engine::each_command`], with its caps; past them the
@@ -533,6 +558,13 @@ impl Reach {
                     },
                 },
             };
+            // A pattern that could name a file that runs commands asks, even
+            // before the file exists (#1245).
+            if has_glob(rel) {
+                if let Some(hit) = self.glob_runs_code(base, rel) {
+                    return (Some(hit), None);
+                }
+            }
             let paths = if has_glob(rel) {
                 match glob_paths(base, rel, &mut scan.glob_names) {
                     Some(paths) => paths,
@@ -1233,6 +1265,14 @@ mod tests {
             assert_eq!((c.kind, c.sensitive), (CardKind::Config, true), "{command}");
         }
         assert_eq!(reach.command_card(None, "cat a.txt", None, &[]), None);
+        // A pattern that could match one asks too, before the file exists.
+        for command in ["echo x > .cl*/mcp.json", "cp evil.json .claude/settings*.json", "tee .[c]laude/MCP.JSON", "rm -r .c?aude"] {
+            let c = reach.command_card(None, command, None, &[]).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!((c.kind, c.sensitive), (CardKind::Config, true), "{command}");
+        }
+        for command in ["cat *.txt", "ls .claude/agents/*.md"] {
+            assert_eq!(reach.command_card(None, command, None, &[]).map(|c| c.kind), None, "{command}");
+        }
     }
 
     #[cfg(unix)]

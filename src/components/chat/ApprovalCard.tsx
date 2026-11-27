@@ -114,7 +114,11 @@ export function ApprovalCard({ approval, onRespond }: Props) {
           {approval.reason}
         </span>
       </div>
-      <pre className="mt-2 overflow-x-auto rounded bg-octo-onyx px-2.5 py-1.5 font-mono text-[12px] text-octo-ivory">
+      {/* Wrapped, never scrolled: nothing it shows sits out of view (#1245). */}
+      <pre
+        data-testid="approval-shown"
+        className="mt-2 whitespace-pre-wrap break-all rounded bg-octo-onyx px-2.5 py-1.5 font-mono text-[12px] text-octo-ivory"
+      >
         {/* Only a shell command reads as one. */}
         {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
         {approval.command}
