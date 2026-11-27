@@ -1713,7 +1713,7 @@ mod tests {
             "!crate::permissions::reads_only(command, Some(command_dir().as_path()), Some(workspace_path.as_path()))",
             "decision => crate::permissions::refusal(decision).map(|m| (u.id.clone(), m)),",
             "if let Some(note) = mode_watch.at_round(mode) {",
-            "if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {",
+            "if denied.is_none() && skill_refusal.is_none() && (mode_asks.contains(&u.id) || moved) {",
             "denied = crate::ask_first::ask_first(preview, ask).await;",
             "let grants = mode != crate::permissions::Mode::Ask;",
             "self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants)",
