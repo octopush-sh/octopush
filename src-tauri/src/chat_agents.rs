@@ -1023,7 +1023,9 @@ impl ToolGate for SubagentGate {
 /// call runs off-thread with the same 60s bound Talk's own MCP calls have.
 pub struct McpSubagentTools {
     pub registry: Arc<crate::mcp::McpRegistry>,
-    pub worktree: std::path::PathBuf,
+    /// Where each call finds its server's config: the worktree's servers
+    /// as they read now, or a Direct run's pinned ones.
+    pub configs: crate::mcp::CallConfigs,
     pub tools: Vec<LlmTool>,
     /// One turnstile per server, shared by every sub-agent of the fan-out:
     /// the registry serialises calls per server anyway, so queueing here
@@ -1055,7 +1057,12 @@ impl McpSubagentTools {
             .filter(|t| definition.map(|d| d.mcp.allows(&t.namespaced)).unwrap_or(true))
             .map(mcp_llm_tool)
             .collect();
-        (!tools.is_empty()).then(|| Self { registry, worktree: worktree.to_path_buf(), tools, turnstiles })
+        (!tools.is_empty()).then(|| Self {
+            registry,
+            configs: crate::mcp::CallConfigs::Worktree(worktree.to_path_buf()),
+            tools,
+            turnstiles,
+        })
     }
 }
 
@@ -1076,9 +1083,9 @@ impl ExternalTools for McpSubagentTools {
         // Bounded on the wire (the turnstile above absorbs the queue), and a
         // timeout STOPS the server so the call can never complete later.
         // A sub-agent reads the rendered text (binary payloads replaced).
-        crate::mcp::call_bounded(
+        crate::mcp::call_bounded_from(
             Arc::clone(&self.registry),
-            self.worktree.clone(),
+            self.configs.clone(),
             name.to_string(),
             input.clone(),
             crate::mcp::CALL_TIMEOUT,

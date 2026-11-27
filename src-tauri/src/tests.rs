@@ -912,7 +912,7 @@ mod workspace_tests {
             loop_mode: None, max_iterations: 30, pos_x: Some(10.0), pos_y: Some(20.0),
             parents: vec![], tools: Some(vec!["read_file".into(), "list_files".into()]),
             custom_name: Some("The Plan".into()), instructions: Some("be terse".into()),
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = a.save_pipeline(None, "My Pipe", "d", &[draft.clone()]).unwrap();
         let synced = a.list_custom_pipelines_for_sync().unwrap();
@@ -942,7 +942,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = db.save_pipeline(None, "Local Newer", "d", &[draft.clone()]).unwrap();
         // A pulled copy stamped in the past must be skipped…
@@ -1005,7 +1005,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = db.save_pipeline(None, "P", "d", &[draft.clone()]).unwrap();
         let (t1, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
@@ -1013,6 +1013,54 @@ mod workspace_tests {
         db.save_pipeline(Some(pid.clone()), "P2", "d", &[draft]).unwrap();
         let (t2, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
         assert!(t2 > t1, "an edit must move the LWW stamp forward");
+    }
+
+    #[test]
+    fn a_stages_mcp_servers_reach_its_runs_and_sync_but_never_a_crew_file() {
+        // #1134: saved on the stage, copied to the run, carried by library
+        // sync; a crew file neither carries them nor sets them on import.
+        let a = test_db();
+        a.seed_builtin_pipelines().unwrap();
+        setup_workspace(&a, "p1", "ws1");
+        let draft = crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m1".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None, escalate_model: None, escalate_effort: None,
+            mcp_servers: vec![" tracker ".into(), "docs".into(), "tracker".into(), "".into()],
+        };
+        let pid = a.save_pipeline(None, "With MCP", "d", &[draft.clone()]).unwrap();
+        let both = vec!["docs".to_string(), "tracker".to_string()];
+        assert_eq!(a.get_pipeline_stages(&pid).unwrap()[0].mcp_servers, both, "trimmed, sorted, once each");
+        let run = a.create_run("ws1", &pid, "t", None, None, &[]).unwrap();
+        let stage = &a.list_run_stages(&run).unwrap()[0];
+        assert_eq!(a.get_stage_mcp_servers(&stage.id).unwrap(), both);
+
+        let synced = a.list_custom_pipelines_for_sync().unwrap();
+        let b = test_db();
+        b.seed_builtin_pipelines().unwrap();
+        assert!(b.upsert_pipeline_from_sync(&synced[0]).unwrap());
+        assert_eq!(b.pipeline_stage_drafts(&pid).unwrap()[0].mcp_servers, both);
+
+        let crew = crate::crew::export(&a, &pid).unwrap();
+        assert!(crew.pipeline.stages[0].mcp_servers.is_empty());
+        assert!(!crate::crew::to_json(&crew).unwrap().contains("mcpServers"));
+        let mut handed = crew.clone();
+        handed.pipeline.name = "Handed over".into();
+        handed.pipeline.stages[0].mcp_servers = vec!["tracker".into()];
+        let imported = crate::crew::import(&b, &handed, &[]).unwrap();
+        assert!(b.get_pipeline_stages(&imported).unwrap()[0].mcp_servers.is_empty());
+
+        // The default: no servers, stored as NULL.
+        let none = crate::db::StageDraft { mcp_servers: vec![], ..draft };
+        let pid2 = a.save_pipeline(None, "Without", "d", &[none]).unwrap();
+        assert!(a.get_pipeline_stages(&pid2).unwrap()[0].mcp_servers.is_empty());
+        let raw: Option<String> = a
+            .conn_ref()
+            .query_row("SELECT mcp_servers FROM pipeline_stages WHERE pipeline_id = ?1", [pid2.as_str()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None);
     }
 
     #[test]
@@ -4067,7 +4115,7 @@ mod pipeline_crud_tests {
             max_iterations: 25,
             pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
@@ -4304,7 +4352,7 @@ mod pipeline_crud_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         assert!(db.validate_pipeline_stages(&[mk("code_review")]).is_ok());
         assert!(db.validate_pipeline_stages(&[mk("bogus_role")]).is_err());
@@ -4889,6 +4937,99 @@ mod run_crud_tests {
         assert!(db.stage_contexts(&run).unwrap().is_empty(), "an older stage has no reading");
         db.set_run_stage_context(&stage, 42_000, Some(200_000)).unwrap();
         assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(42_000, Some(200_000))));
+    }
+
+    #[test]
+    fn migrate_adds_the_mcp_pin_and_routine_columns_to_an_older_database() {
+        // #1134: a database from before the MCP pin and the Routine stamp has
+        // neither column. Opening it adds both, nullable: its runs read as no
+        // Routine's, with nothing pinned. Opening it again changes nothing.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (run, stage) = {
+            let db = Db::open(tmp.path()).unwrap();
+            let ws = seed_workspace(&db);
+            let pid = db.insert_pipeline("P", "d", false).unwrap();
+            db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+            let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+            let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+            db.conn_ref()
+                .execute_batch(
+                    "UPDATE run_stages SET mcp_servers = '[\"tracker\"]';
+                     ALTER TABLE run_stages DROP COLUMN mcp_pinned;
+                     ALTER TABLE runs DROP COLUMN routine_id;",
+                )
+                .unwrap();
+            (run, stage)
+        };
+        for _ in 0..2 {
+            let db = Db::open(tmp.path()).unwrap();
+            for (table, col) in [("run_stages", "mcp_pinned"), ("runs", "routine_id")] {
+                let mut stmt = db.conn_ref().prepare(&format!("PRAGMA table_info({table})")).unwrap();
+                let cols: Vec<(String, i64)> =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?))).unwrap().map(Result::unwrap).collect();
+                let notnull = cols.iter().find(|(n, _)| n == col).unwrap_or_else(|| panic!("{table}.{col} missing")).1;
+                assert_eq!(notnull, 0, "{table}.{col} must be nullable");
+            }
+            assert_eq!(db.run_routine_id(&run).unwrap(), None);
+            assert!(db.get_stage_mcp_pinned(&stage).unwrap().is_empty(), "an older stage starts no server");
+            assert_eq!(db.get_stage_mcp_servers(&stage).unwrap(), vec!["tracker".to_string()]);
+        }
+    }
+
+    #[test]
+    fn a_runs_mcp_servers_are_pinned_once_from_the_settings_servers() {
+        // #1134: each stage's chosen servers are pinned to their Settings
+        // config when the run is created; one Settings doesn't have isn't
+        // pinned, and a later pin never replaces the first.
+        use crate::mcp::McpServerConfig;
+        use std::collections::HashMap;
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let ws = seed_workspace(&db);
+        let draft = |servers: &[&str]| crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+            mcp_servers: servers.iter().map(|s| s.to_string()).collect(),
+        };
+        let cfg = |command: &str| McpServerConfig {
+            command: command.into(),
+            secret_env: vec!["TOKEN".into()],
+            ..Default::default()
+        };
+        let pid = db.save_pipeline(None, "Pinned", "d", &[draft(&["tracker", "project-only"])]).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.get_stage_mcp_pinned(&stage).unwrap().is_empty(), "nothing is pinned before the pin");
+
+        let settings = HashMap::from([("tracker".to_string(), cfg("settings")), ("docs".to_string(), cfg("docs"))]);
+        db.pin_run_mcp_servers(&run, &settings).unwrap();
+        let pinned = db.get_stage_mcp_pinned(&stage).unwrap();
+        assert_eq!(pinned, HashMap::from([("tracker".to_string(), cfg("settings"))]));
+        let raw: String = db
+            .conn_ref()
+            .query_row("SELECT mcp_pinned FROM run_stages WHERE id = ?1", [stage.as_str()], |r| r.get(0))
+            .unwrap();
+        assert!(raw.contains("\"secret_env\":[\"TOKEN\"]"), "Keychain items by name only: {raw}");
+
+        let rewritten = HashMap::from([
+            ("tracker".to_string(), cfg("rewritten")),
+            ("project-only".to_string(), cfg("rewritten")),
+        ]);
+        db.pin_run_mcp_servers(&run, &rewritten).unwrap();
+        assert_eq!(db.get_stage_mcp_pinned(&stage).unwrap(), pinned, "the first pin stays");
+
+        // A stage that chose no server pins nothing.
+        let none = db.save_pipeline(None, "None", "d", &[draft(&[])]).unwrap();
+        let run = db.create_run(&ws, &none, "t", None, None, &[]).unwrap();
+        db.pin_run_mcp_servers(&run, &settings).unwrap();
+        let raw: Option<String> = db
+            .conn_ref()
+            .query_row("SELECT mcp_pinned FROM run_stages WHERE run_id = ?1", [run.as_str()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None);
     }
 
     #[test]
@@ -9095,7 +9236,7 @@ mod orchestrator_tests {
             checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents, tools,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
     fn ro_tools() -> Option<Vec<String>> {
@@ -9682,7 +9823,7 @@ mod orchestrator_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let mut impl_d = mk("implement");
         impl_d.escalate_model = Some("strong-model".into());
@@ -11494,6 +11635,185 @@ mod orchestrator_tests {
             assert_eq!(sent(&got), ["run_failed"]);
             reset();
         }
+    }
+
+    // ─── #1134: a stage's MCP servers, pinned at creation ────────────────
+
+    /// Records what each stage was given of its MCP servers (the names and
+    /// the pinned configs), and rewrites `rewrite/.claude/mcp.json` with its
+    /// own definitions of those servers, as a stage with file tools could.
+    struct McpSeeingRunner {
+        seen: McpSeen,
+        rewrite: Option<std::path::PathBuf>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for McpSeeingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(ctx.mcp.as_ref().map(|m| (m.servers.clone(), (*m.pinned).clone())));
+            if let Some(wt) = &self.rewrite {
+                std::fs::create_dir_all(wt.join(".claude")).unwrap();
+                let entry = serde_json::json!({ "command": "rewritten-by-a-stage" });
+                std::fs::write(
+                    wt.join(".claude/mcp.json"),
+                    serde_json::json!({ "mcpServers": { "tracker": entry.clone(), "project-only": entry } }).to_string(),
+                )
+                .unwrap();
+            }
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: None, session_id: None, blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    type McpSeen = Arc<Mutex<Vec<Option<(Vec<String>, std::collections::HashMap<String, crate::mcp::McpServerConfig>)>>>>;
+
+    /// An API crew whose stages chose `tracker` and `project-only`.
+    fn mcp_crew(db: &Arc<Mutex<Db>>, stages: usize) -> String {
+        let drafts: Vec<crate::db::StageDraft> = (0..stages)
+            .map(|i| crate::db::StageDraft {
+                mcp_servers: vec!["tracker".into(), "project-only".into()],
+                ..draft_with(if i == 0 { "plan" } else { "implement" }, if i == 0 { vec![] } else { vec![i as i64 - 1] }, None, false)
+            })
+            .collect();
+        db.lock().save_pipeline(None, &format!("MCP crew {stages}"), "d", &drafts).unwrap()
+    }
+
+    fn mcp_cfg(command: &str) -> crate::mcp::McpServerConfig {
+        crate::mcp::McpServerConfig { command: command.into(), ..Default::default() }
+    }
+
+    fn mcp_orch(db: &Arc<Mutex<Db>>, seen: &McpSeen, rewrite: Option<std::path::PathBuf>) -> Orchestrator {
+        Orchestrator::new_with_runner(
+            Arc::clone(db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(McpSeeingRunner { seen: Arc::clone(seen), rewrite }),
+        )
+        .with_mcp(Arc::new(crate::mcp::McpRegistry::new()))
+    }
+
+    fn notices(db: &Arc<Mutex<Db>>, run_id: &str) -> Vec<String> {
+        let stages = db.lock().list_run_stages(run_id).unwrap();
+        stages.iter().flat_map(|s| db.lock().list_stage_log(&s.id).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn an_app_run_uses_the_settings_configs_pinned_when_it_was_created() {
+        let (db, _) = db_with_workspace();
+        let wt = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.lock()
+            .conn_ref()
+            .execute(
+                "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+                 VALUES ('w-pin','p1','W','main',?1,?2,?2)",
+                rusqlite::params![wt.path().to_string_lossy().into_owned(), now],
+            )
+            .unwrap();
+        // The worktree defines its own servers before the run starts.
+        std::fs::create_dir_all(wt.path().join(".claude")).unwrap();
+        std::fs::write(
+            wt.path().join(".claude/mcp.json"),
+            r#"{"mcpServers":{"tracker":{"command":"from-the-project"},"project-only":{"command":"from-the-project"}}}"#,
+        )
+        .unwrap();
+        let pid = mcp_crew(&db, 2);
+        let run_id = db.lock().create_run("w-pin", &pid, "t", None, None, &[]).unwrap();
+        let settings = std::collections::HashMap::from([
+            ("tracker".to_string(), mcp_cfg("from-settings")),
+            ("docs".to_string(), mcp_cfg("docs")),
+        ]);
+        db.lock().pin_run_mcp_servers(&run_id, &settings).unwrap();
+
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        let orch = mcp_orch(&db, &seen, Some(wt.path().to_path_buf()));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let pinned = std::collections::HashMap::from([("tracker".to_string(), mcp_cfg("from-settings"))]);
+        let given = Some((vec!["project-only".to_string(), "tracker".to_string()], pinned));
+        // The second stage runs after the first rewrote .claude/mcp.json.
+        assert_eq!(*seen.lock(), vec![given.clone(), given]);
+    }
+
+    #[tokio::test]
+    async fn a_routine_dispatch_stamps_its_run() {
+        use crate::routines::FireOutcome;
+        let (db, ws) = db_with_workspace();
+        let pid = mcp_crew(&db, 1);
+        db.lock()
+            .insert_routine("r-mcp", &routine_input(&pid, "interval", "3600"), Some("2000-01-01T00:00:00+00:00"), true)
+            .unwrap();
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(MockRunner),
+        ));
+        assert_eq!(Arc::clone(&orch).run_routine_now("r-mcp").await.unwrap(), FireOutcome::Dispatched);
+        let runs = db.lock().list_runs(&ws).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(db.lock().run_routine_id(&runs[0].id).unwrap().as_deref(), Some("r-mcp"));
+        // A run the director starts carries no Routine.
+        let other = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        assert_eq!(db.lock().run_routine_id(&other).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn routine_and_detached_runs_never_get_mcp_servers() {
+        let (db, ws) = db_with_workspace();
+        let pid = mcp_crew(&db, 1);
+        let settings = std::collections::HashMap::from([("tracker".to_string(), mcp_cfg("from-settings"))]);
+        let new_run = |routine: Option<&str>| {
+            let db = db.lock();
+            let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+            db.pin_run_mcp_servers(&run, &settings).unwrap();
+            if let Some(r) = routine {
+                db.stamp_run_routine(&run, r).unwrap();
+            }
+            run
+        };
+        let in_routines = "MCP servers aren't available in Routines yet, so this stage runs without them.";
+        let detached = "MCP servers aren't available in detached runs yet, so this stage runs without them.";
+
+        // An older run of a Routine that has fired again since.
+        db.lock().insert_routine("r-mcp", &routine_input(&pid, "interval", "3600"), None, true).unwrap();
+        let older = new_run(Some("r-mcp"));
+        let latest = new_run(Some("r-mcp"));
+        db.lock().stamp_routine_run("r-mcp", &latest, &chrono::Utc::now().to_rfc3339()).unwrap();
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        assert_eq!(mcp_orch(&db, &seen, None).run_to_pause(&older).await.unwrap(), RunStatus::Completed);
+        assert_eq!(*seen.lock(), vec![None]);
+        assert!(notices(&db, &older).iter().any(|n| n.contains(in_routines)), "{:?}", notices(&db, &older));
+
+        // A run of a Routine deleted since.
+        db.lock().delete_routine("r-mcp").unwrap();
+        let orphan = new_run(Some("r-mcp"));
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        assert_eq!(mcp_orch(&db, &seen, None).run_to_pause(&orphan).await.unwrap(), RunStatus::Completed);
+        assert_eq!(*seen.lock(), vec![None]);
+        assert!(notices(&db, &orphan).iter().any(|n| n.contains(in_routines)));
+
+        // A detached run: the worker's drive, even with a registry.
+        let worker_run = new_run(None);
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        let worker = mcp_orch(&db, &seen, None).into_headless();
+        assert_eq!(worker.run_to_pause(&worker_run).await.unwrap(), RunStatus::Completed);
+        assert_eq!(*seen.lock(), vec![None]);
+        assert!(notices(&db, &worker_run).iter().any(|n| n.contains(detached)));
+
+        // The same crew, started in the app, gets its pinned server.
+        let app_run = new_run(None);
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        assert_eq!(mcp_orch(&db, &seen, None).run_to_pause(&app_run).await.unwrap(), RunStatus::Completed);
+        assert_eq!(seen.lock()[0].as_ref().map(|(_, p)| p.clone()), Some(settings.clone()));
+        assert!(!notices(&db, &app_run).iter().any(|n| n.contains(in_routines) || n.contains(detached)));
     }
 }
 
@@ -21500,7 +21820,7 @@ mod crew_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
@@ -25622,7 +25942,7 @@ mod plan_wait_tests {
             max_iterations: 25, pos_x: None, pos_y: None, parents,
             tools: (!parents_is_root(role)).then(|| vec!["read_file".into(), "list_files".into()]),
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
     fn parents_is_root(role: &str) -> bool {
@@ -28051,7 +28371,7 @@ mod sync_contract_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 30, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 

@@ -1452,6 +1452,7 @@ mod tests {
             effort: None,
             escalate_model: escalate.map(Into::into),
             escalate_effort: None,
+            mcp_servers: vec![],
         }
     }
 
@@ -1488,7 +1489,7 @@ mod tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         db.save_pipeline(None, "API only", "d", &[draft("api", "gpt-6.1-terra")]).unwrap();
         assert!(!wants_codex(&db));

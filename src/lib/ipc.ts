@@ -84,6 +84,8 @@ export interface PipelineStage {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none. */
+  mcpServers?: string[];
 }
 export interface Pipeline {
   id: string;
@@ -201,6 +203,9 @@ export interface StageDraft {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none,
+   *  the default. Never carried in a crew file. */
+  mcpServers?: string[];
 }
 /** One stage of a crew import's review sheet (mirrors Rust `crew::CrewStagePreview`). */
 export interface CrewStagePreview {
@@ -1173,6 +1178,9 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The Settings › Integrations servers only, with their live status: what
+   *  a Direct stage can choose. Spawns nothing. */
+  listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
   /** What the user trusts to run without an MCP card in Edit freely, per
    *  server (#1243), that still holds for its user-level entry. With a
    *  worktree, without the servers its own `.claude/mcp.json` defines. */
