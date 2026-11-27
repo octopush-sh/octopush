@@ -433,6 +433,10 @@ export interface ProjectMcpServer {
   command: string;
   args: string[];
   envNames: string[];
+  /** What runs, as the approval card shows it: shell-quoted argv with every
+   *  control, invisible and bidi character written as its code point, then
+   *  `· env …` (values only for names that load code). */
+  display: string;
   hash: string;
   state: "approved" | "waiting" | "changed" | "clash";
 }
