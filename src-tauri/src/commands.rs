@@ -2439,6 +2439,28 @@ pub async fn set_thread_permission_mode(state: State<'_, AppState>, thread_id: S
     Ok(mode.as_str().to_string())
 }
 
+/// The grants a Talk conversation holds (#1229), oldest first: the folders
+/// its commands read and its file tools write, and the exact commands it
+/// runs, without asking. None applies in Plan only.
+#[tauri::command]
+pub async fn list_thread_grants(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<crate::talk_guard::Grant>> {
+    state.db.lock().thread_grants(&thread_id)
+}
+
+/// Revoke one of a conversation's grants and return the rest; the next
+/// call it covered asks again. Emits `chat://grants-changed`, like keeping one.
+#[tauri::command]
+pub async fn revoke_thread_grant(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    grant: crate::talk_guard::Grant,
+) -> AppResult<Vec<crate::talk_guard::Grant>> {
+    let rest = state.db.lock().set_thread_grant(&thread_id, &grant, false)?;
+    let _ = app.emit(crate::chat_engine::GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
+    Ok(rest)
+}
+
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
 #[tauri::command]
 pub async fn get_mcp_config(
