@@ -21,7 +21,7 @@ describe("conductorSourceLine", () => {
       "From .conductor/settings.toml · edit before it runs · 7 lines",
     );
     expect(conductorSourceLine(Array(40).fill("echo $CONDUCTOR_PORT").join("\n"))).toBe(
-      "From .conductor/settings.toml · edit before it runs · 40 lines · CONDUCTOR_PORT isn't set in Octopush",
+      "From .conductor/settings.toml · edit before it runs · 40 lines",
     );
   });
 
@@ -44,15 +44,13 @@ describe("conductorSourceLine", () => {
     );
     const script = [...Array(7).fill("echo café"), "x".repeat(201), "echo $CONDUCTOR_PORT"].join("\n");
     expect(conductorSourceLine(script)).toBe(
-      `${BASE} · 9 lines · long line · non-ASCII characters · CONDUCTOR_PORT isn't set in Octopush`,
+      `${BASE} · 9 lines · long line · non-ASCII characters`,
     );
   });
 
-  it("notes CONDUCTOR_PORT only when the script reads it", () => {
+  it("adds no note for CONDUCTOR_PORT: the setup terminal gets it", () => {
     expect(conductorSourceLine("npm run dev -- --port $CONDUCTOR_PORT")).toBe(
-      "From .conductor/settings.toml · edit before it runs · CONDUCTOR_PORT isn't set in Octopush",
+      "From .conductor/settings.toml · edit before it runs",
     );
-    expect(conductorSourceLine('cp "$CONDUCTOR_ROOT_PATH/.env" .env')).not.toContain("CONDUCTOR_PORT");
-    expect(conductorSourceLine("echo $CONDUCTOR_PORTS")).not.toContain("CONDUCTOR_PORT");
   });
 });

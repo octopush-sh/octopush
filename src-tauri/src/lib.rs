@@ -52,6 +52,7 @@ pub mod talk_guard;
 pub mod permissions;
 pub mod talk_shell;
 pub mod workspace;
+pub mod workspace_ports;
 pub mod workspace_setup;
 pub mod worktree_share;
 pub mod mission;
@@ -271,6 +272,7 @@ pub fn run() {
             commands::workspaces_git_summary,
             commands::project_collisions,
             commands::workspace_diff_size,
+            commands::workspace_ports,
             commands::get_git_diff,
             commands::get_committed_diff,
             // Chat
@@ -782,8 +784,12 @@ fn restore_active_sessions(app: tauri::AppHandle, state: &AppState) {
             continue;
         }
 
-        let guard =
+        let mut guard =
             crate::context_guard::ContextGuard::auto_configure(&session.id, std::path::Path::new(&session.project_root));
+        let ports = crate::workspace_ports::ensure_for_root(&state.db.lock(), &session.project_root);
+        if let Some(block) = ports {
+            guard.set_ports(block);
+        }
         let mut env = std::collections::HashMap::new();
         guard.apply_env(&mut env);
 
