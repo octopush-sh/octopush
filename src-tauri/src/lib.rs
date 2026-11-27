@@ -618,6 +618,14 @@ pub fn run() {
                     Ok(n) => tracing::info!(count = n, "recovered interrupted run stages"),
                     Err(e) => tracing::error!(error = %e, "failed to recover interrupted runs"),
                 }
+                // Talk turns a restart cut off mid-turn end with a note
+                // saying so, instead of no final row at all.
+                let running = |thread: &str| st.chat.is_running(thread);
+                match st.db.lock().note_interrupted_talk_turns(chat_engine::RESTART_NOTE, &running) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "noted Talk turns interrupted by a restart"),
+                    Err(e) => tracing::error!(error = %e, "failed to note interrupted Talk turns"),
+                }
                 let sink = std::sync::Arc::new(orchestrator::events::TauriEventSink {
                     app: app.handle().clone(),
                 });

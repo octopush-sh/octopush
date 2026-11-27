@@ -123,10 +123,14 @@ describe("CompanionHistory — rendering & actions", () => {
     expect(props.onPinChat).toHaveBeenCalledWith("c1", true);
   });
 
-  it("exports a conversation via the export action", async () => {
+  it("copies a conversation as Markdown, and its label says so", async () => {
     const user = userEvent.setup();
     const props = renderHistory({ onExportChat: vi.fn() });
-    await user.click(screen.getAllByRole("button", { name: "Export conversation" })[0]);
+    const copy = screen.getAllByRole("button", { name: "Copy conversation as Markdown" })[0];
+    // The label matches the tooltip: the action copies, it downloads nothing.
+    expect(copy).toHaveAttribute("title", "Copy conversation as Markdown");
+    expect(screen.queryByRole("button", { name: "Export conversation" })).toBeNull();
+    await user.click(copy);
     expect(props.onExportChat).toHaveBeenCalledWith("c1");
   });
 
@@ -288,7 +292,7 @@ describe("CompanionHistory — the title owns the row (#756)", () => {
 
   it("keeps every action focusable with an inset ring", () => {
     renderHistory(withActions);
-    for (const name of ["Pin conversation", "Rename conversation", "Export conversation", "Delete conversation"]) {
+    for (const name of ["Pin conversation", "Rename conversation", "Copy conversation as Markdown", "Delete conversation"]) {
       const btn = screen.getAllByRole("button", { name })[0];
       expect(btn).not.toHaveAttribute("tabindex", "-1");
       expect(btn).toHaveClass("focus-visible:ring-1", "focus-visible:ring-inset");
