@@ -34,7 +34,13 @@ export function roundSummary(tools: ToolExecution[]): Array<{ verb: string; obje
     const verb = toolLabel(t.toolName).toLowerCase();
     const summary = summarizeTool(t.toolName, t.toolInput ?? {});
     const isPath = t.toolName === "read_file" || t.toolName === "write_file" || t.toolName === "edit_file";
-    const object = isPath ? summary.split("/").pop() || summary : summary;
+    // A loaded skill folds to `skill <name>`, not `skill used skill <name>`.
+    const object =
+      t.toolName === "Skill"
+        ? summary.replace(/^used skill /, "")
+        : isPath
+          ? summary.split("/").pop() || summary
+          : summary;
     const last = parts[parts.length - 1];
     if (last && last.verb === verb) last.objects.push(object);
     else parts.push({ verb, objects: [object] });

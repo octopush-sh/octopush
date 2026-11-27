@@ -37,6 +37,13 @@ describe("roundSummary", () => {
       { verb: "read", objects: ["README.md"] },
     ]);
   });
+
+  it("folds a loaded skill to its name", () => {
+    expect(roundSummary([t("Skill", { name: "code-review" }), t("read_file", { path: "a.ts" })])).toEqual([
+      { verb: "skill", objects: ["code-review"] },
+      { verb: "read", objects: ["a.ts"] },
+    ]);
+  });
 });
 
 describe("WorkBlock", () => {
@@ -72,6 +79,13 @@ describe("WorkBlock", () => {
     fireEvent.click(header);
     expect(header).toHaveAttribute("aria-expanded", "true");
     expect(within(row).getByText("ok")).toBeInTheDocument();
+  });
+
+  it("shows a skill the model loaded as a ledger row that names it", () => {
+    const { container } = render(<WorkBlock calls={1} entries={[round(1, [t("Skill", { name: "code-review" })])]} />);
+    const row = container.querySelector('[data-role="tool"]') as HTMLElement;
+    expect(within(row).getByRole("button", { name: "SKILL used skill code-review" })).toBeInTheDocument();
+    expect(within(row).getByText("used skill code-review")).toBeInTheDocument();
   });
 
   it("shows a round of five calls in full", () => {

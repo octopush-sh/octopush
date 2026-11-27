@@ -940,6 +940,69 @@ impl ExternalTools for McpSubagentTools {
     }
 }
 
+/// The `Skill` tool as a sub-agent has it (#1135): the worktree's skills,
+/// loaded the way the director loads them, so a skill can call skills.
+/// Offered before the caller's own tools (`inner`, the MCP grant).
+pub struct SkillSubagentTools<'a> {
+    pub inner: Option<&'a dyn ExternalTools>,
+    pub catalogue: Vec<crate::skills::Skill>,
+    pub scope: &'a Mutex<crate::skills::SkillScope>,
+}
+
+#[async_trait::async_trait]
+impl ExternalTools for SkillSubagentTools<'_> {
+    fn definitions(&self) -> Vec<LlmTool> {
+        let mut tools = Vec::new();
+        if !self.catalogue.is_empty() {
+            tools.push(crate::skills::skill_tool_definition());
+        }
+        if let Some(inner) = self.inner {
+            tools.extend(inner.definitions());
+        }
+        tools
+    }
+    fn owns(&self, name: &str) -> bool {
+        (name == crate::skills::SKILL_TOOL_NAME && !self.catalogue.is_empty())
+            || self.inner.is_some_and(|e| e.owns(name))
+    }
+    async fn call(&self, name: &str, input: &serde_json::Value) -> Result<String, String> {
+        if name == crate::skills::SKILL_TOOL_NAME {
+            let (text, ok) = {
+                let mut scope = self.scope.lock();
+                crate::skills::run_skill_tool(&self.catalogue, &[], &mut scope, input)
+            };
+            return if ok { Ok(text) } else { Err(text) };
+        }
+        match self.inner {
+            Some(inner) => inner.call(name, input).await,
+            None => Err(format!("Unknown tool `{name}`")),
+        }
+    }
+}
+
+/// A sub-agent's gate with the loaded skills' `allowed-tools` in front: a
+/// tool they don't allow is refused before the user is asked anything.
+pub struct SkillSubagentGate<'a> {
+    pub inner: Option<&'a dyn ToolGate>,
+    pub scope: &'a Mutex<crate::skills::SkillScope>,
+    /// The workspace tools a skill can limit (`build_llm_tools`).
+    pub workspace_tools: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl ToolGate for SkillSubagentGate<'_> {
+    async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+        let refusal = self.scope.lock().refusal(name, &self.workspace_tools);
+        if refusal.is_some() {
+            return refusal;
+        }
+        match self.inner {
+            Some(inner) => inner.check(name, input).await,
+            None => None,
+        }
+    }
+}
+
 /// Run one sub-agent to completion on an already-resolved provider. Split
 /// from the spawning wrapper so a scripted provider + recording sink can
 /// drive it in tests.
@@ -959,7 +1022,23 @@ pub async fn run_subagent_core(
     let started = std::time::Instant::now();
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
     let instructions = crate::project_instructions::for_workspace_off_runtime(spec.workspace_path.clone().into()).await;
-    let system = subagent_system_prompt(&spec.workspace_path, &spec.call, spec.definition.as_ref(), &instructions.section);
+    // The worktree's skills, listed after the project's instructions and
+    // loaded with `Skill`, as the director has them (#1135).
+    let catalogue = crate::skills::scan_skills(Path::new(&spec.workspace_path));
+    let skill_list = crate::skills::skill_list_section(&catalogue, &[]);
+    let system = subagent_system_prompt(
+        &spec.workspace_path,
+        &spec.call,
+        spec.definition.as_ref(),
+        &format!("{}{skill_list}", instructions.section),
+    );
+    let skill_scope = Mutex::new(crate::skills::SkillScope::default());
+    let skill_tools = SkillSubagentTools { inner: external, catalogue, scope: &skill_scope };
+    let skill_gate = SkillSubagentGate {
+        inner: gate,
+        scope: &skill_scope,
+        workspace_tools: crate::chat_engine::build_llm_tools().into_iter().map(|t| t.name).collect(),
+    };
     let allowed_tools = spec.definition.as_ref().and_then(|d| d.tools.as_deref());
     let effort = spec.plan.as_ref().and_then(|p| p.effort);
     let out = run_agentic_loop(
@@ -980,8 +1059,8 @@ pub async fn run_subagent_core(
         false,
         None,
         &[],
-        gate,
-        external,
+        Some(&skill_gate as &dyn ToolGate),
+        Some(&skill_tools as &dyn ExternalTools),
     )
     .await?;
     let (report, ok) = report_from_result(&out, spec.max_iterations);
@@ -2166,6 +2245,74 @@ mod tests {
         let (reason, denial) = mcp_gate_texts(Some("Ticket"), "mcp__jira__add_comment");
         assert!(reason.starts_with("Sub-agent \u{201c}Ticket\u{201d}: MCP tool"));
         assert!(reason.contains("may change external state") && denial.contains("do not retry"));
+    }
+
+    struct PromptRecordingScripted {
+        inner: ScriptedProvider,
+        system: Mutex<String>,
+        tools: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for PromptRecordingScripted {
+        async fn complete(&self, b: &str, k: Option<&str>, req: &LlmRequest, c: &reqwest::Client) -> AppResult<LlmResponse> {
+            *self.system.lock() = req.system.clone();
+            *self.tools.lock() = req.tools.iter().map(|t| t.name.clone()).collect();
+            self.inner.complete(b, k, req, c).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subagent_loads_a_skill_and_its_allowed_tools_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claude/skills/audit");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: audit\ndescription: Audit the code.\nallowed-tools: read_file\n---\nRead, never write.",
+        )
+        .unwrap();
+        let provider = PromptRecordingScripted {
+            inner: ScriptedProvider {
+                turns: Mutex::new(VecDeque::from(vec![
+                    resp("", vec![LlmToolUse { id: "t1".into(), name: "Skill".into(), input: serde_json::json!({"name": "audit"}) }], LlmStopReason::ToolUse),
+                    resp("", vec![LlmToolUse { id: "t2".into(), name: "write_file".into(), input: serde_json::json!({"path": "x.txt", "content": "hi"}) }], LlmStopReason::ToolUse),
+                    resp("audited", vec![], LlmStopReason::EndTurn),
+                ])),
+            },
+            system: Mutex::new(String::new()),
+            tools: Mutex::new(vec![]),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Audit".into(), prompt: "p".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(4), max_tokens: 1, sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, None, None).await.unwrap();
+        assert!(out.ok, "{}", out.report);
+        assert!(provider.system.lock().contains("- audit: Audit the code."));
+        assert!(provider.tools.lock().contains(&"Skill".to_string()));
+        // The skill's allowed-tools refused the write; nothing reached disk.
+        assert!(!dir.path().join("x.txt").exists());
+        let results: Vec<String> = out
+            .transcript
+            .iter()
+            .filter_map(|m| match &m.content {
+                crate::providers::LlmContent::ToolResults(r) => Some(r.iter().map(|r| r.content.clone()).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results[0].contains("Read, never write.") && !results[0].contains("[untrusted output from"), "{}", results[0]);
+        assert!(results[1].contains("`write_file` was not run") && results[1].contains("`audit`"), "{}", results[1]);
     }
 
     #[test]

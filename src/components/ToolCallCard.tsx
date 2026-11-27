@@ -30,6 +30,7 @@ export const TOOL_LABELS: Record<string, string> = {
   Agent: "AGENT",
   Task: "AGENT",
   recall_tool_output: "RECALL",
+  Skill: "SKILL",
 };
 
 /** The card header label for a tool name (e.g. `write_file` → `WRITE`,
@@ -66,6 +67,9 @@ export function summarizeTool(
     }
     case "recall_tool_output":
       return `#${String(toolInput?.message_id ?? "")}`;
+    case "Skill":
+      // The model loaded a skill on its own (#1135).
+      return `used skill ${String(toolInput?.name ?? toolInput?.skill ?? "")}`.trim();
     case "write_file":
     case "read_file":
     case "edit_file":

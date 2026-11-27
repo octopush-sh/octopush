@@ -65,7 +65,8 @@ pub enum Class {
     Net,
     /// `Agent` / `Task`: starts a sub-agent.
     Delegate,
-    /// The loop's own tools (recall, ask the director, a verdict, ask a stage).
+    /// The loop's own tools (recall, load a skill, ask the director, a
+    /// verdict, ask a stage).
     Meta,
 }
 
@@ -75,7 +76,11 @@ pub fn classify(name: &str) -> Class {
     match name {
         "read_file" | "list_files" | "grep" | "glob" => Class::Read,
         "run_command" => Class::Exec,
-        crate::chat_engine::RECALL_TOOL_NAME | ASK_DIRECTOR_TOOL | SUBMIT_VERDICT_TOOL | ASK_STAGE_TOOL => Class::Meta,
+        crate::chat_engine::RECALL_TOOL_NAME
+        | crate::skills::SKILL_TOOL_NAME
+        | ASK_DIRECTOR_TOOL
+        | SUBMIT_VERDICT_TOOL
+        | ASK_STAGE_TOOL => Class::Meta,
         n if crate::chat_agents::is_agent_tool(n) => Class::Delegate,
         n if crate::mcp::is_mcp_tool(n) => Class::Net,
         _ => Class::Write,
@@ -533,6 +538,7 @@ mod tests {
             ("ask_director", allow.clone(), allow.clone(), allow.clone()),
             ("submit_verdict", allow.clone(), allow.clone(), allow.clone()),
             ("ask_stage", allow.clone(), allow.clone(), allow.clone()),
+            ("Skill", allow.clone(), allow.clone(), allow.clone()),
         ];
         for (tool, plan, ask_first, edit) in table {
             assert_eq!(d(Mode::Plan, tool, Some(sandboxed), false), plan, "{tool} in Plan only");
