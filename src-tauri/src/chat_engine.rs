@@ -2821,6 +2821,23 @@ fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String
     tries.into_iter().find(|(o, _)| !o.is_empty() && content.contains(o.as_str()))
 }
 
+/// What `edit_file` leaves `content` as for `old` → `new`, matched as the
+/// tool matches it (as written, else copied from `read_file`'s view,
+/// [`edit_from_view`]), and how many places it replaced; `Err` with how
+/// many it found (none, or several without `replace_all`). Shared with Ask
+/// first's preview (#1231), so the card shows exactly what the edit does.
+pub(crate) fn apply_edit(content: &str, old: &str, new: &str, replace_all: bool) -> Result<(String, usize), usize> {
+    if old.is_empty() {
+        return Err(0);
+    }
+    let (old, new) = edit_from_view(content, old, new).unwrap_or_else(|| (old.to_string(), new.to_string()));
+    let count = content.matches(old.as_str()).count();
+    if count == 0 || (count > 1 && !replace_all) {
+        return Err(count);
+    }
+    Ok(if replace_all { (content.replace(&old, &new), count) } else { (content.replacen(&old, &new, 1), 1) })
+}
+
 /// [`execute_tool_cancellable`] with no cancel flag. The app always passes
 /// one ([`run_builtin`]); tests call this.
 #[cfg(test)]
@@ -3156,31 +3173,24 @@ pub(crate) fn execute_tool_cancellable(
                 Ok(c) => c,
                 Err(e) => return (format!("Error reading {path}: {e}"), false),
             };
-            // The model copied the edit from `read_file`'s view (`edit_from_view`).
-            let (old_string, new_string) = edit_from_view(&content, old_string, new_string)
-                .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
-            let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
-            let count = content.matches(old_string).count();
-            if count == 0 {
-                return (
-                    format!(
-                        "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
-                    ),
-                    false,
-                );
-            }
-            if count > 1 && !replace_all {
-                return (
-                    format!(
-                        "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
-                    ),
-                    false,
-                );
-            }
-            let (updated, replaced) = if replace_all {
-                (content.replace(old_string, new_string), count)
-            } else {
-                (content.replacen(old_string, new_string, 1), 1)
+            let (updated, replaced) = match apply_edit(&content, old_string, new_string, replace_all) {
+                Ok(done) => done,
+                Err(0) => {
+                    return (
+                        format!(
+                            "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
+                        ),
+                        false,
+                    );
+                }
+                Err(count) => {
+                    return (
+                        format!(
+                            "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
+                        ),
+                        false,
+                    );
+                }
             };
             // Same containment story as write_file: lexical pre-check plus the
             // kernel-enforced sandboxed write when the mission is sandboxed.

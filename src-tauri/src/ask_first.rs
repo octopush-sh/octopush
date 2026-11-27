@@ -134,17 +134,18 @@ fn file_preview(workspace: &Path, reach: &Reach, name: &str, input: &Value, know
     let after: Vec<u8> = if name == "write_file" {
         text("content").as_bytes().to_vec()
     } else {
-        let (old, new) = (text("old_string"), text("new_string"));
         let all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
         let Ok(current) = std::str::from_utf8(&before) else {
             return noted("No preview: the file isn't text, so the edit can't apply.", Some(bind(&before, &before)));
         };
-        let count = if old.is_empty() { 0 } else { current.matches(old).count() };
-        if count == 0 || (count > 1 && !all) {
-            return noted("No preview: the edit doesn't match the file as it is now, so it will fail.", Some(bind(&before, &before)));
+        // Exactly what `edit_file` applies: an edit copied from the numbered
+        // `read_file` view, CRLF restored, previews as the edit it makes.
+        match crate::chat_engine::apply_edit(current, text("old_string"), text("new_string"), all) {
+            Ok((edited, _)) => edited.into_bytes(),
+            Err(_) => {
+                return noted("No preview: the edit doesn't match the file as it is now, so it will fail.", Some(bind(&before, &before)));
+            }
         }
-        let edited = if all { current.replace(old, new) } else { current.replacen(old, new, 1) };
-        edited.into_bytes()
     };
     let bound = Some(bind(&before, &after));
     if before == after {
@@ -530,6 +531,26 @@ mod tests {
         assert_eq!((out, asks.into_inner()), (None, 1));
         assert!(refused(), "and the guard refuses the write as it runs");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "two lines\n");
+    }
+
+    /// An edit copied from `read_file`'s numbered view, in a CRLF file,
+    /// previews as the edit `edit_file` makes, and the approval binds to the
+    /// file that edit leaves (#1231 with #1244).
+    #[test]
+    fn a_numbered_edit_in_a_crlf_file_previews_what_it_applies() {
+        let ws = tempfile::tempdir().unwrap();
+        let file = ws.path().join("a.txt");
+        std::fs::write(&file, "a\r\nb\r\nc\r\n").unwrap();
+        let reach = Reach::new(ws.path(), None, None);
+        let input = json!({ "path": "a.txt", "old_string": "     2\tb\n     3\tc", "new_string": "B\nC" });
+        let card = card(ws.path(), &reach, None, "edit_file", &input, &[]);
+        assert_eq!(card.note, None);
+        assert_eq!(card.diff.as_deref(), Some("@@ -1,3 +1,3 @@\n a\n-b\n-c\n+B\n+C\n"));
+        let (out, ok) = crate::chat_engine::execute_tool(ws.path(), "edit_file", &input, None);
+        assert!(ok, "{out}");
+        let after = std::fs::read(&file).unwrap();
+        assert_eq!(after, b"a\r\nB\r\nC\r\n");
+        assert_eq!(card.bound, Some(bind(b"a\r\nb\r\nc\r\n", &after)), "the approval binds to the edit that runs");
     }
 
     /// The preview never reads outside the workspace, shows only the hunks
