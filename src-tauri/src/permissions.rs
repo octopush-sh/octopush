@@ -213,47 +213,79 @@ pub fn refusal(decision: Decision) -> Option<String> {
 /// What a command would change outside this Mac, or `None`. Plan only means
 /// no changes to the world, so it refuses these even on the read-only
 /// sandbox, which doesn't stop the network. A heuristic over the command's
-/// words, like the command check whose walk over nested commands it shares
-/// ([`crate::chat_engine::each_command`]); not a network sandbox. It knows
-/// pushing, publishing, deploying and sending tools (`git push`, `gh` writes,
-/// `curl`/`wget` that send data, package publishing, `docker push`,
+/// words, read like the command check reads them: every nested command
+/// ([`crate::chat_engine::each_command`]), each word as the shell splits it
+/// ([`crate::chat_engine::command_words`]: quotes, redirections), past
+/// keywords and wrappers (`then`, `do`, `!`, `sudo`, `eval`…). Not a network
+/// sandbox. It knows pushing, publishing, deploying and sending tools
+/// (`git push`, `gh`/`hub` writes, `curl`/`wget`/httpie that send data,
+/// package publishing and release tools, `docker push`,
 /// `kubectl`/`helm`/`terraform` changes); reading and fetching pass.
 pub fn remote_effect(command: &str) -> Option<&'static str> {
-    crate::chat_engine::each_command(command, |line| line.split([';', '|', '&', '\n']).find_map(remote_segment))
-        .unwrap_or(Some("nests more commands than the check reads"))
+    crate::chat_engine::each_command(command, remote_line).unwrap_or(Some("nests more commands than the check reads"))
 }
 
-/// Programs that run the rest of their line (`env X=1 git push`).
-const WRAPPERS: &[&str] =
-    &["env", "command", "builtin", "exec", "nohup", "time", "nice", "sudo", "doas", "xargs", "timeout", "gtimeout", "caffeinate", "stdbuf", "watch"];
+/// Shell keywords and programs that run the command after them
+/// (`then git push`, `env X=1 git push`, `sudo -u x git push`).
+const WRAPPERS: &[&str] = &[
+    "then", "do", "else", "elif", "if", "while", "until", "!", "{", "time", "exec", "nohup", "xargs", "command", "builtin",
+    "env", "nice", "sudo", "doas", "timeout", "gtimeout", "caffeinate", "stdbuf", "watch",
+];
 
 type RemoteRule = fn(&[&str]) -> Option<&'static str>;
 
-fn remote_segment(segment: &str) -> Option<&'static str> {
-    let words: Vec<&str> = segment
-        .split_whitespace()
-        .map(|w| w.trim_matches(['"', '\'', '`', '(', ')', '{', '}']).trim_start_matches('\\'))
-        .filter(|w| !w.is_empty())
-        .collect();
-    let program = |w: &str| w.rsplit('/').next().unwrap_or(w).to_ascii_lowercase();
-    let assigns = |w: &str| w.split_once('=').is_some_and(|(n, _)| !n.is_empty() && !n.starts_with('-') && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()));
-    let first = words.iter().position(|&w| !assigns(w))?;
-    // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come first.
-    let at = if WRAPPERS.contains(&program(words[first]).as_str()) {
-        first + 1 + words[first + 1..].iter().position(|&w| remote_rule(&program(w)).is_some())?
-    } else {
-        first
-    };
-    remote_rule(&program(words[at]))?(&words[at + 1..])
+fn remote_line(line: &str) -> Option<&'static str> {
+    let words = crate::chat_engine::command_words(line);
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut last = None;
+    for w in &words {
+        if last != Some(w.segment) {
+            segments.push(Vec::new());
+            last = Some(w.segment);
+        }
+        // What runs: the program and its arguments, not a here-document's
+        // body or a redirection's target.
+        let started = segments.last().is_some_and(|s| !s.is_empty());
+        let runs = w.role == crate::chat_engine::WordRole::Program || (started && w.role == crate::chat_engine::WordRole::Argument);
+        if runs && !w.redirect {
+            if let Some(seg) = segments.last_mut() {
+                seg.push(w.word.as_str());
+            }
+        }
+    }
+    segments.iter().find_map(|seg| remote_command(seg))
+}
+
+fn program(w: &str) -> String {
+    w.rsplit('/').next().unwrap_or(w).to_ascii_lowercase()
+}
+
+/// `words` from the program on.
+fn remote_command(words: &[&str]) -> Option<&'static str> {
+    let (first, rest) = words.split_first()?;
+    let name = program(first);
+    if name == "eval" {
+        return remote_effect(&rest.join(" "));
+    }
+    if WRAPPERS.contains(&name.as_str()) {
+        // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come first.
+        let at = rest.iter().position(|&w| program(w) == "eval" || remote_rule(&program(w)).is_some())?;
+        return remote_command(&rest[at..]);
+    }
+    remote_rule(&name)?(rest)
 }
 
 fn remote_rule(program: &str) -> Option<RemoteRule> {
     let rule: RemoteRule = match program {
         "git" => git_remote,
         "gh" => gh_remote,
+        "hub" => hub_remote,
         "curl" => curl_remote,
         "wget" => wget_remote,
-        "npm" | "pnpm" | "yarn" | "bun" | "cargo" | "pip" | "pip3" | "poetry" | "uv" | "twine" | "gem" => publish_remote,
+        "http" | "https" | "xh" | "xhs" => httpie_remote,
+        "npm" | "pnpm" | "yarn" | "bun" | "npx" | "pnpx" | "bunx" | "cargo" | "pip" | "pip3" | "poetry" | "uv" | "uvx" | "twine"
+        | "gem" => publish_remote,
+        "python" | "python3" | "py" => python_remote,
         "docker" | "podman" => docker_remote,
         "kubectl" | "oc" | "helm" | "terraform" | "tofu" => deploy_remote,
         _ => return None,
@@ -295,31 +327,45 @@ const GH_WRITES: &[&str] = &[
     "cancel", "enable", "disable", "develop", "deploy",
 ];
 
+/// `gh api` / `hub api` send a GET unless a method is named or a field is given.
+fn api_sends(args: &[&str]) -> bool {
+    let (mut method, mut fields) = (None, false);
+    for (i, a) in args.iter().enumerate() {
+        if *a == "-X" || *a == "--method" {
+            method = args.get(i + 1).copied();
+        } else if let Some(m) = a.strip_prefix("--method=").or_else(|| a.strip_prefix("-X").filter(|m| !m.is_empty())) {
+            method = Some(m);
+        } else if ["-f", "-F", "--field", "--raw-field", "--input"].iter().any(|f| a.starts_with(f)) {
+            fields = true;
+        }
+    }
+    method.map_or(fields, |m| !is_read_method(m))
+}
+
 fn gh_remote(args: &[&str]) -> Option<&'static str> {
     let ops = operands(args, &["-R", "--repo"]);
     let group = ops.first().map(|s| s.to_ascii_lowercase());
     if group.as_deref() == Some("api") {
-        // `gh api` sends a GET unless a method is named or a field is given.
-        let (mut method, mut fields) = (None, false);
-        for (i, a) in args.iter().enumerate() {
-            if *a == "-X" || *a == "--method" {
-                method = args.get(i + 1).copied();
-            } else if let Some(m) = a.strip_prefix("--method=").or_else(|| a.strip_prefix("-X").filter(|m| !m.is_empty())) {
-                method = Some(m);
-            } else if ["-f", "-F", "--field", "--raw-field", "--input"].iter().any(|f| a.starts_with(f)) {
-                fields = true;
-            }
-        }
-        let sends = method.map_or(fields, |m| !is_read_method(m));
-        return sends.then_some("gh api with a method other than GET");
+        return api_sends(args).then_some("gh api with a method other than GET");
     }
     let local = matches!(group.as_deref(), Some("alias" | "config" | "extension" | "ext" | "completion" | "auth" | "help"));
     let verb = ops.get(1).map(|s| s.to_ascii_lowercase());
     (!local && verb.is_some_and(|v| GH_WRITES.contains(&v.as_str()))).then_some("a gh command that changes GitHub")
 }
 
+/// `hub` wraps git and adds GitHub commands of its own.
+fn hub_remote(args: &[&str]) -> Option<&'static str> {
+    let ops = operands(args, &["-C", "-c"]);
+    let changes = match ops.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("pull-request" | "create" | "fork" | "delete") => true,
+        Some("api") => api_sends(args),
+        _ => git_remote(args).is_some() || gh_remote(args).is_some(),
+    };
+    changes.then_some("a hub command that changes GitHub")
+}
+
 fn curl_remote(args: &[&str]) -> Option<&'static str> {
-    const WHY: &str = "curl that sends data or uses a method other than GET";
+    const WHY: &str = "curl that sends data, uses a method other than GET, or reads a config file";
     // `-G` sends `-d` data as a GET query.
     let get = args.iter().any(|a| *a == "-G" || *a == "--get");
     for (i, a) in args.iter().enumerate() {
@@ -328,8 +374,9 @@ fn curl_remote(args: &[&str]) -> Option<&'static str> {
             _ => a.strip_prefix("--request="),
         };
         let sends_long = |flags: &[&str]| flags.iter().any(|f| a == f || a.strip_prefix(f).is_some_and(|r| r.starts_with('=')));
+        // A config file can name any of these, so it isn't read past.
         if method.is_some_and(|m| !is_read_method(m))
-            || sends_long(&["--form", "--form-string", "--upload-file"])
+            || sends_long(&["--form", "--form-string", "--upload-file", "--config"])
             || (!get && sends_long(&["--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json"]))
         {
             return Some(WHY);
@@ -339,7 +386,7 @@ fn curl_remote(args: &[&str]) -> Option<&'static str> {
         if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) {
             for (j, c) in cluster.char_indices() {
                 match c {
-                    'F' | 'T' => return Some(WHY),
+                    'F' | 'T' | 'K' => return Some(WHY),
                     'd' if !get => return Some(WHY),
                     'X' => {
                         let rest = &cluster[j + 1..];
@@ -349,7 +396,7 @@ fn curl_remote(args: &[&str]) -> Option<&'static str> {
                         }
                         break;
                     }
-                    c if "dHouAebcmwxrEKDCYyzUQtP".contains(c) => break,
+                    c if "dHouAebcmwxrEDCYyzUQtP".contains(c) => break,
                     _ => {}
                 }
             }
@@ -366,15 +413,49 @@ fn wget_remote(args: &[&str]) -> Option<&'static str> {
     })
 }
 
-fn docker_remote(args: &[&str]) -> Option<&'static str> {
-    args.iter().any(|a| a.eq_ignore_ascii_case("push") || *a == "--push").then_some("docker push")
+/// httpie (`http [METHOD] URL [ITEM…]`): the method it names, else POST
+/// when an item carries data (`a=b`, `a:=1`, `a@file`; `a==b` is a query,
+/// `A:b` a header).
+fn httpie_remote(args: &[&str]) -> Option<&'static str> {
+    const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    let ops = operands(args, &["-a", "--auth", "-A", "--auth-type", "--session", "--session-read-only", "-o", "--output", "-p", "--print", "--proxy", "--timeout", "--verify", "--cert", "--cert-key", "--pretty", "-s", "--style"]);
+    let (method, items) = match ops.split_first() {
+        Some((m, rest)) if METHODS.iter().any(|x| m.eq_ignore_ascii_case(x)) => (Some(*m), rest.get(1..).unwrap_or(&[])),
+        Some((_, rest)) => (None, rest),
+        None => return None,
+    };
+    let data = |item: &&str| item.contains(":=") || item.contains('@') || item.split_once('=').is_some_and(|(_, v)| !v.starts_with('='));
+    let sends = method.map_or_else(|| items.iter().any(data), |m| !is_read_method(m));
+    sends.then_some("an httpie request that sends data or uses a method other than GET")
 }
 
+/// Release tools that publish when they run (`npx semantic-release`).
+const RELEASERS: &[&str] = &["semantic-release", "release-it", "np"];
+
 fn publish_remote(args: &[&str]) -> Option<&'static str> {
-    // `yarn npm publish` names it second.
-    let ops = operands(args, &[]);
-    let publishes = |o: &&str| matches!(o.to_ascii_lowercase().as_str(), "publish" | "unpublish" | "deprecate" | "yank" | "owner" | "upload" | "push");
-    ops.iter().take(2).any(publishes).then_some("publishes a package")
+    // Past every flag (`npm --workspace a publish`), and in a package an
+    // npx-style runner starts (`npx lerna publish`, `npx semantic-release@22`).
+    let ops = operands(args, &["--workspace", "-w", "--registry", "--tag", "--otp", "--access", "--filter", "--dir", "--cwd", "--manifest-path", "-p", "--package"]);
+    let publishes = |o: &&str| {
+        let o = o.to_ascii_lowercase();
+        let name = match o.strip_prefix('@') {
+            Some(scoped) => scoped.split('@').next().unwrap_or(scoped),
+            None => o.split('@').next().unwrap_or(&o),
+        };
+        matches!(o.as_str(), "publish" | "unpublish" | "deprecate" | "yank" | "owner" | "upload" | "push") || RELEASERS.contains(&name)
+    };
+    ops.iter().any(publishes).then_some("publishes a package or a release")
+}
+
+/// `python -m <module>` runs the module as the program (`python -m twine upload`).
+fn python_remote(args: &[&str]) -> Option<&'static str> {
+    let at = args.iter().position(|a| *a == "-m")?;
+    let module = args.get(at + 1)?;
+    remote_rule(&program(module))?(&args[at + 2..])
+}
+
+fn docker_remote(args: &[&str]) -> Option<&'static str> {
+    args.iter().any(|a| a.eq_ignore_ascii_case("push") || *a == "--push").then_some("docker push")
 }
 
 /// Words that change a cluster or infrastructure, anywhere in the command.
@@ -608,28 +689,61 @@ mod tests {
             ("gh api with a method other than GET", "gh api --method=PATCH repos/o/r"),
             ("gh api with a method other than GET", "gh api repos/o/r/issues -f title=x"),
             ("gh api with a method other than GET", "gh api repos/o/r/pulls/1/merge -XPUT"),
-            ("curl that sends data or uses a method other than GET", "curl -X POST https://api.example.com"),
-            ("curl that sends data or uses a method other than GET", "curl -XDELETE https://api.example.com/x"),
-            ("curl that sends data or uses a method other than GET", "curl --request=PUT https://x"),
-            ("curl that sends data or uses a method other than GET", "curl -sS -d '{}' https://x"),
-            ("curl that sends data or uses a method other than GET", "curl -sSd x https://x"),
-            ("curl that sends data or uses a method other than GET", "curl --data-binary @f https://x"),
-            ("curl that sends data or uses a method other than GET", "curl --json '{}' https://x"),
-            ("curl that sends data or uses a method other than GET", "curl -F file=@a.png https://x"),
-            ("curl that sends data or uses a method other than GET", "curl -T a.tar https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -X POST https://api.example.com"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -XDELETE https://api.example.com/x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl --request=PUT https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -sS -d '{}' https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -sSd x https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl --data-binary @f https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl --json '{}' https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -F file=@a.png https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -T a.tar https://x"),
             ("wget that sends data or uses a method other than GET", "wget --post-data=a=1 https://x"),
             ("wget that sends data or uses a method other than GET", "wget --method=DELETE https://x"),
-            ("publishes a package", "npm publish"),
-            ("publishes a package", "cargo publish --dry-run=false"),
-            ("publishes a package", "pip publish dist/*"),
-            ("publishes a package", "yarn npm publish"),
-            ("publishes a package", "twine upload dist/*"),
+            ("publishes a package or a release", "npm publish"),
+            ("publishes a package or a release", "cargo publish --dry-run=false"),
+            ("publishes a package or a release", "pip publish dist/*"),
+            ("publishes a package or a release", "yarn npm publish"),
+            ("publishes a package or a release", "twine upload dist/*"),
             ("docker push", "docker push registry.example.com/app:1"),
             ("docker push", "docker buildx build --push ."),
             ("changes a cluster or infrastructure (kubectl, helm, terraform)", "kubectl apply -f deploy.yaml"),
             ("changes a cluster or infrastructure (kubectl, helm, terraform)", "kubectl -n prod delete pod web-1"),
             ("changes a cluster or infrastructure (kubectl, helm, terraform)", "terraform apply -auto-approve"),
             ("changes a cluster or infrastructure (kubectl, helm, terraform)", "helm upgrade web ./chart"),
+            // Past shell keywords and wrappers.
+            ("git push", "for b in main dev; do git push origin $b; done"),
+            ("git push", "if git diff --quiet; then git push; fi"),
+            ("git push", "if git push; then echo ok; fi"),
+            ("git push", "while true; do git push; sleep 60; done"),
+            ("git push", "! git push"),
+            ("git push", "eval git push"),
+            ("git push", "eval \"git push --force\""),
+            ("git push", "time nohup git push &"),
+            // Words as the shell splits them: quotes and redirections.
+            ("git push", "git -C \"my dir\" push"),
+            ("git push", "git push>/dev/null 2>&1"),
+            ("git push", "git push --repo='o r'"),
+            // Publishing past every flag, release tools, modules.
+            ("publishes a package or a release", "npm --workspace a --workspace b publish"),
+            ("publishes a package or a release", "pnpm --filter web publish --no-git-checks"),
+            ("publishes a package or a release", "npx semantic-release"),
+            ("publishes a package or a release", "npx --yes semantic-release@22"),
+            ("publishes a package or a release", "npx lerna publish from-git"),
+            ("publishes a package or a release", "python -m twine upload dist/*"),
+            ("publishes a package or a release", "python3 -m poetry publish"),
+            ("a hub command that changes GitHub", "hub pull-request -m 'Fix it'"),
+            ("a hub command that changes GitHub", "hub push origin main"),
+            ("a hub command that changes GitHub", "hub release create v1.0"),
+            ("a hub command that changes GitHub", "hub api -X POST repos/o/r/issues"),
+            ("an httpie request that sends data or uses a method other than GET", "http POST api.example.com/items name=x"),
+            ("an httpie request that sends data or uses a method other than GET", "http api.example.com/items name=x"),
+            ("an httpie request that sends data or uses a method other than GET", "https PUT api.example.com/items/1 count:=2"),
+            ("an httpie request that sends data or uses a method other than GET", "http -f api.example.com/upload file@a.png"),
+            ("an httpie request that sends data or uses a method other than GET", "http DELETE api.example.com/items/1"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -K req.cfg https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl --config=req.cfg https://x"),
+            ("curl that sends data, uses a method other than GET, or reads a config file", "curl -sK req.cfg"),
         ];
         for (why, command) in refused {
             assert_eq!(remote_effect(command), Some(why), "{command}");
@@ -657,6 +771,19 @@ mod tests {
             "terraform plan",
             "echo git push",
             "grep -rn 'git push' .",
+            "for f in *.md; do git add \"$f\"; done",
+            "if git diff --quiet; then echo clean; fi",
+            "git log --format='%s push' -1",
+            "git commit -m \"then git push\"",
+            "hub pr list",
+            "hub api repos/o/r",
+            "http api.example.com/items",
+            "http GET api.example.com/search q==x Accept:application/json",
+            "https HEAD example.com",
+            "npx eslint .",
+            "npm --workspace a test",
+            "python -m http.server 8000",
+            "python -m pytest -q",
         ];
         for command in allowed {
             assert_eq!(remote_effect(command), None, "{command}");

@@ -780,6 +780,11 @@ pub(crate) struct CommandWord {
     pub unmodeled: bool,
     /// The target of an output redirection (`>`, `>>`, `&>`).
     pub writes: bool,
+    /// The target of any redirection, input or output.
+    pub redirect: bool,
+    /// The word with quotes removed and nothing dropped (`--method=POST`
+    /// whole), for checks that read flags (`permissions::remote_effect`).
+    pub word: String,
 }
 
 /// The words of one command line as the path check reads them (#1201): a
@@ -962,6 +967,8 @@ impl Lexer {
             spliced: strip(&w.spliced),
             unmodeled: w.unmodeled,
             writes: target == Some(true),
+            redirect: target.is_some(),
+            word: crate::talk_guard::unescape(&w.pattern),
         });
     }
 
