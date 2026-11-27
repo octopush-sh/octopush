@@ -780,6 +780,11 @@ pub(crate) struct CommandWord {
     pub unmodeled: bool,
     /// The target of an output redirection (`>`, `>>`, `&>`).
     pub writes: bool,
+    /// The target of any redirection, input or output.
+    pub redirect: bool,
+    /// The word with quotes removed and nothing dropped (`--method=POST`
+    /// whole), for checks that read flags (`permissions::remote_effect`).
+    pub word: String,
 }
 
 /// The words of one command line as the path check reads them (#1201): a
@@ -962,6 +967,8 @@ impl Lexer {
             spliced: strip(&w.spliced),
             unmodeled: w.unmodeled,
             writes: target == Some(true),
+            redirect: target.is_some(),
+            word: crate::talk_guard::unescape(&w.pattern),
         });
     }
 
@@ -2439,6 +2446,38 @@ fn wait_command_bounded(
     }
 }
 
+/// What a command under the read-only profile (Plan only, a read-only
+/// mission) says when a refused write broke it, so the model stops trying.
+pub(crate) const READ_ONLY_NOTE: &str = "(This command ran under the read-only sandbox: it can read the workspace \
+     and write temp files, but it can't change the workspace.)";
+
+/// `out` with [`READ_ONLY_NOTE`] when a command on the read-only profile
+/// (`Some([])`) failed on a refused write.
+fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String]>) -> String {
+    if !ok && matches!(sandbox_roots, Some([])) && out.contains("Operation not permitted") {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(READ_ONLY_NOTE);
+    }
+    out
+}
+
+/// `run_command` with `input` in `workspace` under `roots`, on a blocking
+/// thread, so the turn's runtime thread stays free; `cancel` (Stop) kills
+/// it mid-run.
+pub(crate) async fn run_confined(
+    workspace: &Path,
+    input: &serde_json::Value,
+    roots: Option<Vec<String>>,
+    cancel: &std::sync::Arc<AtomicBool>,
+) -> (String, bool) {
+    let (wp, input, flag) = (workspace.to_path_buf(), input.clone(), std::sync::Arc::clone(cancel));
+    tokio::task::spawn_blocking(move || execute_tool_cancellable(&wp, "run_command", &input, roots.as_deref(), Some(&flag)))
+        .await
+        .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
+}
+
 /// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
 /// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
 /// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
@@ -2508,7 +2547,8 @@ pub(crate) fn execute_tool_cancellable(
                 c
             };
             command.current_dir(workspace_path);
-            wait_command_bounded(command, timeout_secs, cancel)
+            let (out, ok) = wait_command_bounded(command, timeout_secs, cancel);
+            (with_read_only_note(out, ok, sandbox_roots), ok)
         }
         "read_file" => {
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
@@ -4405,6 +4445,14 @@ impl ChatEngine {
 
             // The round boundary: every tool_use has its result.
             self.guard_context(&app, &request, &context_guard, &mut messages, fixed_chars, &tool_rows, v2);
+            // The thread's permission mode (#1146), read at the boundary so a
+            // change applies from the next round. Plan only runs this round's
+            // commands, and its sub-agents', under the read-only sandbox.
+            let mode = crate::permissions::effective(
+                crate::permissions::thread_mode(&self.db, &request.thread_id),
+                sandbox_roots.as_deref(),
+            );
+            let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
 
             let response = loop {
                 let llm_req = director_request(&request, &system_prompt, &messages, &tools);
@@ -4580,6 +4628,25 @@ impl ChatEngine {
             // its content blocks verbatim (`tool_round_turn`).
             messages.push(tool_round_turn(&response));
 
+            // The mode decides each call before anything runs (#1146): a call
+            // it refuses gets a fixed result and never reaches a card.
+            let mode_denials: HashMap<String, String> = response
+                .tool_uses
+                .iter()
+                .filter_map(|u| {
+                    let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
+                    let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
+                    let ctx = crate::permissions::PolicyCtx {
+                        exec_roots: exec_roots.as_deref(),
+                        mcp_read_only: &mcp_read_only,
+                        delegate_writes: crate::chat_agents::delegate_writes(definition),
+                        forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                    };
+                    let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
+                    crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
+                })
+                .collect();
+
             // ── Sub-agents: fan out first ──────────────────────────
             // Every `Agent` call in this response runs CONCURRENTLY (that is
             // how a skill parallelizes: several tool_use blocks in one
@@ -4598,7 +4665,12 @@ impl ChatEngine {
                 // call's plan is decided BEFORE its card opens.
                 let (known_models, tiers) = if has_agents { model_catalog() } else { (Vec::new(), HashMap::new()) };
                 for u in response.tool_uses.iter().filter(|u| is_agent_tool(&u.name)) {
-                    let parsed = parse_agent_call(&u.input);
+                    // A call the mode refused opens its card and fails there,
+                    // like a malformed one.
+                    let parsed = match mode_denials.get(&u.id) {
+                        Some(refused) => Err(refused.clone()),
+                        None => parse_agent_call(&u.input),
+                    };
                     let mut planned: Option<(SubagentSpec, SubagentPlan)> = None;
                     if let Ok(call) = &parsed {
                         let definition = call
@@ -4618,6 +4690,8 @@ impl ChatEngine {
                                 subagent_cap,
                             ),
                             max_tokens: request.max_tokens,
+                            // The mission's; the sub-agent narrows them by
+                            // the thread's mode as it starts (`mode_spec`).
                             sandbox_roots: sandbox_roots.clone(),
                             definition,
                             policy_auto,
@@ -4720,15 +4794,17 @@ impl ChatEngine {
                 // An MCP write and a file tool reaching outside the workspace
                 // ask first (#1147); a server switched off here is refused
                 // below without asking.
-                let mut denied: Option<String> = None;
+                // The mode's refusal comes first; a sub-agent's is its outcome.
+                let mode_denied = mode_denials.contains_key(&u.id);
+                let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();
                 // A tool a skill loaded this turn doesn't allow is refused
                 // before anything asks the user (#1135).
-                let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools);
+                let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools).filter(|_| !mode_denied);
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
                 let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
-                let gated = skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
+                let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
                     denied = guard_card(card, &check, ask).await;
@@ -4738,7 +4814,7 @@ impl ChatEngine {
                 // A denial skips execution and tells the model the user
                 // declined. The secret guard asks first (#819): a thread's
                 // "don't ask again" covers the destructive check, never it.
-                if u.name == "run_command" && skill_refusal.is_none() {
+                if u.name == "run_command" && denied.is_none() && skill_refusal.is_none() {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     denied = guard_agent_command(
                         &self.approvals,
@@ -4755,7 +4831,7 @@ impl ChatEngine {
                     // location asks every time (#1201), read from where the
                     // command runs: the shared shell's cwd when it runs there.
                     if denied.is_none() {
-                        let shared = self.talk_shell.available() && sandbox_roots.is_none();
+                        let shared = self.talk_shell.available() && exec_roots.is_none();
                         let check = || {
                             let cwd = shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
                             let allowed = self.approvals.read_dirs(&request.thread_id);
@@ -4815,7 +4891,7 @@ impl ChatEngine {
                 // Stop interrupted the command: it reads as stopped.
                 let mut interrupted = false;
                 // Not run: denied at its card, or its MCP server is off here.
-                let mut was_denied = denied.is_some();
+                let mut was_denied = denied.is_some() || mode_denied;
 
                 // Route MCP tools (`mcp__server__tool`) to their server; all
                 // other names are built-in workspace tools. MCP calls run off
@@ -4876,7 +4952,7 @@ impl ChatEngine {
                         }
                         Err(e) => (e, false),
                     }
-                } else if u.name == "run_command" && self.talk_shell.available() && sandbox_roots.is_none() {
+                } else if u.name == "run_command" && self.talk_shell.available() && exec_roots.is_none() {
                     // Unify with `$`-direct: the agent runs commands in the SAME
                     // persistent shell, so it shares the user's cwd/env. Capture
                     // (Sandboxed missions skip the shared shell and fall through to
@@ -4947,9 +5023,9 @@ impl ChatEngine {
                             let input = u.input.clone();
                             let (out, ok) = match tokio::time::timeout(
                                 std::time::Duration::from_secs(600),
-                                // This fallback is only reached for a non-sandboxed
-                                // mission (the shared-shell branch is gated on
-                                // sandbox_roots.is_none()), so it runs unconfined.
+                                // This fallback is only reached unsandboxed (the
+                                // shared-shell branch is gated on
+                                // exec_roots.is_none()), so it runs unconfined.
                                 tokio::task::spawn_blocking(move || execute_tool(&wp, &name, &input, None)),
                             )
                             .await
@@ -4965,8 +5041,14 @@ impl ChatEngine {
                             )
                         }
                     }
+                } else if u.name == "run_command" {
+                    // On the sandbox (Plan only, a sandboxed mission) or without
+                    // the shared shell: off the runtime thread, and Stop kills it.
+                    let ran = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
+                    interrupted = cancel.load(Ordering::Relaxed);
+                    ran
                 } else {
-                    execute_tool(&workspace_path, &u.name, &u.input, sandbox_roots.as_deref())
+                    execute_tool(&workspace_path, &u.name, &u.input, exec_roots.as_deref())
                 };
 
                 // ── Live card: announce completion (timing + status) ──
@@ -4982,7 +5064,7 @@ impl ChatEngine {
                 });
 
                 // If the tool wrote a file, record it in file_edits for the Review canvas.
-                if u.name == "write_file" || u.name == "edit_file" {
+                if (u.name == "write_file" || u.name == "edit_file") && !mode_denied {
                     if let Some(path) = u.input.get("path").and_then(|p| p.as_str()) {
                         let msg_id = if assistant_msg_id >= 0 { Some(assistant_msg_id) } else { None };
                         if let Err(e) = self.db.lock().insert_file_edit(
