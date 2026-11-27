@@ -48,6 +48,23 @@ describe("titleRequest", () => {
     expect(req.system).toContain('start the title with "GUIDE-123 · "');
   });
 
+  it("takes no ticket key from an @ block or fenced code", () => {
+    const content = "summarize this file\n\n```src/notes.md\nFollow-up for ENG-42\n```";
+    const start = content.indexOf("\n\n```");
+    const contextBlocks = JSON.stringify([
+      { token: "src/notes.md", kind: "file", label: "notes.md", tokens: 12, start, end: content.length },
+    ]);
+    const withBlock = titleRequest([{ ...msg("user", content), contextBlocks }, msg("assistant", "Done.", "claude-opus-5-5")])!;
+    expect(withBlock.key).toBeNull();
+    expect(withBlock.system).not.toContain("ENG-42");
+    expect(withBlock.system).not.toContain("start the title with");
+
+    const withCode = titleRequest(thread("why does this fail?\n```\n// ENG-42 workaround\nrun()\n```"))!;
+    expect(withCode.key).toBeNull();
+    expect(withCode.system).not.toContain("ENG-42");
+    expect(withCode.system).not.toContain("start the title with");
+  });
+
   it("has nothing to send before an answer", () => {
     expect(titleRequest([msg("user", "hi")])).toBeNull();
     expect(titleRequest([])).toBeNull();

@@ -32,8 +32,11 @@ export function titleRequest(messages: ChatMessage[]): { system: string; prompt:
     .join("\n\n")
     .slice(0, ANSWER_CHARS);
   if (!answer) return null;
-  const typed = titleSource(ask.content, ask.contextBlocks) || ask.content.trim();
-  const key = ticketKey(ask.content);
+  const source = titleSource(ask.content, ask.contextBlocks);
+  const typed = source || ask.content.trim();
+  // The key comes from what the user typed, never from an `@` block's body or
+  // fenced code; a tracker URL typed in the ask still reads as its key.
+  const key = ticketKey(source);
   const system = key
     ? `${TITLE_SYSTEM} The conversation is about ${key}: start the title with "${key} · ".`
     : TITLE_SYSTEM;
