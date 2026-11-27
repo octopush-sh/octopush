@@ -2558,7 +2558,10 @@ mod tests {
         // Chosen by the conversation, and forced by a read-only mission on a
         // conversation left in Edit freely.
         for (mode, mission, forced) in [(Mode::Plan, None, false), (Mode::Edit, Some(vec![]), true)] {
-            let dir = tempfile::tempdir().unwrap();
+            // Outside `$TMPDIR`, which the read-only profile keeps writable.
+            let caches = dirs::cache_dir().unwrap();
+            std::fs::create_dir_all(&caches).unwrap();
+            let dir = tempfile::Builder::new().prefix("octopush-plan-agent-").tempdir_in(&caches).unwrap();
             std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
             let (_tmp, db, mut base) = mode_thread(mode, dir.path());
             base.sandbox_roots = mission;
