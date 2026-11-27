@@ -1,11 +1,12 @@
 import type { KeyboardEvent } from "react";
 import { ShieldAlert } from "lucide-react";
 import type { PendingApproval } from "../../stores/chatStore";
+import type { ApprovalAnswer } from "../../lib/types";
 import { tourId } from "../../lib/tour/ids";
 
 interface Props {
   approval: PendingApproval;
-  onRespond: (decision: "approve" | "always" | "deny") => void;
+  onRespond: (decision: ApprovalAnswer) => void;
   /** Talk is the mode on screen. A card the user focused can keep the focus
    *  after a mode switch hides Talk (WebKit may leave it on a hidden
    *  element), so its keys answer only while Talk shows. */
@@ -55,7 +56,10 @@ export const RUN_CHECK_LIMITS =
  * the same way, showing the command, and its tooltip says the check is a
  * net, not a sandbox. A read outside that isn't a credentials location also
  * offers "Allow reading <folder> for this conversation" (`rememberDir`,
- * answered as "always").
+ * answered as "always"). Since #1243 an MCP card in Edit freely
+ * (`trustServer`/`trustTool`) also offers two lasting answers, app-wide and
+ * revocable in Settings › Integrations: "Always allow this tool" ("tool")
+ * and "Trust <server>" ("server"). The reason line wraps, never cut.
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -77,6 +81,11 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
   const outside = approval.kind === "read" || approval.kind === "write" || run;
   const sensitive = outside && approval.sensitive === true;
   const copy = COPY[secret ? "secret" : sensitive ? "sensitive" : outside ? "outside" : "command"];
+  // An MCP card in Edit freely offers to stop asking for good (#1243).
+  const trust =
+    approval.kind === "mcp" && approval.trustServer && approval.trustTool
+      ? { server: approval.trustServer, tool: approval.trustTool }
+      : null;
   // Where the safe answer leads, it is the first button and Enter takes it.
   const safeLead = secret || sensitive;
   const lead = safeLead ? "deny" : "approve";
@@ -104,10 +113,10 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
       <span role="alert" className="sr-only">
         The turn is waiting on your answer.
       </span>
-      <div className="flex items-center gap-2">
-        <ShieldAlert size={14} aria-hidden className="shrink-0 text-octo-rouge" />
-        <span className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-rouge">{copy.eyebrow}</span>
-        <span className="ml-auto truncate font-mono text-[10px] text-octo-mute" title={approval.reason}>
+      <div className="flex items-baseline gap-2">
+        <ShieldAlert size={14} aria-hidden className="shrink-0 self-center text-octo-rouge" />
+        <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-rouge">{copy.eyebrow}</span>
+        <span data-testid="approval-reason" className="ml-auto min-w-0 break-words text-right font-mono text-[10px] text-octo-mute">
           {approval.reason}
         </span>
       </div>
@@ -135,7 +144,7 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
           {run ? "A credentials location always asks." : "Every access outside the workspace asks again."}
         </p>
       )}
-      <div className="mt-2 flex items-center gap-2">
+      <div className={`mt-2 flex items-center gap-2 ${trust ? "flex-wrap" : ""}`}>
         {/* Where the safe answer leads, it is the first button. */}
         <button
           type="button"
@@ -164,6 +173,26 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
           >
             Approve &amp; don't ask again
           </button>
+        )}
+        {trust && (
+          <span className="flex w-full flex-wrap items-center gap-x-4 gap-y-1 pt-0.5" data-tour={tourId("talk-approval-trust")}>
+            <button
+              type="button"
+              onClick={() => onRespond("tool")}
+              title={`Run this, and let ${trust.tool} run without asking in Edit freely, in every conversation, until you revoke it in Settings › Integrations`}
+              className={`font-serif text-[12px] text-octo-sage hover:text-octo-ivory ${QUICK}`}
+            >
+              Always allow this tool
+            </button>
+            <button
+              type="button"
+              onClick={() => onRespond("server")}
+              title={`Run this, and let every ${trust.server} tool run without asking in Edit freely, in every conversation, until you revoke it in Settings › Integrations (a tool it marks destructive still asks)`}
+              className={`font-serif text-[12px] text-octo-sage hover:text-octo-ivory ${QUICK}`}
+            >
+              Trust {trust.server}
+            </button>
+          </span>
         )}
         {run && !sensitive && approval.rememberDir && (
           <button
