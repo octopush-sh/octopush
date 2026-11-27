@@ -189,15 +189,39 @@ fn tail_bytes(s: &str, max: usize) -> &str {
 /// `recall_hint` is appended inside the gap marker so a truncated excerpt
 /// tells the model how to get the rest.
 pub fn excerpt_head_tail(s: &str, budget: usize, recall_hint: &str) -> String {
+    excerpt_split(s, budget, 7, recall_hint)
+}
+
+/// [`excerpt_head_tail`] with the head given `head_tenths` of the budget.
+fn excerpt_split(s: &str, budget: usize, head_tenths: usize, recall_hint: &str) -> String {
     if s.len() <= budget {
         return s.to_string();
     }
-    let head_max = budget * 7 / 10;
+    let head_max = budget * head_tenths / 10;
     let tail_max = budget - head_max;
     let head = head_bytes(s, head_max);
     let tail = tail_bytes(s, tail_max);
     let omitted = s.len().saturating_sub(head.len() + tail.len());
     format!("{head}\n… [{omitted} chars omitted{recall_hint}]\n{tail}")
+}
+
+/// Most of one `run_command` output that is captured and kept for recall
+/// (4 MB): a longer output keeps its head and tail.
+pub const COMMAND_KEEP_BYTES: usize = 4_000_000;
+
+/// Most of one `run_command` output its tool row and the model's copy carry.
+pub const COMMAND_SHOWN_BYTES: usize = 50_000;
+
+/// The gap-marker suffix of a cut `run_command` output on its tool row, whose
+/// id isn't known yet when the row is written; later turns name the row as
+/// `[Tool #id: …]`.
+pub const COMMAND_KEPT_HINT: &str = " — the full output is kept: call recall_tool_output with this tool row's message_id";
+
+/// A command's output within `budget`, head and tail: 70/30 when it
+/// succeeded, 30/70 when it `failed`, where the failing assertion and the
+/// summary sit at the end.
+pub fn command_excerpt(s: &str, budget: usize, failed: bool, recall_hint: &str) -> String {
+    excerpt_split(s, budget, if failed { 3 } else { 7 }, recall_hint)
 }
 
 /// Char-window over `s` for `recall_tool_output`: `offset` bytes in (snapped
@@ -356,7 +380,12 @@ pub const ORIGINAL_CAP_BYTES: usize = 1_000_000;
 /// The part of `original` that is kept: its first [`ORIGINAL_CAP_BYTES`],
 /// cut on a char boundary.
 pub fn capped_original(original: &str) -> &str {
-    head_bytes(original, ORIGINAL_CAP_BYTES)
+    capped_original_within(original, ORIGINAL_CAP_BYTES)
+}
+
+/// The first `cap` bytes of `original`, cut on a char boundary.
+pub fn capped_original_within(original: &str, cap: usize) -> &str {
+    head_bytes(original, cap)
 }
 
 /// What `recall_tool_output` returns for a stored `role="tool"` row: the

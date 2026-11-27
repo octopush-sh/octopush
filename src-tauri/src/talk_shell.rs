@@ -34,9 +34,11 @@ use std::time::{Duration, Instant};
 /// commands behave as the user's `$` commands do.
 pub(crate) const TALK_BASH: &str = "/bin/bash";
 
-/// Cap on captured output (bytes), mirroring `execute_tool`'s run_command cap
-/// so output can't bloat the DB row / chat render.
-const MAX_OUTPUT_BYTES: usize = 50_000;
+/// Cap on a `$` command's captured output (bytes), so it can't bloat the DB
+/// row / chat render. The agent's capture keeps up to
+/// `chat_history::COMMAND_KEEP_BYTES`; the chat engine cuts the row's and the
+/// model's copy and keeps the rest for recall.
+const MAX_OUTPUT_BYTES: usize = crate::chat_history::COMMAND_SHOWN_BYTES;
 
 /// Upper bound on a complete prompt marker (incl. a long cwd). The live filter
 /// won't hold back a marker-prefix tail longer than this — beyond it the leading
@@ -184,6 +186,7 @@ impl TalkShell {
         // Discard any stale bytes (the idle prompt left in the buffer) so the
         // next prompt marker we see is unambiguously THIS command's completion.
         drain_pending(&rx);
+        let keep = if promote { MAX_OUTPUT_BYTES } else { crate::chat_history::COMMAND_KEEP_BYTES };
         if let Err(e) = client.write(&id, format!("{command}\n").as_bytes()) {
             handle.lock().rx = Some(rx);
             return Err(e);
@@ -196,7 +199,7 @@ impl TalkShell {
                 session.rx = Some(rx);
                 session.cwd = final_cwd.clone();
                 Ok(RunOutcome::Done(ShellResult {
-                    output: cap_output(output),
+                    output: cap_output(output, keep, exit_code != 0),
                     exit_code,
                     ok: exit_code == 0,
                     cwd: final_cwd,
@@ -214,7 +217,7 @@ impl TalkShell {
                     }
                 }
                 Ok(RunOutcome::Done(ShellResult {
-                    output: cap_output(output),
+                    output: cap_output(output, keep, true),
                     exit_code: -1,
                     ok: false,
                     cwd,
@@ -255,7 +258,7 @@ impl TalkShell {
                         session.rx = Some(rx);
                         session.cwd = final_cwd.clone();
                         Ok(RunOutcome::Done(ShellResult {
-                            output: cap_output(body),
+                            output: cap_output(body, keep, true),
                             exit_code: -1,
                             ok: false,
                             cwd: final_cwd,
@@ -276,7 +279,7 @@ impl TalkShell {
                             }
                         }
                         Ok(RunOutcome::Done(ShellResult {
-                            output: cap_output(body),
+                            output: cap_output(body, keep, true),
                             exit_code: -1,
                             ok: false,
                             cwd,
@@ -480,7 +483,7 @@ impl LiveRun {
     }
 
     fn finish(self, mut exit: LiveExit, full: String) -> LiveExit {
-        exit.full_output = cap_output(clean_output(&full));
+        exit.full_output = cap_output(clean_output(&full), MAX_OUTPUT_BYTES, exit.exit_code != 0);
         let mut session = self.handle.lock();
         session.rx = Some(self.rx);
         if !exit.cwd.is_empty() {
@@ -752,16 +755,13 @@ fn strip_octo_markers(s: &str, nonce: &str) -> String {
     re.replace_all(s, "").trim().to_string()
 }
 
-/// Cap output at `MAX_OUTPUT_BYTES` on a char boundary, with a truncation note.
-fn cap_output(s: String) -> String {
-    if s.len() <= MAX_OUTPUT_BYTES {
+/// Cap output at `max` bytes, keeping its head and tail on char boundaries
+/// (the tail weighted when the command `failed`) and marking the gap.
+fn cap_output(s: String, max: usize, failed: bool) -> String {
+    if s.len() <= max {
         return s;
     }
-    let mut end = MAX_OUTPUT_BYTES;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n…(output truncated at {MAX_OUTPUT_BYTES} bytes)", &s[..end])
+    crate::chat_history::command_excerpt(&s, max, failed, "")
 }
 
 #[cfg(test)]
@@ -876,9 +876,19 @@ mod tests {
 
     #[test]
     fn cap_output_truncates_on_char_boundary() {
-        let capped = cap_output("é".repeat(40_000));
+        let capped = cap_output("é".repeat(40_000), MAX_OUTPUT_BYTES, false);
         assert!(capped.len() <= MAX_OUTPUT_BYTES + 64);
-        assert!(capped.contains("truncated"));
+        assert!(capped.contains("chars omitted"));
+    }
+
+    #[test]
+    fn cap_output_keeps_the_tail_of_a_failed_command() {
+        let out = format!("HEAD\n{}\nassertion failed: left == right", "x".repeat(200_000));
+        let capped = cap_output(out.clone(), MAX_OUTPUT_BYTES, true);
+        assert!(capped.starts_with("HEAD") && capped.ends_with("assertion failed: left == right"), "both ends survive");
+        let tail = &capped[capped.find("omitted]").unwrap()..];
+        assert!(tail.len() > MAX_OUTPUT_BYTES / 2, "a failure keeps more of the end");
+        assert_eq!(cap_output(out.clone(), crate::chat_history::COMMAND_KEEP_BYTES, true), out, "the agent's capture keeps it whole");
     }
 
     #[test]

@@ -4885,7 +4885,13 @@ impl Db {
     /// `recall_tool_output`: at most `chat_history::ORIGINAL_CAP_BYTES` of it
     /// (cut on a char boundary), with its full size.
     pub fn set_chat_tool_original(&self, message_id: i64, thread_id: &str, original: &str) -> AppResult<()> {
-        let kept = crate::chat_history::capped_original(original);
+        self.set_chat_tool_original_within(message_id, thread_id, original, crate::chat_history::ORIGINAL_CAP_BYTES)
+    }
+
+    /// [`Self::set_chat_tool_original`] keeping at most `cap` bytes: a long
+    /// `run_command` output keeps up to `chat_history::COMMAND_KEEP_BYTES`.
+    pub fn set_chat_tool_original_within(&self, message_id: i64, thread_id: &str, original: &str, cap: usize) -> AppResult<()> {
+        let kept = crate::chat_history::capped_original_within(original, cap);
         self.conn.execute(
             "INSERT OR REPLACE INTO chat_tool_originals (message_id, thread_id, content, total_bytes) VALUES (?1, ?2, ?3, ?4)",
             params![message_id, thread_id, kept, original.len() as i64],
