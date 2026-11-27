@@ -1094,7 +1094,8 @@ frames a destination, not an interruption. Rules:
   persistent — it adds zero standing pixels. One room per concept (§9).
 - Current residents: **Settings** (`⌘,`) and **Mission Control** (`⌘⇧M`) — the
   fleet cockpit: every active Direct run across all workspaces as live crew
-  cards in triage bands (Needs you / In flight / Settled) with Law 1 ink
+  cards in triage bands (Needs you / In flight / Settled; 32px premium breath
+  above each band's eyebrow, 12px from it to the first card row) with Law 1 ink
   grading (needs-you full ink, in-flight `opacity-75`, settled `opacity-45`
   rising to `0.85` on hover/focus), each card carrying `StageDots` (not
   numerals — the roman-numeral micro-track is retired) plus a fixed-width

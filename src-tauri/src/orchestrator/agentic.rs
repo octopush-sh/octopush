@@ -58,10 +58,11 @@ pub(crate) fn throttle_notice(wait: u64) -> String {
 
 /// The copy of a tool's result the model reads: capped, and marked as
 /// untrusted output of its tool (`chat_history::mark_untrusted`, #1147)
-/// unless the gate denied the call, whose text is Octopush's own.
+/// unless the gate denied the call, whose text is Octopush's own. A loaded
+/// skill (`Skill`, #1135) is instructions to follow, so it isn't marked.
 fn model_copy(tool: &str, result: &str, denied: bool) -> String {
     let capped = cap_tool_result(result);
-    if denied {
+    if denied || tool == crate::skills::SKILL_TOOL_NAME {
         capped
     } else {
         crate::chat_history::mark_untrusted(tool, &capped)
@@ -127,6 +128,10 @@ pub struct AgenticResult {
     /// answer with what it had. `finished` is true, but the caller should
     /// annotate the artifact as possibly incomplete.
     pub closed_at_cap: bool,
+    /// The loop left its turns because its own spend reached `spend_limit`
+    /// (not the iteration cap). Whatever the close produced, more turns
+    /// would not help: the money is what ran out.
+    pub spend_stopped: bool,
     /// Set alongside `blocked`: the full conversation up to (and including)
     /// the `ask_director` turn, so the answered stage can CONTINUE the same
     /// conversation instead of re-running — and re-paying — from scratch.
@@ -139,6 +144,17 @@ pub struct AgenticResult {
     /// stage-model pricing stays correct).
     pub peer_input_tokens: u64,
     pub peer_output_tokens: u64,
+}
+
+/// A loop that errored after real rounds: the error, and the result as it
+/// stood — its usage and cost (billed, so they must be recorded), and its
+/// transcript up to the last complete round (`blocked_transcript` too, so a
+/// Resume continues there). The transcript is empty when no round of this
+/// call completed: there is nothing new to continue from.
+#[derive(Debug)]
+pub struct LoopFailure {
+    pub error: crate::error::AppError,
+    pub partial: AgenticResult,
 }
 
 /// The conversation state persisted while a stage is parked on `ask_director`:
@@ -706,8 +722,46 @@ pub trait ExternalTools: Send + Sync {
 /// when set, the loop stops before the next model turn, closes the journal
 /// with a notice, and returns an UNFINISHED result (the caller maps it to a
 /// failed stage that lands in the normal halt-recovery flow).
+///
+/// An error drops the rounds already spent; a caller that bills them uses
+/// [`run_agentic_loop_billed`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agentic_loop(
+    provider: &dyn LlmProvider,
+    api_base: &str,
+    api_key: Option<&str>,
+    client: &reqwest::Client,
+    model: &str,
+    system: &str,
+    initial_messages: Vec<LlmMessage>,
+    workspace_path: &Path,
+    max_iterations: usize,
+    cancel: &std::sync::Arc<AtomicBool>,
+    emitter: &crate::orchestrator::live::LiveEmitter<'_>,
+    allowed_tools: Option<&[String]>,
+    effort: Option<Effort>,
+    sandbox_roots: Option<&[String]>,
+    verdict_tool: bool,
+    spend_limit: Option<f64>,
+    peers: &[PeerStage],
+    gate: Option<&dyn ToolGate>,
+    external: Option<&dyn ExternalTools>,
+) -> AppResult<AgenticResult> {
+    run_agentic_loop_billed(
+        provider, api_base, api_key, client, model, system, initial_messages, workspace_path,
+        max_iterations, cancel, emitter, allowed_tools, effort, sandbox_roots, verdict_tool,
+        spend_limit, peers, gate, external,
+    )
+    .await
+    .map_err(|f| f.error)
+}
+
+/// [`run_agentic_loop`], keeping what a failed loop already spent: an error
+/// after N rounds (retries exhausted, a context 400, a body that could not be
+/// read) comes back as a [`LoopFailure`] carrying those rounds' usage, cost
+/// and transcript, so the caller bills them and can continue the run.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agentic_loop_billed(
     provider: &dyn LlmProvider,
     api_base: &str,
     api_key: Option<&str>,
@@ -750,7 +804,7 @@ pub async fn run_agentic_loop(
     // Optional caller-owned tools (see [`ExternalTools`]) — offered as given,
     // outside the workspace allowlist, executed by the caller.
     external: Option<&dyn ExternalTools>,
-) -> AppResult<AgenticResult> {
+) -> Result<AgenticResult, Box<LoopFailure>> {
     let mut tools = build_llm_tools();
     if let Some(allowed) = allowed_tools {
         // Implied grants keep allowlists saved before a tool existed working:
@@ -799,7 +853,7 @@ pub async fn run_agentic_loop(
     // of the loop so it covers every path that issues another call.
     let mut pending_throttle: Option<u64> = None;
 
-    for _ in 0..max_iterations {
+    for round in 0..max_iterations {
         if cancel.load(Ordering::Relaxed) {
             emitter.notice("stopped by the director");
             out.text = "(stopped by the director)".to_string();
@@ -865,7 +919,24 @@ pub async fn run_agentic_loop(
             DEFAULT_MAX_RETRIES,
             &mut on_retry,
         )
-        .await?;
+        .await;
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(error) => {
+                // The rounds before this one were billed: hand them back with
+                // the error. Their conversation (it ends on a complete round)
+                // is the resume point; with no round of this call done there
+                // is nothing new to continue from. Counted in rounds, not
+                // tokens: a gateway that reports no usage still did them.
+                if round > 0 {
+                    out.transcript = messages.clone();
+                    out.blocked_transcript =
+                        Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
+                }
+                out.text = format!("(agentic loop failed: {error})");
+                return Err(Box::new(LoopFailure { error, partial: out }));
+            }
+        };
         add_request_usage(&mut out, model, &resp);
         // Pace the next call if this response says the window is nearly spent.
         pending_throttle = compute_throttle(&resp);
@@ -996,6 +1067,7 @@ pub async fn run_agentic_loop(
                     .collect();
                 messages.push(LlmMessage { role: LlmRole::User, content: LlmContent::ToolResults(voided) });
                 budget_stopped = true;
+                out.spend_stopped = true;
                 break;
             }
         }

@@ -121,6 +121,7 @@ Current anchors:
 | `talk-turn-ask` | Talk: a message you sent, set on the panel surface with "— You" and the time (every such turn carries it; a tour finds the first) | `ChatMessage.tsx` |
 | `talk-turn-context` | Talk, under a message you sent with `@` context: its row of chips, one per block, each opening the block as sent (only on such a message; a tour finds the first) | `chat/SentContext.tsx` |
 | `talk-work` · `talk-work-fold` | Talk: the model's work in a turn, its narration and tool calls on one hairline (only when a turn has some) · the summary row of a round of more than five calls (only when one has) | `chat/WorkBlock.tsx` |
+| `talk-crew-ending` | Talk crew card, on a finished sub-agent's row: its ending word (`stopped`, `turn limit`, `needs a decision`; only on a row that ended one of those ways; a tour finds the first) | `chat/CrewCard.tsx` |
 | `talk-tool-verdict` | Talk, on a resolved tool row that failed or was denied: its mono verdict after the summary (`exit 1`, `timed out`, `denied`; every such row carries it, a tour finds the first) | `ToolCallCard.tsx` |
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focusable; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
@@ -166,6 +167,7 @@ Current anchors:
 | `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
 | `settings-shortcuts-modes` | Settings › Shortcuts, Navigation: the first mode row ("Run mode" `⌘⇧1`) | `settings/ShortcutsPane.tsx` |
 | `settings-models-add-provider` · `settings-models-add-model` | Settings › Models: "Connect another provider" under the provider list · "Bring in another model" in the selected provider's Models header | `settings/ModelsPane.tsx` |
+| `settings-models-list` | Settings › Models: the selected provider's list of models (only while it has one) | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
 | `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
@@ -195,11 +197,13 @@ Current anchors:
 | `palette-workspaces` | Command palette: the Workspaces group (every open project's workspaces, needs-you first) | `CommandPalette.tsx` |
 | `palette-groups` | Command palette: the Groups section (every rail group of the open projects, in rail order; only when there is one) | `CommandPalette.tsx` |
 | `file-finder-input` · `file-finder-results` | ⌘P / ⌘⇧F palette: the query input · the virtualized file list (files mode, with matches) | `WorkspaceSearchPalette.tsx` |
-| `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
+| `file-finder-mode` · `file-finder-tab-hint` | ⌘P / ⌘⇧F palette: the brass `FILES` / `TEXT` mode prefix in the search line (a click switches mode) · the footer's "Tab · search text" / "Tab · find files" | `WorkspaceSearchPalette.tsx` |
+| `file-finder-capped` | ⌘P footer: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
 | `companion-run-context` · `companion-run-changes` · `companion-run-read-diff` · `companion-run-mission` | Run Companion: the Context section (only while the focused pane is an agent session Octopush has usage for) · the Changes section · its "Read the diff" link (only with something to read in Review) · the Mission section (only with a mission) | `CompanionRun.tsx` |
 | `companion-chats-list` | Companion › Chats: the conversation list | `CompanionHistory.tsx` |
 | `companion-follows` | Talk Companion › Conversation: the "follows" row, one name per instruction file Talk and its sub-agents follow (the CLAUDE.md chain, or AGENTS.md; only while the worktree has one) | `CompanionInstructions.tsx` via `CompanionContext.tsx` |
-| `companion-can-use` | Talk Companion › Conversation: the "can use" row, one toggle chip per MCP server (only while the workspace has one configured) | `CompanionMcpScope.tsx` via `CompanionContext.tsx` |
+| `companion-can-use` | Talk Companion › Conversation: the "can use" row, one toggle chip per MCP server, then the skills and agents counts (only while the workspace has a server, a skill or a sub-agent type) | `CompanionMcpScope.tsx` via `CompanionContext.tsx` |
+| `companion-can-use-skills` · `companion-can-use-agents` | Talk Companion › Conversation, "can use" row: `skills · N`, which opens the skills (a click adds `/name` to the draft; only with a skill) · `agents · N`, which opens the sub-agent types with their tier or model and tools (only with one) | `CompanionCatalog.tsx` via `CompanionMcpScope.tsx` |
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-headline` | Settings › Usage: the headline stats row (Cost · Per active day · Last 24 hours · Cache hit), also while the ledger is read | `settings/UsagePane.tsx` |
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |

@@ -4675,6 +4675,37 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn budget_headroom_is_the_tightest_budget_left() {
+        // Sub-agents get a share of this as their spend limit (#1149).
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let spend = |cost: f64| crate::token_engine::TokenEvent {
+            id: None,
+            session_id: ws.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: "claude-sonnet-5".into(),
+            cost_usd: cost,
+        };
+        assert_eq!(db.budget_headroom(Some(&ws)).unwrap(), None, "no budget: unbounded");
+        db.upsert_budget("global", "", "monthly", 10.0).unwrap();
+        db.upsert_budget("workspace", &ws, "daily", 2.0).unwrap();
+        // A zero limit is no budget, as for the gate.
+        db.upsert_budget("global", "", "daily", 0.0).unwrap();
+        db.record_token_spend(&spend(0.5), "talk").unwrap();
+        let h = db.budget_headroom(Some(&ws)).unwrap().unwrap();
+        assert!((h - 1.5).abs() < 1e-9, "the workspace's daily $2 is the tightest: {h}");
+        // Another workspace only sees the global budget.
+        let other = db.budget_headroom(Some("elsewhere")).unwrap().unwrap();
+        assert!((other - 9.5).abs() < 1e-9, "{other}");
+        db.record_token_spend(&spend(3.0), "talk").unwrap();
+        assert_eq!(db.budget_headroom(Some(&ws)).unwrap(), Some(0.0), "an overspent budget leaves nothing, never less");
+    }
+
+    #[test]
     fn talk_mid_turn_gate_stops_only_after_iteration_zero_and_never_when_overridden() {
         // Phase 3 last slice: the TALK per-iteration gate stops a runaway
         // agentic loop that crosses a budget mid-turn. Its decision is the pure

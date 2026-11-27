@@ -4,7 +4,7 @@
 // Spec: docs/superpowers/specs/2026-07-11-direct-beauty-redesign-design.md §4.3
 
 import {
-  BadgeCheck, Bot, ChevronRight, CircleDashed, ClipboardList, Compass, Eye, FlaskConical,
+  BadgeCheck, BookOpen, Bot, ChevronRight, CircleDashed, ClipboardList, Compass, Eye, FlaskConical,
   GitBranch, GitMerge, GitPullRequest, Globe, Hammer, Package, PenLine, Pencil,
   Rocket, Search, Shield, Sparkles, SquareTerminal, Terminal, Wrench, type LucideIcon,
 } from "lucide-react";
@@ -40,6 +40,8 @@ export function iconForTool(tool: string): LucideIcon {
   // Sub-agent fan-out (`Agent` / `Task`) before the verb matches: "agent"
   // contains none of them, but "task" must not fall through to the default.
   if (t === "agent" || t === "task") return Bot;
+  // A skill the model loaded (`Skill`, #1135): it read instructions.
+  if (t === "skill") return BookOpen;
   if (t.includes("read") || t.includes("view") || t.includes("cat")) return Eye;
   if (t.includes("edit") || t.includes("write") || t.includes("patch")) return Pencil;
   if (t.includes("bash") || t.includes("run") || t.includes("exec") || t.includes("command") || t.includes("terminal")) return SquareTerminal;

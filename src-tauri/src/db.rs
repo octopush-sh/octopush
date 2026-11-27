@@ -711,6 +711,10 @@ impl Db {
         // before the column — means none is off, so every configured server
         // stays available, as it always was.
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mcp_disabled TEXT")?;
+        // A conversation's permission mode (`permissions::Mode`, #1146):
+        // `plan` or `edit`. NULL, which every row from before the column
+        // has, is Edit freely: what Talk always did.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN permission_mode TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
@@ -4004,6 +4008,37 @@ impl Db {
         Ok(())
     }
 
+    /// A conversation's stored permission mode, as written; `None` for a
+    /// thread that never set one (or no longer exists). Read it through
+    /// `permissions::thread_mode`, which says what each value means.
+    pub fn thread_permission_mode(&self, thread_id: &str) -> AppResult<Option<String>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT permission_mode FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?;
+        Ok(raw.flatten())
+    }
+
+    /// The workspace a conversation belongs to, `None` once it's gone.
+    pub fn chat_thread_workspace(&self, thread_id: &str) -> AppResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT workspace_id FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Set a conversation's permission mode.
+    pub fn set_thread_permission_mode(&self, thread_id: &str, mode: crate::permissions::Mode) -> AppResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE chat_threads SET permission_mode = ?2 WHERE id = ?1",
+            params![thread_id, mode.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(crate::error::AppError::Other("That conversation no longer exists.".into()));
+        }
+        Ok(())
+    }
+
     /// Turn one MCP server off (or back on) in a conversation, leaving the
     /// others as stored, and return the new list. Read and written under the
     /// one connection the caller holds locked, so two toggles never lose
@@ -4203,9 +4238,11 @@ impl Db {
         // One transaction: a failure part-way leaves no half-copied fork.
         let tx = self.conn.unchecked_transaction()?;
         let thread = self.create_chat_thread(&workspace_id, &format!("{title} · fork"))?;
-        // A fork is the same conversation from here: it keeps its MCP scope.
+        // A fork is the same conversation from here: it keeps its MCP scope
+        // and its permission mode.
         tx.execute(
-            "UPDATE chat_threads SET mcp_disabled = (SELECT mcp_disabled FROM chat_threads WHERE id = ?2) WHERE id = ?1",
+            "UPDATE chat_threads SET (mcp_disabled, permission_mode) = \
+             (SELECT mcp_disabled, permission_mode FROM chat_threads WHERE id = ?2) WHERE id = ?1",
             params![thread.id, thread_id],
         )?;
         let mut pairs = Vec::with_capacity(ids.len());
@@ -4546,6 +4583,29 @@ impl Db {
     /// rows and `period_spend` figures the UI uses. Returns the first breached
     /// scope, else `Allow`. A scope with no budget (or limit ≤ 0) never blocks.
     pub fn check_budget(&self, workspace_id: Option<&str>) -> AppResult<BudgetVerdict> {
+        for (scope, spent, limit) in self.budget_spend(workspace_id)? {
+            if spent >= limit {
+                return Ok(BudgetVerdict::Block { scope, spent, limit });
+            }
+        }
+        Ok(BudgetVerdict::Allow)
+    }
+
+    /// What is left to spend under every configured budget that covers this
+    /// workspace (its own, its project's, global; daily and monthly): the
+    /// smallest `limit − spent`, never below zero. `None` when no budget is
+    /// set — spend there is unbounded. The same rows `check_budget` reads.
+    pub fn budget_headroom(&self, workspace_id: Option<&str>) -> AppResult<Option<f64>> {
+        Ok(self
+            .budget_spend(workspace_id)?
+            .into_iter()
+            .map(|(_, spent, limit)| (limit - spent).max(0.0))
+            .reduce(f64::min))
+    }
+
+    /// Each configured budget covering this workspace, widest scope first:
+    /// `("<scope> <period>", spent, limit)`. A limit ≤ 0 is no budget.
+    fn budget_spend(&self, workspace_id: Option<&str>) -> AppResult<Vec<(String, f64, f64)>> {
         let project_id: Option<String> = match workspace_id {
             Some(ws) => self
                 .conn
@@ -4566,6 +4626,7 @@ impl Db {
             scopes.push(("workspace", ws.to_string()));
         }
         let budgets = self.list_budgets()?;
+        let mut out = Vec::new();
         for (scope_type, scope_id) in &scopes {
             for period in ["daily", "monthly"] {
                 let Some(b) = budgets.iter().find(|b| {
@@ -4577,16 +4638,10 @@ impl Db {
                     continue;
                 }
                 let (spent, _) = self.period_spend(scope_type, scope_id, period)?;
-                if spent >= b.limit_usd {
-                    return Ok(BudgetVerdict::Block {
-                        scope: format!("{scope_type} {period}"),
-                        spent,
-                        limit: b.limit_usd,
-                    });
-                }
+                out.push((format!("{scope_type} {period}"), spent, b.limit_usd));
             }
         }
-        Ok(BudgetVerdict::Allow)
+        Ok(out)
     }
 
     /// Return a breakdown of cloud vs local token usage within a time range.

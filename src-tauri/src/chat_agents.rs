@@ -23,7 +23,7 @@ use crate::db::Db;
 use crate::error::AppResult;
 use crate::chat_engine::{continuation_note, dangerous_command, guard_agent_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
 use crate::orchestrator::agentic::resume_messages_for_continuation;
-use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
+use crate::orchestrator::agentic::{run_agentic_loop_billed, user_messages, AgenticResult, BlockedTranscript, ExternalTools, LoopFailure, ToolGate};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
 use crate::providers::{Effort, LlmMessage, LlmProvider, LlmTool};
@@ -210,6 +210,15 @@ pub struct AgentOutcome {
     pub closed_at_cap: bool,
     /// The sub-agent stopped to ask a question it could not resolve alone.
     pub blocked: bool,
+    /// The loop errored (retries exhausted, a context 400…) after the
+    /// rounds this outcome bills. Not a turn cap: more turns are not asked
+    /// for at the cap gate, though the run can be continued from its journal.
+    #[serde(skip)]
+    pub errored: bool,
+    /// The run closed because its spend reached its limit (its share of the
+    /// budget, or its definition's `max-cost`), not because turns ran out.
+    #[serde(skip)]
+    pub spend_stopped: bool,
     pub model: String,
     /// The tier `model` is mapped to in Settings › Models (`fast` /
     /// `balanced` / `strong`), when it is one — the crew card's tier mix.
@@ -234,6 +243,9 @@ pub struct AgentOutcome {
     /// after its first ending; the report is the continuation's.
     #[serde(default)]
     pub continued: bool,
+    /// Stop on the turn ended the run before it reported ([`mark_stopped`]).
+    #[serde(default)]
+    pub stopped: bool,
     /// The conversation as the loop left it — what a continuation resumes
     /// from (for a blocked run, INCLUDING the asking turn). Persisted in
     /// `chat_agent_runs`, never on the tool row.
@@ -283,6 +295,29 @@ impl AgentOutcome {
     }
 }
 
+/// Whether Stop ended `o` (`cancelled`: the turn's flag as the run ended):
+/// it neither answered nor stopped on a question. A run that finished
+/// before Stop keeps its report.
+pub fn was_stopped(o: &AgentOutcome, cancelled: bool) -> bool {
+    cancelled && !o.finished && !o.blocked
+}
+
+/// Mark a run Stop ended (#1148): it failed, reads as stopped, and its
+/// report says so instead of a turn limit it never hit. Its transcript stays,
+/// so it can be continued.
+pub fn mark_stopped(o: &mut AgentOutcome) {
+    o.stopped = true;
+    o.ok = false;
+    let calls = match o.tool_calls {
+        1 => "1 tool call".to_string(),
+        n => format!("{n} tool calls"),
+    };
+    o.report = format!(
+        "Sub-agent stopped: the user stopped the turn after {calls}, before it reported. \
+         Nothing it found is in this report; delegate again if the work is still needed."
+    );
+}
+
 /// Map a finished loop to the report the parent receives. Pure, so the exact
 /// wording of every ending is tested: a clean answer passes through; a
 /// forced close is flagged as possibly incomplete; an `ask_director` block
@@ -293,6 +328,7 @@ pub fn report_from_result(out: &AgenticResult, max_iterations: Option<usize>) ->
     // A cap ending only exists when a limit was configured; the wording
     // names it when it can.
     let limit = match max_iterations {
+        _ if out.spend_stopped => "spend limit".to_string(),
         Some(n) => format!("{n}-turn tool limit"),
         None => "turn limit".to_string(),
     };
@@ -325,6 +361,39 @@ pub fn report_from_result(out: &AgenticResult, max_iterations: Option<usize>) ->
         format!("Sub-agent hit its {limit} without producing a report."),
         false,
     )
+}
+
+/// The most one run may spend (USD): the lower of its share of the budget
+/// headroom and its definition's `max-cost`. `None` when neither is set.
+pub fn subagent_spend_limit(share: Option<f64>, max_cost: Option<f64>) -> Option<f64> {
+    match (share, max_cost) {
+        (Some(s), Some(c)) => Some(s.min(c)),
+        (s, c) => s.or(c),
+    }
+}
+
+/// What is left of `spec`'s spend limit once its attempts so far spent
+/// `spent`: the limit is a total for the run, so an escalation retry or a
+/// continuation the user granted gets only the rest, never a fresh share.
+/// `None` when the run has no limit.
+pub fn spend_left(spec: &SubagentSpec, spent: f64) -> Option<f64> {
+    subagent_spend_limit(spec.spend_limit, spec.definition.as_ref().and_then(|d| d.max_cost))
+        .map(|limit| (limit - spent).max(0.0))
+}
+
+/// Whether another attempt of `spec` may start: a run with nothing left of
+/// its limit would still spend a round before its close.
+pub fn has_spend_left(spec: &SubagentSpec, spent: f64) -> bool {
+    !matches!(spend_left(spec, spent), Some(left) if left <= 0.0)
+}
+
+/// Each sub-agent's share of the budget headroom when `n_agents` run at
+/// once, so together they cannot spend past it before the director's next
+/// budget check. `None` (no budget set, or the turn overrode it) is
+/// unbounded; a spent budget gives each a zero share (one round, then the
+/// close).
+pub fn budget_share(headroom: Option<f64>, n_agents: usize) -> Option<f64> {
+    headroom.map(|h| h.max(0.0) / n_agents.max(1) as f64)
 }
 
 /// Everything a sub-agent needs from the parent turn, owned so the run can
@@ -362,6 +431,11 @@ pub struct SubagentSpec {
     /// the director asked for when that was not honored.
     #[serde(default)]
     pub plan: Option<SubagentPlan>,
+    /// This run's share of the budget headroom (USD), set at the fan-out
+    /// (`budget_share`); the definition's `max-cost` caps it further as the
+    /// run starts. Not saved: a later continuation takes its share anew.
+    #[serde(skip)]
+    pub spend_limit: Option<f64>,
 }
 
 /// The resolved shape of one sub-agent run — model, tier and effort — plus
@@ -580,15 +654,50 @@ const DOCTRINE: &str =
 /// retry: only a **failure** — no usable report. A report that merely hit
 /// the turn cap is still a report (and for a writing role the tree already
 /// holds its work); a `blocked` stop is a question for the director, which
-/// a stronger model cannot answer either — it goes back up as-is.
+/// a stronger model cannot answer either — it goes back up as-is. Nor does a
+/// run its spend limit stopped: the money ran out, and the strong tier would
+/// spend more of it.
 pub fn should_escalate(outcome: &AgentOutcome) -> bool {
-    !outcome.ok && !outcome.blocked
+    !outcome.ok && !outcome.blocked && !outcome.spend_stopped
+}
+
+/// The retry of `spec` on `stronger` after the `model` attempt `first`
+/// failed: the task again with what the first attempt said, at the strong
+/// tier's effort, with only what is left of the spend limit.
+pub fn escalation_retry(
+    spec: &SubagentSpec,
+    first: &AgentOutcome,
+    model: &str,
+    stronger: &str,
+    tiers: &HashMap<String, String>,
+) -> SubagentSpec {
+    let mut retry = spec.clone();
+    retry.call.prompt = escalation_prompt(&spec.call.prompt, model, &first.report, spec_can_write(spec));
+    // The stronger attempt thinks at its own tier's effort (a definition's
+    // explicit `effort` still wins).
+    let stronger_tier = crate::skills::agents::tier_of_model(stronger, tiers).map(str::to_string);
+    retry.plan = Some(SubagentPlan {
+        model: stronger.to_string(),
+        tier: stronger_tier.clone(),
+        effort: spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(stronger_tier.as_deref())),
+        asked_model: None,
+        asked_honored: true,
+    });
+    retry.spend_limit = spend_left(spec, first.cost_usd);
+    retry
 }
 
 /// Whether a sub-agent can change the workspace: its definition grants a
 /// write/edit tool or the shell, or it has the full set.
 pub fn spec_can_write(spec: &SubagentSpec) -> bool {
-    match spec.definition.as_ref().and_then(|d| d.tools.as_deref()) {
+    definition_can_write(spec.definition.as_ref())
+}
+
+/// [`spec_can_write`] for an agent type: no definition (an untyped call, or
+/// a type nobody defined) is the full tool set. Plan only starts only the
+/// types this says can't write (#1146).
+pub fn definition_can_write(definition: Option<&AgentDefinition>) -> bool {
+    match definition.and_then(|d| d.tools.as_deref()) {
         None => true,
         Some(tools) => tools.iter().any(|t| t == "write_file" || t == "edit_file" || t == "run_command"),
     }
@@ -822,6 +931,16 @@ impl ToolGate for SubagentGate {
             {
                 return Some(denial);
             }
+            // A path outside the workspace or in a credentials location
+            // (#1201); a sub-agent's command runs at the workspace root.
+            let check = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.read_dirs(&self.thread_id));
+            if let Some(card) = check() {
+                let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+                if let Some(denial) = crate::chat_engine::guard_card(card, &check, ask).await {
+                    return Some(denial);
+                }
+            }
             let reason = dangerous_command(command)?;
             let (card_reason, denial) = gate_texts(&self.label, reason);
             (command.to_string(), card_reason, denial)
@@ -923,6 +1042,69 @@ impl ExternalTools for McpSubagentTools {
     }
 }
 
+/// The `Skill` tool as a sub-agent has it (#1135): the worktree's skills,
+/// loaded the way the director loads them, so a skill can call skills.
+/// Offered before the caller's own tools (`inner`, the MCP grant).
+pub struct SkillSubagentTools<'a> {
+    pub inner: Option<&'a dyn ExternalTools>,
+    pub catalogue: Vec<crate::skills::Skill>,
+    pub scope: &'a Mutex<crate::skills::SkillScope>,
+}
+
+#[async_trait::async_trait]
+impl ExternalTools for SkillSubagentTools<'_> {
+    fn definitions(&self) -> Vec<LlmTool> {
+        let mut tools = Vec::new();
+        if !self.catalogue.is_empty() {
+            tools.push(crate::skills::skill_tool_definition());
+        }
+        if let Some(inner) = self.inner {
+            tools.extend(inner.definitions());
+        }
+        tools
+    }
+    fn owns(&self, name: &str) -> bool {
+        (name == crate::skills::SKILL_TOOL_NAME && !self.catalogue.is_empty())
+            || self.inner.is_some_and(|e| e.owns(name))
+    }
+    async fn call(&self, name: &str, input: &serde_json::Value) -> Result<String, String> {
+        if name == crate::skills::SKILL_TOOL_NAME {
+            let (text, ok) = {
+                let mut scope = self.scope.lock();
+                crate::skills::run_skill_tool(&self.catalogue, &[], &mut scope, input)
+            };
+            return if ok { Ok(text) } else { Err(text) };
+        }
+        match self.inner {
+            Some(inner) => inner.call(name, input).await,
+            None => Err(format!("Unknown tool `{name}`")),
+        }
+    }
+}
+
+/// A sub-agent's gate with the loaded skills' `allowed-tools` in front: a
+/// tool they don't allow is refused before the user is asked anything.
+pub struct SkillSubagentGate<'a> {
+    pub inner: Option<&'a dyn ToolGate>,
+    pub scope: &'a Mutex<crate::skills::SkillScope>,
+    /// The workspace tools a skill can limit (`build_llm_tools`).
+    pub workspace_tools: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl ToolGate for SkillSubagentGate<'_> {
+    async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+        let refusal = self.scope.lock().refusal(name, &self.workspace_tools);
+        if refusal.is_some() {
+            return refusal;
+        }
+        match self.inner {
+            Some(inner) => inner.check(name, input).await,
+            None => None,
+        }
+    }
+}
+
 /// Run one sub-agent to completion on an already-resolved provider. Split
 /// from the spawning wrapper so a scripted provider + recording sink can
 /// drive it in tests.
@@ -942,10 +1124,27 @@ pub async fn run_subagent_core(
     let started = std::time::Instant::now();
     let emitter = LiveEmitter::new(sink, &spec.thread_id, &spec.call_id);
     let instructions = crate::project_instructions::for_workspace_off_runtime(spec.workspace_path.clone().into()).await;
-    let system = subagent_system_prompt(&spec.workspace_path, &spec.call, spec.definition.as_ref(), &instructions.section);
+    // The worktree's skills, listed after the project's instructions and
+    // loaded with `Skill`, as the director has them (#1135).
+    let catalogue = crate::skills::scan_skills(Path::new(&spec.workspace_path));
+    let skill_list = crate::skills::skill_list_section(&catalogue, &[]);
+    let system = subagent_system_prompt(
+        &spec.workspace_path,
+        &spec.call,
+        spec.definition.as_ref(),
+        &format!("{}{skill_list}", instructions.section),
+    );
+    let skill_scope = Mutex::new(crate::skills::SkillScope::default());
+    let skill_tools = SkillSubagentTools { inner: external, catalogue, scope: &skill_scope };
+    let skill_gate = SkillSubagentGate {
+        inner: gate,
+        scope: &skill_scope,
+        workspace_tools: crate::chat_engine::build_llm_tools().into_iter().map(|t| t.name).collect(),
+    };
     let allowed_tools = spec.definition.as_ref().and_then(|d| d.tools.as_deref());
     let effort = spec.plan.as_ref().and_then(|p| p.effort);
-    let out = run_agentic_loop(
+    let spend_limit = subagent_spend_limit(spec.spend_limit, spec.definition.as_ref().and_then(|d| d.max_cost));
+    let result = run_agentic_loop_billed(
         provider,
         api_base,
         api_key,
@@ -961,19 +1160,33 @@ pub async fn run_subagent_core(
         effort,
         spec.sandbox_roots.as_deref(),
         false,
-        None,
+        spend_limit,
         &[],
-        gate,
-        external,
+        Some(&skill_gate as &dyn ToolGate),
+        Some(&skill_tools as &dyn ExternalTools),
     )
-    .await?;
-    let (report, ok) = report_from_result(&out, spec.max_iterations);
+    .await;
+    // A loop that errored after real rounds still spent them: the outcome
+    // carries their usage (the ledger and the budget see it) and their
+    // transcript (the run can be continued), and fails.
+    let (out, report, ok, errored) = match result {
+        Ok(out) => {
+            let (report, ok) = report_from_result(&out, spec.max_iterations);
+            (out, report, ok, false)
+        }
+        Err(f) => {
+            let LoopFailure { error, partial } = *f;
+            (partial, format!("Sub-agent failed: {error}"), false, true)
+        }
+    };
     Ok(AgentOutcome {
         report,
         ok,
         finished: out.finished,
         closed_at_cap: out.closed_at_cap,
         blocked: out.blocked.is_some(),
+        errored,
+        spend_stopped: out.spend_stopped,
         model: model.to_string(),
         tier: None,
         effort,
@@ -987,6 +1200,7 @@ pub async fn run_subagent_core(
         duration_ms: started.elapsed().as_millis() as u64,
         tool_calls: out.tool_calls.len(),
         continued: spec.resume.is_some(),
+        stopped: false,
         ask_tool_use_id: out.blocked_transcript.as_ref().map(|b| b.ask_tool_use_id.clone()).unwrap_or_default(),
         transcript: match out.blocked_transcript {
             Some(b) => b.messages,
@@ -1152,17 +1366,15 @@ pub async fn run_one_subagent(
     // The plan was decided at fan-out (so the card could say it); a caller
     // without one (a continuation, a test) gets it decided here.
     let plan = spec.plan.clone().unwrap_or_else(|| plan_subagent(spec, known_models, tiers));
-    let spec_owned;
-    let spec: &SubagentSpec = if spec.plan.is_some() {
-        spec
-    } else {
-        spec_owned = SubagentSpec { plan: Some(plan.clone()), ..spec.clone() };
-        &spec_owned
-    };
+    // What is saved for a continuation keeps the mission's roots; what runs
+    // is narrowed by the thread's mode now.
+    let planned = SubagentSpec { plan: Some(plan.clone()), ..spec.clone() };
+    let spec = &mode_spec(&db, &planned);
     let model = plan.model.clone();
     let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
         .with_mcp_writes(mcp_tools)
         .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
+    let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));
     let external = McpSubagentTools::granted(
         mcp,
         Path::new(&spec.workspace_path),
@@ -1189,33 +1401,26 @@ pub async fn run_one_subagent(
             }
         }
     }
-    let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &approval_gate, external_ref, started).await;
+    let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &tool_gate, external_ref, started).await;
     // The definition's `escalate`: one retry on the stronger model when the
     // cheap attempt failed — unless the director stopped the turn. A
     // continuation never escalates: the user chose to give THIS run more
-    // turns.
-    if spec.resume.is_none() && should_escalate(&outcome) && !cancel.load(Ordering::Relaxed) {
+    // turns. Nor does a run with nothing left of its spend limit.
+    if spec.resume.is_none()
+        && should_escalate(&outcome)
+        && has_spend_left(spec, outcome.cost_usd)
+        && !cancel.load(Ordering::Relaxed)
+    {
         if let Some(stronger) = escalation_model(spec, &model, known_models, tiers) {
             tracing::info!(call = %spec.call_id, from = %model, to = %stronger, "escalating sub-agent");
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
                 "escalating to {stronger}: the {model} attempt {}",
                 if outcome.blocked { "stopped on a question" } else if outcome.closed_at_cap { "hit its turn limit" } else { "failed" }
             ));
-            let mut retry = spec.clone();
-            retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report, spec_can_write(spec));
-            // The stronger attempt thinks at its own tier's effort (a
-            // definition's explicit `effort` still wins).
-            let stronger_tier = crate::skills::agents::tier_of_model(&stronger, tiers).map(str::to_string);
-            retry.plan = Some(SubagentPlan {
-                model: stronger.clone(),
-                tier: stronger_tier.clone(),
-                effort: spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(stronger_tier.as_deref())),
-                asked_model: None,
-                asked_honored: true,
-            });
+            let retry = escalation_retry(spec, &outcome, &model, &stronger, tiers);
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
                 .notice(&format!("running on {}", plan_line(retry.plan.as_ref().unwrap())));
-            let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
+            let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &tool_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_escalated(outcome, second);
         }
     }
@@ -1228,7 +1433,13 @@ pub async fn run_one_subagent(
         // Turns spent so far: every billed attempt (an escalated run spent
         // up to two budgets) — the card says how much it already took.
         let mut turns_used = spec.max_iterations.unwrap_or(0) * outcome.billed_attempts().len().max(1);
-        while ran_out_of_turns(&outcome) && spec_edits_files(spec) && !cancel.load(Ordering::Relaxed) {
+        // The user grants turns, not money: each continuation gets what is
+        // left of the run's spend limit, and none starts once it is spent.
+        while ran_out_of_turns(&outcome)
+            && spec_edits_files(spec)
+            && has_spend_left(spec, outcome.cost_usd)
+            && !cancel.load(Ordering::Relaxed)
+        {
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
                 "hit its turn limit mid-work after {turns_used} turns — waiting for you: more turns, or accept what it has"
             ));
@@ -1265,6 +1476,7 @@ pub async fn run_one_subagent(
             let mut more = spec.clone();
             more.call.model = Some(outcome.model.clone());
             more.max_iterations = Some(extra);
+            more.spend_limit = spend_left(spec, outcome.cost_usd);
             if let Some(p) = more.plan.as_mut() {
                 p.model = outcome.model.clone();
                 p.tier = crate::skills::agents::tier_of_model(&outcome.model, tiers).map(str::to_string);
@@ -1275,14 +1487,53 @@ pub async fn run_one_subagent(
                 &BlockedTranscript { messages: outcome.transcript.clone(), ask_tool_use_id: outcome.ask_tool_use_id.clone() },
                 &continuation_note(None, Some(extra)),
             ));
-            let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &approval_gate, external_ref, std::time::Instant::now()).await;
+            let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &tool_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_continued(outcome, second);
             turns_used += extra;
         }
     }
     outcome.tier = tier_for_outcome(spec, &outcome.model, tiers);
-    persist_run(&db, spec, &outcome);
+    if was_stopped(&outcome, cancel.load(Ordering::Relaxed)) {
+        mark_stopped(&mut outcome);
+    }
+    persist_run(&db, &planned, &outcome);
     outcome
+}
+
+/// `spec` in its thread's permission mode (#1146), as it starts: under Plan
+/// only its commands run on the read-only sandbox for the whole run. A
+/// continuation started after a switch to Plan only is narrowed the same way.
+pub fn mode_spec(db: &Mutex<Db>, spec: &SubagentSpec) -> SubagentSpec {
+    let mode = crate::permissions::effective(crate::permissions::thread_mode(db, &spec.thread_id), spec.sandbox_roots.as_deref());
+    SubagentSpec { sandbox_roots: crate::permissions::exec_roots(mode, spec.sandbox_roots.as_deref()), ..spec.clone() }
+}
+
+/// The gate of a sub-agent `spec` runs (narrowed by [`mode_spec`]): each
+/// call is decided in the thread's mode, read at the call, then what the
+/// mode allows goes to `inner` (its approval gate). `mission_roots`, the
+/// mission's own, say whether a read-only mission forces Plan only. Its
+/// read-only MCP tools are the ones their server marks so.
+pub fn mode_gate(
+    db: &Arc<Mutex<Db>>,
+    spec: &SubagentSpec,
+    mission_roots: Option<&[String]>,
+    mcp_tools: &[crate::mcp::McpToolInfo],
+    inner: Option<Box<dyn ToolGate>>,
+) -> crate::permissions::ModeGate {
+    crate::permissions::ModeGate::new(
+        crate::permissions::thread_mode_source(Arc::clone(db), spec.thread_id.clone(), spec.sandbox_roots.clone()),
+        spec.sandbox_roots.clone(),
+        crate::permissions::forced(mission_roots),
+        mcp_tools.iter().filter(|t| t.read_only).map(|t| t.namespaced.clone()).collect(),
+        inner,
+    )
+}
+
+/// What Plan only refuses to start (#1146): a defined agent type whose tools
+/// can write. An untyped call, or a type nobody defined, runs: its sub-agent
+/// inherits the mode through [`mode_gate`] and the sandbox.
+pub fn delegate_writes(definition: Option<&AgentDefinition>) -> bool {
+    definition.is_some() && definition_can_write(definition)
 }
 
 /// Whether a sub-agent may change files: its definition grants `write_file`
@@ -1300,9 +1551,10 @@ pub fn spec_edits_files(spec: &SubagentSpec) -> bool {
 
 /// A run that stopped because its turns ran out — with or without a usable
 /// forced close — and left a transcript to continue from. A blocked run
-/// (a question) and a run that could not start are not this.
+/// (a question), a run that could not start, one that errored and one its
+/// spend limit closed are not this: more turns would not fix them.
 pub fn ran_out_of_turns(o: &AgentOutcome) -> bool {
-    !o.blocked && !o.transcript.is_empty() && (o.closed_at_cap || !o.finished)
+    !o.blocked && !o.errored && !o.spend_stopped && !o.transcript.is_empty() && (o.closed_at_cap || !o.finished)
 }
 
 /// Fold a continuation (more turns on the same transcript) into one outcome:
@@ -1389,7 +1641,7 @@ async fn run_attempt(
     client: &reqwest::Client,
     cancel: &Arc<AtomicBool>,
     sink: &ChatAgentSink,
-    gate: &SubagentGate,
+    gate: &dyn ToolGate,
     external: Option<&dyn ExternalTools>,
     started: std::time::Instant,
 ) -> AgentOutcome {
@@ -1516,6 +1768,7 @@ mod tests {
             escalate: None,
             max_turns: None,
             effort: None,
+            max_cost: None,
             source: "project".into(),
         }
     }
@@ -1581,6 +1834,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -1612,6 +1866,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         assert_eq!(pick_subagent_model(&base, &known, &no_tiers), "conv-model");
         let with_def = SubagentSpec { definition: Some(def("x", None, Some("haiku"))), ..base.clone() };
@@ -1677,6 +1932,7 @@ mod tests {
             default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None,
             definition: None, policy_auto: false, resume: None,
             plan: None,
+            spend_limit: None,
         };
         assert!(spec_edits_files(&base), "no definition → the full tool set");
         let with = |tools: Vec<&str>| SubagentSpec { definition: Some(def("x", Some(tools), None)), ..base.clone() };
@@ -1723,6 +1979,7 @@ mod tests {
             policy_auto: true,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         (known, tiers, base)
     }
@@ -1821,6 +2078,7 @@ mod tests {
             policy_auto: true,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         assert_eq!(pick_subagent_model(&base, &known, &tiers), "haiku", "no model → fast under Auto");
         // A definition's tier still wins; a call's explicit model still wins.
@@ -1882,6 +2140,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let ok = AgentOutcome { ok: true, finished: true, model: "sonnet".into(), ..Default::default() };
         assert!(!should_escalate(&ok));
@@ -1890,6 +2149,9 @@ mod tests {
         // work); a question for the director is not a capability failure.
         assert!(!should_escalate(&AgentOutcome { ok: true, finished: true, closed_at_cap: true, model: "sonnet".into(), ..Default::default() }));
         assert!(!should_escalate(&AgentOutcome { ok: false, blocked: true, model: "sonnet".into(), ..Default::default() }));
+        // A spend stop whose close came back empty: the money ran out, a
+        // dearer model would only spend more.
+        assert!(!should_escalate(&AgentOutcome { ok: false, spend_stopped: true, model: "sonnet".into(), ..Default::default() }));
         // Writing roles are warned about the half-modified tree; read-only ones are not.
         assert!(spec_can_write(&spec), "full tool set");
         let ro = SubagentSpec { definition: Some(def("explorer", Some(vec!["read_file", "grep"]), None)), ..spec.clone() };
@@ -2025,6 +2287,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -2100,6 +2363,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let gate = RecordingGate { seen: Mutex::new(vec![]), deny: vec!["mcp__jira__add_comment"] };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -2115,6 +2379,75 @@ mod tests {
         let (reason, denial) = mcp_gate_texts(Some("Ticket"), "mcp__jira__add_comment");
         assert!(reason.starts_with("Sub-agent \u{201c}Ticket\u{201d}: MCP tool"));
         assert!(reason.contains("may change external state") && denial.contains("do not retry"));
+    }
+
+    struct PromptRecordingScripted {
+        inner: ScriptedProvider,
+        system: Mutex<String>,
+        tools: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for PromptRecordingScripted {
+        async fn complete(&self, b: &str, k: Option<&str>, req: &LlmRequest, c: &reqwest::Client) -> AppResult<LlmResponse> {
+            *self.system.lock() = req.system.clone();
+            *self.tools.lock() = req.tools.iter().map(|t| t.name.clone()).collect();
+            self.inner.complete(b, k, req, c).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subagent_loads_a_skill_and_its_allowed_tools_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claude/skills/audit");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: audit\ndescription: Audit the code.\nallowed-tools: read_file\n---\nRead, never write.",
+        )
+        .unwrap();
+        let provider = PromptRecordingScripted {
+            inner: ScriptedProvider {
+                turns: Mutex::new(VecDeque::from(vec![
+                    resp("", vec![LlmToolUse { id: "t1".into(), name: "Skill".into(), input: serde_json::json!({"name": "audit"}) }], LlmStopReason::ToolUse),
+                    resp("", vec![LlmToolUse { id: "t2".into(), name: "write_file".into(), input: serde_json::json!({"path": "x.txt", "content": "hi"}) }], LlmStopReason::ToolUse),
+                    resp("audited", vec![], LlmStopReason::EndTurn),
+                ])),
+            },
+            system: Mutex::new(String::new()),
+            tools: Mutex::new(vec![]),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Audit".into(), prompt: "p".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(4), max_tokens: 1, sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, None, None).await.unwrap();
+        assert!(out.ok, "{}", out.report);
+        assert!(provider.system.lock().contains("- audit: Audit the code."));
+        assert!(provider.tools.lock().contains(&"Skill".to_string()));
+        // The skill's allowed-tools refused the write; nothing reached disk.
+        assert!(!dir.path().join("x.txt").exists());
+        let results: Vec<String> = out
+            .transcript
+            .iter()
+            .filter_map(|m| match &m.content {
+                crate::providers::LlmContent::ToolResults(r) => Some(r.iter().map(|r| r.content.clone()).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results[0].contains("Read, never write.") && !results[0].contains("[untrusted output from"), "{}", results[0]);
+        assert!(results[1].contains("`write_file` was not run") && results[1].contains("`audit`"), "{}", results[1]);
     }
 
     #[test]
@@ -2158,6 +2491,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -2217,6 +2551,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let gate = DenyRuns { seen: Mutex::new(vec![]) };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -2266,6 +2601,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();
@@ -2283,6 +2619,275 @@ mod tests {
         assert_eq!(entries[0]["stageId"], "call-1");
         let kinds: Vec<&str> = entries.iter().map(|p| p["entry"]["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
+    }
+
+    /// Answers its scripted turns, then fails every request with an error
+    /// that is not retried (a context 400). Panics past `max_calls`, so a
+    /// loop that never stops fails the test instead of hanging it.
+    struct FailsAfter {
+        turns: Mutex<VecDeque<LlmResponse>>,
+        calls: AtomicU64,
+        max_calls: u64,
+        seen: Mutex<Vec<Vec<LlmMessage>>>,
+    }
+    impl FailsAfter {
+        fn new(turns: Vec<LlmResponse>, max_calls: u64) -> Self {
+            Self { turns: Mutex::new(VecDeque::from(turns)), calls: AtomicU64::new(0), max_calls, seen: Mutex::new(vec![]) }
+        }
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for FailsAfter {
+        async fn complete(&self, _b: &str, _k: Option<&str>, req: &LlmRequest, _c: &reqwest::Client) -> AppResult<LlmResponse> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert!(n <= self.max_calls, "the loop never stopped ({n} calls)");
+            self.seen.lock().push(req.messages.clone());
+            self.turns.lock().pop_front().ok_or_else(|| crate::error::AppError::Provider {
+                kind: crate::error::ProviderErrorKind::BadRequest,
+                retry_after: None,
+                message: "prompt is too long".into(),
+            })
+        }
+    }
+
+    fn read_turn(id: &str, input_tokens: u64) -> LlmResponse {
+        LlmResponse {
+            input_tokens,
+            ..resp(
+                "reading",
+                vec![LlmToolUse { id: id.into(), name: "read_file".into(), input: serde_json::json!({"path": "a.rs"}) }],
+                LlmStopReason::ToolUse,
+            )
+        }
+    }
+
+    fn core_spec(dir: &std::path::Path) -> SubagentSpec {
+        SubagentSpec {
+            call_id: "call-f".into(),
+            call: parse_agent_call(&serde_json::json!({"description": "Inspect a.rs", "prompt": "Read a.rs and report."})).unwrap(),
+            workspace_id: "ws".into(),
+            thread_id: "th".into(),
+            workspace_path: dir.to_string_lossy().into_owned(),
+            default_model: "m".into(),
+            max_iterations: None,
+            max_tokens: 4096,
+            sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_subagent_is_continuable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        // Two real rounds, then the provider refuses the third request.
+        let provider = FailsAfter::new(vec![read_turn("t1", 10), read_turn("t2", 10)], 3);
+        let spec = core_spec(dir.path());
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec, &cancel, &rec, None, None)
+            .await
+            .expect("a failed loop is a failed outcome, not an error");
+        assert!(!out.ok && out.errored && !out.finished, "{}", out.report);
+        assert!(out.report.starts_with("Sub-agent failed:") && out.report.contains("prompt is too long"), "{}", out.report);
+        // The two rounds' usage, not zero.
+        assert_eq!((out.input_tokens, out.output_tokens, out.tool_calls), (20, 10, 2));
+        assert_eq!(out.billed_attempts()[0].input_tokens, 20);
+        // Their conversation is the resume point: the ask, then two rounds.
+        assert_eq!(out.transcript.len(), 5, "{:?}", out.transcript);
+        assert!(!ran_out_of_turns(&out), "an error is not a turn cap: the cap gate does not ask");
+
+        // Saved like any other run, so the crew journal can continue it.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        persist_run(&db, &spec, &out);
+        let saved = db.lock().get_chat_agent_run("call-f").unwrap().expect("the failed run was saved");
+        let transcript: BlockedTranscript = serde_json::from_str(&saved.transcript_json).unwrap();
+        assert_eq!(transcript.messages.len(), 5);
+        assert!(transcript.ask_tool_use_id.is_empty(), "a continuation, not an answered ask");
+
+        // Continuing resumes on those rounds instead of starting over.
+        let more = SubagentSpec {
+            resume: Some(resume_messages_for_continuation(&transcript, &continuation_note(None, None))),
+            ..spec.clone()
+        };
+        let provider = FailsAfter::new(vec![resp("Report: a.rs is an empty main.", vec![], LlmStopReason::EndTurn)], 1);
+        let done = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &more, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(done.ok && done.continued, "{}", done.report);
+        let sent = provider.seen.lock()[0].clone();
+        assert!(sent.len() >= 5, "the saved rounds were sent again: {sent:?}");
+
+        // A failure before any round completes has nothing to continue.
+        let provider = FailsAfter::new(vec![], 1);
+        let none = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(!none.ok && none.errored && none.transcript.is_empty());
+        assert_eq!(none.input_tokens + none.output_tokens, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn subagent_spend_limit_closes_run() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let model = "claude-opus-5-5";
+        let round = crate::token_engine::request_cost_for(model, 10_000, 5, 0, 0);
+        assert!(round > 0.0, "the model is priced");
+        // A sub-agent that would read forever: every turn calls a tool.
+        let looping = || FailsAfter::new((0..10).map(|i| read_turn(&format!("t{i}"), 10_000)).collect(), 10);
+
+        // Its share of the headroom is 1.5 rounds: round 2 crosses it, its
+        // tools are voided and the close answers.
+        let spec = SubagentSpec { spend_limit: Some(round * 1.5), ..core_spec(dir.path()) };
+        let provider = looping();
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 3, "two rounds and the close");
+        assert!(out.spend_stopped && out.finished && out.ok, "{}", out.report);
+        assert!(out.report.contains("reached its spend limit"), "{}", out.report);
+        assert_eq!(out.tool_calls, 1, "the second round's call was not run");
+        assert!((out.cost_usd - round * 3.0).abs() < 1e-9, "every request is billed: {}", out.cost_usd);
+        assert!(!ran_out_of_turns(&out), "more turns would not help: the money ran out");
+
+        // A definition's `max-cost` caps it the same way when it is tighter.
+        let mut capped = def("explorer", None, None);
+        capped.max_cost = Some(round * 0.5);
+        let spec = SubagentSpec { definition: Some(capped), spend_limit: Some(10.0), ..core_spec(dir.path()) };
+        let provider = looping();
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "one round and the close");
+        assert!(out.spend_stopped, "{}", out.report);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn an_escalation_gets_only_what_is_left_of_the_spend_limit() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let model = "claude-opus-5-5";
+        let round = crate::token_engine::request_cost_for(model, 10_000, 5, 0, 0);
+        let tiers: HashMap<String, String> = [("strong".to_string(), "opus".to_string())].into_iter().collect();
+        let mut implementer = def("implementer", None, None);
+        implementer.escalate = Some("strong".into());
+        let spec = SubagentSpec { definition: Some(implementer), spend_limit: Some(round * 1.5), ..core_spec(dir.path()) };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // A first attempt that reaches the limit and whose close is empty
+        // fails, but does not escalate.
+        let mut turns: Vec<LlmResponse> = (0..2).map(|i| read_turn(&format!("t{i}"), 10_000)).collect();
+        turns.push(LlmResponse { input_tokens: 10_000, ..resp("", vec![], LlmStopReason::EndTurn) });
+        let provider = FailsAfter::new(turns, 3);
+        let stopped = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(stopped.spend_stopped && !stopped.ok, "{}", stopped.report);
+        assert!(!should_escalate(&stopped), "a spend stop never escalates");
+        assert!(!has_spend_left(&spec, stopped.cost_usd), "and nothing is left for one");
+
+        // A first attempt that errored after one round escalates with the
+        // other half round only.
+        let provider = FailsAfter::new(vec![read_turn("t1", 10_000)], 2);
+        let failed = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(failed.errored && should_escalate(&failed), "{}", failed.report);
+        assert!((failed.cost_usd - round).abs() < 1e-9, "{}", failed.cost_usd);
+        assert!(has_spend_left(&spec, failed.cost_usd));
+        let retry = escalation_retry(&spec, &failed, model, "opus", &tiers);
+        let left = retry.spend_limit.expect("the retry is limited");
+        assert!((left - round * 0.5).abs() < 1e-9, "only what is left: {left}");
+        assert_eq!(retry.plan.as_ref().map(|p| p.model.as_str()), Some("opus"));
+        let provider = FailsAfter::new((0..10).map(|i| read_turn(&format!("r{i}"), 10_000)).collect(), 10);
+        let second = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &retry, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "one round crosses what is left, then the close");
+        assert!(second.spend_stopped, "{}", second.report);
+
+        // A definition's `max-cost` is a total for the run the same way.
+        let mut capped = def("implementer", None, None);
+        capped.max_cost = Some(1.0);
+        let spec = SubagentSpec { definition: Some(capped), spend_limit: None, ..core_spec(dir.path()) };
+        assert_eq!(spend_left(&spec, 0.25), Some(0.75));
+        assert_eq!(spend_left(&spec, 2.0), Some(0.0), "never below zero");
+        assert!(!has_spend_left(&spec, 1.0));
+        let unbounded = core_spec(dir.path());
+        assert_eq!(spend_left(&unbounded, 100.0), None);
+        assert!(has_spend_left(&unbounded, 100.0), "no limit, nothing runs out");
+    }
+
+    #[test]
+    fn a_spend_limit_is_the_tighter_of_the_share_and_the_definitions_cap() {
+        assert_eq!(subagent_spend_limit(None, None), None, "no budget, no cap: unbounded");
+        assert_eq!(subagent_spend_limit(Some(2.0), None), Some(2.0));
+        assert_eq!(subagent_spend_limit(None, Some(0.5)), Some(0.5));
+        assert_eq!(subagent_spend_limit(Some(2.0), Some(0.5)), Some(0.5));
+        assert_eq!(subagent_spend_limit(Some(0.25), Some(0.5)), Some(0.25));
+        assert_eq!(budget_share(None, 3), None);
+        assert_eq!(budget_share(Some(3.0), 3), Some(1.0), "the headroom is split across the fan-out");
+        assert_eq!(budget_share(Some(-1.0), 2), Some(0.0), "a spent budget leaves nothing");
+        assert_eq!(budget_share(Some(1.0), 0), Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn stopped_subagent_reads_as_stopped_and_keeps_its_transcript() {
+        // Stop landed before the sub-agent's next round (#1148).
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::new()) };
+        let spec = SubagentSpec {
+            call_id: "call-7".into(),
+            call: parse_agent_call(&serde_json::json!({"description": "Explore", "prompt": "Map the crate."})).unwrap(),
+            workspace_id: "ws".into(),
+            thread_id: "th".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(),
+            max_iterations: None,
+            max_tokens: 4096,
+            sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(!out.finished && !out.blocked);
+        assert!(!out.transcript.is_empty(), "a stopped run leaves a transcript to continue from");
+        assert!(was_stopped(&out, true));
+        mark_stopped(&mut out);
+        assert!(out.stopped && !out.ok);
+        assert!(out.report.starts_with("Sub-agent stopped: the user stopped the turn after 0 tool calls"), "{}", out.report);
+        assert!(!out.report.contains("turn limit"), "it never hit one");
+        let meta = serde_json::to_value(&out).unwrap();
+        assert_eq!(meta["stopped"], true);
+
+        // A run that reported, or stopped on a question, before Stop keeps
+        // its ending; without Stop nothing is marked.
+        let finished = AgentOutcome { ok: true, finished: true, ..AgentOutcome::default() };
+        assert!(!was_stopped(&finished, true));
+        assert!(!was_stopped(&AgentOutcome { blocked: true, ..AgentOutcome::default() }, true));
+        assert!(!was_stopped(&AgentOutcome::default(), false));
+        let mut one = AgentOutcome { tool_calls: 1, ..AgentOutcome::default() };
+        mark_stopped(&mut one);
+        assert!(one.report.contains("after 1 tool call,"), "{}", one.report);
     }
 
     /// A sub-agent's `run_command` gets the PATH CLI stages spawn with (#1087).
@@ -2315,6 +2920,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();
@@ -2326,5 +2932,212 @@ mod tests {
         assert!(out.ok && out.finished, "{}", out.report);
         let seen = std::fs::read_to_string(dir.path().join("path.txt")).unwrap();
         assert_eq!(seen, crate::orchestrator::cli_runner::resolved_cli_path());
+    }
+
+    /// A provider that records each request's tools and messages as sent.
+    struct Capturing {
+        inner: ScriptedProvider,
+        sent: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for Capturing {
+        async fn complete(&self, b: &str, k: Option<&str>, req: &LlmRequest, c: &reqwest::Client) -> AppResult<LlmResponse> {
+            let json = |v: serde_json::Result<String>| v.unwrap_or_default();
+            self.sent.lock().push((json(serde_json::to_string(&req.tools)), json(serde_json::to_string(&req.messages))));
+            self.inner.complete(b, k, req, c).await
+        }
+    }
+
+    fn capturing(turns: Vec<LlmResponse>) -> Capturing {
+        Capturing { inner: ScriptedProvider { turns: Mutex::new(VecDeque::from(turns)) }, sent: Mutex::new(vec![]) }
+    }
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> LlmToolUse {
+        LlmToolUse { id: id.into(), name: name.into(), input }
+    }
+
+    /// A database with one conversation in `mode`, and an untyped sub-agent
+    /// of it working in `dir`.
+    fn mode_thread(mode: crate::permissions::Mode, dir: &Path) -> (tempfile::NamedTempFile, Arc<Mutex<Db>>, SubagentSpec) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.insert_project("p-mode", "P", "/tmp/octo-mode-project").unwrap();
+        db.insert_workspace("w-mode", "p-mode", "ws", "", "main", None, "", None).unwrap();
+        let thread = db.create_chat_thread("w-mode", "Plan it").unwrap().id;
+        db.set_thread_permission_mode(&thread, mode).unwrap();
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Look".into(), prompt: "look".into(), subagent_type: None, model: None },
+            workspace_id: "w-mode".into(),
+            thread_id: thread,
+            workspace_path: dir.to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None, definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        };
+        (tmp, Arc::new(Mutex::new(db)), spec)
+    }
+
+    fn mcp_info(server: &str, name: &str, read_only: bool) -> crate::mcp::McpToolInfo {
+        crate::mcp::McpToolInfo {
+            server: server.into(),
+            name: name.into(),
+            namespaced: format!("mcp__{server}__{name}"),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only,
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_inherits_mode() {
+        use crate::permissions::{plan_refusal, Mode, Refused};
+        let plan_write = plan_refusal(Refused::Write, false);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+        let (_tmp, db, base) = mode_thread(Mode::Plan, dir.path());
+        // The run is narrowed as it starts: its commands go on the read-only sandbox.
+        let spec = mode_spec(&db, &base);
+        assert_eq!(spec.sandbox_roots, Some(vec![]));
+        let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &[], None);
+        let provider = capturing(vec![
+            resp("", vec![
+                call("t1", "write_file", serde_json::json!({"path": "plan.md", "content": "x"})),
+                call("t2", "edit_file", serde_json::json!({"path": "seed.txt", "old_string": "seed", "new_string": "gone"})),
+                call("t3", "read_file", serde_json::json!({"path": "seed.txt"})),
+            ], LlmStopReason::ToolUse),
+            resp("Report: planned.", vec![], LlmStopReason::EndTurn),
+        ]);
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), None).await.unwrap();
+        assert!(out.ok, "{}", out.report);
+        assert!(!dir.path().join("plan.md").exists(), "nothing was written");
+        assert_eq!(std::fs::read_to_string(dir.path().join("seed.txt")).unwrap(), "seed", "nothing was edited");
+        // Both writes got the mode's fixed result, and the read ran.
+        let sent = provider.sent.lock().clone();
+        let results = &sent[1].1;
+        assert_eq!(results.matches(plan_write.as_str()).count(), 2, "{results}");
+        assert!(results.contains("seed"), "{results}");
+        // The gate reads the thread's mode at each call; a run that started
+        // in Edit freely is not narrowed.
+        db.lock().set_thread_permission_mode(&base.thread_id, Mode::Edit).unwrap();
+        let edit = mode_spec(&db, &base);
+        assert_eq!(edit.sandbox_roots, None);
+        let gate = mode_gate(&db, &edit, base.sandbox_roots.as_deref(), &[], None);
+        assert_eq!(gate.check("write_file", &serde_json::json!({"path": "a"})).await, None);
+        db.lock().set_thread_permission_mode(&base.thread_id, Mode::Plan).unwrap();
+        assert_eq!(gate.check("write_file", &serde_json::json!({"path": "a"})).await, Some(plan_write));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_unhinted_mcp() {
+        use crate::permissions::{plan_refusal, Mode, Refused};
+        let plan_net = plan_refusal(Refused::Net, false);
+        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, db, base) = mode_thread(Mode::Plan, dir.path());
+        let discovered = vec![mcp_info("jira", "get_issue", true), mcp_info("jira", "add_comment", false)];
+        let mcp = FakeMcp { tools: discovered.iter().map(mcp_llm_tool).collect(), calls: Mutex::new(vec![]) };
+        let spec = mode_spec(&db, &base);
+        let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &discovered, None);
+        let provider = capturing(vec![
+            resp("", vec![
+                call("t1", "mcp__jira__add_comment", serde_json::json!({"body": "hi"})),
+                call("t2", "mcp__jira__get_issue", serde_json::json!({"key": "PROJ-1"})),
+            ], LlmStopReason::ToolUse),
+            resp("done", vec![], LlmStopReason::EndTurn),
+        ]);
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), Some(&mcp)).await.unwrap();
+        assert!(out.ok);
+        let calls: Vec<String> = mcp.calls.lock().iter().map(|c| c.0.clone()).collect();
+        assert_eq!(calls, vec!["mcp__jira__get_issue".to_string()], "the unhinted tool never reached its server");
+        assert!(provider.sent.lock()[1].1.contains(plan_net.as_str()));
+        // An MCP name nobody discovered is refused too.
+        assert_eq!(gate.check("mcp__other__delete", &serde_json::json!({})).await, Some(plan_net));
+    }
+
+    #[tokio::test]
+    async fn tool_list_identical_across_modes() {
+        use crate::permissions::Mode;
+        let mut lists: Vec<String> = Vec::new();
+        for mode in [Mode::Plan, Mode::Edit] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+            let (_tmp, db, base) = mode_thread(mode, dir.path());
+            let discovered = vec![mcp_info("jira", "get_issue", true), mcp_info("jira", "add_comment", false)];
+            let mcp = FakeMcp { tools: discovered.iter().map(mcp_llm_tool).collect(), calls: Mutex::new(vec![]) };
+            let spec = mode_spec(&db, &base);
+            let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &discovered, None);
+            let provider = capturing(vec![
+                resp("", vec![call("t1", "write_file", serde_json::json!({"path": "b.txt", "content": "b"}))], LlmStopReason::ToolUse),
+                resp("done", vec![], LlmStopReason::EndTurn),
+            ]);
+            let rec = Recorder { entries: Mutex::new(vec![]) };
+            run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+                &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), Some(&mcp)).await.unwrap();
+            assert_eq!(dir.path().join("b.txt").exists(), mode == Mode::Edit, "{mode:?}");
+            lists.extend(provider.sent.lock().iter().map(|(tools, _)| tools.clone()));
+        }
+        assert_eq!(lists.len(), 4);
+        assert!(lists.iter().all(|l| l == &lists[0]), "the tools sent differ between modes");
+        assert!(lists[0].contains("write_file") && lists[0].contains("mcp__jira__add_comment"), "every tool is still offered");
+    }
+
+    /// Plan only starts an untyped `Agent` call again; its sub-agent gets the
+    /// full tool set, bound by the mode and the read-only sandbox. Forced by
+    /// a read-only mission, its refusals name the mission.
+    #[tokio::test]
+    async fn an_untyped_agent_in_plan_only_cannot_write() {
+        use crate::permissions::{decide, plan_refusal, Decision, Mode, PolicyCtx, Refused, ToolCall};
+        let (none, sandboxed): (std::collections::HashSet<String>, &[String]) = (Default::default(), &[]);
+        assert!(!delegate_writes(None) && delegate_writes(Some(&def("implementer", Some(vec!["edit_file"]), None))));
+        assert!(!delegate_writes(Some(&def("explorer", Some(vec!["read_file", "grep"]), None))));
+        let ctx = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &none, delegate_writes: delegate_writes(None), forced: false };
+        let untyped = serde_json::json!({"prompt": "look around"});
+        assert_eq!(decide(Mode::Plan, &ToolCall { name: "Agent", input: &untyped }, &ctx), Decision::Allow);
+
+        let script = || {
+            capturing(vec![
+                resp("", vec![
+                    call("t1", "write_file", serde_json::json!({"path": "plan.md", "content": "x"})),
+                    call("t2", "edit_file", serde_json::json!({"path": "seed.txt", "old_string": "seed", "new_string": "gone"})),
+                    call("t3", "run_command", serde_json::json!({"command": "echo x > cmd.txt"})),
+                    call("t4", "run_command", serde_json::json!({"command": "git push origin main"})),
+                ], LlmStopReason::ToolUse),
+                resp("Report: looked.", vec![], LlmStopReason::EndTurn),
+            ])
+        };
+        // Chosen by the conversation, and forced by a read-only mission on a
+        // conversation left in Edit freely.
+        for (mode, mission, forced) in [(Mode::Plan, None, false), (Mode::Edit, Some(vec![]), true)] {
+            // Outside `$TMPDIR`, which the read-only profile keeps writable.
+            let caches = dirs::cache_dir().unwrap();
+            std::fs::create_dir_all(&caches).unwrap();
+            let dir = tempfile::Builder::new().prefix("octopush-plan-agent-").tempdir_in(&caches).unwrap();
+            std::fs::write(dir.path().join("seed.txt"), "seed").unwrap();
+            let (_tmp, db, mut base) = mode_thread(mode, dir.path());
+            base.sandbox_roots = mission;
+            let spec = mode_spec(&db, &base);
+            assert_eq!(spec.sandbox_roots, Some(vec![]), "its commands run on the read-only sandbox");
+            let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &[], None);
+            let provider = script();
+            let rec = Recorder { entries: Mutex::new(vec![]) };
+            let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+                &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), None).await.unwrap();
+            assert!(out.ok, "{}", out.report);
+            for f in ["plan.md", "cmd.txt"] {
+                assert!(!dir.path().join(f).exists(), "{f} was written ({mode:?})");
+            }
+            assert_eq!(std::fs::read_to_string(dir.path().join("seed.txt")).unwrap(), "seed");
+            let results = provider.sent.lock()[1].1.clone();
+            assert_eq!(results.matches(plan_refusal(Refused::Write, forced).as_str()).count(), 2, "{results}");
+            assert!(results.contains(plan_refusal(Refused::Remote("git push"), forced).as_str()), "{results}");
+            assert_eq!(results.contains("mission is read-only"), forced, "{results}");
+            assert_eq!(results.contains("Edit freely"), !forced, "{results}");
+        }
     }
 }

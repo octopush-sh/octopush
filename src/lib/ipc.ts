@@ -1063,7 +1063,7 @@ export const ipc = {
   /** The approval cards still waiting on a thread, oldest first (a reloaded
    *  webview shows them again: a card waits until it is answered). */
   pendingApprovals: (threadId: string) =>
-    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write"; sensitive?: boolean }>>(
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run"; sensitive?: boolean; rememberDir?: string }>>(
       "pending_approvals",
       { threadId },
     ),
@@ -1139,8 +1139,9 @@ export const ipc = {
    *  outside the project, or one over 4 MiB. The slash menu lists them. */
   listSkippedSkills: (workspacePath: string) =>
     invoke<SkippedDefinition[]>("list_skipped_skills", { workspacePath }),
-  /** The workspace's `.claude/agents/*.md` definitions — the `subagent_type`s
-   *  Talk's `Agent` tool can run under (project ∪ user, project shadows). */
+  /** The `subagent_type`s Talk's `Agent` tool can run under: the workspace's
+   *  `.claude/agents/*.md` definitions and the built-in types (project ∪ user
+   *  ∪ built-in, project shadows). */
   listSubagentTypes: (workspacePath: string) =>
     invoke<SubagentTypeMeta[]>("list_subagent_types", { workspacePath }),
 
@@ -1165,6 +1166,15 @@ export const ipc = {
    *  off list. The backend reads and writes the list under one lock. */
   setThreadMcpServer: (threadId: string, server: string, off: boolean) =>
     invoke<string[]>("set_thread_mcp_server", { threadId, server, off }),
+  /** A Talk conversation's permission mode, as stored and as its turns run
+   *  it: `plan` (Plan only), `edit` (Edit freely, the default) or `ask` (Ask
+   *  first, stored by a newer build). `effective` is `plan` while the
+   *  workspace's mission is read-only. Talk reads it at each round boundary. */
+  getThreadPermissionMode: (threadId: string) =>
+    invoke<{ stored: "plan" | "ask" | "edit"; effective: "plan" | "ask" | "edit" }>("get_thread_permission_mode", { threadId }),
+  /** Set a conversation's permission mode; resolves to the mode stored. */
+  setThreadPermissionMode: (threadId: string, mode: "plan" | "edit") =>
+    invoke<"plan" | "edit">("set_thread_permission_mode", { threadId, mode }),
   /** Settings saved the MCP config, Reconnect restarted a server, or Talk's
    *  discovery started (or failed to start) servers. If either subscription
    *  fails, the other is dropped and the promise rejects. */
@@ -2195,7 +2205,7 @@ export { CHAT_AGENT_LOG_EVENT } from "./agentTools";
 export interface SubagentTypeMeta {
   name: string;
   description: string;
-  /** "project" or "user". */
+  /** "project", "user" or "builtin". */
   source: string;
   /** Workspace tool names the sub-agent is limited to; null = the full set. */
   tools: string[] | null;

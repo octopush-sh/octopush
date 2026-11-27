@@ -323,9 +323,12 @@ function BandSection({
   control?: React.ReactNode;
 }) {
   if (items.length === 0) return null;
+  // Premium breath (32px) above each band, 12px from its eyebrow to its first
+  // row: the label sits with the cards it names, and bands read as groups. The
+  // eyebrow row is a fixed 12px so a band control can't push its cards down.
   return (
-    <section>
-      <div className="flex h-11 items-center justify-between font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+    <section className="mt-8 first:mt-4">
+      <div className="mb-3 flex h-3 items-center justify-between font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
         {title}
         {control}
       </div>

@@ -58,6 +58,9 @@ export interface AgentMeta {
   /** The run was given more turns (or an answer) after its first ending;
    *  the report and figures cover every run. */
   continued?: boolean;
+  /** Stop on the turn ended the run before it reported; it can still be
+   *  continued from the crew journal. */
+  stopped?: boolean;
 }
 
 export { isAgentToolName };
@@ -168,22 +171,28 @@ export interface PendingApproval {
   secret?: boolean;
   /** The command also stages, so the scan read uncommitted changes. */
   coversUncommitted?: boolean;
-  /** What the card asks about when it isn't a shell command (#1147): an MCP
-   *  tool call, or a file tool reading or writing outside the workspace
-   *  (`command` is then the path, and there is no "don't ask again"). */
+  /** What the card asks about when it isn't a destructive command (#1147):
+   *  an MCP tool call, a file tool reading or writing outside the workspace
+   *  (`command` is then the path, and there is no "don't ask again"), or a
+   *  command naming a path outside the workspace (`run`, #1201; no "don't
+   *  ask again" either). */
   kind?: ApprovalKind;
   /** The path is a well-known credentials location: the safe answer leads. */
   sensitive?: boolean;
+  /** A command's read outside the workspace (#1201): the folder "Allow
+   *  reading … for this conversation" remembers. */
+  rememberDir?: string;
 }
 
-export type ApprovalKind = "mcp" | "read" | "write";
+export type ApprovalKind = "mcp" | "read" | "write" | "run";
 
 /** The card fields a request carries beyond its command and reason. */
-function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean }) {
+function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean; rememberDir?: string }) {
   return {
     ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
     ...(c.kind ? { kind: c.kind } : {}),
     ...(c.sensitive ? { sensitive: true } : {}),
+    ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
   };
 }
 
@@ -1172,6 +1181,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     coversUncommitted?: boolean;
     kind?: ApprovalKind;
     sensitive?: boolean;
+    rememberDir?: string;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
