@@ -848,6 +848,9 @@ pub struct SubagentGate {
     reach: crate::talk_guard::Reach,
     /// The mission's sandbox refuses a write outside the workspace itself.
     writes_confined: bool,
+    /// The thread's mode, read at each call: in Ask first no "don't ask
+    /// again" answers a card (#1231).
+    mode: Option<crate::permissions::ModeSource>,
     seq: AtomicU64,
 }
 
@@ -864,8 +867,21 @@ impl SubagentGate {
             mcp_writes: std::collections::HashSet::new(),
             reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
             writes_confined: spec.sandbox_roots.is_some(),
+            mode: None,
             seq: AtomicU64::new(1),
         }
+    }
+
+    /// Read the thread's mode at each call, so Ask first's rule that no
+    /// grant answers a card holds here too.
+    pub fn with_mode(mut self, mode: crate::permissions::ModeSource) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    /// Whether the thread's "don't ask again" may answer this call's card.
+    fn grants(&self) -> bool {
+        self.mode.as_ref().is_none_or(|mode| mode() != crate::permissions::Mode::Ask)
     }
 
     /// Let reads into the dependency folders a mission links from its
@@ -936,7 +952,7 @@ impl ToolGate for SubagentGate {
             let check = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.read_dirs(&self.thread_id));
             if let Some(card) = check() {
                 let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, self.grants());
                 if let Some(denial) = crate::chat_engine::guard_card(card, &check, ask).await {
                     return Some(denial);
                 }
@@ -957,13 +973,13 @@ impl ToolGate for SubagentGate {
             };
             let card = check()?;
             let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, self.grants());
             return crate::chat_engine::guard_card(card, &check, ask).await;
         };
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         match self
             .broker
-            .await_approval(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason)
+            .await_approval(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, self.grants())
             .await
         {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => None,
@@ -984,6 +1000,8 @@ pub struct SubagentAsk {
     label: String,
     workspace_path: String,
     reach: crate::talk_guard::Reach,
+    /// The user's own credentials, redacted from the diff.
+    known: Vec<crate::secret_scan::KnownSecret>,
     seq: AtomicU64,
 }
 
@@ -998,6 +1016,7 @@ impl SubagentAsk {
             label: spec.call.description.clone(),
             workspace_path: spec.workspace_path.clone(),
             reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
+            known: crate::secret_scan::known_secrets_from(&crate::settings::load_settings().unwrap_or_default()),
             seq: AtomicU64::new(1),
         }
     }
@@ -1007,7 +1026,8 @@ impl SubagentAsk {
 impl crate::permissions::Asker for SubagentAsk {
     async fn ask(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let id = format!("{}:ask:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-        let preview = || crate::ask_first::card(Path::new(&self.workspace_path), &self.reach, Some(self.label.as_str()), name, input);
+        let preview =
+            || crate::ask_first::card(Path::new(&self.workspace_path), &self.reach, Some(self.label.as_str()), name, input, &self.known);
         let ask = |c| self.broker.await_ask_first(&self.app, &self.workspace_id, &self.thread_id, &id, c);
         crate::ask_first::ask_first(preview, ask).await
     }
@@ -1414,7 +1434,8 @@ pub async fn run_one_subagent(
     let model = plan.model.clone();
     let approval_gate = SubagentGate::new(Arc::clone(&approvals), app.clone(), spec)
         .with_mcp_writes(mcp_tools)
-        .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
+        .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id))
+        .with_mode(crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone()));
     let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)))
         .with_asker(Box::new(SubagentAsk::new(approvals, app.clone(), spec)));
     let external = McpSubagentTools::granted(

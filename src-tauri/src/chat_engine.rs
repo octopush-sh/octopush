@@ -13,7 +13,7 @@ use crate::chat_agents::{
     mcp_off_refusal, thread_mcp_off,
 };
 use crate::chat_history::{
-    build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
+    build_history_landing, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
 };
 use crate::context::budget;
 use crate::db::Db;
@@ -22,7 +22,7 @@ use crate::providers::{
     anthropic::AnthropicProvider,
     complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
-    retry_notice, Completion, Effort, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
+    retry_notice, Completion, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
     LlmRole, LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
@@ -403,7 +403,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub skill: Option<String>,
     /// Inline image attachments for THIS turn (base64). Sent as multimodal
-    /// content blocks alongside the user text. Not persisted in history.
+    /// content blocks alongside the user text, and kept with the ask
+    /// (`chat_attachments`) so later turns send them again.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
     /// Regenerate: the prior turn was already truncated and history ends with the
@@ -1567,6 +1568,14 @@ pub struct ApprovalRequestEvent {
     /// An Ask first card's file change, as a unified diff (#1231).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Why an Ask first card shows no diff (a binary file, one too large),
+    /// said plainly on the card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_note: Option<String>,
+    /// The conversation is in Ask first: no "don't ask again" answers this
+    /// card, and it offers none (#1231).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ask_first: bool,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1708,8 +1717,11 @@ impl ApprovalBroker {
     }
 
     /// Ask the user to approve a dangerous agent command and wait for the answer.
-    /// Auto-approved conversations skip the prompt. The card waits as long as
-    /// it takes (see the type's doc): never a silent denial.
+    /// Auto-approved conversations skip the prompt, unless `grants` is false:
+    /// in Ask first no "don't ask again" answers a card, and none is granted
+    /// (#1231). The card waits as long as it takes (see the type's doc):
+    /// never a silent denial.
+    #[allow(clippy::too_many_arguments)]
     pub async fn await_approval(
         &self,
         app: &AppHandle,
@@ -1718,17 +1730,18 @@ impl ApprovalBroker {
         call_id: &str,
         command: &str,
         reason: &str,
+        grants: bool,
     ) -> ApprovalDecision {
-        if self.auto_approve.lock().contains(thread_id) {
+        if self.silenced(thread_id, None, grants) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
-        self.record(thread_id, decision, false);
-        decision
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None, !grants).await;
+        self.record(thread_id, decision, !grants)
     }
 
     /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
-    /// thread's grant answers like a command, or a file outside the
+    /// thread's grant answers like a command (unless `grants` is false: in
+    /// Ask first every MCP write asks, #1231), or a file outside the
     /// workspace, which asks every time and whose approval grants nothing.
     pub async fn await_card(
         &self,
@@ -1737,26 +1750,29 @@ impl ApprovalBroker {
         thread_id: &str,
         call_id: &str,
         card: ToolCard,
+        grants: bool,
     ) -> ApprovalDecision {
-        if self.grant_answers(thread_id, Some(card.kind)) {
+        if self.silenced(thread_id, Some(card.kind), grants) {
             return ApprovalDecision::Approve;
         }
         let marks = Some((card.kind, card.sensitive));
         let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
-        self.settle_card(thread_id, decision, &card)
+        let decision =
+            self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, !grants).await;
+        self.settle_card(thread_id, decision, &card, grants)
     }
 
     /// What an answer to a `talk_guard` card does: "always" on a command's
     /// card that offers a folder lets the thread's commands read it from now
-    /// on and counts as one approval (#1201); any other as [`Self::record`].
-    pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard) -> ApprovalDecision {
+    /// on and counts as one approval (#1201); any other as [`Self::record`],
+    /// which grants nothing when `grants` is false (Ask first).
+    pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard, grants: bool) -> ApprovalDecision {
         match (decision, &card.remember) {
             (ApprovalDecision::ApproveAlways, Some((dir, _))) => {
                 self.read_dirs.lock().entry(thread_id.to_string()).or_default().push(dir.clone());
                 ApprovalDecision::Approve
             }
-            _ => self.record(thread_id, decision, !card.kind.grantable()),
+            _ => self.record(thread_id, decision, !card.kind.grantable() || !grants),
         }
     }
 
@@ -1769,6 +1785,12 @@ impl ApprovalBroker {
     /// a command's (`None`) or an MCP call's, never a file outside.
     pub(crate) fn grant_answers(&self, thread_id: &str, kind: Option<CardKind>) -> bool {
         kind.is_none_or(CardKind::grantable) && self.auto_approve.lock().contains(thread_id)
+    }
+
+    /// Whether a card is answered unseen: only by a grant, and never while
+    /// the conversation is in Ask first (`grants` false, #1231).
+    pub(crate) fn silenced(&self, thread_id: &str, kind: Option<CardKind>, grants: bool) -> bool {
+        grants && self.grant_answers(thread_id, kind)
     }
 
     /// Ask about a command the secret guard stopped (#819). Unlike
@@ -1786,7 +1808,7 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None, false)
             .await;
         self.record(thread_id, decision, true)
     }
@@ -1842,6 +1864,7 @@ impl ApprovalBroker {
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
+        ask_first: bool,
     ) -> ApprovalDecision {
         let request = ApprovalRequestEvent {
             workspace_id: workspace_id.to_string(),
@@ -1855,6 +1878,8 @@ impl ApprovalBroker {
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
             diff: None,
+            preview_note: None,
+            ask_first,
         };
         self.wait_on(app, request).await
     }
@@ -2588,6 +2613,20 @@ fn wait_command_bounded(
 /// mission) says when a refused write broke it, so the model stops trying.
 pub(crate) const READ_ONLY_NOTE: &str = "(This command ran under the read-only sandbox: it can read the workspace \
      and write temp files, but it can't change the workspace.)";
+
+/// [`READ_ONLY_NOTE`] when a read-only mission forced Plan only (#1230).
+pub(crate) const READ_ONLY_MISSION_NOTE: &str = "(This command ran under the read-only sandbox because this workspace's \
+     mission is read-only: it can read the workspace and write temp files, but it can't change the workspace.)";
+
+/// `out` with its read-only note naming the read-only mission when one
+/// forced the sandbox (`forced`), as the policy's refusals do. Pure.
+pub(crate) fn name_forced_mission(out: String, forced: bool) -> String {
+    if forced {
+        out.replace(READ_ONLY_NOTE, READ_ONLY_MISSION_NOTE)
+    } else {
+        out
+    }
+}
 
 /// `out` with [`READ_ONLY_NOTE`] when a command on the read-only profile
 /// (`Some([])`) failed on a refused write.
@@ -3412,7 +3451,8 @@ impl ChatEngine {
         self.approvals.respond(call_id, decision);
     }
 
-    /// Ask the user to approve a dangerous agent command and wait for the answer.
+    /// Ask the user to approve a dangerous agent command and wait for the
+    /// answer; `grants` is false in Ask first (#1231).
     #[allow(clippy::too_many_arguments)]
     async fn await_approval(
         &self,
@@ -3422,9 +3462,10 @@ impl ChatEngine {
         call_id: &str,
         command: &str,
         reason: &str,
+        grants: bool,
     ) -> ApprovalDecision {
         self.approvals
-            .await_approval(app, workspace_id, thread_id, call_id, command, reason)
+            .await_approval(app, workspace_id, thread_id, call_id, command, reason, grants)
             .await
     }
 
@@ -3506,7 +3547,10 @@ impl ChatEngine {
     /// cut would take rows the turn is still writing.
     pub fn truncate_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
         self.ensure_idle(thread_id)?;
-        self.db.lock().truncate_chat_after(thread_id, message_id)
+        let freed = self.db.lock().truncate_chat_after(thread_id, message_id)?;
+        // The images of the rows it took, unless another row names them.
+        crate::chat_attachments::remove(&freed);
+        Ok(())
     }
 
     /// Which of `thread_ids` have a turn or a sub-agent continuation
@@ -4472,6 +4516,17 @@ impl ChatEngine {
                     tracing::warn!(error = %e, message_id = id, "failed to save the ask's @ context blocks");
                 }
             }
+            // Its images are kept with it (#1159), so later turns send them
+            // again. One that can't be saved still goes with this turn.
+            let dir = crate::chat_attachments::dir();
+            for att in &request.attachments {
+                let saved = crate::chat_attachments::save(&dir, att)
+                    .map_err(AppError::from)
+                    .and_then(|name| self.db.lock().add_chat_attachment(id, &name, &att.media_type));
+                if let Err(e) = saved {
+                    tracing::warn!(error = %e, message_id = id, "failed to keep an image attachment");
+                }
+            }
         }
 
         // Build conversation history (this thread only) as normalized
@@ -4506,14 +4561,24 @@ impl ChatEngine {
             }
         }
 
-        let mut messages: Vec<LlmMessage> = match &transcript {
-            Some(rows) => crate::context::transcript::build(rows, &request.model),
+        // The thread's images (#1159): the asks that carry some make their
+        // turns, and go back on them once the context budget is known.
+        let stored_images = self.db.lock().list_chat_attachments(&request.thread_id).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to read the conversation's image attachments");
+            Vec::new()
+        });
+        let current_ask = history.iter().rev().find(|m| m.role == "user").map(|m| m.id);
+        let with_images = crate::chat_attachments::asks_with_images(&stored_images, current_ask, &request.attachments);
+
+        let (mut messages, landing): (Vec<LlmMessage>, Vec<Vec<i64>>) = match &transcript {
+            Some(rows) => crate::context::transcript::build_landing(rows, &request.model, &with_images),
             None => {
                 let rows: Vec<HistoryRow<'_>> = history
                     .iter()
                     .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_blocks.as_deref() })
                     .collect();
-                build_history(&rows)
+                let (turns, landing) = build_history_landing(&rows, &with_images);
+                let messages = turns
                     .into_iter()
                     .map(|t| LlmMessage {
                         role: match t.role {
@@ -4522,44 +4587,10 @@ impl ChatEngine {
                         },
                         content: LlmContent::Text(t.text),
                     })
-                    .collect()
+                    .collect();
+                (messages, landing)
             }
         };
-
-        // Attach this turn's images: replace the current (last) user turn with a
-        // multimodal block carrying the text + image blocks. Attachments aren't
-        // persisted, so they only ride along on the turn that sent them.
-        if !request.attachments.is_empty() {
-            // The just-persisted user message is the last entry. Guard on its
-            // role; warn (rather than silently drop) if it's somehow not a user
-            // turn. The text block is omitted when empty (image-only sends),
-            // since providers reject empty text blocks.
-            match messages.last_mut() {
-                Some(last) if last.role == LlmRole::User => {
-                    // Use the turn's already-built text, not request.user_message:
-                    // the former includes any merged `$`-direct command context
-                    // prepended above, which would otherwise be dropped here.
-                    let text = match &last.content {
-                        LlmContent::Text(t) => t.clone(),
-                        _ => request.user_message.clone(),
-                    };
-                    let mut blocks: Vec<LlmBlock> = Vec::new();
-                    if !text.trim().is_empty() {
-                        blocks.push(LlmBlock::Text(text));
-                    }
-                    for att in &request.attachments {
-                        blocks.push(LlmBlock::Image {
-                            media_type: att.media_type.clone(),
-                            data: att.data.clone(),
-                        });
-                    }
-                    last.content = LlmContent::Multimodal(blocks);
-                }
-                _ => tracing::warn!(
-                    "attachments present but the last message isn't a user turn; images dropped"
-                ),
-            }
-        }
 
         // The project's CLAUDE.md chain (or AGENTS.md), re-read every turn so
         // an edit applies at once; unchanged files give the same text, so the
@@ -4699,6 +4730,8 @@ impl ChatEngine {
         // mission's own sandbox refuses a write outside the workspace.
         let main_checkout = crate::talk_guard::project_root(&self.db, &request.workspace_id);
         let reach = crate::talk_guard::Reach::of_workspace(&workspace_path, main_checkout.as_deref());
+        // The user's own credentials, redacted from an Ask first card's diff.
+        let known = saved_settings.as_ref().map(crate::secret_scan::known_secrets_from).unwrap_or_default();
         let writes_confined = sandbox_roots.is_some();
 
         let mut usage = TurnUsage::default();
@@ -4717,6 +4750,24 @@ impl ChatEngine {
             model_budget = model_budget.with_fixed_window();
         }
         let mut context_guard = budget::ContextGuard::new(model_budget, budget::load_learned(&self.db.lock(), &request.model));
+        // Each ask's images back on its turn (#1159), byte-stable inside the
+        // cached prefix. The ask being answered always carries its own; the
+        // earlier ones stay while the history with them fits in half the
+        // window (where the guard aims), and past that go first, oldest
+        // first, each replaced by a note, before any tool result is stubbed.
+        if !with_images.is_empty() {
+            let base = context_guard.estimate(fixed_chars, &messages);
+            let limit = context_guard.budget().share(budget::TARGET_PCT);
+            let blocks = crate::chat_attachments::for_history(
+                &crate::chat_attachments::dir(),
+                &stored_images,
+                current_ask,
+                &request.attachments,
+                base,
+                limit,
+            );
+            crate::chat_attachments::attach(&mut messages, &landing, &blocks);
+        }
         // Each tool call's stored row, which a stub names for recall (the
         // transcript's earlier calls among them).
         let mut tool_rows: HashMap<String, i64> =
@@ -4806,6 +4857,8 @@ impl ChatEngine {
                 sandbox_roots.as_deref(),
             );
             let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
+            // In Ask first no "don't ask again" answers a card (#1231).
+            let grants = mode != crate::permissions::Mode::Ask;
             if let Some(note) = mode_watch.at_round(mode) {
                 if let Err(e) = self.insert_and_emit_message(&app, &request.workspace_id, &request.thread_id, "stopped", &note, None, None, None, None) {
                     tracing::warn!(error = %e, "failed to note the mode change");
@@ -5204,7 +5257,7 @@ impl ChatEngine {
                 // Ask first: a write waits on its card, with its diff, before
                 // any guard; what the user approves still meets every guard.
                 if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {
-                    let preview = || crate::ask_first::card(&workspace_path, &reach, None, &u.name, &u.input);
+                    let preview = || crate::ask_first::card(&workspace_path, &reach, None, &u.name, &u.input, &known);
                     let ask = |c| self.approvals.await_ask_first(&app, &request.workspace_id, &request.thread_id, &u.id, c);
                     denied = crate::ask_first::ask_first(preview, ask).await;
                 }
@@ -5213,7 +5266,7 @@ impl ChatEngine {
                 let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
-                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants);
                     denied = guard_card(card, &check, ask).await;
                 }
                 // A command flagged destructive pauses for the user's OK before
@@ -5245,7 +5298,7 @@ impl ChatEngine {
                             reach.command_card(None, command, cwd.as_deref().map(Path::new), &allowed)
                         };
                         if let Some(card) = check() {
-                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants);
                             denied = guard_card(card, &check, ask).await;
                         }
                     }
@@ -5258,6 +5311,7 @@ impl ChatEngine {
                                 &u.id,
                                 command,
                                 reason,
+                                grants,
                             )
                             .await
                         {
@@ -5434,9 +5488,9 @@ impl ChatEngine {
                 } else if u.name == "run_command" {
                     // On the sandbox (Plan only, a sandboxed mission) or without
                     // the shared shell: off the runtime thread, and Stop kills it.
-                    let ran = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
+                    let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
-                    ran
+                    (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
                 } else {
                     // Every other built-in tool, off the runtime thread too: a
                     // long grep never stalls another workspace's turn, and a
@@ -6669,7 +6723,7 @@ mod tests {
             .take_while(|m| m.id <= ask)
             .map(|m| HistoryRow { id: m.id, role: &m.role, content: &m.content, context: m.context_blocks.as_deref() })
             .collect();
-        let legacy: Vec<LlmMessage> = build_history(&legacy_rows)
+        let legacy: Vec<LlmMessage> = crate::chat_history::build_history(&legacy_rows)
             .into_iter()
             .map(|h| LlmMessage {
                 role: if h.role == HistoryRole::User { LlmRole::User } else { LlmRole::Assistant },
@@ -7256,6 +7310,24 @@ mod tests {
         assert!(!wp.join("in_workspace.txt").exists(), "nothing was written");
     }
 
+    /// In Ask first an earlier "don't ask again" never answers a card, and
+    /// no answer there grants one (#1231): every MCP write and flagged
+    /// command asks.
+    #[test]
+    fn no_grant_silences_a_card_in_ask_first() {
+        let broker = ApprovalBroker::default();
+        assert_eq!(broker.record("t", ApprovalDecision::ApproveAlways, false), ApprovalDecision::ApproveAlways);
+        for kind in [None, Some(CardKind::Mcp)] {
+            assert!(broker.silenced("t", kind, true), "{kind:?}: Edit freely keeps the grant");
+            assert!(!broker.silenced("t", kind, false), "{kind:?}: Ask first asks anyway");
+        }
+        let mcp = crate::talk_guard::mcp_card(None, "mcp__github__merge_pr", &serde_json::json!({ "number": 7 }));
+        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &mcp, false), ApprovalDecision::Approve);
+        assert!(!broker.auto_approves("u"), "an Ask first answer grants nothing");
+        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &mcp, true), ApprovalDecision::ApproveAlways);
+        assert!(broker.auto_approves("u"));
+    }
+
     #[test]
     fn a_secret_card_never_grants_dont_ask_again() {
         let broker = ApprovalBroker::default();
@@ -7282,7 +7354,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None, diff: None,
+            remember_dir: None, diff: None, preview_note: None, ask_first: false,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7309,14 +7381,14 @@ mod tests {
             sensitive: false,
             remember: Some((dir.clone(), "/tmp/x".into())),
         };
-        assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
+        assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card, true), ApprovalDecision::Approve);
         assert_eq!(broker.read_dirs("t"), vec![dir]);
         assert!(broker.read_dirs("other").is_empty(), "for this conversation only");
         assert!(!broker.auto_approves("t"), "it grants no \"don't ask again\"");
         // Allowed once, or a card that offers no folder: nothing is remembered.
-        assert_eq!(broker.settle_card("u", ApprovalDecision::Approve, &card), ApprovalDecision::Approve);
+        assert_eq!(broker.settle_card("u", ApprovalDecision::Approve, &card, true), ApprovalDecision::Approve);
         let plain = ToolCard { remember: None, ..card };
-        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &plain), ApprovalDecision::Approve);
+        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &plain, true), ApprovalDecision::Approve);
         assert!(broker.read_dirs("u").is_empty() && !broker.auto_approves("u"));
     }
 
@@ -7609,6 +7681,8 @@ mod tests {
             sensitive: false,
             remember_dir: None,
             diff: None,
+            preview_note: None,
+            ask_first: false,
         }
     }
 

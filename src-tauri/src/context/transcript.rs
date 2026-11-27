@@ -169,6 +169,14 @@ pub fn tool_rows(rows: &[Row<'_>]) -> HashMap<String, i64> {
 /// are never replayed; consecutive text turns of one role merge, so roles
 /// alternate.
 pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
+    build_landing(rows, model, &HashSet::new()).0
+}
+
+/// [`build`], and for each message the user rows of `with_images` (asks
+/// that carry images, #1159) it holds, for `chat_attachments::attach`. Such
+/// an ask makes a message even when its text is empty; with no such ask the
+/// messages are [`build`]'s.
+pub fn build_landing(rows: &[Row<'_>], model: &str, with_images: &HashSet<i64>) -> (Vec<LlmMessage>, Vec<Vec<i64>>) {
     let current = rows.iter().rposition(|r| r.role == "user");
     // The turns that replay as pairs, by their ask's index. An empty ask
     // (an image alone) renders as text, so pairs always follow a user message.
@@ -192,6 +200,7 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
     let shortened: usize = rows.iter().filter(|r| r.role == "user").filter_map(|r| Some(shortened_context_len(r.content, r.context?))).sum();
     let mut allowance = plan_tool_history_with(&text_tools, shortened).into_iter();
     let mut out: Vec<LlmMessage> = Vec::new();
+    let mut landing: Vec<Vec<i64>> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rows.len() {
@@ -203,8 +212,10 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
                     Some(ctx) if Some(i - 1) != current => abridge_context(row.id, row.content, ctx),
                     _ => row.content.to_string(),
                 };
-                push_text(&mut out, LlmRole::User, flush(&mut pending, &text));
+                let ask = Some(row.id).filter(|id| with_images.contains(id));
+                push_text(&mut out, &mut landing, LlmRole::User, flush(&mut pending, &text), ask);
                 if let Some((turn, next)) = pairs.remove(&(i - 1)) {
+                    landing.extend(turn.iter().map(|_| Vec::new()));
                     out.extend(turn);
                     i = next;
                 }
@@ -216,14 +227,14 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
                 }
             }
             "tool" => pending.extend(summarize_tool_row(row.id, row.content, allowance.next().unwrap_or(TOOL_HISTORY_STUB))),
-            "assistant" => push_text(&mut out, LlmRole::Assistant, flush(&mut pending, row.content.trim())),
+            "assistant" => push_text(&mut out, &mut landing, LlmRole::Assistant, flush(&mut pending, row.content.trim()), None),
             _ => {}
         }
     }
     // A turn continued with no new message (the error card's "Try again"):
     // what it did before it failed rides on its ask, as on a next one.
-    push_text(&mut out, LlmRole::User, flush(&mut pending, ""));
-    out
+    push_text(&mut out, &mut landing, LlmRole::User, flush(&mut pending, ""), None);
+    (out, landing)
 }
 
 /// A turn's rounds as tool_use and tool_result pairs, then its answer,
@@ -279,18 +290,28 @@ fn flush(pending: &mut Vec<String>, tail: &str) -> String {
     text
 }
 
-fn push_text(out: &mut Vec<LlmMessage>, role: LlmRole, text: String) {
-    if text.is_empty() {
+/// `text` as a `role` message, merged into the last one when it is a text
+/// message of that role; `ask` is the user row it holds, when it has images.
+fn push_text(out: &mut Vec<LlmMessage>, landing: &mut Vec<Vec<i64>>, role: LlmRole, text: String, ask: Option<i64>) {
+    if text.is_empty() && ask.is_none() {
         return;
     }
     if let Some(LlmMessage { role: last, content: LlmContent::Text(t) }) = out.last_mut() {
         if *last == role {
-            t.push_str("\n\n");
-            t.push_str(&text);
+            if !text.is_empty() {
+                if !t.is_empty() {
+                    t.push_str("\n\n");
+                }
+                t.push_str(&text);
+            }
+            if let (Some(id), Some(asks)) = (ask, landing.last_mut()) {
+                asks.push(id);
+            }
             return;
         }
     }
     out.push(LlmMessage { role, content: LlmContent::Text(text) });
+    landing.push(ask.into_iter().collect());
 }
 
 #[cfg(test)]
