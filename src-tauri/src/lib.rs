@@ -26,6 +26,7 @@ pub mod error;
 mod file_open;
 mod file_seen;
 mod fleet_status;
+pub mod fs_safe;
 mod menu_bar;
 pub mod gateway;
 pub mod git_ops;
