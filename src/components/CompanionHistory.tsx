@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { Plus, X, Pencil, Check, Search, Download, Pin, PinOff, RefreshCw } from "lucide-react";
+import { Plus, X, Pencil, Check, Search, ClipboardCopy, Pin, PinOff, RefreshCw } from "lucide-react";
 import { CompanionSection } from "./CompanionSection";
 import { tourId } from "../lib/tour/ids";
 import { useTourStore } from "../stores/tourStore";
@@ -318,10 +318,10 @@ export function CompanionHistory({
                           onExportChat(c.id);
                         }}
                         title="Copy conversation as Markdown"
-                        aria-label="Export conversation"
+                        aria-label="Copy conversation as Markdown"
                         className="pointer-events-auto flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
                       >
-                        <Download size={12} />
+                        <ClipboardCopy size={12} />
                       </button>
                     )}
                     {onDeleteChat && (
