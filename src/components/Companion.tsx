@@ -14,7 +14,7 @@ import { WorkContextPanel } from "./WorkContextPanel";
 import { ElsewhereFooter } from "./ElsewhereFooter";
 import { ElsewhereModal } from "./ElsewhereModal";
 import { FadeSwap } from "./primitives/FadeSwap";
-import { useIssuesStore } from "../stores/issuesStore";
+import { useIssuesStore, useKnownStory } from "../stores/issuesStore";
 import { useChatStore } from "../stores/chatStore";
 import { findCrewAgent } from "./chat/CrewCard";
 
@@ -126,7 +126,8 @@ export function Companion({
 
   const branch = workspace?.branch ?? "";
   const manualKey = workspace?.linkedIssueKey ?? null;
-  const detectedKey = detectTrackerKey(branch, tracker, project?.jiraProjectKey ?? null);
+  const isKnownStory = useKnownStory();
+  const detectedKey = detectTrackerKey(branch, tracker, project?.jiraProjectKey ?? null, isKnownStory);
   const activeKey = manualKey ?? detectedKey;
   // Backlog project key: the configured key, else a manually-linked ticket's
   // prefix. A key guessed from an arbitrary branch name is NOT used (C5).

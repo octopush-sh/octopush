@@ -183,9 +183,21 @@ pub fn detect_issue_key(branch: &str) -> Option<String> {
     None
 }
 
+/// A Jira key never has dotted numbers: `PROJ-12.5` names `PROJ-12`.
+pub fn jira_key(key: &str) -> &str {
+    key.split('.').next().unwrap_or(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_jira_key_drops_dotted_numbers() {
+        assert_eq!(jira_key("PROJ-12.5"), "PROJ-12");
+        assert_eq!(jira_key("PROJ-7.1.2"), "PROJ-7");
+        assert_eq!(jira_key("PROJ-12"), "PROJ-12");
+    }
 
     #[test]
     fn detects_key_in_branch() {
