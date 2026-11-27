@@ -952,8 +952,10 @@ impl ToolGate for SubagentGate {
             }
             // A path outside the workspace or in a credentials location
             // (#1201); a sub-agent's command runs at the workspace root.
-            let check = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.grants(&self.thread_id, mode));
-            if let Some(card) = check() {
+            let place = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.grants(&self.thread_id, mode));
+            // Git is asked off the async worker, as each check starts.
+            let check = || self.reach.checked(&place);
+            if let Some(card) = check().await {
                 let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
                 let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode);
                 if let Some(denial) = crate::chat_engine::guard_card(card, &check, ask).await {
@@ -967,7 +969,7 @@ impl ToolGate for SubagentGate {
             // An MCP write, or a file tool reaching outside the workspace,
             // checked again once approved (`guard_card`).
             let label = Some(self.label.as_str());
-            let check = || {
+            let place = || {
                 if self.mcp_writes.contains(name) {
                     Some(crate::talk_guard::mcp_card(label, name, input))
                 } else {
@@ -978,15 +980,17 @@ impl ToolGate for SubagentGate {
                     card
                 }
             };
-            let card = check()?;
+            let check = || self.reach.checked(&place);
+            let card = check().await?;
             let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
             let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode);
             return crate::chat_engine::guard_card(card, &check, ask).await;
         };
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+        let grant = self.reach.checked(|| self.reach.command_grant(&shown, None)).await;
         match self
             .broker
-            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, self.reach.command_grant(&shown, None), mode)
+            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, grant, mode)
             .await
         {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => None,

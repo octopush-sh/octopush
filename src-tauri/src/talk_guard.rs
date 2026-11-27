@@ -252,11 +252,12 @@ fn repo_dir(path: &Path) -> Option<PathBuf> {
 /// Where Git runs hooks from for the repository at `repo`, asked now
 /// (#1229): `git rev-parse --git-path hooks`, which honours `core.hooksPath`
 /// from every config scope, with `safe.bareRepository=explicit` so Git never
-/// takes a bare repository it finds on its own, bounded to half a second.
-/// Resolved where it exists. `None` when Git can't say in time.
-pub(crate) fn git_hooks_dir(repo: &Path) -> Option<PathBuf> {
+/// takes a bare repository it finds on its own, bounded by `bound`. Resolved
+/// where it exists. An error, an empty answer or a timeout (the process is
+/// killed) is [`HooksAt::Unknown`]: it fails closed. `git` is the program.
+fn git_hooks_dir(git: &Path, bound: std::time::Duration, repo: &Path) -> HooksAt {
     use std::io::Read;
-    let mut child = std::process::Command::new("git")
+    let Ok(mut child) = std::process::Command::new(git)
         .arg("-C")
         .arg(repo)
         .args(["-c", "safe.bareRepository=explicit", "rev-parse", "--git-path", "hooks"])
@@ -265,24 +266,28 @@ pub(crate) fn git_hooks_dir(repo: &Path) -> Option<PathBuf> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    else {
+        return HooksAt::Unknown;
+    };
+    let deadline = std::time::Instant::now() + bound;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let mut out = String::new();
-                if !status.success() || child.stdout.take()?.read_to_string(&mut out).is_err() {
-                    return None;
+                let read = child.stdout.take().is_some_and(|mut o| o.read_to_string(&mut out).is_ok());
+                let answer = out.trim_end_matches(['\n', '\r']);
+                if !status.success() || !read || answer.trim().is_empty() {
+                    return HooksAt::Unknown;
                 }
-                let dir = repo.join(out.trim_end_matches(['\n', '\r']));
-                return (!out.trim().is_empty()).then(|| std::fs::canonicalize(&dir).unwrap_or(dir));
+                let dir = repo.join(answer);
+                return HooksAt::Dir(std::fs::canonicalize(&dir).unwrap_or(dir));
             }
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(5)),
-            // Past the bound, or Git can't be waited on: it says nothing.
+            // Past the bound, or Git can't be waited on: it said nothing.
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return HooksAt::Unknown;
             }
         }
     }
@@ -316,7 +321,23 @@ pub struct Reach {
     main: Option<PathBuf>,
     /// Where Git runs hooks from, per repository folder, asked during the
     /// current check only ([`Reach::hooks_dir`]; cleared as each starts).
-    hooks: parking_lot::Mutex<std::collections::HashMap<PathBuf, Option<PathBuf>>>,
+    hooks: parking_lot::Mutex<std::collections::HashMap<PathBuf, HooksAt>>,
+    /// While [`Reach::checked`] runs a check: the repositories it still has
+    /// to ask Git about, off the async worker.
+    wanted: parking_lot::Mutex<Vec<PathBuf>>,
+    prefetching: std::sync::atomic::AtomicBool,
+    /// The Git it asks, and how long it waits ([`git_hooks_dir`]).
+    git: PathBuf,
+    git_bound: std::time::Duration,
+}
+
+/// Where Git runs a repository's hooks from, as Git said it during a check.
+#[derive(Clone, Debug)]
+enum HooksAt {
+    Dir(PathBuf),
+    /// Git didn't say (an error, a timeout, a repository it won't read):
+    /// everything in that repository counts as running code (#1229).
+    Unknown,
 }
 
 /// The dependency folders a mission may link from its project's main
@@ -361,26 +382,89 @@ impl Reach {
             runs_code,
             main: main_checkout.map(Path::to_path_buf),
             hooks: parking_lot::Mutex::default(),
+            wanted: parking_lot::Mutex::default(),
+            prefetching: std::sync::atomic::AtomicBool::new(false),
+            git: PathBuf::from("git"),
+            git_bound: std::time::Duration::from_millis(500),
         }
+    }
+
+    /// Ask `git` instead, waiting at most `bound` (tests).
+    #[cfg(test)]
+    fn with_git(mut self, git: PathBuf, bound: std::time::Duration) -> Self {
+        (self.git, self.git_bound) = (git, bound);
+        self
+    }
+
+    /// Run the check `place` with every Git answer it needs asked first, on
+    /// a blocking thread (#1229): a round notes the repositories it has no
+    /// answer for (counting them as running code meanwhile), Git is asked
+    /// about them off the async worker, and the check runs again, at most
+    /// three times; what is still unknown then counts as running code.
+    /// Nothing Git said before this check is kept.
+    pub async fn checked<T>(&self, place: impl Fn() -> T) -> T {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.hooks.lock().clear();
+        self.prefetching.store(true, Relaxed);
+        let mut done = None;
+        for _ in 0..3 {
+            let wanted = {
+                self.wanted.lock().clear();
+                let placed = place();
+                let wanted = std::mem::take(&mut *self.wanted.lock());
+                if wanted.is_empty() {
+                    done = Some(placed);
+                    break;
+                }
+                wanted
+            };
+            let (git, bound) = (self.git.clone(), self.git_bound);
+            let answers = tokio::task::spawn_blocking(move || wanted.into_iter().map(|r| (r.clone(), git_hooks_dir(&git, bound, &r))).collect::<Vec<_>>())
+                .await
+                .unwrap_or_default();
+            self.hooks.lock().extend(answers);
+        }
+        let out = done.unwrap_or_else(&place);
+        self.prefetching.store(false, Relaxed);
+        out
     }
 
     /// A new check starts: nothing Git said earlier counts (#1229).
     fn fresh(&self) {
-        self.hooks.lock().clear();
+        if !self.prefetching.load(std::sync::atomic::Ordering::Relaxed) {
+            self.hooks.lock().clear();
+        }
     }
 
     /// Where Git runs hooks from for the repository `path` is in (and the
     /// workspace's), when that isn't inside its Git folder: `core.hooksPath`,
     /// as `git rev-parse --git-path hooks` says now ([`git_hooks_dir`]), once
     /// per repository and check.
-    fn hooks_dir(&self, path: &Path) -> Vec<PathBuf> {
+    fn hooks_dir(&self, path: &Path) -> Vec<HooksAt> {
         let repos = [repo_dir(path), self.root.as_deref().filter(|r| r.join(".git").symlink_metadata().is_ok()).map(Path::to_path_buf)];
+        let prefetching = self.prefetching.load(std::sync::atomic::Ordering::Relaxed);
         let mut memo = self.hooks.lock();
-        repos
-            .into_iter()
-            .flatten()
-            .filter_map(|repo| memo.entry(repo.clone()).or_insert_with(|| git_hooks_dir(&repo)).clone())
-            .collect()
+        let mut out = Vec::new();
+        for repo in repos.into_iter().flatten() {
+            let answer = match memo.get(&repo) {
+                Some(a) => a.clone(),
+                // Asked off the async worker by `checked`: unknown until then.
+                None if prefetching => {
+                    let mut wanted = self.wanted.lock();
+                    if !wanted.contains(&repo) {
+                        wanted.push(repo);
+                    }
+                    HooksAt::Unknown
+                }
+                None => {
+                    let a = git_hooks_dir(&self.git, self.git_bound, &repo);
+                    memo.insert(repo, a.clone());
+                    a
+                }
+            };
+            out.push(answer);
+        }
+        out
     }
 
     /// [`Reach::new`] with the user's home.
@@ -432,7 +516,12 @@ impl Reach {
         if let Some((_, _, why)) = self.runs_code.iter().find(|(place, resolved, _)| std::iter::once(place).chain(resolved).any(|p| under(path, p))) {
             return Some(*why);
         }
-        self.hooks_dir(path).iter().any(|h| under(path, h)).then_some("Git runs its hooks from it (core.hooksPath)")
+        // Fails closed: a repository Git couldn't answer for counts as running code.
+        let hooks = self.hooks_dir(path);
+        if hooks.iter().any(|h| matches!(h, HooksAt::Unknown)) {
+            return Some("Git couldn't say where it runs hooks from");
+        }
+        hooks.iter().any(|h| matches!(h, HooksAt::Dir(d) if under(path, d))).then_some("Git runs its hooks from it (core.hooksPath)")
     }
 
     /// The grant for exactly `command` run from `cwd` (#1229), bound to that
@@ -1836,6 +1925,8 @@ mod tests {
     #[test]
     fn places_that_run_code_always_ask_and_are_never_granted() {
         let (_d, ws, home) = setup();
+        // A real repository: one Git can't answer for asks everywhere in it.
+        assert!(std::process::Command::new("git").arg("-C").arg(&ws).args(["init", "-q"]).status().is_ok_and(|s| s.success()));
         std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
         std::fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
         let reach = Reach::new(&ws, None, Some(&home));
@@ -1952,5 +2043,77 @@ mod tests {
         assert!(git(&other, &["init", "-q"]) && git(&other, &["config", "core.hooksPath", ".husky"]));
         let c = reach.outside_card(None, "write_file", &json!({"path": other.join(".husky/pre-push"), "content": "x"}), false, &[]).unwrap();
         assert!(c.reason.contains("core.hooksPath") && c.grant.is_none(), "{}", c.reason);
+    }
+
+    /// A stand-in for Git at `bin/name`: a shell script running `body`.
+    #[cfg(unix)]
+    fn fake_git(bin: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).unwrap();
+        let git = bin.join(name);
+        std::fs::write(&git, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git
+    }
+
+    /// When Git can't say where a repository runs hooks from (an error, as
+    /// for a repository it calls of dubious ownership, or no answer in
+    /// time), it fails closed (#1229): a write and a command there ask, as
+    /// running code, and offer nothing to keep. Only a target with no `.git`
+    /// anywhere above it, in a workspace with none, skips the question.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_cannot_say_fails_closed() {
+        use std::time::{Duration, Instant};
+        let (d, ws, home) = setup();
+        let asked = d.path().join("asked");
+        let bin = d.path().join("bin");
+        let fails = fake_git(&bin, "fails", &format!("echo x >> '{}'\necho 'fatal: detected dubious ownership' >&2\nexit 128", asked.display()));
+        let slow = fake_git(&bin, "slow", "exec sleep 5");
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        let outside = json!({"path": home.join("sub/x.txt"), "content": "c"});
+        // Outside any repository: Git isn't asked, and the folder may be kept.
+        let reach = Reach::new(&ws, None, Some(&home)).with_git(fails.clone(), Duration::from_secs(5));
+        let c = reach.outside_card(None, "write_file", &outside, false, &[]).expect("a write outside asks");
+        assert!(c.grant.is_some() && !c.reason.contains("couldn't say"), "{}", c.reason);
+        assert!(!asked.exists(), "no `.git` above it: Git isn't asked");
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        for (git, bound) in [(fails, Duration::from_secs(5)), (slow, Duration::from_millis(100))] {
+            let reach = Reach::new(&ws, None, Some(&home)).with_git(git, bound);
+            let started = Instant::now();
+            let inside = json!({"path": "src/main.rs", "content": "c"});
+            for c in [
+                reach.outside_card(None, "write_file", &inside, false, &[]),
+                reach.outside_card(None, "write_file", &inside, true, &[]),
+                reach.outside_card(None, "write_file", &outside, false, &[]),
+                reach.command_card(None, "echo x > notes.md", None, &[]),
+            ] {
+                let c = c.expect("it asks");
+                assert!(c.reason.contains("couldn't say") && c.reason.contains("it runs code") && c.grant.is_none(), "{}", c.reason);
+            }
+            assert_eq!(reach.command_grant("echo x > notes.md", None), None, "nor is the command offered");
+            assert!(started.elapsed() < Duration::from_secs(4), "a Git that doesn't answer is cut off");
+        }
+        assert!(asked.exists(), "in a repository, Git is asked");
+    }
+
+    /// `checked` asks Git what a check needs before it places it, off the
+    /// async worker, and asks again for the next check (#1229).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_asks_git_first_and_again_each_time() {
+        let (d, ws, home) = setup();
+        let asked = d.path().join("asked");
+        // This Git says the repository runs hooks from `custom-hooks`.
+        let git = fake_git(&d.path().join("bin"), "git", &format!("echo x >> '{}'\necho custom-hooks", asked.display()));
+        std::fs::create_dir_all(ws.join(".git")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home)).with_git(git, std::time::Duration::from_secs(5));
+        let times = || std::fs::read_to_string(&asked).map(|s| s.lines().count()).unwrap_or(0);
+        let place = |path: &str| reach.outside_card(None, "write_file", &json!({"path": path, "content": "c"}), false, &[]);
+        assert_eq!(reach.checked(|| place("src/main.rs")).await, None, "Git answered first: no card");
+        assert_eq!(times(), 1, "once for the repository");
+        let c = reach.checked(|| place("custom-hooks/pre-commit")).await.expect("where its hooks run asks");
+        assert!(c.reason.contains("core.hooksPath") && c.grant.is_none(), "{}", c.reason);
+        assert_eq!(times(), 2, "asked again, never kept");
     }
 }

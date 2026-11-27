@@ -2039,12 +2039,10 @@ impl ApprovalBroker {
 /// it runs only if what it reaches is still what the card showed. A link
 /// that changed while the card waited asks again, about where it now leads;
 /// a target that is now inside runs. `Some` is the denial for the model.
-pub(crate) async fn guard_card<F, Fut>(
-    mut card: ToolCard,
-    recheck: impl Fn() -> Option<ToolCard>,
-    ask: F,
-) -> Option<String>
+pub(crate) async fn guard_card<C, CFut, F, Fut>(mut card: ToolCard, recheck: C, ask: F) -> Option<String>
 where
+    C: Fn() -> CFut,
+    CFut: std::future::Future<Output = Option<ToolCard>>,
     F: Fn(ToolCard) -> Fut,
     Fut: std::future::Future<Output = ApprovalDecision>,
 {
@@ -2052,7 +2050,7 @@ where
         if ask(card.clone()).await == ApprovalDecision::Deny {
             return Some(card.denial);
         }
-        match recheck() {
+        match recheck().await {
             Some(next) if next != card => card = next,
             _ => return None,
         }
@@ -2780,7 +2778,8 @@ fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String
 /// file are opened without following a link (`openat`, `O_NOFOLLOW`), so a
 /// swap after that resolve fails instead of redirecting the write. With a
 /// `check` (Talk's), the full check runs again on the path the walk opens,
-/// inside the workspace or out, and a change refuses the write.
+/// inside the workspace or out, and again on where the opened file is
+/// ([`open_without_links`]); a change refuses the write.
 fn write_unfollowed(workspace: &Path, full: &Path, content: &str, check: Option<&crate::talk_guard::WriteCheck>) -> std::io::Result<()> {
     use std::io::Write;
     let refuse = |why: &str| std::io::Error::other(why.to_string());
@@ -2803,15 +2802,19 @@ fn write_unfollowed(workspace: &Path, full: &Path, content: &str, check: Option<
     if let Some(check) = check {
         check.recheck(&parent.join(name)).map_err(|why| refuse(&why))?;
     }
-    open_without_links(&parent, name)?.write_all(content.as_bytes())
+    open_without_links(&parent, name, check)?.write_all(content.as_bytes())
 }
 
 /// `name` in `dir` (already resolved), opened to write (created, emptied)
 /// without following a link anywhere: from `/`, each folder with
 /// `O_DIRECTORY | O_NOFOLLOW`, then the file with `O_NOFOLLOW`. A folder or
-/// file swapped for a link after `dir` was resolved makes it fail.
+/// file swapped for a link after `dir` was resolved makes it fail. With a
+/// `check`, the file, once open and before anything is written or emptied,
+/// is checked again where the system says it is (`F_GETPATH`), which a
+/// folder renamed into place on the way changes (#1229); a refusal leaves
+/// no new file behind and an existing one as it was.
 #[cfg(unix)]
-fn open_without_links(dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+fn open_without_links(dir: &Path, name: &std::ffi::OsStr, check: Option<&crate::talk_guard::WriteCheck>) -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -2840,14 +2843,56 @@ fn open_without_links(dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<std
         }
     }
     let name = c(name)?;
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: as above; the mode applies to a new file only.
-    let fd = owned(unsafe { libc::openat(at.as_raw_fd(), name.as_ptr(), flags, 0o666 as libc::c_uint) })?;
-    Ok(std::fs::File::from(fd))
+    let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // Opened as it is first, so a refusal empties nothing; created only
+    // when it isn't there, so a refusal removes only what this made.
+    // SAFETY: as above.
+    let (fd, created) = match owned(unsafe { libc::openat(at.as_raw_fd(), name.as_ptr(), flags) }) {
+        Ok(fd) => (fd, false),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+            // SAFETY: as above; the mode applies to the new file.
+            let fd = unsafe { libc::openat(at.as_raw_fd(), name.as_ptr(), flags | libc::O_CREAT | libc::O_EXCL, 0o666 as libc::c_uint) };
+            (owned(fd)?, true)
+        }
+        Err(e) => return Err(e),
+    };
+    let file = std::fs::File::from(fd);
+    if let Some(check) = check {
+        let landed = opened_path(&file).map_err(|e| format!("Not written: where the file is can't be read back ({e})."));
+        if let Err(why) = landed.and_then(|path| check.recheck(&path)) {
+            if created {
+                // SAFETY: `at` is the open folder the file was made in.
+                unsafe { libc::unlinkat(at.as_raw_fd(), name.as_ptr(), 0) };
+            }
+            return Err(std::io::Error::other(why));
+        }
+    }
+    file.set_len(0)?;
+    Ok(file)
+}
+
+/// Where the open `file` is now, as the system has it, links resolved.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; libc::MAXPATHLEN as usize];
+    // SAFETY: `F_GETPATH` writes at most `MAXPATHLEN` bytes, NUL included, into `buf`.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn opened_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
 #[cfg(not(unix))]
-fn open_without_links(dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+fn open_without_links(dir: &Path, name: &std::ffi::OsStr, _check: Option<&crate::talk_guard::WriteCheck>) -> std::io::Result<std::fs::File> {
     std::fs::File::create(dir.join(name))
 }
 
@@ -5447,14 +5492,17 @@ impl ChatEngine {
                 // the card just kept answers its recheck; none in Plan only.
                 // What a write was last checked against, to check again as it lands.
                 let write_check: Mutex<Option<crate::talk_guard::WriteCheck>> = Mutex::new(None);
-                let check = || {
+                let place = || {
                     let grants = self.approvals.grants(&request.thread_id, mode);
                     let card = crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined, &grants);
                     *write_check.lock() = reach.write_check(&u.name, &u.input, writes_confined, &grants, card.is_some());
                     card
                 };
+                // Git is asked off the async worker, as each check starts.
+                let check = || reach.checked(&place);
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
-                if let Some(card) = gated.then(&check).flatten() {
+                let first = if gated { check().await } else { None };
+                if let Some(card) = first {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
                     denied = guard_card(card, &check, ask).await;
                 }
@@ -5482,19 +5530,20 @@ impl ChatEngine {
                     let shared = self.talk_shell.available() && exec_roots.is_none();
                     let shell_cwd = || shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
                     if denied.is_none() {
-                        let check = || {
+                        let place = || {
                             let cwd = shell_cwd();
                             let grants = self.approvals.grants(&request.thread_id, mode);
                             reach.command_card(None, command, cwd.as_deref().map(Path::new), &grants)
                         };
-                        if let Some(card) = check() {
+                        let check = || reach.checked(&place);
+                        if let Some(card) = check().await {
                             let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
                             denied = guard_card(card, &check, ask).await;
                         }
                     }
                     if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         // Its grant is bound to where it runs, and checks where it reaches (#1229).
-                        let grant = reach.command_grant(command, shell_cwd().as_deref().map(Path::new));
+                        let grant = reach.checked(|| reach.command_grant(command, shell_cwd().as_deref().map(Path::new))).await;
                         match self
                             .approvals
                             .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, grant, mode)
@@ -7733,10 +7782,40 @@ mod tests {
         std::fs::create_dir_all(real.join("a")).unwrap();
         std::os::unix::fs::symlink(real.join("a"), real.join("l")).unwrap();
         std::os::unix::fs::symlink(real.join("a/t"), real.join("a/f")).unwrap();
-        assert!(open_without_links(&real.join("a"), std::ffi::OsStr::new("ok")).is_ok());
-        assert!(open_without_links(&real.join("l"), std::ffi::OsStr::new("x")).is_err(), "a folder that is a link");
-        assert!(open_without_links(&real.join("a"), std::ffi::OsStr::new("f")).is_err(), "a file that is a link");
+        assert!(open_without_links(&real.join("a"), std::ffi::OsStr::new("ok"), None).is_ok());
+        assert!(open_without_links(&real.join("l"), std::ffi::OsStr::new("x"), None).is_err(), "a folder that is a link");
+        assert!(open_without_links(&real.join("a"), std::ffi::OsStr::new("f"), None).is_err(), "a file that is a link");
         assert!(!real.join("a/t").exists());
+    }
+
+    /// Once open, the file is checked again where the system says it is
+    /// (`F_GETPATH`): a folder renamed into place on the way lands it
+    /// somewhere else, and that refuses, before anything is created or
+    /// emptied (#1229). Here the walk is given that other folder.
+    #[cfg(unix)]
+    #[test]
+    fn the_opened_file_is_checked_again_where_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let (ws, home) = (real.join("ws"), real.join("home"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(home.join("out/sub")).unwrap();
+        std::fs::create_dir_all(home.join("moved")).unwrap();
+        let reach = crate::talk_guard::Reach::new(&ws, None, Some(&home));
+        let grants = [Grant { kind: GrantKind::Write, value: home.join("out").to_string_lossy().into_owned(), shown: "~/out".into() }];
+        let input = serde_json::json!({ "path": home.join("out/sub/x.txt"), "content": "c" });
+        let check = reach.write_check("write_file", &input, false, &grants, false).unwrap();
+        let name = std::ffi::OsStr::new("x.txt");
+        let refused = open_without_links(&home.join("moved"), name, Some(&check)).unwrap_err().to_string();
+        assert!(refused.contains("changed after it was checked"), "{refused}");
+        assert!(!home.join("moved/x.txt").exists(), "a refusal leaves no new file behind");
+        std::fs::write(home.join("moved/x.txt"), "kept").unwrap();
+        assert!(open_without_links(&home.join("moved"), name, Some(&check)).is_err());
+        assert_eq!(std::fs::read_to_string(home.join("moved/x.txt")).unwrap(), "kept", "nor empties one");
+        // Where it was checked, it opens, emptied.
+        std::fs::write(home.join("out/sub/x.txt"), "old").unwrap();
+        assert!(open_without_links(&home.join("out/sub"), name, Some(&check)).is_ok());
+        assert_eq!(std::fs::read_to_string(home.join("out/sub/x.txt")).unwrap(), "");
     }
 
     #[test]
@@ -7777,12 +7856,12 @@ mod tests {
             asked.lock().push(c.shown);
             std::future::ready(ApprovalDecision::Approve)
         };
-        assert_eq!(guard_card(card("~/a"), || Some(card("~/b")), approve).await, None);
+        assert_eq!(guard_card(card("~/a"), || std::future::ready(Some(card("~/b"))), approve).await, None);
         assert_eq!(*asked.lock(), ["~/a", "~/b"]);
         let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
-        assert_eq!(guard_card(card("~/a"), || Some(card("~/b")), deny).await, Some("declined ~/a".to_string()));
+        assert_eq!(guard_card(card("~/a"), || std::future::ready(Some(card("~/b"))), deny).await, Some("declined ~/a".to_string()));
         // Approved, and the target is now inside: it runs.
-        assert_eq!(guard_card(card("~/a"), || None, |_: ToolCard| std::future::ready(ApprovalDecision::Approve)).await, None);
+        assert_eq!(guard_card(card("~/a"), || std::future::ready(None), |_: ToolCard| std::future::ready(ApprovalDecision::Approve)).await, None);
     }
 
     /// The guard is only as good as its call sites: the director's loop and
