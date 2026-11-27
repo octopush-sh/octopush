@@ -44,6 +44,8 @@ interface Props {
   onLinkJira?: () => void;
   onChangeJira?: () => void;
   onUnlinkJira?: () => void;
+  /** What the link items name: "Jira ticket" (default) or "Epiku story". */
+  ticketNoun?: string;
   /** Mission groups. "Move to group ›" shows when `onMoveToGroup` and
    *  `onNewGroup` are wired: `groups` are the groups of this workspace's
    *  project and `groupId` the one it is in. */
@@ -81,6 +83,7 @@ export function WorkspaceContextMenu({
   onLinkJira,
   onChangeJira,
   onUnlinkJira,
+  ticketNoun = "Jira ticket",
   groups,
   groupId,
   onMoveToGroup,
@@ -144,17 +147,17 @@ export function WorkspaceContextMenu({
           <div className={SEP} />
           {linkageKind === "unlinked" && onLinkJira && (
             <button type="button" role="menuitem" className={ITEM} onClick={run(onLinkJira)}>
-              <Link2 size={12} className="shrink-0" /> Link Jira ticket…
+              <Link2 size={12} className="shrink-0" /> Link {ticketNoun}…
             </button>
           )}
           {linkageKind === "linked" && onChangeJira && (
             <button type="button" role="menuitem" className={ITEM} onClick={run(onChangeJira)}>
-              <Link2 size={12} className="shrink-0" /> Change Jira ticket…
+              <Link2 size={12} className="shrink-0" /> Change {ticketNoun}…
             </button>
           )}
           {linkageKind === "linked" && onUnlinkJira && (
             <button type="button" role="menuitem" className={ITEM} onClick={run(onUnlinkJira)}>
-              <Link2Off size={12} className="shrink-0" /> Unlink Jira ticket
+              <Link2Off size={12} className="shrink-0" /> Unlink {ticketNoun}
             </button>
           )}
         </>

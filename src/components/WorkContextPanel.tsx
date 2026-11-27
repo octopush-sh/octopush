@@ -37,8 +37,12 @@ interface PillSpec {
 
 interface Props {
   configured: boolean;
-  /** Caller guarantees this is non-null when Companion renders the panel. */
+  /** Caller guarantees this is non-null when Companion renders the panel,
+   *  unless `wholeBacklog`. */
   projectKey?: string | null;
+  /** Epiku (#1127): the backlog is the project's already, so "Mine" lists it
+   *  whole instead of filtering by a key prefix. */
+  wholeBacklog?: boolean;
   /** Project id — keys the persisted collapse preference. Without it the
    *  collapse state is session-local. */
   projectId?: string | null;
@@ -53,6 +57,7 @@ interface Props {
 export function WorkContextPanel({
   configured,
   projectKey = null,
+  wholeBacklog = false,
   projectId = null,
   defaultCollapsed = false,
   activeKey,
@@ -132,7 +137,7 @@ export function WorkContextPanel({
     if (epicKey) void loadEpic(epicKey);
   }, [epicKey, loadEpic]);
 
-  const mineList     = useMemo(() => selectBacklog(issues ?? [], projectKey, activeKey), [issues, projectKey, activeKey]);
+  const mineList     = useMemo(() => selectBacklog(issues ?? [], projectKey, activeKey, wholeBacklog), [issues, projectKey, activeKey, wholeBacklog]);
   const blockingList = useMemo(() => selectBlocking(activeIssue),                          [activeIssue]);
   const blockedList  = useMemo(() => selectBlockedBy(activeIssue),                         [activeIssue]);
   const subtaskList  = useMemo(() => selectSubtasksOrSiblings(activeIssue, parents),       [activeIssue, parents]);
