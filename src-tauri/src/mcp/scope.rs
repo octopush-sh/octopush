@@ -64,6 +64,31 @@ impl McpRegistry {
         out
     }
 
+    /// The tools of only the servers in `only` (a Direct stage's choice), in
+    /// [`sort_tools`] order, and why each chosen server gave none: it isn't
+    /// configured for `worktree`, or it failed to start (the reason redacted
+    /// as every start failure is). The other servers are never started.
+    pub fn list_tools_of(&self, worktree: &Path, only: &[String]) -> (Vec<McpToolInfo>, Vec<(String, String)>) {
+        let mut out = Vec::new();
+        let mut missing = Vec::new();
+        let cfgs = sorted_server_configs(worktree);
+        let mut wanted: Vec<&String> = only.iter().collect();
+        wanted.sort();
+        wanted.dedup();
+        for name in wanted {
+            let Some((_, cfg)) = cfgs.iter().find(|(n, _)| n == name) else {
+                missing.push((name.clone(), "it isn't configured on this Mac or in this project".to_string()));
+                continue;
+            };
+            match self.ensure(name, cfg) {
+                Ok((conn, _)) => out.extend(conn.lock().tools.clone()),
+                Err(e) => missing.push((name.clone(), e.trim().lines().next().unwrap_or("").trim().to_string())),
+            }
+        }
+        sort_tools(&mut out);
+        (out, missing)
+    }
+
     /// Every server configured for `worktree` (project ∪ user), sorted, with
     /// what this session knows about it. Reads the registry only: it spawns
     /// nothing, and takes one registry lock at a time and never a
@@ -204,6 +229,27 @@ done
         let off: HashSet<String> = ["beta".to_string()].into();
         let without: Vec<String> = first.iter().filter(|n| !n.starts_with("mcp__beta__")).cloned().collect();
         assert_eq!(names(&reg.list_tools_except(wt.path(), &off)), without);
+    }
+
+    #[test]
+    fn a_stage_gets_only_the_servers_it_chose() {
+        let wt = tempfile::tempdir().unwrap();
+        four_servers(wt.path());
+        let reg = McpRegistry::new();
+        let chosen = vec!["mid".to_string(), "gone".to_string(), "alpha".to_string()];
+        let (tools, missing) = reg.list_tools_of(wt.path(), &chosen);
+        let servers: HashSet<&str> = tools.iter().map(|t| t.server.as_str()).collect();
+        assert_eq!(servers, ["alpha", "mid"].into());
+        assert_eq!(tools.len(), 6);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "gone");
+        // The servers it didn't choose were never started.
+        for name in ["beta", "zeta"] {
+            assert_eq!(of(&reg.status(wt.path()), name).state, McpServerState::Idle);
+        }
+        // No choice, no tools and nothing started.
+        let (none, missing) = reg.list_tools_of(wt.path(), &[]);
+        assert!(none.is_empty() && missing.is_empty());
     }
 
     #[test]

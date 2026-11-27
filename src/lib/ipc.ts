@@ -84,6 +84,8 @@ export interface PipelineStage {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none. */
+  mcpServers?: string[];
 }
 export interface Pipeline {
   id: string;
@@ -201,6 +203,9 @@ export interface StageDraft {
   customName: string | null;
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
+  /** The MCP servers (by name) an API stage may use; empty/absent = none,
+   *  the default. Never carried in a crew file. */
+  mcpServers?: string[];
 }
 /** One stage of a crew import's review sheet (mirrors Rust `crew::CrewStagePreview`). */
 export interface CrewStagePreview {

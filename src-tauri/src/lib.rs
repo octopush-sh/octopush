@@ -619,10 +619,12 @@ pub fn run() {
                 let sink = std::sync::Arc::new(orchestrator::events::TauriEventSink {
                     app: app.handle().clone(),
                 });
-                let orch = std::sync::Arc::new(orchestrator::Orchestrator::new(
-                    std::sync::Arc::clone(&st.db),
-                    sink,
-                ));
+                // API stages reach the MCP servers they chose through Talk's
+                // registry (#1134).
+                let orch = std::sync::Arc::new(
+                    orchestrator::Orchestrator::new(std::sync::Arc::clone(&st.db), sink)
+                        .with_mcp(std::sync::Arc::clone(&st.chat.mcp)),
+                );
                 // Detached bridge: re-emits worker-driven runs' persisted
                 // progress as live run://* events, repairs runs whose worker
                 // died, and adopts leases from a previous app session.

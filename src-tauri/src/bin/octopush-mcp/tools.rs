@@ -560,8 +560,11 @@ fn save_pipeline(db: &Db, args: &Value, edit: Option<()>) -> Result<Value, Strin
         // `escalateModel` is trimmed to "no escalation" downstream by
         // `db.save_pipeline` (the single source of truth), which the re-read
         // before returning reflects.
-        let stage: StageDraft = serde_json::from_value(normalized)
+        let mut stage: StageDraft = serde_json::from_value(normalized)
             .map_err(|e| format!("stage {} is malformed: {e}", i + 1))?;
+        // An agent can't give a stage the user's MCP servers (#1134): the
+        // user turns them on in the builder.
+        stage.mcp_servers.clear();
         stages.push(stage);
     }
     // `save_pipeline` runs the full §3.7 validator and rejects invalid drafts.

@@ -123,6 +123,24 @@ fn tools_to_json(tools: &Option<Vec<String>>) -> Option<String> {
     tools.as_ref().and_then(|t| serde_json::to_string(t).ok())
 }
 
+/// A stage's stored MCP server names (#1134); NULL or unreadable ⇒ none.
+fn parse_mcp_servers(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default()
+}
+
+/// A stage's MCP server names as stored: trimmed, sorted, each once; NULL
+/// when there are none.
+fn mcp_servers_to_json(servers: &[String]) -> Option<String> {
+    let mut names: Vec<&str> = servers.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&names).ok()
+    }
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -842,6 +860,11 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalate_model TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalate_effort TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN escalated INTEGER NOT NULL DEFAULT 0")?;
+        // #1134: the MCP servers a stage may use (JSON array of server
+        // names). NULL ⇒ none, the default for every stage: crews run
+        // unattended, so access is opt-in per stage.
+        add_column_if_missing(&self.conn, "ALTER TABLE pipeline_stages ADD COLUMN mcp_servers TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN mcp_servers TEXT")?;
         // The escape valve: a parked stage's `ask_director` questions (JSON
         // `BlockedAsk`), NULL unless the stage is blocked awaiting the director.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_questions TEXT")?;
@@ -5518,11 +5541,12 @@ impl Db {
             "SELECT id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                     loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                     pos_x, pos_y, parents, tools, custom_name, instructions, effort,
-                    escalate_model, escalate_effort
+                    escalate_model, escalate_effort, mcp_servers
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
             Ok(PipelineStageRow {
+                mcp_servers: parse_mcp_servers(r.get(20)?),
                 id: r.get(0)?,
                 pipeline_id: r.get(1)?,
                 position: r.get(2)?,
@@ -5912,8 +5936,8 @@ impl Db {
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      pos_x, pos_y, parents, tools, custom_name, instructions, effort,
-                     escalate_model, escalate_effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                     escalate_model, escalate_effort, mcp_servers)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 params![Uuid::new_v4().to_string(), saved_id, i as i64, s.role, s.agent_model,
                         s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
@@ -5921,7 +5945,8 @@ impl Db {
                         s.pos_x, s.pos_y, parents_json, tools_json, custom_name, instructions,
                         s.effort.as_ref().map(|e| e.as_str()),
                         s.escalate_model.as_deref().map(str::trim).filter(|t| !t.is_empty()),
-                        s.escalate_effort.as_ref().map(|e| e.as_str())],
+                        s.escalate_effort.as_ref().map(|e| e.as_str()),
+                        mcp_servers_to_json(&s.mcp_servers)],
             )?;
         }
         tx.commit()?;
@@ -6001,15 +6026,16 @@ impl Db {
                     (id, run_id, position, role, agent_model, substrate, checkpoint, status,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      parents, tools, custom_name, instructions, effort,
-                     escalate_model, escalate_effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                     escalate_model, escalate_effort, mcp_servers)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![sid, id, s.position, s.role, model, s.substrate, s.checkpoint as i64,
                         s.loop_target_position, s.loop_max_iterations, s.loop_mode,
                         s.max_iterations,
                         parents_json, tools_json, s.custom_name, s.instructions,
                         s.effort.as_ref().map(|e| e.as_str()),
                         s.escalate_model.as_deref(),
-                        s.escalate_effort.as_ref().map(|e| e.as_str())],
+                        s.escalate_effort.as_ref().map(|e| e.as_str()),
+                        mcp_servers_to_json(&s.mcp_servers)],
             )?;
         }
         Ok(id)
@@ -6387,13 +6413,14 @@ impl Db {
             "SELECT role, agent_model, substrate, checkpoint, loop_target_position,
                     loop_max_iterations, loop_mode, max_iterations, pos_x, pos_y,
                     parents, tools, custom_name, instructions, effort,
-                    escalate_model, escalate_effort
+                    escalate_model, escalate_effort, mcp_servers
              FROM pipeline_stages WHERE pipeline_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![pipeline_id], |r| {
             let parents_json: Option<String> = r.get(10)?;
             let tools_json: Option<String> = r.get(11)?;
             Ok(StageDraft {
+                mcp_servers: parse_mcp_servers(r.get(17)?),
                 role: r.get(0)?,
                 agent_model: r.get(1)?,
                 substrate: r.get(2)?,
@@ -6481,8 +6508,8 @@ impl Db {
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      pos_x, pos_y, parents, tools, custom_name, instructions, effort,
-                     escalate_model, escalate_effort)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                     escalate_model, escalate_effort, mcp_servers)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 params![Uuid::new_v4().to_string(), sp.id, i as i64, st.role, st.agent_model,
                         st.substrate, st.checkpoint as i64,
                         st.loop_target_position, st.loop_max_iterations, st.loop_mode,
@@ -6493,7 +6520,8 @@ impl Db {
                         // synced `escalate_model = ""` isn't treated as a real
                         // policy that escalates to an empty model id.
                         st.escalate_model.as_deref().map(str::trim).filter(|t| !t.is_empty()),
-                        st.escalate_effort.as_ref().map(|e| e.as_str())],
+                        st.escalate_effort.as_ref().map(|e| e.as_str()),
+                        mcp_servers_to_json(&st.mcp_servers)],
             )?;
         }
         tx.commit()?;
@@ -8216,6 +8244,16 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// The MCP servers a run stage may use (copied from its template; #1134).
+    pub fn get_stage_mcp_servers(&self, stage_id: &str) -> AppResult<Vec<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT mcp_servers FROM run_stages WHERE id = ?1", params![stage_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(parse_mcp_servers(raw))
+    }
+
     /// Override a stage's tool-turn budget (used by Resume/Re-run with N turns).
     pub fn set_stage_max_iterations(&self, stage_id: &str, max_iterations: i64) -> AppResult<()> {
         self.conn.execute(
@@ -8993,6 +9031,11 @@ pub struct StageDraft {
     /// like `effort`). `None` ⇒ keep the base effort on the retry.
     #[serde(default)]
     pub escalate_effort: Option<crate::providers::Effort>,
+    /// The MCP servers (by name) an API stage may use; empty ⇒ none, the
+    /// default (#1134). Omitted from the JSON when empty, so payloads from
+    /// before it read and write as they did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
 }
 
 fn default_max_iterations() -> i64 {
@@ -9228,6 +9271,8 @@ pub struct PipelineStageRow {
     pub escalate_model: Option<String>,
     /// Escalation policy — the effort to bump to on the failed-retry (API only).
     pub escalate_effort: Option<crate::providers::Effort>,
+    /// The MCP servers an API stage may use; empty ⇒ none (#1134).
+    pub mcp_servers: Vec<String>,
 }
 
 /// A row for the canonical `spend_events` ledger.

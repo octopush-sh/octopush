@@ -94,6 +94,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     body = (
       <PipelineBuilder
         pipeline={builder ? pipelines.find((p) => p.pipeline.id === builder) ?? null : null}
+        workspacePath={workspacePath}
         onClose={() => setBuilder(undefined)}
       />
     );

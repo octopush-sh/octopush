@@ -7,6 +7,7 @@ import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
 import { TrackRecord, type StageRecord } from "./TrackRecord";
+import { StageMcpServers } from "./StageMcpServers";
 import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
@@ -148,16 +149,19 @@ interface Props {
   issue?: { error?: string; warning?: string };
   /** This stage's track record on a saved pipeline; absent on a new stage. */
   record?: StageRecord | null;
+  /** The open workspace, whose MCP servers (Settings › Integrations and its
+   *  `.claude/mcp.json`) the MCP field lists. */
+  workspacePath?: string;
   onPatch: (partial: Partial<StageNodeData>) => void;
   onSetLoop: (next: LoopState) => void;
   onClose: () => void;
 }
 
 /** The Companion: edits the selected stage as an agent — archetype, model,
- *  substrate, tools, gate, turn budget, free-form instructions, and (for review
+ *  substrate, tools, MCP servers, gate, turn budget, free-form instructions, and (for review
  *  archetypes) the loop. The archetype is the operability anchor; everything
  *  else is the author's to shape. */
-export function StageInspector({ node, ancestors, loop, issue, record, onPatch, onSetLoop, onClose }: Props) {
+export function StageInspector({ node, ancestors, loop, issue, record, workspacePath, onPatch, onSetLoop, onClose }: Props) {
   const data = node.data;
   // Subscribe to roles store so the Listbox re-renders when roles load late.
   // archetypes() reads the module-level cache populated by setArchetypes() —
@@ -398,6 +402,15 @@ export function StageInspector({ node, ancestors, loop, issue, record, onPatch, 
             </div>
             {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own tools.</span>}
           </div>
+
+          {/* MCP servers — opt-in per stage, API substrate only for now. */}
+          <StageMcpServers
+            workspacePath={workspacePath}
+            substrate={data.substrate}
+            model={data.agentModel}
+            chosen={data.mcpServers}
+            onChange={(next) => onPatch({ mcpServers: next })}
+          />
 
           {/* Max turns */}
           <label className="flex items-center justify-between gap-2">

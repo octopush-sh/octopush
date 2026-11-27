@@ -104,6 +104,7 @@ Current anchors:
 | `crew-import-sheet` · `crew-import-add` | Crew import review sheet, while open: the sheet · "Add this crew to my library" | `CrewImportSheet.tsx` |
 | `palette-import-crew` | Command palette, Actions: "Import a crew…" | `CommandPalette.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
+| `builder-stage-mcp` | Pipeline builder, Stage inspector: the "MCP servers" field (one toggle chip per server, all off by default; disabled on a CLI stage) | `builder/StageMcpServers.tsx` via `StageInspector.tsx` |
 | `builder-stage-track-record` | Pipeline builder, Stage inspector of a saved stage: the Track record section (its toggle, the record, the micro-history and suggestions) | `builder/TrackRecord.tsx` via `StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
 | `run-session-line` · `run-session-cell` | Run mode band, right track: the session line (session cells, `+`, the layout button) · the focused session's cell (hover or keyboard focus opens its instant label) | `run/SessionLine.tsx` |

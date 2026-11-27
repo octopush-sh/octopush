@@ -895,7 +895,7 @@ mod workspace_tests {
             loop_mode: None, max_iterations: 30, pos_x: Some(10.0), pos_y: Some(20.0),
             parents: vec![], tools: Some(vec!["read_file".into(), "list_files".into()]),
             custom_name: Some("The Plan".into()), instructions: Some("be terse".into()),
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = a.save_pipeline(None, "My Pipe", "d", &[draft.clone()]).unwrap();
         let synced = a.list_custom_pipelines_for_sync().unwrap();
@@ -925,7 +925,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = db.save_pipeline(None, "Local Newer", "d", &[draft.clone()]).unwrap();
         // A pulled copy stamped in the past must be skipped…
@@ -988,7 +988,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = db.save_pipeline(None, "P", "d", &[draft.clone()]).unwrap();
         let (t1, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
@@ -996,6 +996,54 @@ mod workspace_tests {
         db.save_pipeline(Some(pid.clone()), "P2", "d", &[draft]).unwrap();
         let (t2, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
         assert!(t2 > t1, "an edit must move the LWW stamp forward");
+    }
+
+    #[test]
+    fn a_stages_mcp_servers_reach_its_runs_and_sync_but_never_a_crew_file() {
+        // #1134: saved on the stage, copied to the run, carried by library
+        // sync; a crew file neither carries them nor sets them on import.
+        let a = test_db();
+        a.seed_builtin_pipelines().unwrap();
+        setup_workspace(&a, "p1", "ws1");
+        let draft = crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m1".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None, escalate_model: None, escalate_effort: None,
+            mcp_servers: vec![" tracker ".into(), "docs".into(), "tracker".into(), "".into()],
+        };
+        let pid = a.save_pipeline(None, "With MCP", "d", &[draft.clone()]).unwrap();
+        let both = vec!["docs".to_string(), "tracker".to_string()];
+        assert_eq!(a.get_pipeline_stages(&pid).unwrap()[0].mcp_servers, both, "trimmed, sorted, once each");
+        let run = a.create_run("ws1", &pid, "t", None, None, &[]).unwrap();
+        let stage = &a.list_run_stages(&run).unwrap()[0];
+        assert_eq!(a.get_stage_mcp_servers(&stage.id).unwrap(), both);
+
+        let synced = a.list_custom_pipelines_for_sync().unwrap();
+        let b = test_db();
+        b.seed_builtin_pipelines().unwrap();
+        assert!(b.upsert_pipeline_from_sync(&synced[0]).unwrap());
+        assert_eq!(b.pipeline_stage_drafts(&pid).unwrap()[0].mcp_servers, both);
+
+        let crew = crate::crew::export(&a, &pid).unwrap();
+        assert!(crew.pipeline.stages[0].mcp_servers.is_empty());
+        assert!(!crate::crew::to_json(&crew).unwrap().contains("mcpServers"));
+        let mut handed = crew.clone();
+        handed.pipeline.name = "Handed over".into();
+        handed.pipeline.stages[0].mcp_servers = vec!["tracker".into()];
+        let imported = crate::crew::import(&b, &handed, &[]).unwrap();
+        assert!(b.get_pipeline_stages(&imported).unwrap()[0].mcp_servers.is_empty());
+
+        // The default: no servers, stored as NULL.
+        let none = crate::db::StageDraft { mcp_servers: vec![], ..draft };
+        let pid2 = a.save_pipeline(None, "Without", "d", &[none]).unwrap();
+        assert!(a.get_pipeline_stages(&pid2).unwrap()[0].mcp_servers.is_empty());
+        let raw: Option<String> = a
+            .conn_ref()
+            .query_row("SELECT mcp_servers FROM pipeline_stages WHERE pipeline_id = ?1", [pid2.as_str()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None);
     }
 
     #[test]
@@ -3834,7 +3882,7 @@ mod pipeline_crud_tests {
             max_iterations: 25,
             pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
@@ -4071,7 +4119,7 @@ mod pipeline_crud_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         assert!(db.validate_pipeline_stages(&[mk("code_review")]).is_ok());
         assert!(db.validate_pipeline_stages(&[mk("bogus_role")]).is_err());
@@ -8862,7 +8910,7 @@ mod orchestrator_tests {
             checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents, tools,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
     fn ro_tools() -> Option<Vec<String>> {
@@ -9449,7 +9497,7 @@ mod orchestrator_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let mut impl_d = mk("implement");
         impl_d.escalate_model = Some("strong-model".into());
@@ -21070,7 +21118,7 @@ mod crew_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
@@ -25192,7 +25240,7 @@ mod plan_wait_tests {
             max_iterations: 25, pos_x: None, pos_y: None, parents,
             tools: (!parents_is_root(role)).then(|| vec!["read_file".into(), "list_files".into()]),
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
     fn parents_is_root(role: &str) -> bool {
@@ -27621,7 +27669,7 @@ mod sync_contract_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 30, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
