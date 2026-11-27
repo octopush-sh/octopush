@@ -498,6 +498,11 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN skill_shell_off INTEGER NOT NULL DEFAULT 0",
         )?;
+        // Which issue tracker a project reads (#1127): NULL = the default
+        // (Jira where it is configured), else `jira` / `epiku` / `none`; and
+        // the Epiku project it reads, NULL = the one in Settings.
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN issue_tracker TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN epiku_project TEXT")?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -2613,6 +2618,35 @@ impl Db {
         self.conn.execute(
             "UPDATE projects SET jira_project_key = ?1 WHERE id = ?2",
             rusqlite::params![jira_project_key, project_id],
+        )?;
+        Ok(())
+    }
+
+    /// A project's issue-tracker choice and Epiku project override (#1127),
+    /// both `None` for a project that never chose (or doesn't exist).
+    pub fn project_issue_tracker(&self, project_id: &str) -> AppResult<(Option<String>, Option<String>)> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT issue_tracker, epiku_project FROM projects WHERE id = ?1",
+                params![project_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Store a project's issue-tracker choice; callers validate it
+    /// (`issue_tracker::validate_project_choice`).
+    pub fn update_project_issue_tracker(
+        &self,
+        project_id: &str,
+        tracker: Option<&str>,
+        epiku_project: Option<&str>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET issue_tracker = ?1, epiku_project = ?2 WHERE id = ?3",
+            params![tracker, epiku_project, project_id],
         )?;
         Ok(())
     }

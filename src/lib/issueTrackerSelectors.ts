@@ -1,4 +1,4 @@
-import type { Issue, LinkedIssueRef, ProjectInfo, Workspace } from "./types";
+import type { Issue, LinkedIssueRef, ProjectInfo, TrackerKind, Workspace } from "./types";
 import { detectIssueKey } from "./detectIssueKey";
 
 export type LinkageState =
@@ -27,6 +27,39 @@ export function resolveJiraProjectKey(
     return linkage.key.split("-")[0];
   }
   return null;
+}
+
+/** What the workspace menu and the ticket picker call a ticket (#1127). */
+export function ticketNoun(tracker: TrackerKind | null): string {
+  return tracker === "epiku" ? "Epiku story" : "Jira ticket";
+}
+
+/** The cached rows the ticket picker may offer a project. The list is the
+ *  active project's tracker's: the Jira list serves any Jira project, an
+ *  Epiku list only its own project. Anyone else gets none, only the
+ *  exact-key fallback checked against its own tracker. */
+export function pickerCandidates(
+  issues: Issue[] | null,
+  list: { scope: string | null; projectId: string | null },
+  picker: { projectId: string | null; tracker: TrackerKind | null },
+): Issue[] {
+  const same =
+    picker.tracker === "epiku"
+      ? picker.projectId !== null && list.scope === `epiku:${picker.projectId}`
+      : picker.tracker === "jira" && list.scope === "jira";
+  return same ? issues ?? [] : [];
+}
+
+/** "Create workspace" on an Epiku story: the wizard opens on the active
+ *  project, whose backlog listed it. `null` under Jira, which finds the
+ *  project by the key's prefix. */
+export function epikuTicketTarget(
+  issue: Pick<Issue, "key" | "summary">,
+  activeTracker: TrackerKind | null,
+  activeProject: Pick<ProjectInfo, "id" | "path"> | null,
+): { projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string } | null {
+  if (activeTracker !== "epiku" || !activeProject) return null;
+  return { projectId: activeProject.id, projectPath: activeProject.path, initialTask: issue.summary, linkIssueKeyOnCreate: issue.key };
 }
 
 // Order maps the spec's "inProgress → todo → unknown → done" rule.
@@ -60,12 +93,15 @@ function sortByStatusPriorityKey(issues: Issue[]): Issue[] {
 }
 
 /** "Mine" — the user's open assignments in this Jira project, minus the
- *  active ticket (it's already shown in the ContextHeader). */
+ *  active ticket (it's already shown in the ContextHeader). `wholeList`: the
+ *  list is the project's already (Epiku, #1127), so no key-prefix filter. */
 export function selectBacklog(
   allIssues: Issue[],
   projectKey: string | null,
   activeKey: string | null,
+  wholeList = false,
 ): Issue[] {
+  if (wholeList) return sortByStatusPriorityKey(allIssues.filter((i) => i.key !== activeKey));
   if (projectKey == null) return [];
   const prefix = projectKey + "-";
   return sortByStatusPriorityKey(

@@ -3,6 +3,9 @@ import {
   resolveLinkage,
   resolveJiraProjectKey,
   selectBacklog,
+  ticketNoun,
+  pickerCandidates,
+  epikuTicketTarget,
   selectElsewhereCount,
   selectBlocking,
   selectBlockedBy,
@@ -115,6 +118,11 @@ describe("selectBacklog", () => {
 
   it("returns [] when projectKey is null", () => {
     expect(selectBacklog(issues, null, null)).toEqual([]);
+  });
+
+  it("keeps the whole list, whatever the prefix, for an Epiku project", () => {
+    const stories = [issue("ST-1.1", "Story"), issue("HU-2.1", "Story", { statusCategory: "inProgress" }), issue("ST-1.2", "Story")];
+    expect(selectBacklog(stories, null, "ST-1.2", true).map((i) => i.key)).toEqual(["HU-2.1", "ST-1.1"]);
   });
 
   it("sorts by statusCategory (inProgress, todo, unknown, done) then priority then key", () => {
@@ -295,5 +303,39 @@ describe("resolveEpicKey", () => {
 
   it("returns null when active is null", () => {
     expect(resolveEpicKey(null, {})).toBeNull();
+  });
+});
+
+describe("Epiku paths of the workspace menu, the picker and Create workspace (#1127)", () => {
+  const rows = [issue("ST-1.1"), issue("ST-1.2")];
+
+  it("names a ticket after the project's tracker", () => {
+    expect(ticketNoun("epiku")).toBe("Epiku story");
+    expect(ticketNoun("jira")).toBe("Jira ticket");
+    expect(ticketNoun(null)).toBe("Jira ticket");
+  });
+
+  it("offers the cached rows only to a project that reads that same list", () => {
+    const epikuList = { scope: "epiku:p1", projectId: "p1" };
+    const jiraList = { scope: "jira", projectId: "p1" };
+    expect(pickerCandidates(rows, epikuList, { projectId: "p1", tracker: "epiku" })).toEqual(rows);
+    expect(pickerCandidates(rows, epikuList, { projectId: "p2", tracker: "epiku" })).toEqual([]);
+    expect(pickerCandidates(rows, epikuList, { projectId: "p1", tracker: "jira" })).toEqual([]);
+    expect(pickerCandidates(rows, jiraList, { projectId: "p2", tracker: "jira" })).toEqual(rows);
+    expect(pickerCandidates(rows, jiraList, { projectId: "p1", tracker: "epiku" })).toEqual([]);
+    expect(pickerCandidates(rows, jiraList, { projectId: "p3", tracker: null })).toEqual([]);
+    expect(pickerCandidates(null, epikuList, { projectId: "p1", tracker: "epiku" })).toEqual([]);
+  });
+
+  it("opens Create workspace for an Epiku story on the active project, and leaves Jira to its prefix", () => {
+    const story = issue("ST-1.1");
+    expect(epikuTicketTarget(story, "epiku", { id: "p1", path: "/tmp/p1" })).toEqual({
+      projectId: "p1",
+      projectPath: "/tmp/p1",
+      initialTask: "summary ST-1.1",
+      linkIssueKeyOnCreate: "ST-1.1",
+    });
+    expect(epikuTicketTarget(story, "jira", { id: "p1", path: "/tmp/p1" })).toBeNull();
+    expect(epikuTicketTarget(story, "epiku", null)).toBeNull();
   });
 });

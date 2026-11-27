@@ -122,7 +122,7 @@ describe("InlineTicketPicker", () => {
     const useBtn = await screen.findByRole("button", { name: /use clpnsns-555/i });
     fireEvent.click(useBtn);
     await waitFor(() => {
-      expect(getIssueMock).toHaveBeenCalledWith("CLPNSNS-555");
+      expect(getIssueMock).toHaveBeenCalledWith("CLPNSNS-555", null);
       expect(onPick).toHaveBeenCalledWith("CLPNSNS-555");
     });
   });

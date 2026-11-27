@@ -483,6 +483,12 @@ pub fn run() {
             commands::list_issues_in_epic,
             commands::get_issue_tracker_config,
             commands::save_issue_tracker_config,
+            commands::get_project_issue_tracker,
+            commands::set_project_issue_tracker,
+            commands::get_epiku_config,
+            commands::save_epiku_config,
+            commands::remove_epiku_config,
+            commands::check_epiku_connection,
             // AI primitive (G5)
             commands::ai_complete,
             commands::generate_chat_title,
