@@ -3721,6 +3721,44 @@ pub async fn estimate_run_cost(
     Ok(serde_json::to_value(est)?)
 }
 
+/// The crew report card (#983): each stage's first-pass, loop-back,
+/// escalation and halt rates and median cost over this Mac's latest runs of
+/// the pipeline, and the right-sizing suggestions they support. Read-only
+/// and local; applying a suggestion is a separate, confirmed pipeline save.
+#[tauri::command]
+pub async fn get_crew_report(
+    state: State<'_, AppState>,
+    pipeline_id: String,
+) -> AppResult<crate::orchestrator::crew_report::CrewReport> {
+    use crate::orchestrator::crew_report::{build_report, next_lighter_tier, CurrentStage};
+    let (current, samples) = {
+        let db = state.db.lock();
+        let current: Vec<CurrentStage> = db
+            .get_pipeline_stages(&pipeline_id)?
+            .into_iter()
+            .map(|s| CurrentStage {
+                position: s.position,
+                role: s.role,
+                agent_model: s.agent_model,
+                escalate_model: s.escalate_model.filter(|m| !m.trim().is_empty()),
+            })
+            .collect();
+        (current, db.stage_outcomes(&pipeline_id)?)
+    };
+    let router = crate::token_engine::catalog();
+    let price = |m: &str| crate::token_engine::prices_in(router.as_deref(), m);
+    let lighter = |m: &str| router.as_deref().and_then(|r| next_lighter_tier(r, m));
+    let label = |m: &str| {
+        router
+            .as_deref()
+            .and_then(|r| r.find_model(m).map(|(_, mi)| mi.display_name.clone()))
+            .filter(|n| !n.trim().is_empty())
+            .map(|n| n.trim_start_matches("Claude ").to_string())
+            .unwrap_or_else(|| m.to_string())
+    };
+    Ok(build_report(&current, &samples, &price, &lighter, &label))
+}
+
 // ─── File operations ──────────────────────────────────────────────
 
 #[tauri::command]

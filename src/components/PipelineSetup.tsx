@@ -17,6 +17,7 @@ import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
 import { SupersededModelLine } from "./direct/SupersededModelLine";
 import { RetiringModelLine } from "./direct/RetiringModelLine";
+import { CrewSuggestionLine } from "./direct/CrewSuggestionLine";
 import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
@@ -595,6 +596,18 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                   </span>
                 )}
               </div>
+
+              <CrewSuggestionLine
+                key={`suggest-${selected.pipeline.id}`}
+                pipeline={selected}
+                onApplied={(id, position) => {
+                  // A builtin's edit lands as its fork: follow it. A launcher
+                  // pick on the changed stage would hide the change: drop it.
+                  setSelectedId(id);
+                  setOverrides((prev) => Object.fromEntries(Object.entries(prev).filter(([pos]) => Number(pos) !== position)));
+                }}
+                onOpenBuilder={(id) => onEditPipeline(id)}
+              />
 
               <div className="flex shrink-0 items-center gap-2">
                 <label htmlFor="run-budget" className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">

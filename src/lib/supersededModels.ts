@@ -62,7 +62,8 @@ export function keepLabel(s: Supersession): string {
   return `Keep ${shortModelName(s.from).split(/\s+/).pop()}`;
 }
 
-function toDraft(s: PipelineStage, fromIds: readonly string[], toId: string): StageDraft {
+/** A saved stage as a draft, with every use of `fromIds` moved to `toId`. */
+export function toDraft(s: PipelineStage, fromIds: readonly string[], toId: string): StageDraft {
   const swap = (id: string) => (fromIds.includes(id) ? toId : id);
   return {
     role: s.role,
