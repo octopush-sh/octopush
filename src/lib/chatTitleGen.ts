@@ -10,6 +10,9 @@ import { deriveChatTitle, isPlaceholderTitle, ticketKey, titleSource } from "./c
 
 /** How long the title call may take before the derived title stays. */
 export const TITLE_TIMEOUT_MS = 10_000;
+/** The ask's share of the prompt: an ask that is only an `@` mention or code
+ *  is sent whole, so it is cut to its start. */
+const ASK_CHARS = 2_000;
 /** The answer's share of the prompt. */
 const ANSWER_CHARS = 1_500;
 /** Words a generated title may hold, after the ticket key. */
@@ -33,7 +36,7 @@ export function titleRequest(messages: ChatMessage[]): { system: string; prompt:
     .slice(0, ANSWER_CHARS);
   if (!answer) return null;
   const source = titleSource(ask.content, ask.contextBlocks);
-  const typed = source || ask.content.trim();
+  const typed = (source || ask.content.trim()).slice(0, ASK_CHARS);
   // The key comes from what the user typed, never from an `@` block's body or
   // fenced code; a tracker URL typed in the ask still reads as its key.
   const key = ticketKey(source);

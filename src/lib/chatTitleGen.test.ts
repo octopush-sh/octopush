@@ -65,6 +65,14 @@ describe("titleRequest", () => {
     expect(withCode.system).not.toContain("start the title with");
   });
 
+  it("sends at most the first 2,000 characters of an ask that is only code", () => {
+    const ask = "```\n" + "a".repeat(1990) + "b".repeat(3000) + "\n```";
+    const req = titleRequest(thread(ask))!;
+    const sent = req.prompt.slice("The developer asked:\n".length, req.prompt.indexOf("\n\nThe assistant answered:"));
+    expect(sent).toBe(ask.slice(0, 2000));
+    expect(req.prompt).not.toContain("b".repeat(11));
+  });
+
   it("has nothing to send before an answer", () => {
     expect(titleRequest([msg("user", "hi")])).toBeNull();
     expect(titleRequest([])).toBeNull();
