@@ -5841,17 +5841,15 @@ pub struct WriteResult {
     pub mtime: i64,
 }
 
-/// Sync core of `read_file_checked` (testable without a tokio runtime).
+/// Sync core of `read_file_checked` (testable without a tokio runtime). A
+/// named pipe, socket or device is refused, never read (`fs_safe`, #1190).
 pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<FileReadResult> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
+    let (bytes, meta) = match crate::fs_safe::read_regular(std::path::Path::new(path), max_bytes)? {
+        crate::fs_safe::Capped::TooLarge { size } => return Ok(FileReadResult::TooLarge { size }),
+        crate::fs_safe::Capped::Read { bytes, meta } => (bytes, meta),
+    };
     let size = meta.len();
     let mtime = mtime_millis(&meta);
-    if size > max_bytes {
-        return Ok(FileReadResult::TooLarge { size });
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
     if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(FileReadResult::Binary { size, mtime });
     }
@@ -5864,7 +5862,9 @@ pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<F
 #[tauri::command]
 pub async fn read_file_checked(path: String, max_bytes: Option<u64>) -> AppResult<FileReadResult> {
     let path = expand_tilde(&path);
-    read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES))
+    tokio::task::spawn_blocking(move || read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES)))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file_checked: {e}")))?
 }
 
 /// Lines `start..=end` of a file, for Talk's `@path#L10-40` (#1046).
@@ -5889,7 +5889,8 @@ pub(crate) fn read_file_lines_inner(path: &str, start: u32, end: u32, max_bytes:
     let io = |e: std::io::Error| AppError::Other(format!("read_file_lines({path}): {e}"));
     let start = start.max(1);
     let end = end.max(start);
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+    let (file, _) = crate::fs_safe::open_regular(std::path::Path::new(path))?;
+    let mut reader = std::io::BufReader::new(file);
     if reader.fill_buf().map_err(io)?.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(LineRangeResult::Binary);
     }
@@ -5963,12 +5964,14 @@ pub async fn read_file_lines(path: String, start: u32, end: u32, max_bytes: usiz
         .map_err(|e| AppError::Other(format!("read_file_lines: {e}")))?
 }
 
-/// Kept for any non-editor callers that want a plain string read.
+/// Kept for any non-editor callers that want a plain string read. Capped
+/// like `read_file_checked`; a named pipe, socket or device is refused.
 #[tauri::command]
 pub async fn read_file(path: String) -> AppResult<String> {
     let path = expand_tilde(&path);
-    std::fs::read_to_string(&path)
-        .map_err(|e| AppError::Other(format!("read_file({}): {e}", path)))
+    tokio::task::spawn_blocking(move || crate::fs_safe::read_regular_text(std::path::Path::new(&path), READ_CAP_BYTES))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file: {e}")))?
 }
 
 /// Sync core of `write_file` (testable; returns the post-write mtime).

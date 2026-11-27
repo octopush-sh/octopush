@@ -11,7 +11,7 @@ vi.mock("./ipc", () => ({
   ipc: { readFileChecked, readFileLines, fileMeta, getGitDiff, getStagedDiff, secretScanText, listWorkspaceFiles },
 }));
 
-const { expandDraft, joinBlocks, resolveContextBlock, resolveContextBlocks, scanContextBlocks, withContext } =
+const { expandDraft, joinBlocks, notAFileReason, resolveContextBlock, resolveContextBlocks, scanContextBlocks, withContext } =
   await import("./talkContextResolve");
 const { blockBody, parseSentContext, typedText } = await import("./sentContext");
 const { registerTerminalBuffer } = await import("./terminalBuffers");
@@ -131,6 +131,18 @@ describe("resolveContextBlock", () => {
     const block = await resolveContextBlock(one("src/a.ts#L1"), "/w", files);
     expect(block.text).toBe("\n\nsrc/a.ts#L1 _(not included: unreadable)_");
     expect(block.scan).toEqual([]);
+  });
+
+  it("says a named pipe isn't a file instead of calling it unreadable (#1190)", async () => {
+    const refusal = "other: .env is a named pipe, not a file (a secrets manager may serve it). Octopush doesn't read it.";
+    readFileChecked.mockRejectedValue(refusal);
+    readFileLines.mockRejectedValue(refusal);
+    const whole = await resolveContextBlock(one("src/a.ts"), "/w", files);
+    expect(whole.missing).toBe("a named pipe, not a file");
+    expect(whole.text).toBe("\n\nsrc/a.ts _(not included: a named pipe, not a file)_");
+    expect((await resolveContextBlock(one("src/a.ts#L1-3"), "/w", files)).missing).toBe("a named pipe, not a file");
+    expect(notAFileReason("other: null is a device, not a file. Octopush doesn't read it.")).toBe("a device, not a file");
+    expect(notAFileReason(new Error("permission denied"))).toBeNull();
   });
 
   it("scans a diff per file, by the file's path, without the diff's prefixes", async () => {
