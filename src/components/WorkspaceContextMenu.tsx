@@ -10,6 +10,7 @@ import {
   Link2,
   Link2Off,
   Trash2,
+  Hourglass,
 } from "lucide-react";
 import { MenuSurface } from "./MenuSurface";
 import { MoveToGroupItem, type MoveTargetGroup } from "./MoveToGroupItem";
@@ -51,6 +52,8 @@ interface Props {
   onMoveToGroup?: (groupId: string) => void;
   onNewGroup?: () => void;
   onRemoveFromGroup?: () => void;
+  /** "Start after…" (#960): opens the dialog that makes this mission wait. */
+  onStartAfter?: () => void;
 }
 
 const ITEM = MENU_ITEM;
@@ -83,6 +86,7 @@ export function WorkspaceContextMenu({
   onMoveToGroup,
   onNewGroup,
   onRemoveFromGroup,
+  onStartAfter,
 }: Props) {
   const run = (fn: () => void) => () => {
     fn();
@@ -128,6 +132,11 @@ export function WorkspaceContextMenu({
           onNewGroup={run(onNewGroup)}
           onRemoveFromGroup={groupId && onRemoveFromGroup ? run(onRemoveFromGroup) : undefined}
         />
+      )}
+      {onStartAfter && (
+        <button type="button" role="menuitem" data-tour="rail-menu-start-after" className={ITEM} onClick={run(onStartAfter)}>
+          <Hourglass size={12} className="shrink-0" /> Start after…
+        </button>
       )}
 
       {linkageKind && (
