@@ -20,13 +20,20 @@ pub enum ProviderErrorKind {
     /// HTTP 5xx (other than 529) — a transient server-side fault.
     ServerError,
     /// The connection couldn't be opened (refused, DNS failure, connect
-    /// timeout): the request never reached the provider.
+    /// timeout), so the request never reached the provider; or it dropped
+    /// after a 200 while the answer's body was arriving
+    /// (`providers::body_error`).
     Network,
     /// HTTP 401/403 — missing or invalid credentials.
     Auth,
     /// HTTP 400/404/422 — a malformed or unacceptable request.
     BadRequest,
-    /// Any other non-success status.
+    /// A 429 for a spend or usage limit the account set (no `retry-after`,
+    /// a body that names the limit, `providers::classify_status`). Waiting
+    /// a minute doesn't lift it, so it is not retried.
+    SpendCap,
+    /// Any other non-success status, and a transient status the provider
+    /// marked `x-should-retry: false`.
     Other,
 }
 
@@ -61,7 +68,23 @@ impl ProviderErrorKind {
             Self::Network => "network error",
             Self::Auth => "authentication failed",
             Self::BadRequest => "request rejected",
+            Self::SpendCap => "spend limit reached",
             Self::Other => "provider error",
+        }
+    }
+
+    /// The stored form: the `error_kind` column of a Talk error row, read
+    /// by the error card (`other` for an error that isn't a provider's).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Overloaded => "overloaded",
+            Self::ServerError => "server_error",
+            Self::Network => "network",
+            Self::Auth => "auth",
+            Self::BadRequest => "bad_request",
+            Self::SpendCap => "spend_cap",
+            Self::Other => "other",
         }
     }
 }
@@ -175,6 +198,15 @@ impl AppError {
                 ..
             } if kind.is_transient() => Some((*kind, *retry_after)),
             _ => None,
+        }
+    }
+
+    /// The kind a Talk error row keeps: a provider error's own, `Other` for
+    /// anything else.
+    pub fn provider_kind(&self) -> ProviderErrorKind {
+        match self {
+            AppError::Provider { kind, .. } => *kind,
+            _ => ProviderErrorKind::Other,
         }
     }
 }
@@ -338,9 +370,18 @@ mod tests {
         for k in [RateLimit, Overloaded, ServerError, Network] {
             assert!(k.is_transient(), "{k:?} should be transient");
         }
-        for k in [Auth, BadRequest, Other] {
+        for k in [Auth, BadRequest, SpendCap, Other] {
             assert!(!k.is_transient(), "{k:?} should not be transient");
         }
+    }
+
+    #[test]
+    fn stored_kind_matches_its_serialized_name() {
+        use ProviderErrorKind::*;
+        for k in [RateLimit, Overloaded, ServerError, Network, Auth, BadRequest, SpendCap, Other] {
+            assert_eq!(serde_json::to_value(k).unwrap(), k.as_str(), "{k:?}");
+        }
+        assert_eq!(AppError::Other("x".into()).provider_kind(), Other);
     }
 
     #[test]

@@ -439,10 +439,12 @@ describe("ChatView — renders tool cards in the DOM", () => {
 
     // The error content should appear in the DOM via ErrorBlock.
     expect(screen.getByText(/API key not configured/i)).toBeInTheDocument();
-    // The "Something went wrong." heading from ErrorBlock.
-    expect(screen.getByText(/Something went wrong/i)).toBeInTheDocument();
-    // Since content includes "API key" and onOpenSettings is provided, the button appears.
-    expect(screen.getByText(/Configure API key/i)).toBeInTheDocument();
+    // A row from before the kind was kept reads as `other`: the generic
+    // headline and its details to copy (#1151).
+    expect(screen.getByText(/The turn ended on an error/i)).toBeInTheDocument();
+    expect(screen.getByText("Your message is kept.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Copy error details/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Configure API key/i)).toBeNull();
     // User message still renders.
     expect(screen.getByText("Tell me a secret.")).toBeInTheDocument();
   });
@@ -953,7 +955,106 @@ describe("ChatView — budget error and override", () => {
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     expect(screen.queryByText(/Budget cap reached/i)).toBeNull();
     expect(screen.queryByText(/Override for this turn/i)).toBeNull();
-    expect(screen.getByText(/Something went wrong/i)).toBeTruthy();
+    expect(screen.getByText(/The turn ended on an error/i)).toBeTruthy();
+  });
+
+  it("offers the API key on a refused send that names it", () => {
+    useChatStore.setState({
+      errorByWs: { "ws-1": "anthropic API key not configured. Open Settings · Models & Providers." },
+    });
+    const onOpenSettings = vi.fn();
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" onOpenSettings={onOpenSettings} />);
+    fireEvent.click(screen.getByRole("button", { name: /Configure API key/i }));
+    expect(onOpenSettings).toHaveBeenCalled();
+  });
+});
+
+// ─── The error card, per kind (#1151) ─────────────────────────────────
+describe("ChatView — the error card names the failure and offers the next step", () => {
+  const row = (id: number, role: string, content: string, errorKind?: string) => ({
+    id,
+    workspaceId: "ws-1",
+    role,
+    content,
+    model: null,
+    inputTokens: null,
+    outputTokens: null,
+    costUsd: null,
+    createdAt: `2026-11-27T10:00:${String(id).padStart(2, "0")}Z`,
+    ...(errorKind ? { errorKind } : {}),
+  });
+  /** An ask, `rounds` tool rounds of the turn, then the error row. */
+  const failedTurn = (kind: string, rounds = 0) => [
+    row(1, "user", "Fix the parser."),
+    ...Array.from({ length: rounds }, (_, i) => row(2 + i, "assistant_tool_use", "[tool_calls: []]")),
+    row(2 + rounds, "error", `Provider said no (${kind})`, kind),
+  ];
+
+  async function renderLoaded(rows: unknown[], onOpenSettings?: () => void) {
+    listChatMessagesMock.mockResolvedValueOnce(rows);
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" onOpenSettings={onOpenSettings} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByText(/Provider said no/)).toBeInTheDocument());
+  }
+
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipcMock.sendChatMessage).mockClear();
+    vi.mocked(ipcMock.truncateChatAfter).mockClear();
+  });
+
+  it.each([
+    ["overloaded", "Try again", /The model is overloaded/],
+    ["rate_limit", "Try again", /The rate limit didn't clear/],
+    ["server_error", "Try again", /server error/],
+    ["network", "Try again", /connection to the provider dropped/],
+    ["auth", "Configure API key", /API key is missing or was refused/],
+    ["spend_cap", "Copy error details", /spend limit is reached\. Waiting won't lift it/],
+    ["bad_request", "Copy error details", /rejected the request/],
+    ["other", "Copy error details", /The turn ended on an error/],
+  ])("a %s error offers “%s”", async (kind, action, headline) => {
+    await renderLoaded(failedTurn(kind), () => {});
+    const card = document.querySelector(`[data-error-kind="${kind}"]`) as HTMLElement;
+    expect(card).not.toBeNull();
+    expect(within(card).getByText(headline)).toBeInTheDocument();
+    const buttons = within(card).getAllByRole("button");
+    expect(buttons.map((b) => b.textContent)).toEqual([action]);
+    expect(buttons[0].getAttribute("data-tour")).toBe("talk-error-action");
+    expect(buttons[0].getAttribute("title")).toBe(action);
+    expect(buttons[0].className).toContain("border-octo-border-strong");
+    expect(buttons[0].className).toContain("hover:text-octo-ivory");
+    expect(buttons[0].className).not.toContain("hover:text-octo-brass");
+  });
+
+  it("says how much of the turn is kept", async () => {
+    await renderLoaded(failedTurn("overloaded", 14));
+    expect(screen.getByText("Work up to round 14 is kept.")).toBeInTheDocument();
+  });
+
+  it("“Try again” continues the turn with no new user row", async () => {
+    await renderLoaded(failedTurn("overloaded", 2));
+    const usersBefore = useChatStore.getState().messagesByWs["ws-1"].filter((m) => m.role === "user").length;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    });
+    expect(ipcMock.sendChatMessage).toHaveBeenCalledTimes(1);
+    expect(ipcMock.sendChatMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ threadId: "t1", regenerate: true, userMessage: "" }),
+    );
+    // Nothing is cut and no ask is added.
+    expect(ipcMock.truncateChatAfter).not.toHaveBeenCalled();
+    const msgs = useChatStore.getState().messagesByWs["ws-1"];
+    expect(msgs.filter((m) => m.role === "user").length).toBe(usersBefore);
+    expect(msgs.length).toBe(4);
+  });
+
+  it("an earlier error, followed by more of the thread, can't be continued", async () => {
+    await renderLoaded([...failedTurn("overloaded"), row(3, "user", "Never mind."), row(4, "assistant", "OK.")]);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(screen.getByRole("button", { name: /Copy error details/i })).toBeInTheDocument();
   });
 });
 

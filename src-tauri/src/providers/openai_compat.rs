@@ -16,7 +16,7 @@ use super::{
     Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
     LlmStopReason, LlmToolUse, StreamEvent,
 };
-use crate::error::{AppError, AppResult, ProviderErrorKind};
+use crate::error::{AppError, AppResult};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -105,18 +105,7 @@ impl OpenAICompatibleProvider {
             .map_err(|e| super::request_error(WHAT, api_base, &e))?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let retry_after = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok());
-            let text = resp.text().await.unwrap_or_default();
-            return Err(AppError::Provider {
-                kind: ProviderErrorKind::from_http_status(status.as_u16()),
-                retry_after,
-                message: format!("OpenAI-compat API error {status}: {text}"),
-            });
+            return Err(super::status_error("OpenAI-compat API error", resp).await);
         }
         Ok(resp)
     }

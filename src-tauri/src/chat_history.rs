@@ -471,7 +471,9 @@ pub(crate) fn summarize_tool_row(id: i64, content: &str, budget: usize) -> Optio
 /// - `user` rows absorb any orphaned narration/summaries (a `$`-direct
 ///   command's output, a turn that errored before answering) so the model
 ///   still sees what happened, then merge into a preceding user turn rather
-///   than producing two in a row (strict providers reject that).
+///   than producing two in a row (strict providers reject that). Orphans
+///   after the last row (a failed turn continued with no new message) ride
+///   on the last user turn the same way.
 /// - `error`, `stopped` and unknown roles are never replayed.
 ///
 /// Consecutive same-role turns are merged, so the output alternates.
@@ -566,6 +568,10 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
             _ => {}
         }
     }
+    // A turn continued with no new message (the error card's "Try again"):
+    // what it did before it failed rides on its ask, as on a next one.
+    let rest = flush(&mut pending, "");
+    push_turn(&mut turns, HistoryRole::User, rest);
     turns
 }
 
@@ -918,6 +924,34 @@ mod tests {
         assert!(!turns[0].text.contains("stopped"));
         assert!(turns[0].text.starts_with("review\n\n[Tool #3: read_file"));
         assert!(turns[0].text.ends_with("\n\ncontinue"), "{}", turns[0].text);
+    }
+
+    #[test]
+    fn a_failed_turn_continued_with_no_new_message_keeps_its_work_on_the_ask() {
+        // The error card's "Try again": no new user row, the failed turn's
+        // rounds still reach the model, and the history ends on the user.
+        let t = tool_row(3, "read_file", "contents");
+        let rows = [
+            HistoryRow { id: 1, role: "user", content: "review", context: None },
+            HistoryRow { id: 2, role: "assistant_tool_use", content: "Reading it.\n\n[tool_calls: []]", context: None },
+            HistoryRow { id: 3, role: "tool", content: &t, context: None },
+            HistoryRow { id: 4, role: "error", content: "Model overloaded, still failing after 5 retries.", context: None },
+        ];
+        let turns = build_history(&rows);
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        assert_eq!(turns[0].role, HistoryRole::User);
+        assert!(turns[0].text.starts_with("review\n\nReading it.\n[Tool #3: read_file"), "{}", turns[0].text);
+        assert!(!turns[0].text.contains("overloaded"), "the error row is never replayed");
+
+        // Talk engine v2 does the same.
+        let v2_rows: Vec<crate::context::transcript::Row<'_>> = rows
+            .iter()
+            .map(|r| crate::context::transcript::Row { id: r.id, role: r.role, content: r.content, ..Default::default() })
+            .collect();
+        let v2 = crate::context::transcript::build(&v2_rows, "m");
+        assert_eq!(v2.len(), 1, "{v2:?}");
+        assert!(matches!(&v2[0], crate::providers::LlmMessage { role: crate::providers::LlmRole::User, content: crate::providers::LlmContent::Text(t) }
+            if t.starts_with("review\n\nReading it.\n[Tool #3: read_file")), "{v2:?}");
     }
 
     #[test]

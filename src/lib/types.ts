@@ -496,6 +496,10 @@ export interface ChatMessage {
   /** A user row's `@` context blocks (`SentContextBlock[]` as JSON, #1150);
    *  absent on older rows. */
   contextBlocks?: string | null;
+  /** How an `error` row's turn failed (`rate_limit`, `overloaded`,
+   *  `server_error`, `network`, `auth`, `bad_request`, `spend_cap`, `other`);
+   *  absent on older rows, which read as `other`. */
+  errorKind?: string | null;
 }
 
 /** What one Talk conversation has cost so far, from the ledger (director
