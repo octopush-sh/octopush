@@ -10,6 +10,7 @@ import { CompanionSection } from "./CompanionSection";
 import { ContextMeter, contextTone } from "./ContextMeter";
 import { CompanionMcpScope } from "./CompanionMcpScope";
 import { CompanionProjectServers } from "./CompanionProjectServers";
+import { CompanionGrants } from "./CompanionGrants";
 import { CompanionInstructions } from "./CompanionInstructions";
 
 interface Props {
@@ -179,6 +180,8 @@ export function CompanionContext({
         <CompanionInstructions worktreePath={worktreePath} workspaceId={workspaceId} />
         <CompanionMcpScope worktreePath={worktreePath} workspaceId={workspaceId} />
         <CompanionProjectServers worktreePath={worktreePath} workspaceId={workspaceId} />
+        {/* What this conversation may do without asking (#1229). */}
+        <CompanionGrants workspaceId={workspaceId} />
 
         {/* Budgets — only when one exists (an empty block earns no space). */}
         {spendingRows.length > 0 && (

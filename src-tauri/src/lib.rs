@@ -32,6 +32,7 @@ pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
 pub mod mcp;
+pub mod name_fold;
 pub mod notify_elsewhere;
 pub mod provider_router;
 pub mod providers;
@@ -316,6 +317,8 @@ pub fn run() {
             commands::set_thread_mcp_server,
             commands::get_thread_permission_mode,
             commands::set_thread_permission_mode,
+            commands::list_thread_grants,
+            commands::revoke_thread_grant,
             commands::get_mcp_config,
             commands::save_mcp_config,
             commands::test_mcp_server,
