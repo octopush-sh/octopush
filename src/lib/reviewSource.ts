@@ -4,18 +4,26 @@
 // run the working tree is often clean while the branch holds the change.
 // Pure, so the default and the copy stay unit-testable.
 
-export type ReviewSource = "working" | "committed";
+// A third view, "turn" (#1152), shows what one Talk turn changed: the diff
+// between its two checkpoints, opened from the turn's ledger row.
+export type ReviewSource = "working" | "committed" | "turn";
 
-/** The view Review shows. With no commits ahead there is only the working
- *  tree. Otherwise the user's pick wins; without one, the working tree when
- *  it has changes (today's behaviour), else the commits. App passes the
- *  pinned default as the pick once a default has been shown (#903), so a
- *  crew touching a file never flips the view mid-read. */
+/** The view Review shows. A "turn" pick shows while a turn scope is set.
+ *  With no commits ahead there is otherwise only the working tree. Else the
+ *  user's pick wins; without one, the working tree when it has changes
+ *  (today's behaviour), else the commits. App passes the pinned default as
+ *  the pick once a default has been shown (#903), so a crew touching a file
+ *  never flips the view mid-read. */
 export function resolveReviewSource(
   pick: ReviewSource | null | undefined,
   hasWorkingChanges: boolean,
   commitsAhead: number,
+  hasTurn = false,
 ): ReviewSource {
+  if (pick === "turn") {
+    if (hasTurn) return "turn";
+    pick = null;
+  }
   if (commitsAhead <= 0) return "working";
   if (pick) return pick;
   return hasWorkingChanges ? "working" : "committed";

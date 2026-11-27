@@ -28774,6 +28774,115 @@ mod talk_checkpoint_tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(db.list_chat_messages(&fork.id).unwrap().len(), 2);
     }
+
+    // ── #1152: what a turn changed ────────────────────────────────
+
+    #[test]
+    fn numstat_parsing_reads_counts_and_binary_files() {
+        let out = b"3\t1\tsrc/a.ts\0-\t-\tlogo.png\0\x000\t2\tgone.txt\0garbage\0";
+        assert_eq!(
+            ck::parse_numstat(out),
+            vec![
+                ("src/a.ts".to_string(), 3, 1),
+                ("logo.png".to_string(), 0, 0),
+                ("gone.txt".to_string(), 0, 2),
+            ]
+        );
+        assert!(ck::parse_numstat(b"").is_empty());
+    }
+
+    /// A turn that edits, creates (as a shell command would, outside any
+    /// write tool) and deletes files reports each with its counts; the
+    /// snapshot covers the whole tree, so how a file changed doesn't matter.
+    #[test]
+    fn turn_changes_counts_every_file_the_turn_changed() {
+        let dir = repo("turn-changes");
+        write(&dir, "a.txt", "1\n2\n3\n");
+        write(&dir, "gone.txt", "x\ny\n");
+        write(&dir, "same.txt", "s\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+
+        assert!(ck::capture_before(&dir, THREAD, 20));
+        write(&dir, "a.txt", "1\ntwo\n3\n4\n");
+        write(&dir, "made/by-shell.txt", "a\nb\nc\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        AfterTurn::new(&dir, THREAD, 20).record();
+
+        let mut changes = ck::turn_changes(&dir, THREAD, 20).unwrap();
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        let got: Vec<(&str, &str, u32, u32)> =
+            changes.iter().map(|c| (c.path.as_str(), c.status, c.added, c.removed)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a.txt", "modified", 2, 1),
+                ("gone.txt", "deleted", 0, 2),
+                ("made/by-shell.txt", "added", 3, 0),
+            ]
+        );
+
+        // The turn's diff holds exactly those files.
+        let (before, after) = ck::turn_refs(&dir, THREAD, 20).unwrap();
+        let diff = crate::git_ops::commits_diff(&dir, &before, &after, false).unwrap();
+        assert_eq!(diff.matches("diff --git ").count(), 3, "{diff}");
+        assert!(diff.contains("+two"));
+        assert!(!diff.contains("same.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turn_changes_is_empty_for_a_read_only_turn_or_a_missing_checkpoint() {
+        let dir = repo("turn-none");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+
+        // A turn that only read.
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        AfterTurn::new(&dir, THREAD, 1).record();
+        assert!(ck::turn_changes(&dir, THREAD, 1).unwrap().is_empty());
+
+        // A turn that wrote but has no `-after` (interrupted hard).
+        assert!(ck::capture_before(&dir, THREAD, 2));
+        write(&dir, "a.txt", "changed\n");
+        assert!(ck::turn_changes(&dir, THREAD, 2).unwrap().is_empty());
+        assert!(ck::turn_refs(&dir, THREAD, 2).is_none());
+
+        // A turn with no checkpoint at all, and a bad thread id.
+        assert!(ck::turn_changes(&dir, THREAD, 99).unwrap().is_empty());
+        assert!(ck::turn_changes(&dir, "../x", 1).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `x` in the This turn scope reverses a hunk of the turn's diff in the
+    /// working tree: when the file moved on since the turn, the reverse no
+    /// longer applies, and the tree is left exactly as it was.
+    #[tokio::test]
+    async fn a_turn_hunk_that_no_longer_applies_leaves_the_tree_untouched() {
+        let dir = repo("turn-revert");
+        write(&dir, "a.txt", "1\n2\n3\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 5));
+        write(&dir, "a.txt", "1\nturn\n3\n");
+        AfterTurn::new(&dir, THREAD, 5).record();
+        let (before, after) = ck::turn_refs(&dir, THREAD, 5).unwrap();
+        let diff = crate::git_ops::commits_diff(&dir, &before, &after, false).unwrap();
+        let ws = dir.to_string_lossy().to_string();
+
+        // Someone edits the same line after the turn: the reverse can't apply.
+        write(&dir, "a.txt", "1\nlater\n3\n");
+        assert!(crate::commands::revert_hunk(ws.clone(), diff.clone()).await.is_err());
+        assert_eq!(read(&dir, "a.txt"), "1\nlater\n3\n", "the tree is untouched");
+
+        // Back as the turn left it, the same hunk reverts cleanly.
+        write(&dir, "a.txt", "1\nturn\n3\n");
+        crate::commands::revert_hunk(ws, diff).await.unwrap();
+        assert_eq!(read(&dir, "a.txt"), "1\n2\n3\n");
+        assert_eq!(git(&dir, &["diff", "--cached", "--name-only"]), "", "the index is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

@@ -8,17 +8,23 @@
  * has been on screen (#903): the default follows the tree's dirtiness, so
  * without the pin a crew touching a file would switch a reader of the
  * committed view to the working tree mid-read. An explicit pick still wins;
- * App clears the pins when Review leaves the screen. None is persisted: a
- * restart starts from the default again.
+ * App clears the pins when Review leaves the screen. `turnByWs` is the Talk
+ * turn the "This turn" scope shows (#1152), set from the turn's ledger row
+ * together with a "turn" pick. None is persisted: a restart starts from the
+ * default again.
  */
 import { create } from "zustand";
 import type { CommittedDiff } from "../lib/ipc";
 import type { ReviewSource } from "../lib/reviewSource";
+import type { TurnScope } from "../lib/turnChanges";
 
 interface ReviewSourceState {
   committedByWs: Record<string, CommittedDiff | null>;
   pickByWs: Record<string, ReviewSource>;
   pinnedByWs: Record<string, ReviewSource>;
+  turnByWs: Record<string, TurnScope>;
+  /** Show `turn` in the This turn scope, picked. */
+  openTurn: (workspaceId: string, turn: TurnScope) => void;
   /** Store a fetched answer; a result equal to the current one is ignored,
    *  so the 3 s poll never re-renders Review for nothing. */
   setCommitted: (workspaceId: string, c: CommittedDiff | null) => void;
@@ -37,6 +43,12 @@ export const useReviewSource = create<ReviewSourceState>((set, get) => ({
   committedByWs: {},
   pickByWs: {},
   pinnedByWs: {},
+  turnByWs: {},
+  openTurn: (workspaceId, turn) =>
+    set((s) => ({
+      turnByWs: { ...s.turnByWs, [workspaceId]: turn },
+      pickByWs: { ...s.pickByWs, [workspaceId]: "turn" },
+    })),
   setCommitted: (workspaceId, c) => {
     const cur = get().committedByWs;
     if (workspaceId in cur && same(cur[workspaceId], c)) return;

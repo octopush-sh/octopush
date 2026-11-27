@@ -129,6 +129,7 @@ import {
 } from "./lib/runChanges";
 import { refetchForWorkspace } from "./lib/workspaceRefetch";
 import { useReviewSource } from "./stores/reviewSourceStore";
+import { useTurnDiff } from "./hooks/useTurnDiff";
 import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
@@ -1502,21 +1503,36 @@ function App() {
   );
   const reviewPick = useReviewSource((s) => (activeWorkspaceId ? s.pickByWs[activeWorkspaceId] : undefined));
   const reviewPinned = useReviewSource((s) => (activeWorkspaceId ? s.pinnedByWs[activeWorkspaceId] : undefined));
+  // The Talk turn the This turn scope shows (#1152), opened from its row.
+  const reviewTurn = useReviewSource((s) => (activeWorkspaceId ? s.turnByWs[activeWorkspaceId] : undefined)) ?? null;
   const reviewSource = resolveReviewSource(
     reviewPick ?? reviewPinned,
     (gitStatus?.changedFiles.length ?? 0) > 0,
     committed?.commits ?? 0,
+    reviewTurn !== null,
   );
+  const turnDiff = useTurnDiff(activeMode === "review" && reviewSource === "turn" ? reviewTurn : null, ignoreWs);
   // Pin the default once Review has shown it (#903), from this visit's fresh
   // answers only: a crew touching a file must not switch a reader of Since
   // base to the working tree mid-read. Leaving Review drops the pins.
   useReviewDefaultPin(activeMode, activeWorkspaceId, reviewAnswers);
-  const reviewDiff = reviewSource === "committed" ? committed?.diff ?? "" : gitDiff;
+  const reviewDiff =
+    reviewSource === "committed"
+      ? committed?.diff ?? ""
+      : reviewSource === "turn"
+        ? turnDiff && "diff" in turnDiff
+          ? turnDiff.diff
+          : ""
+        : gitDiff;
+  // Until the turn's diff is read, or when it can't be, the view says so
+  // rather than showing the empty "left the files as they were" state.
+  const turnRead =
+    reviewSource !== "turn" ? null : turnDiff === null ? "loading" : "error" in turnDiff ? turnDiff : null;
   const reviewDiffStat = useMemo(() => diffStat(reviewDiff), [reviewDiff]);
   const reviewChangedCount =
-    reviewSource === "committed" ? diffFileCount(reviewDiff) : gitStatus?.changedFiles.length ?? 0;
-  // The 1 MiB cap can cut the committed diff, so its file count is a floor.
-  const reviewCountPartial = reviewSource === "committed" && isDiffTruncated(reviewDiff);
+    reviewSource === "working" ? gitStatus?.changedFiles.length ?? 0 : diffFileCount(reviewDiff);
+  // The 1 MiB cap can cut a tree diff, so its file count is a floor.
+  const reviewCountPartial = reviewSource !== "working" && isDiffTruncated(reviewDiff);
   const modeMetaText = useMemo(
     () =>
       modeMetaLabel(activeMode, {
@@ -1652,6 +1668,15 @@ function App() {
   // Lifted from ReviewCanvas so any surface (terminal, chat link, FILES tree,
   // CHANGES rail) can deep-link straight into either the diff or the editor.
   const [reviewViewMode, setReviewViewMode] = useState<ReviewViewMode>("diff");
+  // A turn opened from Talk ("Review these changes") lands on its diff,
+  // not on whatever file the editor view last held. A workspace switch
+  // onto a workspace that has a turn set is not an opening.
+  const lastTurnRef = useRef<{ ws: string | null; turn: typeof reviewTurn }>({ ws: null, turn: null });
+  useEffect(() => {
+    const prev = lastTurnRef.current;
+    lastTurnRef.current = { ws: activeWorkspaceId, turn: reviewTurn };
+    if (reviewTurn && prev.ws === activeWorkspaceId && prev.turn !== reviewTurn) setReviewViewMode("diff");
+  }, [activeWorkspaceId, reviewTurn]);
 
   /**
    * Open `path` (relative or absolute) in the Review canvas.
@@ -1783,7 +1808,7 @@ function App() {
   // to the working tree first instead of toasting "Not in the current diff"
   // (#903). The switch is an explicit pick, like a click on the toggle.
   const toWorkingTree = useCallback(() => {
-    if (activeWorkspaceId && reviewSource === "committed") {
+    if (activeWorkspaceId && reviewSource !== "working") {
       useReviewSource.getState().pick(activeWorkspaceId, "working");
     }
   }, [activeWorkspaceId, reviewSource]);
@@ -2686,6 +2711,8 @@ function App() {
                         commitsAhead={committed?.commits ?? 0}
                         base={committed?.base ?? null}
                         mergeBase={committed?.mergeBase ?? null}
+                        turn={reviewTurn}
+                        turnRead={turnRead}
                         onSourceChange={(src) => useReviewSource.getState().pick(activeWorkspaceId!, src)}
                         viewMode={reviewViewMode}
                         onViewModeChange={setReviewViewMode}
