@@ -2701,9 +2701,16 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn delete_project(&self, id: &str) -> AppResult<()> {
+    /// Delete a project; its workspaces (archived ones too) and their chat rows
+    /// cascade with it. Returns the attachment files no row names any more,
+    /// for `chat_attachments::remove`.
+    pub fn delete_project(&self, id: &str) -> AppResult<Vec<String>> {
+        let paths = self.chat_attachment_paths(
+            "m.workspace_id IN (SELECT id FROM workspaces WHERE project_id = ?1)",
+            params![id],
+        )?;
         self.conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
-        Ok(())
+        self.unreferenced_attachments(paths)
     }
 
     // ─── Rail groups ──────────────────────────────────────────────
@@ -3811,7 +3818,10 @@ impl Db {
         Ok(created.map(|c| c != 0).unwrap_or(false))
     }
 
-    pub fn delete_workspace(&self, id: &str) -> AppResult<()> {
+    /// Delete a workspace; its chat rows cascade with it. Returns the
+    /// attachment files no row names any more, for `chat_attachments::remove`.
+    pub fn delete_workspace(&self, id: &str) -> AppResult<Vec<String>> {
+        let paths = self.chat_attachment_paths("m.workspace_id = ?1", params![id])?;
         // Cascade to missions in lockstep. `missions` has no FK on workspace_id
         // (it is nullable for design/probe missions), so a deleted workspace's
         // missions must be removed explicitly or they linger as active orphans.
@@ -3819,7 +3829,7 @@ impl Db {
             .execute("DELETE FROM missions WHERE workspace_id = ?1", params![id])?;
         self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
-        Ok(())
+        self.unreferenced_attachments(paths)
     }
 
     /// Mark a workspace archived (worktree removed, branch kept). The row
@@ -4159,7 +4169,7 @@ impl Db {
     }
 
     /// Those of `paths` that no attachment row names.
-    pub fn unreferenced_attachments(&self, paths: Vec<String>) -> AppResult<Vec<String>> {
+    fn unreferenced_attachments(&self, paths: Vec<String>) -> AppResult<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT EXISTS(SELECT 1 FROM chat_attachments WHERE path = ?1)")?;
         let mut out = Vec::new();
         for path in paths {
@@ -4168,11 +4178,6 @@ impl Db {
             }
         }
         Ok(out)
-    }
-
-    /// The attachment files of a workspace's messages (they go with it).
-    pub fn workspace_attachment_paths(&self, workspace_id: &str) -> AppResult<Vec<String>> {
-        self.chat_attachment_paths("m.workspace_id = ?1", params![workspace_id])
     }
 
     /// Record an image attachment of user row `message_id`.

@@ -73,7 +73,8 @@ pub fn save(dir: &Path, attachment: &Attachment) -> std::io::Result<String> {
 }
 
 /// Delete the files `names` from [`dir`]: those no row names any more
-/// (`Db::delete_chat_thread`, `Db::truncate_chat_after`).
+/// (`Db::delete_chat_thread`, `Db::truncate_chat_after`,
+/// `Db::delete_workspace`, `Db::delete_project`).
 pub fn remove(names: &[String]) {
     remove_in(&dir(), names)
 }
@@ -371,6 +372,36 @@ mod tests {
         std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
         remove_in(dir.path(), &["notes.txt".to_string(), "../notes.txt".to_string()]);
         assert!(dir.path().join("notes.txt").exists());
+    }
+
+    #[test]
+    fn images_deleted_with_workspace_and_project() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let t = thread(&db);
+        send(&db, &t, dir.path(), "kept elsewhere", &[png(1)]);
+        // An archived workspace of a second project, with a Talk image of its
+        // own and one the first project's thread also names.
+        db.insert_project("q", "Q", "/tmp/q").unwrap();
+        db.insert_workspace("old", "q", "old", "", "main", None, "", None).unwrap();
+        let archived = db.create_chat_thread("old", "A").unwrap().id;
+        let id = db.insert_chat_message("old", &archived, "user", "look", None, None, None, None).unwrap();
+        for a in [png(1), png(2)] {
+            db.add_chat_attachment(id, &save(dir.path(), &a).unwrap(), &a.media_type).unwrap();
+        }
+        db.archive_workspace("old").unwrap();
+
+        // Deleting the project frees its archived workspace's own file, and
+        // keeps the one another row still names.
+        let freed = db.delete_project("q").unwrap();
+        assert_eq!(freed, [save_name(&png(2))]);
+        remove_in(dir.path(), &freed);
+        assert!(!dir.path().join(save_name(&png(2))).exists());
+        assert!(dir.path().join(save_name(&png(1))).exists());
+        // Deleting a workspace (the app's command or a Routine's) frees the rest.
+        remove_in(dir.path(), &db.delete_workspace("ws").unwrap());
+        assert!(!dir.path().join(save_name(&png(1))).exists());
     }
 
     /// The name [`save`] gives `a`, without writing it.
