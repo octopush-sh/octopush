@@ -133,7 +133,7 @@ export function ProjectContextMenu({
       </button>
       {onSetJiraProjectKey && (
         <button type="button" role="menuitem" className={ITEM} onClick={run(onSetJiraProjectKey)}>
-          <Link2 size={12} className="shrink-0" /> Set Jira project key…
+          <Link2 size={12} className="shrink-0" /> Issue tracking…
         </button>
       )}
 

@@ -51,6 +51,7 @@ describe("PrivacyPane", () => {
       "the project's name and the mission's title (the start of its task)",
       "never code, diffs, the crew's questions or agent output",
       "Jira",
+      "Epiku",
       "GitHub",
       "LiteLLM gateway",
       "MCP servers",
@@ -92,7 +93,7 @@ const APPROVED_INVENTORY = [
     "Clerk for sign-in and Dodo Payments for checkout, when you use your account." +
     "Octopush's sync service, only if you turn on sync in Account." +
     "A webhook URL you set in Notify me elsewhere, only if you turn it on or send a test — a fixed label, the project's name and the mission's title (the start of its task), never code, diffs, the crew's questions or agent output." +
-    "Integrations you connect — Jira, GitHub, a LiteLLM gateway, MCP servers — and your git remotes." +
+    "Integrations you connect — Jira, Epiku, GitHub, a LiteLLM gateway, MCP servers — and your git remotes." +
     "Update checks — octopush.sh/update/latest.json and GitHub releases." +
     "LiteLLM's public pricing table on GitHub, when you refresh pricing.",
   "No analytics, no telemetry.",
