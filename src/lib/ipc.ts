@@ -1190,30 +1190,14 @@ export const ipc = {
    *  read-only. Talk reads it at each round boundary. */
   getThreadPermissionMode: (threadId: string) =>
     invoke<{ stored: "plan" | "ask" | "edit"; effective: "plan" | "ask" | "edit" }>("get_thread_permission_mode", { threadId }),
-<<<<<<< HEAD
   /** Set a conversation's permission mode; resolves to the mode stored. A
    *  turn that is running takes it from its next round and notes the switch. */
   setThreadPermissionMode: (threadId: string, mode: "plan" | "ask" | "edit") =>
     invoke<"plan" | "ask" | "edit">("set_thread_permission_mode", { threadId, mode }),
-  /** Settings saved the MCP config, Reconnect restarted a server, or Talk's
-   *  discovery started (or failed to start) servers. If either subscription
-   *  fails, the other is dropped and the promise rejects. */
-||||||| f7e63dd6
-  /** Set a conversation's permission mode; resolves to the mode stored. */
-  setThreadPermissionMode: (threadId: string, mode: "plan" | "edit") =>
-    invoke<"plan" | "edit">("set_thread_permission_mode", { threadId, mode }),
-  /** Settings saved the MCP config, Reconnect restarted a server, or Talk's
-   *  discovery started (or failed to start) servers. If either subscription
-   *  fails, the other is dropped and the promise rejects. */
-=======
-  /** Set a conversation's permission mode; resolves to the mode stored. */
-  setThreadPermissionMode: (threadId: string, mode: "plan" | "edit") =>
-    invoke<"plan" | "edit">("set_thread_permission_mode", { threadId, mode }),
   /** Settings saved the MCP config, Reconnect restarted a server, Talk's
    *  discovery started (or failed to start) servers, or the MCP trust changed
    *  (a card's lasting answer, a revoke). If any subscription fails, the
    *  others are dropped and the promise rejects. */
->>>>>>> origin/main
   onMcpChanged: async (handler: () => void) => {
     const subs = await Promise.allSettled([
       listen("mcp://config-changed", () => handler()),

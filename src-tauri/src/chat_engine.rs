@@ -1555,19 +1555,15 @@ pub struct ApprovalRequestEvent {
     /// its "Allow reading … for this conversation" answer remembers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remember_dir: Option<String>,
-<<<<<<< HEAD
     /// An Ask first card for a file change (#1231): the diff the call makes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
-||||||| f7e63dd6
-=======
     /// An MCP card in Edit freely (#1243): the server and tool its "Trust
     /// <server>" and "Always allow this tool" answers would trust.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_tool: Option<String>,
->>>>>>> origin/main
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1737,17 +1733,8 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None, None).await;
-<<<<<<< HEAD
-        self.record(thread_id, decision, false);
-        decision
-||||||| f7e63dd6
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
-        self.record(thread_id, decision, false);
-        decision
-=======
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None, None, None).await;
         self.record(thread_id, decision, false)
->>>>>>> origin/main
     }
 
     /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
@@ -1766,23 +1753,16 @@ impl ApprovalBroker {
         }
         let marks = Some((card.kind, card.sensitive));
         let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
-<<<<<<< HEAD
         let diff = card.diff.as_deref();
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, diff).await;
-        self.settle_card(thread_id, decision, &card)
-||||||| f7e63dd6
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
-        self.settle_card(thread_id, decision, &card)
-=======
         let trust = card.trust.as_ref();
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, trust).await;
+        let decision =
+            self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, diff, trust).await;
         let settled = self.settle_card(thread_id, decision, &card);
         if trust.is_some() && matches!(decision, ApprovalDecision::TrustTool | ApprovalDecision::TrustServer) {
             // Settings and the Companion list it.
             let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
         }
         settled
->>>>>>> origin/main
     }
 
     /// What an answer to a `talk_guard` card does: "always" on a command's
@@ -1835,7 +1815,7 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None, None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None, None, None)
             .await;
         self.record(thread_id, decision, true)
     }
@@ -1878,12 +1858,8 @@ impl ApprovalBroker {
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
-<<<<<<< HEAD
         diff: Option<&str>,
-||||||| f7e63dd6
-=======
         trust: Option<&crate::talk_guard::TrustOffer>,
->>>>>>> origin/main
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1899,13 +1875,9 @@ impl ApprovalBroker {
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
-<<<<<<< HEAD
             diff: diff.map(str::to_string),
-||||||| f7e63dd6
-=======
             trust_server: trust.map(|o| o.server.clone()),
             trust_tool: trust.map(|o| o.tool.clone()),
->>>>>>> origin/main
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -7641,13 +7613,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-<<<<<<< HEAD
-            remember_dir: None, diff: None,
-||||||| f7e63dd6
-            remember_dir: None,
-=======
-            remember_dir: None, trust_server: None, trust_tool: None,
->>>>>>> origin/main
+            remember_dir: None, diff: None, trust_server: None, trust_tool: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7677,12 +7643,8 @@ mod tests {
             denial: "d".into(),
             sensitive: false,
             remember: Some((dir.clone(), "/tmp/x".into())),
-<<<<<<< HEAD
             diff: None,
-||||||| f7e63dd6
-=======
             trust: None,
->>>>>>> origin/main
         };
         assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
         assert_eq!(broker.read_dirs("t"), vec![dir]);
@@ -7704,12 +7666,8 @@ mod tests {
             denial: format!("declined {shown}"),
             sensitive: false,
             remember: None,
-<<<<<<< HEAD
             diff: None,
-||||||| f7e63dd6
-=======
             trust: None,
->>>>>>> origin/main
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -7764,6 +7722,7 @@ mod tests {
             sensitive: false,
             remember: None,
             trust,
+            diff: None,
         };
         let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
         assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone())), ApprovalDecision::Approve);
@@ -8036,13 +7995,9 @@ mod tests {
             kind: None,
             sensitive: false,
             remember_dir: None,
-<<<<<<< HEAD
             diff: None,
-||||||| f7e63dd6
-=======
             trust_server: None,
             trust_tool: None,
->>>>>>> origin/main
         }
     }
 

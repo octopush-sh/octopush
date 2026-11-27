@@ -317,6 +317,7 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         denial: denial.to_string(),
         sensitive: false,
         remember: None,
+        trust: None,
         diff,
     };
     if name == "run_command" {

@@ -56,13 +56,10 @@ pub struct ToolCard {
     /// thread's commands read from then on, and how the card names it
     /// (#1201): only on a command's card for a read outside the workspace.
     pub remember: Option<(PathBuf, String)>,
-<<<<<<< HEAD
     /// What an Ask first card for a file change shows (#1231): the unified
     /// diff the call makes, redacted and capped. Part of the card, so a file
     /// that changes while the card waits asks again (`guard_card`).
     pub diff: Option<String>,
-||||||| f7e63dd6
-=======
     /// What an MCP card offers to trust for good (#1243): only in Edit
     /// freely, never for a tool marked destructive, and only for a
     /// user-level server a project doesn't define (`TrustView::offer`).
@@ -77,7 +74,6 @@ pub struct TrustOffer {
     pub server: String,
     pub tool: String,
     pub config: String,
->>>>>>> origin/main
 }
 
 /// An MCP card shows a string argument up to this long, a longer one (a
@@ -85,25 +81,12 @@ pub struct TrustOffer {
 const MCP_ARG_SHOWN: usize = 160;
 const MCP_ARGS_MAX: usize = 400;
 
-<<<<<<< HEAD
-/// The card for an MCP tool its server does not mark read-only. `label`
-/// names the sub-agent that asks.
-pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value) -> ToolCard {
-    let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool);
-    ToolCard { kind: CardKind::Mcp, shown: format!("{tool} {}", mcp_args_shown(input)), reason, denial, sensitive: false, remember: None, diff: None }
-||||||| f7e63dd6
-/// The card for an MCP tool its server does not mark read-only. `label`
-/// names the sub-agent that asks.
-pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value) -> ToolCard {
-    let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool);
-    ToolCard { kind: CardKind::Mcp, shown: format!("{tool} {}", mcp_args_shown(input)), reason, denial, sensitive: false, remember: None }
-=======
 /// The card for an MCP tool its server does not mark read-only (or marks
 /// `destructive`). `label` names the sub-agent that asks.
 pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value, destructive: bool) -> ToolCard {
     let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool, destructive);
     let shown = format!("{tool} {}", mcp_args_shown(input));
-    ToolCard { kind: CardKind::Mcp, shown, reason, denial, sensitive: false, remember: None, trust: None }
+    ToolCard { kind: CardKind::Mcp, shown, reason, denial, sensitive: false, remember: None, trust: None, diff: None }
 }
 
 /// What an MCP tool's server says about it, as a card reads it (#1243).
@@ -231,7 +214,6 @@ pub struct McpCheck<'a> {
     pub tools: &'a McpTools,
     pub mode: Mode,
     pub trust: &'a (dyn Fn() -> TrustView + Sync),
->>>>>>> origin/main
 }
 
 /// An MCP call's arguments as its card shows them: JSON, with each long
@@ -404,13 +386,7 @@ impl Reach {
              Work inside the workspace, or ask the user for what you need; do not retry it.",
             r.shown, r.place
         );
-<<<<<<< HEAD
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None, diff: None })
-||||||| f7e63dd6
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None })
-=======
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None, trust: None })
->>>>>>> origin/main
+        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None, trust: None, diff: None })
     }
 
     /// Where `joined` leads, resolved as a tool opening it gets there
@@ -508,13 +484,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-<<<<<<< HEAD
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember, diff: None })
-||||||| f7e63dd6
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember })
-=======
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember, trust: None })
->>>>>>> origin/main
+        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember, trust: None, diff: None })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
