@@ -6,7 +6,7 @@
 //! out the servers a conversation switched off, and the status read spawns
 //! nothing.
 
-use super::{load_server_configs, sort_tools, sorted_server_configs, McpRegistry, McpToolInfo};
+use super::{sort_tools, McpRegistry, McpToolInfo};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -51,7 +51,7 @@ impl McpRegistry {
     /// is unchanged.
     pub fn list_tools_except(&self, worktree: &Path, off: &HashSet<String>) -> Vec<McpToolInfo> {
         let mut out = Vec::new();
-        for (name, cfg) in sorted_server_configs(worktree) {
+        for (name, cfg) in self.sorted_configs(worktree) {
             if off.contains(&name) {
                 continue;
             }
@@ -64,12 +64,12 @@ impl McpRegistry {
         out
     }
 
-    /// Every server configured for `worktree` (project ∪ user), sorted, with
+    /// Every server it may start for `worktree` (Settings ∪ approved project), sorted, with
     /// what this session knows about it. Reads the registry only: it spawns
     /// nothing, and takes one registry lock at a time and never a
     /// connection's own lock (a call in flight can hold that for a minute).
     pub fn status(&self, worktree: &Path) -> Vec<McpServerStatus> {
-        let cfgs = load_server_configs(worktree);
+        let cfgs = self.configs(worktree);
         let mut names: Vec<&String> = cfgs.keys().collect();
         names.sort();
         // A connection or failure counts only for the config on disk now: one
@@ -152,7 +152,7 @@ done
             ..Default::default()
         };
         write_servers(wt.path(), &[("docs-server", cfg)]);
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
 
         let tools = reg.list_tools_except(wt.path(), &HashSet::new());
         // By tool name, not the server's listed order (`sort_tools`).
@@ -185,7 +185,7 @@ done
     fn mcp_tool_order_is_the_same_on_every_rebuild() {
         let wt = tempfile::tempdir().unwrap();
         four_servers(wt.path());
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         let names = |tools: &[McpToolInfo]| tools.iter().map(|t| t.namespaced.clone()).collect::<Vec<_>>();
         let first = names(&reg.list_tools_except(wt.path(), &HashSet::new()));
         let mut expected = Vec::new();
@@ -211,7 +211,7 @@ done
         use crate::providers::{LlmContent, LlmMessage, LlmRequest, LlmRole};
         let wt = tempfile::tempdir().unwrap();
         four_servers(wt.path());
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         let request_tools = || {
             let tools = reg.list_tools_except(wt.path(), &HashSet::new());
             let req = LlmRequest {

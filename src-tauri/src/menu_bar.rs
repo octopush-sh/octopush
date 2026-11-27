@@ -322,6 +322,8 @@ pub fn talk_label(t: &TalkWaiting) -> String {
         (false, Some(CardKind::Mcp)) => "an MCP tool call wants approval",
         (false, Some(CardKind::Read | CardKind::Write)) => "a file outside the workspace wants approval",
         (false, Some(CardKind::Run)) => "a command reaching outside the workspace wants approval",
+        (false, Some(CardKind::Config)) => "a change to a file that runs commands wants approval",
+        (false, Some(CardKind::Server)) => "a project MCP server wants approval",
         (false, None) => "a command wants approval",
     };
     format!("{} · Talk — {what}", clip(t.name.trim(), NAME_MAX_CHARS))
@@ -646,6 +648,7 @@ mod tests {
         assert_eq!(kind(crate::talk_guard::CardKind::Mcp), "auth-flow · Talk — an MCP tool call wants approval");
         assert_eq!(kind(crate::talk_guard::CardKind::Read), "auth-flow · Talk — a file outside the workspace wants approval");
         assert_eq!(kind(crate::talk_guard::CardKind::Run), "auth-flow · Talk — a command reaching outside the workspace wants approval");
+        assert_eq!(kind(crate::talk_guard::CardKind::Server), "auth-flow · Talk — a project MCP server wants approval");
         assert_eq!(talk_of(ids[0]), Some("th-1"));
         assert_eq!(run_of(ids[0]), None);
         assert_eq!(talk_of(ids[1]), None);

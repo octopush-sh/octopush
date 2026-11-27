@@ -25,6 +25,12 @@ pub enum CardKind {
     /// A command naming a path outside the workspace or in a credentials
     /// location (#1201).
     Run,
+    /// A file tool or a command that would change a workspace file that
+    /// makes Octopush or Claude Code run commands ([`RUNS_CODE`], #1245).
+    Config,
+    /// A server of the project's own `.claude/mcp.json` that waits for the
+    /// user's approval before it starts (#1245).
+    Server,
 }
 
 impl CardKind {
@@ -56,6 +62,30 @@ pub struct ToolCard {
 /// comment body, a file) as its length, and at most [`MCP_ARGS_MAX`] in all.
 const MCP_ARG_SHOWN: usize = 160;
 const MCP_ARGS_MAX: usize = 400;
+
+/// Files in a workspace that make Octopush or Claude Code run commands: the
+/// project's MCP servers and Claude Code's project settings (its hooks).
+/// Changing one always asks, Deny first, wherever the call comes from.
+pub const RUNS_CODE: &[&str] = &[".claude/mcp.json", ".claude/settings.json", ".claude/settings.local.json"];
+
+/// The card that asks before a project's own MCP server starts: its exact
+/// command, arguments and env names (`approval::ProjectServer::shown`).
+pub fn server_card(server: &crate::mcp::approval::ProjectServer) -> ToolCard {
+    let changed = server.state == crate::mcp::approval::ProjectServerState::Changed;
+    let reason = if changed {
+        "this project's .claude/mcp.json changed this server since you approved it"
+    } else {
+        "this project's .claude/mcp.json defines this server"
+    };
+    ToolCard {
+        kind: CardKind::Server,
+        shown: server.shown(),
+        reason: reason.to_string(),
+        denial: String::new(),
+        sensitive: true,
+        remember: None,
+    }
+}
 
 /// The card for an MCP tool its server does not mark read-only. `label`
 /// names the sub-agent that asks.
@@ -225,10 +255,23 @@ impl Reach {
             "edit_file" => (CardKind::Write, "edits a file", "edit", path("")),
             _ => return None,
         };
+        let joined = self.workspace.join(&raw);
+        // A sandbox lets a write in the workspace through, so this asks there too.
+        if matches!(name, "write_file" | "edit_file") {
+            if let Some(r) = self.runs_code(&joined, false) {
+                let denial = format!(
+                    "Tool call not made \u{2014} the user declined to let it change {}, which can make Octopush or \
+                     Claude Code run commands. Ask the user to make this change; do not retry it.",
+                    r.shown
+                );
+                let reason = sub_agent(label, format!("changes {} \u{b7} it can make Octopush or Claude Code run commands", r.shown));
+                return Some(ToolCard { kind: CardKind::Config, shown: r.shown, reason, denial, sensitive: true, remember: None });
+            }
+        }
         if kind == CardKind::Write && writes_confined {
             return None;
         }
-        let r = self.reached(&self.workspace.join(&raw), kind == CardKind::Read, name == "grep")?;
+        let r = self.reached(&joined, kind == CardKind::Read, name == "grep")?;
         let reason = sub_agent(label, r.reason(verb));
         let denial = format!(
             "Tool call not made \u{2014} the user declined to let it {act} {}, {}. \
@@ -274,7 +317,38 @@ impl Reach {
         };
         let sensitive = location.is_some() || by_name.is_some();
         let why = location.or(by_name.map(str::to_string)).or(too_deep.then(|| "its links go too deep to follow".to_string()));
-        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, remember: None })
+        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, remember: None, runs_code: false })
+    }
+
+    /// Where `path` leads when that is one of the workspace's [`RUNS_CODE`]
+    /// files, or (`folder`, for a command, which may write into it) the
+    /// `.claude` folder that holds them. Compared without case, since the
+    /// volume is case-insensitive. Only a name that could be one, or a link,
+    /// is resolved.
+    fn runs_code(&self, path: &Path, folder: bool) -> Option<Reached> {
+        let root = self.root.as_deref()?;
+        let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let maybe = matches!(name.as_str(), "mcp.json" | "settings.json" | "settings.local.json" | ".claude")
+            || path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink());
+        if !maybe {
+            return None;
+        }
+        let real = resolve(path).unwrap_or_else(|| lexical(path));
+        let rel = real.strip_prefix(root).ok()?;
+        let is = |f: &str| under(rel, Path::new(f)) && rel.components().count() == Path::new(f).components().count();
+        if !(RUNS_CODE.iter().any(|f| is(f)) || (folder && is(".claude"))) {
+            return None;
+        }
+        Some(Reached {
+            shown: self.shown(&real),
+            real,
+            place: "in the workspace",
+            why: Some("it can make Octopush or Claude Code run commands".to_string()),
+            sensitive: true,
+            deep: false,
+            remember: None,
+            runs_code: true,
+        })
     }
 
     /// The card an agent's `run_command` must pass (#1201), or `None`. Every
@@ -309,8 +383,9 @@ impl Reach {
             Ok(found) => found,
             Err(_) => self.scan_line(command, start, &mut scan),
         };
-        let (reason, denial, sensitive, remember) = match (first, scan.over, scan.outside) {
+        let (kind, reason, denial, sensitive, remember) = match (first, scan.over, scan.outside) {
             (Some(r), ..) | (None, false, Some(r)) => (
+                if r.runs_code { CardKind::Config } else { CardKind::Run },
                 r.reason(&format!("reaches {}", r.shown)),
                 format!(
                     "Command not run \u{2014} the user declined to let it reach {}, {}. \
@@ -324,6 +399,7 @@ impl Reach {
                 }),
             ),
             (None, true, _) => (
+                CardKind::Run,
                 format!("names more paths than the check reads (over {MAX_COMMAND_PATHS}, or {MAX_COMMAND_WORDS} words)"),
                 "Command not run \u{2014} it names more paths than the check reads, and the user declined it. \
                  Split it into smaller commands, or ask the user how to proceed; do not retry it."
@@ -333,7 +409,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember })
+        Some(ToolCard { kind, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
@@ -495,6 +571,10 @@ impl Reach {
         if !scan.seen.insert((path.to_path_buf(), ctx)) {
             return None;
         }
+        // Read or written: the check can't tell which a program does.
+        if let Some(hit) = self.runs_code(path, true) {
+            return Some(hit);
+        }
         let stays = plain.is_some_and(|fast| path.symlink_metadata().map_or(true, |m| fast && !m.file_type().is_symlink()));
         scan.resolved += usize::from(!stays);
         if scan.seen.len() > MAX_COMMAND_WORDS || scan.resolved > MAX_COMMAND_PATHS {
@@ -606,6 +686,8 @@ struct Reached {
     sensitive: bool,
     deep: bool,
     remember: Option<PathBuf>,
+    /// One of the workspace's [`RUNS_CODE`] files (or their folder).
+    runs_code: bool,
 }
 
 impl Reached {
@@ -700,6 +782,7 @@ fn named_credential(pattern: &str, spliced: &str) -> Option<Reached> {
         sensitive: true,
         deep: false,
         remember: None,
+        runs_code: false,
     })
 }
 
@@ -1113,6 +1196,43 @@ mod tests {
         let env = card(&at_home, "read_file", "app/.env").unwrap();
         assert_eq!((env.sensitive, env.reason.as_str()), (true, "reads a file in the workspace \u{b7} its name marks it as an env file"));
         assert_eq!(card(&at_home, "read_file", "notes.txt"), None);
+    }
+
+    #[test]
+    fn a_change_to_a_file_that_runs_commands_always_asks_deny_first() {
+        // #1245: the project's MCP servers and Claude Code's project settings.
+        let (_d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home));
+        for path in [".claude/mcp.json", ".claude/settings.json", ".claude/settings.local.json", "./.Claude/MCP.json"] {
+            for tool in ["write_file", "edit_file"] {
+                let c = card(&reach, tool, path).unwrap_or_else(|| panic!("{tool} {path}"));
+                assert_eq!((c.kind, c.sensitive), (CardKind::Config, true), "{tool} {path}");
+                assert!(c.reason.ends_with("it can make Octopush or Claude Code run commands"), "{}", c.reason);
+                assert!(c.denial.contains("do not retry"), "{}", c.denial);
+            }
+            // A sandbox lets a write in the workspace through: it asks there too.
+            let sandboxed = reach.outside_card(None, "write_file", &json!({"path": path, "content": "{}"}), true);
+            assert_eq!(sandboxed.map(|c| c.kind), Some(CardKind::Config), "{path}");
+            assert_eq!(card(&reach, "read_file", path), None, "reading it doesn't ask");
+        }
+        assert_eq!(card(&reach, "write_file", ".claude/agents/x.md"), None, "only the files that run commands");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(ws.join(".claude")).unwrap();
+            std::os::unix::fs::symlink(ws.join(".claude/mcp.json"), ws.join("cfg")).unwrap();
+            assert_eq!(card(&reach, "write_file", "cfg").map(|c| c.kind), Some(CardKind::Config), "through a link");
+        }
+        // A command that names one, or their folder, asks whether it reads or writes.
+        for command in [
+            "echo '{}' > .claude/mcp.json",
+            "cat .claude/settings.json",
+            "cp evil.json .claude/settings.local.json",
+            "rm -rf .claude",
+        ] {
+            let c = reach.command_card(None, command, None, &[]).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!((c.kind, c.sensitive), (CardKind::Config, true), "{command}");
+        }
+        assert_eq!(reach.command_card(None, "cat a.txt", None, &[]), None);
     }
 
     #[cfg(unix)]

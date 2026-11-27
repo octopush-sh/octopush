@@ -77,8 +77,8 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
 
 /**
  * The Conversation section's "can use" row: one chip per MCP server
- * configured for the workspace (Settings › Integrations and the project's
- * `.claude/mcp.json`), then the `skills · N` and `agents · N` counts. Every
+ * configured for the workspace (Settings › Integrations and the approved
+ * servers of the project's `.claude/mcp.json`), then the `skills · N` and `agents · N` counts. Every
  * server is on in every conversation; clicking a chip turns it off for this
  * conversation only, and clicking again turns it back on. Hidden when there
  * is no server, skill or agent.
@@ -95,7 +95,7 @@ export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?
     >
       <span
         className="text-octo-sage"
-        title="MCP servers from Settings › Integrations and this project's .claude/mcp.json (click one to turn it off or back on in this conversation), then the skills and sub-agent types this conversation can use."
+        title="MCP servers from Settings › Integrations and the ones of this project's .claude/mcp.json you approved (click one to turn it off or back on in this conversation), then the skills and sub-agent types this conversation can use."
       >
         can use
       </span>

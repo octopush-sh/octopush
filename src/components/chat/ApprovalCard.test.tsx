@@ -131,6 +131,37 @@ describe("ApprovalCard", () => {
     expect(screen.queryByText(/uncommitted/)).toBeNull();
     expect(screen.getByText(/runs it once, for exactly these findings/)).toBeInTheDocument();
   });
+
+  it("a project's MCP server and a file that runs commands lead with Deny, and never offer don't ask again (#1245)", () => {
+    const onRespond = vi.fn();
+    const server = {
+      ...base,
+      kind: "server" as const,
+      command: "docs: node docs.js · env DOCS_TOKEN",
+      reason: "this project's .claude/mcp.json defines this server",
+    };
+    render(<ApprovalCard approval={server} onRespond={onRespond} />);
+    const card = screen.getByRole("group", { name: "Project MCP server: docs: node docs.js · env DOCS_TOKEN" });
+    expect(screen.getByText(/any change asks again/)).toBeInTheDocument();
+    expect(screen.queryByText("$")).toBeNull();
+    expect(screen.getAllByRole("button")[0]).toHaveTextContent("Deny");
+    fireEvent.keyDown(card, { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Allow" }));
+    expect(onRespond.mock.calls).toEqual([["deny"], ["approve"]]);
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
+    cleanup();
+
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "config", sensitive: true, command: "~/w/.claude/mcp.json", reason: "changes ~/w/.claude/mcp.json · it can make Octopush or Claude Code run commands" }}
+        onRespond={onRespond}
+      />,
+    );
+    expect(screen.getByText("Runs commands")).toBeInTheDocument();
+    expect(screen.getByText(/always asks/)).toBeInTheDocument();
+    expect(screen.queryByText(/This may hold credentials/)).toBeNull();
+    expect(screen.getAllByRole("button")[0]).toHaveTextContent("Deny");
+  });
 });
 
 describe("ApprovalCard at the keyboard", () => {

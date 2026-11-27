@@ -80,7 +80,8 @@ export function PrivacyPane() {
           OAuth client secret and the values you mark Keep in Keychain go to the macOS Keychain, and
           mcp-remote keeps a browser sign-in in{" "}
           <code className={PATH_CHIP_CLASS}>~/.mcp-auth</code>. A project's own{" "}
-          <code className={PATH_CHIP_CLASS}>.claude/mcp.json</code> stays as written. Your account
+          <code className={PATH_CHIP_CLASS}>.claude/mcp.json</code> stays as written; its servers start only
+          once you approve them, and the approvals stay in octopush.db. Your account
           session lives in the macOS Keychain too.
         </li>
         <li>
