@@ -863,7 +863,7 @@ impl Reach {
         let joined = self.workspace.join(&raw);
         // A sandbox lets a write in the workspace through, so this asks there too.
         if matches!(name, "write_file" | "edit_file") {
-            if let Some(r) = self.config_file(&joined, false) {
+            if let Some(r) = self.config_file(&joined, false, true) {
                 let denial = format!(
                     "Tool call not made \u{2014} the user declined to let it change {}, which can make Octopush or \
                      Claude Code run commands. Ask the user to make this change; do not retry it.",
@@ -975,13 +975,14 @@ impl Reach {
     /// Where `path` leads when that is one of the workspace's [`RUNS_CODE`]
     /// files, or (`folder`, for a command, which may write into it) the
     /// `.claude` folder that holds them. Compared without case, since the
-    /// volume is case-insensitive. Only a name that could be one, or a link,
-    /// is resolved.
-    fn config_file(&self, path: &Path, folder: bool) -> Option<Reached> {
+    /// volume is case-insensitive. Only a name that could be one, or (with
+    /// `links`, when the caller hasn't already seen it isn't one) a link, is
+    /// resolved.
+    fn config_file(&self, path: &Path, folder: bool, links: bool) -> Option<Reached> {
         let root = self.root.as_deref()?;
         let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
         let maybe = matches!(name.as_str(), "mcp.json" | "settings.json" | "settings.local.json" | ".claude")
-            || path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink());
+            || (links && path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()));
         if !maybe {
             return None;
         }
@@ -1025,7 +1026,7 @@ impl Reach {
             let names: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
             names.len() == parts.len() && names.iter().zip(&parts).all(|(n, p)| matches(n, p))
         })?;
-        let mut r = self.config_file(&hit, true)?;
+        let mut r = self.config_file(&hit, true, false)?;
         r.shown = format!("{} (a pattern that can match {})", unescape(pattern), r.shown);
         Some(r)
     }
@@ -1265,12 +1266,13 @@ impl Reach {
         if !scan.seen.insert((path.to_path_buf(), ctx)) {
             return None;
         }
-        // Read or written: the check can't tell which a program does.
-        if let Some(hit) = self.config_file(path, true) {
-            return Some(hit);
-        }
         // A missing name written to is a file the command creates: it counts.
         let stays = plain.is_some_and(|fast| path.symlink_metadata().map_or(fast || !ctx.writes, |m| fast && !m.file_type().is_symlink()));
+        // Read or written: the check can't tell which a program does. A name
+        // that stays put was already seen not to be a link.
+        if let Some(hit) = self.config_file(path, true, !stays) {
+            return Some(hit);
+        }
         scan.resolved += usize::from(!stays);
         if scan.seen.len() > MAX_COMMAND_WORDS || scan.resolved > MAX_COMMAND_PATHS {
             scan.over = true;
