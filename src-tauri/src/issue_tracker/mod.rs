@@ -6,7 +6,7 @@
 pub mod epiku;
 pub mod jira;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Where a ticket sits in its workflow, normalized from the provider's status
 /// category so the UI can color it without knowing provider specifics.
@@ -81,6 +81,47 @@ pub trait IssueTracker {
     /// "Epic" pill — the user wants visibility into what the rest of their
     /// team is doing in the same epic, not only their own assignments.
     async fn list_issues_in_epic(&self, epic_key: &str) -> crate::error::AppResult<Vec<Issue>>;
+}
+
+/// The trackers a project can read (#1127).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrackerKind {
+    Jira,
+    Epiku,
+}
+
+/// The values a project's stored tracker choice may hold.
+pub const TRACKER_CHOICES: [&str; 3] = ["jira", "epiku", "none"];
+
+/// The tracker a project reads, from its stored choice (`jira`, `epiku`,
+/// `none`) and what is configured. No choice yet means Jira wherever Jira is
+/// configured, so nothing changes for existing users; a chosen tracker that
+/// isn't configured reads as none.
+pub fn resolve_tracker(choice: Option<&str>, jira_configured: bool, epiku_configured: bool) -> Option<TrackerKind> {
+    match choice {
+        Some("none") => None,
+        Some("epiku") => epiku_configured.then_some(TrackerKind::Epiku),
+        _ => jira_configured.then_some(TrackerKind::Jira),
+    }
+}
+
+/// A project's choice as stored: empty means the default, any other value
+/// must be one of [`TRACKER_CHOICES`]; the Epiku project override must be a
+/// valid Epiku project id, empty meaning the one in Settings.
+pub fn validate_project_choice(
+    choice: Option<&str>,
+    epiku_project: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let choice = choice.map(str::trim).filter(|c| !c.is_empty());
+    if let Some(c) = choice.filter(|c| !TRACKER_CHOICES.contains(c)) {
+        return Err(format!("{c} isn't an issue tracker Octopush reads."));
+    }
+    let epiku_project = epiku_project.map(str::trim).filter(|p| !p.is_empty());
+    if epiku_project.is_some_and(|p| !epiku::valid_project_id(p)) {
+        return Err(epiku::INVALID_PROJECT.into());
+    }
+    Ok((choice.map(str::to_string), epiku_project.map(str::to_string)))
 }
 
 /// Map a Jira-style `statusCategory.key` to our normalized category.
@@ -182,6 +223,29 @@ mod tests {
         assert_eq!(detect_issue_key("ABC-9_x").as_deref(), Some("ABC-9"));
         assert_eq!(detect_issue_key("release/1.2-PROJ-7").as_deref(), Some("PROJ-7"));
         assert_eq!(detect_issue_key("ST-.1"), None);
+    }
+
+    #[test]
+    fn a_project_reads_jira_by_default_wherever_jira_is_configured() {
+        use TrackerKind::{Epiku, Jira};
+        assert_eq!(resolve_tracker(None, true, true), Some(Jira));
+        assert_eq!(resolve_tracker(None, false, true), None);
+        assert_eq!(resolve_tracker(Some("jira"), true, false), Some(Jira));
+        assert_eq!(resolve_tracker(Some("jira"), false, true), None);
+        assert_eq!(resolve_tracker(Some("epiku"), true, true), Some(Epiku));
+        assert_eq!(resolve_tracker(Some("epiku"), true, false), None);
+        assert_eq!(resolve_tracker(Some("none"), true, true), None);
+        assert_eq!(serde_json::to_string(&Epiku).unwrap(), "\"epiku\"");
+    }
+
+    #[test]
+    fn validates_a_project_choice() {
+        assert_eq!(validate_project_choice(Some(" epiku "), Some(" sample-project ")).unwrap(),
+            (Some("epiku".to_string()), Some("sample-project".to_string())));
+        assert_eq!(validate_project_choice(Some(""), Some("")).unwrap(), (None, None));
+        assert_eq!(validate_project_choice(None, None).unwrap(), (None, None));
+        assert!(validate_project_choice(Some("linear"), None).is_err());
+        assert!(validate_project_choice(Some("epiku"), Some("Bad_Id")).is_err());
     }
 
     #[test]
