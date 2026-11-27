@@ -513,6 +513,11 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN skill_shell_off INTEGER NOT NULL DEFAULT 0",
         )?;
+        // Which issue tracker a project reads (#1127): NULL = the default
+        // (Jira where it is configured), else `jira` / `epiku` / `none`; and
+        // the Epiku project it reads, NULL = the one in Settings.
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN issue_tracker TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN epiku_project TEXT")?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -1416,6 +1421,15 @@ impl Db {
             "ALTER TABLE workspaces ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0",
         )?;
 
+        // ── Workspace ports (#1219): the first port of the workspace's block,
+        // NULL until it first needs one (`ensure_workspace_port_base`). The
+        // partial index keeps two rows from ever holding the same block.
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN port_base INTEGER")?;
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_port_base
+                 ON workspaces(port_base) WHERE port_base IS NOT NULL;",
+        )?;
+
         self.backfill_default_threads()?;
 
         Ok(())
@@ -1820,6 +1834,33 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// The first port of workspace `id`'s block (#1219), allocating the lowest
+    /// free block (`workspace_ports::pick_base`, with `is_free` as the bind
+    /// test) when it has none. `None` when the workspace doesn't exist or the
+    /// range is used up. Every row counts as holding its block, archived ones
+    /// too; a deleted row's block is free again.
+    pub fn ensure_workspace_port_base(&self, id: &str, is_free: impl Fn(u16) -> bool) -> AppResult<Option<u16>> {
+        let current: Option<Option<i64>> = self
+            .conn
+            .query_row("SELECT port_base FROM workspaces WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        let Some(current) = current else { return Ok(None) };
+        if let Some(base) = current.and_then(|b| u16::try_from(b).ok()) {
+            return Ok(Some(base));
+        }
+        let taken: std::collections::HashSet<u16> = {
+            let mut stmt = self.conn.prepare("SELECT port_base FROM workspaces WHERE port_base IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+            rows.filter_map(|b| b.ok().and_then(|b| u16::try_from(b).ok())).collect()
+        };
+        let Some(base) = crate::workspace_ports::pick_base(&taken, is_free) else { return Ok(None) };
+        self.conn.execute(
+            "UPDATE workspaces SET port_base = ?2 WHERE id = ?1 AND port_base IS NULL",
+            params![id, base as i64],
+        )?;
+        Ok(Some(base))
     }
 
     /// Every RUN session opened on `project_root`.
@@ -2601,6 +2642,35 @@ impl Db {
         self.conn.execute(
             "UPDATE projects SET jira_project_key = ?1 WHERE id = ?2",
             rusqlite::params![jira_project_key, project_id],
+        )?;
+        Ok(())
+    }
+
+    /// A project's issue-tracker choice and Epiku project override (#1127),
+    /// both `None` for a project that never chose (or doesn't exist).
+    pub fn project_issue_tracker(&self, project_id: &str) -> AppResult<(Option<String>, Option<String>)> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT issue_tracker, epiku_project FROM projects WHERE id = ?1",
+                params![project_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Store a project's issue-tracker choice; callers validate it
+    /// (`issue_tracker::validate_project_choice`).
+    pub fn update_project_issue_tracker(
+        &self,
+        project_id: &str,
+        tracker: Option<&str>,
+        epiku_project: Option<&str>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET issue_tracker = ?1, epiku_project = ?2 WHERE id = ?3",
+            params![tracker, epiku_project, project_id],
         )?;
         Ok(())
     }
