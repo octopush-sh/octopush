@@ -98,6 +98,7 @@ import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
 import { CollisionMark, useWorkspaceCollisions } from "./CollisionMark";
+import { PrerequisiteMark } from "./PrerequisiteMark";
 import { collisionSegment, worstSeverity } from "../lib/collisions";
 
 /**
@@ -2066,7 +2067,7 @@ function WorkspaceRow({
       </button>
 
       {/* Meta — unboxed, right-aligned, tabular: ticket · ahead/behind · PR ·
-          dirty · collision (#732) · attention. Brass appears here only as the attention dot. The
+          dirty · collision (#732) · waiting (#960) · attention. Brass appears here only as the attention dot. The
           ahead/behind pair is the row's one demotion rung (`shedsGitMeta`). */}
       <div className="octo-tabular flex shrink-0 items-center gap-2 font-mono text-[10px] leading-none text-octo-mute">
         {ticketKey && (
@@ -2120,6 +2121,7 @@ function WorkspaceRow({
           </span>
         )}
         <CollisionMark workspaceId={workspace.id} />
+        <PrerequisiteMark workspaceId={workspace.id} />
         {attention === "dot" && (
           <span
             role="img"

@@ -3055,6 +3055,28 @@ impl Db {
         })
     }
 
+    /// Every link of `project_id`'s active (not archived) missions, oldest
+    /// mission first.
+    pub fn list_workspace_prerequisites(&self, project_id: &str) -> AppResult<Vec<PrerequisiteRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, after_workspace_id, after_condition, branch_from_prerequisite, auto_start
+             FROM workspaces
+             WHERE project_id = ?1 AND status != 'archived'
+               AND after_workspace_id IS NOT NULL AND after_condition IS NOT NULL
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok(PrerequisiteRow {
+                workspace_id: r.get(0)?,
+                after_workspace_id: r.get(1)?,
+                after_condition: r.get(2)?,
+                branch_from_prerequisite: r.get::<_, i64>(3)? != 0,
+                auto_start: r.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Make `workspace_id` wait on `after_workspace_id` until `condition`
     /// (one of [`PREREQUISITE_CONDITIONS`]), replacing any earlier link.
     /// Refuses an unknown condition, a missing or archived prerequisite, one

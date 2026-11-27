@@ -211,6 +211,9 @@ Current anchors:
 | `usage-managed-pricing` | Settings › Usage, under the headline: "Your organization set Claude Code's rates on this Mac (…)" (only while managed Claude Code settings carry a `modelPricing` table) | `settings/ManagedPricingNote.tsx` via `settings/UsagePane.tsx` |
 | `fleet-chip` | Top bar: the fleet chip (`2 needs you` · `1 in flight` · `✓ 3 done`; only while the board has something) | `RunsTray.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
+| `rail-menu-start-after` | Mission menu (rail, not on the project's main workspace): "Start after…" (while the menu is open) | `WorkspaceContextMenu.tsx` |
+| `starts-after-dialog` · `starts-after-auto-start` | The Start after dialog, while open · its "Start the run on its own" switch (only when the project has another mission) | `StartsAfterDialog.tsx` |
+| `rail-prerequisite` · `mission-control-card-prerequisite` | Rail row meta: the mute hourglass of a mission waiting on another · that mission's Mission Control card: the "Starts after …" line (only while it waits and has a card) | `PrerequisiteMark.tsx` via `WorkspaceRail.tsx` · `MissionControl.tsx` |
 | `rail-collision` | Rail row meta: the `GitCompareArrows` collision mark, amber for a file overlap, rouge for a confirmed conflict (only while another live workspace of the project changes the same files) | `CollisionMark.tsx` via `WorkspaceRail.tsx` |
 | `mission-control-card-collision` | Mission Control, a non-settled crew card: the "overlaps auth-flow · 2 files" meta segment (only while its workspace overlaps another) | `MissionControl.tsx` |
 | `mission-control-card-task` · `mission-control-card-workspace` · `mission-control-card-spent` | Mission Control crew card: its task title · the workspace name in its meta row · the spent figure in its ledger foot | `MissionControl.tsx` |
