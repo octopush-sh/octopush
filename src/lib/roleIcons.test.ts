@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  ChevronRight, CircleDashed, Eye, FlaskConical, GitBranch, Globe, Hammer,
+  BookOpen, ChevronRight, CircleDashed, Eye, FlaskConical, GitBranch, Globe, Hammer,
   Package, PenLine, Pencil, Search, Sparkles, SquareTerminal, Terminal, Wrench,
 } from "lucide-react";
 import { iconForRole, iconForSessionRole, iconForTool } from "./roleIcons";
@@ -32,6 +32,10 @@ describe("iconForTool", () => {
     expect(iconForTool("Bash")).toBe(SquareTerminal);
     expect(iconForTool("Grep")).toBe(Search);
     expect(iconForTool("WebFetch")).toBe(iconForTool("web_search"));
+  });
+
+  it("gives a loaded skill the book", () => {
+    expect(iconForTool("Skill")).toBe(BookOpen);
   });
 
   it("falls back for unknown tools", () => {
