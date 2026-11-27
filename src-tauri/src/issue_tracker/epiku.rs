@@ -185,8 +185,21 @@ pub fn describe_failure(status: u16, body: &str) -> String {
         }
         (404, Some("no_encontrada")) => "That story isn't in the Epiku project.".into(),
         (404, None) => "This Epiku doesn't have that endpoint. Check the base URL.".into(),
+        (300..=399, _) => {
+            "Epiku answered with a redirect, which Octopush doesn't follow with your token. Check the base URL.".into()
+        }
         (s, _) => format!("Epiku answered HTTP {s}."),
     }
+}
+
+/// The HTTP client for Epiku. It never follows a redirect: the bearer token
+/// would go along to wherever it points.
+fn http_client() -> reqwest::Client {
+    let no_redirects = reqwest::redirect::Policy::none;
+    crate::tls::client_builder().redirect(no_redirects()).build().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "epiku: could not build the hardened HTTP client; using reqwest's default");
+        reqwest::Client::builder().redirect(no_redirects()).build().unwrap_or_default()
+    })
 }
 
 /// A read-only client for one Epiku project.
@@ -214,7 +227,7 @@ impl EpikuClient {
             base_url,
             project: project.to_string(),
             token: token.to_string(),
-            http: crate::tls::client(),
+            http: http_client(),
         })
     }
 
@@ -264,10 +277,14 @@ impl IssueTracker for EpikuClient {
         open_stories(&v, &self.board_url())
     }
 
-    /// One story with its blockers, its dependents and its epic resolved.
+    /// One story with its blockers, its dependents and its epic resolved,
+    /// and its `markdown` as the description (cut like Jira's).
     async fn get_issue(&self, key: &str) -> AppResult<Issue> {
         let v = self.get(&story_path(key), &[]).await?;
-        issue_from_story(&v, &self.board_url()).ok_or_else(|| AppError::Other(NOT_EPIKU.into()))
+        let mut issue =
+            issue_from_story(&v, &self.board_url()).ok_or_else(|| AppError::Other(NOT_EPIKU.into()))?;
+        issue.description = super::jira::description_text(&v["markdown"]);
+        Ok(issue)
     }
 
     /// The open stories of an epic. Epics are explicit in Epiku, not derived
@@ -329,8 +346,11 @@ mod tests {
                         .find(|(t, _, _)| *t == target)
                         .map(|(_, s, b)| (*s, *b))
                         .unwrap_or((404, "<html>Not Found</html>"));
+                    // A redirect points at another path of this server, so a
+                    // client that followed it would show up in `seen`.
+                    let location = if (300..400).contains(&status) { "Location: /elsewhere\r\n" } else { "" };
                     let resp = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
@@ -402,6 +422,8 @@ mod tests {
         assert_eq!(issues[2].parent_key.as_deref(), Some("EP-2"));
         assert_eq!(issues[2].priority.as_deref(), Some("Normal"));
         assert_eq!(issues[2].status_category, StatusCategory::Todo);
+        // Like Jira's list, the backlog carries no description.
+        assert!(issues.iter().all(|i| i.description.is_none()));
     }
 
     #[tokio::test]
@@ -414,6 +436,7 @@ mod tests {
         let board = format!("{base}/?proyecto=sample-project");
         assert_eq!(issue.key, "ST-1.1");
         assert_eq!(issue.parent_key.as_deref(), Some("EP-1"));
+        assert_eq!(issue.description.as_deref(), Some("Sample story markdown"));
         let blocker = &issue.blocked_by[0];
         assert_eq!(
             (blocker.summary.as_str(), blocker.status_name.as_str(), blocker.status_category, blocker.issue_type.as_str()),
@@ -483,6 +506,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_redirect_is_never_followed_with_the_token() {
+        let list = "/api/historias?proyecto=sample-project";
+        let (base, seen) = serve(vec![(list, 302, ""), ("/elsewhere", 200, EPICA)]).await;
+        let err = client(&base).check_connection().await.unwrap_err().to_string();
+        assert!(err.contains("redirect"), "{err}");
+        assert_sent_only(&seen, &[list]);
+    }
+
+    #[tokio::test]
     async fn an_unreachable_epiku_never_shows_the_token() {
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -504,6 +536,7 @@ mod tests {
         assert_eq!(describe_failure(404, NO_ENCONTRADA), "That story isn't in the Epiku project.");
         assert_eq!(describe_failure(404, "Not Found"), "This Epiku doesn't have that endpoint. Check the base URL.");
         assert_eq!(describe_failure(500, ""), "Epiku answered HTTP 500.");
+        assert!(describe_failure(307, "").contains("doesn't follow"));
     }
 
     #[test]
