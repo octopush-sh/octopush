@@ -167,8 +167,48 @@ const HOME_RUNS_CODE: &[(&str, &str)] = &[
     (".zshrc", "every new shell runs it"), (".zprofile", "every new shell runs it"), (".zshenv", "every new shell runs it"),
     (".zlogin", "every new shell runs it"), (".bashrc", "every new shell runs it"), (".bash_profile", "every new shell runs it"),
     (".bash_login", "every new shell runs it"), (".profile", "every new shell runs it"),
-    (".config/fish/config.fish", "every new shell runs it"), (".ssh/config", "ssh runs what it names"),
+    (".config/fish", "fish runs what is in it"), (".config/git", "Git reads its config and hooks from it"),
+    (".gitconfig", "Git's config can make Git run programs"), (".ssh/config", "ssh runs what it names"),
 ];
+
+/// Whether a write at `rest`, below a Git folder (`.git`, or a bare
+/// `*.git`), makes code run, and what runs it (#1229): `config`,
+/// `config.worktree`, `hooks/`, `info/`, `worktrees/*/config.worktree`,
+/// and a submodule's own (`modules/<name>/…`, whose name may hold `/`).
+/// Lowercased components. Pure.
+fn git_dir_runs(rest: &[String]) -> Option<&'static str> {
+    let at = |i: usize| rest.get(i).map(String::as_str);
+    match (at(0), rest.len()) {
+        (Some("hooks"), _) => Some("Git runs its hooks"),
+        (Some("info"), _) => Some("Git's info files can make Git run programs"),
+        (Some("config" | "config.worktree"), 1) => Some("Git's config can make Git run programs"),
+        (Some("worktrees"), 3) if at(2) == Some("config.worktree") => Some("Git's config can make Git run programs"),
+        (Some("modules"), n) => (2..n).find_map(|k| match at(k) {
+            Some("hooks") => Some("Git runs a submodule's hooks"),
+            Some("info") => Some("Git's info files can make Git run programs"),
+            Some("config" | "config.worktree") if k == n - 1 => Some("Git's config can make Git run programs"),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// Where `workspace`'s repository runs its hooks from when `core.hooksPath`
+/// is set (in any of Git's config scopes), as `git config --path` reads it:
+/// `~` expanded, a relative one from the workspace. `None` when it isn't set
+/// or Git can't say.
+pub fn hooks_path(workspace: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["config", "--path", "--get", "core.hooksPath"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !value.is_empty()).then(|| workspace.join(value))
+}
 
 /// The same, outside home.
 const SYSTEM_RUNS_CODE: &[(&str, &str)] = &[("/Library/LaunchAgents", "macOS runs login items from it"), ("/Library/LaunchDaemons", "macOS runs login items from it")];
@@ -241,7 +281,7 @@ impl Reach {
 
     /// [`Reach::new`] with the user's home.
     pub fn of_workspace(workspace: &Path, main_checkout: Option<&Path>) -> Self {
-        Self::new(workspace, main_checkout, dirs::home_dir().as_deref())
+        Self::new(workspace, main_checkout, dirs::home_dir().as_deref()).with_hooks_path(hooks_path(workspace))
     }
 
     /// `path` as the card names it: `~/…` under home, else in full.
@@ -275,15 +315,24 @@ impl Reach {
     /// granted, inside the workspace too.
     fn runs_code(&self, path: &Path) -> Option<&'static str> {
         let names: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
-        for i in (0..names.len()).filter(|&i| names[i] == ".git") {
-            match names.get(i + 1).map(String::as_str) {
-                Some("hooks") => return Some("Git runs its hooks"),
-                Some("config") if names.len() == i + 2 => return Some("Git's config can make Git run programs"),
-                Some("info") => return Some("Git's info files can make Git run programs"),
-                _ => {}
+        // A `.git` folder, or a bare `*.git` one.
+        for i in (0..names.len()).filter(|&i| names[i].ends_with(".git")) {
+            if let Some(why) = git_dir_runs(&names[i + 1..]) {
+                return Some(why);
             }
         }
         self.runs_code.iter().find(|(place, resolved, _)| std::iter::once(place).chain(resolved).any(|p| under(path, p))).map(|(_, _, why)| *why)
+    }
+
+    /// Also treat where `core.hooksPath` points as a place that runs code
+    /// (`hooks`, as configured and resolved: husky's `.husky`, a global hooks
+    /// folder). [`Reach::of_workspace`] reads it from the repository.
+    pub fn with_hooks_path(mut self, hooks: Option<PathBuf>) -> Self {
+        if let Some(h) = hooks {
+            let resolved = std::fs::canonicalize(&h).ok();
+            self.runs_code.push((h, resolved, "Git runs its hooks from it (core.hooksPath)"));
+        }
+        self
     }
 
     /// The grant for exactly `command` run from `cwd` (#1229), bound to that
@@ -509,7 +558,7 @@ impl Reach {
                 && self.root.as_deref().is_some_and(|r| real.starts_with(r))
                 && self.secrets.iter().all(|(place, resolved, _)| std::iter::once(place).chain(resolved).all(|p| !under(&real, p) && !under(p, &real)));
             // In a `.git` folder, or where code runs from, a name is never plain.
-            let careful = real.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) || self.runs_code(&real).is_some();
+            let careful = real.components().any(|c| c.as_os_str().to_string_lossy().to_lowercase().ends_with(".git")) || self.runs_code(&real).is_some();
             Cwd { logical, real, fast: fast && !careful, careful }
         };
         // Where the command stands (`None`: after a `cd` the check can't
@@ -1670,7 +1719,7 @@ mod tests {
             (ws.join(".git/info/exclude"), "Git's info files"),
             (home.join(".zshrc"), "every new shell runs it"),
             (home.join(".bash_profile"), "every new shell runs it"),
-            (home.join(".config/fish/config.fish"), "every new shell runs it"),
+            (home.join(".config/fish/config.fish"), "fish runs what is in it"),
             (home.join("Library/LaunchAgents/x.plist"), "login items"),
         ] {
             for confined in [false, true] {
@@ -1703,5 +1752,59 @@ mod tests {
         // A file a redirect creates from where the shell stands outside asks.
         std::fs::create_dir_all(home.join("sub")).unwrap();
         assert!(reach.command_card(None, "echo x > new.txt", Some(&home.join("sub")), &[]).is_some());
+    }
+
+    /// More places that run code ask (#1229): Git's XDG config, all of
+    /// fish's, the `core.hooksPath` folder, and a Git folder's (or a bare
+    /// repository's) worktree and submodule config and hooks, matched by
+    /// component after resolving.
+    #[test]
+    fn git_config_fish_bare_repositories_submodules_and_the_hooks_path_ask() {
+        let (_d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home)).with_hooks_path(Some(ws.join(".husky")));
+        let write = |path: PathBuf| reach.outside_card(None, "write_file", &json!({"path": path, "content": "c"}), false, &[]);
+        for path in [
+            home.join(".config/git/config"),
+            home.join(".config/git/hooks/pre-commit"),
+            home.join(".config/fish/functions/ls.fish"),
+            home.join(".config/fish/conf.d/x.fish"),
+            ws.join(".husky/pre-commit"),
+            ws.join(".git/config.worktree"),
+            ws.join(".git/worktrees/w1/config.worktree"),
+            ws.join(".git/modules/libs/a/hooks/post-checkout"),
+            ws.join(".git/modules/libs/a/config"),
+            home.join("src/tool.git/config"),
+            home.join("src/tool.git/hooks/update"),
+        ] {
+            let c = write(path.clone()).unwrap_or_else(|| panic!("{path:?} asks"));
+            assert!(c.reason.contains("it runs code") && c.grant.is_none(), "{path:?}: {}", c.reason);
+        }
+        for path in [ws.join(".git/worktrees/w1/HEAD"), ws.join(".git/modules/libs/a/HEAD"), ws.join(".huskyrc")] {
+            assert_eq!(write(path.clone()), None, "{path:?}");
+        }
+        assert!(write(ws.join(".husky/pre-push")).is_some_and(|c| c.reason.contains("core.hooksPath")));
+        #[cfg(unix)]
+        {
+            // Matched where it resolves: a link in the workspace to a hooks folder.
+            std::fs::create_dir_all(home.join("src/tool.git/hooks")).unwrap();
+            std::os::unix::fs::symlink(home.join("src/tool.git/hooks"), ws.join("h")).unwrap();
+            assert!(write(ws.join("h/pre-receive")).is_some_and(|c| c.reason.contains("Git runs its hooks")));
+            assert!(run(&reach, "cp x h/post-update").is_some_and(|c| c.reason.contains("it runs code")));
+        }
+    }
+
+    /// `core.hooksPath` is read from the repository, as Git reads it.
+    #[test]
+    fn the_hooks_path_comes_from_the_repository() {
+        let (_d, ws, _home) = setup();
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&ws).args(args).output().is_ok_and(|o| o.status.success());
+        if !git(&["init", "-q"]) {
+            return; // No Git here.
+        }
+        assert!(git(&["config", "core.hooksPath", ".husky"]));
+        assert_eq!(hooks_path(&ws), Some(ws.join(".husky")));
+        let reach = Reach::of_workspace(&ws, None);
+        let c = reach.outside_card(None, "write_file", &json!({"path": ".husky/pre-commit", "content": "x"}), false, &[]);
+        assert!(c.is_some_and(|c| c.reason.contains("core.hooksPath")), "a write there asks");
     }
 }

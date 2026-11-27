@@ -2770,26 +2770,80 @@ fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String
     out
 }
 
-/// Talk's unsandboxed `write_file` (#1229): it never follows a link at the
-/// file it opens (`O_NOFOLLOW`), so a link swapped in after the check can't
-/// send the write elsewhere. A link already there is written through its
-/// target, resolved now, only when that is inside the workspace
-/// (`CLAUDE.md -> AGENTS.md`); one that leads out is refused.
+/// Talk's unsandboxed `write_file` and `edit_file` (#1229): the write never
+/// follows a link the check didn't see. A link already at the file is
+/// written through its target, resolved now, only when that is inside the
+/// workspace (`CLAUDE.md -> AGENTS.md`); one that leads out is refused. The
+/// folder is resolved now too, and a path written inside the workspace
+/// must still resolve inside it, so a folder swapped for a link after the
+/// check can't lead the write out. Then every folder on the way and the
+/// file are opened without following a link (`openat`, `O_NOFOLLOW`), so a
+/// swap after that resolve fails instead of redirecting the write.
 fn write_unfollowed(workspace: &Path, full: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
+    let refuse = |why: &str| std::io::Error::other(why.to_string());
+    let root = std::fs::canonicalize(workspace)?;
     let mut target = full.to_path_buf();
     if std::fs::symlink_metadata(full).is_ok_and(|m| m.file_type().is_symlink()) {
-        let real = crate::talk_guard::resolve(full).ok_or_else(|| std::io::Error::other("its links go too deep to follow"))?;
-        if !real.starts_with(std::fs::canonicalize(workspace)?) {
-            return Err(std::io::Error::other("it is a link that leads outside the workspace; write the file it points to by its own path"));
+        target = crate::talk_guard::resolve(full).ok_or_else(|| refuse("its links go too deep to follow"))?;
+        if !target.starts_with(&root) {
+            return Err(refuse("it is a link that leads outside the workspace; write the file it points to by its own path"));
         }
-        target = real;
     }
-    let mut open = std::fs::OpenOptions::new();
-    open.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NOFOLLOW);
-    open.open(&target)?.write_all(content.as_bytes())
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        return Err(refuse("it names no file"));
+    };
+    let parent = std::fs::canonicalize(parent)?;
+    let inside_as_written = full.starts_with(workspace) && !full.components().any(|c| c == std::path::Component::ParentDir);
+    if inside_as_written && !parent.starts_with(&root) {
+        return Err(refuse("a folder on its path is a link that leads outside the workspace; write by the real path"));
+    }
+    open_without_links(&parent, name)?.write_all(content.as_bytes())
+}
+
+/// `name` in `dir` (already resolved), opened to write (created, emptied)
+/// without following a link anywhere: from `/`, each folder with
+/// `O_DIRECTORY | O_NOFOLLOW`, then the file with `O_NOFOLLOW`. A folder or
+/// file swapped for a link after `dir` was resolved makes it fail.
+#[cfg(unix)]
+fn open_without_links(dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let c = |s: &std::ffi::OsStr| CString::new(s.as_bytes()).map_err(std::io::Error::other);
+    let owned = |fd: libc::c_int| -> std::io::Result<OwnedFd> {
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by a successful open, and nothing else owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let slash = c(std::ffi::OsStr::new("/"))?;
+    // SAFETY: a valid NUL-terminated path.
+    let mut at = owned(unsafe { libc::open(slash.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) })?;
+    for part in dir.components() {
+        match part {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(p) => {
+                let p = c(p)?;
+                // SAFETY: `at` is an open folder and `p` a valid NUL-terminated name.
+                at = owned(unsafe {
+                    libc::openat(at.as_raw_fd(), p.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                })?;
+            }
+            _ => return Err(std::io::Error::other("its folder isn't a resolved path")),
+        }
+    }
+    let name = c(name)?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: as above; the mode applies to a new file only.
+    let fd = owned(unsafe { libc::openat(at.as_raw_fd(), name.as_ptr(), flags, 0o666 as libc::c_uint) })?;
+    Ok(std::fs::File::from(fd))
+}
+
+#[cfg(not(unix))]
+fn open_without_links(dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(dir.join(name))
 }
 
 /// Talk's `run_command` with `input` in `workspace` under `roots`, on a
@@ -3302,7 +3356,7 @@ pub(crate) fn execute_tool_cancellable(
                 }
                 return (format!("Edited {path}: replaced {replaced} occurrence(s)"), true);
             }
-            match std::fs::write(&full, updated) {
+            match write_unfollowed(workspace_path, &full, &updated) {
                 Ok(()) => (format!("Edited {path}: replaced {replaced} occurrence(s)"), true),
                 Err(e) => (format!("Error writing {path}: {e}"), false),
             }
@@ -7600,6 +7654,35 @@ mod tests {
         assert!(!ok && msg.contains("leads outside the workspace"), "{msg}");
         assert!(!out.join("x.txt").exists());
         assert!(write("plain.txt").1);
+        // A folder that is a link out: refused, nothing written there.
+        std::os::unix::fs::symlink(&out, ws.join("sub")).unwrap();
+        let (msg, ok) = write("sub/y.txt");
+        assert!(!ok && msg.contains("leads outside the workspace"), "{msg}");
+        assert!(!out.join("y.txt").exists());
+        // `edit_file` writes the same way.
+        std::fs::write(out.join("x.txt"), "old").unwrap();
+        let edit = |p: &str| execute_tool_cancellable(&ws, "edit_file", &serde_json::json!({ "path": p, "old_string": "old", "new_string": "new" }), None, None);
+        let (msg, ok) = edit("leak.txt");
+        assert!(!ok && msg.contains("leads outside the workspace"), "{msg}");
+        assert_eq!(std::fs::read_to_string(out.join("x.txt")).unwrap(), "old");
+        std::fs::write(ws.join("AGENTS.md"), "old").unwrap();
+        assert!(edit("CLAUDE.md").1, "a link inside is edited through");
+        assert_eq!(std::fs::read_to_string(ws.join("AGENTS.md")).unwrap(), "new");
+    }
+
+    /// The opened file and every folder on the way are never a link.
+    #[cfg(unix)]
+    #[test]
+    fn open_without_links_refuses_a_link_on_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(real.join("a")).unwrap();
+        std::os::unix::fs::symlink(real.join("a"), real.join("l")).unwrap();
+        std::os::unix::fs::symlink(real.join("a/t"), real.join("a/f")).unwrap();
+        assert!(open_without_links(&real.join("a"), std::ffi::OsStr::new("ok")).is_ok());
+        assert!(open_without_links(&real.join("l"), std::ffi::OsStr::new("x")).is_err(), "a folder that is a link");
+        assert!(open_without_links(&real.join("a"), std::ffi::OsStr::new("f")).is_err(), "a file that is a link");
+        assert!(!real.join("a/t").exists());
     }
 
     #[test]
