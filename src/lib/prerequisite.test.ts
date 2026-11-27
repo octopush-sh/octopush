@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { Run, RunStage } from "./ipc";
-import { prVerdict, runVerdict, waitingLine } from "./prerequisite";
+import { notStartedText, prVerdict, queuedLine, runVerdict, stagedText, waitingLine } from "./prerequisite";
 
 const run = (status: Run["status"]) => ({ id: "r1", status }) as Run;
 const stage = (status: RunStage["status"], checkpoint = false) => ({ status, checkpoint }) as RunStage;
@@ -42,4 +42,21 @@ it("waitingLine names the prerequisite, the condition and why a stopped run stil
   );
   expect(waitingLine("run_finished", "a", "aborted")).toContain("That run was aborted");
   expect(waitingLine("pr_merged", "a", "failed")).toBe("Starts after a's pull request merges");
+});
+
+it("queuedLine says a met mission waits for another mission's seed to be taken", () => {
+  expect(queuedLine("pr_merged", "auth", "docs")).toBe("auth's pull request merged. Ready to start once you open docs in Direct");
+  expect(queuedLine("run_finished", "auth", null)).toBe(
+    "auth's run passed its last gate. Ready to start once you open a launcher in Direct",
+  );
+});
+
+it("stagedText and notStartedText claim only what was seeded", () => {
+  expect(stagedText(true, true)).toBe("Its brief and crew wait in Direct for Begin the run.");
+  expect(stagedText(true, false)).toBe("Its brief waits in Direct; choose a crew to begin the run.");
+  expect(stagedText(false, true)).toBe("Its crew waits in Direct; write a brief to begin the run.");
+  expect(stagedText(false, false)).toBe("Open it in Direct to write a brief and choose a crew.");
+  expect(notStartedText(true, false)).toBe("It has no crew to start on its own.");
+  expect(notStartedText(false, false)).toBe("It has no brief or crew to start on its own.");
+  expect(notStartedText(true, true)).toBe("It didn't start on its own.");
 });

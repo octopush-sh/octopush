@@ -1,15 +1,20 @@
 import { Hourglass } from "lucide-react";
-import { waitingLine } from "../lib/prerequisite";
+import { queuedLine, waitingLine } from "../lib/prerequisite";
 import { usePrerequisitesStore } from "../stores/prerequisitesStore";
 import { findWorkspaceName, useWorkspaceStore } from "../stores/workspaceStore";
 
 /** The waiting mission's line ("Starts after auth-flow's run passes its last
- *  gate"), or null while it waits on nothing (#960). */
+ *  gate", or, once met but queued for the launcher, "… Ready to start once
+ *  you open docs in Direct"), or null while it waits on nothing (#960). */
 function usePrerequisiteLine(workspaceId: string): string | null {
   const link = usePrerequisitesStore((s) => s.byWs[workspaceId]);
   const hold = usePrerequisitesStore((s) => s.holdByWs[workspaceId] ?? null);
+  const queued = usePrerequisitesStore((s) => s.queuedByWs[workspaceId]);
   const afterName = useWorkspaceStore((s) => (link ? findWorkspaceName(s.workspacesByProjectId, link.afterWorkspaceId) : null));
-  return link && afterName ? waitingLine(link.afterCondition, afterName, hold) : null;
+  const seededName = useWorkspaceStore((s) => (queued ? findWorkspaceName(s.workspacesByProjectId, queued) : null));
+  if (!link || !afterName) return null;
+  if (queued !== undefined) return queuedLine(link.afterCondition, afterName, seededName);
+  return waitingLine(link.afterCondition, afterName, hold);
 }
 
 /** Rail row meta: a mute hourglass while the mission waits on another. */

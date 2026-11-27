@@ -52,7 +52,7 @@ const load = (links: Prerequisite[]) => {
 beforeEach(() => {
   vi.clearAllMocks();
   __resetPrerequisites();
-  usePrerequisitesStore.setState({ byWs: {}, holdByWs: {} });
+  usePrerequisitesStore.setState({ byWs: {}, holdByWs: {}, queuedByWs: {} });
   useRunsStore.setState({ activeRunIdByWs: {}, launcherPrefill: null });
   setLauncherPrefill.mockImplementation((p: LauncherPrefill | null) => useRunsStore.setState({ launcherPrefill: p }));
   useWorkspaceStore.setState({
@@ -147,6 +147,7 @@ describe("prerequisitesStore", () => {
     expect(mockIpc.clearWorkspacePrerequisite).toHaveBeenCalledWith("w2");
     expect(mockIpc.clearWorkspacePrerequisite).not.toHaveBeenCalledWith("w3");
     expect(usePrerequisitesStore.getState().byWs.w3).toEqual(link({ workspaceId: "w3" }));
+    expect(usePrerequisitesStore.getState().queuedByWs).toEqual({ w3: "w2" });
     expect(pushToast).toHaveBeenCalledTimes(1);
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "w2 is ready to start" }));
 
@@ -155,7 +156,70 @@ describe("prerequisitesStore", () => {
     await usePrerequisitesStore.getState().check();
     expect(useRunsStore.getState().launcherPrefill).toEqual(expect.objectContaining({ workspaceId: "w3", task: "Write the guide" }));
     expect(usePrerequisitesStore.getState().byWs).toEqual({});
+    expect(usePrerequisitesStore.getState().queuedByWs).toEqual({});
     expect(pushToast).toHaveBeenLastCalledWith(expect.objectContaining({ title: "w3 is ready to start" }));
+  });
+
+  it("says a met mission is queued behind a seed that is never taken", async () => {
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [workspace("w1"), workspace("w2", "Wire the token store"), workspace("w3", "Write the guide")] },
+    });
+    mockIpc.listRuns.mockResolvedValue([run("completed")]);
+    await load([link(), link({ workspaceId: "w3" })]);
+    // w2 is never opened: its seed stays in the slot, check after check.
+    await usePrerequisitesStore.getState().check();
+    await usePrerequisitesStore.getState().check();
+
+    expect(useRunsStore.getState().launcherPrefill).toEqual(expect.objectContaining({ workspaceId: "w2" }));
+    expect(usePrerequisitesStore.getState().byWs.w3).toBeDefined();
+    expect(usePrerequisitesStore.getState().queuedByWs).toEqual({ w3: "w2" });
+    expect(pushToast).toHaveBeenCalledTimes(1);
+
+    // The rail's hourglass says the run isn't simply still waiting.
+    const { PrerequisiteMark } = await import("../components/PrerequisiteMark");
+    const { render, screen } = await import("@testing-library/react");
+    const { createElement } = await import("react");
+    render(createElement(PrerequisiteMark, { workspaceId: "w3" }));
+    expect(screen.getByRole("img").getAttribute("title")).toBe(
+      "w1's run passed its last gate. Ready to start once you open w2 in Direct",
+    );
+  });
+
+  it("frees the slot from a seed whose mission is gone", async () => {
+    useRunsStore.setState({ launcherPrefill: { task: "x", pipelineId: "p", overrides: [], workspaceId: "gone" } });
+    mockIpc.listRuns.mockResolvedValue([run("completed")]);
+    await load([link()]);
+
+    expect(useRunsStore.getState().launcherPrefill).toEqual(expect.objectContaining({ workspaceId: "w2" }));
+    expect(usePrerequisitesStore.getState().queuedByWs).toEqual({});
+  });
+
+  it("words the toast for what was seeded when an auto-start link has no prerequisite run", async () => {
+    mockIpc.findPrForBranch.mockResolvedValue(pr("merged"));
+    mockIpc.listRuns.mockResolvedValue([]);
+    await load([link({ afterCondition: "pr_merged", autoStart: true })]);
+
+    expect(begin).not.toHaveBeenCalled();
+    expect(setLauncherPrefill).toHaveBeenCalledWith({ task: "Wire the token store", pipelineId: "", overrides: [], workspaceId: "w2" });
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({
+      title: "w2 is ready to start",
+      body: "w1's pull request merged. It has no crew to start on its own. Its brief waits in Direct; choose a crew to begin the run.",
+    }));
+  });
+
+  it("seeds nothing when there is neither a brief nor a crew, and says so", async () => {
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [workspace("w1"), workspace("w2")] } });
+    // Another mission's seed holds the slot; with nothing to seed, it doesn't matter.
+    useRunsStore.setState({ launcherPrefill: { task: "x", pipelineId: "p", overrides: [], workspaceId: "w1" } });
+    mockIpc.listRuns.mockResolvedValue([run("completed", "")]);
+    await load([link()]);
+
+    expect(setLauncherPrefill).not.toHaveBeenCalled();
+    expect(selectRun).toHaveBeenCalledWith("w2", null);
+    expect(usePrerequisitesStore.getState().byWs).toEqual({});
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({
+      body: "w1's run passed its last gate. Open it in Direct to write a brief and choose a crew.",
+    }));
   });
 
   it("doesn't claim a seed for a refused auto-start while another mission's seed holds the slot", async () => {

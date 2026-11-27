@@ -44,3 +44,32 @@ export function waitingLine(
   const what = hold === "halted" ? "halted" : hold === "aborted" ? "was aborted" : "failed";
   return `${base}. That run ${what}, so this mission keeps waiting`;
 }
+
+/** "auth-flow's pull request merged.": the met condition, as a sentence. */
+export function metReason(condition: PrerequisiteCondition, afterName: string): string {
+  return condition === "pr_merged"
+    ? `${afterName}'s pull request merged.`
+    : `${afterName}'s run passed its last gate.`;
+}
+
+/** A met mission queued behind another mission's seed in the one launcher
+ *  slot: it is staged once that seed is taken, i.e. once `seededName` is
+ *  opened in Direct (null: a seed any launcher takes). */
+export function queuedLine(condition: PrerequisiteCondition, afterName: string, seededName: string | null): string {
+  const where = seededName ? `you open ${seededName} in Direct` : "you open a launcher in Direct";
+  return `${metReason(condition, afterName)} Ready to start once ${where}`;
+}
+
+/** What a staged start put in the launcher, and what's left to do. */
+export function stagedText(seededTask: boolean, seededCrew: boolean): string {
+  if (seededTask && seededCrew) return "Its brief and crew wait in Direct for Begin the run.";
+  if (seededTask) return "Its brief waits in Direct; choose a crew to begin the run.";
+  if (seededCrew) return "Its crew waits in Direct; write a brief to begin the run.";
+  return "Open it in Direct to write a brief and choose a crew.";
+}
+
+/** Why an auto-start link didn't begin its run: what it lacked, or a refusal. */
+export function notStartedText(hasTask: boolean, hasCrew: boolean): string {
+  const missing = !hasTask && !hasCrew ? "brief or crew" : !hasTask ? "brief" : !hasCrew ? "crew" : null;
+  return missing ? `It has no ${missing} to start on its own.` : "It didn't start on its own.";
+}
