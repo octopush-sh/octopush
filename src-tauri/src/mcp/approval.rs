@@ -182,8 +182,8 @@ mod tests {
     use super::*;
 
     /// Approvals as a map of server → approved hash.
-    struct Approved(HashMap<String, String>);
-    impl ProjectApprovals for Approved {
+    struct ApprovedHashes(HashMap<String, String>);
+    impl ProjectApprovals for ApprovedHashes {
         fn approved(&self, _: &Path, server: &str, hash: &str) -> Option<bool> {
             self.0.get(server).map(|h| h == hash)
         }
@@ -211,7 +211,7 @@ mod tests {
         assert!(shown.starts_with("docs: node docs.js") && shown.contains("DOCS_TOKEN"), "{shown}");
         assert!(!shown.contains("t-1"), "env names, never a value: {shown}");
 
-        let approved = Approved(HashMap::from([("docs".to_string(), docs.hash.clone())]));
+        let approved = ApprovedHashes(HashMap::from([("docs".to_string(), docs.hash.clone())]));
         assert_eq!(states(&project_servers(dir.path(), &HashMap::new(), &approved)), [("docs", Approved)]);
         // Any change to the entry, a value included, asks again.
         write(dir.path(), r#"{"mcpServers":{"docs":{"command":"node","args":["docs.js"],"env":{"DOCS_TOKEN":"t-2"}}}}"#);
