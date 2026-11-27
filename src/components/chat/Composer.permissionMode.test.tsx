@@ -26,7 +26,7 @@ beforeEach(() => {
   usePermissionModeStore.setState({ byThread: {} });
   useChatStore.setState({ activeThreadByWs: { w1: "t1" } });
   let stored = "edit";
-  modes.getThreadPermissionMode.mockReset().mockImplementation(async () => ({ stored, effective: stored }));
+  modes.getThreadPermissionMode.mockReset().mockImplementation(async () => ({ stored, effective: stored, forced: false }));
   modes.setThreadPermissionMode.mockReset().mockImplementation(async (_t: string, mode: string) => (stored = mode));
 });
 

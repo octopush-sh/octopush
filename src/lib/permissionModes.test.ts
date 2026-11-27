@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { PERMISSION_MODES, isModeChord, isModeNote, nextPermissionMode, threadModeOf } from "./permissionModes";
+import { PERMISSION_MODES, isModeChord, isModeNote, nextPermissionMode } from "./permissionModes";
 
 const key = (over: Partial<KeyboardEvent> = {}) =>
   ({ metaKey: true, ctrlKey: false, altKey: true, shiftKey: false, repeat: false, key: "π", code: "KeyP", ...over }) as KeyboardEvent;
@@ -39,9 +39,4 @@ describe("permission modes", () => {
     }
   });
 
-  it("works out a forced Plan only from what the backend reads", () => {
-    expect(threadModeOf({ stored: "edit", effective: "plan" })).toEqual({ stored: "edit", effective: "plan", forced: true });
-    expect(threadModeOf({ stored: "ask", effective: "ask" }).forced).toBe(false);
-    expect(threadModeOf({ stored: "plan", effective: "plan" }).forced).toBe(false);
-  });
 });

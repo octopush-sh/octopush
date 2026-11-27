@@ -11,15 +11,15 @@ vi.mock("../../lib/ipc", () => ({ ipc: ipcMock }));
 import { PermissionModeControl } from "./PermissionModeControl";
 import { usePermissionModeStore } from "../../stores/permissionModeStore";
 
-/** What `get_thread_permission_mode` answers: no `forced`, the store works it out. */
-let backend: Omit<ThreadMode, "forced">;
+/** What `get_thread_permission_mode` answers. */
+let backend: ThreadMode;
 
 beforeEach(() => {
   usePermissionModeStore.setState({ byThread: {} });
-  backend = { stored: "edit", effective: "edit" };
+  backend = { stored: "edit", effective: "edit", forced: false };
   ipcMock.getThreadPermissionMode.mockReset().mockImplementation(async () => ({ ...backend }));
   ipcMock.setThreadPermissionMode.mockReset().mockImplementation(async (_thread: string, mode: PermissionMode) => {
-    backend = { stored: mode, effective: mode };
+    backend = { stored: mode, effective: mode, forced: false };
     return mode;
   });
 });
@@ -57,8 +57,8 @@ describe("PermissionModeControl", () => {
     expect(ipcMock.setThreadPermissionMode).toHaveBeenCalledTimes(1);
   });
 
-  it("a read-only mission's Plan only shows a lock and can't be changed", async () => {
-    backend = { stored: "edit", effective: "plan" };
+  it("a read-only mission's Plan only shows a lock and can't be changed, whatever is stored", async () => {
+    backend = { stored: "edit", effective: "plan", forced: true };
     render(<PermissionModeControl threadId="t1" streaming={false} />);
     const chip = await screen.findByRole("button", { name: /^Permission mode: Plan only\. This workspace's mission is read-only/ });
     expect(chip).toHaveAttribute("aria-disabled", "true");
@@ -67,6 +67,17 @@ describe("PermissionModeControl", () => {
     expect(screen.queryByRole("menu")).toBeNull();
     await act(() => usePermissionModeStore.getState().cycle("t1"));
     await act(() => usePermissionModeStore.getState().set("t1", "edit"));
+    expect(ipcMock.setThreadPermissionMode).not.toHaveBeenCalled();
+  });
+
+  it("with Plan only stored under a read-only mission, it's still locked: the backend says forced (#1231)", async () => {
+    backend = { stored: "plan", effective: "plan", forced: true };
+    render(<PermissionModeControl threadId="t1" streaming={false} />);
+    const chip = await screen.findByRole("button", { name: /^Permission mode: Plan only\. This workspace's mission is read-only/ });
+    expect(chip).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(chip);
+    expect(screen.queryByRole("menu")).toBeNull();
+    await act(() => usePermissionModeStore.getState().cycle("t1"));
     expect(ipcMock.setThreadPermissionMode).not.toHaveBeenCalled();
   });
 

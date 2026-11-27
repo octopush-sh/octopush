@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
-import { nextPermissionMode, threadModeOf, type PermissionMode, type ThreadMode } from "../lib/permissionModes";
+import { nextPermissionMode, type PermissionMode, type ThreadMode } from "../lib/permissionModes";
 
 interface PermissionModeState {
   /** Each conversation's mode, once read. */
@@ -27,7 +27,7 @@ export const usePermissionModeStore = create<PermissionModeState>((set, get) => 
   load: async (threadId) => {
     const seq = (loadSeq[threadId] = (loadSeq[threadId] ?? 0) + 1);
     try {
-      const mode = threadModeOf(await ipc.getThreadPermissionMode(threadId));
+      const mode = await ipc.getThreadPermissionMode(threadId);
       // A newer read, or a set still in flight, has the say.
       if (loadSeq[threadId] !== seq || (pendingSets[threadId] ?? 0) > 0) return;
       set((s) => ({ byThread: { ...s.byThread, [threadId]: mode } }));

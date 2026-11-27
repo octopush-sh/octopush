@@ -957,6 +957,21 @@ pub fn thread_mode(db: &Mutex<Db>, thread_id: &str) -> Mode {
 /// A thread's stored mode, and the mode its turns run in now: Plan only
 /// when its workspace's active mission is read-only.
 pub fn thread_modes(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode) {
+    let state = thread_mode_state(db, thread_id);
+    (state.stored, state.effective)
+}
+
+/// A thread's mode as the Composer shows it (#1231): stored, in force, and
+/// whether a read-only mission forces Plan only, by the rule its turns run
+/// under ([`forced`]), whatever is stored (Plan only included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadModeState {
+    pub stored: Mode,
+    pub effective: Mode,
+    pub forced: bool,
+}
+
+pub fn thread_mode_state(db: &Mutex<Db>, thread_id: &str) -> ThreadModeState {
     let stored = thread_mode(db, thread_id);
     let db = db.lock();
     let mission = db
@@ -966,7 +981,7 @@ pub fn thread_modes(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode) {
         .and_then(|w| db.active_mission_for_workspace(&w).ok().flatten());
     // Only whether the roots are empty matters here, not the workspace's path.
     let roots = mission.and_then(|m| crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, ""));
-    (stored, effective(stored, roots.as_deref()))
+    ThreadModeState { stored, effective: effective(stored, roots.as_deref()), forced: forced(roots.as_deref()) }
 }
 
 /// How a gate learns the mode at the moment a call is checked.
@@ -1759,6 +1774,13 @@ mod tests {
         db.lock().insert_mission("m-ro", Some("w-eff"), "p-eff", "review", "Review it", "active", None, "readonly", "none", "{}").unwrap();
         assert_eq!(thread_modes(&db, &thread), (Mode::Edit, Mode::Plan), "the mission forces Plan only");
         assert_eq!(thread_modes(&db, "gone"), (Mode::Edit, Mode::Edit));
+        // The Composer reads `forced` from this rule, Plan only stored too
+        // (#1231): its control locks, and offers no mode the turns won't run.
+        let state = |db: &Mutex<Db>| thread_mode_state(db, &thread);
+        assert_eq!(state(&db), ThreadModeState { stored: Mode::Edit, effective: Mode::Plan, forced: true });
+        db.lock().set_thread_permission_mode(&thread, Mode::Plan).unwrap();
+        assert_eq!(state(&db), ThreadModeState { stored: Mode::Plan, effective: Mode::Plan, forced: true }, "stored=plan under a read-only mission");
+        assert!(!thread_mode_state(&db, "gone").forced);
     }
 
     /// A Plan only command runs off the turn's runtime thread and stops with

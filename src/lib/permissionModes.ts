@@ -5,18 +5,13 @@
 export type PermissionMode = "plan" | "ask" | "edit";
 
 /** A conversation's mode as stored, as its turns run it, and whether a
- *  read-only mission forces Plan only (then the control can't change it). */
+ *  read-only mission forces Plan only (then the control can't change it),
+ *  all three as `get_thread_permission_mode` reads them from the backend's
+ *  own rule (`permissions::thread_mode_state`). */
 export interface ThreadMode {
   stored: PermissionMode;
   effective: PermissionMode;
   forced: boolean;
-}
-
-/** A mode as `get_thread_permission_mode` reads it, with `forced` worked out:
- *  the turns run Plan only although the conversation is set to another
- *  mode, which only a read-only mission does. Pure. */
-export function threadModeOf(read: { stored: PermissionMode; effective: PermissionMode }): ThreadMode {
-  return { ...read, forced: read.effective === "plan" && read.stored !== "plan" };
 }
 
 /** The modes in the order the chord cycles them. */

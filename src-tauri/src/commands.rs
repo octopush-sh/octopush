@@ -2415,17 +2415,19 @@ pub async fn set_thread_mcp_server(
 /// A Talk conversation's permission mode (#1146), as stored and as its
 /// turns run it: `plan` (Plan only), `edit` (Edit freely, also every
 /// conversation that never set one) or `ask`. `effective` is `plan` when the
-/// workspace's active mission is read-only, whatever is stored.
+/// workspace's active mission is read-only, whatever is stored, and
+/// `forced` says so (Plan only stored too), so the Composer locks its control.
 #[derive(serde::Serialize)]
 pub struct ThreadPermissionMode {
     stored: &'static str,
     effective: &'static str,
+    forced: bool,
 }
 
 #[tauri::command]
 pub async fn get_thread_permission_mode(state: State<'_, AppState>, thread_id: String) -> AppResult<ThreadPermissionMode> {
-    let (stored, effective) = crate::permissions::thread_modes(&state.db, &thread_id);
-    Ok(ThreadPermissionMode { stored: stored.as_str(), effective: effective.as_str() })
+    let mode = crate::permissions::thread_mode_state(&state.db, &thread_id);
+    Ok(ThreadPermissionMode { stored: mode.stored.as_str(), effective: mode.effective.as_str(), forced: mode.forced })
 }
 
 /// Set a Talk conversation's permission mode, `plan`, `ask` or `edit`; a

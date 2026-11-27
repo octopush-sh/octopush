@@ -1205,9 +1205,10 @@ export const ipc = {
   /** A Talk conversation's permission mode, as stored and as its turns run
    *  it: `plan` (Plan only), `ask` (Ask first) or `edit` (Edit freely, the
    *  default). `effective` is `plan` while the workspace's mission is
-   *  read-only. Talk reads it at each round boundary. */
+   *  read-only, and `forced` says so (whatever is stored, Plan only too).
+   *  Talk reads it at each round boundary. */
   getThreadPermissionMode: (threadId: string) =>
-    invoke<{ stored: PermissionMode; effective: PermissionMode }>("get_thread_permission_mode", { threadId }),
+    invoke<{ stored: PermissionMode; effective: PermissionMode; forced: boolean }>("get_thread_permission_mode", { threadId }),
   /** Set a conversation's permission mode; resolves to the mode stored. A
    *  turn that is running takes it from its next round and notes the switch. */
   setThreadPermissionMode: (threadId: string, mode: PermissionMode) =>
