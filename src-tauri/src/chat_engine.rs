@@ -735,77 +735,446 @@ fn nested_commands(line: &str) -> Vec<String> {
 /// What a word of a command line is to the path check (#1201).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum WordRole {
-    /// A segment's program: what runs, not what it reads.
+    /// A command's program: what runs, not what it reads.
     Program,
     /// An argument, or the target of a redirection.
     Argument,
-    /// A word of a here-document's body: what the command gets on its input.
+    /// A word of a here-document's body or a here-string: what the command
+    /// gets on its input.
     Data,
 }
 
-/// The words of one command line as the path check reads them (#1201):
-/// segments split at `;`, `|`, `&`, parens and backticks, words at
-/// whitespace and at `<` and `>` (a redirection's target is an argument, its
-/// fd number no word). Each segment's first word past `NAME=value`
-/// assignments is its program. A word loses its quotes and backslashes (the
-/// shell joins `"$HOME"/.ssh` into one path), a `NAME=` or `--flag=` prefix
-/// and a leading `@` (`curl -d @file`). The lines of a here-document's body
-/// (`<<EOF` … `EOF`, `<<-`, a quoted delimiter) are `Data`. A heuristic, not
-/// a shell parser. Pure.
-pub(crate) fn command_words(line: &str) -> Vec<(WordRole, String)> {
-    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let heredoc = HEREDOC.get_or_init(|| {
-        regex::Regex::new(r#"(?:^|[^<])<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z0-9_.-]+))"#).unwrap()
-    });
-    let mut out = Vec::new();
-    // Here-documents opened and not closed yet, oldest first: (delimiter, `<<-`).
-    let mut bodies: std::collections::VecDeque<(String, bool)> = Default::default();
-    for text in line.split('\n') {
-        if let Some((delimiter, dash)) = bodies.front() {
-            let end = if *dash { text.trim_start_matches('\t') } else { text };
-            if end == delimiter.as_str() {
-                bodies.pop_front();
-            } else {
-                out.extend(line_words(text).into_iter().map(|(_, w)| (WordRole::Data, w)));
-            }
-            continue;
-        }
-        for cap in heredoc.captures_iter(text) {
-            if let Some(d) = cap.get(2).or(cap.get(3)).or(cap.get(4)) {
-                bodies.push_back((d.as_str().to_string(), !cap[1].is_empty()));
-            }
-        }
-        out.extend(line_words(text));
-    }
-    out
+/// A word of a command line as the path check reads it (#1201).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandWord {
+    pub role: WordRole,
+    /// Which command of the line it is in: `;`, `|`, `&`, `&&`, `||`,
+    /// parens and newlines start the next.
+    pub segment: usize,
+    /// The word before expansion: quotes removed, `$'…'` decoded, `$HOME`
+    /// at its start written `~`, and each quoted or escaped `\`, `~`, `*`,
+    /// `?`, `[`, `]`, `{`, `}` and `,` written with a `\` before it, so tilde,
+    /// brace and glob expansion see only the shell's own. A `NAME=` or
+    /// `--flag=` prefix and a leading `@` (`curl -d @file`) are dropped.
+    pub pattern: String,
+    /// `pattern` without the expansions the check doesn't model.
+    pub spliced: String,
+    /// It holds an expansion the check doesn't model: a variable, `$(…)`, a
+    /// backtick span, an extglob.
+    pub unmodeled: bool,
+    /// The target of an output redirection (`>`, `>>`, `&>`).
+    pub writes: bool,
 }
 
-/// [`command_words`] for one line of text outside a here-document.
-fn line_words(text: &str) -> Vec<(WordRole, String)> {
-    static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let prefix = PREFIX.get_or_init(|| regex::Regex::new(r"^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*=").unwrap());
-    let word = |w: &str| {
-        let w: String = w.chars().filter(|c| !matches!(c, '\'' | '"' | '\\')).collect();
-        let w = prefix.find(&w).map_or(w.as_str(), |m| &w[m.end()..]);
-        w.strip_prefix('@').unwrap_or(w).to_string()
-    };
-    let mut out = Vec::new();
-    for seg in text.split([';', '|', '&', '(', ')', '`']) {
-        let mut program = true;
-        for raw in seg.split_whitespace() {
-            let mut parts = raw.split(['<', '>']);
-            let head = parts.next().unwrap_or_default();
-            let fd = head.len() < raw.len() && head.bytes().all(|b| b.is_ascii_digit());
-            if !head.is_empty() && !fd {
-                let assigns = head.split_once('=').is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()));
-                let role = if program && !assigns { WordRole::Program } else { WordRole::Argument };
-                program &= assigns;
-                out.push((role, word(head)));
+/// The words of one command line as the path check reads them (#1201): a
+/// small lexer that keeps quoted text in one word (`git commit -m "…"`),
+/// knows redirections (a target is an argument, `2>` and `>&1` no word),
+/// here-documents (`<<EOF` … `EOF`, `<<-`, a quoted delimiter: the body is
+/// `Data`), here-strings, comments, `$'…'`, `$"…"`, `$(…)`, backticks and
+/// `${…}`. Each command's first word past `NAME=value` assignments is its
+/// program. A command nested in a word (`$(…)`, a backtick span, `<(…)`) is
+/// read on its own by [`each_command`]. A heuristic, not a shell. Pure.
+pub(crate) fn command_words(line: &str) -> Vec<CommandWord> {
+    let mut lexer = Lexer { s: line.chars().collect(), ..Lexer::default() };
+    lexer.run();
+    lexer.out
+}
+
+#[derive(Default)]
+struct WordBuf {
+    pattern: String,
+    spliced: String,
+    unmodeled: bool,
+    quoted: bool,
+}
+
+impl WordBuf {
+    fn lit(&mut self, c: char, quoted: bool) {
+        if quoted && matches!(c, '\\' | '~' | '*' | '?' | '[' | ']' | '{' | '}' | ',') {
+            self.pattern.push('\\');
+            self.spliced.push('\\');
+        }
+        self.pattern.push(c);
+        self.spliced.push(c);
+    }
+
+    /// Where a `~` expands: at the start, after `NAME=` or `--flag=`, after `@`.
+    fn tilde_ok(&self) -> bool {
+        self.pattern.is_empty() || self.pattern == "@" || self.pattern.ends_with('=')
+    }
+}
+
+#[derive(Default)]
+struct Lexer {
+    s: Vec<char>,
+    i: usize,
+    out: Vec<CommandWord>,
+    word: Option<WordBuf>,
+    segment: usize,
+    /// The command's program was seen.
+    started: bool,
+    /// The next word is a redirection's target: `Some(writes)`.
+    target: Option<bool>,
+    /// The next word is a here-document's delimiter: `Some(<<-)`.
+    delimiter: Option<bool>,
+    here_string: bool,
+    heredocs: Vec<(String, bool)>,
+    /// Lexing a here-document's body: every word is `Data`.
+    data: bool,
+}
+
+impl Lexer {
+    fn peek(&self) -> Option<char> {
+        self.s.get(self.i).copied()
+    }
+
+    fn buf(&mut self) -> &mut WordBuf {
+        self.word.get_or_insert_with(WordBuf::default)
+    }
+
+    fn run(&mut self) {
+        while let Some(c) = self.peek() {
+            let next = self.s.get(self.i + 1).copied();
+            match c {
+                ' ' | '\t' | '\r' => {
+                    self.finish();
+                    self.i += 1;
+                }
+                '\n' => {
+                    self.finish();
+                    self.i += 1;
+                    self.bodies();
+                    self.next_segment();
+                }
+                '#' if self.word.is_none() && !self.data => {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.i += 1;
+                    }
+                }
+                ';' | '(' | ')' | '|' => {
+                    self.i += if c == '|' && matches!(next, Some('|' | '&')) { 2 } else { 1 };
+                    self.next_segment();
+                }
+                '&' if next == Some('>') => {
+                    self.finish();
+                    self.i += if self.s.get(self.i + 2) == Some(&'>') { 3 } else { 2 };
+                    self.target = Some(true);
+                }
+                '&' => {
+                    self.i += if next == Some('&') { 2 } else { 1 };
+                    self.next_segment();
+                }
+                '<' | '>' => self.redirect(c),
+                '@' | '!' | '+' | '*' | '?' if next == Some('(') => {
+                    // An extglob: its alternatives stay in `spliced`.
+                    let end = self.span_end(self.i + 1, '(', ')');
+                    let inner: String = self.s[self.i + 2..end].iter().collect();
+                    let w = self.buf();
+                    w.pattern.push_str(&format!("{c}({inner})"));
+                    w.spliced.push_str(&inner);
+                    w.unmodeled = true;
+                    self.i = end + 1;
+                }
+                '\'' => {
+                    let end = (self.i + 1..self.s.len()).find(|&j| self.s[j] == '\'').unwrap_or(self.s.len());
+                    let text: Vec<char> = self.s[self.i + 1..end].to_vec();
+                    let w = self.buf();
+                    w.quoted = true;
+                    text.into_iter().for_each(|c| w.lit(c, true));
+                    self.i = end + 1;
+                }
+                '"' => self.double_quoted(),
+                '\\' => {
+                    if let Some(n) = next.filter(|&n| n != '\n') {
+                        self.buf().lit(n, true);
+                    }
+                    self.i += 2;
+                }
+                '$' => self.dollar(false),
+                '`' => self.backtick(),
+                c => {
+                    // An unquoted `~` stays bare: expanded where a word starts.
+                    let w = self.buf();
+                    if c == '~' {
+                        w.pattern.push(c);
+                        w.spliced.push(c);
+                    } else {
+                        w.lit(c, false);
+                    }
+                    self.i += 1;
+                }
             }
-            out.extend(parts.filter(|p| !p.is_empty()).map(|p| (WordRole::Argument, word(p))));
+        }
+        self.finish();
+    }
+
+    fn next_segment(&mut self) {
+        self.finish();
+        self.segment += 1;
+        self.started = false;
+        self.target = None;
+    }
+
+    fn finish(&mut self) {
+        static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let Some(w) = self.word.take() else { return };
+        if let Some(dash) = self.delimiter.take() {
+            self.heredocs.push((crate::talk_guard::unescape(&w.pattern), dash));
+            return;
+        }
+        let target = self.target.take();
+        let assigns = w.pattern.split_once('=').is_some_and(|(n, _)| {
+            n.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()) && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+        });
+        let role = if self.data || std::mem::take(&mut self.here_string) {
+            WordRole::Data
+        } else if target.is_some() || self.started || assigns {
+            WordRole::Argument
+        } else {
+            self.started = true;
+            WordRole::Program
+        };
+        let prefix = PREFIX.get_or_init(|| regex::Regex::new(r"^-{0,2}[A-Za-z_][A-Za-z0-9_.-]*=").unwrap());
+        let strip = |p: &str| {
+            let p = prefix.find(p).map_or(p, |m| &p[m.end()..]);
+            p.strip_prefix('@').unwrap_or(p).to_string()
+        };
+        self.out.push(CommandWord {
+            role,
+            segment: self.segment,
+            pattern: strip(&w.pattern),
+            spliced: strip(&w.spliced),
+            unmodeled: w.unmodeled,
+            writes: target == Some(true),
+        });
+    }
+
+    fn redirect(&mut self, c: char) {
+        // `2>f`: digits right before the operator are its fd, not a word.
+        if self.word.as_ref().is_some_and(|w| !w.quoted && !w.pattern.is_empty() && w.pattern.bytes().all(|b| b.is_ascii_digit())) {
+            self.word = None;
+        }
+        self.finish();
+        self.i += 1;
+        match (c, self.peek()) {
+            // A process substitution: its command is read on its own.
+            (_, Some('(')) => {
+                self.i = self.span_end(self.i, '(', ')') + 1;
+                return;
+            }
+            ('<', Some('<')) => {
+                self.i += 1;
+                if self.peek() == Some('<') {
+                    self.i += 1;
+                    self.here_string = true;
+                } else {
+                    let dash = self.peek() == Some('-');
+                    self.i += usize::from(dash);
+                    self.delimiter = Some(dash);
+                }
+                return;
+            }
+            ('<', Some('>')) | ('>', Some('>' | '|')) => self.i += 1,
+            _ => {}
+        }
+        let writes = c == '>' || self.s.get(self.i - 1) == Some(&'>');
+        if self.peek() == Some('&') {
+            self.i += 1;
+            // `>&2`, `<&-`: an fd, not a word.
+            let fd = self.s[self.i..].iter().take_while(|c| c.is_ascii_digit() || **c == '-').count();
+            if fd > 0 && self.s.get(self.i + fd).is_none_or(|c| c.is_whitespace() || ";|&)".contains(*c)) {
+                self.i += fd;
+                return;
+            }
+        }
+        self.target = Some(writes);
+    }
+
+    fn double_quoted(&mut self) {
+        self.i += 1;
+        self.buf().quoted = true;
+        while let Some(c) = self.peek().filter(|&c| c != '"') {
+            match c {
+                '\\' if matches!(self.s.get(self.i + 1), Some('$' | '`' | '"' | '\\' | '\n')) => {
+                    let n = self.s[self.i + 1];
+                    if n != '\n' {
+                        self.buf().lit(n, true);
+                    }
+                    self.i += 2;
+                }
+                '$' => self.dollar(true),
+                '`' => self.backtick(),
+                c => {
+                    self.buf().lit(c, true);
+                    self.i += 1;
+                }
+            }
+        }
+        self.i += 1;
+    }
+
+    /// A `$` at `self.i`: `$'…'` decoded, `$"…"` as `"…"`, `$HOME` (or
+    /// `${HOME}`) where a `~` would expand written `~`, any other expansion
+    /// kept as written and marked as not modeled.
+    fn dollar(&mut self, quoted: bool) {
+        let (i, len) = (self.i, self.s.len());
+        match self.s.get(i + 1).copied() {
+            Some('\'') if !quoted => {
+                let (text, end) = ansi_c(&self.s, i + 2);
+                let w = self.buf();
+                w.quoted = true;
+                text.chars().for_each(|c| w.lit(c, true));
+                self.i = end + 1;
+            }
+            Some('"') if !quoted => {
+                self.i += 1;
+                self.double_quoted();
+            }
+            Some('(') => {
+                let end = self.span_end(i + 1, '(', ')');
+                self.raw(i, end + 1);
+            }
+            Some('{') => {
+                let end = self.span_end(i + 1, '{', '}');
+                let home = self.s[i + 2..end].iter().collect::<String>() == "HOME";
+                self.expansion(i, end + 1, home);
+            }
+            Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+                let end = (i + 1..len).find(|&j| self.s[j] != '_' && !self.s[j].is_ascii_alphanumeric()).unwrap_or(len);
+                let home = self.s[i + 1..end].iter().collect::<String>() == "HOME";
+                self.expansion(i, end, home);
+            }
+            Some(c) if c.is_ascii_digit() || "@*#?$!-".contains(c) => self.raw(i, i + 2),
+            _ => {
+                self.buf().lit('$', quoted);
+                self.i += 1;
+            }
         }
     }
-    out
+
+    /// A variable from `from` to `to`: home where a `~` would expand.
+    fn expansion(&mut self, from: usize, to: usize, home: bool) {
+        if home && self.word.as_ref().is_none_or(WordBuf::tilde_ok) {
+            let w = self.buf();
+            w.pattern.push('~');
+            w.spliced.push('~');
+            self.i = to;
+        } else {
+            self.raw(from, to);
+        }
+    }
+
+    /// An expansion the check doesn't model, from `from` to `to`.
+    fn raw(&mut self, from: usize, to: usize) {
+        let to = to.min(self.s.len());
+        let text: String = self.s[from..to].iter().collect();
+        let w = self.buf();
+        w.pattern.push_str(&text);
+        w.unmodeled = true;
+        self.i = to;
+    }
+
+    fn backtick(&mut self) {
+        let mut j = self.i + 1;
+        while j < self.s.len() && self.s[j] != '`' {
+            j += 1 + usize::from(self.s[j] == '\\');
+        }
+        self.raw(self.i, j + 1);
+    }
+
+    /// Where the span opened by `open` at `at` closes (or the line's end),
+    /// quotes and escapes skipped.
+    fn span_end(&self, at: usize, open: char, close: char) -> usize {
+        let (mut depth, mut j) = (0usize, at);
+        while j < self.s.len() {
+            match self.s[j] {
+                '\\' => j += 1,
+                q @ ('\'' | '"') => {
+                    j += 1;
+                    while j < self.s.len() && self.s[j] != q {
+                        j += 1 + usize::from(q == '"' && self.s[j] == '\\');
+                    }
+                }
+                c if c == open => depth += 1,
+                c if c == close => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return j;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        self.s.len()
+    }
+
+    /// The bodies of the here-documents the line just opened, as `Data`.
+    fn bodies(&mut self) {
+        for (delimiter, dash) in std::mem::take(&mut self.heredocs) {
+            let mut body = String::new();
+            while self.i < self.s.len() {
+                let end = (self.i..self.s.len()).find(|&j| self.s[j] == '\n').unwrap_or(self.s.len());
+                let text: String = self.s[self.i..end].iter().collect();
+                self.i = (end + 1).min(self.s.len());
+                if (if dash { text.trim_start_matches('\t') } else { text.as_str() }) == delimiter {
+                    break;
+                }
+                body.push_str(&text);
+                body.push('\n');
+            }
+            let mut sub = Lexer { s: body.chars().collect(), data: true, segment: self.segment, ..Lexer::default() };
+            sub.run();
+            self.out.extend(sub.out);
+        }
+    }
+}
+
+/// The text of a `$'…'` string from `start` (after its quote), and where
+/// its closing quote is: bash 3.2's escapes decoded, an unknown one kept.
+fn ansi_c(s: &[char], start: usize) -> (String, usize) {
+    let (mut out, mut i) = (String::new(), start);
+    while i < s.len() && s[i] != '\'' {
+        if s[i] != '\\' || i + 1 >= s.len() {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let digits = |from: usize, max: usize, radix: u32| {
+            let n = s[from..].iter().take(max).take_while(|c| c.is_digit(radix)).count();
+            (u32::from_str_radix(&s[from..from + n].iter().collect::<String>(), radix).ok().and_then(char::from_u32), n)
+        };
+        let simple = match s[i] {
+            'n' => Some('\n'),
+            't' => Some('\t'),
+            'r' => Some('\r'),
+            'a' => Some('\u{7}'),
+            'b' => Some('\u{8}'),
+            'e' | 'E' => Some('\u{1b}'),
+            'f' => Some('\u{c}'),
+            'v' => Some('\u{b}'),
+            '\\' | '\'' | '"' | '?' => Some(s[i]),
+            _ => None,
+        };
+        let (code, n) = if s[i] == 'x' { digits(i + 1, 2, 16) } else { digits(i, 3, 8) };
+        match (simple, code) {
+            (Some(c), _) => {
+                out.push(c);
+                i += 1;
+            }
+            (None, Some(c)) if n > 0 => {
+                out.push(c);
+                i += n + usize::from(s[i] == 'x');
+            }
+            _ => {
+                out.push('\\');
+                out.push(s[i]);
+                i += 1;
+            }
+        }
+    }
+    (out, i)
 }
 
 /// A path the check treats as a dotfile or credentials file: one with a
@@ -1081,6 +1450,10 @@ pub struct ApprovalRequestEvent {
     /// The path is a well-known credentials location: the safe answer leads.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sensitive: bool,
+    /// A command's card for a read outside the workspace (#1201): the folder
+    /// its "Allow reading … for this conversation" answer remembers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remember_dir: Option<String>,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1128,6 +1501,9 @@ pub(crate) struct ApprovalBroker {
     /// Deleted workspaces: nobody can answer a card there any more, so a
     /// request from one is denied at once instead of parked.
     retired: Mutex<std::collections::HashSet<String>>,
+    /// Folders a thread's commands may read without asking, each one the
+    /// user allowed from a command's card (#1201; in-memory, like the grant).
+    read_dirs: Mutex<HashMap<String, Vec<std::path::PathBuf>>>,
 }
 
 impl ApprovalBroker {
@@ -1233,7 +1609,7 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None).await;
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
         self.record(thread_id, decision, false);
         decision
     }
@@ -1253,8 +1629,27 @@ impl ApprovalBroker {
             return ApprovalDecision::Approve;
         }
         let marks = Some((card.kind, card.sensitive));
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks).await;
-        self.record(thread_id, decision, !card.kind.grantable())
+        let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
+        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
+        self.settle_card(thread_id, decision, &card)
+    }
+
+    /// What an answer to a `talk_guard` card does: "always" on a command's
+    /// card that offers a folder lets the thread's commands read it from now
+    /// on and counts as one approval (#1201); any other as [`Self::record`].
+    pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard) -> ApprovalDecision {
+        match (decision, &card.remember) {
+            (ApprovalDecision::ApproveAlways, Some((dir, _))) => {
+                self.read_dirs.lock().entry(thread_id.to_string()).or_default().push(dir.clone());
+                ApprovalDecision::Approve
+            }
+            _ => self.record(thread_id, decision, !card.kind.grantable()),
+        }
+    }
+
+    /// The folders the user let `thread_id`'s commands read (#1201).
+    pub(crate) fn read_dirs(&self, thread_id: &str) -> Vec<std::path::PathBuf> {
+        self.read_dirs.lock().get(thread_id).cloned().unwrap_or_default()
     }
 
     /// Whether the thread's "don't ask again" answers a card of `kind` unseen:
@@ -1278,7 +1673,7 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None)
             .await;
         self.record(thread_id, decision, true)
     }
@@ -1318,6 +1713,7 @@ impl ApprovalBroker {
         reason: &str,
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
+        remember: Option<&str>,
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1332,6 +1728,7 @@ impl ApprovalBroker {
             covers_uncommitted: secret.unwrap_or(false),
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
+            remember_dir: remember.map(str::to_string),
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -4287,7 +4684,8 @@ impl ChatEngine {
                         let shared = self.talk_shell.available() && sandbox_roots.is_none();
                         let check = || {
                             let cwd = shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
-                            reach.command_card(None, command, cwd.as_deref().map(Path::new))
+                            let allowed = self.approvals.read_dirs(&request.thread_id);
+                            reach.command_card(None, command, cwd.as_deref().map(Path::new), &allowed)
                         };
                         if let Some(card) = check() {
                             let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
@@ -5565,6 +5963,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
+            remember_dir: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -5574,6 +5973,32 @@ mod tests {
         // A `talk_guard` card names its kind, and a credentials location says so.
         let r = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Read), sensitive: true, ..ev(false, false) }).unwrap();
         assert_eq!((r["kind"].as_str(), r["sensitive"].as_bool()), (Some("read"), Some(true)));
+        assert!(plain.get("rememberDir").is_none());
+        let run = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Run), remember_dir: Some("~/notes".into()), ..ev(false, false) }).unwrap();
+        assert_eq!((run["kind"].as_str(), run["rememberDir"].as_str()), (Some("run"), Some("~/notes")));
+    }
+
+    #[test]
+    fn a_command_card_answered_always_remembers_its_folder_for_the_thread_only() {
+        let broker = ApprovalBroker::default();
+        let dir = std::path::PathBuf::from("/tmp/x");
+        let card = ToolCard {
+            kind: CardKind::Run,
+            shown: "cat /tmp/x/a".into(),
+            reason: "reaches /tmp/x/a outside the workspace".into(),
+            denial: "d".into(),
+            sensitive: false,
+            remember: Some((dir.clone(), "/tmp/x".into())),
+        };
+        assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
+        assert_eq!(broker.read_dirs("t"), vec![dir]);
+        assert!(broker.read_dirs("other").is_empty(), "for this conversation only");
+        assert!(!broker.auto_approves("t"), "it grants no \"don't ask again\"");
+        // Allowed once, or a card that offers no folder: nothing is remembered.
+        assert_eq!(broker.settle_card("u", ApprovalDecision::Approve, &card), ApprovalDecision::Approve);
+        let plain = ToolCard { remember: None, ..card };
+        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &plain), ApprovalDecision::Approve);
+        assert!(broker.read_dirs("u").is_empty() && !broker.auto_approves("u"));
     }
 
     #[tokio::test]
@@ -5584,6 +6009,7 @@ mod tests {
             reason: "reads a file outside the workspace".into(),
             denial: format!("declined {shown}"),
             sensitive: false,
+            remember: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -5769,19 +6195,28 @@ mod tests {
     #[test]
     fn command_words_mark_programs_arguments_and_heredoc_bodies() {
         use WordRole::*;
-        let words = command_words;
-        let want = |v: &[(WordRole, &str)]| v.iter().map(|(r, w)| (*r, w.to_string())).collect::<Vec<_>>();
+        let words = |line: &str| command_words(line).into_iter().map(|w| (w.role, w.segment, w.pattern, w.writes)).collect::<Vec<_>>();
+        let want = |v: &[(WordRole, usize, &str, bool)]| v.iter().map(|(r, s, p, w)| (*r, *s, p.to_string(), *w)).collect::<Vec<_>>();
         assert_eq!(
             words("FOO=1 cat \"$HOME\"/a <in 2>/dev/null | wc -l"),
-            want(&[(Argument, "1"), (Program, "cat"), (Argument, "$HOME/a"), (Argument, "in"), (Argument, "/dev/null"), (Program, "wc"), (Argument, "-l")])
+            want(&[(Argument, 0, "1", false), (Program, 0, "cat", false), (Argument, 0, "~/a", false), (Argument, 0, "in", false), (Argument, 0, "/dev/null", true), (Program, 1, "wc", false), (Argument, 1, "-l", false)])
         );
-        assert_eq!(words("echo $(id) `pwd`"), want(&[(Program, "echo"), (Argument, "$"), (Program, "id"), (Program, "pwd")]));
+        // Quoted text is one word, and a quoted `~`, `,` or `*` is escaped.
         assert_eq!(
-            words("cat <<-'EOF' > f\n\tx /y\n\tEOF\nls"),
-            want(&[(Program, "cat"), (Argument, "-EOF"), (Argument, "f"), (Data, "x"), (Data, "/y"), (Program, "ls")])
+            words("git commit -m \"fix: a/b, and ~/x\" 'it''s' \\* # cat ~/.ssh/x"),
+            want(&[(Program, 0, "git", false), (Argument, 0, "commit", false), (Argument, 0, "-m", false), (Argument, 0, "fix: a/b\\, and \\~/x", false), (Argument, 0, "its", false), (Argument, 0, "\\*", false)])
         );
-        assert_eq!(words("cat <<< ~/x"), want(&[(Program, "cat"), (Argument, "~/x")]), "a here-string is no here-document");
-        assert_eq!(words("curl -d @f --out=/o"), want(&[(Program, "curl"), (Argument, "-d"), (Argument, "f"), (Argument, "/o")]));
+        assert_eq!(
+            words("cat <<-'EOF' > f\n\tx /y\n\tEOF\nls <<< ~/s 2>&1 && curl -d @f --out=/o"),
+            want(&[(Program, 0, "cat", false), (Argument, 0, "f", true), (Data, 0, "x", false), (Data, 0, "/y", false), (Program, 1, "ls", false), (Data, 1, "~/s", false), (Program, 2, "curl", false), (Argument, 2, "-d", false), (Argument, 2, "f", false), (Argument, 2, "/o", false)])
+        );
+        // `$'…'` is decoded, `$HOME` where a `~` expands is one; the rest isn't modeled.
+        let w = command_words("cat ~/.ss$''h $'\\x7e/k' $X/y ${HOME}/z a$HOME ~/.@(ssh|aws)");
+        let shapes: Vec<(&str, &str, bool)> = w.iter().map(|w| (w.pattern.as_str(), w.spliced.as_str(), w.unmodeled)).collect();
+        assert_eq!(
+            shapes,
+            [("cat", "cat", false), ("~/.ssh", "~/.ssh", false), ("\\~/k", "\\~/k", false), ("$X/y", "/y", true), ("~/z", "~/z", false), ("a$HOME", "a", true), ("~/.@(ssh|aws)", "~/.ssh|aws", true)]
+        );
     }
 
     #[test]
@@ -5853,6 +6288,7 @@ mod tests {
             covers_uncommitted: false,
             kind: None,
             sensitive: false,
+            remember_dir: None,
         }
     }
 

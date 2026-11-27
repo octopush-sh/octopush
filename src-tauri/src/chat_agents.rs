@@ -824,7 +824,7 @@ impl ToolGate for SubagentGate {
             }
             // A path outside the workspace or in a credentials location
             // (#1201); a sub-agent's command runs at the workspace root.
-            let check = || self.reach.command_card(Some(self.label.as_str()), command, None);
+            let check = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.read_dirs(&self.thread_id));
             if let Some(card) = check() {
                 let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
                 let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);

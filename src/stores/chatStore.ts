@@ -176,16 +176,20 @@ export interface PendingApproval {
   kind?: ApprovalKind;
   /** The path is a well-known credentials location: the safe answer leads. */
   sensitive?: boolean;
+  /** A command's read outside the workspace (#1201): the folder "Allow
+   *  reading … for this conversation" remembers. */
+  rememberDir?: string;
 }
 
 export type ApprovalKind = "mcp" | "read" | "write" | "run";
 
 /** The card fields a request carries beyond its command and reason. */
-function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean }) {
+function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean; rememberDir?: string }) {
   return {
     ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
     ...(c.kind ? { kind: c.kind } : {}),
     ...(c.sensitive ? { sensitive: true } : {}),
+    ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
   };
 }
 
@@ -1174,6 +1178,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     coversUncommitted?: boolean;
     kind?: ApprovalKind;
     sensitive?: boolean;
+    rememberDir?: string;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;

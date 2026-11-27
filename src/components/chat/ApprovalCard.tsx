@@ -40,7 +40,9 @@ export const RUN_CHECK_LIMITS =
  * the secret card, keys included. Since #1201 a command that names a path
  * outside the workspace or in a credentials location (`kind: "run"`) asks
  * the same way, showing the command, and its tooltip says the check is a
- * net, not a sandbox.
+ * net, not a sandbox. A read outside that isn't a credentials location also
+ * offers "Allow reading <folder> for this conversation" (`rememberDir`,
+ * answered as "always").
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -105,7 +107,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
             : run
               ? "Allowing runs it once, and its output goes to your AI provider. "
               : "Allowing lets the agent write it once. "}
-          Every access outside the workspace asks again.
+          {run ? "A credentials location always asks." : "Every access outside the workspace asks again."}
         </p>
       )}
       <div className="mt-2 flex items-center gap-2">
@@ -136,6 +138,16 @@ export function ApprovalCard({ approval, onRespond }: Props) {
             className={`ml-auto font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
           >
             Approve &amp; don't ask again
+          </button>
+        )}
+        {run && !sensitive && approval.rememberDir && (
+          <button
+            type="button"
+            onClick={() => onRespond("always")}
+            title={`Run this, and let commands read ${approval.rememberDir} without asking for the rest of this conversation (a credentials location still asks)`}
+            className={`ml-auto truncate font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
+          >
+            Allow reading {approval.rememberDir} for this conversation
           </button>
         )}
       </div>

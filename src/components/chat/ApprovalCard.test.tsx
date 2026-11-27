@@ -109,9 +109,20 @@ describe("ApprovalCard", () => {
     fireEvent.keyDown(card, { key: "Enter" });
     expect(onRespond).toHaveBeenLastCalledWith("deny");
     cleanup();
-    render(<ApprovalCard approval={{ ...base, kind: "run", command: "cat /tmp/out.log", reason: "reaches /tmp/out.log outside the workspace" }} onRespond={() => {}} />);
+    expect(screen.queryByText(/for this conversation/)).toBeNull();
+    cleanup();
+    const onRemember = vi.fn();
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "run", command: "cat /tmp/out.log", reason: "reaches /tmp/out.log outside the workspace", rememberDir: "/tmp" }}
+        onRespond={onRemember}
+      />,
+    );
     expect(screen.getByRole("group", { name: "Outside the workspace: cat /tmp/out.log" })).toHaveAttribute("title", `⌘↵ allows once · Esc denies. ${RUN_CHECK_LIMITS}`);
     expect(screen.getAllByRole("button")[0]).toHaveTextContent("Allow once");
+    expect(screen.getByText(/A credentials location always asks/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Allow reading /tmp for this conversation"));
+    expect(onRemember).toHaveBeenLastCalledWith("always");
   });
 
   it("a plain commit's secret card doesn't mention uncommitted changes", () => {
