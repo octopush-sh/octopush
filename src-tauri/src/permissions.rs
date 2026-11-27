@@ -13,6 +13,7 @@ use crate::orchestrator::agentic::{ToolGate, ASK_DIRECTOR_TOOL, ASK_STAGE_TOOL, 
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// A conversation's posture. In the UI: Plan only, Ask first, Edit freely.
@@ -117,6 +118,11 @@ pub struct PolicyCtx<'a> {
     /// Plan only is forced by a read-only mission rather than chosen, so a
     /// refusal names the mission and offers no switch.
     pub forced: bool,
+    /// Where a command starts (the shared shell's directory, else the
+    /// workspace root) and the workspace: in Ask first a git reader counts
+    /// as one only inside the workspace ([`reads_only`]).
+    pub cwd: Option<&'a Path>,
+    pub workspace: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,7 +217,7 @@ pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
         (Mode::Plan, Class::Delegate) if !ctx.delegate_writes => Decision::Allow,
         (Mode::Plan, Class::Delegate) => refuse(Refused::Delegate),
         (Mode::Ask, Class::Write) => Decision::Ask { reason: "changes a file".into(), preview: field("path") },
-        (Mode::Ask, Class::Exec) if reads_only(&field("command")) => Decision::Allow,
+        (Mode::Ask, Class::Exec) if reads_only(&field("command"), ctx.cwd, ctx.workspace) => Decision::Allow,
         (Mode::Ask, Class::Exec) => Decision::Ask { reason: "runs a command".into(), preview: field("command") },
         (Mode::Ask, Class::Net | Class::Delegate) => Decision::Allow,
     }
@@ -497,24 +503,160 @@ fn deploy_remote(args: &[&str]) -> Option<&'static str> {
 /// of its commands is a known reader ([`READERS`], `git` [`GIT_READS`])
 /// named bare, with only the flags its entry lists. Anything else asks: an
 /// unknown flag, an assignment (but a locale or display name before a
-/// program, [`ONE_PROGRAM_ENV`]), arithmetic, a wrapper, a keyword, a
-/// script, a path or a variable as the program. A net for a workflow aid,
-/// not a sandbox; what it lets through still meets the guards.
-pub fn reads_only(command: &str) -> bool {
-    !sets_state(command)
-        && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+/// program, [`ONE_PROGRAM_ENV`]), arithmetic, any `${…}` but a plain
+/// name, a wrapper, a keyword, a script, a path or a variable as the
+/// program. A `git` reader also has to run inside `workspace`, from `cwd`
+/// (where the command starts) through every `cd` it may take ([`Places`]).
+/// A net for a workflow aid, not a sandbox; what it lets through still
+/// meets the guards.
+pub fn reads_only(command: &str, cwd: Option<&Path>, workspace: Option<&Path>) -> bool {
+    if sets_state(command) {
+        return false;
+    }
+    let places = Places::of(command, cwd, workspace);
+    matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line, &places)).then_some(())), Ok(None))
 }
 
-/// Arithmetic (`$((x=1))`, `$[x=1]`) and assigning expansions
-/// (`${x:=1}`, `${x=1}`) set shell variables wherever they sit.
+/// Arithmetic (`$((…))`, `$[…]`) and every `${…}` but a plain name or its
+/// length (`${name}`, `${#name}`), wherever they sit: an assigning
+/// expansion (`${x:=1}`), an indirect one (`${!x}`), and an array subscript
+/// or a substring offset (`${a[_]}`, `${PWD:_}`), whose arithmetic runs what
+/// a variable holds.
 fn sets_state(command: &str) -> bool {
     if command.contains("$((") || command.contains("$[") {
         return true;
     }
-    command.match_indices("${").any(|(at, _)| {
-        let rest = &command[at + 2..];
-        rest[..rest.find('}').unwrap_or(rest.len())].contains('=')
-    })
+    let mut rest = command;
+    while let Some(at) = rest.find("${") {
+        let inner = &rest[at + 2..];
+        let Some(end) = inner.find('}') else { return true };
+        let name = inner[..end].strip_prefix('#').unwrap_or(&inner[..end]);
+        let plain = name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+            && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric());
+        if !plain {
+            return true;
+        }
+        rest = &inner[end + 1..];
+    }
+    false
+}
+
+/// How many places a command's `cd`s may lead to before it asks.
+const MAX_PLACES: usize = 32;
+
+/// Where a command's programs may run, for its git readers: where it
+/// starts, and every directory each `cd` may lead to from any of those, in
+/// the order the check reads them (a `cd` in a subshell may not take
+/// effect, so each one adds places and removes none). `dirs` is `None` when
+/// a `cd` can't be followed: no operand, a flag or `-`, `~`, a word that
+/// expands, or a bare name `CDPATH` may send elsewhere (`./name` is
+/// followed), or when the command starts somewhere unknown.
+struct Places {
+    dirs: Option<Vec<PathBuf>>,
+    workspace: Option<PathBuf>,
+}
+
+impl Places {
+    fn of(command: &str, cwd: Option<&Path>, workspace: Option<&Path>) -> Self {
+        let mut targets: Vec<Option<String>> = Vec::new();
+        let walked = crate::chat_engine::each_command(command, |line| {
+            targets.extend(cd_targets(line));
+            None::<()>
+        });
+        let dirs = (|| {
+            walked.ok()?;
+            let mut dirs = vec![lexical(cwd?)];
+            for target in targets {
+                let target = target?;
+                let more: Vec<PathBuf> = dirs.iter().map(|d| lexical(&d.join(&target))).collect();
+                for dir in more {
+                    if !dirs.contains(&dir) {
+                        dirs.push(dir);
+                    }
+                }
+                if dirs.len() > MAX_PLACES {
+                    return None;
+                }
+            }
+            Some(dirs)
+        })();
+        Places { dirs, workspace: workspace.and_then(|w| std::fs::canonicalize(w).ok()) }
+    }
+
+    /// Whether a git reader that changes into each of `chdirs` (`-C`, in
+    /// order) runs inside the workspace from every place: each resolved as
+    /// git resolves it, on the disk, links followed.
+    fn keeps_git_inside(&self, chdirs: &[&str]) -> bool {
+        let (Some(dirs), Some(workspace)) = (&self.dirs, &self.workspace) else { return false };
+        dirs.iter().all(|dir| {
+            let mut at = match std::fs::canonicalize(dir) {
+                Ok(at) => at,
+                Err(_) => return false,
+            };
+            for chdir in chdirs {
+                at = match std::fs::canonicalize(at.join(chdir)) {
+                    Ok(next) => next,
+                    Err(_) => return false,
+                };
+            }
+            at.starts_with(workspace)
+        })
+    }
+}
+
+/// `path` with `.` and `..` folded in as the shell's `cd` folds them.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The directory each `cd` in `line` changes to, `None` for one that can't
+/// be followed (see [`Places`]).
+fn cd_targets(line: &str) -> Vec<Option<String>> {
+    let words = crate::chat_engine::command_words(line);
+    let segs = segments(&words);
+    let targets = segs
+        .into_iter()
+        .filter_map(|seg| {
+            let at = seg.iter().position(|w| w.role == crate::chat_engine::WordRole::Program)?;
+            (seg[at].word.to_ascii_lowercase() == "cd").then(|| match &seg[at + 1..] {
+                [w] if !expands(w)
+                    && !w.word.starts_with('-')
+                    && (w.word.starts_with('/') || w.word == "." || w.word == ".." || w.word.starts_with("./") || w.word.starts_with("../")) =>
+                {
+                    Some(w.word.clone())
+                }
+                _ => None,
+            })
+        })
+        .collect();
+    targets
+}
+
+/// A line's commands, each its words but here-document bodies and
+/// redirection targets.
+fn segments(words: &[crate::chat_engine::CommandWord]) -> Vec<Vec<&crate::chat_engine::CommandWord>> {
+    let mut segments: Vec<Vec<&crate::chat_engine::CommandWord>> = Vec::new();
+    let mut last = None;
+    for w in words.iter().filter(|w| w.role != crate::chat_engine::WordRole::Data && !w.redirect) {
+        if last != Some(w.segment) {
+            segments.push(Vec::new());
+            last = Some(w.segment);
+        }
+        if let Some(seg) = segments.last_mut() {
+            seg.push(w);
+        }
+    }
+    segments
 }
 
 /// What may be set for one program: locale and display, never `PATH`,
@@ -663,7 +805,7 @@ const READERS: &[Reader] = &[
 
 const TEST_OPS: &[&str] = &[
     "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-L", "-n", "-o", "-p", "-r", "-s", "-S", "-t", "-u", "-w",
-    "-x", "-z", "-O", "-G", "-N", "-v", "-nt", "-ot", "-ef", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+    "-x", "-z", "-O", "-G", "-N", "-nt", "-ot", "-ef", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
 ];
 
 /// Git subcommands that only read.
@@ -705,26 +847,16 @@ const GIT: Reader = Reader {
     ..R
 };
 
-fn line_reads_only(line: &str) -> bool {
-    use crate::chat_engine::{CommandWord, WordRole};
+fn line_reads_only(line: &str, places: &Places) -> bool {
+    use crate::chat_engine::WordRole;
     let words = crate::chat_engine::command_words(line);
     // An output redirection (`>`, `>>`, `&>`, `<>`) outside a here-document's
     // body writes, but to `/dev/null`.
     if words.iter().any(|w| w.writes && w.role != WordRole::Data && w.word != "/dev/null") {
         return false;
     }
-    let mut segments: Vec<Vec<&CommandWord>> = Vec::new();
-    let mut last = None;
-    for w in words.iter().filter(|w| w.role != WordRole::Data && !w.redirect) {
-        if last != Some(w.segment) {
-            segments.push(Vec::new());
-            last = Some(w.segment);
-        }
-        if let Some(seg) = segments.last_mut() {
-            seg.push(w);
-        }
-    }
-    segments.iter().all(|seg| {
+    let segs = segments(&words);
+    let reads = segs.iter().all(|seg| {
         // Assignments alone, or before a program, set shell state: they ask,
         // but for a locale or display name set for one program.
         let Some(at) = seg.iter().position(|w| w.role == WordRole::Program) else { return false };
@@ -732,36 +864,44 @@ fn line_reads_only(line: &str) -> bool {
         seg[..at].iter().all(|w| one_program_env(&w.word))
             && !seg[at].unmodeled
             && !name.contains('/')
-            && program_reads(&name, &seg[at + 1..])
-    })
+            && program_reads(&name, &seg[at + 1..], places)
+    });
+    reads
 }
 
 /// Whether `program` with `args` only reads.
-fn program_reads(program: &str, args: &[&crate::chat_engine::CommandWord]) -> bool {
+fn program_reads(program: &str, args: &[&crate::chat_engine::CommandWord], places: &Places) -> bool {
     if program == "git" {
-        return git_reads(args);
+        return git_reads(args, places);
     }
     READERS.iter().find(|r| r.name == program).is_some_and(|r| takes_only_listed(r, args))
 }
 
 /// `git` past `-C <dir>` and `--no-pager` (any other option before the
 /// subcommand, such as `-c`, asks), running a subcommand that reads, with
-/// only the flags [`GIT`] lists.
-fn git_reads(mut args: &[&crate::chat_engine::CommandWord]) -> bool {
+/// only the flags [`GIT`] lists, inside the workspace from every place the
+/// command may be in ([`Places::keeps_git_inside`]): a repository elsewhere
+/// brings its own config (hooks, `core.fsmonitor`) into a `git status`.
+fn git_reads(mut args: &[&crate::chat_engine::CommandWord], places: &Places) -> bool {
     if args.iter().any(|w| expands(w)) {
         return false;
     }
+    let mut chdirs: Vec<&str> = Vec::new();
     loop {
         match args {
-            [c, _, rest @ ..] if c.word == "-C" => args = rest,
+            [c, dir, rest @ ..] if c.word == "-C" => {
+                chdirs.push(dir.word.as_str());
+                args = rest;
+            }
             [p, rest @ ..] if p.word == "--no-pager" => args = rest,
             _ => break,
         }
     }
-    match args.split_first() {
-        None => true,
-        Some((sub, flags)) => GIT_READS.contains(&sub.word.as_str()) && takes_only_listed(&GIT, flags),
-    }
+    places.keeps_git_inside(&chdirs)
+        && match args.split_first() {
+            None => true,
+            Some((sub, flags)) => GIT_READS.contains(&sub.word.as_str()) && takes_only_listed(&GIT, flags),
+        }
 }
 
 /// Whether every flag in `args` is one `reader` lists, and its operands fit.
@@ -945,6 +1085,8 @@ pub struct ModeGate {
     mcp_read_only: HashSet<String>,
     inner: Option<Box<dyn ToolGate>>,
     asker: Option<Box<dyn Asker>>,
+    /// The workspace: a sub-agent's commands start at its root.
+    workspace: Option<PathBuf>,
 }
 
 impl ModeGate {
@@ -955,7 +1097,13 @@ impl ModeGate {
         mcp_read_only: HashSet<String>,
         inner: Option<Box<dyn ToolGate>>,
     ) -> Self {
-        Self { mode, exec_roots, forced, mcp_read_only, inner, asker: None }
+        Self { mode, exec_roots, forced, mcp_read_only, inner, asker: None, workspace: None }
+    }
+
+    /// The workspace the sub-agent's commands start in.
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     /// Ask the user about what Ask first holds, before `inner` checks it.
@@ -973,6 +1121,8 @@ impl ToolGate for ModeGate {
             mcp_read_only: &self.mcp_read_only,
             delegate_writes: true,
             forced: self.forced,
+            cwd: self.workspace.as_deref(),
+            workspace: self.workspace.as_deref(),
         };
         let decision = decide((self.mode)(), &ToolCall { name, input }, &ctx);
         let asks = matches!(decision, Decision::Ask { .. });
@@ -1001,7 +1151,8 @@ mod tests {
     use serde_json::json;
 
     fn ctx<'a>(roots: Option<&'a [String]>, ro: &'a HashSet<String>, delegate_writes: bool) -> PolicyCtx<'a> {
-        PolicyCtx { exec_roots: roots, mcp_read_only: ro, delegate_writes, forced: false }
+        let root = Some(Path::new("/"));
+        PolicyCtx { exec_roots: roots, mcp_read_only: ro, delegate_writes, forced: false, cwd: root, workspace: root }
     }
 
     fn deny(r: Refused) -> Decision {
@@ -1080,7 +1231,7 @@ mod tests {
         let ro = HashSet::new();
         let input = json!({ "path": "a.rs" });
         let sandboxed: &[String] = &[];
-        let forced = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &ro, delegate_writes: false, forced: true };
+        let forced = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &ro, delegate_writes: false, forced: true, cwd: None, workspace: None };
         assert_eq!(
             decide(Mode::Plan, &ToolCall { name: "write_file", input: &input }, &forced),
             Decision::Deny { message: plan_refusal(Refused::Write, true) }
@@ -1360,13 +1511,16 @@ mod tests {
     /// reads; anything the check can't tell asks.
     #[test]
     fn ask_first_runs_only_readers_without_a_card() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir(ws.path().join("src")).unwrap();
+        let reads_only = |c: &str| super::reads_only(c, Some(ws.path()), Some(ws.path()));
         let readers = [
             "ls -la src",
             "cat Cargo.toml | head -20",
             "grep -rn 'fn main' src 2>/dev/null",
             "ls -la 2>&1 | tail -5",
             "git status --short && git diff HEAD~1 --stat",
-            "git -C ../repo --no-pager log --oneline -5",
+            "git -C src --no-pager log --oneline -5",
             "git",
             "rg -n 'TODO|FIXME' src",
             "find . -name '*.rs' -type f",
@@ -1386,6 +1540,8 @@ mod tests {
             "uniq -c -",
             "printf '%s\\n' done",
             "[ -f a.txt ] && echo yes",
+            "echo ${HOME} ${#PATH} ${_}",
+            "cd ./src && git status",
         ];
         for c in readers {
             assert!(reads_only(c), "{c}");
@@ -1451,11 +1607,43 @@ mod tests {
             "git log --textconv",
             "git status -O x",
             "sort -T /tmp a",
+            // Expansions whose arithmetic or indirection runs what a
+            // variable holds, and `test -v`'s subscript.
+            "echo $'a[\\x24(touch pwned)]'; echo ${a[_]}",
+            "echo x; echo ${!_}",
+            "echo 1; echo ${PWD:_}",
+            "echo $'a[\\x24(touch pwned)]'; test -v 'a[_]'",
+            "echo ${x//a/b} ${x[1]} ${#}",
+            // A git reader outside the workspace, or after a `cd` the check
+            // can't follow.
+            "git -C ../repo --no-pager log --oneline -5",
+            "cd src && git status",
+            "cd && git status",
+            "cd - && git log",
+            "(cd ./src); cd ../../elsewhere && git status",
         ];
         for c in writers {
             assert!(!reads_only(c), "{c}");
         }
-        assert!(!reads_only(&"$(".repeat(6)), "past the nesting it reads, it asks");
+        assert!(!reads_only("$(".repeat(6).as_str()), "past the nesting it reads, it asks");
+    }
+
+    /// A git reader runs only inside the workspace: a repository planted
+    /// elsewhere, reached with `-C` or after a `cd`, or the shared shell
+    /// left in it, asks (its config could run anything).
+    #[test]
+    fn a_git_reader_outside_the_workspace_asks() {
+        let ws = tempfile::tempdir().unwrap();
+        let planted = tempfile::tempdir().unwrap();
+        let (ws_dir, out) = (ws.path(), planted.path().display().to_string());
+        let here = |c: &str| reads_only(c, Some(ws_dir), Some(ws_dir));
+        assert!(here("git status") && here("git -C . log -1") && here("ls; git diff"));
+        assert!(!here(&format!("git -C {out} status")), "the -C form");
+        assert!(!here(&format!("cd {out} && git log")), "the cd form");
+        assert!(here(&format!("cd {out} && ls")), "only git cares where it runs");
+        assert!(!reads_only("git status", Some(planted.path()), Some(ws_dir)), "a shell left outside");
+        assert!(!reads_only("git status", None, Some(ws_dir)) && !reads_only("git status", Some(ws_dir), None));
+        assert!(reads_only("ls", None, None));
     }
 
     /// A switch made while a round runs applies from the next round, whose
@@ -1522,6 +1710,7 @@ mod tests {
         for call in [
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
             "match crate::permissions::decide(mode, &call, &ctx) {",
+            "!crate::permissions::reads_only(command, Some(command_dir().as_path()), Some(workspace_path.as_path()))",
             "decision => crate::permissions::refusal(decision).map(|m| (u.id.clone(), m)),",
             "if let Some(note) = mode_watch.at_round(mode) {",
             "if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {",
