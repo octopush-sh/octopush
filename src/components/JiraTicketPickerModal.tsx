@@ -5,12 +5,13 @@ import { ModalShell } from "./ModalShell";
 interface Props {
   candidates: Issue[];
   projectKey: string | null;
+  projectId?: string | null;
   title: string;
   onPick: (key: string) => void;
   onClose: () => void;
 }
 
-export function JiraTicketPickerModal({ candidates, projectKey, title, onPick, onClose }: Props) {
+export function JiraTicketPickerModal({ candidates, projectKey, projectId = null, title, onPick, onClose }: Props) {
   return (
     <ModalShell onClose={onClose} ariaLabel={title}>
       <div className="flex max-h-[80vh] w-[560px] flex-col rounded-md border border-octo-hairline bg-octo-panel">
@@ -32,6 +33,7 @@ export function JiraTicketPickerModal({ candidates, projectKey, title, onPick, o
           <InlineTicketPicker
             candidates={candidates}
             projectKey={projectKey}
+            projectId={projectId}
             onPick={onPick}
             onCancel={onClose}
           />

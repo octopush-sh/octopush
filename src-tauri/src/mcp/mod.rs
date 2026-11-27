@@ -493,6 +493,11 @@ static SECRET_ENV_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
     regex::Regex::new(r"(?i)TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|BEARER|CREDENTIAL|PRIVATE").unwrap()
 });
 
+/// Whether an env name reads as a credential's (`SECRET_ENV_NAME`).
+pub(crate) fn secret_env_name(key: &str) -> bool {
+    SECRET_ENV_NAME.is_match(key)
+}
+
 /// A value that looks like base64 rather than a word: a digit or `+/=`, or
 /// a capital after its first character beside a lower-case letter.
 fn looks_base64(v: &str) -> bool {
