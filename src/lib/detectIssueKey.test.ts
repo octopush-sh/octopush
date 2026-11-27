@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectIssueKey, detectIssueKeyForProject } from "./detectIssueKey";
+import { detectIssueKey, detectIssueKeyForProject, isIssueKey } from "./detectIssueKey";
 
 describe("detectIssueKey", () => {
   it("extracts the first Jira-style key from a branch", () => {
@@ -11,6 +11,37 @@ describe("detectIssueKey", () => {
     expect(detectIssueKey("main")).toBeNull();
     expect(detectIssueKey("feature/login")).toBeNull();
     expect(detectIssueKey("proj-123")).toBeNull();
+    expect(detectIssueKey("A-1.1")).toBeNull();
+  });
+  it("extracts a dotted Epiku story id whole", () => {
+    expect(detectIssueKey("feat/ST-2.3-login")).toBe("ST-2.3");
+    expect(detectIssueKey("HU-1.1")).toBe("HU-1.1");
+    expect(detectIssueKey("ST-1.2.3-deep")).toBe("ST-1.2.3");
+    expect(detectIssueKey("fix/[ST-10.12]")).toBe("ST-10.12");
+  });
+  it("matches Jira keys exactly as before: a dot extends a key only before a digit", () => {
+    expect(detectIssueKey("feat/PROJ-123.fix")).toBe("PROJ-123");
+    expect(detectIssueKey("Fix PROJ-123.")).toBe("PROJ-123");
+    expect(detectIssueKey("PROJ-12..3")).toBe("PROJ-12");
+    expect(detectIssueKey("PROJ-123-login.v2")).toBe("PROJ-123");
+    expect(detectIssueKey("ABC-9_x")).toBe("ABC-9");
+    expect(detectIssueKey("release/1.2-PROJ-7")).toBe("PROJ-7");
+    expect(detectIssueKey("ST-.1")).toBeNull();
+  });
+});
+
+describe("isIssueKey", () => {
+  it("accepts one whole Jira key or Epiku story id", () => {
+    expect(isIssueKey("PROJ-123")).toBe(true);
+    expect(isIssueKey("ST-1.1")).toBe(true);
+    expect(isIssueKey("HU-2.10.3")).toBe(true);
+  });
+  it("rejects anything else", () => {
+    expect(isIssueKey("proj-123")).toBe(false);
+    expect(isIssueKey("PROJ-123.")).toBe(false);
+    expect(isIssueKey("ST-1.1 extra")).toBe(false);
+    expect(isIssueKey("A-1")).toBe(false);
+    expect(isIssueKey("#42")).toBe(false);
   });
 });
 
@@ -26,6 +57,9 @@ describe("detectIssueKeyForProject", () => {
   it("returns null when the project has no configured key", () => {
     expect(detectIssueKeyForProject("feat/OCT-12", null)).toBeNull();
     expect(detectIssueKeyForProject("feat/OCT-12", "")).toBeNull();
+  });
+  it("accepts a dotted id under the project prefix", () => {
+    expect(detectIssueKeyForProject("feat/ST-2.3-login", "ST")).toBe("ST-2.3");
   });
   it("does not detect lowercase keys", () => {
     expect(detectIssueKeyForProject("feat/oct-12", "OCT")).toBeNull();

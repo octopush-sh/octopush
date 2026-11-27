@@ -1,0 +1,8 @@
+{
+  "proyecto": "sample-project",
+  "total": 2,
+  "historias": [
+    {"id": "ST-1.1", "titulo": "Sample story title", "epica": "EP-1", "estado": "bloqueada", "talla": "M", "prioridad": "alta", "progreso": {"subtareasHechas": 1, "subtareasTotal": 2, "pct": 50}, "bloqueantesPendientes": ["ST-1.2"], "desbloquea": ["ST-1.3"], "listaParaEmpezar": false},
+    {"id": "ST-1.2", "titulo": "Sample blocking story", "epica": "EP-1", "estado": "curso", "talla": "S", "prioridad": "normal", "progreso": {"subtareasHechas": 0, "subtareasTotal": 0, "pct": 0}, "bloqueantesPendientes": [], "desbloquea": ["ST-1.1"], "listaParaEmpezar": false}
+  ]
+}
