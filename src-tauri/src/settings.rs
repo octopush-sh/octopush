@@ -55,6 +55,13 @@ pub struct AppSettings {
     #[serde(default)]
     pub subagent_max_turns: Option<u32>,
 
+    /// Which engine runs a Talk turn (Talk engine v2, #1143), for one
+    /// release: `legacy` (the default) or `v2`, which replays the
+    /// append-only transcript (`context::transcript`). settings.json only,
+    /// no toggle yet; a value this build doesn't know reads as `legacy`.
+    #[serde(default, deserialize_with = "enum_or_default", skip_serializing_if = "TalkEngine::is_legacy")]
+    pub talk_engine: TalkEngine,
+
     /// Run-mode attention from Claude Code's own lifecycle hooks
     /// (`Notification`/`Stop`, #287) instead of the terminal bell. `None` =
     /// the default, read as **on** by `claude_hooks::hooks_enabled` once the
@@ -169,6 +176,21 @@ pub struct AppSettings {
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
     pub legacy_openai_api_key: Option<String>,
+}
+
+/// The Talk engine a turn runs on (`AppSettings::talk_engine`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TalkEngine {
+    #[default]
+    Legacy,
+    V2,
+}
+
+impl TalkEngine {
+    fn is_legacy(&self) -> bool {
+        *self == TalkEngine::Legacy
+    }
 }
 
 /// `settings.json`'s reader for an enum-valued field: a value this build
@@ -992,6 +1014,17 @@ mod tests {
         assert_eq!(settings.talk_max_iterations, Some(60));
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""talkMaxIterations":60"#), "{json}");
+    }
+
+    #[test]
+    fn talk_engine_defaults_to_legacy_and_reads_v2() {
+        let read = |json: &str| serde_json::from_str::<AppSettings>(json).unwrap().talk_engine;
+        assert_eq!(read("{}"), TalkEngine::Legacy);
+        assert_eq!(read(r#"{"talkEngine":"v2"}"#), TalkEngine::V2);
+        assert_eq!(read(r#"{"talkEngine":"v3"}"#), TalkEngine::Legacy, "unknown reads as the default");
+        let v2: AppSettings = serde_json::from_str(r#"{"talkEngine":"v2"}"#).unwrap();
+        assert!(serde_json::to_string(&v2).unwrap().contains(r#""talkEngine":"v2""#));
+        assert!(!serde_json::to_string(&AppSettings::default()).unwrap().contains("talkEngine"));
     }
 
     #[test]
