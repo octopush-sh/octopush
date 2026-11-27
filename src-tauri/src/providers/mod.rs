@@ -118,8 +118,9 @@ pub enum LlmContent {
         /// request). On an OpenAI Responses turn with reasoning, its output items
         /// behind an origin item instead (`openai_compat::parse_responses_response`).
         /// Empty for Chat Completions and for turns built without a captured
-        /// response (TALK, the truncation path) — the serializer then rebuilds
-        /// from `text` + `tool_uses`.
+        /// response (TALK, a truncated round with no signed thinking: see
+        /// [`truncated_round_turn`]) — the serializer then rebuilds from
+        /// `text` + `tool_uses`.
         raw: Vec<serde_json::Value>,
         text: String,
         tool_uses: Vec<LlmToolUse>,
@@ -214,6 +215,50 @@ pub enum LlmStopReason {
     ToolUse,
     MaxTokens,
     Other(String),
+}
+
+/// The leading complete thinking blocks of a response's content: signed
+/// `thinking` and `redacted_thinking` blocks, up to the first other block.
+/// Empty for an OpenAI Responses turn or a response without thinking.
+fn leading_signed_thinking(raw: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    if openai_compat::is_responses_raw(raw) {
+        return Vec::new();
+    }
+    let nonempty = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.is_empty());
+    raw.iter()
+        .take_while(|b| match b["type"].as_str() {
+            Some("thinking") => nonempty(&b["signature"]),
+            Some("redacted_thinking") => nonempty(&b["data"]),
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// The assistant turn of a round cut off at `max_tokens` mid-tool-use, shared
+/// by the Talk director and the sub-agent / Direct loop (`run_agentic_loop`).
+/// It is rebuilt from its text and tool calls, since a cut-off turn can end in
+/// a partial block, but its leading signed thinking blocks are kept in front:
+/// with a thinking budget on, the API rejects a final assistant turn that
+/// doesn't start with one.
+pub fn truncated_round_turn(response: &LlmResponse) -> LlmMessage {
+    let mut raw = leading_signed_thinking(&response.raw_content);
+    if !raw.is_empty() {
+        if !response.text.is_empty() {
+            raw.push(serde_json::json!({ "type": "text", "text": response.text }));
+        }
+        for u in &response.tool_uses {
+            raw.push(serde_json::json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input }));
+        }
+    }
+    LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::AssistantWithTools {
+            raw,
+            text: response.text.clone(),
+            tool_uses: response.tool_uses.clone(),
+        },
+    }
 }
 
 /// One piece of a streamed answer, the same shape for every provider. Tool
