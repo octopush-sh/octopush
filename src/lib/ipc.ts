@@ -1180,6 +1180,9 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The Settings › Integrations servers only, with their live status: what
+   *  a Direct stage can choose. Spawns nothing. */
+  listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
   /** The worktree's own `.claude/mcp.json` servers and where each stands
    *  (#1245). Spawns nothing. */
   listProjectMcpServers: (workspacePath: string) =>

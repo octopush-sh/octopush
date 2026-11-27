@@ -305,6 +305,7 @@ pub fn run() {
             commands::read_attachment,
             commands::list_mcp_tools,
             commands::list_mcp_server_status,
+            commands::list_user_mcp_server_status,
             commands::list_project_mcp_servers,
             commands::list_project_mcp_approvals,
             commands::revoke_project_mcp_server,
