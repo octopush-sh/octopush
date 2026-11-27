@@ -4,6 +4,7 @@ import { useRef } from "react";
 import { ModalShell } from "../ModalShell";
 import { useChatStore } from "../../stores/chatStore";
 import { escStopsTurn, useEscStopsTurn } from "./talkEscape";
+import { ApprovalCard } from "./ApprovalCard";
 
 function Talk({ active = true, children }: { active?: boolean; children?: React.ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -114,6 +115,29 @@ describe("Esc stops the running Talk turn", () => {
     expect(stop).not.toHaveBeenCalled();
   });
 
+  it("with an approval card focused, Esc denies the card and never stops the turn", () => {
+    const onRespond = vi.fn();
+    const approval = { callId: "c1", threadId: "t", command: "git push --force", reason: "force-push" };
+    const { getByRole } = render(
+      <Talk>
+        <ApprovalCard approval={approval} onRespond={onRespond} />
+      </Talk>,
+    );
+    const card = getByRole("group", { name: "Approval needed: git push --force" });
+    card.focus();
+    esc(card);
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(onRespond).toHaveBeenLastCalledWith("deny");
+    expect(stop).not.toHaveBeenCalled();
+
+    // A button inside the card keeps its own keys: no answer, and no stop.
+    const approve = getByRole("button", { name: "Approve" });
+    approve.focus();
+    esc(approve);
+    expect(onRespond).toHaveBeenCalledTimes(1);
+    expect(stop).not.toHaveBeenCalled();
+  });
+
   it("takes only a bare, fresh Escape", () => {
     render(<Talk />);
     esc(document.body, { shiftKey: true });
@@ -138,5 +162,21 @@ describe("escStopsTurn", () => {
     expect(escStopsTurn(key(), root, false)).toBe(false);
     expect(escStopsTurn(key({ isComposing: true }), root, true)).toBe(false);
     expect(escStopsTurn(key({ defaultPrevented: true }), root, true)).toBe(false);
+  });
+
+  it("never with the key or the focus on an approval card", () => {
+    const root = document.createElement("div");
+    const card = document.createElement("div");
+    card.setAttribute("data-approval-card", "");
+    card.tabIndex = 0;
+    const inside = document.createElement("button");
+    card.appendChild(inside);
+    root.appendChild(card);
+    document.body.appendChild(root);
+    expect(escStopsTurn(key({ target: root }), root, true)).toBe(true);
+    expect(escStopsTurn(key({ target: card }), root, true)).toBe(false);
+    inside.focus();
+    expect(escStopsTurn(key({ target: document.body }), root, true)).toBe(false);
+    root.remove();
   });
 });

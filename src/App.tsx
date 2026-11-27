@@ -50,6 +50,7 @@ import { RunPanes } from "./components/run/RunPanes";
 import { LINE_FLOOR_PX, LINE_LAST_PX, SessionLine } from "./components/run/SessionLine";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
 import { ConversationSwitcher } from "./components/chat/ConversationSwitcher";
+import { focusOldestCard } from "./components/chat/ApprovalCard";
 import { ReviewTail } from "./components/ReviewTail";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
@@ -1277,6 +1278,8 @@ function App() {
         handleNewChat();
         return true;
       },
+      // A card never takes the focus by itself; this is the user asking.
+      focusApproval: () => !!activeWorkspaceId && !isModalOpen() && focusOldestCard(),
       // Open beside: the pairing switcher while a session is off screen,
       // else an empty seat. Never under another dialog.
       openBeside: () => {
@@ -1368,6 +1371,13 @@ function App() {
   const activeChatId = activeWorkspaceId;
   const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
   const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
+  // An approval card waits in the conversation Talk shows (as ChatCanvas
+  // scopes them), for ⌘K's "Focus the waiting approval card".
+  const approvalWaiting = useChatStore((s) =>
+    s
+      .getPendingApprovals(activeWorkspaceId ?? "")
+      .some((a) => !activeThreadId || a.threadId === activeThreadId),
+  );
   // The threads running a turn (for the live pulse in the chat list).
   const streamingThreadIds = useChatStore((s) =>
     activeWorkspaceId ? s.streamingThreadsByWs[activeWorkspaceId] : undefined,
@@ -3056,6 +3066,14 @@ function App() {
                 },
                 onCopy: companionHistoryProps.activeChatId
                   ? () => handleExportChat(companionHistoryProps.activeChatId!)
+                  : undefined,
+                // A frame later: the palette hands the focus back to its
+                // opener as it closes, and Talk has to be on screen.
+                onFocusApproval: approvalWaiting
+                  ? () => {
+                      setMode("talk");
+                      requestAnimationFrame(() => void focusOldestCard());
+                    }
                   : undefined,
               }
             : undefined

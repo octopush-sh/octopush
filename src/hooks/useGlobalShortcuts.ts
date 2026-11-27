@@ -40,6 +40,9 @@ export interface ShortcutContext {
   /** ⌘⌥N: a new Talk conversation in the active workspace, shown in Talk.
    *  Returns false when it can't (no workspace, a dialog is open). */
   newConversation: () => boolean;
+  /** ⌘⌥A in Talk: focus the oldest approval card waiting in the conversation
+   *  on screen. Returns false when none waits (or a dialog is open). */
+  focusApproval: () => boolean;
   /** ⌘D in Run: open beside (the pairing switcher, or an empty seat).
    *  Returns false when there is nothing to open beside. */
   openBeside: () => boolean;
@@ -284,6 +287,20 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
       else return false;
       return true;
     },
+  },
+  {
+    // The one way a key moves the focus to an approval card: a card never
+    // takes it when it appears, so a keystroke meant for something else
+    // can't answer a command nobody read. Talk only (the cards are Talk's).
+    // The physical key: Option turns `a` into `å` on macOS.
+    id: "focus-approval",
+    chords: ["⌘⌥A"],
+    scope: "talk",
+    shift: false,
+    alt: true,
+    keys: ["a"],
+    codes: ["KeyA"],
+    run: (_e, c) => c.focusApproval(),
   },
   {
     // Previous / next session in the focused pane, wrapping. Sessions in the

@@ -53,6 +53,7 @@ function ctx(over: Partial<ShortcutContext> & { modeNow?: WorkspaceMode } = {}):
     toggleSessionSwitcher: vi.fn(),
     toggleConversationSwitcher: vi.fn(),
     newConversation: vi.fn(() => true),
+    focusApproval: vi.fn(() => true),
     openBeside: vi.fn(() => true),
     toggleTalkSeat: vi.fn(() => true),
     terminalIds: () => ["t1", "t2", "t3"],
@@ -97,6 +98,11 @@ describe("matchShortcut", () => {
     // Option remapped the printed character; the physical key still counts.
     [{ key: "˚", code: "KeyK", alt: true }, "switcher"],
     [{ key: "k", alt: true, shift: true }, null],
+    [{ key: "a", alt: true }, "focus-approval"],
+    // macOS: ⌥A prints "å"; the code decides.
+    [{ key: "å", code: "KeyA", alt: true }, "focus-approval"],
+    [{ key: "a" }, null],
+    [{ key: "a", alt: true, shift: true }, null],
     [{ key: "ArrowLeft", alt: true }, "session-step"],
     [{ key: "ArrowRight", alt: true }, "session-step"],
     [{ key: "ArrowRight" }, null],
@@ -246,6 +252,29 @@ describe("handleShortcut", () => {
     handleShortcut(press({ key: "n" }), c);
     expect(c.openCreator).toHaveBeenCalled();
     expect(c.newConversation).not.toHaveBeenCalled();
+  });
+
+  it("⌘⌥A focuses the oldest approval card in Talk only, and leaves the key alone when none waits", () => {
+    const talk = ctx({ modeNow: "talk" });
+    const e = press({ key: "å", code: "KeyA", alt: true });
+    handleShortcut(e, talk);
+    expect(talk.focusApproval).toHaveBeenCalledTimes(1);
+    expect(e.preventDefault).toHaveBeenCalled();
+
+    const none = ctx({ modeNow: "talk", focusApproval: vi.fn(() => false) });
+    const n = press({ key: "a", alt: true });
+    handleShortcut(n, none);
+    expect(none.focusApproval).toHaveBeenCalledTimes(1);
+    expect(n.preventDefault).not.toHaveBeenCalled();
+
+    // The cards are Talk's: elsewhere a hidden card is never focused.
+    for (const modeNow of ["run", "review", "direct"] as const) {
+      const other = ctx({ modeNow });
+      const o = press({ key: "a", alt: true });
+      handleShortcut(o, other);
+      expect(other.focusApproval).not.toHaveBeenCalled();
+      expect(o.preventDefault).not.toHaveBeenCalled();
+    }
   });
 
   it("⌘⌥K lists sessions in Run, conversations in Talk, and nothing elsewhere", () => {

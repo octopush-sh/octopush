@@ -47,8 +47,9 @@ interface Props {
    *  The Groups section shows only when this is wired. */
   onRevealGroup?: (groupId: string) => void;
   /** The Talk group's commands, for the active workspace; absent without
-   *  one. `onCopy` is absent with no conversation. */
-  talk?: { onNew: () => void; onSwitch: () => void; onCopy?: () => void };
+   *  one. `onCopy` is absent with no conversation, `onFocusApproval` while
+   *  no approval card waits in the conversation Talk shows. */
+  talk?: { onNew: () => void; onSwitch: () => void; onCopy?: () => void; onFocusApproval?: () => void };
 }
 
 export function CommandPalette({
@@ -238,6 +239,14 @@ export function CommandPalette({
                 <Item glyph="⇄" label="Switch conversation…" shortcut="⌘⌥K" onSelect={() => run(talk.onSwitch)} />
                 {talk.onCopy && (
                   <Item glyph="#" label="Copy conversation as Markdown" onSelect={() => run(talk.onCopy!)} />
+                )}
+                {talk.onFocusApproval && (
+                  <Item
+                    glyph="!"
+                    label="Focus the waiting approval card"
+                    shortcut="⌘⌥A"
+                    onSelect={() => run(talk.onFocusApproval!)}
+                  />
                 )}
               </Group>
             )}

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { ApprovalCard, RUN_CHECK_LIMITS, cardTakesFocus } from "./ApprovalCard";
+import { ApprovalCard, FOCUS_CARD_CHORD, RUN_CHECK_LIMITS, focusOldestCard } from "./ApprovalCard";
+import { matchShortcut, type ShortcutContext } from "../../hooks/useGlobalShortcuts";
 
 const base = { callId: "c", threadId: "t", command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3" };
 
@@ -54,7 +55,7 @@ describe("ApprovalCard", () => {
       />,
     );
     const card = screen.getByRole("group", { name: "Outside the workspace: ~/notes/plan.md" });
-    expect(card).toHaveAttribute("title", "⌘↵ allows once · Esc denies");
+    expect(card).toHaveAttribute("title", "⌘↵ allows once · Esc denies · ⌘⌥A focuses the oldest waiting card");
     expect(container.querySelector("pre")?.textContent).toBe("~/notes/plan.md");
     expect(screen.queryByText(/don't ask again/)).toBeNull();
     expect(screen.getByText(/what it reads goes to your AI provider/)).toBeInTheDocument();
@@ -79,7 +80,7 @@ describe("ApprovalCard", () => {
       />,
     );
     const card = screen.getByRole("group", { name: "Possible credentials: ~/.ssh/id_ed25519" });
-    expect(card).toHaveAttribute("title", "⌘↵, Enter or Esc denies");
+    expect(card).toHaveAttribute("title", "⌘↵, Enter or Esc denies · ⌘⌥A focuses the oldest waiting card");
     expect(screen.getByText(/This may hold credentials/)).toBeInTheDocument();
     const [first] = screen.getAllByRole("button");
     expect(first).toHaveTextContent("Deny");
@@ -100,7 +101,7 @@ describe("ApprovalCard", () => {
       />,
     );
     const card = screen.getByRole("group", { name: "Possible credentials: cat ~/.ssh/id_ed25519" });
-    expect(card).toHaveAttribute("title", `⌘↵, Enter or Esc denies. ${RUN_CHECK_LIMITS}`);
+    expect(card).toHaveAttribute("title", `⌘↵, Enter or Esc denies · ⌘⌥A focuses the oldest waiting card. ${RUN_CHECK_LIMITS}`);
     expect(RUN_CHECK_LIMITS).toMatch(/a net, not a sandbox/);
     expect(container.querySelector("pre")?.textContent).toBe("$ cat ~/.ssh/id_ed25519");
     expect(screen.getByText(/its output goes to your AI provider/)).toBeInTheDocument();
@@ -118,7 +119,7 @@ describe("ApprovalCard", () => {
         onRespond={onRemember}
       />,
     );
-    expect(screen.getByRole("group", { name: "Outside the workspace: cat /tmp/out.log" })).toHaveAttribute("title", `⌘↵ allows once · Esc denies. ${RUN_CHECK_LIMITS}`);
+    expect(screen.getByRole("group", { name: "Outside the workspace: cat /tmp/out.log" })).toHaveAttribute("title", `⌘↵ allows once · Esc denies · ⌘⌥A focuses the oldest waiting card. ${RUN_CHECK_LIMITS}`);
     expect(screen.getAllByRole("button")[0]).toHaveTextContent("Allow once");
     expect(screen.getByText(/A credentials location always asks/)).toBeInTheDocument();
     fireEvent.click(screen.getByText("Allow reading /tmp for this conversation"));
@@ -140,7 +141,7 @@ describe("ApprovalCard at the keyboard", () => {
     render(<ApprovalCard approval={plain} onRespond={onRespond} />);
     const card = screen.getByRole("group", { name: "Approval needed: git push --force" });
     expect(card).toHaveAttribute("tabindex", "0");
-    expect(card).toHaveAttribute("title", "⌘↵ approves · Esc denies");
+    expect(card).toHaveAttribute("title", "⌘↵ approves · Esc denies · ⌘⌥A focuses the oldest waiting card");
     expect(card).toHaveAttribute("aria-keyshortcuts", "Meta+Enter Escape");
     expect(card).toHaveAttribute("data-tour", "talk-approval");
     // The keys answer the card's own focus, and the buttons say so.
@@ -201,60 +202,84 @@ describe("ApprovalCard at the keyboard", () => {
     expect(behind).not.toHaveBeenCalled();
   });
 
-  it("takes the focus when it appears with nothing focused or an empty composer, so the keys answer at once (#1153)", () => {
+  it("never takes the focus when it appears: not from nothing, an empty composer or a draft", () => {
+    // A habitual ⌘↵ or Enter meant for the composer must never land on a
+    // command the user hasn't read.
     const onRespond = vi.fn();
-    render(<ApprovalCard approval={plain} onRespond={onRespond} />);
-    const card = screen.getByRole("group");
-    expect(card).toHaveFocus();
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
-    expect(onRespond).toHaveBeenLastCalledWith("deny");
-    cleanup();
-
-    render(
-      <div>
-        <textarea data-tour="talk-composer-input" aria-label="composer" autoFocus />
-        <ApprovalCard approval={plain} onRespond={() => {}} />
-      </div>,
-    );
-    expect(screen.getByRole("group")).toHaveFocus();
-  });
-
-  it("never takes the focus from a draft or from elsewhere", () => {
-    const { unmount } = render(
-      <div>
-        <textarea data-tour="talk-composer-input" aria-label="composer" defaultValue="half a thought" autoFocus />
-        <ApprovalCard approval={plain} onRespond={() => {}} />
-      </div>,
-    );
-    expect(screen.getByRole("textbox", { name: "composer" })).toHaveFocus();
+    const { rerender, unmount } = render(<div />);
+    expect(document.activeElement).toBe(document.body);
+    rerender(<ApprovalCard approval={plain} onRespond={onRespond} />);
+    expect(screen.getByRole("group")).not.toHaveFocus();
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.keyDown(document.activeElement!, { key: "Enter", metaKey: true });
+    fireEvent.keyDown(document.activeElement!, { key: "Enter" });
+    expect(onRespond).not.toHaveBeenCalled();
     unmount();
 
-    render(
-      <div>
-        <input aria-label="rail search" autoFocus />
-        <ApprovalCard approval={plain} onRespond={() => {}} />
-      </div>,
-    );
-    expect(screen.getByRole("textbox", { name: "rail search" })).toHaveFocus();
+    for (const draft of ["", "half a thought"]) {
+      const Talk = ({ card }: { card: boolean }) => (
+        <div>
+          <textarea data-tour="talk-composer-input" aria-label="composer" defaultValue={draft} autoFocus />
+          {card && <ApprovalCard approval={plain} onRespond={onRespond} />}
+        </div>
+      );
+      const view = render(<Talk card={false} />);
+      const composer = screen.getByRole("textbox", { name: "composer" });
+      expect(composer).toHaveFocus();
+      // The card arrives while the user sits in the composer.
+      view.rerender(<Talk card />);
+      expect(composer).toHaveFocus();
+      fireEvent.keyDown(composer, { key: "Enter", metaKey: true });
+      expect(onRespond).not.toHaveBeenCalled();
+      view.unmount();
+    }
   });
 
-  it("cardTakesFocus: only from nothing or an empty composer", () => {
-    const composer = document.createElement("textarea");
-    const other = document.createElement("button");
-    expect(cardTakesFocus(null, null)).toBe(true);
-    expect(cardTakesFocus(document.body, composer)).toBe(true);
-    expect(cardTakesFocus(composer, composer)).toBe(true);
-    expect(cardTakesFocus(other, composer)).toBe(false);
-    composer.value = "draft";
-    expect(cardTakesFocus(document.body, composer)).toBe(false);
-    expect(cardTakesFocus(composer, composer)).toBe(false);
+  it("takes the focus from a click or Tab, and says how to reach it from the keyboard", () => {
+    render(<ApprovalCard approval={plain} onRespond={() => {}} />);
+    const card = screen.getByRole("group");
+    expect(card).toHaveAttribute("data-approval-card");
+    expect(card.getAttribute("title")).toContain("⌘⌥A focuses the oldest waiting card");
+    card.focus();
+    expect(card).toHaveFocus();
+  });
+
+  it("⌘⌥A focuses the oldest waiting card, whose Esc then denies only it", () => {
+    const answers: string[] = [];
+    render(
+      <div>
+        <textarea aria-label="composer" defaultValue="" autoFocus />
+        <ApprovalCard approval={{ ...plain, callId: "old", command: "rm -rf build" }} onRespond={(d) => answers.push(`old:${d}`)} />
+        <ApprovalCard approval={{ ...plain, callId: "new", command: "git push --force" }} onRespond={(d) => answers.push(`new:${d}`)} />
+      </div>,
+    );
+    const composer = screen.getByRole("textbox", { name: "composer" });
+    expect(composer).toHaveFocus();
+
+    // The global table's chord, the physical key (Option prints å).
+    const e = new KeyboardEvent("keydown", { key: "å", code: "KeyA", metaKey: true, altKey: true });
+    const shortcut = matchShortcut(e);
+    expect(shortcut?.id).toBe("focus-approval");
+    expect(shortcut?.chords).toEqual([FOCUS_CARD_CHORD]);
+    expect(shortcut?.run(e, { focusApproval: () => focusOldestCard() } as unknown as ShortcutContext)).toBe(true);
+    const oldest = screen.getByRole("group", { name: "Approval needed: rm -rf build" });
+    expect(oldest).toHaveFocus();
+
+    fireEvent.keyDown(oldest, { key: "Escape" });
+    expect(answers).toEqual(["old:deny"]);
+  });
+
+  it("focusOldestCard: false with no card waiting", () => {
+    render(<textarea aria-label="composer" autoFocus />);
+    expect(focusOldestCard()).toBe(false);
+    expect(screen.getByRole("textbox", { name: "composer" })).toHaveFocus();
   });
 
   it("on the secret card, Enter and ⌘↵ take the safe lead answer: leave it out", () => {
     const onRespond = vi.fn();
     render(<ApprovalCard approval={{ ...base, secret: true }} onRespond={onRespond} />);
     const card = screen.getByRole("group", { name: /^Possible secret: / });
-    expect(card).toHaveAttribute("title", "⌘↵, Enter or Esc leaves it out");
+    expect(card).toHaveAttribute("title", "⌘↵, Enter or Esc leaves it out · ⌘⌥A focuses the oldest waiting card");
     fireEvent.keyDown(card, { key: "Enter" });
     fireEvent.keyDown(card, { key: "Enter", metaKey: true });
     fireEvent.keyDown(card, { key: "Escape" });

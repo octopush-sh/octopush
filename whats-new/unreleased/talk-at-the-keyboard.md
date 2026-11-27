@@ -10,8 +10,9 @@ steps:
     caption: In Run, the same keys list your sessions instead.
   - open: palette
     target: palette-talk
-    caption: ⌘K has the same commands, and copies the open conversation as Markdown.
+    caption: ⌘K has the same commands, copies the open conversation as Markdown and, while an approval card waits, focuses it (⌘⌥A).
 ---
-**Esc** stops the running Talk turn, unless a popover, dialog, editor or terminal has the focus. **⌘⌥N** starts a new
-conversation and **⌘⌥K** in Talk switches between them. An approval card takes the focus when it appears, so ⌘↵ or
-Esc answers it at once.
+**Esc** stops the running Talk turn, unless a popover, dialog, approval card, editor or terminal has the focus. **⌘⌥N**
+starts a new conversation and **⌘⌥K** in Talk switches between them. **⌘⌥A** focuses the oldest approval card waiting
+in the conversation, so ⌘↵ or Esc answers it; a card never takes the focus by itself, so a stray keystroke can't answer
+a command you haven't read.

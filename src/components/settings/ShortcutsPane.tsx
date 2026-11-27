@@ -49,6 +49,7 @@ export function ShortcutsPane() {
           <Shortcut keys="Esc" desc="Stop the running turn" />
           <Shortcut keys="⌘⌥N" desc="New conversation" />
           <Shortcut keys="⌘⌥K" desc="Switch conversation" />
+          <Shortcut keys="⌘⌥A" desc="Focus the oldest waiting approval card" />
           <Shortcut keys="⌘↵" desc="Approval card focused: approve (on a credentials or secret card, the safe answer)" />
           <Shortcut keys="Esc" desc="Approval card focused: deny" />
         </ShortcutGroup>

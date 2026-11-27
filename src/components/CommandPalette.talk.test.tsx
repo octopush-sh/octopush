@@ -28,7 +28,7 @@ afterAll(() => {
   Element.prototype.scrollIntoView = originalScrollIntoView;
 });
 
-function open(talk?: { onNew: () => void; onSwitch: () => void; onCopy?: () => void }) {
+function open(talk?: { onNew: () => void; onSwitch: () => void; onCopy?: () => void; onFocusApproval?: () => void }) {
   const onClose = vi.fn();
   const view = render(
     <CommandPalette open onClose={onClose} onNewSession={vi.fn()} onToggleTokens={vi.fn()} talk={talk} />,
@@ -59,6 +59,20 @@ describe("CommandPalette Talk group", () => {
     expect(talk.onSwitch).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByText("Copy conversation as Markdown"));
     expect(talk.onCopy).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers to focus the waiting approval card only while one waits", () => {
+    const onFocusApproval = vi.fn();
+    const { onClose, unmount } = open({ onNew: vi.fn(), onSwitch: vi.fn(), onFocusApproval });
+    const group = document.querySelector('[data-tour="palette-talk"]');
+    expect(group).toHaveTextContent("Focus the waiting approval card");
+    expect(group).toHaveTextContent("⌘⌥A");
+    fireEvent.click(screen.getByText("Focus the waiting approval card"));
+    expect(onClose).toHaveBeenCalled();
+    expect(onFocusApproval).toHaveBeenCalledTimes(1);
+    unmount();
+    open({ onNew: vi.fn(), onSwitch: vi.fn() });
+    expect(screen.queryByText("Focus the waiting approval card")).toBeNull();
   });
 
   it("drops Copy with no conversation, and the group with no workspace", () => {

@@ -38,6 +38,7 @@ describe("ShortcutsPane", () => {
       "⌘⌥N New conversation",
       "⌘⌥K Switch conversation",
       "⌘⌥K Switch session",
+      "⌘⌥A Focus the oldest waiting approval card",
       "Esc Approval card focused: deny",
     ]) {
       expect(rows).toContain(row);
