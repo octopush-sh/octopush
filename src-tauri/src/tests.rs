@@ -13558,6 +13558,65 @@ mod live_tests {
         assert!(call_2.get("id").is_none());
     }
 
+    /// Scripted turns, recording each request as the Anthropic body it becomes.
+    struct AnthropicRecorder { turns: Mutex<VecDeque<LlmResponse>>, bodies: Mutex<Vec<Value>> }
+    #[async_trait::async_trait]
+    impl LlmProvider for AnthropicRecorder {
+        async fn complete(&self, _b: &str, _k: Option<&str>, r: &LlmRequest, _c: &reqwest::Client)
+            -> crate::error::AppResult<LlmResponse> {
+            self.bodies.lock().push(crate::providers::anthropic::build_request(r));
+            Ok(self.turns.lock().pop_front().expect("AnthropicRecorder ran out of turns"))
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_retries_a_truncated_round_with_its_signed_thinking_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = LlmToolUse { id: "t1".into(), name: "write_file".into(),
+            input: json!({ "path": "a.rs", "content": "fn main() {" }) };
+        let mut cut = resp("Writing it.", vec![call.clone()], LlmStopReason::MaxTokens);
+        cut.raw_content = vec![
+            json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
+            json!({ "type": "text", "text": "Writing it." }),
+            json!({ "type": "tool_use", "id": "t1", "name": "write_file", "input": call.input }),
+            // A block cut off mid-way is never replayed.
+            json!({ "type": "thinking", "thinking": "half" }),
+        ];
+        let provider = AnthropicRecorder {
+            turns: Mutex::new(VecDeque::from(vec![cut, resp("done", vec![], LlmStopReason::EndTurn)])),
+            bodies: Mutex::new(vec![]),
+        };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        // Haiku 4.5 thinks only with a budget.
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "claude-haiku-4-5-20251001",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None,
+                                   Some(crate::providers::Effort::High), None, false, None, &[], None,
+                                   None,).await.unwrap();
+        assert_eq!(out.text, "done");
+        assert!(!dir.path().join("a.rs").exists(), "the cut-off call never ran");
+
+        let bodies = provider.bodies.lock();
+        assert_eq!(bodies.len(), 2);
+        let retry = &bodies[1];
+        assert_eq!(retry["thinking"]["type"], "enabled", "{retry}");
+        // The retried assistant turn starts with its signed thinking (the API
+        // 400s one that doesn't while a budget is on), then its text and call.
+        let messages = retry["messages"].as_array().unwrap();
+        let at = messages.iter().rposition(|m| m["role"] == "assistant").unwrap();
+        let turn = &messages[at];
+        let content = turn["content"].as_array().unwrap();
+        assert_eq!((content[0]["type"].as_str(), content[0]["signature"].as_str()), (Some("thinking"), Some("sig-1")), "{turn}");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!((content[2]["type"].as_str(), content[2]["id"].as_str()), (Some("tool_use"), Some("t1")));
+        assert_eq!(content.len(), 3, "the partial block is dropped: {turn}");
+        let results = &messages[at + 1]["content"];
+        assert_eq!(results[0]["tool_use_id"], "t1");
+        assert_eq!(results[0]["is_error"], true);
+    }
+
     #[tokio::test]
     async fn agentic_loop_exhaustion_forces_a_toolless_close() {
         let dir = tempfile::tempdir().unwrap();
