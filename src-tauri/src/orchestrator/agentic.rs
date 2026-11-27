@@ -840,6 +840,9 @@ pub async fn run_agentic_loop_billed(
     }
     let mut messages: Vec<LlmMessage> = initial_messages;
     let mut out = AgenticResult::default();
+    // The files this loop's tools read or wrote, as they saw them, so a
+    // `write_file` never overwrites a file blind (`file_seen`).
+    let file_seen = std::sync::Arc::new(parking_lot::Mutex::new(crate::file_seen::FileSeen::default()));
     // Why the loop left its turn budget: the iteration cap (default) or a
     // mid-stage budget stop. Drives the forced-close notice below.
     let mut budget_stopped = false;
@@ -1162,8 +1165,16 @@ pub async fn run_agentic_loop_billed(
                 let input = u.input.clone();
                 let roots = sandbox_roots.map(|r| r.to_vec());
                 let cancel_flag = std::sync::Arc::clone(cancel);
+                let seen = std::sync::Arc::clone(&file_seen);
                 tokio::task::spawn_blocking(move || {
-                    execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag))
+                    // A write over a file this loop hasn't read, or that
+                    // changed since, is refused (#1165).
+                    if let Some(refusal) = crate::file_seen::refusal(&seen, &wp, &name, &input) {
+                        return (refusal, false);
+                    }
+                    let (result, ok) = execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag));
+                    crate::file_seen::note(&seen, &wp, &name, &input, ok);
+                    (result, ok)
                 })
                 .await
                 .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
