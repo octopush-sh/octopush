@@ -109,7 +109,9 @@ export function ConversationSwitcher({ chats, activeChatId, streamingChatIds, on
           >
             <span className="flex w-4 shrink-0 justify-center">
               {c.pinned ? (
-                <Pin size={11} strokeWidth={1.75} aria-label="Pinned" className="text-octo-brass" />
+                <span role="img" aria-label="Pinned" title="Pinned" className="flex">
+                  <Pin size={11} strokeWidth={1.75} aria-hidden className="text-octo-brass" />
+                </span>
               ) : (
                 <MessageSquare size={12} strokeWidth={1.75} aria-hidden className="text-octo-mute" />
               )}

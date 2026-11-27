@@ -29,6 +29,9 @@ describe("ConversationSwitcher", () => {
     expect(screen.getByTestId("conversation-switcher-row-a")).toHaveTextContent("here");
     expect(screen.getByTestId("conversation-switcher-row-b")).toHaveTextContent("running ·");
     expect(screen.getByTestId("conversation-switcher-row-c")).not.toHaveTextContent("here");
+    const pin = screen.getByTestId("conversation-switcher-row-a").querySelector('[aria-label="Pinned"]');
+    expect(pin).toHaveAttribute("title", "Pinned");
+    expect(screen.getByTestId("conversation-switcher-row-b").querySelector('[aria-label="Pinned"]')).toBeNull();
     expect(screen.getByTestId("conversation-switcher-new")).toHaveTextContent("Begin a new conversation");
   });
 
