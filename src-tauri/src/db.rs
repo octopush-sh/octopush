@@ -1127,6 +1127,14 @@ impl Db {
         // tokens, start, end, notIncluded?}]`, offsets into `content` (UTF-16
         // units). NULL on older rows and on asks with no `@` context.
         add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN context_blocks TEXT")?;
+        // Talk's append-only transcript (`context::transcript`, B2), written
+        // once on a `talkEngine: "v2"` turn: an `assistant_tool_use` row's
+        // verbatim round and origin model (`raw_json`), and a tool row's call
+        // (`tool_use_id`) and the capped text the model was given
+        // (`model_view`). NULL on older rows, which replay as text.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN raw_json TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN tool_use_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_messages ADD COLUMN model_view TEXT")?;
         // A finished sub-agent's conversation, kept so the user can give it
         // more turns or an answer and it CONTINUES instead of starting over.
         self.conn.execute_batch(
@@ -4179,6 +4187,8 @@ impl Db {
             params![thread.id, thread_id],
         )?;
         let mut pairs = Vec::with_capacity(ids.len());
+        // The transcript's columns stay behind: a model view names its own
+        // row for recall, so a fork's copies replay as text with their own ids.
         for old in ids {
             tx.execute(
                 "INSERT INTO chat_messages (workspace_id, thread_id, role, content, model, input_tokens,
@@ -4746,7 +4756,8 @@ impl Db {
     pub fn get_chat_message(&self, message_id: i64) -> AppResult<Option<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
-                    cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks
+                    cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks,
+                    raw_json, tool_use_id, model_view
              FROM chat_messages WHERE id = ?1",
         )?;
         let row = stmt
@@ -4761,6 +4772,9 @@ impl Db {
                     cache_creation_tokens: r.get(10)?,
                     context_tokens: r.get(11)?,
                     context_blocks: r.get(12)?,
+                    raw_json: r.get(13)?,
+                    tool_use_id: r.get(14)?,
+                    model_view: r.get(15)?,
                     input_tokens: r.get(5)?,
                     output_tokens: r.get(6)?,
                     cost_usd: r.get(7)?,
@@ -4833,6 +4847,41 @@ impl Db {
         Ok(())
     }
 
+    /// Keep a tool round's verbatim assistant turn and its origin model
+    /// (`context::transcript::RoundRecord`) on its `assistant_tool_use` row.
+    /// Written once: a row that has one keeps it.
+    pub fn set_chat_round(&self, message_id: i64, raw_json: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET raw_json = ?2 WHERE id = ?1 AND role = 'assistant_tool_use' AND raw_json IS NULL",
+            params![message_id, raw_json],
+        )?;
+        Ok(())
+    }
+
+    /// Keep what the model was given for tool row `message_id`: the tool_use
+    /// it answers and the capped text (`context::transcript::model_view`).
+    /// Written once; only the context guard's stub replaces it, once
+    /// ([`Self::set_chat_tool_stub`]).
+    pub fn set_chat_tool_view(&self, message_id: i64, tool_use_id: &str, model_view: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET tool_use_id = ?2, model_view = ?3
+             WHERE id = ?1 AND role = 'tool' AND model_view IS NULL",
+            params![message_id, tool_use_id, model_view],
+        )?;
+        Ok(())
+    }
+
+    /// The context guard stubbed tool row `message_id`'s result in a v2
+    /// request: the stub becomes its model view, so later turns replay it
+    /// byte for byte. A stub is never stubbed again, so this happens once.
+    pub fn set_chat_tool_stub(&self, message_id: i64, stub: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET model_view = ?2 WHERE id = ?1 AND role = 'tool' AND model_view IS NOT NULL",
+            params![message_id, stub],
+        )?;
+        Ok(())
+    }
+
     /// Append one live-journal entry of a TALK sub-agent (`Agent` tool call).
     pub fn append_chat_agent_log(&self, thread_id: &str, call_id: &str, entry_json: &str) -> AppResult<()> {
         self.conn.execute(
@@ -4868,10 +4917,12 @@ impl Db {
     }
 
     /// Replace a message's content in place (a continued sub-agent's tool
-    /// row takes its new report and meta).
+    /// row takes its new report and meta). The row's model view was the old
+    /// content as the model was given it, so it goes too: the director's
+    /// next turn reads the new report, from that turn on as text.
     pub fn update_chat_message_content(&self, message_id: i64, content: &str) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE chat_messages SET content = ?2 WHERE id = ?1",
+            "UPDATE chat_messages SET content = ?2, model_view = NULL WHERE id = ?1",
             params![message_id, content],
         )?;
         Ok(())
@@ -5325,7 +5376,8 @@ impl Db {
     pub fn list_chat_messages(&self, thread_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
-                    cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks
+                    cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks,
+                    raw_json, tool_use_id, model_view
              FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
@@ -5343,6 +5395,9 @@ impl Db {
                 cache_creation_tokens: r.get(10)?,
                 context_tokens: r.get(11)?,
                 context_blocks: r.get(12)?,
+                raw_json: r.get(13)?,
+                tool_use_id: r.get(14)?,
+                model_view: r.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -7439,6 +7494,77 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every stage of `pipeline_id`'s settled runs (completed, failed or
+    /// aborted), newest run first, with its archived failed attempts and the
+    /// direct spend of each model that ran it. Read-only; feeds the crew
+    /// report (`orchestrator::crew_report`), which picks the windows.
+    pub fn stage_outcomes(&self, pipeline_id: &str) -> AppResult<Vec<crate::orchestrator::crew_report::StageRunSample>> {
+        use crate::orchestrator::crew_report::{ModelSpend, StageRunSample};
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.run_id, r.status, s.position, s.role, s.status, s.escalated != 0,
+                    (SELECT COUNT(*) FROM stage_iterations i WHERE i.stage_id = s.id AND i.status = 'failed'),
+                    s.loop_target_position, s.loop_iterations
+             FROM run_stages s JOIN runs r ON r.id = s.run_id
+             WHERE r.pipeline_id = ?1 AND r.status IN ('completed', 'failed', 'aborted')
+             ORDER BY r.created_at DESC, r.rowid DESC, s.position",
+        )?;
+        let rows = stmt.query_map(params![pipeline_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StageRunSample {
+                    run_id: r.get(1)?,
+                    run_status: r.get(2)?,
+                    position: r.get(3)?,
+                    role: r.get(4)?,
+                    status: r.get(5)?,
+                    escalated: r.get(6)?,
+                    failed_attempts: r.get(7)?,
+                    loop_target_position: r.get(8)?,
+                    loop_iterations: r.get(9)?,
+                    spend: Vec::new(),
+                },
+            ))
+        })?;
+        let mut samples = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT se.source_id, se.model, SUM(se.cost_usd), MAX(se.cost_basis = 'unpriced'),
+                    SUM(se.input_tokens), SUM(se.output_tokens),
+                    SUM(se.cache_read_tokens), SUM(se.cache_creation_tokens)
+             FROM spend_events se
+             JOIN run_stages s ON s.id = se.source_id
+             JOIN runs r ON r.id = s.run_id
+             WHERE se.surface = 'direct' AND r.pipeline_id = ?1
+             GROUP BY se.source_id, se.model
+             ORDER BY MIN(se.ts_utc)",
+        )?;
+        let spend = stmt.query_map(params![pipeline_id], |r| {
+            let n = |i: usize| r.get::<_, i64>(i).map(|v| v.max(0) as u64);
+            Ok((
+                r.get::<_, String>(0)?,
+                ModelSpend {
+                    model: r.get(1)?,
+                    cost_usd: r.get(2)?,
+                    unpriced: r.get(3)?,
+                    tokens: crate::orchestrator::cost::TokenSample {
+                        input: n(4)?,
+                        output: n(5)?,
+                        cache_read: n(6)?,
+                        cache_creation: n(7)?,
+                    },
+                },
+            ))
+        })?;
+        let mut by_stage: std::collections::HashMap<String, Vec<ModelSpend>> = std::collections::HashMap::new();
+        for row in spend {
+            let (id, m) = row?;
+            by_stage.entry(id).or_default().push(m);
+        }
+        for (id, s) in &mut samples {
+            s.spend = by_stage.remove(id.as_str()).unwrap_or_default();
+        }
+        Ok(samples.into_iter().map(|(_, s)| s).collect())
+    }
+
     /// Resolve a stage's workspace/project/model and append a `direct` spend
     /// event. `finished_at`-derived idempotency key = one row per completion.
     #[allow(clippy::too_many_arguments)]
@@ -8365,6 +8491,14 @@ pub struct ChatMessageRow {
     /// A user row's `@` context blocks (#1150); NULL renders and replays as
     /// before.
     pub context_blocks: Option<String>,
+    /// The transcript's columns (`context::transcript`, B2). For the
+    /// backend only: the webview never receives them.
+    #[serde(skip)]
+    pub raw_json: Option<String>,
+    #[serde(skip)]
+    pub tool_use_id: Option<String>,
+    #[serde(skip)]
+    pub model_view: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

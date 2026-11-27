@@ -6,6 +6,7 @@ import { SegmentedControl } from "../controls/SegmentedControl";
 import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
+import { TrackRecord, type StageRecord } from "./TrackRecord";
 import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
@@ -145,6 +146,8 @@ interface Props {
   /** This stage's first validation error / caution, surfaced inline so the
    *  amber/rouge ring on the node always has a stated reason. */
   issue?: { error?: string; warning?: string };
+  /** This stage's track record on a saved pipeline; absent on a new stage. */
+  record?: StageRecord | null;
   onPatch: (partial: Partial<StageNodeData>) => void;
   onSetLoop: (next: LoopState) => void;
   onClose: () => void;
@@ -154,7 +157,7 @@ interface Props {
  *  substrate, tools, gate, turn budget, free-form instructions, and (for review
  *  archetypes) the loop. The archetype is the operability anchor; everything
  *  else is the author's to shape. */
-export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoop, onClose }: Props) {
+export function StageInspector({ node, ancestors, loop, issue, record, onPatch, onSetLoop, onClose }: Props) {
   const data = node.data;
   // Subscribe to roles store so the Listbox re-renders when roles load late.
   // archetypes() reads the module-level cache populated by setArchetypes() —
@@ -352,6 +355,9 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
             </Reveal>
           </div>
         </div>
+
+        {/* How this stage did in this Mac's runs, and what that suggests. */}
+        {record && <TrackRecord record={record} onPatch={onPatch} />}
 
         {/* Execution group: substrate, approval, tools, max turns. */}
         <div className="flex flex-col gap-4 border-t border-octo-hairline pt-4">

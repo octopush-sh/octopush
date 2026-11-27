@@ -158,10 +158,12 @@ pub fn save_learned(db: &Db, model: &str, learned: &Learned) -> AppResult<()> {
 }
 
 /// What the guard did to a request at a round boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stubbed {
     /// Tool results replaced by stubs.
     pub results: usize,
+    /// Their tool_use ids, so a v2 turn can keep each stub on its row.
+    pub ids: Vec<String>,
     /// The estimate before and after (tokens).
     pub before: u64,
     pub after: u64,
@@ -170,10 +172,11 @@ pub struct Stubbed {
 /// A context-length error the guard answered: the window the retry was
 /// sized for (tokens), the results it stubbed, and whether what was learned
 /// changed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Recovery {
     window: u64,
     results: usize,
+    ids: Vec<String>,
     learned: bool,
 }
 
@@ -183,6 +186,8 @@ struct Recovery {
 pub struct AfterFailure {
     pub save: bool,
     pub retry: Option<String>,
+    /// The tool_use ids of the results stubbed for the retry.
+    pub stubbed: Vec<String>,
 }
 
 /// One model's guard for one turn.
@@ -250,8 +255,8 @@ impl ContextGuard {
             return None;
         }
         let keep = if before >= self.budget.share(HARD_PCT) { 1 } else { KEEP_ROUNDS };
-        let results = self.stub_to(messages, fixed_chars, rows, self.budget.share(TARGET_PCT), keep);
-        Some(Stubbed { results, before, after: self.estimate(fixed_chars, messages) })
+        let ids = self.stub_to(messages, fixed_chars, rows, self.budget.share(TARGET_PCT), keep);
+        Some(Stubbed { results: ids.len(), ids, before, after: self.estimate(fixed_chars, messages) })
     }
 
     /// Stub the results of the rounds before the last `keep`, oldest first
@@ -259,12 +264,14 @@ impl ContextGuard {
     /// A round is an assistant turn with tool calls and the results up to the
     /// next one. Assistant turns are never edited, so signed thinking goes
     /// out as it came, and every tool_use keeps its result.
-    fn stub_to(&self, messages: &mut [LlmMessage], fixed_chars: usize, rows: &HashMap<String, i64>, target: u64, keep: usize) -> usize {
+    /// Returns the stubbed results' tool_use ids. A stub is under
+    /// `STUB_MIN_CHARS`, so a result is stubbed at most once.
+    fn stub_to(&self, messages: &mut [LlmMessage], fixed_chars: usize, rows: &HashMap<String, i64>, target: u64, keep: usize) -> Vec<String> {
         let starts: Vec<usize> = (0..messages.len())
             .filter(|&i| matches!(messages[i].content, LlmContent::AssistantWithTools { .. }))
             .collect();
         let eligible = starts.len().saturating_sub(keep.max(1));
-        let mut stubbed = 0;
+        let mut stubbed = Vec::new();
         for round in starts.windows(2).take(eligible) {
             if self.estimate(fixed_chars, messages) <= target {
                 break;
@@ -273,7 +280,7 @@ impl ContextGuard {
                 if let LlmContent::ToolResults(results) = &mut m.content {
                     for r in results.iter_mut().filter(|r| r.content.len() > STUB_MIN_CHARS) {
                         r.content = stub(&r.content, rows.get(&r.tool_use_id).copied());
-                        stubbed += 1;
+                        stubbed.push(r.tool_use_id.clone());
                     }
                 }
             }
@@ -359,8 +366,8 @@ impl ContextGuard {
         } else {
             self.budget.with_window((self.estimate_size(size) * UNREPORTED_WINDOW_PCT / 100).clamp(MIN_WINDOW_TOKENS.min(current), current))
         };
-        let results = self.stub_to(messages, fixed_chars, rows, retry.share(TARGET_PCT), 1);
-        Some(Recovery { window: retry.window, results, learned: self.learned != before })
+        let ids = self.stub_to(messages, fixed_chars, rows, retry.share(TARGET_PCT), 1);
+        Some(Recovery { window: retry.window, results: ids.len(), ids, learned: self.learned != before })
     }
 
     /// The Failed arm of a director request: whether to save what was
@@ -369,8 +376,11 @@ impl ContextGuard {
     /// stub). Otherwise the turn ends with the provider's error, as before.
     pub fn after_failure(&mut self, error: &AppError, messages: &mut [LlmMessage], fixed_chars: usize, rows: &HashMap<String, i64>) -> AfterFailure {
         match self.on_overflow(error, messages, fixed_chars, rows) {
-            Some(r) => AfterFailure { save: r.learned, retry: (r.results > 0).then(|| self.recovery_notice(&r)) },
-            None => AfterFailure { save: false, retry: None },
+            Some(r) => {
+                let retry = (r.results > 0).then(|| self.recovery_notice(&r));
+                AfterFailure { save: r.learned, retry, stubbed: r.ids }
+            }
+            None => AfterFailure { save: false, retry: None, stubbed: Vec::new() },
         }
     }
 
@@ -572,7 +582,7 @@ mod tests {
 
         // Once: the same round failing again ends the turn.
         guard.sent(0, &messages);
-        assert_eq!(guard.after_failure(&too_long, &mut messages, 0, &rows(8)), AfterFailure { save: false, retry: None });
+        assert_eq!(guard.after_failure(&too_long, &mut messages, 0, &rows(8)), AfterFailure { save: false, retry: None, stubbed: vec![] });
         // An answered round may recover again later.
         assert!(guard.observed(&response(60_000)));
         messages.extend(round(&["t7"], &[60_000], false));
@@ -588,7 +598,7 @@ mod tests {
             provider_error(ProviderErrorKind::RateLimit, "prompt is too long"),
             AppError::Other("prompt is too long".into()),
         ] {
-            assert_eq!(fresh.after_failure(&e, &mut messages, 0, &rows(8)), AfterFailure { save: false, retry: None }, "{e}");
+            assert_eq!(fresh.after_failure(&e, &mut messages, 0, &rows(8)), AfterFailure { save: false, retry: None, stubbed: vec![] }, "{e}");
         }
 
         // A window lowered from another catalog window no longer applies.
