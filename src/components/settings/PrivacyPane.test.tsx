@@ -87,7 +87,7 @@ describe("PrivacyPane", () => {
  *  the owner to approve at merge). */
 const APPROVED_INVENTORY = [
   "Stored on this Mac: projects, workspaces, chats, tool executions, Direct runs, token usage — in ~/Library/Application Support/octopush/octopush.db. Runs and custom pipelines leave it only if you turn on sync.",
-  "API keys: stored in ~/.octopush/settings.json. MCP servers you add in Settings: ~/.claude/mcp.json. A Token sign-in, an OAuth client secret and the values you mark Keep in Keychain go to the macOS Keychain, and mcp-remote keeps a browser sign-in in ~/.mcp-auth. A project's own .claude/mcp.json stays as written. Your account session lives in the macOS Keychain too.",
+  "API keys: stored in ~/.octopush/settings.json. MCP servers you add in Settings: ~/.claude/mcp.json. A Token sign-in, an OAuth client secret, the values you mark Keep in Keychain and your Epiku token go to the macOS Keychain, and mcp-remote keeps a browser sign-in in ~/.mcp-auth. A project's own .claude/mcp.json stays as written. Your account session lives in the macOS Keychain too.",
   "Outbound traffic, only to:" +
     "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models." +
     "Clerk for sign-in and Dodo Payments for checkout, when you use your account." +

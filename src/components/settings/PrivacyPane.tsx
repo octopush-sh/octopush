@@ -77,8 +77,8 @@ export function PrivacyPane() {
           <span className={LEAD_IN_CLASS}>API keys:</span> stored in{" "}
           <code className={PATH_CHIP_CLASS}>~/.octopush/settings.json</code>. MCP servers you add in
           Settings: <code className={PATH_CHIP_CLASS}>~/.claude/mcp.json</code>. A Token sign-in, an
-          OAuth client secret and the values you mark Keep in Keychain go to the macOS Keychain, and
-          mcp-remote keeps a browser sign-in in{" "}
+          OAuth client secret, the values you mark Keep in Keychain and your Epiku token go to the macOS
+          Keychain, and mcp-remote keeps a browser sign-in in{" "}
           <code className={PATH_CHIP_CLASS}>~/.mcp-auth</code>. A project's own{" "}
           <code className={PATH_CHIP_CLASS}>.claude/mcp.json</code> stays as written. Your account
           session lives in the macOS Keychain too.
