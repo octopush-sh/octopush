@@ -20,6 +20,17 @@ describe("WorkspaceContextMenu", () => {
     onClose: vi.fn(),
   };
 
+  it("offers Start after… only when wired, and it opens the dialog", () => {
+    const { unmount } = render(<WorkspaceContextMenu {...baseProps} />);
+    expect(screen.queryByText("Start after…")).toBeNull();
+    unmount();
+    const onStartAfter = vi.fn();
+    render(<WorkspaceContextMenu {...baseProps} onStartAfter={onStartAfter} />);
+    fireEvent.click(screen.getByText("Start after…"));
+    expect(onStartAfter).toHaveBeenCalled();
+    expect(baseProps.onClose).toHaveBeenCalled();
+  });
+
   it("renders reach-on-disk, Customize, and Delete rows", () => {
     render(<WorkspaceContextMenu {...baseProps} />);
     expect(screen.getByText(/Reveal in Finder/)).toBeInTheDocument();

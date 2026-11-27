@@ -26811,6 +26811,31 @@ mod prerequisite_tests {
     }
 
     #[test]
+    fn list_returns_the_project_links_of_active_missions_only() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        seed_workspace(&db, "p2", "x2");
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", false, true).unwrap();
+        link(&db, "w3", "w2");
+        link(&db, "x2", "x1");
+
+        let waiting = |db: &Db| -> Vec<(String, String)> {
+            let rows = db.list_workspace_prerequisites("p1").unwrap();
+            rows.into_iter().map(|p| (p.workspace_id, p.after_workspace_id)).collect()
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(waiting(&db), [pair("w2", "w1"), pair("w3", "w2")]);
+        let first = &db.list_workspace_prerequisites("p1").unwrap()[0];
+        assert!(first.auto_start && first.after_condition == "pr_merged");
+
+        // An archived mission keeps its link, but it waits on nothing now.
+        db.archive_workspace("w3").unwrap();
+        assert_eq!(waiting(&db), [pair("w2", "w1")]);
+        assert!(db.list_workspace_prerequisites("nope").unwrap().is_empty());
+    }
+
+    #[test]
     fn deleting_a_prerequisite_clears_the_links_to_it() {
         let db = seeded();
         db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
@@ -30709,5 +30734,103 @@ mod crew_report_tests {
         assert_eq!(next_lighter_tier(&router, "claude-sonnet-5-5").as_deref(), Some("claude-haiku-5-5"));
         assert_eq!(next_lighter_tier(&router, "claude-haiku-5-5"), None);
         assert_eq!(next_lighter_tier(&router, "not-a-model"), None);
+    }
+}
+
+/// A Talk thread's generated title (#1137): the fast tier it runs on stays on
+/// the conversation's provider, and its spend lands on the thread as origin
+/// `title`.
+#[cfg(test)]
+mod chat_title_tests {
+    use crate::commands::{bill_title_reply, fast_model_on_provider, record_title_spend, TITLE_ORIGIN};
+    use crate::db::Db;
+    use crate::providers::{LlmResponse, LlmStopReason};
+    use crate::provider_router::{builtin_providers, ProviderRouter};
+    use crate::token_engine::{TokenEngine, TokenEvent};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn tiers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn the_title_runs_on_the_fast_tier_of_the_conversations_own_provider() {
+        let router = ProviderRouter::from_map(builtin_providers());
+        // Unmapped: the provider's current haiku.
+        let fast = fast_model_on_provider(&router, "claude-opus-5-5", &HashMap::new()).unwrap();
+        assert!(fast.contains("haiku"), "{fast}");
+        // A mapped fast tier on the same provider wins.
+        let mapped = tiers(&[("fast", "claude-sonnet-5-5")]);
+        assert_eq!(fast_model_on_provider(&router, "claude-opus-5-5", &mapped).as_deref(), Some("claude-sonnet-5-5"));
+        // A fast tier on another provider is never used: the title would go
+        // somewhere the conversation doesn't.
+        let elsewhere = tiers(&[("fast", "gpt-4o-mini")]);
+        let fast = fast_model_on_provider(&router, "claude-opus-5-5", &elsewhere).unwrap();
+        assert!(fast.contains("haiku"), "{fast}");
+        // Auto reads as the strong tier's provider.
+        let auto = tiers(&[("strong", "claude-opus-5-5"), ("fast", "claude-sonnet-5-5")]);
+        assert_eq!(fast_model_on_provider(&router, "auto", &auto).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(fast_model_on_provider(&router, "auto", &HashMap::new()), None);
+        // No fast tier on the provider, or an unknown model: no title call.
+        assert_eq!(fast_model_on_provider(&router, "gpt-6.2-astra", &HashMap::new()), None);
+        assert_eq!(fast_model_on_provider(&router, "not-a-model", &HashMap::new()), None);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_title_call_is_billed_to_its_thread_as_origin_title() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        let ev = |model: &str, cost: f64| TokenEvent {
+            id: None,
+            session_id: "ws-1".into(),
+            timestamp: String::new(),
+            input_tokens: 400,
+            output_tokens: 12,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            model: model.into(),
+            cost_usd: cost,
+        };
+        record_title_spend(&engine, "t-1", ev("claude-haiku-5-5", 0.0005)).unwrap();
+        let c = db.lock().thread_cost("t-1", None).unwrap();
+        assert_eq!(c.calls, 1);
+        assert!((c.spent_usd - 0.0005).abs() < 1e-12, "{}", c.spent_usd);
+        assert_eq!(c.subagents_usd, 0.0);
+        // The row carries the origin (read back through an unpriced row).
+        record_title_spend(&engine, "t-1", ev("mystery-title-model", 0.0)).unwrap();
+        let rows = db.lock().reprice_candidates(false).unwrap();
+        let row = rows.iter().find(|r| r.model == "mystery-title-model").unwrap();
+        assert_eq!((row.surface.as_str(), row.origin.as_deref()), ("talk", Some(TITLE_ORIGIN)));
+        assert_eq!(TITLE_ORIGIN, "title");
+        assert!(row.single_request());
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_truncated_title_reply_is_still_billed_and_kept() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        let resp = LlmResponse {
+            text: "GUIDE-123 · Waive virtualenv findings\nBecause the".into(),
+            stop_reason: LlmStopReason::MaxTokens,
+            input_tokens: 400,
+            output_tokens: 64,
+            ..Default::default()
+        };
+        let title = bill_title_reply(&engine, "t-2", "ws-1", "claude-haiku-5-5".into(), resp);
+        assert!(title.text.starts_with("GUIDE-123 · Waive virtualenv findings"), "{}", title.text);
+        assert_eq!(title.model, "claude-haiku-5-5");
+        let c = db.lock().thread_cost("t-2", None).unwrap();
+        assert_eq!(c.calls, 1);
+        assert!((c.spent_usd - title.cost_usd).abs() < 1e-12, "{} vs {}", c.spent_usd, title.cost_usd);
     }
 }

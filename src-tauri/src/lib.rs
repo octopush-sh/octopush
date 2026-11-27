@@ -240,6 +240,7 @@ pub fn run() {
             commands::set_items_group,
             commands::set_workspace_prerequisite,
             commands::clear_workspace_prerequisite,
+            commands::list_workspace_prerequisites,
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,
@@ -475,6 +476,7 @@ pub fn run() {
             commands::save_issue_tracker_config,
             // AI primitive (G5)
             commands::ai_complete,
+            commands::generate_chat_title,
             // MCP server integration (Connect to Claude Code)
             commands::mcp_connection_status,
             commands::connect_claude_code,

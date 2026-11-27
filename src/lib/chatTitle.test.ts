@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { deriveChatTitle, deriveChatMeta } from "./chatTitle";
+import { deriveChatTitle, deriveChatMeta, shortUrl, ticketKey } from "./chatTitle";
 import type { ChatMessage } from "./types";
 
 function msg(
@@ -57,6 +57,78 @@ describe("deriveChatTitle", () => {
     expect(deriveChatTitle([msg("user", "line one\n\nline two")])).toBe(
       "line one line two",
     );
+  });
+
+  it("drops a /skill token and reads a tracker URL as its ticket key", () => {
+    expect(
+      deriveChatTitle([msg("user", "/ship-ticket https://acme.atlassian.net/browse/GUIDE-123")]),
+    ).toBe("GUIDE-123");
+    expect(
+      deriveChatTitle([msg("user", "/review-pr please look at https://linear.app/acme/issue/ENG-42/fix-login")]),
+    ).toBe("please look at ENG-42");
+  });
+
+  it("reads any other URL as its host and path tail", () => {
+    expect(deriveChatTitle([msg("user", "why does https://github.com/acme/api/pull/918 fail?")])).toBe(
+      "why does github.com/…/pull/918 fail?",
+    );
+    expect(deriveChatTitle([msg("user", "see https://www.example.com/docs")])).toBe("see example.com/docs");
+    expect(deriveChatTitle([msg("user", "open https://example.com/")])).toBe("open example.com");
+  });
+
+  it("leaves paths alone, but drops @file mentions and fenced code", () => {
+    expect(deriveChatTitle([msg("user", "run /usr/bin/env in @src/lib/a.ts now")])).toBe(
+      "run /usr/bin/env in now",
+    );
+    expect(deriveChatTitle([msg("user", 'compare @"docs/my notes.md" and\n```ts\nconst a = 1;\n```\nfix it')])).toBe(
+      "compare and fix it",
+    );
+  });
+
+  it("titles from what was typed, not the @ blocks appended to it", () => {
+    const typed = "explain this file ";
+    const block = "\n\nsrc/a.ts\n```ts\nexport const secretSauce = 42;\n```";
+    const m = msg("user", typed + block);
+    m.contextBlocks = JSON.stringify([
+      { token: "src/a.ts", kind: "file", label: "a.ts", tokens: 9, start: typed.length, end: typed.length + block.length },
+    ]);
+    expect(deriveChatTitle([m])).toBe("explain this file");
+  });
+
+  it("keeps a message that is only a skill readable", () => {
+    expect(deriveChatTitle([msg("user", "/standup")])).toBe("/standup");
+  });
+
+  it("cuts a long message at a word boundary after tidying it", () => {
+    const out = deriveChatTitle([
+      msg("user", `/ship-ticket ${"word ".repeat(30)}https://example.com/a`),
+    ]);
+    expect(out.startsWith("word word")).toBe(true);
+    expect(out.endsWith("word…")).toBe(true);
+  });
+});
+
+describe("ticketKey", () => {
+  it("finds a key in a tracker URL first, then in the text", () => {
+    expect(ticketKey("look at OPS-9 and https://acme.atlassian.net/browse/GUIDE-123")).toBe("GUIDE-123");
+    expect(ticketKey("https://acme.atlassian.net/jira/software/projects/G/boards/1?selectedIssue=GUIDE-7")).toBe("GUIDE-7");
+    expect(ticketKey("fix GUIDE-123 today")).toBe("GUIDE-123");
+  });
+
+  it("doesn't take standards or versions for keys", () => {
+    expect(ticketKey("read it as UTF-8 and hash with SHA-256")).toBeNull();
+    expect(ticketKey("bump to ABC-1.2")).toBeNull();
+    expect(ticketKey("nothing here")).toBeNull();
+  });
+});
+
+describe("shortUrl", () => {
+  it("decodes the path tail", () => {
+    expect(shortUrl("https://example.com/a/b/my%20page")).toBe("example.com/…/b/my page");
+  });
+
+  it("drops trailing punctuation", () => {
+    expect(shortUrl("https://example.com/docs.")).toBe("example.com/docs");
   });
 });
 

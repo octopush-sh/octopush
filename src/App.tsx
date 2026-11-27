@@ -13,6 +13,7 @@ import { WorkspaceCustomizeMenu } from "./components/WorkspaceCustomizeMenu";
 import { MissionCreator } from "./components/MissionCreator";
 import { WorkspaceContextMenu } from "./components/WorkspaceContextMenu";
 import { RenameDialog } from "./components/RenameDialog";
+import { StartsAfterDialog } from "./components/StartsAfterDialog";
 import { ProjectContextMenu } from "./components/ProjectContextMenu";
 import { ProjectCustomizeMenu } from "./components/ProjectCustomizeMenu";
 import { ArchivedWorkspacesModal } from "./components/ArchivedWorkspacesModal";
@@ -78,6 +79,7 @@ import { useProjectStore } from "./stores/projectStore";
 import { useCollisionStore } from "./stores/collisionStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useMissionsStore } from "./stores/missionsStore";
+import { setPrerequisiteOpener, usePrerequisitesStore } from "./stores/prerequisitesStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
@@ -103,7 +105,8 @@ import {
 import type { Group } from "./lib/types";
 import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
-import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
+import { deriveChatTitle, deriveChatMeta, formatRelTime, isPlaceholderTitle } from "./lib/chatTitle";
+import { titleFailureToast } from "./lib/chatTitleGen";
 import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
@@ -443,6 +446,8 @@ function App() {
   const [creatorGroupId, setCreatorGroupId] = useState<string | null>(null);
   const [customizingWorkspaceId, setCustomizingWorkspaceId] = useState<string | null>(null);
   const [renamingWorkspace, setRenamingWorkspace] = useState<{ id: string; name: string } | null>(null);
+  // "Start after…" (#960): the mission whose wait the dialog edits.
+  const [startsAfterFor, setStartsAfterFor] = useState<string | null>(null);
   // When the user opens NewProjectFlow from the switcher (not from the welcome
   // screen), we render it as an overlay on top of the current project — the
   // !project early-return path doesn't fire and the create/clone form needs to
@@ -769,6 +774,7 @@ function App() {
     // that already point at it.
     void useGroupsStore.getState().load();
     void useMissionsStore.getState().loadAll(ids);
+    void usePrerequisitesStore.getState().load(ids);
     const pathById = new Map<string, string>();
     recentProjects.forEach((p) => pathById.set(p.id, p.path));
     if (project) pathById.set(project.id, project.path);
@@ -812,6 +818,7 @@ function App() {
       void loadAllWorkspaces([...byId.keys()]);
       void useGroupsStore.getState().load();
       void useMissionsStore.getState().loadAll([...byId.keys()]);
+      void usePrerequisitesStore.getState().load([...byId.keys()]);
       byId.forEach((path, id) => {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
@@ -1057,6 +1064,9 @@ function App() {
         .catch(() => {
           // Network / auth errors are non-fatal — just leave the chip hidden.
         });
+      // "Starts after" (#960) rides the same cadence: a prerequisite's
+      // merged PR or finished run starts the mission waiting on it.
+      void usePrerequisitesStore.getState().check();
     };
     fetchPr();
     const id = setInterval(fetchPr, 60_000);
@@ -1176,6 +1186,15 @@ function App() {
     (id: string, title: string) => {
       if (!activeWorkspaceId) return;
       void useChatStore.getState().renameThread(activeWorkspaceId, id, title).catch(console.error);
+    },
+    [activeWorkspaceId],
+  );
+
+  const handleRegenerateTitle = useCallback(
+    async (id: string) => {
+      if (!activeWorkspaceId) return;
+      const failure = await useChatStore.getState().regenerateTitle(activeWorkspaceId, id);
+      if (failure) pushToast({ level: "info", ...titleFailureToast(failure) });
     },
     [activeWorkspaceId],
   );
@@ -1544,7 +1563,9 @@ function App() {
           const msgs = activeWsPrimaryMessages ?? [];
           return {
             id: t.id,
-            title: deriveChatTitle(msgs) || t.title,
+            // The stored title (derived at the first send, then generated or
+            // set by the user); derived live only while it's the placeholder.
+            title: isPlaceholderTitle(t.title) && msgs.length > 0 ? deriveChatTitle(msgs) : t.title,
             meta: deriveChatMeta(msgs, tickerNow),
             pinned: t.pinned,
           };
@@ -1563,6 +1584,7 @@ function App() {
         onNewChat: handleNewChat,
         onDeleteChat: handleDeleteChat,
         onRenameChat: handleRenameChat,
+        onRegenerateTitle: handleRegenerateTitle,
         onExportChat: handleExportChat,
         onPinChat: handlePinChat,
         streamingChatIds: streamingThreadIds,
@@ -1573,6 +1595,7 @@ function App() {
       activeThreadId,
       handleSelectChat,
       handleNewChat,
+      handleRegenerateTitle,
       handleDeleteChat,
       handleRenameChat,
       handleExportChat,
@@ -1896,6 +1919,9 @@ function App() {
     },
     [handleSelectWorkspace],
   );
+
+  // A mission whose prerequisite is met opens on its Direct surface from the toast.
+  useEffect(() => setPrerequisiteOpener(handleJumpToRun), [handleJumpToRun]);
 
   // The menu bar Octo (#718): a crew chosen in its menu. Rust has shown the
   // window; close whatever covers the canvas, then land on the crew's Direct
@@ -2960,6 +2986,19 @@ function App() {
         </ErrorBoundary>
       )}
 
+      {(() => {
+        const list = startsAfterFor ? Object.values(workspacesByProjectId).find((l) => l.some((w) => w.id === startsAfterFor)) : undefined;
+        const waiting = list?.find((w) => w.id === startsAfterFor);
+        const close = () => setStartsAfterFor(null);
+        return list && waiting ? (
+          <ErrorBoundary surface="Start after" variant="overlay" onDismiss={close}>
+          <ModalShell onClose={close} ariaLabel="Start after">
+            <StartsAfterDialog workspace={waiting} candidates={list.filter((w) => w !== waiting)} onClose={close} />
+          </ModalShell>
+          </ErrorBoundary>
+        ) : null;
+      })()}
+
       {/* Session switcher (⌘⌥K / the session line). Available with zero
           sessions too — its last row opens one, which is exactly what an empty
           workspace needs. */}
@@ -3339,6 +3378,7 @@ function App() {
             onMoveToGroup={(groupId) => void moveMissionToGroup(workspace.id, groupId)}
             onNewGroup={() => void createMissionGroup(workspace.projectId, workspace.id)}
             onRemoveFromGroup={() => void moveMissionToGroup(workspace.id, null)}
+            onStartAfter={isMain ? undefined : () => setStartsAfterFor(workspace.id)}
           />
           </ErrorBoundary>
         );
