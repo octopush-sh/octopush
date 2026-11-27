@@ -2173,7 +2173,7 @@ export { CHAT_AGENT_LOG_EVENT } from "./agentTools";
 export interface SubagentTypeMeta {
   name: string;
   description: string;
-  /** "project" or "user". */
+  /** "project", "user" or "builtin". */
   source: string;
   /** Workspace tool names the sub-agent is limited to; null = the full set. */
   tools: string[] | null;

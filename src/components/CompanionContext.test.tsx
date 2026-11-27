@@ -24,6 +24,8 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       listMcpServerStatus: (...a: unknown[]) => listMcpServerStatus(...a),
       listProjectInstructions: (...a: unknown[]) => listProjectInstructions(...a),
       getThreadMcpDisabled: () => Promise.resolve([]),
+      listSkills: () => Promise.resolve([]),
+      listSubagentTypes: () => Promise.resolve([]),
     },
   };
 });
