@@ -856,6 +856,11 @@ pub(crate) struct CommandWord {
     /// The word with quotes removed and nothing dropped (`--method=POST`
     /// whole), for checks that read flags (`permissions::remote_effect`).
     pub word: String,
+    /// Its command reads its input from a pipe or a `<` redirection
+    /// (`permissions`' ship-nothing check).
+    pub stdin: bool,
+    /// Its command reads its input from a here-document or a here-string.
+    pub inline: bool,
 }
 
 /// The words of one command line as the path check reads them (#1201): a
@@ -913,6 +918,10 @@ struct Lexer {
     heredocs: Vec<(String, bool)>,
     /// Lexing a here-document's body: every word is `Data`.
     data: bool,
+    /// The current command reads its input from a pipe or `<` ([`CommandWord::stdin`]).
+    stdin: bool,
+    /// The current command reads its input from a here-document or a here-string.
+    inline: bool,
 }
 
 impl Lexer {
@@ -946,6 +955,8 @@ impl Lexer {
                 ';' | '(' | ')' | '|' => {
                     self.i += if c == '|' && matches!(next, Some('|' | '&')) { 2 } else { 1 };
                     self.next_segment();
+                    // `|` and `|&` feed the next command; `||` doesn't.
+                    self.stdin = c == '|' && next != Some('|');
                 }
                 '&' if next == Some('>') => {
                     self.finish();
@@ -1005,6 +1016,22 @@ impl Lexer {
         self.segment += 1;
         self.started = false;
         self.target = None;
+        self.stdin = false;
+        self.inline = false;
+    }
+
+    /// The current command reads its input from a pipe or a file
+    /// (`inline`: a here-document or a here-string), its words already
+    /// read included (`bash < script.sh`).
+    fn feeds(&mut self, inline: bool) {
+        let segment = self.segment;
+        let mark = |w: &mut CommandWord| if inline { w.inline = true } else { w.stdin = true };
+        self.out.iter_mut().rev().take_while(|w| w.segment == segment).for_each(mark);
+        if inline {
+            self.inline = true;
+        } else {
+            self.stdin = true;
+        }
     }
 
     fn finish(&mut self) {
@@ -1040,6 +1067,8 @@ impl Lexer {
             writes: target == Some(true),
             redirect: target.is_some(),
             word: crate::talk_guard::unescape(&w.pattern),
+            stdin: self.stdin,
+            inline: self.inline,
         });
     }
 
@@ -1057,6 +1086,7 @@ impl Lexer {
                 return;
             }
             ('<', Some('<')) => {
+                self.feeds(true);
                 self.i += 1;
                 if self.peek() == Some('<') {
                     self.i += 1;
@@ -1072,6 +1102,9 @@ impl Lexer {
             _ => {}
         }
         let writes = c == '>' || self.s.get(self.i - 1) == Some(&'>');
+        if c == '<' {
+            self.feeds(false);
+        }
         if self.peek() == Some('&') {
             self.i += 1;
             // `>&2`, `<&-`: an fd, not a word.
