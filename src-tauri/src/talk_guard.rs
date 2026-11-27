@@ -1070,7 +1070,6 @@ impl Reach {
         let kind = if first.as_ref().is_some_and(|r| r.config) { CardKind::Config } else { CardKind::Run };
         let (reason, denial, sensitive, grant) = match (first, scan.over, scan.outside) {
             (Some(r), ..) | (None, false, Some(r)) => (
-                if r.runs_code { CardKind::Config } else { CardKind::Run },
                 r.reason(&format!("reaches {}", r.shown)),
                 format!(
                     "Command not run \u{2014} the user declined to let it reach {}, {}. \
@@ -1085,7 +1084,6 @@ impl Reach {
                 },
             ),
             (None, true, _) => (
-                CardKind::Run,
                 format!("names more paths than the check reads (over {MAX_COMMAND_PATHS}, or {MAX_COMMAND_WORDS} words)"),
                 "Command not run \u{2014} it names more paths than the check reads, and the user declined it. \
                  Split it into smaller commands, or ask the user how to proceed; do not retry it."
