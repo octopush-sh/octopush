@@ -2319,6 +2319,46 @@ pub async fn list_mcp_server_status(
     Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
 }
 
+/// The servers a worktree's own `.claude/mcp.json` defines and where each
+/// stands (#1245): approved, waiting for approval, changed since, or
+/// clashing with a Settings server. Spawns nothing.
+#[tauri::command]
+pub async fn list_project_mcp_servers(
+    state: State<'_, AppState>,
+    workspace_path: String,
+) -> AppResult<Vec<crate::mcp::approval::ProjectServer>> {
+    let mcp = Arc::clone(&state.chat.mcp);
+    let listed = tokio::task::spawn_blocking(move || mcp.project_servers(std::path::Path::new(&workspace_path))).await;
+    listed.map_err(|e| AppError::Other(e.to_string()))
+}
+
+/// Every approved project server, for Settings › Integrations.
+#[tauri::command]
+pub async fn list_project_mcp_approvals(state: State<'_, AppState>) -> AppResult<Vec<crate::db::ProjectMcpApproval>> {
+    state.db.lock().list_project_mcp_approvals()
+}
+
+/// Revoke a project server's approval (by its project, or a worktree of
+/// it) and stop the server, so it waits for approval again.
+#[tauri::command]
+pub async fn revoke_project_mcp_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    project_id: Option<String>,
+    workspace_path: Option<String>,
+) -> AppResult<bool> {
+    let project = match (project_id, workspace_path) {
+        (Some(p), _) => Some(p),
+        (None, Some(w)) => state.db.lock().project_id_for_worktree(&w)?,
+        (None, None) => None,
+    };
+    let project = project.ok_or_else(|| AppError::Other("No project to revoke the server in.".into()))?;
+    let had = crate::mcp::approval::revoke(&state.db, &state.chat.mcp, &project, &server).map_err(AppError::Other)?;
+    let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ());
+    Ok(had)
+}
+
 /// The instruction files Talk and its sub-agents follow in a worktree (its
 /// CLAUDE.md chain, or AGENTS.md), with the tokens each adds, for the
 /// Companion's "follows" row. Reads only.

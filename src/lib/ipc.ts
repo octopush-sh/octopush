@@ -638,6 +638,8 @@ import type {
   McpToolInfo,
   McpServerConfig,
   McpServerStatus,
+  ProjectMcpServer,
+  ProjectMcpApproval,
   InstructionList,
   CreateSessionArgs,
   DirectoryEntry,
@@ -1162,6 +1164,15 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The worktree's own `.claude/mcp.json` servers and where each stands
+   *  (#1245). Spawns nothing. */
+  listProjectMcpServers: (workspacePath: string) =>
+    invoke<ProjectMcpServer[]>("list_project_mcp_servers", { workspacePath }),
+  listProjectMcpApprovals: () => invoke<ProjectMcpApproval[]>("list_project_mcp_approvals"),
+  /** Revoke a project server's approval and stop it; by project id, or by a
+   *  worktree of the project. */
+  revokeProjectMcpServer: (server: string, where: { projectId: string } | { workspacePath: string }) =>
+    invoke<boolean>("revoke_project_mcp_server", { server, ...where }),
   /** The instruction files Talk follows in a worktree (its CLAUDE.md chain,
    *  or AGENTS.md), each with its token estimate, and how many skipped files
    *  weren't listed. Reads only. */
