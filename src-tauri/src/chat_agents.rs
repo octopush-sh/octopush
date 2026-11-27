@@ -243,6 +243,9 @@ pub struct AgentOutcome {
     /// after its first ending; the report is the continuation's.
     #[serde(default)]
     pub continued: bool,
+    /// Stop on the turn ended the run before it reported ([`mark_stopped`]).
+    #[serde(default)]
+    pub stopped: bool,
     /// The conversation as the loop left it — what a continuation resumes
     /// from (for a blocked run, INCLUDING the asking turn). Persisted in
     /// `chat_agent_runs`, never on the tool row.
@@ -290,6 +293,29 @@ impl AgentOutcome {
             self.attempts.clone()
         }
     }
+}
+
+/// Whether Stop ended `o` (`cancelled`: the turn's flag as the run ended):
+/// it neither answered nor stopped on a question. A run that finished
+/// before Stop keeps its report.
+pub fn was_stopped(o: &AgentOutcome, cancelled: bool) -> bool {
+    cancelled && !o.finished && !o.blocked
+}
+
+/// Mark a run Stop ended (#1148): it failed, reads as stopped, and its
+/// report says so instead of a turn limit it never hit. Its transcript stays,
+/// so it can be continued.
+pub fn mark_stopped(o: &mut AgentOutcome) {
+    o.stopped = true;
+    o.ok = false;
+    let calls = match o.tool_calls {
+        1 => "1 tool call".to_string(),
+        n => format!("{n} tool calls"),
+    };
+    o.report = format!(
+        "Sub-agent stopped: the user stopped the turn after {calls}, before it reported. \
+         Nothing it found is in this report; delegate again if the work is still needed."
+    );
 }
 
 /// Map a finished loop to the report the parent receives. Pure, so the exact
@@ -1131,6 +1157,7 @@ pub async fn run_subagent_core(
         duration_ms: started.elapsed().as_millis() as u64,
         tool_calls: out.tool_calls.len(),
         continued: spec.resume.is_some(),
+        stopped: false,
         ask_tool_use_id: out.blocked_transcript.as_ref().map(|b| b.ask_tool_use_id.clone()).unwrap_or_default(),
         transcript: match out.blocked_transcript {
             Some(b) => b.messages,
@@ -1423,6 +1450,9 @@ pub async fn run_one_subagent(
         }
     }
     outcome.tier = tier_for_outcome(spec, &outcome.model, tiers);
+    if was_stopped(&outcome, cancel.load(Ordering::Relaxed)) {
+        mark_stopped(&mut outcome);
+    }
     persist_run(&db, &planned, &outcome);
     outcome
 }
@@ -2545,6 +2575,7 @@ mod tests {
         assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
     }
 
+<<<<<<< HEAD
     /// Answers its scripted turns, then fails every request with an error
     /// that is not retried (a context 400). Panics past `max_calls`, so a
     /// loop that never stops fails the test instead of hanging it.
@@ -2706,6 +2737,53 @@ mod tests {
         assert_eq!(budget_share(Some(3.0), 3), Some(1.0), "the headroom is split across the fan-out");
         assert_eq!(budget_share(Some(-1.0), 2), Some(0.0), "a spent budget leaves nothing");
         assert_eq!(budget_share(Some(1.0), 0), Some(1.0));
+||||||| f60356b3
+=======
+    #[tokio::test]
+    async fn stopped_subagent_reads_as_stopped_and_keeps_its_transcript() {
+        // Stop landed before the sub-agent's next round (#1148).
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::new()) };
+        let spec = SubagentSpec {
+            call_id: "call-7".into(),
+            call: parse_agent_call(&serde_json::json!({"description": "Explore", "prompt": "Map the crate."})).unwrap(),
+            workspace_id: "ws".into(),
+            thread_id: "th".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(),
+            max_iterations: None,
+            max_tokens: 4096,
+            sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(true));
+        let mut out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(!out.finished && !out.blocked);
+        assert!(!out.transcript.is_empty(), "a stopped run leaves a transcript to continue from");
+        assert!(was_stopped(&out, true));
+        mark_stopped(&mut out);
+        assert!(out.stopped && !out.ok);
+        assert!(out.report.starts_with("Sub-agent stopped: the user stopped the turn after 0 tool calls"), "{}", out.report);
+        assert!(!out.report.contains("turn limit"), "it never hit one");
+        let meta = serde_json::to_value(&out).unwrap();
+        assert_eq!(meta["stopped"], true);
+
+        // A run that reported, or stopped on a question, before Stop keeps
+        // its ending; without Stop nothing is marked.
+        let finished = AgentOutcome { ok: true, finished: true, ..AgentOutcome::default() };
+        assert!(!was_stopped(&finished, true));
+        assert!(!was_stopped(&AgentOutcome { blocked: true, ..AgentOutcome::default() }, true));
+        assert!(!was_stopped(&AgentOutcome::default(), false));
+        let mut one = AgentOutcome { tool_calls: 1, ..AgentOutcome::default() };
+        mark_stopped(&mut one);
+        assert!(one.report.contains("after 1 tool call,"), "{}", one.report);
+>>>>>>> origin/main
     }
 
     /// A sub-agent's `run_command` gets the PATH CLI stages spawn with (#1087).

@@ -157,6 +157,22 @@ describe("CrewCard — rendering", () => {
     render(<CrewCard workspaceId="ws" agents={crewAgentsFromTools([resolved(1, "c1", true, { closedAtCap: true })])} />);
     expect(screen.getByText("turn limit")).toBeInTheDocument();
   });
+
+  it("a sub-agent Stop ended reads as stopped, beside the ones that reported", () => {
+    render(
+      <CrewCard
+        workspaceId="ws"
+        agents={crewAgentsFromTools([
+          resolved(1, "c1"),
+          resolved(2, "c2", false, { finished: false, stopped: true }),
+        ])}
+      />,
+    );
+    const rows = screen.getAllByTestId("crew-row");
+    expect(rows[1]).toHaveAttribute("data-status", "failed");
+    expect(rows[1]).toHaveTextContent("stopped");
+    expect(rows[0]).not.toHaveTextContent("stopped");
+  });
 });
 
 describe("CrewCard — what the run is on, from the first second", () => {

@@ -487,6 +487,25 @@ fn tool_row(call_id: &str, tool_name: &str, tool_input: serde_json::Value, resul
     record
 }
 
+/// Put a sub-agent's meta on its tool row (`agent` key): what the card's
+/// collapsed summary shows (tokens, cost, ending). The report already sits
+/// in `result`.
+fn attach_agent_meta(record: &mut serde_json::Value, meta: &AgentOutcome) {
+    let mut m = serde_json::to_value(meta).unwrap_or_default();
+    if let Some(obj) = m.as_object_mut() {
+        obj.remove("report");
+    }
+    record["agent"] = m;
+}
+
+/// Whether a call of a round Stop landed in is still persisted and fed back
+/// (#1148): a sub-agent whose outcome the fan-out holds (it reported, or
+/// was stopped), since its report and spend are real. Every other call not
+/// started yet is skipped.
+fn kept_after_stop(tool_name: &str, has_outcome: bool) -> bool {
+    is_agent_tool(tool_name) && has_outcome
+}
+
 /// The exit status bash gives a command it couldn't find.
 const NOT_FOUND_EXIT: i32 = 127;
 
@@ -2969,6 +2988,19 @@ pub fn merge_continued_meta(old: &serde_json::Value, new: &AgentOutcome) -> serd
     m
 }
 
+/// A continued sub-agent's tool row, rewritten in place: the continuation's
+/// report, both runs' meta, and the verdict of how it ended now, so a run
+/// stopped and then let finish no longer reads as stopped.
+fn restamp_continued(record: &mut serde_json::Value, outcome: &AgentOutcome) {
+    let old_meta = record.get("agent").cloned().unwrap_or_else(|| serde_json::json!({}));
+    record["agent"] = merge_continued_meta(&old_meta, outcome);
+    record["result"] = serde_json::Value::String(outcome.report.clone());
+    if let Some(obj) = record.as_object_mut() {
+        obj.remove("reason");
+    }
+    stamp_outcome(record, RowVerdict { ok: outcome.ok, stopped: outcome.stopped, ..RowVerdict::default() });
+}
+
 // ─── Engine ───────────────────────────────────────────────────────
 
 /// Removes a cancel flag from the registry when its turn ends, no matter
@@ -3734,9 +3766,7 @@ impl ChatEngine {
         // meta carries both runs.
         let mut record: serde_json::Value = serde_json::from_str(&row.content)
             .unwrap_or_else(|_| serde_json::json!({ "callId": call_id, "toolName": "Agent" }));
-        let old_meta = record.get("agent").cloned().unwrap_or_else(|| serde_json::json!({}));
-        record["agent"] = merge_continued_meta(&old_meta, &outcome);
-        record["result"] = serde_json::Value::String(outcome.report.clone());
+        restamp_continued(&mut record, &outcome);
         let content = record.to_string();
         self.db.lock().update_chat_message_content(message_id, &content)?;
         let _ = app.emit("chat://message-updated", &MessageUpdatedEvent {
@@ -4794,11 +4824,12 @@ impl ChatEngine {
             // Execute each tool, persist to DB, and collect results.
             let mut tool_results: Vec<LlmToolResult> = Vec::new();
             for u in &response.tool_uses {
-                // Honor a cancel that landed between tools — stop before
-                // kicking off another (possibly long) tool.
-                if cancel.load(Ordering::Relaxed) {
-                    self.finish_stopped(&app, &request.workspace_id, &request.thread_id, &request.model, &usage)?;
-                    return Ok(());
+                // Honor a cancel that landed between tools — never kick off
+                // another (possibly long) tool. A sub-agent the fan-out
+                // already ran is still persisted and fed back (#1148); the
+                // next check of the loop ends the turn as stopped.
+                if cancel.load(Ordering::Relaxed) && !kept_after_stop(&u.name, agent_outcomes.contains_key(&u.id)) {
+                    continue;
                 }
                 tracing::info!(tool = %u.name, "executing tool");
 
@@ -4944,6 +4975,7 @@ impl ChatEngine {
                         ..AgentOutcome::default()
                     });
                     let pair = (outcome.report.clone(), outcome.ok);
+                    interrupted = outcome.stopped;
                     agent_meta = Some(outcome);
                     pair
                 } else if u.name == RECALL_TOOL_NAME {
@@ -5132,13 +5164,7 @@ impl ChatEngine {
                     RowVerdict { ok, denied: was_denied, exit_code: run_command_exit, stopped: interrupted },
                 );
                 if let Some(meta) = &agent_meta {
-                    // Report already sits in `result`; the meta is what the
-                    // card's collapsed summary shows (tokens, cost, ending).
-                    let mut m = serde_json::to_value(meta).unwrap_or_default();
-                    if let Some(obj) = m.as_object_mut() {
-                        obj.remove("report");
-                    }
-                    tool_record["agent"] = m;
+                    attach_agent_meta(&mut tool_record, meta);
                 }
                 // The thread may have been deleted while the turn was parked (a
                 // tool running, or an approval card awaiting the user). Skip the
@@ -5493,6 +5519,96 @@ mod continuation_tests {
         assert_eq!(m["escalatedFrom"], "haiku");
         assert_eq!(m["attempts"].as_array().unwrap().len(), 3);
         assert_eq!(m["inputTokens"], 12);
+    }
+
+    /// The row the tool loop writes for a sub-agent's outcome.
+    fn agent_row(call_id: &str, o: &AgentOutcome) -> serde_json::Value {
+        let mut row = tool_row(
+            call_id,
+            "Agent",
+            serde_json::json!({ "description": call_id }),
+            &o.report,
+            RowVerdict { ok: o.ok, stopped: o.stopped, ..RowVerdict::default() },
+        );
+        attach_agent_meta(&mut row, o);
+        row
+    }
+
+    fn stopped_outcome(tool_calls: usize) -> AgentOutcome {
+        let mut o = AgentOutcome { model: "haiku".into(), tool_calls, cost_usd: 0.02, ..AgentOutcome::default() };
+        crate::chat_agents::mark_stopped(&mut o);
+        o
+    }
+
+    #[test]
+    fn stop_during_fanout_persists_finished_reports() {
+        // Six explorers reported, the seventh was stopped; one read_file of
+        // the same round never started (#1148).
+        let mut outcomes: HashMap<String, AgentOutcome> = (1..=6)
+            .map(|i| (format!("a{i}"), AgentOutcome { report: format!("report {i}"), ok: true, finished: true, ..AgentOutcome::default() }))
+            .collect();
+        outcomes.insert("a7".into(), stopped_outcome(12));
+        let round: Vec<(&str, String)> = (1..=7)
+            .map(|i| ("Agent", format!("a{i}")))
+            .chain([("read_file", "r1".to_string()), ("Task", "lost".to_string())])
+            .collect();
+        let kept: Vec<&str> = round
+            .iter()
+            .filter(|(name, id)| kept_after_stop(name, outcomes.contains_key(id)))
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(kept, vec!["a1", "a2", "a3", "a4", "a5", "a6", "a7"], "every sub-agent with an outcome, nothing else");
+        // Each finished report is on its row, as it passed.
+        let row = agent_row("a3", &outcomes["a3"]);
+        assert_eq!(row["result"], "report 3");
+        assert_eq!((row["ok"].as_bool(), row["outcome"].as_str()), (Some(true), Some("ok")));
+        assert!(row.get("reason").is_none());
+        assert_eq!(row["agent"]["finished"], true);
+        assert!(row["agent"].get("report").is_none(), "the report rides on `result`");
+    }
+
+    #[test]
+    fn stopped_subagent_row_marked_stopped() {
+        let o = stopped_outcome(12);
+        let row = agent_row("a7", &o);
+        assert_eq!((row["ok"].as_bool(), row["outcome"].as_str(), row["reason"].as_str()), (Some(false), Some("failed"), Some("stopped")));
+        assert_eq!(row["agent"]["stopped"], true);
+        assert_eq!(row["agent"]["ok"], false);
+        assert!(row["result"].as_str().unwrap().contains("the user stopped the turn after 12 tool calls"));
+    }
+
+    #[test]
+    fn stopped_fanout_runs_are_continuable() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute("INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)", [&now]).unwrap();
+        db.conn_ref()
+            .execute("INSERT INTO workspaces (id,project_id,name,branch,created_at,last_active) VALUES ('w1','p1','W','main',?1,?1)", [&now])
+            .unwrap();
+        let thread = db.create_chat_thread("w1", "t").unwrap();
+        // The fan-out saved the stopped run; the loop writes its row and links it.
+        db.upsert_chat_agent_run("a7", &thread.id, "w1", "{}", "{\"messages\":[{}],\"askToolUseId\":\"\"}", "haiku").unwrap();
+        let o = stopped_outcome(12);
+        let id = db.insert_chat_message("w1", &thread.id, "tool", &agent_row("a7", &o).to_string(), None, None, None, None).unwrap();
+        db.set_chat_agent_run_message("a7", id).unwrap();
+        // What `continue_subagent` reads first: the run, linked to a live row.
+        let run = db.get_chat_agent_run("a7").unwrap().unwrap();
+        assert_eq!(run.message_id, Some(id));
+        assert!(db.get_chat_message(id).unwrap().is_some());
+
+        // "Let it finish": the rewritten row no longer reads as stopped.
+        let mut record: serde_json::Value = serde_json::from_str(&db.get_chat_message(id).unwrap().unwrap().content).unwrap();
+        let done = AgentOutcome { report: "full map".into(), ok: true, finished: true, model: "haiku".into(), continued: true, ..AgentOutcome::default() };
+        restamp_continued(&mut record, &done);
+        assert_eq!(record["result"], "full map");
+        assert_eq!((record["ok"].as_bool(), record["outcome"].as_str()), (Some(true), Some("ok")));
+        assert!(record.get("reason").is_none());
+        assert_eq!(record["agent"]["stopped"], false);
+        assert_eq!(record["agent"]["toolCalls"], 12, "both runs' figures");
+        // Stopped again, it says so again.
+        restamp_continued(&mut record, &stopped_outcome(3));
+        assert_eq!(record["reason"], "stopped");
     }
 
     #[test]
