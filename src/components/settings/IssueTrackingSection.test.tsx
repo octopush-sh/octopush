@@ -54,6 +54,8 @@ describe("IssueTrackingSection — Epiku", () => {
     expect(await screen.findByText("Connected · 2 stories")).toBeInTheDocument();
     expect(ipcMock.saveEpikuConfig).toHaveBeenCalledWith(view.baseUrl, view.project, "epk_sample");
     expect(screen.getByLabelText("Epiku token")).toHaveValue("");
+    // "Forget this connection" appears with the shared fade primitive.
+    expect(screen.getByRole("button", { name: "Forget this connection" })).toHaveClass("octo-fade-in");
   });
 
   it("checks a saved connection on open, says why it failed, and keeps the saved token on a blank save", async () => {

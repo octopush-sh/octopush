@@ -481,7 +481,7 @@ function EpikuDetail({ connection, onConfigSaved }: {
             <button
               type="button"
               onClick={() => void handleForget()}
-              className="rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory"
+              className="octo-fade-in rounded-md border border-octo-border-strong px-3 py-2 font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory"
             >
               Forget this connection
             </button>
