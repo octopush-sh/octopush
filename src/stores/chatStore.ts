@@ -183,17 +183,22 @@ export interface PendingApproval {
   /** A command's read outside the workspace (#1201): the folder "Allow
    *  reading … for this conversation" remembers. */
   rememberDir?: string;
+  /** An Ask first card's file change, as a unified diff (#1231). */
+  diff?: string;
 }
 
-export type ApprovalKind = "mcp" | "read" | "write" | "run";
+/** `ask` and `ask-run` are Ask first's cards (#1231): a file change (or
+ *  another tool) and a command that may write. */
+export type ApprovalKind = "mcp" | "read" | "write" | "run" | "ask" | "ask-run";
 
 /** The card fields a request carries beyond its command and reason. */
-function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean; rememberDir?: string }) {
+function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean; rememberDir?: string; diff?: string }) {
   return {
     ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
     ...(c.kind ? { kind: c.kind } : {}),
     ...(c.sensitive ? { sensitive: true } : {}),
     ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
+    ...(c.diff ? { diff: c.diff } : {}),
   };
 }
 
@@ -1211,6 +1216,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     kind?: ApprovalKind;
     sensitive?: boolean;
     rememberDir?: string;
+    diff?: string;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;

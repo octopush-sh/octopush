@@ -275,6 +275,45 @@ describe("ApprovalCard at the keyboard", () => {
     expect(screen.getByRole("textbox", { name: "composer" })).toHaveFocus();
   });
 
+  it("an Ask first file change shows its diff and asks approve or deny, never don't ask again (#1231)", () => {
+    const onRespond = vi.fn();
+    const diff = "@@ -1,3 +1,3 @@\n fn a() {\n-    1\n+    2\n }\n";
+    const { container } = render(
+      <ApprovalCard approval={{ ...base, kind: "ask", command: "src/a.rs", reason: "edits a file", diff }} onRespond={onRespond} />,
+    );
+    const card = screen.getByRole("group", { name: "Ask first: src/a.rs" });
+    expect(card).toHaveAttribute("data-tour", "talk-ask-first-approval");
+    expect(card).toHaveAttribute("title", "⌘↵ approves · Esc denies · ⌘⌥A focuses the oldest waiting card");
+    expect(document.activeElement).not.toBe(card);
+    const [path, change] = Array.from(container.querySelectorAll("pre"));
+    expect(path.textContent).toBe("src/a.rs");
+    const lines = Array.from(change.children);
+    expect(lines.map((l) => l.textContent)).toEqual(["@@ -1,3 +1,3 @@", " fn a() {", "-    1", "+    2", " }"]);
+    expect(lines[2].className).toContain("text-octo-rouge");
+    expect(lines[3].className).toContain("text-octo-verdigris");
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
+    fireEvent.keyDown(card, { key: "Enter" });
+    expect(onRespond).not.toHaveBeenCalled();
+    fireEvent.keyDown(card, { key: "Enter", metaKey: true });
+    expect(onRespond).toHaveBeenLastCalledWith("approve");
+    fireEvent.keyDown(card, { key: "Escape" });
+    expect(onRespond).toHaveBeenLastCalledWith("deny");
+  });
+
+  it("an Ask first command reads as a shell command, with no diff (#1231)", () => {
+    const { container } = render(
+      <ApprovalCard
+        approval={{ ...base, kind: "ask-run", command: "cargo fmt", reason: "runs a command that may change files" }}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Ask first")).toBeInTheDocument();
+    const pres = container.querySelectorAll("pre");
+    expect(Array.from(pres).map((p) => p.textContent)).toEqual(["$ cargo fmt"]);
+    expect(screen.getByText("Approve")).toBeInTheDocument();
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
+  });
+
   it("on the secret card, Enter and ⌘↵ take the safe lead answer: leave it out", () => {
     const onRespond = vi.fn();
     render(<ApprovalCard approval={{ ...base, secret: true }} onRespond={onRespond} />);

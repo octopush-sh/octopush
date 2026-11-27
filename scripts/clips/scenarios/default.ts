@@ -308,6 +308,8 @@ export const defaultScenario: Scenario = {
     }),
     // talk
     list_chat_threads: (a) => (a.workspaceId === ACTIVE.id ? [THREAD] : []),
+    get_thread_permission_mode: { stored: "edit", effective: "edit", forced: false },
+    set_thread_permission_mode: (a) => a.mode,
     list_chat_messages: (a) => (a.threadId === THREAD.id ? MESSAGES : []),
     get_thread_cost: THREAD_COST,
     // the Companion's "follows" row: the active worktree's CLAUDE.md

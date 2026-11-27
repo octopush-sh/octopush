@@ -88,6 +88,8 @@ import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
 import { focus as focusPane, useTerminalLayoutStore } from "./stores/terminalLayoutStore";
 import { useTerminalSlotsStore } from "./stores/terminalSlotsStore";
 import { useChatStore, workingTalkWorkspaces } from "./stores/chatStore";
+import { usePermissionModeStore } from "./stores/permissionModeStore";
+import type { PermissionMode } from "./lib/permissionModes";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
 import { useShallow } from "zustand/react/shallow";
@@ -1371,6 +1373,8 @@ function App() {
   // read separately below.
   const activeChatId = activeWorkspaceId;
   const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
+  // The conversation's permission mode, as the Composer's control last read it (#1231).
+  const threadMode = usePermissionModeStore((s) => (activeThreadId ? s.byThread[activeThreadId] : undefined));
   const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
   // An approval card waits in the conversation Talk shows (as ChatCanvas
   // scopes them), for ⌘K's "Focus the waiting approval card".
@@ -3102,6 +3106,13 @@ function App() {
                       requestAnimationFrame(() => void focusOldestCard());
                     }
                   : undefined,
+                mode:
+                  activeThreadId && threadMode && !threadMode.forced
+                    ? {
+                        current: threadMode.effective,
+                        onSet: (m: PermissionMode) => void usePermissionModeStore.getState().set(activeThreadId, m),
+                      }
+                    : undefined,
               }
             : undefined
         }

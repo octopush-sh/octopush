@@ -2,6 +2,7 @@ import type { KeyboardEvent } from "react";
 import { ShieldAlert } from "lucide-react";
 import type { PendingApproval } from "../../stores/chatStore";
 import { tourId } from "../../lib/tour/ids";
+import { diffLineStyle } from "../../lib/diffLineStyle";
 
 interface Props {
   approval: PendingApproval;
@@ -17,6 +18,7 @@ const COPY = {
   outside: { eyebrow: "Outside the workspace", title: "⌘↵ allows once · Esc denies", lead: ["Allow once", "Allow once (⌘↵ with the card focused)"], other: ["Deny", "Deny (Esc with the card focused)"] },
   sensitive: { eyebrow: "Possible credentials", title: "⌘↵, Enter or Esc denies", lead: ["Deny", "Deny (⌘↵, Enter or Esc with the card focused)"], other: ["Allow once", "Allow this one access; the next one asks again"] },
   secret: { eyebrow: "Possible secret", title: "⌘↵, Enter or Esc leaves it out", lead: ["Leave it out", "Leave it out (⌘↵, Enter or Esc with the card focused)"], other: ["Run regardless", "Run it as it is, once, for exactly these findings"] },
+  ask: { eyebrow: "Ask first", title: "⌘↵ approves · Esc denies", lead: ["Approve", "Approve this one change (⌘↵ with the card focused)"], other: ["Deny", "Deny (Esc with the card focused)"] },
 } as const;
 
 /** The chord that focuses the oldest card waiting in the conversation on
@@ -52,6 +54,9 @@ export const RUN_CHECK_LIMITS =
  * net, not a sandbox. A read outside that isn't a credentials location also
  * offers "Allow reading <folder> for this conversation" (`rememberDir`,
  * answered as "always").
+ * Since #1231 a conversation in Ask first parks each write here: a file
+ * change (`kind: "ask"`) with its diff when it can be shown, or a command
+ * that may write (`kind: "ask-run"`). Neither offers "don't ask again".
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -72,7 +77,8 @@ export function ApprovalCard({ approval, onRespond }: Props) {
   const run = approval.kind === "run";
   const outside = approval.kind === "read" || approval.kind === "write" || run;
   const sensitive = outside && approval.sensitive === true;
-  const copy = COPY[secret ? "secret" : sensitive ? "sensitive" : outside ? "outside" : "command"];
+  const askFirst = approval.kind === "ask" || approval.kind === "ask-run";
+  const copy = COPY[secret ? "secret" : sensitive ? "sensitive" : outside ? "outside" : askFirst ? "ask" : "command"];
   // Where the safe answer leads, it is the first button and Enter takes it.
   const safeLead = secret || sensitive;
   const lead = safeLead ? "deny" : "approve";
@@ -92,7 +98,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       aria-keyshortcuts={safeLead ? "Meta+Enter Enter Escape" : "Meta+Enter Escape"}
       title={`${copy.title} · ${FOCUS_CARD_CHORD} focuses the oldest waiting card${run ? `. ${RUN_CHECK_LIMITS}` : ""}`}
       onKeyDown={onKeyDown}
-      data-tour={secret ? tourId("talk-secret-approval") : tourId("talk-approval")}
+      data-tour={secret ? tourId("talk-secret-approval") : askFirst ? tourId("talk-ask-first-approval") : tourId("talk-approval")}
       className="octo-rise-in my-2 rounded-md border border-[var(--rouge-border)] bg-[var(--rouge-ghost)] px-3 py-2.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
     >
       <div className="flex items-center gap-2">
@@ -104,9 +110,10 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       </div>
       <pre className="mt-2 overflow-x-auto rounded bg-octo-onyx px-2.5 py-1.5 font-mono text-[12px] text-octo-ivory">
         {/* Only a shell command reads as one. */}
-        {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
+        {(approval.kind === undefined || run || approval.kind === "ask-run") && <span className="text-octo-brass">$ </span>}
         {approval.command}
       </pre>
+      {approval.diff && <AskDiff diff={approval.diff} />}
       {secret && (
         <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">
           {approval.coversUncommitted
@@ -146,7 +153,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         >
           {copy.other[0]}
         </button>
-        {!secret && !outside && (
+        {!secret && !outside && !askFirst && (
           <button
             type="button"
             onClick={() => onRespond("always")}
@@ -168,6 +175,27 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         )}
       </div>
     </div>
+  );
+}
+
+/** An Ask first card's change: the hunks the call would write, each line
+ *  in the diff colours Review uses (`diffLineStyle`). */
+function AskDiff({ diff }: { diff: string }) {
+  const lines = diff.endsWith("\n") ? diff.slice(0, -1).split("\n") : diff.split("\n");
+  return (
+    <pre
+      aria-label="The change"
+      className="mt-1 max-h-64 overflow-auto rounded bg-octo-onyx py-1.5 font-mono text-[12px] leading-[1.45]"
+    >
+      {lines.map((line, i) => {
+        const style = diffLineStyle(line);
+        return (
+          <div key={i} className={`px-2.5 ${style.className}`} style={style.background ? { background: style.background } : undefined}>
+            {line || " "}
+          </div>
+        );
+      })}
+    </pre>
   );
 }
 

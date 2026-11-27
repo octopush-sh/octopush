@@ -24,6 +24,14 @@ describe("decideApprovalNotification", () => {
     );
   });
 
+  it("names an Ask first card as a change, never its diff or command (#1231)", () => {
+    for (const kind of ["ask", "ask-run"] as const) {
+      expect(decideApprovalNotification({ kind }, "auth-flow").body).toBe(
+        "auth-flow — A change is waiting for your approval (Ask first)",
+      );
+    }
+  });
+
   it("names a secret card for what it is, never what was found", () => {
     expect(decideApprovalNotification({ secret: true }, null)).toEqual({
       title: "Talk needs a decision",
