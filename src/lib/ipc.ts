@@ -1178,6 +1178,9 @@ export const ipc = {
    *  Talk's live status for it. Spawns nothing. */
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
+  /** The Settings › Integrations servers only, with their live status: what
+   *  a Direct stage can choose. Spawns nothing. */
+  listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
   /** What the user trusts to run without an MCP card in Edit freely, per
    *  server (#1243), that still holds for its user-level entry. With a
    *  worktree, without the servers its own `.claude/mcp.json` defines. */
