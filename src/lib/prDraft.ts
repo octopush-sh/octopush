@@ -1,16 +1,18 @@
 import type { BranchList, FileEdit } from "./types";
+import { isIssueKey } from "./detectIssueKey";
 
 export const PR_SYSTEM = `You write GitHub pull request descriptions from a branch's diff. Output ONLY: the PR title on the first line (<=72 characters, imperative, no trailing period), a blank line, then the Markdown body. If a pull request template is given, fill in that template — keep its headings and checklists, answer each section, leave a checklist item unchecked when the input doesn't show it was done. Otherwise use the sections "## Summary", "## Changes", "## How it was built" and "## Testing". Report provenance and test results only from the input; never invent them. No backticks around the whole output, no "Here is", no closing notes.`;
 
 const MAX_DIFF = 12000;
 
 /** A linked ticket's effect on the PR: a GitHub issue closes (`#42`,
- *  `owner/repo#42`), a Jira-style key (`OCTO-12`) prefixes the title. */
+ *  `owner/repo#42`), a Jira key (`OCTO-12`) or an Epiku story id (`ST-1.1`)
+ *  prefixes the title. */
 export function issueRef(key: string | null | undefined): { closes?: string; titlePrefix?: string } {
   const k = key?.trim() ?? "";
   if (/^#?\d+$/.test(k)) return { closes: `#${k.replace(/^#/, "")}` };
   if (/^[\w.-]+\/[\w.-]+#\d+$/.test(k)) return { closes: k };
-  if (/^[A-Z][A-Z0-9]+-\d+$/.test(k)) return { titlePrefix: k };
+  if (isIssueKey(k)) return { titlePrefix: k };
   return {};
 }
 
