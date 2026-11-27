@@ -848,6 +848,9 @@ pub struct SubagentGate {
     reach: crate::talk_guard::Reach,
     /// The mission's sandbox refuses a write outside the workspace itself.
     writes_confined: bool,
+    /// The thread's mode at each call (#1229): no grant applies in Plan
+    /// only. Without one, the gate reads it as Plan only.
+    mode: Option<crate::permissions::ModeSource>,
     seq: AtomicU64,
 }
 
@@ -864,8 +867,19 @@ impl SubagentGate {
             mcp_writes: std::collections::HashSet::new(),
             reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
             writes_confined: spec.sandbox_roots.is_some(),
+            mode: None,
             seq: AtomicU64::new(1),
         }
+    }
+
+    /// Read the thread's mode from `source` at each call.
+    pub fn with_mode(mut self, source: crate::permissions::ModeSource) -> Self {
+        self.mode = Some(source);
+        self
+    }
+
+    fn mode(&self) -> crate::permissions::Mode {
+        self.mode.as_ref().map_or(crate::permissions::Mode::Plan, |m| m())
     }
 
     /// Let reads into the dependency folders a mission links from its
@@ -913,7 +927,8 @@ pub fn gate_texts(label: &str, reason: &str) -> (String, String) {
 #[async_trait::async_trait]
 impl ToolGate for SubagentGate {
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
-        let (shown, card_reason, denial) = if name == "run_command" {
+        let mode = self.mode();
+        let (shown, card_reason, denial, remote) = if name == "run_command" {
             let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
             // The secret guard first (#819); the thread's grant never answers it.
             let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
@@ -933,17 +948,19 @@ impl ToolGate for SubagentGate {
             }
             // A path outside the workspace or in a credentials location
             // (#1201); a sub-agent's command runs at the workspace root.
-            let check = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.read_dirs(&self.thread_id));
+            let check = || self.reach.command_card(Some(self.label.as_str()), command, None, &self.broker.grants(&self.thread_id, mode));
             if let Some(card) = check() {
                 let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode);
                 if let Some(denial) = crate::chat_engine::guard_card(card, &check, ask).await {
                     return Some(denial);
                 }
             }
-            let reason = dangerous_command(command)?;
-            let (card_reason, denial) = gate_texts(&self.label, reason);
-            (command.to_string(), card_reason, denial)
+            // A remote side effect asks every time (#1229).
+            let remote = crate::permissions::remote_effect(command);
+            let reason = dangerous_command(command).map(str::to_string).or_else(|| remote.map(crate::chat_engine::remote_reason))?;
+            let (card_reason, denial) = gate_texts(&self.label, &reason);
+            (command.to_string(), card_reason, denial, remote.is_some())
         } else {
             // An MCP write, or a file tool reaching outside the workspace,
             // checked again once approved (`guard_card`).
@@ -952,21 +969,21 @@ impl ToolGate for SubagentGate {
                 if self.mcp_writes.contains(name) {
                     Some(crate::talk_guard::mcp_card(label, name, input))
                 } else {
-                    self.reach.outside_card(label, name, input, self.writes_confined)
+                    self.reach.outside_card(label, name, input, self.writes_confined, &self.broker.grants(&self.thread_id, mode))
                 }
             };
             let card = check()?;
             let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+            let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode);
             return crate::chat_engine::guard_card(card, &check, ask).await;
         };
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         match self
             .broker
-            .await_approval(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason)
+            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, remote, mode)
             .await
         {
-            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => None,
+            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => None,
             ApprovalDecision::Deny => Some(denial),
         }
     }
@@ -1372,6 +1389,7 @@ pub async fn run_one_subagent(
     let spec = &mode_spec(&db, &planned);
     let model = plan.model.clone();
     let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
+        .with_mode(crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone()))
         .with_mcp_writes(mcp_tools)
         .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
     let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));

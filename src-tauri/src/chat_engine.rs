@@ -29,7 +29,7 @@ use crate::provider_router::ProviderRouter;
 use crate::orchestrator::agentic::{
     compute_throttle, resume_messages_for_answered_block, resume_messages_for_continuation, throttle_notice, BlockedTranscript,
 };
-use crate::talk_guard::{CardKind, ToolCard};
+use crate::talk_guard::{CardKind, Grant, GrantKind, ToolCard};
 use crate::token_engine;
 use parking_lot::Mutex;
 use reqwest::Client;
@@ -888,6 +888,29 @@ pub(crate) fn command_words(line: &str) -> Vec<CommandWord> {
     lexer.out
 }
 
+/// What a per-conversation command grant compares (#1229): `command` as
+/// [`command_words`]' lexer reads it, every word and operator in order. Two
+/// commands are the same when they have the same words, each as the shell
+/// gets it after quote removal, a quoted or escaped `\`, `~`, `*`, `?`, `[`,
+/// `]`, `{`, `}` or `,` kept apart from a bare one (so `rm '*'` is not
+/// `rm *`), and a `NAME=` or `--flag=` prefix kept; the same operators
+/// between them (`;`, `&&`, `||`, `|`, `|&`, `&`, parens, newlines); the same
+/// redirections with their fd (`>`, `>>`, `2>`, `&>`, `<`, `>&2`…); and the
+/// same here-documents, delimiter quoting and body byte for byte. Spacing and
+/// the quoting style of plain text don't count, and nor do comments. `None`
+/// when a word holds an expansion the check doesn't model (a variable other
+/// than `$HOME`, `$(…)`, a backtick span, an extglob, a process
+/// substitution), since what it runs can change between calls, and for a
+/// carriage return, which the lexer reads as a space and bash doesn't. Pure.
+pub(crate) fn command_key(command: &str) -> Option<String> {
+    if command.contains('\r') {
+        return None;
+    }
+    let mut lexer = Lexer { s: command.chars().collect(), ..Lexer::default() };
+    lexer.run();
+    (!lexer.opaque && !lexer.shape.is_empty()).then(|| serde_json::to_string(&lexer.shape).unwrap_or_default())
+}
+
 #[derive(Default)]
 struct WordBuf {
     pattern: String,
@@ -929,11 +952,22 @@ struct Lexer {
     heredocs: Vec<(String, bool)>,
     /// Lexing a here-document's body: every word is `Data`.
     data: bool,
+    /// Every word (`w`), operator (`o`), here-document delimiter (`d`) and
+    /// body (`h`) in order, as [`command_key`] compares them.
+    shape: Vec<String>,
+    /// It holds something [`command_key`] can't compare.
+    opaque: bool,
 }
 
 impl Lexer {
     fn peek(&self) -> Option<char> {
         self.s.get(self.i).copied()
+    }
+
+    /// The operator from `from` to here, with the fd written before it.
+    fn op(&mut self, fd: &str, from: usize) {
+        let text: String = self.s[from.min(self.s.len())..self.i.min(self.s.len())].iter().collect();
+        self.shape.push(format!("o{fd}{text}"));
     }
 
     fn buf(&mut self) -> &mut WordBuf {
@@ -951,6 +985,7 @@ impl Lexer {
                 '\n' => {
                     self.finish();
                     self.i += 1;
+                    self.shape.push("o\n".to_string());
                     self.bodies();
                     self.next_segment();
                 }
@@ -960,16 +995,24 @@ impl Lexer {
                     }
                 }
                 ';' | '(' | ')' | '|' => {
+                    self.finish();
+                    let from = self.i;
                     self.i += if c == '|' && matches!(next, Some('|' | '&')) { 2 } else { 1 };
+                    self.op("", from);
                     self.next_segment();
                 }
                 '&' if next == Some('>') => {
                     self.finish();
+                    let from = self.i;
                     self.i += if self.s.get(self.i + 2) == Some(&'>') { 3 } else { 2 };
+                    self.op("", from);
                     self.target = Some(true);
                 }
                 '&' => {
+                    self.finish();
+                    let from = self.i;
                     self.i += if next == Some('&') { 2 } else { 1 };
+                    self.op("", from);
                     self.next_segment();
                 }
                 '<' | '>' => self.redirect(c),
@@ -1026,10 +1069,14 @@ impl Lexer {
     fn finish(&mut self) {
         static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let Some(w) = self.word.take() else { return };
+        self.opaque |= w.unmodeled;
         if let Some(dash) = self.delimiter.take() {
+            // A quoted delimiter leaves the body as written.
+            self.shape.push(format!("d{}:{}", u8::from(w.quoted), w.pattern));
             self.heredocs.push((crate::talk_guard::unescape(&w.pattern), dash));
             return;
         }
+        self.shape.push(format!("w{}", w.pattern));
         let target = self.target.take();
         let assigns = w.pattern.split_once('=').is_some_and(|(n, _)| {
             n.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic()) && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
@@ -1061,15 +1108,18 @@ impl Lexer {
 
     fn redirect(&mut self, c: char) {
         // `2>f`: digits right before the operator are its fd, not a word.
+        let mut fd = String::new();
         if self.word.as_ref().is_some_and(|w| !w.quoted && !w.pattern.is_empty() && w.pattern.bytes().all(|b| b.is_ascii_digit())) {
-            self.word = None;
+            fd = self.word.take().map(|w| w.pattern).unwrap_or_default();
         }
         self.finish();
+        let from = self.i;
         self.i += 1;
         match (c, self.peek()) {
             // A process substitution: its command is read on its own.
             (_, Some('(')) => {
                 self.i = self.span_end(self.i, '(', ')') + 1;
+                self.opaque = true;
                 return;
             }
             ('<', Some('<')) => {
@@ -1082,6 +1132,7 @@ impl Lexer {
                     self.i += usize::from(dash);
                     self.delimiter = Some(dash);
                 }
+                self.op(&fd, from);
                 return;
             }
             ('<', Some('>')) | ('>', Some('>' | '|')) => self.i += 1,
@@ -1091,12 +1142,14 @@ impl Lexer {
         if self.peek() == Some('&') {
             self.i += 1;
             // `>&2`, `<&-`: an fd, not a word.
-            let fd = self.s[self.i..].iter().take_while(|c| c.is_ascii_digit() || **c == '-').count();
-            if fd > 0 && self.s.get(self.i + fd).is_none_or(|c| c.is_whitespace() || ";|&)".contains(*c)) {
-                self.i += fd;
+            let to = self.s[self.i..].iter().take_while(|c| c.is_ascii_digit() || **c == '-').count();
+            if to > 0 && self.s.get(self.i + to).is_none_or(|c| c.is_whitespace() || ";|&)".contains(*c)) {
+                self.i += to;
+                self.op(&fd, from);
                 return;
             }
         }
+        self.op(&fd, from);
         self.target = Some(writes);
     }
 
@@ -1235,6 +1288,8 @@ impl Lexer {
             }
             let mut sub = Lexer { s: body.chars().collect(), data: true, segment: self.segment, ..Lexer::default() };
             sub.run();
+            self.opaque |= sub.opaque;
+            self.shape.push(format!("h{body}"));
             self.out.extend(sub.out);
         }
     }
@@ -1523,17 +1578,60 @@ pub enum ApprovalDecision {
     Approve,
     /// Approve and stop asking for this conversation (auto-approve the thread).
     ApproveAlways,
+    /// Approve and keep the grant the card offers (#1229): a folder, or
+    /// this exact command, for this conversation.
+    Grant,
 }
 
 impl ApprovalDecision {
-    /// Parse the frontend's string ("deny" | "approve" | "always").
+    /// Parse the frontend's string ("deny" | "approve" | "always" | "grant").
     pub fn parse(s: &str) -> Self {
         match s {
             "approve" => ApprovalDecision::Approve,
             "always" => ApprovalDecision::ApproveAlways,
+            "grant" => ApprovalDecision::Grant,
             _ => ApprovalDecision::Deny,
         }
     }
+}
+
+/// Why a card offers no grant at all (#1229).
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EveryTime {
+    /// The command changes something outside this Mac
+    /// (`permissions::remote_effect`): it asks every time in Edit freely.
+    Remote,
+    /// The conversation is in Plan only, where no grant applies.
+    Plan,
+}
+
+/// What a card offers beyond allowing once (#1229).
+#[derive(Default)]
+struct Offer {
+    /// The folder a read or write grant covers, as the card names it.
+    dir: Option<String>,
+    /// "Allow this command for this conversation".
+    command: bool,
+    every_time: Option<EveryTime>,
+}
+
+impl Offer {
+    fn of(grant: Option<&Grant>, every_time: Option<EveryTime>) -> Self {
+        match grant {
+            Some(g) if g.kind == GrantKind::Command => Offer { command: true, every_time, ..Offer::default() },
+            Some(g) => Offer { dir: Some(g.shown.clone()), every_time, ..Offer::default() },
+            None => Offer { every_time, ..Offer::default() },
+        }
+    }
+}
+
+/// Emitted when a conversation gains a grant, so the Companion lists it.
+pub const GRANTS_CHANGED_EVENT: &str = "chat://grants-changed";
+
+/// The reason a command with a remote side effect asks for (#1229).
+pub(crate) fn remote_reason(what: &str) -> String {
+    format!("changes something outside this Mac ({what})")
 }
 
 /// Emitted when the agent wants to run a command flagged as destructive — the
@@ -1560,10 +1658,17 @@ pub struct ApprovalRequestEvent {
     /// The path is a well-known credentials location: the safe answer leads.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sensitive: bool,
-    /// A command's card for a read outside the workspace (#1201): the folder
-    /// its "Allow reading … for this conversation" answer remembers.
+    /// The folder the card's "Allow reading … for this conversation" (a
+    /// command's read outside, #1201) or "Allow writing … for this
+    /// conversation" (a file tool's write outside, #1229) answer keeps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remember_dir: Option<String>,
+    /// The card offers "Allow this command for this conversation" (#1229).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub remember_command: bool,
+    /// The card offers no grant and no "don't ask again", and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every_time: Option<EveryTime>,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1611,12 +1716,36 @@ pub(crate) struct ApprovalBroker {
     /// Deleted workspaces: nobody can answer a card there any more, so a
     /// request from one is denied at once instead of parked.
     retired: Mutex<std::collections::HashSet<String>>,
-    /// Folders a thread's commands may read without asking, each one the
-    /// user allowed from a command's card (#1201; in-memory, like the grant).
-    read_dirs: Mutex<HashMap<String, Vec<std::path::PathBuf>>>,
+    /// Where each conversation's grants are kept (#1229,
+    /// `chat_threads.talk_grants`). A broker without one keeps none.
+    db: Option<Arc<Mutex<Db>>>,
 }
 
 impl ApprovalBroker {
+    /// A broker that keeps the conversations' grants in `db`.
+    pub(crate) fn with_db(db: Arc<Mutex<Db>>) -> Self {
+        Self { db: Some(db), ..Self::default() }
+    }
+
+    /// The grants `thread_id` holds, in the mode its call runs in: none in
+    /// Plan only, where no grant applies (#1229). Read at each check, so a
+    /// grant kept or revoked a moment ago counts.
+    pub(crate) fn grants(&self, thread_id: &str, mode: crate::permissions::Mode) -> Vec<Grant> {
+        if mode == crate::permissions::Mode::Plan {
+            return Vec::new();
+        }
+        self.db.as_ref().and_then(|db| db.lock().thread_grants(thread_id).ok()).unwrap_or_default()
+    }
+
+    /// Keep `grant` for `thread_id`.
+    fn keep(&self, thread_id: &str, grant: &Grant) {
+        if let Some(db) = &self.db {
+            if let Err(e) = db.lock().set_thread_grant(thread_id, grant, true) {
+                tracing::warn!(error = %e, "could not keep the conversation's grant; the next call asks again");
+            }
+        }
+    }
+
     pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
         if let Some(parked) = self.approvals.lock().remove(call_id) {
             let _ = parked.tx.send(decision);
@@ -1704,10 +1833,14 @@ impl ApprovalBroker {
         rx
     }
 
-    /// Ask the user to approve a dangerous agent command and wait for the answer.
-    /// Auto-approved conversations skip the prompt. The card waits as long as
-    /// it takes (see the type's doc): never a silent denial.
-    pub async fn await_approval(
+    /// Ask the user to approve a command `dangerous_command` flags, or one
+    /// with a remote side effect (`remote`), and wait for the answer. The
+    /// card waits as long as it takes (see the type's doc): never a silent
+    /// denial. Outside Plan only, the thread's "don't ask again" or a grant
+    /// for this exact command (#1229) answers it unseen, except a remote
+    /// one, which asks every time and offers neither.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn await_command(
         &self,
         app: &AppHandle,
         workspace_id: &str,
@@ -1715,51 +1848,89 @@ impl ApprovalBroker {
         call_id: &str,
         command: &str,
         reason: &str,
+        remote: bool,
+        mode: crate::permissions::Mode,
     ) -> ApprovalDecision {
-        if self.auto_approve.lock().contains(thread_id) {
+        let (answered, offer) = self.command_offer(thread_id, command, remote, mode);
+        if answered {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
-        self.record(thread_id, decision, false);
-        decision
+        let every_time = offer.every_time;
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, &offer).await;
+        let settled = self.settle_command(thread_id, decision, command, offer.command, every_time.is_some());
+        if decision == ApprovalDecision::Grant {
+            let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
+        }
+        settled
+    }
+
+    /// Whether a flagged command is answered unseen, and what its card
+    /// offers otherwise (#1229). Pure but for the grants it reads.
+    fn command_offer(&self, thread_id: &str, command: &str, remote: bool, mode: crate::permissions::Mode) -> (bool, Offer) {
+        let every_time = match (remote, mode == crate::permissions::Mode::Plan) {
+            (true, _) => Some(EveryTime::Remote),
+            (false, true) => Some(EveryTime::Plan),
+            (false, false) => None,
+        };
+        // `Grant::command` has none for a remote side effect either.
+        let grant = Grant::command(command).filter(|_| every_time.is_none());
+        let held = grant.as_ref().is_some_and(|g| self.grants(thread_id, mode).iter().any(|h| h.same(g)));
+        let answered = every_time.is_none() && (held || self.auto_approve.lock().contains(thread_id));
+        (answered, Offer { command: grant.is_some(), every_time, ..Offer::default() })
+    }
+
+    /// What an answer to a flagged command's card does: "grant" keeps this
+    /// exact command for the thread, "always" the thread's "don't ask
+    /// again"; on a card that offers neither (`every_time`) each is one
+    /// approval.
+    pub(crate) fn settle_command(&self, thread_id: &str, decision: ApprovalDecision, command: &str, offered: bool, every_time: bool) -> ApprovalDecision {
+        if let Some(g) = Grant::command(command).filter(|_| offered && decision == ApprovalDecision::Grant) {
+            self.keep(thread_id, &g);
+        }
+        self.record(thread_id, decision, every_time)
     }
 
     /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
-    /// thread's grant answers like a command, or a file outside the
-    /// workspace, which asks every time and whose approval grants nothing.
+    /// thread's "don't ask again" answers like a command, or a path outside
+    /// the workspace, which asks every time unless the thread holds the
+    /// grant that covers it (a folder or this command, #1201 and #1229,
+    /// which the card's check reads). In Plan only nothing answers it and
+    /// it offers no grant.
     pub async fn await_card(
         &self,
         app: &AppHandle,
         workspace_id: &str,
         thread_id: &str,
         call_id: &str,
-        card: ToolCard,
+        mut card: ToolCard,
+        mode: crate::permissions::Mode,
     ) -> ApprovalDecision {
-        if self.grant_answers(thread_id, Some(card.kind)) {
+        let plan = mode == crate::permissions::Mode::Plan;
+        if !plan && self.grant_answers(thread_id, Some(card.kind)) {
             return ApprovalDecision::Approve;
         }
+        // A card that would offer a grant says why it doesn't.
+        let withheld = plan && card.grant.take().is_some();
         let marks = Some((card.kind, card.sensitive));
-        let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
+        let offer = Offer::of(card.grant.as_ref(), withheld.then_some(EveryTime::Plan));
+        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, &offer).await;
+        if decision == ApprovalDecision::Grant && card.grant.is_some() {
+            let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
+        }
         self.settle_card(thread_id, decision, &card)
     }
 
-    /// What an answer to a `talk_guard` card does: "always" on a command's
-    /// card that offers a folder lets the thread's commands read it from now
-    /// on and counts as one approval (#1201); any other as [`Self::record`].
+    /// What an answer to a `talk_guard` card does: "grant" keeps the grant
+    /// the card offers (#1229) and counts as one approval; any other as
+    /// [`Self::record`].
     pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard) -> ApprovalDecision {
-        match (decision, &card.remember) {
-            (ApprovalDecision::ApproveAlways, Some((dir, _))) => {
-                self.read_dirs.lock().entry(thread_id.to_string()).or_default().push(dir.clone());
+        match (decision, &card.grant) {
+            (ApprovalDecision::Grant, Some(grant)) => {
+                self.keep(thread_id, grant);
                 ApprovalDecision::Approve
             }
             _ => self.record(thread_id, decision, !card.kind.grantable()),
         }
-    }
-
-    /// The folders the user let `thread_id`'s commands read (#1201).
-    pub(crate) fn read_dirs(&self, thread_id: &str) -> Vec<std::path::PathBuf> {
-        self.read_dirs.lock().get(thread_id).cloned().unwrap_or_default()
     }
 
     /// Whether the thread's "don't ask again" answers a card of `kind` unseen:
@@ -1769,7 +1940,7 @@ impl ApprovalBroker {
     }
 
     /// Ask about a command the secret guard stopped (#819). Unlike
-    /// [`Self::await_approval`], a thread's "don't ask again" never answers it,
+    /// [`Self::await_command`], a thread's "don't ask again" never answers it,
     /// and an approval grants nothing beyond this one call.
     #[allow(clippy::too_many_arguments)]
     pub async fn await_secret_approval(
@@ -1783,17 +1954,19 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, &Offer::default())
             .await;
         self.record(thread_id, decision, true)
     }
 
     /// Keep a "don't ask again" grant, except from a card that grants nothing
-    /// (`secret`: the secret card, a file outside the workspace), whose
-    /// approval reads as a plain one. Returns the decision to act on.
+    /// (`secret`: the secret card, a file outside the workspace, a card that
+    /// asks every time), whose approval reads as a plain one. A "grant"
+    /// answer here offered nothing to keep. Returns the decision to act on.
     pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
         match decision {
             ApprovalDecision::ApproveAlways if secret => ApprovalDecision::Approve,
+            ApprovalDecision::Grant => ApprovalDecision::Approve,
             ApprovalDecision::ApproveAlways => {
                 self.auto_approve.lock().insert(thread_id.to_string());
                 decision
@@ -1811,7 +1984,7 @@ impl ApprovalBroker {
 
     /// Emit the card and wait for its answer. `secret` is `Some(covers
     /// uncommitted)` for the secret guard's card, `card` the kind and
-    /// sensitivity of a `talk_guard` card.
+    /// sensitivity of a `talk_guard` card, `offer` its grants.
     #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
@@ -1823,7 +1996,7 @@ impl ApprovalBroker {
         reason: &str,
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
-        remember: Option<&str>,
+        offer: &Offer,
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1838,7 +2011,9 @@ impl ApprovalBroker {
             covers_uncommitted: secret.unwrap_or(false),
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
-            remember_dir: remember.map(str::to_string),
+            remember_dir: offer.dir.clone(),
+            remember_command: offer.command,
+            every_time: offer.every_time,
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -3359,6 +3534,7 @@ impl ChatEngine {
     pub fn new(db: Arc<Mutex<Db>>, daemon: Option<Arc<crate::pty_client::DaemonClient>>) -> Self {
         let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
         talk_shell.set_client(daemon);
+        let approvals = Arc::new(ApprovalBroker::with_db(Arc::clone(&db)));
         Self {
             // Clone of the process-wide client — shares its connection pool.
             client: shared_http_client().clone(),
@@ -3366,7 +3542,7 @@ impl ChatEngine {
             cancels: Arc::new(Mutex::new(HashMap::new())),
             mcp: Arc::new(crate::mcp::McpRegistry::new()),
             talk_shell,
-            approvals: Arc::new(ApprovalBroker::default()),
+            approvals,
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
             stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -3391,22 +3567,6 @@ impl ChatEngine {
         self.approvals.respond(call_id, decision);
     }
 
-    /// Ask the user to approve a dangerous agent command and wait for the answer.
-    #[allow(clippy::too_many_arguments)]
-    async fn await_approval(
-        &self,
-        app: &AppHandle,
-        workspace_id: &str,
-        thread_id: &str,
-        call_id: &str,
-        command: &str,
-        reason: &str,
-    ) -> ApprovalDecision {
-        self.approvals
-            .await_approval(app, workspace_id, thread_id, call_id, command, reason)
-            .await
-    }
-
     /// Request cancellation of the in-flight turn for `thread_id`, if any.
     /// No-op when nothing is running. The loop checks the flag between
     /// iterations and after each tool, then stops cleanly. Keyed by thread so
@@ -3422,7 +3582,7 @@ impl ChatEngine {
         }
         // Resolve every pending approval for this thread (the turn's own and
         // its sub-agents') as Deny — otherwise Stop leaves a loop parked in
-        // await_approval (and a later Approve would run a destructive command
+        // await_command (and a later Approve would run a destructive command
         // on a turn the user already cancelled).
         self.approvals.deny_thread(thread_id);
         // A turn-limit card waiting on the thread resolves as "accept what it
@@ -5165,10 +5325,15 @@ impl ChatEngine {
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
-                let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
+                // The thread's grants (#1229) are read at each check, so one
+                // the card just kept answers its recheck; none in Plan only.
+                let check = || {
+                    let grants = self.approvals.grants(&request.thread_id, mode);
+                    crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined, &grants)
+                };
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
-                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
                     denied = guard_card(card, &check, ask).await;
                 }
                 // A command flagged destructive pauses for the user's OK before
@@ -5196,27 +5361,25 @@ impl ChatEngine {
                         let shared = self.talk_shell.available() && exec_roots.is_none();
                         let check = || {
                             let cwd = shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
-                            let allowed = self.approvals.read_dirs(&request.thread_id);
-                            reach.command_card(None, command, cwd.as_deref().map(Path::new), &allowed)
+                            let grants = self.approvals.grants(&request.thread_id, mode);
+                            reach.command_card(None, command, cwd.as_deref().map(Path::new), &grants)
                         };
                         if let Some(card) = check() {
-                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
                             denied = guard_card(card, &check, ask).await;
                         }
                     }
-                    if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
+                    // A command with a remote side effect asks every time in
+                    // Edit freely (#1229); Plan only refused it above.
+                    let remote = crate::permissions::remote_effect(command);
+                    let flagged = dangerous_command(command).map(str::to_string).or_else(|| remote.map(remote_reason));
+                    if let Some(reason) = flagged.filter(|_| denied.is_none()) {
                         match self
-                            .await_approval(
-                                &app,
-                                &request.workspace_id,
-                                &request.thread_id,
-                                &u.id,
-                                command,
-                                reason,
-                            )
+                            .approvals
+                            .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, &reason, remote.is_some(), mode)
                             .await
                         {
-                            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {}
+                            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => {}
                             ApprovalDecision::Deny => {
                                 denied = Some(format!(
                                     "Command not run — the user declined to approve it \
@@ -7237,7 +7400,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None,
+            remember_dir: None, remember_command: false, every_time: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7250,29 +7413,103 @@ mod tests {
         assert!(plain.get("rememberDir").is_none());
         let run = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Run), remember_dir: Some("~/notes".into()), ..ev(false, false) }).unwrap();
         assert_eq!((run["kind"].as_str(), run["rememberDir"].as_str()), (Some("run"), Some("~/notes")));
+        // A card's command grant and why it offers none (#1229).
+        assert!(plain.get("rememberCommand").is_none() && plain.get("everyTime").is_none());
+        let offer = serde_json::to_value(ApprovalRequestEvent { remember_command: true, ..ev(false, false) }).unwrap();
+        assert_eq!(offer["rememberCommand"].as_bool(), Some(true));
+        let remote = serde_json::to_value(ApprovalRequestEvent { every_time: Some(EveryTime::Remote), ..ev(false, false) }).unwrap();
+        assert_eq!(remote["everyTime"].as_str(), Some("remote"));
+    }
+
+    /// A database from before `talk_grants` holding one conversation, `t-old`.
+    fn old_thread_db() -> (tempfile::NamedTempFile, Arc<Mutex<Db>>) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let now = "'2026-01-01T00:00:00Z'";
+        rusqlite::Connection::open(tmp.path()).unwrap().execute_batch(&format!(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, last_opened TEXT NOT NULL);
+             CREATE TABLE workspaces (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', branch TEXT NOT NULL, worktree_path TEXT, setup_script TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, last_active TEXT NOT NULL);
+             CREATE TABLE chat_threads (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT 'New conversation', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO projects VALUES ('p1', 'Old', '/tmp/octo-grants-old', {now}, {now});
+             INSERT INTO workspaces (id, project_id, name, branch, created_at, last_active) VALUES ('w1', 'p1', 'main', 'main', {now}, {now});
+             INSERT INTO chat_threads (id, workspace_id, title, created_at, updated_at) VALUES ('t-old', 'w1', 'Old talk', {now}, {now});"
+        )).unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        (tmp, db)
     }
 
     #[test]
-    fn a_command_card_answered_always_remembers_its_folder_for_the_thread_only() {
-        let broker = ApprovalBroker::default();
-        let dir = std::path::PathBuf::from("/tmp/x");
-        let card = ToolCard {
-            kind: CardKind::Run,
-            shown: "cat /tmp/x/a".into(),
-            reason: "reaches /tmp/x/a outside the workspace".into(),
-            denial: "d".into(),
-            sensitive: false,
-            remember: Some((dir.clone(), "/tmp/x".into())),
-        };
-        assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
-        assert_eq!(broker.read_dirs("t"), vec![dir]);
-        assert!(broker.read_dirs("other").is_empty(), "for this conversation only");
-        assert!(!broker.auto_approves("t"), "it grants no \"don't ask again\"");
-        // Allowed once, or a card that offers no folder: nothing is remembered.
-        assert_eq!(broker.settle_card("u", ApprovalDecision::Approve, &card), ApprovalDecision::Approve);
-        let plain = ToolCard { remember: None, ..card };
-        assert_eq!(broker.settle_card("u", ApprovalDecision::ApproveAlways, &plain), ApprovalDecision::Approve);
-        assert!(broker.read_dirs("u").is_empty() && !broker.auto_approves("u"));
+    fn grants_persist_with_the_conversation_and_never_apply_in_plan_only() {
+        use crate::permissions::Mode;
+        let (_tmp, db) = old_thread_db();
+        assert!(db.lock().thread_grants("t-old").unwrap().is_empty(), "an old conversation holds none");
+        let broker = ApprovalBroker::with_db(Arc::clone(&db));
+        let dir = Grant { kind: GrantKind::Read, value: "/tmp/x".into(), shown: "/tmp/x".into() };
+        let card = ToolCard { kind: CardKind::Run, shown: "cat /tmp/x/a".into(), reason: "r".into(), denial: "d".into(), sensitive: false, grant: Some(dir.clone()) };
+        assert_eq!(broker.settle_card("t-old", ApprovalDecision::Grant, &card), ApprovalDecision::Approve);
+        assert!(broker.grants("t-old", Mode::Plan).is_empty() && !broker.auto_approves("t-old"), "none in Plan only, no \"don't ask again\"");
+        // Kept in the database: a restart keeps it, another conversation has none.
+        let restarted = ApprovalBroker::with_db(Arc::clone(&db));
+        assert_eq!((restarted.grants("t-old", Mode::Edit), restarted.grants("other", Mode::Edit)), (vec![dir.clone()], vec![]));
+        // Allowed once, or "grant" on a card that offers none: nothing more is kept.
+        broker.settle_card("t-old", ApprovalDecision::Approve, &card);
+        broker.settle_card("t-old", ApprovalDecision::Grant, &ToolCard { grant: None, ..card });
+        assert_eq!(broker.grants("t-old", Mode::Edit).len(), 1);
+        // A command grant shows as written; a fork starts with none; a revoke forgets one.
+        broker.settle_command("t-old", ApprovalDecision::Grant, "npm  run build", true, false);
+        let held = db.lock().thread_grants("t-old").unwrap();
+        assert_eq!((held.len(), held[1].kind, held[1].shown.as_str()), (2, GrantKind::Command, "npm run build"));
+        let id = db.lock().insert_chat_message("w1", "t-old", "user", "go on", None, None, None, None).unwrap();
+        let (fork, ..) = db.lock().fork_chat_thread("t-old", id).unwrap();
+        assert!(db.lock().thread_grants(&fork.id).unwrap().is_empty(), "a fork starts with none");
+        db.lock().set_thread_grant("t-old", &dir, false).unwrap();
+        assert_eq!(broker.grants("t-old", Mode::Edit), vec![held[1].clone()], "revoked, it asks again");
+    }
+
+    #[test]
+    fn a_remote_side_effect_asks_every_time_and_a_command_grant_is_for_that_command_only() {
+        use crate::permissions::Mode::{Edit, Plan};
+        let (_tmp, db) = old_thread_db();
+        let broker = ApprovalBroker::with_db(Arc::clone(&db));
+        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", false, Edit);
+        assert!(!answered && offer.command && offer.every_time.is_none(), "a flagged command offers itself");
+        broker.settle_command("t-old", ApprovalDecision::Grant, "rm -rf build", true, false);
+        assert!(broker.command_offer("t-old", "rm  -rf 'build'", false, Edit).0, "the same command, spelled another way");
+        for other in ["rm -rf build && rm -rf ~", "rm -rf build2", "rm -rf build; ls", "sudo rm -rf build", "rm -rf build &"] {
+            assert!(!broker.command_offer("t-old", other, false, Edit).0, "{other}");
+        }
+        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", false, Plan);
+        assert!(!answered && !offer.command && offer.every_time == Some(EveryTime::Plan), "never in Plan only");
+        // Neither a grant nor "don't ask again" answers a remote side effect, or is kept from its card.
+        broker.record("t-old", ApprovalDecision::ApproveAlways, false);
+        let (answered, offer) = broker.command_offer("t-old", "git push --force origin main", true, Edit);
+        assert!(!answered && !offer.command && offer.every_time == Some(EveryTime::Remote));
+        for answer in [ApprovalDecision::Grant, ApprovalDecision::ApproveAlways] {
+            assert_eq!(broker.settle_command("t-old", answer, "git push origin main", false, true), ApprovalDecision::Approve);
+        }
+        assert!(db.lock().thread_grants("t-old").unwrap().iter().all(|g| !g.shown.contains("push")));
+        assert!(broker.command_offer("t-old", "git clean -fd", false, Edit).0, "\"don't ask again\" still answers a flagged one");
+    }
+
+    #[test]
+    fn command_key_matches_the_same_command_and_nothing_else() {
+        let k = |c: &str| command_key(c).unwrap_or_else(|| panic!("{c:?} has a key"));
+        // Spacing, the quoting of plain text, `$HOME` and comments don't count.
+        for (a, b) in [("npm run build", "  npm   run\tbuild "), ("git commit -m \"a b\"", "git commit -m 'a b'"), ("ls $HOME/x", "ls ~/x"), ("echo a # n", "echo a"), ("make 2>/dev/null", "make  2> /dev/null")] {
+            assert_eq!(k(a), k(b), "{a:?} | {b:?}");
+        }
+        // Every word, operator, redirection and here-document counts; a prefix is another command.
+        for (a, b) in [
+            ("rm -rf build", "rm -rf build && rm -rf ~"), ("rm -rf build", "rm -rf build2"), ("rm '*'", "rm *"), ("echo a b", "echo \"a b\""),
+            ("a && b", "a || b"), ("a; b", "a | b"), ("a & b", "a && b"), ("echo x > f", "echo x >> f"), ("make > log", "make 2> log"),
+            ("make >&2", "make"), ("(cd a && make)", "cd a && make"), ("FOO=1 make", "FOO=2 make"), ("tool --out=a", "tool --out=b"),
+            ("cat <<EOF\na\nEOF", "cat <<EOF\nb\nEOF"), ("cat <<EOF\na\\\\b\nEOF", "cat <<'EOF'\na\\\\b\nEOF"),
+        ] {
+            assert_ne!(k(a), k(b), "{a:?} | {b:?}");
+        }
+        // What it runs could change between calls: no key.
+        for c in ["rm -rf $DIR", "echo \"$X\"", "rm $(cat l)", "rm `ls`", "diff <(a) <(b)", "ls !(x)", "rm a\rb", "", "cat <<EOF\n$X\nEOF"] {
+            assert_eq!(command_key(c), None, "{c:?}");
+        }
     }
 
     #[tokio::test]
@@ -7283,7 +7520,7 @@ mod tests {
             reason: "reads a file outside the workspace".into(),
             denial: format!("declined {shown}"),
             sensitive: false,
-            remember: None,
+            grant: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -7313,10 +7550,14 @@ mod tests {
         // A command's paths are read before the command check (#1201).
         let paths = gate.find("reach.command_card(").expect("the director reads a command's paths");
         assert!(paths < gate.find("dangerous_command(command)").unwrap(), "{gate}");
+        // A remote side effect asks too, and the mode decides the grants (#1229).
+        for call in ["permissions::remote_effect(command)", "await_command(", "grants(&request.thread_id, mode)"] {
+            assert!(gate.contains(call), "the director calls {call}");
+        }
         let agents = include_str!("chat_agents.rs");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
+        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check", "permissions::remote_effect(command)", "await_command(", "grants(&self.thread_id, mode)"] {
             assert!(body.contains(call), "the sub-agent gate calls {call}");
         }
     }
@@ -7563,6 +7804,8 @@ mod tests {
             kind: None,
             sensitive: false,
             remember_dir: None,
+            remember_command: false,
+            every_time: None,
         }
     }
 
@@ -7746,6 +7989,7 @@ mod tests {
         assert_eq!(ApprovalDecision::parse("approve"), ApprovalDecision::Approve);
         assert_eq!(ApprovalDecision::parse("always"), ApprovalDecision::ApproveAlways);
         assert_eq!(ApprovalDecision::parse("deny"), ApprovalDecision::Deny);
+        assert_eq!(ApprovalDecision::parse("grant"), ApprovalDecision::Grant);
         assert_eq!(ApprovalDecision::parse("garbage"), ApprovalDecision::Deny);
     }
 

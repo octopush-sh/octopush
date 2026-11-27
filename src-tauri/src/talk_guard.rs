@@ -7,7 +7,7 @@
 //! not a sandbox, since a shell can build a path no check sees.
 
 use crate::chat_engine::{CommandWord, WordRole};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -46,10 +46,61 @@ pub struct ToolCard {
     pub reason: String,
     pub denial: String,
     pub sensitive: bool,
-    /// The folder an "Allow reading … for this conversation" answer lets the
-    /// thread's commands read from then on, and how the card names it
-    /// (#1201): only on a command's card for a read outside the workspace.
-    pub remember: Option<(PathBuf, String)>,
+    /// The grant the card offers for the conversation: a folder its
+    /// commands may read (#1201), a folder the file tools may write, or the
+    /// command itself (#1229). Never for a credentials location.
+    pub grant: Option<Grant>,
+}
+
+/// What a Talk conversation may do without asking again (#1229), each one
+/// granted from a card: read in a folder with its commands (#1201), write in
+/// a folder with the file tools, or run one exact command. Kept with the
+/// conversation (`chat_threads.talk_grants`), listed in the Companion, and
+/// never applied in Plan only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    pub kind: GrantKind,
+    /// The folder, resolved, or the command's key
+    /// ([`crate::chat_engine::command_key`]).
+    pub value: String,
+    /// How the card and the Companion name it: `~/notes`, or the command.
+    pub shown: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantKind {
+    Read,
+    Write,
+    Command,
+}
+
+/// A command grant shows at most this many characters.
+const GRANT_SHOWN_MAX: usize = 200;
+
+impl Grant {
+    /// The grant for exactly `command`, or `None` when it can't have one: it
+    /// holds an expansion the check can't follow, so what it runs can change
+    /// between calls ([`crate::chat_engine::command_key`]), or it changes
+    /// something outside this Mac ([`crate::permissions::remote_effect`]).
+    pub fn command(command: &str) -> Option<Grant> {
+        if crate::permissions::remote_effect(command).is_some() {
+            return None;
+        }
+        let value = crate::chat_engine::command_key(command)?;
+        let line = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        let shown = if line.len() > GRANT_SHOWN_MAX {
+            format!("{}\u{2026}", crate::chat_engine::truncate_char_safe(&line, GRANT_SHOWN_MAX))
+        } else {
+            line
+        };
+        Some(Grant { kind: GrantKind::Command, value, shown })
+    }
+
+    /// The same grant: its kind and value, however it was shown.
+    pub fn same(&self, other: &Grant) -> bool {
+        self.kind == other.kind && self.value == other.value
+    }
 }
 
 /// An MCP card shows a string argument up to this long, a longer one (a
@@ -61,7 +112,7 @@ const MCP_ARGS_MAX: usize = 400;
 /// names the sub-agent that asks.
 pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value) -> ToolCard {
     let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool);
-    ToolCard { kind: CardKind::Mcp, shown: format!("{tool} {}", mcp_args_shown(input)), reason, denial, sensitive: false, remember: None }
+    ToolCard { kind: CardKind::Mcp, shown: format!("{tool} {}", mcp_args_shown(input)), reason, denial, sensitive: false, grant: None }
 }
 
 /// An MCP call's arguments as its card shows them: JSON, with each long
@@ -86,18 +137,26 @@ pub fn mcp_args_shown(input: &Value) -> String {
 
 /// The director's card for a tool call other than a command: an MCP tool
 /// not in `mcp_read_only` (those this turn discovered with `readOnlyHint`,
-/// so an undiscovered one asks too), or a file tool reaching outside.
+/// so an undiscovered one asks too), or a file tool reaching outside where
+/// the thread's `grants` don't cover it.
 pub fn director_card(
     name: &str,
     input: &Value,
     mcp_read_only: &HashSet<String>,
     reach: &Reach,
     writes_confined: bool,
+    grants: &[Grant],
 ) -> Option<ToolCard> {
     if crate::mcp::is_mcp_tool(name) {
         return (!mcp_read_only.contains(name)).then(|| mcp_card(None, name, input));
     }
-    reach.outside_card(None, name, input, writes_confined)
+    reach.outside_card(None, name, input, writes_confined, grants)
+}
+
+/// Whether one of `grants` of `kind` covers `real`, a folder the
+/// conversation may still be granted ([`Reach::rememberable`]).
+fn covered(reach: &Reach, grants: &[Grant], kind: GrantKind, real: &Path) -> bool {
+    grants.iter().any(|g| g.kind == kind && real.starts_with(&g.value) && reach.rememberable(Path::new(&g.value)))
 }
 
 /// Well-known credentials locations under home, and what each holds. Matched
@@ -213,8 +272,10 @@ impl Reach {
     /// workspace, in a linked folder, and anywhere in a workspace that holds
     /// home. `writes_confined`: the mission's sandbox refuses a write
     /// outside, so a write doesn't ask (an `edit_file` still reads first, so
-    /// it asks as a read). `label` names the sub-agent that asks.
-    pub fn outside_card(&self, label: Option<&str>, name: &str, input: &Value, writes_confined: bool) -> Option<ToolCard> {
+    /// it asks as a read). `label` names the sub-agent that asks. A write
+    /// outside that isn't a credentials location offers its folder for the
+    /// conversation (#1229), and doesn't ask in a folder `grants` covers.
+    pub fn outside_card(&self, label: Option<&str>, name: &str, input: &Value, writes_confined: bool, grants: &[Grant]) -> Option<ToolCard> {
         let path = |default: &'static str| input.get("path").and_then(|p| p.as_str()).unwrap_or(default).to_string();
         let (kind, verb, act, raw) = match name {
             "read_file" => (CardKind::Read, "reads a file", "read", path("")),
@@ -229,13 +290,28 @@ impl Reach {
             return None;
         }
         let r = self.reached(&self.workspace.join(&raw), kind == CardKind::Read, name == "grep")?;
+        let open = kind == CardKind::Write && !r.sensitive && !r.deep;
+        if open && covered(self, grants, GrantKind::Write, &r.real) {
+            return None;
+        }
+        let grant = open
+            .then(|| self.folder_of(&r.real))
+            .flatten()
+            .map(|d| Grant { kind: GrantKind::Write, value: d.to_string_lossy().into_owned(), shown: self.shown(&d) });
         let reason = sub_agent(label, r.reason(verb));
         let denial = format!(
             "Tool call not made \u{2014} the user declined to let it {act} {}, {}. \
              Work inside the workspace, or ask the user for what you need; do not retry it.",
             r.shown, r.place
         );
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, remember: None })
+        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, grant })
+    }
+
+    /// The folder a grant for `real` would cover (the folder itself, or the
+    /// file's), when the conversation may be granted it.
+    fn folder_of(&self, real: &Path) -> Option<PathBuf> {
+        let dir = if real.is_dir() { real } else { real.parent()? };
+        self.rememberable(dir).then(|| dir.to_path_buf())
     }
 
     /// Where `joined` leads, resolved as a tool opening it gets there
@@ -274,7 +350,7 @@ impl Reach {
         };
         let sensitive = location.is_some() || by_name.is_some();
         let why = location.or(by_name.map(str::to_string)).or(too_deep.then(|| "its links go too deep to follow".to_string()));
-        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, remember: None })
+        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, folder: None, read })
     }
 
     /// The card an agent's `run_command` must pass (#1201), or `None`. Every
@@ -295,21 +371,25 @@ impl Reach {
     /// credentials location ([`credential_part`]), and a credentials path
     /// inside one word of code or prose (`python3 -c "…"`, `eval "…"`). Any
     /// other path outside the workspace asks, except a read under the
-    /// system's folders ([`SYSTEM_READS`]) or under one in `allowed`, which
-    /// the user let this conversation read; its card offers to remember the
-    /// folder (`ToolCard::remember`). A program that runs, a pseudo-device and
+    /// system's folders ([`SYSTEM_READS`]) or in a folder a read grant in
+    /// `grants` covers, and any path in a folder that may be granted when
+    /// `grants` holds this exact command (#1229). The card offers a read's
+    /// folder, else the command ([`Grant::command`]), when that folder may
+    /// be granted (`ToolCard::grant`). A program that runs, a pseudo-device and
     /// a here-document's body ask only for a credentials location. Past
     /// [`MAX_COMMAND_PATHS`] paths, [`MAX_COMMAND_WORDS`] words or
     /// [`MAX_GLOB_NAMES`] names a glob reads, the command asks. A net, not a
     /// sandbox: a path built at run time isn't followed.
-    pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, allowed: &[PathBuf]) -> Option<ToolCard> {
+    pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, grants: &[Grant]) -> Option<ToolCard> {
         let start = cwd.unwrap_or(&self.workspace);
-        let mut scan = Scan { allowed, glob_names: MAX_GLOB_NAMES, ..Scan::default() };
+        let exact = Grant::command(command);
+        let granted = exact.as_ref().is_some_and(|e| grants.iter().any(|g| g.same(e)));
+        let mut scan = Scan { grants, granted, glob_names: MAX_GLOB_NAMES, ..Scan::default() };
         let first = match crate::chat_engine::each_command(command, |line| self.scan_line(line, start, &mut scan)) {
             Ok(found) => found,
             Err(_) => self.scan_line(command, start, &mut scan),
         };
-        let (reason, denial, sensitive, remember) = match (first, scan.over, scan.outside) {
+        let (reason, denial, sensitive, grant) = match (first, scan.over, scan.outside) {
             (Some(r), ..) | (None, false, Some(r)) => (
                 r.reason(&format!("reaches {}", r.shown)),
                 format!(
@@ -318,10 +398,11 @@ impl Reach {
                     r.shown, r.place
                 ),
                 r.sensitive,
-                r.remember.map(|d| {
-                    let shown = self.shown(&d);
-                    (d, shown)
-                }),
+                match (r.folder, r.read) {
+                    (Some(d), true) => Some(Grant { kind: GrantKind::Read, value: d.to_string_lossy().into_owned(), shown: self.shown(&d) }),
+                    (Some(_), false) => exact,
+                    (None, _) => None,
+                },
             ),
             (None, true, _) => (
                 format!("names more paths than the check reads (over {MAX_COMMAND_PATHS}, or {MAX_COMMAND_WORDS} words)"),
@@ -333,7 +414,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, remember })
+        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
@@ -509,27 +590,24 @@ impl Reach {
             return Some(hit);
         }
         let read = !ctx.writes && !hit.deep;
+        let folder = (!hit.deep).then(|| self.folder_of(&hit.real)).flatten();
         let quiet = match ctx.role {
             WordRole::Program => runs(&hit.real),
             WordRole::Data => true,
             WordRole::Argument => false,
-        } || (read
-            && (SYSTEM_READS.iter().any(|d| hit.real.starts_with(d))
-                || scan.allowed.iter().any(|d| hit.real.starts_with(d) && self.rememberable(d))));
+        } || (read && (SYSTEM_READS.iter().any(|d| hit.real.starts_with(d)) || covered(self, scan.grants, GrantKind::Read, &hit.real)))
+            || (scan.granted && folder.is_some());
         if !quiet {
-            if read {
-                let dir = if hit.real.is_dir() { Some(hit.real.as_path()) } else { hit.real.parent() };
-                hit.remember = dir.filter(|d| self.rememberable(d)).map(Path::to_path_buf);
-            }
+            (hit.folder, hit.read) = (folder, read);
             scan.outside.get_or_insert(hit);
         }
         None
     }
 
-    /// Whether the conversation may remember `dir` for its commands' reads
-    /// (#1201): never a folder that is, holds or is inside a credentials
-    /// location, as named or where it resolves (`~`, `~/.config`, `/`, a
-    /// link to one of them). Such a read is allowed once at a time.
+    /// Whether the conversation may be granted `dir` (#1201, #1229): never a
+    /// folder that is, holds or is inside a credentials location, as named
+    /// or where it resolves (`~`, `~/.config`, `/`, a link to one of them).
+    /// A path there is allowed once at a time.
     fn rememberable(&self, dir: &Path) -> bool {
         let real = resolve(dir).unwrap_or_else(|| dir.to_path_buf());
         self.secrets.iter().all(|(place, resolved, _)| {
@@ -585,8 +663,10 @@ struct Ctx {
 /// What [`Reach::command_card`] has found so far across a command's lines.
 #[derive(Default)]
 struct Scan<'a> {
-    /// Folders the user let this conversation's commands read.
-    allowed: &'a [PathBuf],
+    /// The conversation's grants (#1201, #1229).
+    grants: &'a [Grant],
+    /// `grants` holds this exact command.
+    granted: bool,
     seen: HashSet<(PathBuf, Ctx)>,
     resolved: usize,
     glob_names: usize,
@@ -596,8 +676,8 @@ struct Scan<'a> {
 
 /// A path a tool call reaches that must ask ([`Reach::reached`]): where it
 /// leads, as the card names it, where that is, why it is sensitive, whether
-/// its links go too deep to follow, and the folder a command's card offers
-/// to remember.
+/// its links go too deep to follow, the folder a command's card may offer a
+/// grant for, and whether the command only reads it.
 struct Reached {
     real: PathBuf,
     shown: String,
@@ -605,7 +685,8 @@ struct Reached {
     why: Option<String>,
     sensitive: bool,
     deep: bool,
-    remember: Option<PathBuf>,
+    folder: Option<PathBuf>,
+    read: bool,
 }
 
 impl Reached {
@@ -699,7 +780,8 @@ fn named_credential(pattern: &str, spliced: &str) -> Option<Reached> {
         why: Some(format!("it names {part}, which holds credentials")),
         sensitive: true,
         deep: false,
-        remember: None,
+        folder: None,
+        read: false,
     })
 }
 
@@ -966,7 +1048,7 @@ mod tests {
     }
 
     fn card(reach: &Reach, tool: &str, path: impl AsRef<Path>) -> Option<ToolCard> {
-        reach.outside_card(None, tool, &json!({"path": path.as_ref().to_string_lossy(), "content": "c"}), false)
+        reach.outside_card(None, tool, &json!({"path": path.as_ref().to_string_lossy(), "content": "c"}), false, &[])
     }
 
     #[test]
@@ -989,7 +1071,7 @@ mod tests {
         for (tool, path) in [("read_file", "a.txt"), ("read_file", abs), ("list_files", "."), ("grep", "."), ("write_file", "new/dir/b.txt"), ("edit_file", "./a.txt"), ("glob", "/"), ("run_command", "/")] {
             assert_eq!(card(&reach, tool, path), None, "{tool} {path}");
         }
-        assert_eq!(reach.outside_card(None, "grep", &json!({"pattern": "x"}), false), None, "no path: the workspace");
+        assert_eq!(reach.outside_card(None, "grep", &json!({"pattern": "x"}), false, &[]), None, "no path: the workspace");
     }
 
     #[cfg(unix)]
@@ -1086,9 +1168,9 @@ mod tests {
         // A sandboxed mission refuses the write itself; a read there still
         // asks, and so does an edit, which reads the file first.
         let target = json!({"path": home.join("x").to_string_lossy()});
-        assert_eq!(reach.outside_card(None, "write_file", &target, true), None);
-        assert!(reach.outside_card(None, "read_file", &target, true).is_some());
-        let edit = reach.outside_card(None, "edit_file", &target, true).expect("an edit reads first");
+        assert_eq!(reach.outside_card(None, "write_file", &target, true, &[]), None);
+        assert!(reach.outside_card(None, "read_file", &target, true, &[]).is_some());
+        let edit = reach.outside_card(None, "edit_file", &target, true, &[]).expect("an edit reads first");
         assert_eq!((edit.kind, edit.reason.as_str()), (CardKind::Read, "reads a file to edit it outside the workspace"));
     }
 
@@ -1108,7 +1190,7 @@ mod tests {
         }
         // A workspace opened at home still asks for ~/.ssh and name-marked files.
         let at_home = Reach::new(&home, None, Some(&home));
-        let c = at_home.outside_card(Some("Scout"), "read_file", &json!({"path": ".ssh/id_ed25519"}), false).unwrap();
+        let c = at_home.outside_card(Some("Scout"), "read_file", &json!({"path": ".ssh/id_ed25519"}), false, &[]).unwrap();
         assert!(c.sensitive && c.reason == "Sub-agent \u{201c}Scout\u{201d}: reads a file in a credentials location \u{b7} ~/.ssh holds SSH keys");
         let env = card(&at_home, "read_file", "app/.env").unwrap();
         assert_eq!((env.sensitive, env.reason.as_str()), (true, "reads a file in the workspace \u{b7} its name marks it as an env file"));
@@ -1143,12 +1225,12 @@ mod tests {
         let (_d, ws, home) = setup();
         let reach = Reach::new(&ws, None, Some(&home));
         let read_only: HashSet<String> = ["mcp__github__get_issue".to_string()].into();
-        let c = director_card("mcp__github__merge_pr", &json!({"number": 7}), &read_only, &reach, false)
+        let c = director_card("mcp__github__merge_pr", &json!({"number": 7}), &read_only, &reach, false, &[])
             .expect("a tool without readOnlyHint asks");
         assert_eq!((c.kind, c.shown.as_str()), (CardKind::Mcp, "mcp__github__merge_pr {\"number\":7}"));
         assert!(c.reason.starts_with("MCP tool `mcp__github__merge_pr` may change external state"));
         assert!(c.kind.grantable(), "the thread's \"don't ask again\" may answer it");
-        assert!(director_card("mcp__other__thing", &json!({}), &read_only, &reach, false).is_some(), "an undiscovered tool asks");
+        assert!(director_card("mcp__other__thing", &json!({}), &read_only, &reach, false, &[]).is_some(), "an undiscovered tool asks");
     }
 
     #[test]
@@ -1157,7 +1239,7 @@ mod tests {
         let reach = Reach::new(&ws, None, Some(&home));
         let read_only: HashSet<String> = ["mcp__github__get_issue".to_string()].into();
         for (tool, input) in [("mcp__github__get_issue", json!({"number": 7})), ("read_file", json!({"path": "a.txt"}))] {
-            assert_eq!(director_card(tool, &input, &read_only, &reach, false), None, "{tool}");
+            assert_eq!(director_card(tool, &input, &read_only, &reach, false, &[]), None, "{tool}");
         }
     }
 
@@ -1174,6 +1256,11 @@ mod tests {
         reach.command_card(None, command, None, &[])
     }
 
+    /// Read grants for `dirs`, as a command's card keeps them.
+    fn reads(dirs: &[PathBuf]) -> Vec<Grant> {
+        dirs.iter().map(|d| Grant { kind: GrantKind::Read, value: d.to_string_lossy().into_owned(), shown: String::new() }).collect()
+    }
+
     #[test]
     fn a_command_reading_a_credentials_location_asks_deny_first() {
         let (_d, ws, home) = setup();
@@ -1187,7 +1274,7 @@ mod tests {
             assert_eq!((c.kind, c.shown.as_str(), c.sensitive), (CardKind::Run, command, true), "the card shows the command, Deny first");
             assert_eq!(c.reason, format!("reaches {path} outside the workspace \u{b7} {why}"));
             assert!(c.denial.contains(path) && c.denial.contains("do not retry"), "{}", c.denial);
-            assert!(!c.kind.grantable() && c.remember.is_none(), "no grant answers it, and it is never remembered");
+            assert!(!c.kind.grantable() && c.grant.is_none(), "no grant answers it, and it is never offered");
         }
         let sub = reach.command_card(Some("Scout"), "cat ~/.ssh/id_ed25519", None, &[]).unwrap();
         assert!(sub.reason.starts_with("Sub-agent \u{201c}Scout\u{201d}: reaches ~/.ssh/id_ed25519"), "{}", sub.reason);
@@ -1305,12 +1392,13 @@ mod tests {
         }
         assert!(run(&reach, "cat /Library/Keychains/System.keychain").is_some_and(|c| c.sensitive), "a credentials location there still asks");
         let write = run(&reach, "echo x > /usr/local/bin/tool").expect("a write there asks");
-        assert_eq!((write.sensitive, write.remember), (false, None), "and offers no folder");
+        assert_eq!((write.sensitive, write.grant.map(|g| g.kind)), (false, Some(GrantKind::Command)), "and offers the command, no folder");
         // A read outside offers its folder (the file's, or the folder itself).
-        assert_eq!(run(&reach, "cat ~/sub/x").unwrap().remember, Some((home.join("sub"), "~/sub".to_string())));
-        assert_eq!(run(&reach, "ls ~/sub").unwrap().remember, Some((home.join("sub"), "~/sub".to_string())));
+        let sub = Some(Grant { kind: GrantKind::Read, value: home.join("sub").to_string_lossy().into_owned(), shown: "~/sub".into() });
+        assert_eq!(run(&reach, "cat ~/sub/x").unwrap().grant, sub);
+        assert_eq!(run(&reach, "ls ~/sub").unwrap().grant, sub);
         // Once allowed, reads there run; a write there and a read elsewhere still ask.
-        let allowed = [home.join("sub")];
+        let allowed = reads(&[home.join("sub")]);
         assert_eq!(reach.command_card(None, "cat ~/sub/x ~/sub/y", None, &allowed), None);
         assert!(reach.command_card(None, "echo x > ~/sub/out.txt", None, &allowed).is_some());
         assert!(reach.command_card(None, "cat ~/notes.txt", None, &allowed).is_some());
@@ -1328,18 +1416,18 @@ mod tests {
         let reach = Reach::new(&ws, None, Some(&home));
         for command in ["ls ~", "cd ~", "cat ~/notes.txt", "ls ~/.config", "ls /"] {
             let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
-            assert_eq!((c.sensitive, c.remember), (false, None), "{command}: allowed once at a time");
+            assert_eq!((c.sensitive, c.grant), (false, None), "{command}: allowed once at a time");
         }
         #[cfg(unix)]
-        assert_eq!(run(&reach, "ls home-link").map(|c| c.remember), Some(None), "a link to home is home");
+        assert_eq!(run(&reach, "ls home-link").map(|c| c.grant), Some(None), "a link to home is home");
         // Whatever grant is in place, these still ask, Deny first.
-        let granted = [home.clone(), home.join(".config"), home.join(".ssh"), PathBuf::from("/"), ws.join("home-link"), home.join("sub")];
+        let granted = reads(&[home.clone(), home.join(".config"), home.join(".ssh"), PathBuf::from("/"), ws.join("home-link"), home.join("sub")]);
         for command in ["ls ~", "cat ~/notes.txt"] {
             assert!(reach.command_card(None, command, None, &granted).is_some_and(|c| !c.sensitive), "{command} still asks");
         }
         for command in ["ditto ~ ./bk", "gzip -rc ~", "python3 -m zipfile -c o.zip ~", "cat $(echo ~/.ne )trc", "cat ~/.ssh/id_ed25519"] {
             let c = reach.command_card(None, command, None, &granted).unwrap_or_else(|| panic!("{command} asks"));
-            assert!(c.sensitive && c.remember.is_none(), "{command}: {}", c.reason);
+            assert!(c.sensitive && c.grant.is_none(), "{command}: {}", c.reason);
         }
     }
 
@@ -1420,5 +1508,55 @@ mod tests {
         assert_eq!(run(&reach, &"echo $(date) ".repeat(65)), None);
         assert!(run(&reach, &"echo $(cat ~/.ssh/id_ed25519) ".repeat(65)).is_some_and(|c| c.sensitive));
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// A file tool's write outside offers its folder (#1229); once granted,
+    /// the file tools write there without a card, and a read there, another
+    /// folder and a credentials location still ask.
+    #[test]
+    fn a_write_outside_offers_its_folder_and_the_grant_covers_writes_there() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let at = |tool: &str, path: PathBuf, grants: &[Grant]| reach.outside_card(None, tool, &json!({"path": path, "content": "c"}), false, grants);
+        let c = at("write_file", home.join("sub/out.txt"), &[]).expect("a write outside asks");
+        let g = c.grant.expect("it offers its folder");
+        assert_eq!((g.kind, g.shown.as_str()), (GrantKind::Write, "~/sub"));
+        let held = [g];
+        assert_eq!(at("write_file", home.join("sub/new/x.txt"), &held), None, "a write in the folder runs");
+        assert_eq!(at("edit_file", home.join("sub/out.txt"), &held), None, "an edit there too");
+        assert!(at("read_file", home.join("sub/out.txt"), &held).is_some(), "a read there still asks");
+        assert!(at("write_file", home.join("other.txt"), &held).is_some(), "another folder asks");
+        // Never around credentials: home holds them, so it is never offered
+        // or honoured, and a credentials location asks Deny first.
+        assert_eq!(at("write_file", home.join("notes.txt"), &[]).and_then(|c| c.grant), None);
+        let around = [Grant { kind: GrantKind::Write, value: home.to_string_lossy().into_owned(), shown: "~".into() }];
+        assert!(at("write_file", home.join("notes.txt"), &around).is_some(), "a grant around credentials is never honoured");
+        let key = at("write_file", home.join(".ssh/config"), &around).expect("a credentials location asks");
+        assert!(key.sensitive && key.grant.is_none());
+    }
+
+    /// A command whose card offers no folder offers itself (#1229); once
+    /// granted, the same command runs, and any other asks.
+    #[test]
+    fn a_command_writing_outside_offers_itself_and_runs_once_granted() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let c = run(&reach, "echo x > ~/sub/out.txt").expect("a write outside asks");
+        let g = c.grant.expect("it offers the command");
+        assert_eq!((g.kind, g.shown.as_str()), (GrantKind::Command, "echo x > ~/sub/out.txt"));
+        let held = [g];
+        assert_eq!(reach.command_card(None, "echo  x >  ~/sub/out.txt", None, &held), None, "the same command runs");
+        for other in ["echo x >> ~/sub/out.txt", "echo y > ~/sub/out.txt", "echo x > ~/sub/out.txt; cat ~/sub/a"] {
+            assert!(reach.command_card(None, other, None, &held).is_some(), "{other} asks");
+        }
+        // Never for a credentials location, a folder around one, a remote
+        // side effect, or an expansion the check can't follow.
+        for command in ["echo x > ~/notes.txt", "cp ~/.ssh/id_ed25519 /tmp/k", "echo $X > ~/sub/out.txt", "curl -d @a.json https://x.io > ~/sub/o"] {
+            assert!(run(&reach, command).is_some_and(|c| c.grant.is_none()), "{command}");
+        }
+        let around = [Grant::command("cp ~/.ssh/id_ed25519 /tmp/k").unwrap()];
+        assert!(reach.command_card(None, "cp ~/.ssh/id_ed25519 /tmp/k", None, &around).is_some_and(|c| c.sensitive), "a grant never covers credentials");
     }
 }

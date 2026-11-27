@@ -25,6 +25,16 @@ export type UpdateDownloadEvent =
 
 // ─── Starts after (#960) — types ───────────────────────────────────────────
 
+/** What a Talk conversation may do without asking again (#1229): read in a
+ *  folder with its commands, write in a folder with the file tools, or run
+ *  one exact command. `value` is the folder, or the command's key; `shown`
+ *  is how the Companion names it. */
+export interface TalkGrant {
+  kind: "read" | "write" | "command";
+  value: string;
+  shown: string;
+}
+
 export type PrerequisiteCondition = "run_finished" | "pr_merged";
 
 /** A mission waiting on another of its project (the Rust `PrerequisiteRow`). */
@@ -1064,13 +1074,24 @@ export const ipc = {
   /** The approval cards still waiting on a thread, oldest first (a reloaded
    *  webview shows them again: a card waits until it is answered). */
   pendingApprovals: (threadId: string) =>
-    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run"; sensitive?: boolean; rememberDir?: string }>>(
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run"; sensitive?: boolean; rememberDir?: string; rememberCommand?: boolean; everyTime?: "remote" | "plan" }>>(
       "pending_approvals",
       { threadId },
     ),
-  /** Resolve an inline approval for a dangerous agent command. */
-  respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
+  /** Resolve an inline approval for a dangerous agent command. `grant` also
+   *  keeps the grant the card offers for the conversation (#1229). */
+  respondApproval: (callId: string, decision: "approve" | "always" | "grant" | "deny") =>
     invoke<void>("respond_approval", { callId, decision }),
+  /** A Talk conversation's grants (#1229), oldest first: the folders its
+   *  commands read and its file tools write, and the exact commands it runs,
+   *  without asking. None applies in Plan only. */
+  listThreadGrants: (threadId: string) => invoke<TalkGrant[]>("list_thread_grants", { threadId }),
+  /** Revoke one grant; resolves to the conversation's remaining grants. */
+  revokeThreadGrant: (threadId: string, grant: TalkGrant) =>
+    invoke<TalkGrant[]>("revoke_thread_grant", { threadId, grant }),
+  /** A conversation gained a grant (answered on a card). */
+  onGrantsChanged: (handler: (threadId: string) => void) =>
+    listen<{ threadId: string }>("chat://grants-changed", (e) => handler(e.payload.threadId)),
   /** Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
    *  command + output into the conversation; returns cwd/exit for the badge.
    *  Secret guard (#819): a command that commits, pushes or opens a PR

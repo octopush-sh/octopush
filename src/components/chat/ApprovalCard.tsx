@@ -5,7 +5,7 @@ import { tourId } from "../../lib/tour/ids";
 
 interface Props {
   approval: PendingApproval;
-  onRespond: (decision: "approve" | "always" | "deny") => void;
+  onRespond: (decision: "approve" | "always" | "grant" | "deny") => void;
 }
 
 const QUICK = "transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)]";
@@ -27,6 +27,16 @@ export const FOCUS_CARD_CHORD = "⌘⌥A";
 /** Every card carries this attribute, so the chord can find the oldest one
  *  and Talk's Esc can leave a card's focus alone (`talkEscape`). */
 export const APPROVAL_CARD_SELECTOR = "[data-approval-card]";
+
+/** Why a card offers no grant (#1229), under its command. */
+export const EVERY_TIME_COPY = {
+  remote: "A command that changes something outside this Mac asks every time.",
+  plan: "In Plan only, nothing is remembered: every card asks.",
+} as const;
+
+/** The per-command grant's tooltip (#1229). */
+export const COMMAND_GRANT_TITLE =
+  "Run this, and run exactly this command again without asking for the rest of this conversation: the same words, quotes, operators and redirections. A credentials location still asks. Revoke it in the Companion.";
 
 /** What a command's path card can't promise (#1201), on its tooltip. */
 export const RUN_CHECK_LIMITS =
@@ -50,8 +60,10 @@ export const RUN_CHECK_LIMITS =
  * outside the workspace or in a credentials location (`kind: "run"`) asks
  * the same way, showing the command, and its tooltip says the check is a
  * net, not a sandbox. A read outside that isn't a credentials location also
- * offers "Allow reading <folder> for this conversation" (`rememberDir`,
- * answered as "always").
+ * offers "Allow reading <folder> for this conversation" (`rememberDir`). Since
+ * #1229 a write outside offers "Allow writing <folder>…", a command card with
+ * no folder "Allow this command…" (`rememberCommand`), each answered "grant";
+ * a card with no grant says why (`everyTime`).
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -76,6 +88,15 @@ export function ApprovalCard({ approval, onRespond }: Props) {
   // Where the safe answer leads, it is the first button and Enter takes it.
   const safeLead = secret || sensitive;
   const lead = safeLead ? "deny" : "approve";
+  // The grant the card offers for the conversation (#1229): a folder, or the command itself.
+  const dir = !secret && !sensitive && (run || approval.kind === "write") ? approval.rememberDir : undefined;
+  const grant = dir
+    ? run
+      ? { label: `Allow reading ${dir} for this conversation`, title: `Run this, and let commands read ${dir} without asking for the rest of this conversation (a credentials location still asks). Revoke it in the Companion.` }
+      : { label: `Allow writing ${dir} for this conversation`, title: `Allow this, and let the agent's file tools write in ${dir} without asking for the rest of this conversation (reads there still ask). Revoke it in the Companion.` }
+    : !secret && !sensitive && approval.rememberCommand && (run || !outside)
+      ? { label: "Allow this command for this conversation", title: COMMAND_GRANT_TITLE }
+      : null;
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     const answer = cardKeyAnswer(e, safeLead);
     if (!answer) return;
@@ -107,6 +128,9 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
         {approval.command}
       </pre>
+      {approval.everyTime && !secret && (
+        <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">{EVERY_TIME_COPY[approval.everyTime]}</p>
+      )}
       {secret && (
         <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">
           {approval.coversUncommitted
@@ -123,7 +147,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
             : run
               ? "Allowing runs it once, and its output goes to your AI provider. "
               : "Allowing lets the agent write it once. "}
-          {run ? "A credentials location always asks." : "Every access outside the workspace asks again."}
+          {run || dir ? "A credentials location always asks." : "Every access outside the workspace asks again."}
         </p>
       )}
       <div className="mt-2 flex items-center gap-2">
@@ -146,24 +170,24 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         >
           {copy.other[0]}
         </button>
-        {!secret && !outside && (
+        {grant && (
           <button
             type="button"
-            onClick={() => onRespond("always")}
-            title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)"
-            className={`ml-auto font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
-          >
-            Approve &amp; don't ask again
-          </button>
-        )}
-        {run && !sensitive && approval.rememberDir && (
-          <button
-            type="button"
-            onClick={() => onRespond("always")}
-            title={`Run this, and let commands read ${approval.rememberDir} without asking for the rest of this conversation (a credentials location still asks)`}
+            onClick={() => onRespond("grant")}
+            title={grant.title}
             className={`ml-auto truncate font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
           >
-            Allow reading {approval.rememberDir} for this conversation
+            {grant.label}
+          </button>
+        )}
+        {!secret && !outside && !approval.everyTime && (
+          <button
+            type="button"
+            onClick={() => onRespond("always")}
+            title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, a command that changes something outside this Mac, or a file or command reaching outside the workspace, still asks)"
+            className={`${grant ? "shrink-0" : "ml-auto"} font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
+          >
+            Approve &amp; don't ask again
           </button>
         )}
       </div>

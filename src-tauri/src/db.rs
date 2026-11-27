@@ -84,6 +84,9 @@ fn unknown_group_item_kind(kind: &str) -> crate::error::AppError {
 /// What a mission can wait for on its prerequisite (`workspaces.after_condition`).
 pub const PREREQUISITE_CONDITIONS: [&str; 2] = ["run_finished", "pr_merged"];
 
+/// How many grants one Talk conversation keeps (#1229).
+pub const MAX_THREAD_GRANTS: usize = 64;
+
 /// A refusal from the prerequisite ("Starts after") layer, worded for the user.
 fn prerequisite_error(message: impl Into<String>) -> crate::error::AppError {
     crate::error::AppError::Other(message.into())
@@ -715,6 +718,10 @@ impl Db {
         // `plan` or `edit`. NULL, which every row from before the column
         // has, is Edit freely: what Talk always did.
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN permission_mode TEXT")?;
+        // A conversation's grants (`talk_guard::Grant`, #1229): a JSON array
+        // of `{kind, value, shown}`. NULL, which every row from before the
+        // column has, is none: every such call asks, as it always did.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN talk_grants TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
@@ -4021,6 +4028,34 @@ impl Db {
             .query_row("SELECT permission_mode FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
             .optional()?;
         Ok(raw.flatten())
+    }
+
+    /// A conversation's grants (#1229), oldest first. NULL, or a value this
+    /// build can't read, is none: a grant only ever skips a card, so losing
+    /// one makes Talk ask again, never less.
+    pub fn thread_grants(&self, thread_id: &str) -> AppResult<Vec<crate::talk_guard::Grant>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT talk_grants FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default())
+    }
+
+    /// Keep `grant` in a conversation, or revoke it (`keep: false`), and
+    /// return its grants. A grant is its kind and value: keeping one again
+    /// moves it to the end. Past [`MAX_THREAD_GRANTS`] the oldest goes.
+    pub fn set_thread_grant(&self, thread_id: &str, grant: &crate::talk_guard::Grant, keep: bool) -> AppResult<Vec<crate::talk_guard::Grant>> {
+        let mut grants = self.thread_grants(thread_id)?;
+        grants.retain(|g| !g.same(grant));
+        if keep {
+            grants.push(grant.clone());
+        }
+        let extra = grants.len().saturating_sub(MAX_THREAD_GRANTS);
+        grants.drain(..extra);
+        let value = (!grants.is_empty()).then(|| serde_json::to_string(&grants).ok()).flatten();
+        self.conn.execute("UPDATE chat_threads SET talk_grants = ?2 WHERE id = ?1", params![thread_id, value])?;
+        Ok(grants)
     }
 
     /// The workspace a conversation belongs to, `None` once it's gone.

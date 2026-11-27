@@ -305,6 +305,8 @@ pub fn run() {
             commands::set_thread_mcp_server,
             commands::get_thread_permission_mode,
             commands::set_thread_permission_mode,
+            commands::list_thread_grants,
+            commands::revoke_thread_grant,
             commands::get_mcp_config,
             commands::save_mcp_config,
             commands::test_mcp_server,

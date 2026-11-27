@@ -180,20 +180,26 @@ export interface PendingApproval {
   kind?: ApprovalKind;
   /** The path is a well-known credentials location: the safe answer leads. */
   sensitive?: boolean;
-  /** A command's read outside the workspace (#1201): the folder "Allow
-   *  reading … for this conversation" remembers. */
+  /** The folder "Allow reading/writing … for this conversation" keeps
+   *  (#1201, #1229). */
   rememberDir?: string;
+  /** The card offers "Allow this command for this conversation" (#1229). */
+  rememberCommand?: boolean;
+  /** Why it offers no grant: a remote side effect, or Plan only (#1229). */
+  everyTime?: "remote" | "plan";
 }
 
 export type ApprovalKind = "mcp" | "read" | "write" | "run";
 
 /** The card fields a request carries beyond its command and reason. */
-function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean; rememberDir?: string }) {
+function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command" | "reason">) {
   return {
     ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
     ...(c.kind ? { kind: c.kind } : {}),
     ...(c.sensitive ? { sensitive: true } : {}),
     ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
+    ...(c.rememberCommand ? { rememberCommand: true } : {}),
+    ...(c.everyTime ? { everyTime: c.everyTime } : {}),
   };
 }
 
@@ -696,7 +702,7 @@ interface ChatState {
   respondApproval: (
     workspaceId: string,
     callId: string,
-    decision: "approve" | "always" | "deny",
+    decision: "approve" | "always" | "grant" | "deny",
   ) => void;
   setModel: (model: string) => void;
   setEffort: (effort: Effort) => void;
@@ -1211,6 +1217,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     kind?: ApprovalKind;
     sensitive?: boolean;
     rememberDir?: string;
+    rememberCommand?: boolean;
+    everyTime?: "remote" | "plan";
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
