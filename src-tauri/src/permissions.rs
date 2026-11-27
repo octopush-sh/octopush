@@ -254,47 +254,38 @@ const READERS: &[&str] = &["ls", "cat", "head", "tail", "wc", "grep", "diff", "p
 const GIT_READERS: &[&str] = &["status", "diff", "log", "show", "blame", "ls-files", "rev-parse"];
 
 /// Whether every command `command` runs only reads, so Ask first runs it
-/// without a card (#1231). Read the way the command check reads commands:
-/// every nested one ([`crate::chat_engine::each_command`]), each word as the
-/// shell splits it ([`crate::chat_engine::command_words`]). Each command must
-/// start with a program in [`READERS`] (or `git` with a subcommand in
-/// [`GIT_READERS`] right after it), named plainly, and nothing may redirect
-/// output except to `/dev/null`. Anything the check can't tell asks: a
-/// variable or a path as the program, an assignment before it, a wrapper or
-/// a shell keyword, a script, or nesting past the check's caps.
+/// without a card (#1231). Only a command of [`plain_shape`] qualifies.
+/// Then it is read the way the command check reads commands: every nested
+/// one ([`crate::chat_engine::each_command`]), each word as the shell splits
+/// it ([`crate::chat_engine::command_words`]). Each command must start with a
+/// program in [`READERS`] (or `git` with a subcommand in [`GIT_READERS`]
+/// right after it), named plainly, and nothing may redirect output except to
+/// `/dev/null`. Anything the check can't tell asks: a path as the program,
+/// an assignment before it, a wrapper or a shell keyword, a script.
 pub fn reads_only(command: &str) -> bool {
     !command.trim().is_empty()
         && crate::chat_engine::control_refusal(command).is_none()
-        // A line continued with `\` can hide an expansion from the check
-        // (`$\⏎{PWD:_}`): it asks.
-        && !command.contains("\\\n")
-        && !runs_arithmetic(command)
+        && plain_shape(command)
         && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
 }
 
-/// Whether `command` holds arithmetic (`$((…))`, `$[…]`) or any `${…}` but a
-/// plain name or its length (`${name}`, `${#name}`), anywhere, quoted or
-/// not. Bash evaluates a substring offset or an array subscript
-/// (`${PWD:_}`, `${a[_]}`) and arithmetic as an expression, and a variable
-/// in it, such as `$_` after `echo 'a[$(cmd)]'`, runs the command it holds:
-/// a reader that runs code. So it asks.
-fn runs_arithmetic(command: &str) -> bool {
-    if command.contains("$((") || command.contains("$[") {
-        return true;
-    }
-    let mut rest = command;
-    while let Some(at) = rest.find("${") {
-        let inner = &rest[at + 2..];
-        let Some(end) = inner.find('}') else { return true };
-        let name = inner[..end].strip_prefix('#').unwrap_or(&inner[..end]);
-        let plain = name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
-            && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric());
-        if !plain {
-            return true;
-        }
-        rest = &inner[end + 1..];
-    }
-    false
+/// The characters a command [`plain_shape`] never holds: every way into an
+/// expansion (`$`, a backtick, `{` and `}` of a brace expansion), quoting
+/// that changes what the next character means (`\`), history expansion
+/// (`!`), and a here-document (`<<`, checked as a pair).
+const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!'];
+
+/// Whether `command` has the plain shape Ask first lets run without a card:
+/// none of [`NOT_PLAIN`] anywhere in its raw text, quoted or not, and no
+/// `<<`. A whitelist on purpose, not a list of tricks: bash builds code from
+/// many shapes a reader check doesn't model (`{$,}{PWD:_}` makes `${PWD:_}`
+/// by brace expansion, whose arithmetic runs the command `$_` holds after
+/// `echo $'a[\x24(touch x)]'`; `$\⏎{` joins a line; `$((…))`, `${x:-…}`),
+/// and each new one was a bypass. Without these characters no expansion,
+/// substitution or line join can happen, so what the check reads is what
+/// runs. A command outside the shape only gets Ask first's card. Pure.
+pub fn plain_shape(command: &str) -> bool {
+    !command.contains(NOT_PLAIN) && !command.contains("<<")
 }
 
 /// Whether `command` runs `git` from outside `workspace` (#1231): `cwd` is
@@ -377,7 +368,7 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         reason: crate::talk_guard::sub_agent(label, reason),
         denial: denial.to_string(),
         sensitive: false,
-        remember: None,
+        grant: None,
         trust: None,
         diff,
         bound,
@@ -406,7 +397,7 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
 /// its diff: inside the workspace, and not named like an env file or a key.
 fn previewed(reach: &Reach, name: &str, input: &Value, path: &str) -> bool {
     let marked = crate::secret_scan::is_env_file(path) || crate::secret_scan::is_sensitive_name(path);
-    !marked && reach.outside_card(None, name, input, false).is_none()
+    !marked && reach.outside_card(None, name, input, false, &[]).is_none()
 }
 
 /// What an Ask first approval binds to (#1231): the SHA-256 of the file at
@@ -491,13 +482,15 @@ pub enum AskOutcome {
 /// shown. A change that moved meanwhile gets a new card that says so
 /// ([`CHANGED_WHILE_WAITING`]); one the tool would now refuse (`refused`)
 /// gets that refusal and no second card.
-pub async fn guard_ask_first<F, Fut>(
+pub async fn guard_ask_first<C, CFut, F, Fut>(
     mut card: ToolCard,
-    recheck: impl Fn() -> ToolCard,
+    recheck: C,
     refused: impl Fn() -> Option<String>,
     ask: F,
 ) -> AskOutcome
 where
+    C: Fn() -> CFut,
+    CFut: std::future::Future<Output = Option<ToolCard>>,
     F: Fn(ToolCard) -> Fut,
     Fut: std::future::Future<Output = crate::chat_engine::ApprovalDecision>,
 {
@@ -508,7 +501,7 @@ where
         if let Some(why) = refused() {
             return AskOutcome::Refused(why);
         }
-        let next = recheck();
+        let Some(next) = recheck().await else { return AskOutcome::Approved };
         let same = (next.kind, &next.shown, &next.diff, next.bound) == (card.kind, &card.shown, &card.diff, card.bound);
         if same {
             return AskOutcome::Approved;
@@ -1047,6 +1040,10 @@ impl ToolGate for ModeGate {
             None => None,
         }
     }
+
+    fn write_check(&self, name: &str, input: &Value) -> Option<crate::talk_guard::WriteCheck> {
+        self.inner.as_ref().and_then(|g| g.write_check(name, input))
+    }
 }
 
 #[cfg(test)]
@@ -1130,7 +1127,7 @@ mod tests {
             "git status", "git status --porcelain", "git diff HEAD~1", "git log --oneline -5", "git show HEAD:a.rs",
             "git blame a.rs", "git ls-files", "git rev-parse HEAD",
             "cat a.rs | grep fn | head -3", "ls && git status; pwd", "grep x a.rs 2>/dev/null", "ls >/dev/null 2>&1",
-            "cat < a.rs", "echo $(git rev-parse HEAD)", "cat \"$FILE\"", "grep -c fn a.rs || echo none",
+            "cat < a.rs", "grep -c fn a.rs || echo none", "grep -n foo src/*.rs",
         ];
         for command in runs {
             assert!(reads_only(command), "{command} should run without a card");
@@ -1143,6 +1140,8 @@ mod tests {
             "echo x > a.rs", "cat a >> b", "ls &> out.txt", "grep x a.rs 2> err.txt",
             // A reader beside a writer, or nested in one.
             "ls; rm a.rs", "cat a.rs | tee b.rs", "echo $(rm a.rs)", "ls `touch x`", "cat <(rm -rf x)",
+            // Outside the plain shape, a reader asks too (`plain_shape`).
+            "echo $(git rev-parse HEAD)", "cat \"$FILE\"",
             // git that writes, or git flags before the subcommand.
             "git commit -m x", "git push", "git checkout main", "git branch -D x", "git -c core.pager=x log",
             "git -C .. status", "git diff --output=patch.txt", "git log --output patch.txt", "git diff --ext-diff",
@@ -1194,8 +1193,9 @@ mod tests {
         for command in ["echo $'a[\\x24(touch x)]'; echo $\\\n{PWD:_}", "echo $'a[\\x24(touch x)]'; echo $\\\n[_]", "ls \\\n-la"] {
             assert!(!reads_only(command), "{command:?} should ask");
         }
-        // `$'\x24'` decodes to a plain `$`, which bash never expands again.
-        assert!(reads_only("echo $'\\x24'{PWD:_}"));
+        // `$'\x24'` decodes to a plain `$`, which bash never expands again;
+        // it still asks, as anything with a `$` does (`plain_shape`).
+        assert!(!reads_only("echo $'\\x24'{PWD:_}"));
         let dir = tempfile::tempdir().unwrap();
         let run = |command: &str| std::process::Command::new("/bin/bash").arg("-c").arg(command).current_dir(dir.path()).output().unwrap();
         run("echo 'a[$(touch x)]' >/dev/null; echo $'\\x24'{PWD:_} >/dev/null; echo $'\\x24(touch y)' >/dev/null");
@@ -1204,27 +1204,42 @@ mod tests {
         assert!(dir.path().join("z").exists(), "the continuation does run it: the case the check asks for");
     }
 
-    /// Arithmetic runs what a variable holds, `$_` included, so a reader
-    /// that expands it asks: `echo 'a[$(touch x)]'; echo ${PWD:_}` runs
-    /// `touch x` in bash.
+    /// Only a command of the plain shape runs without Ask first's card: no
+    /// `$`, backtick, brace, backslash, `!` or `<<`. Brace expansion builds
+    /// `${PWD:_}` from `{$,}{PWD:_}`, whose arithmetic runs what `$_` holds.
     #[test]
-    fn a_reader_that_expands_arithmetic_asks() {
+    fn only_a_plain_shape_reads() {
         for command in [
+            // Brace expansion builds `${PWD:_}`: bash ran `touch` from this one.
+            "echo $'a[\\x24(touch x)]'; echo {$,}{PWD:_}",
+            "echo {$,}{PWD:_}",
+            "echo 'a[$(touch x)]'; echo $_",
+            "echo ${x:-a.rs}",
+            "echo $((1+1))",
             "echo 'a[$(touch x)]'; echo ${PWD:_}",
-            "echo 'a[$(touch x)]'; echo ${a[_]}",
-            "echo 'a[$(touch x)]'; echo $((_))",
+            "echo ${a[_]}",
             "echo $[_]",
             "cat ${!_}",
-            "echo ${x:=1}",
-            "cat ${f:-a.rs}",
-            "echo ${PWD",
+            "cat \"${FILE}\"",
+            "echo ${#PATH}",
+            "ls {a,b}.rs",
             "grep x '${a[_]}'",
+            "echo hi!",
+            "grep 'a\\.b' a.rs",
+            "cat <<EOF",
         ] {
-            assert!(!reads_only(command), "{command} should ask");
+            assert!(!plain_shape(command) && !reads_only(command), "{command} should ask");
         }
-        for command in ["cat \"${FILE}\"", "echo ${#PATH}", "cat \"$FILE\"", "echo $_", "ls ${HOME}/x"] {
-            assert!(reads_only(command), "{command} should run without a card");
+        for command in ["grep -n foo src/*.rs", "cat a.rs | head -3", "git log --oneline -5", "ls -la src > /dev/null 2>&1"] {
+            assert!(plain_shape(command) && reads_only(command), "{command} should run without a card");
         }
+        let dir = tempfile::tempdir().unwrap();
+        let ran = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg("echo $'a[\\x24(touch x)]' >/dev/null; echo {$,}{PWD:_} >/dev/null")
+            .current_dir(dir.path())
+            .status();
+        assert!(ran.is_ok_and(|s| s.success()) && dir.path().join("x").exists(), "bash runs it: the case the shape asks for");
     }
 
     /// A git reader skips the card only where it starts inside the
@@ -1307,10 +1322,10 @@ mod tests {
         let write = json!({ "path": "a.rs", "content": "new\n" });
         let check = || Some(ask_card(None, "write_file", &write, &reach));
         let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
-        assert_eq!(guard_card(check().unwrap(), &check, deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
         let command = json!({ "command": "npm test" });
         let run = || Some(ask_card(None, "run_command", &command, &reach));
-        assert_eq!(guard_card(run().unwrap(), &run, deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
+        assert_eq!(guard_card(run().unwrap(), || std::future::ready(run()), deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
         assert_eq!(std::fs::read_to_string(ws.path().join("a.rs")).unwrap(), "old\n");
 
         // A sub-agent's gate asks through its approval gate before the guards.
@@ -1362,7 +1377,7 @@ mod tests {
             }
             std::future::ready(ApprovalDecision::Approve)
         };
-        assert_eq!(guard_card(check().unwrap(), &check, approve).await, None, "approved again, it runs");
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), approve).await, None, "approved again, it runs");
         let shown = shown.into_inner();
         assert_eq!(shown, ["@@ -1,1 +1,1 @@\n-old\n+new", "@@ -1,1 +1,1 @@\n-changed meanwhile\n+new"]);
     }
@@ -1386,7 +1401,8 @@ mod tests {
             }
             std::future::ready(ApprovalDecision::Approve)
         };
-        assert_eq!(guard_ask_first(first.clone(), check, || None, approve).await, AskOutcome::Approved);
+        let recheck = || std::future::ready(Some(check()));
+        assert_eq!(guard_ask_first(first.clone(), recheck, || None, approve).await, AskOutcome::Approved);
         let asked = asked.into_inner();
         assert_eq!(asked.len(), 2, "{asked:?}");
         assert_eq!(asked[1], format!("{} {CHANGED_WHILE_WAITING}", first.reason));
@@ -1438,7 +1454,7 @@ mod tests {
             std::future::ready(ApprovalDecision::Approve)
         };
         let now = || refused_before_card(&reach, "edit_file", &input, None);
-        let outcome = guard_ask_first(check(), check, now, approve).await;
+        let outcome = guard_ask_first(check(), || std::future::ready(Some(check())), now, approve).await;
         assert!(matches!(&outcome, AskOutcome::Refused(r) if r.starts_with("old_string not found")), "{outcome:?}");
         assert_eq!(*asked.lock(), 1);
     }
@@ -1818,12 +1834,13 @@ mod tests {
         for call in [
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
             "match crate::permissions::decide(mode, &call, &ctx) {",
-            "let grants = mode != crate::permissions::Mode::Ask;",
+            "let git_outside = mode == crate::permissions::Mode::Ask && !mode_denied && u.name == \"run_command\" && {",
             "crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))",
             "let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();",
             "if held && pre_refused.is_none() {",
-            "let check = || crate::permissions::ask_card(None, &u.name, &u.input, &reach);",
-            "match crate::permissions::guard_ask_first(check(), check, refused, ask).await {",
+            "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
+            "if !reach.checked(&granted).await {",
+            "match crate::permissions::guard_ask_first(card, &check, refused, ask).await {",
             "None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
@@ -1832,7 +1849,7 @@ mod tests {
             "self.talk_shell.available() && exec_roots.is_none()",
             "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
             "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
-            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await",
             "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
         ] {
             assert!(body.contains(call), "the director's loop no longer has: {call}");
@@ -1850,13 +1867,13 @@ mod tests {
         let attempts: Vec<&str> = run.lines().filter(|l| l.contains("run_attempt(")).collect();
         assert_eq!(attempts.len(), 3, "{attempts:?}");
         assert!(attempts.iter().all(|l| l.contains("&sink, &tool_gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
-        // In Ask first no grant answers a card (#1231): every card the
-        // director and a sub-agent gate raise says whether one may.
-        assert_eq!(body.matches("self.approvals.await_card(").count(), body.matches(", c, grants)").count(), "{body}");
-        assert!(body.contains("reason,\n                                grants,\n"), "the destructive-command card");
+        // In Ask first no "don't ask again" answers a card (#1231): every
+        // card the director and a sub-agent gate raise carries the mode.
+        assert_eq!(body.matches("self.approvals.await_card(").count(), body.matches(", c, mode)").count(), "{body}");
+        assert!(body.contains("command, reason, grant, mode)"), "the destructive-command card");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let gate = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        assert_eq!(gate.matches("self.broker.await_card(").count(), 3);
-        assert_eq!(gate.matches("self.mcp.grants())").count(), 4, "{gate}");
+        assert_eq!(gate.matches("self.broker.await_card(").count(), gate.matches(", c, mode)").count(), "{gate}");
+        assert!(gate.contains("&card_reason, grant, mode)"), "{gate}");
     }
 }

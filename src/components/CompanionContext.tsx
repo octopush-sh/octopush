@@ -9,6 +9,7 @@ import { formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
 import { ContextMeter, contextTone } from "./ContextMeter";
 import { CompanionMcpScope } from "./CompanionMcpScope";
+import { CompanionGrants } from "./CompanionGrants";
 import { CompanionInstructions } from "./CompanionInstructions";
 
 interface Props {
@@ -177,6 +178,8 @@ export function CompanionContext({
             list only offers to add one to the draft. */}
         <CompanionInstructions worktreePath={worktreePath} workspaceId={workspaceId} />
         <CompanionMcpScope worktreePath={worktreePath} workspaceId={workspaceId} />
+        {/* What this conversation may do without asking (#1229). */}
+        <CompanionGrants workspaceId={workspaceId} />
 
         {/* Budgets — only when one exists (an empty block earns no space). */}
         {spendingRows.length > 0 && (
