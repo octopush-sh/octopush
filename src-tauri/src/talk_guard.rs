@@ -152,9 +152,17 @@ impl WriteCheck {
     }
 }
 
-/// Whether `a` and `b` are the same path, by components and without case.
+/// A path component as a case-insensitive APFS volume compares it
+/// (`name_fold::fold`: canonical decomposition and full case folding, so
+/// `ſ` is `s` and the Kelvin sign `k`).
+fn folded(name: &std::ffi::OsStr) -> String {
+    crate::name_fold::fold(&name.to_string_lossy())
+}
+
+/// Whether `a` and `b` are the same path, by components and as the volume
+/// compares names ([`folded`]).
 fn same_path(a: &Path, b: &Path) -> bool {
-    let low = |p: &Path| p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>();
+    let low = |p: &Path| p.components().map(|c| folded(c.as_os_str())).collect::<Vec<_>>();
     low(a) == low(b)
 }
 
@@ -365,10 +373,12 @@ const HOME_RUNS_CODE: &[(&str, &str)] = &[
     (".gitconfig", "Git's config can make Git run programs"), (".ssh/config", "ssh runs what it names"),
 ];
 
-/// Whether a write at `names` (a path's components, lowercased) is a
-/// project's agent or CI config, which runs code or instructs an agent the
-/// next time a tool opens the project (#1229): anything under `.claude/`,
-/// `.mcp.json`, `CLAUDE.md` and `AGENTS.md`; `.github/workflows/`,
+/// Whether a write at `names` (a path's components, folded as the volume
+/// compares them, [`folded`]) is a project's agent or CI config, which runs
+/// code or instructs an agent the next time a tool opens the project
+/// (#1229): anything under `.claude/`, a project MCP config
+/// (`secret_scan::MCP_CONFIG_FILES`: `.mcp.json`, `.cursor/mcp.json`,
+/// `.vscode/mcp.json`), `CLAUDE.md` and `AGENTS.md`; `.github/workflows/`,
 /// `.github/actions/`, `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`,
 /// `azure-pipelines.yml`, `Jenkinsfile` and `bitbucket-pipelines.yml`;
 /// `.husky/`, `.envrc`, `.vscode/tasks.json` and `.vscode/launch.json`. At
@@ -380,8 +390,15 @@ fn project_config_runs(names: &[String]) -> Option<&'static str> {
     if has(".claude") {
         return Some("Claude Code loads its settings, hooks, commands, agents and skills from it");
     }
+    // The project MCP configs the secret scan knows (Claude Code's, Cursor's, VS Code's).
+    let ends_with = |file: &str| {
+        let parts: Vec<String> = file.split('/').map(crate::name_fold::fold).collect();
+        names.ends_with(&parts)
+    };
+    if crate::secret_scan::MCP_CONFIG_FILES.iter().any(|f| ends_with(f)) {
+        return Some("an agent starts the MCP servers it names");
+    }
     match last {
-        Some(".mcp.json") => return Some("Claude Code starts the MCP servers it names"),
         Some("claude.md" | "agents.md") => return Some("coding agents follow it as their instructions"),
         Some(".gitlab-ci.yml" | "azure-pipelines.yml" | "bitbucket-pipelines.yml" | "jenkinsfile") => return Some("CI runs what it says"),
         Some(".envrc") => return Some("direnv runs it on entering the folder"),
@@ -473,11 +490,12 @@ fn git_hooks_dir(git: &Path, bound: std::time::Duration, repo: &Path) -> HooksAt
 /// The same, outside home.
 const SYSTEM_RUNS_CODE: &[(&str, &str)] = &[("/Library/LaunchAgents", "macOS runs login items from it"), ("/Library/LaunchDaemons", "macOS runs login items from it")];
 
-/// Whether `path` is `prefix` or inside it, by components and without case.
+/// Whether `path` is `prefix` or inside it, by components and as the
+/// volume compares names ([`folded`]).
 fn under(path: &Path, prefix: &Path) -> bool {
     let mut p = path.components();
     prefix.components().all(|c| {
-        p.next().is_some_and(|q| q.as_os_str().to_string_lossy().to_lowercase() == c.as_os_str().to_string_lossy().to_lowercase())
+        p.next().is_some_and(|q| folded(q.as_os_str()) == folded(c.as_os_str()))
     })
 }
 
@@ -686,7 +704,7 @@ impl Reach {
     /// folder a grant could cover, a project's agent and CI config too
     /// ([`project_config_runs`]).
     fn runs_code(&self, path: &Path) -> Option<&'static str> {
-        let names: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+        let names: Vec<String> = path.components().map(|c| folded(c.as_os_str())).collect();
         // A worktree's `.git` file names the Git folder Git uses.
         if names.last().is_some_and(|n| n == ".git") {
             return Some("Git follows it to the Git folder it names");
@@ -990,7 +1008,7 @@ impl Reach {
                 && self.root.as_deref().is_some_and(|r| real.starts_with(r))
                 && self.secrets.iter().all(|(place, resolved, _)| std::iter::once(place).chain(resolved).all(|p| !under(&real, p) && !under(p, &real)));
             // In a `.git` folder, or where code runs from, a name is never plain.
-            let careful = real.components().any(|c| c.as_os_str().to_string_lossy().to_lowercase().ends_with(".git")) || self.runs_code(&real).is_some();
+            let careful = real.components().any(|c| folded(c.as_os_str()).ends_with(".git")) || self.runs_code(&real).is_some();
             Cwd { logical, real, fast: fast && !careful, careful }
         };
         // Where the command stands (`None`: after a `cd` the check can't
@@ -1089,7 +1107,7 @@ impl Reach {
                 None => match &lands {
                     Some(l) => {
                         // `.git` is never plain: a worktree's is a file Git follows.
-                        let plain = !l.careful && !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt) && !unescape(alt).eq_ignore_ascii_case(".git");
+                        let plain = !l.careful && !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt) && crate::name_fold::fold(&unescape(alt)) != ".git";
                         (l.base, alt.as_str(), plain.then_some(l.fast))
                     }
                     None => match named_credential(alt, alt) {
@@ -1330,7 +1348,7 @@ fn walking_segments(words: &[CommandWord]) -> Vec<bool> {
 /// then keychains, an env file, an SSH key, a certificate, a credentials file.
 fn credential_part(texts: &[String]) -> Option<&'static str> {
     const MORE: &[&str] = &["keychains", ".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".pem", ".p12", "credentials"];
-    let texts: Vec<String> = texts.iter().map(|t| t.to_lowercase()).collect();
+    let texts: Vec<String> = texts.iter().map(|t| crate::name_fold::fold(t)).collect();
     HOME_SECRETS
         .iter()
         .map(|(rel, _)| *rel)
@@ -1866,6 +1884,11 @@ mod tests {
             "proj/.husky/pre-commit", "proj/.envrc", "proj/.vscode/tasks.json", "proj/.vscode/launch.json",
             // Without case, at any depth, and through `..`.
             "PROJ/.Claude/Settings.json", "a/b/c/.GITHUB/Workflows/deploy.YML", "proj/x/../.husky/_/h",
+            // As the volume folds names: the long s, the Kelvin sign, a ligature.
+            "proj/.mcp.j\u{17F}on", "proj/.vscode/tas\u{212A}s.json", "proj/Jen\u{212A}insfile", "proj/.github/work\u{FB02}ows/ci.yml",
+            "proj/.\u{17F}\u{17F}h/../.claude/x",
+            // Every project MCP config the secret scan knows.
+            "proj/.cursor/mcp.json", "proj/.vscode/MCP.json", "proj/.claude/mcp.json",
         ];
         for rel in places {
             let c = write(out.join(rel), &granted).unwrap_or_else(|| panic!("{rel} asks under a granted folder"));
@@ -1885,6 +1908,9 @@ mod tests {
         let command = "echo '{}' > ~/out/proj/.claude/settings.json";
         assert_eq!(reach.command_grant(command, None), None);
         assert!(reach.command_card(None, command, None, &[reach.exact(command, &ws).unwrap()]).is_some());
+        // A composed and a decomposed spelling are the same path.
+        assert!(same_path(&out.join("Caf\u{E9}/x"), &out.join("Cafe\u{301}/X")));
+        assert!(!same_path(&out.join("Cafe\u{301}/x"), &out.join("cafe/x")));
         // The workspace's own: as before.
         for rel in [".claude/settings.json", ".github/workflows/ci.yml", "CLAUDE.md"] {
             assert_eq!(write(ws.join(rel), &[]), None, "{rel} in the workspace");

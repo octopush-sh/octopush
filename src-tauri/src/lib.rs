@@ -32,6 +32,7 @@ pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
 pub mod mcp;
+pub mod name_fold;
 pub mod notify_elsewhere;
 pub mod provider_router;
 pub mod providers;
