@@ -5539,12 +5539,7 @@ impl ChatEngine {
                 };
                 // A loaded skill is instructions to follow, as the same skill
                 // named with `/name` is: it carries no untrusted mark.
-<<<<<<< HEAD
                 let mark = (!was_denied && !is_skill && u.input_error.is_none()).then_some(source.as_str());
-||||||| b18d9f6b
-                let mark = (!was_denied && !is_skill).then_some(source.as_str());
-=======
-                let mark = (!was_denied && !is_skill).then_some(source.as_str());
                 // A cut command output: the model's copy names its row.
                 let result = match (&command_full, row_id) {
                     (Some(full), Some(id)) => {
@@ -5557,7 +5552,6 @@ impl ChatEngine {
                     }
                     _ => result,
                 };
->>>>>>> origin/main
                 let content = if v2 {
                     let window = context_guard.budget().window;
                     let view = crate::context::transcript::model_view(&u.name, &result, row_id, window, mark);
