@@ -39,6 +39,7 @@ import { DiffView } from "./review/DiffView";
 import { AiReviewPanel } from "./review/AiReviewPanel";
 import { TestDrawer } from "./review/TestDrawer";
 import { baseName, commitCount, sinceBaseLabel, type ReviewSource } from "../lib/reviewSource";
+import type { TurnScope } from "../lib/turnChanges";
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -80,6 +81,9 @@ interface Props {
   /** The base branch and merge base (short SHA) the committed view diffs from. */
   base?: string | null;
   mergeBase?: string | null;
+  /** The Talk turn of the This turn scope (#1152); its segment shows only
+   *  while one is set. In that view `x` reverts a hunk in the working tree. */
+  turn?: TurnScope | null;
   onSourceChange?: (source: ReviewSource) => void;
   /** Callback to request parent to re-fetch diff (after Accept/Reject). */
   onDiffChange?: () => void;
@@ -114,6 +118,7 @@ export function ReviewCanvas({
   commitsAhead = 0,
   base = null,
   mergeBase = null,
+  turn = null,
   onSourceChange,
   onDiffChange,
   initialTestCommand,
@@ -254,7 +259,10 @@ export function ReviewCanvas({
   // (it only shows with files to review); close the drawer so its state can't
   // disagree with a missing toggle.
   const readOnly = source === "committed";
-  const fileCount = readOnly ? diffFiles.length : gitStatus?.changedFiles.length ?? 0;
+  // This turn (#1152): a record of what the turn did. Nothing to stage; `x`
+  // reverts a hunk in the working tree, only while it still applies.
+  const turnView = source === "turn" && turn !== null;
+  const fileCount = readOnly || turnView ? diffFiles.length : gitStatus?.changedFiles.length ?? 0;
   useEffect(() => {
     if (fileCount === 0) setAiOpen(false);
   }, [fileCount]);
@@ -372,17 +380,27 @@ export function ReviewCanvas({
     const hunk = diffFiles.find((f) => f.filePath === filePath)?.hunks[hunkIdx];
     if (!hunk) return;
     try {
+      // Working tree only: `git apply --reverse` writes nothing unless the
+      // whole hunk still applies, and never touches the index.
       await ipc.revertHunk(workspacePath, hunk.rawText);
       setUndo({ rawText: hunk.rawText });
       onDiffChange?.();
     } catch (e) {
       console.error("revert hunk failed:", e);
-      pushToast({ level: "error", title: "Couldn't reject hunk", body: String(e) });
+      if (turnView) {
+        pushToast({ level: "info", title: "This hunk changed since the turn.", body: "The files were left as they are." });
+      } else {
+        pushToast({ level: "error", title: "Couldn't reject hunk", body: String(e) });
+      }
     }
   };
 
   const workingCount = gitStatus?.changedFiles.length ?? 0;
   const sinceTitle = `Commits since ${baseName(base)}${mergeBase ? ` (merge base ${mergeBase})` : ""} · read-only`;
+  const turnTitle = turn
+    ? `What the turn “${turn.label}” changed · x reverts a hunk in the working tree`
+    : "";
+  const workingOn = !readOnly && !turnView;
 
   return (
     // `isolate` keeps the toolbar's z-index local to this canvas, so it never
@@ -395,9 +413,10 @@ export function ReviewCanvas({
           On a narrow canvas the secondary toggles shed into "More"
           (`.octo-reviewbar` ladder) so AI and Accept all stay whole. */}
       <header ref={toolbarRef} className="octo-reviewbar flex h-11 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel px-3">
-        {/* Source — Working tree / Since base (#851). Only once the workspace
-            has commits ahead of its base; the committed view is read-only. */}
-        {viewMode === "diff" && commitsAhead > 0 && (
+        {/* Source — Working tree / Since base (#851) / This turn (#1152).
+            Since base only once the workspace has commits ahead of its base
+            (read-only); This turn only once a Talk turn was opened here. */}
+        {viewMode === "diff" && (commitsAhead > 0 || turn !== null) && (
           <div className="octo-fade-in flex min-w-0 items-center gap-2">
             <div
               role="group"
@@ -407,19 +426,20 @@ export function ReviewCanvas({
             >
               <button
                 onClick={() => onSourceChange?.("working")}
-                aria-pressed={!readOnly}
+                aria-pressed={workingOn}
                 title={
                   workingCount > 0
                     ? `Uncommitted changes · ${workingCount} file${workingCount === 1 ? "" : "s"}`
                     : "Uncommitted changes · the working tree is clean"
                 }
                 className={`whitespace-nowrap px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
-                  !readOnly ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+                  workingOn ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                 }`}
-                style={!readOnly ? { background: "var(--brass-ghost)" } : undefined}
+                style={workingOn ? { background: "var(--brass-ghost)" } : undefined}
               >
                 Working tree
               </button>
+              {commitsAhead > 0 && (
               <button
                 onClick={() => onSourceChange?.("committed")}
                 aria-pressed={readOnly}
@@ -439,6 +459,21 @@ export function ReviewCanvas({
                   {`\u00a0· ${commitCount(commitsAhead)}`}
                 </span>
               </button>
+              )}
+              {turn !== null && (
+                <button
+                  onClick={() => onSourceChange?.("turn")}
+                  aria-pressed={turnView}
+                  data-tour="review-diff-turn"
+                  title={turnTitle}
+                  className={`octo-fade-in whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                    turnView ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+                  }`}
+                  style={turnView ? { background: "var(--brass-ghost)" } : undefined}
+                >
+                  This turn
+                </button>
+              )}
             </div>
             {readOnly && (
               <span
@@ -689,7 +724,7 @@ export function ReviewCanvas({
                 )}
               </button>
 
-              {!readOnly && (
+              {!readOnly && !turnView && (
               <button
                 onClick={handleAcceptAll}
                 data-tour="review-accept-all"
@@ -717,15 +752,17 @@ export function ReviewCanvas({
           <DiffView
             // A source switch is a different diff: its viewed/collapsed marks
             // and focus start fresh rather than reading as "changed since viewed".
-            key={source}
+            key={turnView && turn ? `turn-${turn.threadId}-${turn.messageId}` : source}
             active={active}
             files={diffFiles}
             workspacePath={workspacePath}
             workspaceId={workspaceId}
             diffWorkspaceId={diffWorkspaceId}
             readOnly={readOnly}
-            // The committed side matches the disk only while the tree is clean.
-            diskContext={!readOnly || workingCount === 0}
+            revertOnly={turnView}
+            // The committed side matches the disk only while the tree is
+            // clean; a turn's side, only until something changes after it.
+            diskContext={turnView ? false : !readOnly || workingCount === 0}
             empty={{ source, commitsAhead, base, workingCount, ignoreWhitespace }}
             onShowCommitted={() => onSourceChange?.("committed")}
             stagedCount={
@@ -787,7 +824,7 @@ export function ReviewCanvas({
             <span className="text-octo-rouge">Couldn&apos;t undo automatically — the file changed since the hunk was rejected.</span>
           ) : (
             <>
-              <span>Hunk rejected.</span>
+              <span>{turnView ? "Hunk reverted in the working tree." : "Hunk rejected."}</span>
               <button
                 onClick={async () => {
                   try {

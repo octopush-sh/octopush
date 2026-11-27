@@ -21,6 +21,15 @@ export function emptyDiffCopy(
 ): { title: string; body: string; showCommitted: boolean } {
   const commits = ctx?.commitsAhead ?? 0;
   const base = baseName(ctx?.base);
+  if (ctx?.source === "turn") {
+    return {
+      title: "Nothing to review.",
+      body: ctx.ignoreWhitespace
+        ? "With whitespace ignored, this turn changes nothing."
+        : "This turn left the files as they were.",
+      showCommitted: false,
+    };
+  }
   if (ctx?.source === "committed") {
     return {
       title: "Nothing to review.",

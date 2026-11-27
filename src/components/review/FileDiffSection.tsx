@@ -25,6 +25,8 @@ interface Props {
   changedSinceViewed?: boolean;
   /** Committed changes (#851): the hunk rails carry no Accept / Reject. */
   readOnly?: boolean;
+  /** The This turn view (#1152): the hunk rails carry Revert only. */
+  revertOnly?: boolean;
   onAccept: (hunkIdx: number) => void;
   onReject: (hunkIdx: number) => void;
   onWhy: (hunkIdx: number) => void;
@@ -53,6 +55,7 @@ export function FileDiffSection({
   collapsed,
   changedSinceViewed = false,
   readOnly = false,
+  revertOnly = false,
   onAccept,
   onReject,
   onWhy,
@@ -198,6 +201,7 @@ export function FileDiffSection({
                 focused={focusedHunk === i}
                 staged={false}
                 readOnly={readOnly}
+                revertOnly={revertOnly}
                 onAccept={() => onAccept(i)}
                 onReject={() => onReject(i)}
                 onWhy={() => onWhy(i)}
