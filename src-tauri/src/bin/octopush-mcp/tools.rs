@@ -69,7 +69,9 @@ pub fn tool_definitions() -> Value {
             "Update an existing pipeline's name, description, and full stage set. \
              If pipelineId refers to a BUILT-IN pipeline, this forks it into a new \
              custom copy (built-ins are never mutated) and returns the new id; for \
-             a custom pipeline it updates in place and returns the same id.",
+             a custom pipeline it updates in place and returns the same id. It \
+             clears the MCP servers the user turned on for its stages; the reply's \
+             `notice` names them, so tell the user to turn them back on in the builder.",
             json!({
                 "type": "object",
                 "properties": {
@@ -567,6 +569,22 @@ fn save_pipeline(db: &Db, args: &Value, edit: Option<()>) -> Result<Value, Strin
         stage.mcp_servers.clear();
         stages.push(stage);
     }
+    // An edit clears the stages' MCP choice too, so the reply says so when
+    // there was one: otherwise the user's grants vanish without a word.
+    let cleared_mcp: Vec<String> = match &pipeline_id {
+        Some(pid) => {
+            let mut names: Vec<String> = db
+                .get_pipeline_stages(pid)
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|s| s.mcp_servers)
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        }
+        None => Vec::new(),
+    };
     // `save_pipeline` runs the full §3.7 validator and rejects invalid drafts.
     let id = db
         .save_pipeline(pipeline_id, &name, &description, &stages)
@@ -578,7 +596,22 @@ fn save_pipeline(db: &Db, args: &Value, edit: Option<()>) -> Result<Value, Strin
         .ok_or("pipeline saved but could not be reloaded")?;
     let mut payload = pipeline_with_stages(db, &p)?;
     payload["pipelineId"] = json!(id);
+    if let Some(note) = mcp_cleared_note(&cleared_mcp) {
+        payload["notice"] = json!(note);
+    }
     Ok(payload)
+}
+
+/// What an edit's reply says when it cleared the stages' MCP servers, which
+/// only the user can turn back on. `None` when no stage had any.
+fn mcp_cleared_note(cleared: &[String]) -> Option<String> {
+    if cleared.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "This edit cleared the MCP servers its stages could use ({}). Tell the user: they turn them back on per stage in the Direct builder.",
+        cleared.join(", ")
+    ))
 }
 
 /// Fill the StageDraft fields that lack a serde default so the model only has
@@ -1420,6 +1453,47 @@ mod tests {
         });
         let err = save_pipeline(&db, &args, None).expect_err("an invalid effort must be rejected");
         assert!(err.contains("stage 1"), "error should name the stage: {err}");
+    }
+
+    /// An agent's edit clears the stages' MCP servers (it may not grant them)
+    /// and its reply says which, so the user can turn them back on. A create,
+    /// or an edit of stages that had none, says nothing.
+    #[test]
+    fn update_pipeline_says_it_cleared_the_stages_mcp_servers() {
+        let db = test_db();
+        let stage = |mcp: Value| {
+            serde_json::from_value::<StageDraft>(normalize_stage(
+                &json!({ "role": "implement", "agentModel": "claude-sonnet-4-6", "mcpServers": mcp }),
+            ))
+            .unwrap()
+        };
+        let pid = db
+            .save_pipeline(None, "Granted", "user chose servers", &[stage(json!(["tracker", "docs"]))])
+            .unwrap();
+        assert_eq!(db.get_pipeline_stages(&pid).unwrap()[0].mcp_servers, vec!["docs", "tracker"]);
+
+        let edit = json!({
+            "pipelineId": pid,
+            "name": "Granted",
+            "description": "agent changed the instruction",
+            "stages": [ { "role": "implement", "agentModel": "claude-sonnet-4-6", "mcpServers": ["tracker", "shell"] } ]
+        });
+        let payload = save_pipeline(&db, &edit, Some(())).unwrap();
+        assert!(db.get_pipeline_stages(&pid).unwrap()[0].mcp_servers.is_empty());
+        let notice = payload["notice"].as_str().expect("the reply names what it cleared");
+        assert!(notice.contains("(docs, tracker)") && notice.contains("Direct builder"), "{notice}");
+
+        // Nothing left to clear: no notice.
+        let again = save_pipeline(&db, &edit, Some(())).unwrap();
+        assert!(again.get("notice").is_none());
+        let created = json!({
+            "name": "Fresh",
+            "description": "new",
+            "stages": [ { "role": "implement", "agentModel": "claude-sonnet-4-6", "mcpServers": ["tracker"] } ]
+        });
+        let payload = save_pipeline(&db, &created, None).unwrap();
+        assert!(payload.get("notice").is_none());
+        assert_eq!(payload["stages"][0]["mcpServers"], json!([]));
     }
 
     // ── role authoring ────────────────────────────────────────────────────

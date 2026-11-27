@@ -1,36 +1,117 @@
-import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { McpServerStatus } from "../../lib/types";
 
 const statusMock = vi.hoisted(() => vi.fn());
+const changedMock = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/ipc", async () => {
   const actual = await vi.importActual<any>("../../lib/ipc");
-  return { ...actual, ipc: { ...actual.ipc, listMcpServerStatus: statusMock } };
+  return { ...actual, ipc: { ...actual.ipc, listMcpServerStatus: statusMock, onMcpChanged: changedMock } };
 });
 
-const { StageMcpServers, mcpUnavailableTitle, stageMcpChipTitle, stageMcpChips } = await import("./StageMcpServers");
+const { StageMcpServers, mcpUnavailableTitle, stageMcpChipTitle, stageMcpChips, stageMcpNote } = await import(
+  "./StageMcpServers"
+);
 const { graphToStageDrafts, newStageData } = await import("./graph");
+const { useMcpScopeStore } = await import("../../stores/mcpScopeStore");
 
 const SERVERS: McpServerStatus[] = [
   { name: "docs", state: "connected", tools: 3, reason: null },
   { name: "tracker", state: "failed", tools: null, reason: "spawn npx: not found" },
 ];
+const EMPTY_LINE = "No MCP servers in Settings › Integrations or this project's .claude/mcp.json.";
+
+beforeEach(() => {
+  changedMock.mockResolvedValue(() => {});
+});
 
 afterEach(() => {
   cleanup();
   statusMock.mockReset();
+  changedMock.mockReset();
+  useMcpScopeStore.setState({ statusByPath: {} });
 });
 
-function renderField(chosen: string[] | undefined, substrate: "api" | "cli" = "api", model = "claude-sonnet-5-5") {
-  statusMock.mockResolvedValue(SERVERS);
+function renderField(
+  chosen: string[] | undefined,
+  substrate: "api" | "cli" = "api",
+  model = "claude-sonnet-5-5",
+  workspacePath: string | null = "/ws/mcp",
+) {
+  if (!statusMock.getMockImplementation()) statusMock.mockResolvedValue(SERVERS);
   const onChange = vi.fn();
   render(
-    <StageMcpServers workspacePath="/ws/mcp" substrate={substrate} model={model} chosen={chosen} onChange={onChange} />,
+    <StageMcpServers workspacePath={workspacePath ?? undefined} substrate={substrate} model={model} chosen={chosen} onChange={onChange} />,
   );
   return onChange;
 }
 
 describe("StageMcpServers", () => {
+  it("says it is reading, never 'none configured', until the list arrives", async () => {
+    let answer!: (s: McpServerStatus[]) => void;
+    statusMock.mockImplementation(() => new Promise<McpServerStatus[]>((r) => (answer = r)));
+    renderField(["docs"]);
+    expect(screen.getByText("Reading the MCP servers…")).toBeTruthy();
+    expect(screen.queryByText(EMPTY_LINE)).toBeNull();
+    expect(screen.queryAllByRole("switch")).toHaveLength(0);
+    answer(SERVERS);
+    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(2));
+    expect(screen.queryByText("Reading the MCP servers…")).toBeNull();
+  });
+
+  it("says none are configured only once a read found none", async () => {
+    statusMock.mockResolvedValue([]);
+    renderField(undefined);
+    expect(await screen.findByText(EMPTY_LINE)).toBeTruthy();
+    expect(screen.queryAllByRole("switch")).toHaveLength(0);
+  });
+
+  it("doesn't claim none are configured when the read fails, and keeps the chosen servers", async () => {
+    statusMock.mockRejectedValue(new Error("ipc down"));
+    const onChange = renderField(["tracker"]);
+    expect(await screen.findByText("Couldn't read the MCP servers configured here.")).toBeTruthy();
+    expect(screen.queryByText(EMPTY_LINE)).toBeNull();
+    const chip = screen.getByRole("switch", { name: /tracker/ });
+    expect(chip.getAttribute("title")).toBe("tracker · status unknown · click to take it off this stage");
+    fireEvent.click(chip);
+    expect(onChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it("reads nothing without a workspace", () => {
+    renderField(["docs"], "api", "claude-sonnet-5-5", null);
+    expect(statusMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Open a workspace to choose its MCP servers.")).toBeTruthy();
+    expect(screen.queryByText(EMPTY_LINE)).toBeNull();
+    expect(screen.getByRole("switch", { name: /docs/ }).getAttribute("title")).toMatch(/status unknown/);
+    expect(stageMcpNote(undefined, [], false)).toBe("Open a workspace to choose its MCP servers.");
+  });
+
+  it("tones every chip's icon by its server's status, on or off", async () => {
+    renderField(["tracker"]);
+    await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(2));
+    const [docsIcon, trackerIcon] = screen.getAllByTestId("stage-mcp-icon");
+    // docs is off and connected, tracker is on and failed.
+    expect(docsIcon.getAttribute("class")).toContain("text-octo-verdigris");
+    expect(trackerIcon.getAttribute("class")).toContain("text-octo-rouge");
+    const docs = screen.getByRole("switch", { name: /docs/ });
+    expect(docs.className).toContain("border-octo-border-strong");
+    expect(docs.className).toContain("duration-[var(--dur-quick)]");
+    expect(screen.getByRole("switch", { name: /tracker/ }).className).toContain("text-octo-brass");
+  });
+
+  it("re-reads the list when the MCP config or status changes", async () => {
+    let fire!: () => void;
+    changedMock.mockImplementation(async (h: () => void) => {
+      fire = h;
+      return () => {};
+    });
+    renderField(undefined);
+    await waitFor(() => expect(statusMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(fire).toBeTypeOf("function"));
+    act(() => fire());
+    await waitFor(() => expect(statusMock).toHaveBeenCalledTimes(2));
+  });
+
   it("lists the workspace's servers, every one off by default", async () => {
     renderField(undefined);
     await waitFor(() => expect(screen.getAllByRole("switch")).toHaveLength(2));

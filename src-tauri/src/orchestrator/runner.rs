@@ -105,9 +105,16 @@ pub async fn stage_mcp_tools(
         tokio::task::spawn_blocking(move || reg.list_tools_of(&wt, &servers)),
     )
     .await;
-    let Ok(Ok((tools, missing))) = found else {
-        emitter.notice("MCP servers didn't start within 20s, so this stage runs without them");
-        return None;
+    let (tools, missing) = match found {
+        Ok(Ok(found)) => found,
+        Ok(Err(_)) => {
+            emitter.notice("Starting the MCP servers stopped with an internal error, so this stage runs without them");
+            return None;
+        }
+        Err(_) => {
+            emitter.notice("MCP servers didn't start within 20s, so this stage runs without them");
+            return None;
+        }
     };
     for (server, reason) in &missing {
         emitter.notice(&mcp_unavailable_notice(server, reason));
