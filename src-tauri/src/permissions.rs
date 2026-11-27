@@ -95,9 +95,14 @@ pub struct PolicyCtx<'a> {
     pub exec_roots: Option<&'a [String]>,
     /// The MCP tools this turn discovered with `readOnlyHint`.
     pub mcp_read_only: &'a HashSet<String>,
-    /// For a Delegate call: whether the agent type it names can change the
-    /// workspace ([`crate::chat_agents::definition_can_write`]).
+    /// For a Delegate call: it names a defined agent type whose tools can
+    /// change the workspace ([`crate::chat_agents::definition_can_write`]).
+    /// An untyped call runs: its sub-agent is bound by the same mode
+    /// ([`ModeGate`]) and the same sandbox.
     pub delegate_writes: bool,
+    /// Plan only is forced by a read-only mission rather than chosen, so a
+    /// refusal names the mission and offers no switch.
+    pub forced: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,41 +114,81 @@ pub enum Decision {
     Deny { message: String },
 }
 
-pub const PLAN_WRITE: &str = "Not done: this conversation is in Plan only mode, so no file can be written or edited. \
-     Keep exploring and present your plan; the user can switch to Edit freely to carry it out.";
-pub const PLAN_NET: &str = "Not called: this conversation is in Plan only mode, and this MCP tool's server doesn't mark \
-     it read-only. Use a read-only tool, or put the step in your plan.";
-pub const PLAN_EXEC: &str = "Not run: this conversation is in Plan only mode, and this command couldn't be put under \
-     the read-only sandbox. Read with the file tools instead.";
-pub const PLAN_DELEGATE: &str = "Not started: this conversation is in Plan only mode, which runs only read-only agent \
-     types (no write, edit or shell tool). Name a read-only agent type, or explore yourself.";
+/// What Plan only refused, for its fixed result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    Write,
+    Net,
+    /// A command the host couldn't put on the read-only sandbox.
+    Unconfined,
+    Delegate,
+    /// A command that changes something elsewhere, and what ([`remote_effect`]).
+    Remote(&'static str),
+}
+
+/// The fixed result Plan only gives a call it refuses, saying why Plan only
+/// applies. When a read-only mission forces it, the text names the mission
+/// and offers no switch to Edit freely, which doesn't exist there.
+pub fn plan_refusal(refused: Refused, forced: bool) -> String {
+    let why = if forced {
+        "this workspace's mission is read-only, so Talk works in Plan only mode here"
+    } else {
+        "this conversation is in Plan only mode"
+    };
+    match refused {
+        Refused::Write if forced => {
+            format!("Not done: {why}, and no file can be written or edited. Report what you found and what you would change.")
+        }
+        Refused::Write => format!(
+            "Not done: {why}, so no file can be written or edited. Keep exploring and present your plan; \
+             the user can switch to Edit freely to carry it out."
+        ),
+        Refused::Net => format!(
+            "Not called: {why}, and this MCP tool's server doesn't mark it read-only. Use a read-only tool, \
+             or leave the step in your plan."
+        ),
+        Refused::Unconfined => {
+            format!("Not run: {why}, and this command couldn't be put under the read-only sandbox. Read with the file tools instead.")
+        }
+        Refused::Delegate => format!(
+            "Not started: {why}, which starts untyped sub-agents and read-only agent types only (no write, edit \
+             or shell tool). Leave the type out, or name a read-only one."
+        ),
+        Refused::Remote(what) => format!(
+            "Not run: {why}, which allows reading and fetching but no command that changes something elsewhere \
+             ({what}). Leave the step in your plan."
+        ),
+    }
+}
+
 /// What a call that Ask first would hold gets until Ask first can ask.
 pub const ASK_UNAVAILABLE: &str = "Not done: this conversation is in Ask first mode, which this version can't ask \
      in yet. Nothing was changed. Tell the user, who can switch the conversation to Edit freely or Plan only.";
 
-fn deny(message: &str) -> Decision {
-    Decision::Deny { message: message.to_string() }
-}
-
 /// Whether `call` may run in `mode`.
 ///
 /// - **Plan only:** reads and the loop's own tools run. Writes are refused.
-///   A command runs only under the read-only sandbox, so no command
-///   allowlist is needed. An MCP tool runs only when its server marks it
-///   read-only, and a sub-agent only when its type can't write.
+///   A command runs only under the read-only sandbox, and not when it
+///   changes something elsewhere ([`remote_effect`]). An MCP tool runs only
+///   when its server marks it read-only, and a sub-agent unless it names a
+///   type that writes.
 /// - **Ask first:** writes and commands ask.
 /// - **Edit freely:** everything runs, as before modes existed.
 pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
     let field = |key: &str| call.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let refuse = |r: Refused| Decision::Deny { message: plan_refusal(r, ctx.forced) };
     match (mode, classify(call.name)) {
         (Mode::Edit, _) | (_, Class::Read | Class::Meta) => Decision::Allow,
-        (Mode::Plan, Class::Write) => deny(PLAN_WRITE),
-        (Mode::Plan, Class::Exec) if matches!(ctx.exec_roots, Some([])) => Decision::Allow,
-        (Mode::Plan, Class::Exec) => deny(PLAN_EXEC),
+        (Mode::Plan, Class::Write) => refuse(Refused::Write),
+        (Mode::Plan, Class::Exec) => match remote_effect(&field("command")) {
+            Some(what) => refuse(Refused::Remote(what)),
+            None if matches!(ctx.exec_roots, Some([])) => Decision::Allow,
+            None => refuse(Refused::Unconfined),
+        },
         (Mode::Plan, Class::Net) if ctx.mcp_read_only.contains(call.name) => Decision::Allow,
-        (Mode::Plan, Class::Net) => deny(PLAN_NET),
+        (Mode::Plan, Class::Net) => refuse(Refused::Net),
         (Mode::Plan, Class::Delegate) if !ctx.delegate_writes => Decision::Allow,
-        (Mode::Plan, Class::Delegate) => deny(PLAN_DELEGATE),
+        (Mode::Plan, Class::Delegate) => refuse(Refused::Delegate),
         (Mode::Ask, Class::Write) => Decision::Ask { reason: "changes a file".into(), preview: field("path") },
         (Mode::Ask, Class::Exec) => Decision::Ask { reason: "runs a command".into(), preview: field("command") },
         (Mode::Ask, Class::Net | Class::Delegate) => Decision::Allow,
@@ -160,14 +205,199 @@ pub fn refusal(decision: Decision) -> Option<String> {
     }
 }
 
+/// What a command would change outside this Mac, or `None`. Plan only means
+/// no changes to the world, so it refuses these even on the read-only
+/// sandbox, which doesn't stop the network. A heuristic over the command's
+/// words, like the command check whose walk over nested commands it shares
+/// ([`crate::chat_engine::each_command`]); not a network sandbox. It knows
+/// pushing, publishing, deploying and sending tools (`git push`, `gh` writes,
+/// `curl`/`wget` that send data, package publishing, `docker push`,
+/// `kubectl`/`helm`/`terraform` changes); reading and fetching pass.
+pub fn remote_effect(command: &str) -> Option<&'static str> {
+    crate::chat_engine::each_command(command, |line| line.split([';', '|', '&', '\n']).find_map(remote_segment))
+        .unwrap_or(Some("nests more commands than the check reads"))
+}
+
+/// Programs that run the rest of their line (`env X=1 git push`).
+const WRAPPERS: &[&str] =
+    &["env", "command", "builtin", "exec", "nohup", "time", "nice", "sudo", "doas", "xargs", "timeout", "gtimeout", "caffeinate", "stdbuf", "watch"];
+
+type RemoteRule = fn(&[&str]) -> Option<&'static str>;
+
+fn remote_segment(segment: &str) -> Option<&'static str> {
+    let words: Vec<&str> = segment
+        .split_whitespace()
+        .map(|w| w.trim_matches(['"', '\'', '`', '(', ')', '{', '}']).trim_start_matches('\\'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let program = |w: &str| w.rsplit('/').next().unwrap_or(w).to_ascii_lowercase();
+    let assigns = |w: &str| w.split_once('=').is_some_and(|(n, _)| !n.is_empty() && !n.starts_with('-') && n.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()));
+    let first = words.iter().position(|&w| !assigns(w))?;
+    // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come first.
+    let at = if WRAPPERS.contains(&program(words[first]).as_str()) {
+        first + 1 + words[first + 1..].iter().position(|&w| remote_rule(&program(w)).is_some())?
+    } else {
+        first
+    };
+    remote_rule(&program(words[at]))?(&words[at + 1..])
+}
+
+fn remote_rule(program: &str) -> Option<RemoteRule> {
+    let rule: RemoteRule = match program {
+        "git" => git_remote,
+        "gh" => gh_remote,
+        "curl" => curl_remote,
+        "wget" => wget_remote,
+        "npm" | "pnpm" | "yarn" | "bun" | "cargo" | "pip" | "pip3" | "poetry" | "uv" | "twine" | "gem" => publish_remote,
+        "docker" | "podman" => docker_remote,
+        "kubectl" | "oc" | "helm" | "terraform" | "tofu" => deploy_remote,
+        _ => return None,
+    };
+    Some(rule)
+}
+
+/// The words that aren't flags; a flag in `valued` takes the next word.
+fn operands<'a>(args: &[&'a str], valued: &[&str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if valued.contains(a) {
+            it.next();
+        } else if !a.starts_with('-') {
+            out.push(*a);
+        }
+    }
+    out
+}
+
+fn is_read_method(m: &str) -> bool {
+    m.eq_ignore_ascii_case("GET") || m.eq_ignore_ascii_case("HEAD")
+}
+
+fn git_remote(args: &[&str]) -> Option<&'static str> {
+    let ops = operands(args, &["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
+    match ops.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("push") => Some("git push"),
+        Some("send-email") => Some("git send-email"),
+        _ => None,
+    }
+}
+
+/// `gh` verbs that change GitHub, in groups other than the local ones.
+const GH_WRITES: &[&str] = &[
+    "create", "merge", "close", "reopen", "comment", "edit", "delete", "review", "ready", "lock", "unlock", "transfer",
+    "pin", "unpin", "upload", "archive", "unarchive", "rename", "fork", "sync", "set", "add", "remove", "run", "rerun",
+    "cancel", "enable", "disable", "develop", "deploy",
+];
+
+fn gh_remote(args: &[&str]) -> Option<&'static str> {
+    let ops = operands(args, &["-R", "--repo"]);
+    let group = ops.first().map(|s| s.to_ascii_lowercase());
+    if group.as_deref() == Some("api") {
+        // `gh api` sends a GET unless a method is named or a field is given.
+        let (mut method, mut fields) = (None, false);
+        for (i, a) in args.iter().enumerate() {
+            if *a == "-X" || *a == "--method" {
+                method = args.get(i + 1).copied();
+            } else if let Some(m) = a.strip_prefix("--method=").or_else(|| a.strip_prefix("-X").filter(|m| !m.is_empty())) {
+                method = Some(m);
+            } else if ["-f", "-F", "--field", "--raw-field", "--input"].iter().any(|f| a.starts_with(f)) {
+                fields = true;
+            }
+        }
+        let sends = method.map_or(fields, |m| !is_read_method(m));
+        return sends.then_some("gh api with a method other than GET");
+    }
+    let local = matches!(group.as_deref(), Some("alias" | "config" | "extension" | "ext" | "completion" | "auth" | "help"));
+    let verb = ops.get(1).map(|s| s.to_ascii_lowercase());
+    (!local && verb.is_some_and(|v| GH_WRITES.contains(&v.as_str()))).then_some("a gh command that changes GitHub")
+}
+
+fn curl_remote(args: &[&str]) -> Option<&'static str> {
+    const WHY: &str = "curl that sends data or uses a method other than GET";
+    // `-G` sends `-d` data as a GET query.
+    let get = args.iter().any(|a| *a == "-G" || *a == "--get");
+    for (i, a) in args.iter().enumerate() {
+        let method = match *a {
+            "-X" | "--request" => args.get(i + 1).copied(),
+            _ => a.strip_prefix("--request="),
+        };
+        let sends_long = |flags: &[&str]| flags.iter().any(|f| a == f || a.strip_prefix(f).is_some_and(|r| r.starts_with('=')));
+        if method.is_some_and(|m| !is_read_method(m))
+            || sends_long(&["--form", "--form-string", "--upload-file"])
+            || (!get && sends_long(&["--data", "--data-raw", "--data-binary", "--data-urlencode", "--data-ascii", "--json"]))
+        {
+            return Some(WHY);
+        }
+        // A cluster of short flags (`-sSd x`, `-XPOST`): a flag that takes a
+        // value ends it.
+        if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+            for (j, c) in cluster.char_indices() {
+                match c {
+                    'F' | 'T' => return Some(WHY),
+                    'd' if !get => return Some(WHY),
+                    'X' => {
+                        let rest = &cluster[j + 1..];
+                        let m = if rest.is_empty() { args.get(i + 1).copied().unwrap_or("") } else { rest };
+                        if !is_read_method(m) {
+                            return Some(WHY);
+                        }
+                        break;
+                    }
+                    c if "dHouAebcmwxrEKDCYyzUQtP".contains(c) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+fn wget_remote(args: &[&str]) -> Option<&'static str> {
+    args.iter().enumerate().find_map(|(i, a)| {
+        let method = if *a == "--method" { args.get(i + 1).copied() } else { a.strip_prefix("--method=") };
+        let data = ["--post-data", "--post-file", "--body-data", "--body-file"].iter().any(|f| a.starts_with(f));
+        (data || method.is_some_and(|m| !is_read_method(m))).then_some("wget that sends data or uses a method other than GET")
+    })
+}
+
+fn docker_remote(args: &[&str]) -> Option<&'static str> {
+    args.iter().any(|a| a.eq_ignore_ascii_case("push") || *a == "--push").then_some("docker push")
+}
+
+fn publish_remote(args: &[&str]) -> Option<&'static str> {
+    // `yarn npm publish` names it second.
+    let ops = operands(args, &[]);
+    let publishes = |o: &&str| matches!(o.to_ascii_lowercase().as_str(), "publish" | "unpublish" | "deprecate" | "yank" | "owner" | "upload" | "push");
+    ops.iter().take(2).any(publishes).then_some("publishes a package")
+}
+
+/// Words that change a cluster or infrastructure, anywhere in the command.
+const DEPLOY_WRITES: &[&str] = &[
+    "apply", "delete", "create", "replace", "patch", "edit", "scale", "label", "annotate", "drain", "cordon", "uncordon",
+    "taint", "untaint", "expose", "autoscale", "set", "destroy", "import", "install", "upgrade", "uninstall", "rollback",
+    "restart", "undo", "push", "rm", "mv",
+];
+
+fn deploy_remote(args: &[&str]) -> Option<&'static str> {
+    args.iter()
+        .any(|a| DEPLOY_WRITES.contains(&a.to_ascii_lowercase().as_str()))
+        .then_some("changes a cluster or infrastructure (kubectl, helm, terraform)")
+}
+
 /// The mode a call runs in: a read-only mission forces Plan only, since a
 /// mode can narrow a mission's isolation, never widen it.
 pub fn effective(mode: Mode, mission_roots: Option<&[String]>) -> Mode {
-    if matches!(mission_roots, Some([])) {
+    if forced(mission_roots) {
         Mode::Plan
     } else {
         mode
     }
+}
+
+/// Whether the mission's roots (`Some([])`: read-only) force Plan only.
+pub fn forced(mission_roots: Option<&[String]>) -> bool {
+    matches!(mission_roots, Some([]))
 }
 
 /// The write roots a command runs under in `mode`: Plan only's read-only
@@ -192,6 +422,21 @@ pub fn thread_mode(db: &Mutex<Db>, thread_id: &str) -> Mode {
     }
 }
 
+/// A thread's stored mode, and the mode its turns run in now: Plan only
+/// when its workspace's active mission is read-only.
+pub fn thread_modes(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode) {
+    let stored = thread_mode(db, thread_id);
+    let db = db.lock();
+    let mission = db
+        .chat_thread_workspace(thread_id)
+        .ok()
+        .flatten()
+        .and_then(|w| db.active_mission_for_workspace(&w).ok().flatten());
+    // Only whether the roots are empty matters here, not the workspace's path.
+    let roots = mission.and_then(|m| crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, ""));
+    (stored, effective(stored, roots.as_deref()))
+}
+
 /// How a gate learns the mode at the moment a call is checked.
 pub type ModeSource = Arc<dyn Fn() -> Mode + Send + Sync>;
 
@@ -208,6 +453,8 @@ pub fn thread_mode_source(db: Arc<Mutex<Db>>, thread_id: String, roots: Option<V
 pub struct ModeGate {
     mode: ModeSource,
     exec_roots: Option<Vec<String>>,
+    /// A read-only mission forces Plan only ([`PolicyCtx::forced`]).
+    forced: bool,
     mcp_read_only: HashSet<String>,
     inner: Option<Box<dyn ToolGate>>,
 }
@@ -216,17 +463,23 @@ impl ModeGate {
     pub fn new(
         mode: ModeSource,
         exec_roots: Option<Vec<String>>,
+        forced: bool,
         mcp_read_only: HashSet<String>,
         inner: Option<Box<dyn ToolGate>>,
     ) -> Self {
-        Self { mode, exec_roots, mcp_read_only, inner }
+        Self { mode, exec_roots, forced, mcp_read_only, inner }
     }
 }
 
 #[async_trait::async_trait]
 impl ToolGate for ModeGate {
     async fn check(&self, name: &str, input: &Value) -> Option<String> {
-        let ctx = PolicyCtx { exec_roots: self.exec_roots.as_deref(), mcp_read_only: &self.mcp_read_only, delegate_writes: true };
+        let ctx = PolicyCtx {
+            exec_roots: self.exec_roots.as_deref(),
+            mcp_read_only: &self.mcp_read_only,
+            delegate_writes: true,
+            forced: self.forced,
+        };
         if let Some(refused) = refusal(decide((self.mode)(), &ToolCall { name, input }, &ctx)) {
             return Some(refused);
         }
@@ -243,7 +496,11 @@ mod tests {
     use serde_json::json;
 
     fn ctx<'a>(roots: Option<&'a [String]>, ro: &'a HashSet<String>, delegate_writes: bool) -> PolicyCtx<'a> {
-        PolicyCtx { exec_roots: roots, mcp_read_only: ro, delegate_writes }
+        PolicyCtx { exec_roots: roots, mcp_read_only: ro, delegate_writes, forced: false }
+    }
+
+    fn deny(r: Refused) -> Decision {
+        Decision::Deny { message: plan_refusal(r, false) }
     }
 
     #[test]
@@ -258,18 +515,18 @@ mod tests {
         let allow = Decision::Allow;
         let ask = |reason: &str, preview: &str| Decision::Ask { reason: reason.into(), preview: preview.into() };
         // (tool, Plan only, Ask first, Edit freely), with commands under the
-        // read-only profile and a read-only agent type.
+        // read-only profile and an untyped or read-only agent call.
         let table: Vec<(&str, Decision, Decision, Decision)> = vec![
             ("read_file", allow.clone(), allow.clone(), allow.clone()),
             ("list_files", allow.clone(), allow.clone(), allow.clone()),
             ("grep", allow.clone(), allow.clone(), allow.clone()),
             ("glob", allow.clone(), allow.clone(), allow.clone()),
-            ("write_file", deny(PLAN_WRITE), ask("changes a file", "a.rs"), allow.clone()),
-            ("edit_file", deny(PLAN_WRITE), ask("changes a file", "a.rs"), allow.clone()),
-            ("a_tool_nobody_classified", deny(PLAN_WRITE), ask("changes a file", "a.rs"), allow.clone()),
+            ("write_file", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
+            ("edit_file", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
+            ("a_tool_nobody_classified", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
             ("run_command", allow.clone(), ask("runs a command", "ls"), allow.clone()),
             ("mcp__docs__search", allow.clone(), allow.clone(), allow.clone()),
-            ("mcp__jira__create_issue", deny(PLAN_NET), allow.clone(), allow.clone()),
+            ("mcp__jira__create_issue", deny(Refused::Net), allow.clone(), allow.clone()),
             ("Agent", allow.clone(), allow.clone(), allow.clone()),
             ("Task", allow.clone(), allow.clone(), allow.clone()),
             ("recall_tool_output", allow.clone(), allow.clone(), allow.clone()),
@@ -282,17 +539,123 @@ mod tests {
             assert_eq!(d(Mode::Ask, tool, None, false), ask_first, "{tool} in Ask first");
             assert_eq!(d(Mode::Edit, tool, None, true), edit, "{tool} in Edit freely");
         }
-        // Plan only runs a command only under the read-only profile, and a
-        // sub-agent only when its type can't write.
-        assert_eq!(d(Mode::Plan, "run_command", None, false), deny(PLAN_EXEC));
-        assert_eq!(d(Mode::Plan, "run_command", Some(ws), false), deny(PLAN_EXEC));
-        assert_eq!(d(Mode::Plan, "Agent", Some(sandboxed), true), deny(PLAN_DELEGATE));
-        // Every denial names the mode, and Ask first refuses until it can ask.
-        for m in [PLAN_WRITE, PLAN_NET, PLAN_EXEC, PLAN_DELEGATE] {
-            assert!(m.contains("Plan only mode"), "{m}");
+        // Plan only runs a command only under the read-only profile, and
+        // refuses an agent type that writes.
+        assert_eq!(d(Mode::Plan, "run_command", None, false), deny(Refused::Unconfined));
+        assert_eq!(d(Mode::Plan, "run_command", Some(ws), false), deny(Refused::Unconfined));
+        assert_eq!(d(Mode::Plan, "Agent", Some(sandboxed), true), deny(Refused::Delegate));
+        // A command that changes something elsewhere is refused even there.
+        let push = json!({ "command": "git push origin main" });
+        let plan = decide(Mode::Plan, &ToolCall { name: "run_command", input: &push }, &ctx(Some(sandboxed), &ro, false));
+        assert_eq!(plan, deny(Refused::Remote("git push")));
+        assert_eq!(decide(Mode::Edit, &ToolCall { name: "run_command", input: &push }, &ctx(None, &ro, false)), allow);
+        // Every refusal names the mode, and Ask first refuses until it can ask.
+        for r in [Refused::Write, Refused::Net, Refused::Unconfined, Refused::Delegate, Refused::Remote("git push")] {
+            assert!(plan_refusal(r, false).contains("Plan only mode"), "{r:?}");
         }
         assert_eq!(refusal(ask("runs a command", "ls")), Some(ASK_UNAVAILABLE.to_string()));
         assert_eq!(refusal(Decision::Allow), None);
+    }
+
+    /// Plan only forced by a read-only mission says so, and never offers a
+    /// switch to Edit freely, which doesn't exist there.
+    #[test]
+    fn a_forced_refusal_names_the_mission() {
+        for r in [Refused::Write, Refused::Net, Refused::Unconfined, Refused::Delegate, Refused::Remote("git push")] {
+            let forced = plan_refusal(r, true);
+            assert!(forced.contains("mission is read-only") && forced.contains("Plan only mode"), "{forced}");
+            assert!(!forced.contains("Edit freely") && !forced.contains("switch"), "{forced}");
+            assert!(!plan_refusal(r, false).contains("mission"), "{r:?}");
+        }
+        assert!(plan_refusal(Refused::Write, false).contains("switch to Edit freely"));
+        let ro = HashSet::new();
+        let input = json!({ "path": "a.rs" });
+        let sandboxed: &[String] = &[];
+        let forced = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &ro, delegate_writes: false, forced: true };
+        assert_eq!(
+            decide(Mode::Plan, &ToolCall { name: "write_file", input: &input }, &forced),
+            Decision::Deny { message: plan_refusal(Refused::Write, true) }
+        );
+    }
+
+    /// Plan only means no changes to the world: a command that pushes,
+    /// publishes, deploys or sends is refused, and reading and fetching run.
+    #[test]
+    fn plan_mode_refuses_remote_side_effects() {
+        let refused = [
+            ("git push", "git push origin main"),
+            ("git push", "git -C ../repo push"),
+            ("git push", "cd app && env GIT_TRACE=1 git push --tags"),
+            ("git push", "echo ok; $(git push)"),
+            ("git push", "bash -c 'git push'"),
+            ("git push", "sudo -u ci /usr/bin/git push"),
+            ("git send-email", "git send-email HEAD~1"),
+            ("a gh command that changes GitHub", "gh pr create --title x --body y"),
+            ("a gh command that changes GitHub", "gh pr merge 12 --squash"),
+            ("a gh command that changes GitHub", "gh issue close 3"),
+            ("a gh command that changes GitHub", "gh issue comment 3 -b hi"),
+            ("a gh command that changes GitHub", "gh pr edit 4 --add-label bug"),
+            ("a gh command that changes GitHub", "gh release create v1.0"),
+            ("a gh command that changes GitHub", "gh repo edit --visibility public"),
+            ("a gh command that changes GitHub", "gh repo delete o/r --yes"),
+            ("gh api with a method other than GET", "gh api -X POST repos/o/r/issues"),
+            ("gh api with a method other than GET", "gh api --method=PATCH repos/o/r"),
+            ("gh api with a method other than GET", "gh api repos/o/r/issues -f title=x"),
+            ("gh api with a method other than GET", "gh api repos/o/r/pulls/1/merge -XPUT"),
+            ("curl that sends data or uses a method other than GET", "curl -X POST https://api.example.com"),
+            ("curl that sends data or uses a method other than GET", "curl -XDELETE https://api.example.com/x"),
+            ("curl that sends data or uses a method other than GET", "curl --request=PUT https://x"),
+            ("curl that sends data or uses a method other than GET", "curl -sS -d '{}' https://x"),
+            ("curl that sends data or uses a method other than GET", "curl -sSd x https://x"),
+            ("curl that sends data or uses a method other than GET", "curl --data-binary @f https://x"),
+            ("curl that sends data or uses a method other than GET", "curl --json '{}' https://x"),
+            ("curl that sends data or uses a method other than GET", "curl -F file=@a.png https://x"),
+            ("curl that sends data or uses a method other than GET", "curl -T a.tar https://x"),
+            ("wget that sends data or uses a method other than GET", "wget --post-data=a=1 https://x"),
+            ("wget that sends data or uses a method other than GET", "wget --method=DELETE https://x"),
+            ("publishes a package", "npm publish"),
+            ("publishes a package", "cargo publish --dry-run=false"),
+            ("publishes a package", "pip publish dist/*"),
+            ("publishes a package", "yarn npm publish"),
+            ("publishes a package", "twine upload dist/*"),
+            ("docker push", "docker push registry.example.com/app:1"),
+            ("docker push", "docker buildx build --push ."),
+            ("changes a cluster or infrastructure (kubectl, helm, terraform)", "kubectl apply -f deploy.yaml"),
+            ("changes a cluster or infrastructure (kubectl, helm, terraform)", "kubectl -n prod delete pod web-1"),
+            ("changes a cluster or infrastructure (kubectl, helm, terraform)", "terraform apply -auto-approve"),
+            ("changes a cluster or infrastructure (kubectl, helm, terraform)", "helm upgrade web ./chart"),
+        ];
+        for (why, command) in refused {
+            assert_eq!(remote_effect(command), Some(why), "{command}");
+        }
+        let allowed = [
+            "git fetch origin",
+            "git log --grep push",
+            "git status && git diff",
+            "gh pr view 12",
+            "gh pr list --state open",
+            "gh pr checks 12",
+            "gh issue view 3 --comments",
+            "gh api repos/o/r/pulls",
+            "gh api -X GET repos/o/r/issues -f state=open",
+            "gh alias set co 'pr checkout'",
+            "curl -sSL https://example.com",
+            "curl -I https://example.com",
+            "curl -G -d q=1 https://example.com/search",
+            "curl -H 'Accept: x' -o out.json https://example.com",
+            "wget -q https://example.com/a.tar",
+            "npm view react version",
+            "cargo build --release",
+            "docker pull alpine",
+            "kubectl get pods -n prod",
+            "terraform plan",
+            "echo git push",
+            "grep -rn 'git push' .",
+        ];
+        for command in allowed {
+            assert_eq!(remote_effect(command), None, "{command}");
+        }
+        assert!(remote_effect(&"$(".repeat(6)).is_some(), "past the nesting it reads, it refuses");
     }
 
     #[test]
@@ -404,5 +767,86 @@ mod tests {
         }
         let assigned = body.lines().map(str::trim).find(|l| l.starts_with("tools = ") && l.ends_with(';'));
         assert_eq!(assigned, None, "the loop replaces the tool list");
+    }
+
+    /// `get_thread_permission_mode` reports the stored mode and the mode the
+    /// turns run in, so a control can show when a mission forces Plan only.
+    #[test]
+    fn a_read_only_mission_shows_as_the_effective_mode() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Mutex::new(Db::open(tmp.path()).unwrap());
+        let thread = {
+            let d = db.lock();
+            d.insert_project("p-eff", "P", "/tmp/octo-mode-effective").unwrap();
+            d.insert_workspace("w-eff", "p-eff", "ws", "", "main", None, "", None).unwrap();
+            d.create_chat_thread("w-eff", "Look").unwrap().id
+        };
+        assert_eq!(thread_modes(&db, &thread), (Mode::Edit, Mode::Edit));
+        db.lock().set_thread_permission_mode(&thread, Mode::Plan).unwrap();
+        assert_eq!(thread_modes(&db, &thread), (Mode::Plan, Mode::Plan));
+        db.lock().set_thread_permission_mode(&thread, Mode::Edit).unwrap();
+        db.lock().insert_mission("m-ro", Some("w-eff"), "p-eff", "review", "Review it", "active", None, "readonly", "none", "{}").unwrap();
+        assert_eq!(thread_modes(&db, &thread), (Mode::Edit, Mode::Plan), "the mission forces Plan only");
+        assert_eq!(thread_modes(&db, "gone"), (Mode::Edit, Mode::Edit));
+    }
+
+    /// A Plan only command runs off the turn's runtime thread and stops with
+    /// the turn: on a one-thread runtime the canceller below could never
+    /// run while a blocking command held the thread.
+    #[test]
+    fn a_plan_only_command_stops_with_the_turn() {
+        let ws = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::time::Instant::now();
+        let (out, ok) = rt.block_on(async {
+            let flag = Arc::clone(&cancel);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            crate::chat_engine::run_confined(ws.path(), &json!({ "command": "sleep 30" }), None, &cancel).await
+        });
+        assert!(!ok, "{out}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(15), "Stop didn't reach the command: {out}");
+    }
+
+    /// The hosts are only as strict as their call sites. An `AppHandle` can't
+    /// be built in a test, so this reads them: the director decides each
+    /// round's calls (`mode_denials`) and runs its commands on the round's
+    /// roots, cancellably; a sub-agent runs narrowed (`mode_spec`) behind the
+    /// mode gate, on every attempt.
+    #[test]
+    fn the_hosts_call_the_policy() {
+        let engine = include_str!("chat_engine.rs");
+        let from = engine.find("// \u{2500}\u{2500}\u{2500} Agentic loop").expect("the director's loop");
+        let to = from + engine[from..].find("// \u{2500}\u{2500}\u{2500} Cap reached").expect("its forced close");
+        let body = &engine[from..to];
+        for call in [
+            "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
+            "crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx))",
+            "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
+            "let parsed = match mode_denials.get(&u.id) {",
+            "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
+            "let mut was_denied = denied.is_some() || mode_denied;",
+            "self.talk_shell.available() && exec_roots.is_none()",
+            "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
+            "execute_tool(&workspace_path, &u.name, &u.input, exec_roots.as_deref())",
+        ] {
+            assert!(body.contains(call), "the director's loop no longer has: {call}");
+        }
+        let agents = include_str!("chat_agents.rs");
+        let at = agents.find("pub async fn run_one_subagent(").expect("the sub-agent runner");
+        let run = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
+        for call in [
+            "let spec = &mode_spec(&db, &planned);",
+            "let gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));",
+            "persist_run(&db, &planned, &outcome);",
+        ] {
+            assert!(run.contains(call), "the sub-agent runner no longer has: {call}");
+        }
+        let attempts: Vec<&str> = run.lines().filter(|l| l.contains("run_attempt(")).collect();
+        assert_eq!(attempts.len(), 3, "{attempts:?}");
+        assert!(attempts.iter().all(|l| l.contains("&sink, &gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
     }
 }

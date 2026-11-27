@@ -1143,11 +1143,12 @@ export const ipc = {
    *  off list. The backend reads and writes the list under one lock. */
   setThreadMcpServer: (threadId: string, server: string, off: boolean) =>
     invoke<string[]>("set_thread_mcp_server", { threadId, server, off }),
-  /** A Talk conversation's permission mode: `plan` (Plan only), `edit`
-   *  (Edit freely, the default) or `ask` (Ask first, stored by a newer
-   *  build). Talk reads it at each round boundary. */
+  /** A Talk conversation's permission mode, as stored and as its turns run
+   *  it: `plan` (Plan only), `edit` (Edit freely, the default) or `ask` (Ask
+   *  first, stored by a newer build). `effective` is `plan` while the
+   *  workspace's mission is read-only. Talk reads it at each round boundary. */
   getThreadPermissionMode: (threadId: string) =>
-    invoke<"plan" | "ask" | "edit">("get_thread_permission_mode", { threadId }),
+    invoke<{ stored: "plan" | "ask" | "edit"; effective: "plan" | "ask" | "edit" }>("get_thread_permission_mode", { threadId }),
   /** Set a conversation's permission mode; resolves to the mode stored. */
   setThreadPermissionMode: (threadId: string, mode: "plan" | "edit") =>
     invoke<"plan" | "edit">("set_thread_permission_mode", { threadId, mode }),

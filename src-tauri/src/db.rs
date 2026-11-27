@@ -3997,6 +3997,14 @@ impl Db {
         Ok(raw.flatten())
     }
 
+    /// The workspace a conversation belongs to, `None` once it's gone.
+    pub fn chat_thread_workspace(&self, thread_id: &str) -> AppResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT workspace_id FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?)
+    }
+
     /// Set a conversation's permission mode.
     pub fn set_thread_permission_mode(&self, thread_id: &str, mode: crate::permissions::Mode) -> AppResult<()> {
         let changed = self.conn.execute(

@@ -2456,6 +2456,21 @@ fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String
     out
 }
 
+/// `run_command` with `input` in `workspace` under `roots`, on a blocking
+/// thread, so the turn's runtime thread stays free; `cancel` (Stop) kills
+/// it mid-run.
+pub(crate) async fn run_confined(
+    workspace: &Path,
+    input: &serde_json::Value,
+    roots: Option<Vec<String>>,
+    cancel: &std::sync::Arc<AtomicBool>,
+) -> (String, bool) {
+    let (wp, input, flag) = (workspace.to_path_buf(), input.clone(), std::sync::Arc::clone(cancel));
+    tokio::task::spawn_blocking(move || execute_tool_cancellable(&wp, "run_command", &input, roots.as_deref(), Some(&flag)))
+        .await
+        .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
+}
+
 /// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
 /// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
 /// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
@@ -4597,7 +4612,8 @@ impl ChatEngine {
                     let ctx = crate::permissions::PolicyCtx {
                         exec_roots: exec_roots.as_deref(),
                         mcp_read_only: &mcp_read_only,
-                        delegate_writes: crate::chat_agents::definition_can_write(definition),
+                        delegate_writes: crate::chat_agents::delegate_writes(definition),
+                        forced: crate::permissions::forced(sandbox_roots.as_deref()),
                     };
                     let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
                     crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
@@ -4988,6 +5004,12 @@ impl ChatEngine {
                             )
                         }
                     }
+                } else if u.name == "run_command" {
+                    // On the sandbox (Plan only, a sandboxed mission) or without
+                    // the shared shell: off the runtime thread, and Stop kills it.
+                    let ran = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
+                    interrupted = cancel.load(Ordering::Relaxed);
+                    ran
                 } else {
                     execute_tool(&workspace_path, &u.name, &u.input, exec_roots.as_deref())
                 };
