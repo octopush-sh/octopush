@@ -634,13 +634,18 @@ fn walking_segments(words: &[CommandWord]) -> Vec<bool> {
     (0..n).map(|s| always[s] || (named[s] && flagged[s])).collect()
 }
 
-/// The credentials location or file a word names, by name and without case
-/// (#1201): a [`HOME_SECRETS`] name, keychains, an env file, an SSH key, a
-/// certificate, a credentials file.
-fn credential_part(text: &str) -> Option<&'static str> {
+/// The credentials location or file one of `texts` (spellings of a word)
+/// names, by name and without case (#1201): a [`HOME_SECRETS`] name first,
+/// then keychains, an env file, an SSH key, a certificate, a credentials file.
+fn credential_part(texts: &[String]) -> Option<&'static str> {
     const MORE: &[&str] = &["keychains", ".env", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".pem", ".p12", "credentials"];
-    let text = text.to_lowercase();
-    HOME_SECRETS.iter().map(|(rel, _)| *rel).filter(|r| !r.starts_with("Library")).chain(MORE.iter().copied()).find(|p| text.contains(*p))
+    let texts: Vec<String> = texts.iter().map(|t| t.to_lowercase()).collect();
+    HOME_SECRETS
+        .iter()
+        .map(|(rel, _)| *rel)
+        .filter(|r| !r.starts_with("Library"))
+        .chain(MORE.iter().copied())
+        .find(|p| texts.iter().any(|t| t.contains(*p)))
 }
 
 /// The sensitive hit for a word whose expansion the check can't follow
@@ -650,7 +655,7 @@ fn credential_part(text: &str) -> Option<&'static str> {
 /// to, it asks.
 fn named_credential(pattern: &str, spliced: &str) -> Option<Reached> {
     let squeeze = |s: &str| s.chars().filter(|c| !"\\'\"$(){}[]*?@!+|,`".contains(*c)).collect::<String>();
-    let part = [pattern, spliced].into_iter().flat_map(|s| [s.to_string(), squeeze(s)]).find_map(|t| credential_part(&t))?;
+    let part = credential_part(&[pattern.to_string(), squeeze(pattern), spliced.to_string(), squeeze(spliced)])?;
     let shown = unescape(pattern);
     Some(Reached {
         real: PathBuf::from(&shown),
