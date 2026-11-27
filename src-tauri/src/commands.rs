@@ -2024,6 +2024,44 @@ pub async fn list_talk_checkpoints(
     crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::checkpoints(&path, &thread_id)).await
 }
 
+/// The files a Talk turn changed, with their line counts (#1152). None when
+/// the turn has no checkpoint before or after it, or changed nothing.
+#[tauri::command]
+pub async fn talk_turn_changes(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<Vec<crate::talk_checkpoints::TurnChange>> {
+    let Ok((_, path)) = talk_thread_home(&state, &thread_id) else {
+        return Ok(Vec::new());
+    };
+    crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::turn_changes(&path, &thread_id, message_id)
+    })
+    .await
+}
+
+/// The unified diff of a Talk turn, between its two checkpoints: Review's
+/// "This turn" scope (#1152). Empty when either checkpoint is missing.
+#[tauri::command]
+pub async fn talk_turn_diff(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+    ignore_whitespace: Option<bool>,
+) -> AppResult<String> {
+    let (_, path) = talk_thread_home(&state, &thread_id)?;
+    crate::talk_checkpoints::off_runtime(move || {
+        match crate::talk_checkpoints::turn_refs(&path, &thread_id, message_id) {
+            Some((before, after)) => {
+                crate::git_ops::commits_diff(&path, &before, &after, ignore_whitespace.unwrap_or(false))
+            }
+            None => Ok(String::new()),
+        }
+    })
+    .await
+}
+
 /// What rewinding to a turn would change — shown before anything is written.
 #[tauri::command]
 pub async fn preview_talk_rewind(

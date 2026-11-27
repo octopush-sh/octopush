@@ -627,6 +627,76 @@ fn diff(ws: &Path, from: &str, to: &str) -> AppResult<Vec<RawChange>> {
     Ok(parse_raw_diff(&out.stdout))
 }
 
+/// One file a turn changed (#1152), between its checkpoint and `-after`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnChange {
+    pub path: String,
+    /// `added`, `deleted` or `modified`.
+    pub status: &'static str,
+    /// Lines added and removed (0 and 0 for a binary file).
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// Parse `git diff-tree -r -z --no-renames --numstat` output: one
+/// `<added>\t<removed>\t<path>\0` per file, `-` for a binary file's counts.
+pub fn parse_numstat(out: &[u8]) -> Vec<(String, u32, u32)> {
+    out.split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| {
+            let entry = String::from_utf8_lossy(entry);
+            let mut fields = entry.splitn(3, '\t');
+            let (added, removed, path) = (fields.next()?, fields.next()?, fields.next()?);
+            let count = |s: &str| if s == "-" { Some(0) } else { s.parse::<u32>().ok() };
+            Some((path.to_string(), count(added)?, count(removed)?))
+        })
+        .collect()
+}
+
+/// The two checkpoints of a turn — before it ran and how it left the tree —
+/// when both exist.
+pub fn turn_refs(ws: &Path, thread_id: &str, message_id: i64) -> Option<(String, String)> {
+    if !valid_thread(thread_id) || !is_repo(ws) {
+        return None;
+    }
+    let before = resolve(ws, &ref_for(thread_id, message_id))?;
+    let after = resolve(ws, &after_ref_for(thread_id, message_id))?;
+    Some((before, after))
+}
+
+/// What a turn changed: every file that differs between its two
+/// checkpoints, with its line counts. The checkpoints snapshot the whole
+/// tree, so edits by `run_command` and sub-agents are included. None when
+/// either checkpoint is missing or the turn changed nothing.
+pub fn turn_changes(ws: &Path, thread_id: &str, message_id: i64) -> AppResult<Vec<TurnChange>> {
+    let Some((before, after)) = turn_refs(ws, thread_id, message_id) else {
+        return Ok(Vec::new());
+    };
+    let raw: Vec<RawChange> = diff(ws, &before, &after)?.into_iter().filter(|c| !c.submodule).collect();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let out = bytes_ok(
+        git(ws, None, &["diff-tree", "-r", "-z", "--no-renames", "--numstat", &before, &after])?,
+        "diff-tree --numstat",
+    )?;
+    let counts = parse_numstat(&out);
+    Ok(raw
+        .into_iter()
+        .map(|c| {
+            let (added, removed) =
+                counts.iter().find(|(p, _, _)| *p == c.path).map(|&(_, a, r)| (a, r)).unwrap_or((0, 0));
+            let status = match c.status {
+                'A' => "added",
+                'D' => "deleted",
+                _ => "modified",
+            };
+            TurnChange { path: c.path, status, added, removed }
+        })
+        .collect())
+}
+
 /// One file a rewind will change.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

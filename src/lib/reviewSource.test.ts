@@ -19,6 +19,15 @@ describe("resolveReviewSource (#851)", () => {
     expect(resolveReviewSource("committed", true, 3)).toBe("committed");
     expect(resolveReviewSource("working", false, 3)).toBe("working");
   });
+  it("shows a picked turn (#1152), with or without commits ahead", () => {
+    expect(resolveReviewSource("turn", true, 0, true)).toBe("turn");
+    expect(resolveReviewSource("turn", false, 3, true)).toBe("turn");
+  });
+  it("falls back to the default when a turn pick has no turn to show", () => {
+    expect(resolveReviewSource("turn", false, 3, false)).toBe("committed");
+    expect(resolveReviewSource("turn", true, 3)).toBe("working");
+    expect(resolveReviewSource("turn", false, 0)).toBe("working");
+  });
 });
 
 describe("review source copy", () => {
