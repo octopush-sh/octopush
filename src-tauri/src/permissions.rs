@@ -254,47 +254,38 @@ const READERS: &[&str] = &["ls", "cat", "head", "tail", "wc", "grep", "diff", "p
 const GIT_READERS: &[&str] = &["status", "diff", "log", "show", "blame", "ls-files", "rev-parse"];
 
 /// Whether every command `command` runs only reads, so Ask first runs it
-/// without a card (#1231). Read the way the command check reads commands:
-/// every nested one ([`crate::chat_engine::each_command`]), each word as the
-/// shell splits it ([`crate::chat_engine::command_words`]). Each command must
-/// start with a program in [`READERS`] (or `git` with a subcommand in
-/// [`GIT_READERS`] right after it), named plainly, and nothing may redirect
-/// output except to `/dev/null`. Anything the check can't tell asks: a
-/// variable or a path as the program, an assignment before it, a wrapper or
-/// a shell keyword, a script, or nesting past the check's caps.
+/// without a card (#1231). Only a command of [`plain_shape`] qualifies.
+/// Then it is read the way the command check reads commands: every nested
+/// one ([`crate::chat_engine::each_command`]), each word as the shell splits
+/// it ([`crate::chat_engine::command_words`]). Each command must start with a
+/// program in [`READERS`] (or `git` with a subcommand in [`GIT_READERS`]
+/// right after it), named plainly, and nothing may redirect output except to
+/// `/dev/null`. Anything the check can't tell asks: a path as the program,
+/// an assignment before it, a wrapper or a shell keyword, a script.
 pub fn reads_only(command: &str) -> bool {
     !command.trim().is_empty()
         && crate::chat_engine::control_refusal(command).is_none()
-        // A line continued with `\` can hide an expansion from the check
-        // (`$\⏎{PWD:_}`): it asks.
-        && !command.contains("\\\n")
-        && !runs_arithmetic(command)
+        && plain_shape(command)
         && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
 }
 
-/// Whether `command` holds arithmetic (`$((…))`, `$[…]`) or any `${…}` but a
-/// plain name or its length (`${name}`, `${#name}`), anywhere, quoted or
-/// not. Bash evaluates a substring offset or an array subscript
-/// (`${PWD:_}`, `${a[_]}`) and arithmetic as an expression, and a variable
-/// in it, such as `$_` after `echo 'a[$(cmd)]'`, runs the command it holds:
-/// a reader that runs code. So it asks.
-fn runs_arithmetic(command: &str) -> bool {
-    if command.contains("$((") || command.contains("$[") {
-        return true;
-    }
-    let mut rest = command;
-    while let Some(at) = rest.find("${") {
-        let inner = &rest[at + 2..];
-        let Some(end) = inner.find('}') else { return true };
-        let name = inner[..end].strip_prefix('#').unwrap_or(&inner[..end]);
-        let plain = name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
-            && name.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric());
-        if !plain {
-            return true;
-        }
-        rest = &inner[end + 1..];
-    }
-    false
+/// The characters a command [`plain_shape`] never holds: every way into an
+/// expansion (`$`, a backtick, `{` and `}` of a brace expansion), quoting
+/// that changes what the next character means (`\`), history expansion
+/// (`!`), and a here-document (`<<`, checked as a pair).
+const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!'];
+
+/// Whether `command` has the plain shape Ask first lets run without a card:
+/// none of [`NOT_PLAIN`] anywhere in its raw text, quoted or not, and no
+/// `<<`. A whitelist on purpose, not a list of tricks: bash builds code from
+/// many shapes a reader check doesn't model (`{$,}{PWD:_}` makes `${PWD:_}`
+/// by brace expansion, whose arithmetic runs the command `$_` holds after
+/// `echo $'a[\x24(touch x)]'`; `$\⏎{` joins a line; `$((…))`, `${x:-…}`),
+/// and each new one was a bypass. Without these characters no expansion,
+/// substitution or line join can happen, so what the check reads is what
+/// runs. A command outside the shape only gets Ask first's card. Pure.
+pub fn plain_shape(command: &str) -> bool {
+    !command.contains(NOT_PLAIN) && !command.contains("<<")
 }
 
 /// Whether `command` runs `git` from outside `workspace` (#1231): `cwd` is
@@ -1121,7 +1112,7 @@ mod tests {
             "git status", "git status --porcelain", "git diff HEAD~1", "git log --oneline -5", "git show HEAD:a.rs",
             "git blame a.rs", "git ls-files", "git rev-parse HEAD",
             "cat a.rs | grep fn | head -3", "ls && git status; pwd", "grep x a.rs 2>/dev/null", "ls >/dev/null 2>&1",
-            "cat < a.rs", "echo $(git rev-parse HEAD)", "cat \"$FILE\"", "grep -c fn a.rs || echo none",
+            "cat < a.rs", "grep -c fn a.rs || echo none", "grep -n foo src/*.rs",
         ];
         for command in runs {
             assert!(reads_only(command), "{command} should run without a card");
@@ -1134,6 +1125,8 @@ mod tests {
             "echo x > a.rs", "cat a >> b", "ls &> out.txt", "grep x a.rs 2> err.txt",
             // A reader beside a writer, or nested in one.
             "ls; rm a.rs", "cat a.rs | tee b.rs", "echo $(rm a.rs)", "ls `touch x`", "cat <(rm -rf x)",
+            // Outside the plain shape, a reader asks too (`plain_shape`).
+            "echo $(git rev-parse HEAD)", "cat \"$FILE\"",
             // git that writes, or git flags before the subcommand.
             "git commit -m x", "git push", "git checkout main", "git branch -D x", "git -c core.pager=x log",
             "git -C .. status", "git diff --output=patch.txt", "git log --output patch.txt", "git diff --ext-diff",
@@ -1185,8 +1178,9 @@ mod tests {
         for command in ["echo $'a[\\x24(touch x)]'; echo $\\\n{PWD:_}", "echo $'a[\\x24(touch x)]'; echo $\\\n[_]", "ls \\\n-la"] {
             assert!(!reads_only(command), "{command:?} should ask");
         }
-        // `$'\x24'` decodes to a plain `$`, which bash never expands again.
-        assert!(reads_only("echo $'\\x24'{PWD:_}"));
+        // `$'\x24'` decodes to a plain `$`, which bash never expands again;
+        // it still asks, as anything with a `$` does (`plain_shape`).
+        assert!(!reads_only("echo $'\\x24'{PWD:_}"));
         let dir = tempfile::tempdir().unwrap();
         let run = |command: &str| std::process::Command::new("/bin/bash").arg("-c").arg(command).current_dir(dir.path()).output().unwrap();
         run("echo 'a[$(touch x)]' >/dev/null; echo $'\\x24'{PWD:_} >/dev/null; echo $'\\x24(touch y)' >/dev/null");
@@ -1195,27 +1189,42 @@ mod tests {
         assert!(dir.path().join("z").exists(), "the continuation does run it: the case the check asks for");
     }
 
-    /// Arithmetic runs what a variable holds, `$_` included, so a reader
-    /// that expands it asks: `echo 'a[$(touch x)]'; echo ${PWD:_}` runs
-    /// `touch x` in bash.
+    /// Only a command of the plain shape runs without Ask first's card: no
+    /// `$`, backtick, brace, backslash, `!` or `<<`. Brace expansion builds
+    /// `${PWD:_}` from `{$,}{PWD:_}`, whose arithmetic runs what `$_` holds.
     #[test]
-    fn a_reader_that_expands_arithmetic_asks() {
+    fn only_a_plain_shape_reads() {
         for command in [
+            // Brace expansion builds `${PWD:_}`: bash ran `touch` from this one.
+            "echo $'a[\\x24(touch x)]'; echo {$,}{PWD:_}",
+            "echo {$,}{PWD:_}",
+            "echo 'a[$(touch x)]'; echo $_",
+            "echo ${x:-a.rs}",
+            "echo $((1+1))",
             "echo 'a[$(touch x)]'; echo ${PWD:_}",
-            "echo 'a[$(touch x)]'; echo ${a[_]}",
-            "echo 'a[$(touch x)]'; echo $((_))",
+            "echo ${a[_]}",
             "echo $[_]",
             "cat ${!_}",
-            "echo ${x:=1}",
-            "cat ${f:-a.rs}",
-            "echo ${PWD",
+            "cat \"${FILE}\"",
+            "echo ${#PATH}",
+            "ls {a,b}.rs",
             "grep x '${a[_]}'",
+            "echo hi!",
+            "grep 'a\\.b' a.rs",
+            "cat <<EOF",
         ] {
-            assert!(!reads_only(command), "{command} should ask");
+            assert!(!plain_shape(command) && !reads_only(command), "{command} should ask");
         }
-        for command in ["cat \"${FILE}\"", "echo ${#PATH}", "cat \"$FILE\"", "echo $_", "ls ${HOME}/x"] {
-            assert!(reads_only(command), "{command} should run without a card");
+        for command in ["grep -n foo src/*.rs", "cat a.rs | head -3", "git log --oneline -5", "ls -la src > /dev/null 2>&1"] {
+            assert!(plain_shape(command) && reads_only(command), "{command} should run without a card");
         }
+        let dir = tempfile::tempdir().unwrap();
+        let ran = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg("echo $'a[\\x24(touch x)]' >/dev/null; echo {$,}{PWD:_} >/dev/null")
+            .current_dir(dir.path())
+            .status();
+        assert!(ran.is_ok_and(|s| s.success()) && dir.path().join("x").exists(), "bash runs it: the case the shape asks for");
     }
 
     /// A git reader skips the card only where it starts inside the
