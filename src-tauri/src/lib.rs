@@ -487,6 +487,8 @@ pub fn run() {
             commands::claude_known_bad_note,
             commands::codex_trust_note,
             commands::repo_hooks_notice,
+            commands::skill_shell_off,
+            commands::set_skill_shell_off,
             commands::model_retirements,
             commands::readiness_check,
             // Role commands

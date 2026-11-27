@@ -342,6 +342,23 @@ mod workspace_tests {
     }
 
     #[test]
+    fn skill_shell_off_is_per_project_and_off_by_default() {
+        // #1188: "Don't run skill shell commands in crews".
+        let db = test_db();
+        setup_workspace(&db, "a", "wa");
+        setup_workspace(&db, "b", "wb");
+        assert!(!db.get_project_skill_shell_off("a").unwrap());
+        assert!(!db.workspace_skill_shell_off("wa").unwrap());
+        db.set_project_skill_shell_off("a", true).unwrap();
+        assert!(db.workspace_skill_shell_off("wa").unwrap());
+        assert!(!db.workspace_skill_shell_off("wb").unwrap(), "another project keeps its own");
+        assert!(!db.workspace_skill_shell_off("no-such-workspace").unwrap());
+        assert!(!db.get_project_skill_shell_off("no-such-project").unwrap());
+        db.set_project_skill_shell_off("a", false).unwrap();
+        assert!(!db.workspace_skill_shell_off("wa").unwrap());
+    }
+
+    #[test]
     fn count_started_runs_excludes_drafts_and_counts_started() {
         // Guards the free-tier Direct-runs meter/quota: only runs that have
         // *left* `draft` (i.e. were started) this month are counted.
@@ -12024,6 +12041,45 @@ mod cli_args_tests {
             INNER_SANDBOX_OFF_LABEL,
             "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage"
         );
+    }
+
+    #[test]
+    fn a_project_that_turned_skill_shell_off_adds_the_key_to_every_claude_stage() {
+        use crate::orchestrator::cli_runner::{
+            confine_reads_in_sandbox, disable_skill_shell, turn_off_inner_sandbox, CliDialect, CodexWriteScope,
+        };
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #1188: the settings key, beside the guards and the inner-sandbox
+        // override, fresh and resumed, in every isolation.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        for (git, exec) in [("worktree", "sandbox"), ("readonly", "none"), ("worktree", "none")] {
+            let iso = stage_isolation(git, exec, "/ws");
+            for off in [true, false] {
+                for mut args in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, true)] {
+                    let reads = confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args);
+                    let wrapped = turn_off_inner_sandbox(CliDialect::Claude, &iso.exec_isolation, &mut args);
+                    assert_eq!(disable_skill_shell(CliDialect::Claude, off, &mut args), off);
+                    let v = settings(&args);
+                    assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true));
+                    assert_eq!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some(), reads);
+                    assert_eq!(v.get("sandbox").is_some(), wrapped);
+                    if off {
+                        assert_eq!(v["disableSkillShellExecution"], serde_json::json!(true), "{git}/{exec}: {args:?}");
+                    } else {
+                        assert!(v.get("disableSkillShellExecution").is_none(), "off by default: {args:?}");
+                    }
+                    assert!(!args.iter().any(|a| a.contains("PreSkillShellCommand")), "never the hook: {args:?}");
+                }
+            }
+        }
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox, "/ws");
+        let mut same = codex.clone();
+        assert!(!disable_skill_shell(CliDialect::Codex, true, &mut same));
+        assert_eq!(same, codex);
     }
 
     #[test]
