@@ -2491,17 +2491,140 @@ pub(crate) async fn run_confined(
     roots: Option<Vec<String>>,
     cancel: &std::sync::Arc<AtomicBool>,
 ) -> (String, bool) {
-    let (wp, input, flag) = (workspace.to_path_buf(), input.clone(), std::sync::Arc::clone(cancel));
-    tokio::task::spawn_blocking(move || execute_tool_cancellable(&wp, "run_command", &input, roots.as_deref(), Some(&flag)))
+    run_builtin(workspace, "run_command", input, roots, cancel).await
+}
+
+/// The built-in tool `name` on a blocking thread, so a long walk or command
+/// never holds a runtime worker another workspace's turn needs; `cancel`
+/// (Stop) kills a command's process group and ends a grep or glob walk.
+pub(crate) async fn run_builtin(
+    workspace: &Path,
+    name: &str,
+    input: &serde_json::Value,
+    roots: Option<Vec<String>>,
+    cancel: &std::sync::Arc<AtomicBool>,
+) -> (String, bool) {
+    let (wp, name, input, flag) = (workspace.to_path_buf(), name.to_string(), input.clone(), std::sync::Arc::clone(cancel));
+    tokio::task::spawn_blocking(move || execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&flag)))
         .await
         .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
 }
 
-/// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
-/// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
-/// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
-/// kernel enforces the workspace boundary. Reads stay open (the profile allows
-/// reads too).
+/// A Talk `run_command` the shared shell couldn't take (`reason`), run in an
+/// isolated shell at the workspace root. Only reached unsandboxed (the
+/// shared-shell branch is gated on no exec roots), so it runs unconfined,
+/// bounded by the command's own timeout; Stop kills it, and once Stop landed
+/// it never starts.
+async fn run_fallback_shell(
+    workspace: &Path,
+    input: &serde_json::Value,
+    reason: &str,
+    cancel: &std::sync::Arc<AtomicBool>,
+) -> (String, bool) {
+    if cancel.load(Ordering::Relaxed) {
+        return (format!("(stopped before an isolated shell ran it — {reason})"), false);
+    }
+    let (out, ok) = run_confined(workspace, input, None, cancel).await;
+    (format!("(ran in an isolated shell at the workspace root — {reason})\n{out}"), ok)
+}
+
+/// Whether Stop landed: a grep or glob walk checks it between files.
+fn stop_requested(cancel: Option<&std::sync::Arc<AtomicBool>>) -> bool {
+    cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
+/// `read_file`'s cap on what it returns, in bytes.
+const READ_FILE_MAX_BYTES: usize = 100_000;
+
+/// Lines `start..` (0-based) of `full`, at most `limit` of them and at most
+/// [`READ_FILE_MAX_BYTES`] joined, streamed: the read stops at the window's
+/// end, so paging through a large file never loads all of it. Lines split as
+/// `str::lines` splits them. `total` is the file's line count when the read
+/// reached its end, `None` when lines follow the window.
+fn read_line_window(full: &Path, start: usize, limit: Option<usize>) -> std::io::Result<(Vec<String>, Option<usize>)> {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(std::fs::File::open(full)?);
+    let mut line = 0usize;
+    while line < start {
+        if !skip_line(&mut reader)? {
+            return Ok((Vec::new(), Some(line)));
+        }
+        line += 1;
+    }
+    let end = limit.map_or(usize::MAX, |l| start.saturating_add(l.max(1)));
+    let (mut window, mut bytes, mut buf) = (Vec::new(), 0usize, Vec::new());
+    while line < end && bytes < READ_FILE_MAX_BYTES {
+        buf.clear();
+        // Never more of one line than the room left: a minified file's one
+        // huge line is cut, not read whole.
+        let room = (READ_FILE_MAX_BYTES - bytes) as u64;
+        if (&mut reader).take(room + 1).read_until(b'\n', &mut buf)? == 0 {
+            return Ok((window, Some(line)));
+        }
+        let whole = buf.last() == Some(&b'\n');
+        if whole {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        let text = utf8_keeping_cut(std::mem::take(&mut buf), !whole)?;
+        bytes += text.len() + 1;
+        window.push(text);
+        line += 1;
+    }
+    let total = reader.fill_buf()?.is_empty().then_some(line);
+    Ok((window, total))
+}
+
+/// Consumes one line of `reader` without holding it; `false` at the end.
+fn skip_line(reader: &mut impl std::io::BufRead) -> std::io::Result<bool> {
+    let mut any = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(any);
+        }
+        any = true;
+        if let Some(i) = chunk.iter().position(|&b| b == b'\n') {
+            reader.consume(i + 1);
+            return Ok(true);
+        }
+        let n = chunk.len();
+        reader.consume(n);
+    }
+}
+
+/// `bytes` as UTF-8; when they were `cut` inside a character, what precedes
+/// it. Content that isn't UTF-8 is an error, as `read_to_string` gives.
+fn utf8_keeping_cut(bytes: Vec<u8>, cut: bool) -> std::io::Result<String> {
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(s),
+        Err(e) if cut && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            Ok(String::from_utf8(bytes).unwrap_or_default())
+        }
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8")),
+    }
+}
+
+/// The head of `full`, at most [`READ_FILE_MAX_BYTES`], and the file's size:
+/// a large file is never read past the cap.
+fn read_file_head(full: &Path) -> std::io::Result<(String, u64)> {
+    use std::io::Read;
+    let file = std::fs::File::open(full)?;
+    let size = file.metadata()?.len();
+    let mut bytes = Vec::new();
+    file.take(READ_FILE_MAX_BYTES as u64).read_to_end(&mut bytes)?;
+    let cut = size > bytes.len() as u64;
+    Ok((utf8_keeping_cut(bytes, cut)?, size))
+}
+
+/// [`execute_tool_cancellable`] with no cancel flag. The app always passes
+/// one ([`run_builtin`]); tests call this.
+#[cfg(test)]
 pub(crate) fn execute_tool(
     workspace_path: &Path,
     name: &str,
@@ -2511,9 +2634,13 @@ pub(crate) fn execute_tool(
     execute_tool_cancellable(workspace_path, name, input, sandbox_roots, None)
 }
 
-/// [`execute_tool`] with a director cancel flag: a long `run_command` polls it
-/// and kills the process group when set, so a DIRECT stage stop interrupts
-/// in-flight tool work instead of waiting for a process that may never exit.
+/// Execute a built-in workspace tool. When `sandbox_roots` is `Some`, the
+/// mission is sandboxed: `run_command` runs its shell under seatbelt (fail-closed
+/// — no wrapper, no run) and `write_file` writes through a seatbelt wrap so the
+/// kernel enforces the workspace boundary. Reads stay open (the profile allows
+/// reads too). `cancel` (a director or Talk Stop): a long `run_command` polls
+/// it and kills the process group when set, and a grep or glob walk ends, so
+/// a stop interrupts in-flight tool work instead of waiting for it.
 pub(crate) fn execute_tool_cancellable(
     workspace_path: &Path,
     name: &str,
@@ -2572,46 +2699,36 @@ pub(crate) fn execute_tool_cancellable(
         "read_file" => {
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
             let full = workspace_path.join(path);
-            match std::fs::read_to_string(&full) {
-                Ok(content) => {
-                    // Optional line-window: `offset` (1-based first line) and/or
-                    // `limit` (line count) let the model page through a large
-                    // file instead of re-reading (and re-paying for) all of it.
-                    let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let limit = input.get("limit").and_then(|v| v.as_u64());
-                    if offset > 1 || limit.is_some() {
-                        let start = offset.max(1) as usize - 1;
-                        let total = content.lines().count();
-                        let window: Vec<&str> = content
-                            .lines()
-                            .skip(start)
-                            .take(limit.map(|l| l.max(1) as usize).unwrap_or(usize::MAX))
-                            .collect();
+            // Optional line-window: `offset` (1-based first line) and/or
+            // `limit` (line count) let the model page through a large
+            // file instead of re-reading (and re-paying for) all of it.
+            // Either way the file is read only as far as what is shown.
+            let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let limit = input.get("limit").and_then(|v| v.as_u64());
+            if offset > 1 || limit.is_some() {
+                let start = offset.max(1) as usize - 1;
+                return match read_line_window(&full, start, limit.map(|l| l as usize)) {
+                    Ok((window, total)) => {
                         let shown = window.len();
                         let body = window.join("\n");
-                        let body = truncate_char_safe(&body, 100_000);
-                        return (
-                            format!(
-                                "(lines {}-{} of {total})\n{body}",
-                                start + 1,
-                                start + shown,
-                            ),
-                            true,
-                        );
+                        let body = truncate_char_safe(&body, READ_FILE_MAX_BYTES);
+                        let of = match total {
+                            Some(total) => format!(" of {total}"),
+                            None => "; more follow".to_string(),
+                        };
+                        (format!("(lines {}-{}{of})\n{body}", start + 1, start + shown), true)
                     }
-                    if content.len() > 100_000 {
-                        let head = truncate_char_safe(&content, 100_000);
-                        (
-                            format!(
-                                "{head}... (truncated, {} bytes total — re-read with `offset`/`limit` to see the rest)",
-                                content.len()
-                            ),
-                            true,
-                        )
-                    } else {
-                        (content, true)
-                    }
-                }
+                    Err(e) => (format!("Error reading {path}: {e}"), false),
+                };
+            }
+            match read_file_head(&full) {
+                Ok((head, size)) if size > head.len() as u64 => (
+                    format!(
+                        "{head}... (truncated, {size} bytes total — re-read with `offset`/`limit` to see the rest)"
+                    ),
+                    true,
+                ),
+                Ok((content, _)) => (content, true),
                 Err(e) => (format!("Error reading {path}: {e}"), false),
             }
         }
@@ -2703,6 +2820,9 @@ pub(crate) fn execute_tool_cancellable(
                 .require_git(false)
                 .build();
             'files: for entry in walker.flatten() {
+                if stop_requested(cancel) {
+                    return (format!("Search stopped after {} matches.", out.len()), false);
+                }
                 let p = entry.path();
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
@@ -2772,6 +2892,9 @@ pub(crate) fn execute_tool_cancellable(
                 .require_git(false)
                 .build();
             for entry in walker.flatten() {
+                if stop_requested(cancel) {
+                    return (format!("Search stopped after {} files.", out.len()), false);
+                }
                 if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                     continue;
                 }
@@ -5073,8 +5196,8 @@ impl ChatEngine {
                         // a transient error). Run THIS command in an isolated shell
                         // so the agent isn't blocked — but say so explicitly, since
                         // it runs at the workspace root, not the shared cwd. The
-                        // fallback is itself bounded (off-thread + timeout) so it
-                        // can't hang the turn.
+                        // fallback runs off-thread, bounded by the command's own
+                        // timeout, and Stop kills it.
                         other => {
                             let reason = match other {
                                 Ok(Ok(crate::talk_shell::CaptureOutcome::Busy)) =>
@@ -5082,27 +5205,9 @@ impl ChatEngine {
                                 Ok(Err(e)) => e.to_string(),
                                 _ => "the shared shell task failed".to_string(),
                             };
-                            let wp = workspace_path.clone();
-                            let name = u.name.clone();
-                            let input = u.input.clone();
-                            let (out, ok) = match tokio::time::timeout(
-                                std::time::Duration::from_secs(600),
-                                // This fallback is only reached unsandboxed (the
-                                // shared-shell branch is gated on
-                                // exec_roots.is_none()), so it runs unconfined.
-                                tokio::task::spawn_blocking(move || execute_tool(&wp, &name, &input, None)),
-                            )
-                            .await
-                            {
-                                Ok(Ok((o, k))) => (o, k),
-                                _ => ("(isolated fallback timed out or failed)".to_string(), false),
-                            };
-                            (
-                                format!(
-                                    "(ran in an isolated shell at the workspace root — {reason})\n{out}"
-                                ),
-                                ok,
-                            )
+                            let ran = run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await;
+                            interrupted = cancel.load(Ordering::Relaxed);
+                            ran
                         }
                     }
                 } else if u.name == "run_command" {
@@ -5112,7 +5217,12 @@ impl ChatEngine {
                     interrupted = cancel.load(Ordering::Relaxed);
                     ran
                 } else {
-                    execute_tool(&workspace_path, &u.name, &u.input, exec_roots.as_deref())
+                    // Every other built-in tool, off the runtime thread too: a
+                    // long grep never stalls another workspace's turn, and a
+                    // walk Stop ended reads as stopped.
+                    let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await;
+                    interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
+                    ran
                 };
 
                 // ── Live card: announce completion (timing + status) ──
@@ -6506,6 +6616,118 @@ mod tests {
         assert!(out.contains("stopped by the director"), "{out}");
     }
 
+    /// Runs `run` on a one-thread runtime, raising `cancel` 300ms in, and
+    /// returns its result with how long it took to return after the stop. On
+    /// that runtime the canceller could never run while a tool held the
+    /// thread.
+    fn stopped_after_300ms<F: std::future::Future<Output = (String, bool)>>(
+        cancel: &Arc<AtomicBool>,
+        run: F,
+    ) -> (String, bool, std::time::Duration) {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let stopped_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::default();
+        let (flag, at) = (Arc::clone(cancel), Arc::clone(&stopped_at));
+        let (out, ok) = rt.block_on(async move {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                *at.lock() = Some(std::time::Instant::now());
+                flag.store(true, Ordering::Relaxed);
+            });
+            run.await
+        });
+        let at = *stopped_at.lock();
+        let after = at.expect("the stop landed while the tool ran").elapsed();
+        (out, ok, after)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sandboxed_run_command_honours_stop() {
+        let ws = tempfile::tempdir().unwrap();
+        let roots = vec![ws.path().to_string_lossy().into_owned()];
+        let cancel = Arc::new(AtomicBool::new(false));
+        let input = serde_json::json!({ "command": "echo MARK_PRE; sleep 30", "timeout_secs": 3600 });
+        let (out, ok, after) = stopped_after_300ms(&cancel, run_confined(ws.path(), &input, Some(roots.clone()), &cancel));
+        let _ = crate::orchestrator::sandbox::remove_workspace_build_caches(&roots[0]);
+        assert!(!ok, "{out}");
+        assert!(after < std::time::Duration::from_secs(1), "Stop took {after:?} to end the command: {out}");
+        assert!(out.contains("stopped") && out.contains("MARK_PRE"), "{out}");
+    }
+
+    #[test]
+    fn fallback_shell_honours_stop() {
+        let ws = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let input = serde_json::json!({ "command": "sleep 30" });
+        let (out, ok, after) = stopped_after_300ms(&cancel, run_fallback_shell(ws.path(), &input, "busy", &cancel));
+        assert!(!ok, "{out}");
+        assert!(after < std::time::Duration::from_secs(1), "Stop took {after:?} to end the command: {out}");
+        assert!(out.starts_with("(ran in an isolated shell at the workspace root — busy)"), "{out}");
+        assert!(out.contains("stopped"), "{out}");
+        // Once Stop landed, the fallback never starts the command.
+        let input = serde_json::json!({ "command": "touch ran.txt" });
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (out, ok) = rt.block_on(run_fallback_shell(ws.path(), &input, "busy", &cancel));
+        assert!(!ok && out.contains("stopped before"), "{out}");
+        assert!(!ws.path().join("ran.txt").exists(), "the command ran after Stop");
+    }
+
+    #[test]
+    fn a_grep_or_glob_walk_honours_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle").unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for (name, input) in [
+            ("grep", serde_json::json!({ "pattern": "needle" })),
+            ("glob", serde_json::json!({ "pattern": "*.txt" })),
+        ] {
+            let (out, ok) = rt.block_on(run_builtin(dir.path(), name, &input, None, &cancel));
+            assert!(!ok && out.starts_with("Search stopped"), "{name}: {out}");
+        }
+        // Without a stop they run as before.
+        let (out, ok) = execute_tool(dir.path(), "grep", &serde_json::json!({ "pattern": "needle" }), None);
+        assert!(ok && out.contains("a.txt:1:needle"), "{out}");
+    }
+
+    #[test]
+    fn read_file_window_does_not_read_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        // Ten lines, then bytes that aren't UTF-8: reading the whole file fails,
+        // so a window that reads past line 10 can't succeed.
+        let mut bytes = (1..=10).map(|i| format!("line{i}\r\n")).collect::<String>().into_bytes();
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        bytes.extend_from_slice(b"line12\n");
+        std::fs::write(wp.join("w.txt"), &bytes).unwrap();
+        let read = |input: serde_json::Value| execute_tool(wp, "read_file", &input, None);
+        let (out, ok) = read(serde_json::json!({ "path": "w.txt", "offset": 2, "limit": 3 }));
+        assert!(ok, "{out}");
+        assert_eq!(out, "(lines 2-4; more follow)\nline2\nline3\nline4");
+        // A window that ends at the file's end knows its total.
+        std::fs::write(wp.join("short.txt"), "a\nb\nc\n").unwrap();
+        let (out, ok) = read(serde_json::json!({ "path": "short.txt", "offset": 2, "limit": 5 }));
+        assert!(ok);
+        assert_eq!(out, "(lines 2-3 of 3)\nb\nc");
+        let (out, _) = read(serde_json::json!({ "path": "short.txt", "offset": 3, "limit": 1 }));
+        assert_eq!(out, "(lines 3-3 of 3)\nc");
+        // Past the end: nothing shown, the total still told.
+        let (out, _) = read(serde_json::json!({ "path": "short.txt", "offset": 9 }));
+        assert_eq!(out, "(lines 9-8 of 3)\n");
+        // A whole-file read stops at the cap, and the bytes past it aren't read.
+        let mut big = "x".repeat(READ_FILE_MAX_BYTES + 10).into_bytes();
+        big.extend_from_slice(&[0xff, 0xfe]);
+        std::fs::write(wp.join("big.txt"), &big).unwrap();
+        let (out, ok) = read(serde_json::json!({ "path": "big.txt" }));
+        assert!(ok, "{}", &out[out.len().saturating_sub(120)..]);
+        assert!(out.contains(&format!("truncated, {} bytes total", big.len())), "{}", &out[out.len() - 120..]);
+        // One huge line in a window is cut at the cap, not read whole.
+        let (out, ok) = read(serde_json::json!({ "path": "big.txt", "limit": 1 }));
+        assert!(ok, "{}", &out[..80]);
+        assert!(out.starts_with("(lines 1-1; more follow)\nxxx"), "{}", &out[..80]);
+        assert!(out.len() < READ_FILE_MAX_BYTES + 100);
+    }
+
     #[test]
     fn sandboxed_write_file_refuses_paths_outside_the_workspace() {
         // M3.1b: in-process write_file is path-contained when the mission is
@@ -6687,7 +6909,7 @@ mod tests {
     fn the_director_loop_and_the_subagent_gate_call_the_guard() {
         let engine = include_str!("chat_engine.rs");
         let from = engine.find("// \u{2500}\u{2500} Approval gate").expect("the director's approval gate");
-        let to = from + engine[from..].find("execute_tool(&workspace_path, &u.name").expect("the director runs the tool after it");
+        let to = from + engine[from..].find("run_builtin(&workspace_path, &u.name").expect("the director runs the tool after it");
         let gate = &engine[from..to];
         assert!(gate.contains("talk_guard::director_card(") && gate.contains("guard_card(card, &check"), "{gate}");
         // A command's paths are read before the command check (#1201).
