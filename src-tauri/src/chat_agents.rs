@@ -372,6 +372,21 @@ pub fn subagent_spend_limit(share: Option<f64>, max_cost: Option<f64>) -> Option
     }
 }
 
+/// What is left of `spec`'s spend limit once its attempts so far spent
+/// `spent`: the limit is a total for the run, so an escalation retry or a
+/// continuation the user granted gets only the rest, never a fresh share.
+/// `None` when the run has no limit.
+pub fn spend_left(spec: &SubagentSpec, spent: f64) -> Option<f64> {
+    subagent_spend_limit(spec.spend_limit, spec.definition.as_ref().and_then(|d| d.max_cost))
+        .map(|limit| (limit - spent).max(0.0))
+}
+
+/// Whether another attempt of `spec` may start: a run with nothing left of
+/// its limit would still spend a round before its close.
+pub fn has_spend_left(spec: &SubagentSpec, spent: f64) -> bool {
+    !matches!(spend_left(spec, spent), Some(left) if left <= 0.0)
+}
+
 /// Each sub-agent's share of the budget headroom when `n_agents` run at
 /// once, so together they cannot spend past it before the director's next
 /// budget check. `None` (no budget set, or the turn overrode it) is
@@ -639,9 +654,37 @@ const DOCTRINE: &str =
 /// retry: only a **failure** — no usable report. A report that merely hit
 /// the turn cap is still a report (and for a writing role the tree already
 /// holds its work); a `blocked` stop is a question for the director, which
-/// a stronger model cannot answer either — it goes back up as-is.
+/// a stronger model cannot answer either — it goes back up as-is. Nor does a
+/// run its spend limit stopped: the money ran out, and the strong tier would
+/// spend more of it.
 pub fn should_escalate(outcome: &AgentOutcome) -> bool {
-    !outcome.ok && !outcome.blocked
+    !outcome.ok && !outcome.blocked && !outcome.spend_stopped
+}
+
+/// The retry of `spec` on `stronger` after the `model` attempt `first`
+/// failed: the task again with what the first attempt said, at the strong
+/// tier's effort, with only what is left of the spend limit.
+pub fn escalation_retry(
+    spec: &SubagentSpec,
+    first: &AgentOutcome,
+    model: &str,
+    stronger: &str,
+    tiers: &HashMap<String, String>,
+) -> SubagentSpec {
+    let mut retry = spec.clone();
+    retry.call.prompt = escalation_prompt(&spec.call.prompt, model, &first.report, spec_can_write(spec));
+    // The stronger attempt thinks at its own tier's effort (a definition's
+    // explicit `effort` still wins).
+    let stronger_tier = crate::skills::agents::tier_of_model(stronger, tiers).map(str::to_string);
+    retry.plan = Some(SubagentPlan {
+        model: stronger.to_string(),
+        tier: stronger_tier.clone(),
+        effort: spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(stronger_tier.as_deref())),
+        asked_model: None,
+        asked_honored: true,
+    });
+    retry.spend_limit = spend_left(spec, first.cost_usd);
+    retry
 }
 
 /// Whether a sub-agent can change the workspace: its definition grants a
@@ -1362,26 +1405,19 @@ pub async fn run_one_subagent(
     // The definition's `escalate`: one retry on the stronger model when the
     // cheap attempt failed — unless the director stopped the turn. A
     // continuation never escalates: the user chose to give THIS run more
-    // turns.
-    if spec.resume.is_none() && should_escalate(&outcome) && !cancel.load(Ordering::Relaxed) {
+    // turns. Nor does a run with nothing left of its spend limit.
+    if spec.resume.is_none()
+        && should_escalate(&outcome)
+        && has_spend_left(spec, outcome.cost_usd)
+        && !cancel.load(Ordering::Relaxed)
+    {
         if let Some(stronger) = escalation_model(spec, &model, known_models, tiers) {
             tracing::info!(call = %spec.call_id, from = %model, to = %stronger, "escalating sub-agent");
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
                 "escalating to {stronger}: the {model} attempt {}",
                 if outcome.blocked { "stopped on a question" } else if outcome.closed_at_cap { "hit its turn limit" } else { "failed" }
             ));
-            let mut retry = spec.clone();
-            retry.call.prompt = escalation_prompt(&spec.call.prompt, &model, &outcome.report, spec_can_write(spec));
-            // The stronger attempt thinks at its own tier's effort (a
-            // definition's explicit `effort` still wins).
-            let stronger_tier = crate::skills::agents::tier_of_model(&stronger, tiers).map(str::to_string);
-            retry.plan = Some(SubagentPlan {
-                model: stronger.clone(),
-                tier: stronger_tier.clone(),
-                effort: spec.definition.as_ref().and_then(|d| d.effort).or_else(|| default_effort_for_tier(stronger_tier.as_deref())),
-                asked_model: None,
-                asked_honored: true,
-            });
+            let retry = escalation_retry(spec, &outcome, &model, &stronger, tiers);
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
                 .notice(&format!("running on {}", plan_line(retry.plan.as_ref().unwrap())));
             let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &tool_gate, external_ref, std::time::Instant::now()).await;
@@ -1397,7 +1433,13 @@ pub async fn run_one_subagent(
         // Turns spent so far: every billed attempt (an escalated run spent
         // up to two budgets) — the card says how much it already took.
         let mut turns_used = spec.max_iterations.unwrap_or(0) * outcome.billed_attempts().len().max(1);
-        while ran_out_of_turns(&outcome) && spec_edits_files(spec) && !cancel.load(Ordering::Relaxed) {
+        // The user grants turns, not money: each continuation gets what is
+        // left of the run's spend limit, and none starts once it is spent.
+        while ran_out_of_turns(&outcome)
+            && spec_edits_files(spec)
+            && has_spend_left(spec, outcome.cost_usd)
+            && !cancel.load(Ordering::Relaxed)
+        {
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id).notice(&format!(
                 "hit its turn limit mid-work after {turns_used} turns — waiting for you: more turns, or accept what it has"
             ));
@@ -1434,6 +1476,7 @@ pub async fn run_one_subagent(
             let mut more = spec.clone();
             more.call.model = Some(outcome.model.clone());
             more.max_iterations = Some(extra);
+            more.spend_limit = spend_left(spec, outcome.cost_usd);
             if let Some(p) = more.plan.as_mut() {
                 p.model = outcome.model.clone();
                 p.tier = crate::skills::agents::tier_of_model(&outcome.model, tiers).map(str::to_string);
@@ -2106,6 +2149,9 @@ mod tests {
         // work); a question for the director is not a capability failure.
         assert!(!should_escalate(&AgentOutcome { ok: true, finished: true, closed_at_cap: true, model: "sonnet".into(), ..Default::default() }));
         assert!(!should_escalate(&AgentOutcome { ok: false, blocked: true, model: "sonnet".into(), ..Default::default() }));
+        // A spend stop whose close came back empty: the money ran out, a
+        // dearer model would only spend more.
+        assert!(!should_escalate(&AgentOutcome { ok: false, spend_stopped: true, model: "sonnet".into(), ..Default::default() }));
         // Writing roles are warned about the half-modified tree; read-only ones are not.
         assert!(spec_can_write(&spec), "full tool set");
         let ro = SubagentSpec { definition: Some(def("explorer", Some(vec!["read_file", "grep"]), None)), ..spec.clone() };
@@ -2723,6 +2769,65 @@ mod tests {
             .unwrap();
         assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "one round and the close");
         assert!(out.spend_stopped, "{}", out.report);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn an_escalation_gets_only_what_is_left_of_the_spend_limit() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let model = "claude-opus-5-5";
+        let round = crate::token_engine::request_cost_for(model, 10_000, 5, 0, 0);
+        let tiers: HashMap<String, String> = [("strong".to_string(), "opus".to_string())].into_iter().collect();
+        let mut implementer = def("implementer", None, None);
+        implementer.escalate = Some("strong".into());
+        let spec = SubagentSpec { definition: Some(implementer), spend_limit: Some(round * 1.5), ..core_spec(dir.path()) };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // A first attempt that reaches the limit and whose close is empty
+        // fails, but does not escalate.
+        let mut turns: Vec<LlmResponse> = (0..2).map(|i| read_turn(&format!("t{i}"), 10_000)).collect();
+        turns.push(LlmResponse { input_tokens: 10_000, ..resp("", vec![], LlmStopReason::EndTurn) });
+        let provider = FailsAfter::new(turns, 3);
+        let stopped = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(stopped.spend_stopped && !stopped.ok, "{}", stopped.report);
+        assert!(!should_escalate(&stopped), "a spend stop never escalates");
+        assert!(!has_spend_left(&spec, stopped.cost_usd), "and nothing is left for one");
+
+        // A first attempt that errored after one round escalates with the
+        // other half round only.
+        let provider = FailsAfter::new(vec![read_turn("t1", 10_000)], 2);
+        let failed = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(failed.errored && should_escalate(&failed), "{}", failed.report);
+        assert!((failed.cost_usd - round).abs() < 1e-9, "{}", failed.cost_usd);
+        assert!(has_spend_left(&spec, failed.cost_usd));
+        let retry = escalation_retry(&spec, &failed, model, "opus", &tiers);
+        let left = retry.spend_limit.expect("the retry is limited");
+        assert!((left - round * 0.5).abs() < 1e-9, "only what is left: {left}");
+        assert_eq!(retry.plan.as_ref().map(|p| p.model.as_str()), Some("opus"));
+        let provider = FailsAfter::new((0..10).map(|i| read_turn(&format!("r{i}"), 10_000)).collect(), 10);
+        let second = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &retry, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "one round crosses what is left, then the close");
+        assert!(second.spend_stopped, "{}", second.report);
+
+        // A definition's `max-cost` is a total for the run the same way.
+        let mut capped = def("implementer", None, None);
+        capped.max_cost = Some(1.0);
+        let spec = SubagentSpec { definition: Some(capped), spend_limit: None, ..core_spec(dir.path()) };
+        assert_eq!(spend_left(&spec, 0.25), Some(0.75));
+        assert_eq!(spend_left(&spec, 2.0), Some(0.0), "never below zero");
+        assert!(!has_spend_left(&spec, 1.0));
+        let unbounded = core_spec(dir.path());
+        assert_eq!(spend_left(&unbounded, 100.0), None);
+        assert!(has_spend_left(&unbounded, 100.0), "no limit, nothing runs out");
     }
 
     #[test]

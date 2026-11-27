@@ -853,7 +853,7 @@ pub async fn run_agentic_loop_billed(
     // of the loop so it covers every path that issues another call.
     let mut pending_throttle: Option<u64> = None;
 
-    for _ in 0..max_iterations {
+    for round in 0..max_iterations {
         if cancel.load(Ordering::Relaxed) {
             emitter.notice("stopped by the director");
             out.text = "(stopped by the director)".to_string();
@@ -926,8 +926,9 @@ pub async fn run_agentic_loop_billed(
                 // The rounds before this one were billed: hand them back with
                 // the error. Their conversation (it ends on a complete round)
                 // is the resume point; with no round of this call done there
-                // is nothing new to continue from.
-                if out.input_tokens + out.output_tokens > 0 {
+                // is nothing new to continue from. Counted in rounds, not
+                // tokens: a gateway that reports no usage still did them.
+                if round > 0 {
                     out.transcript = messages.clone();
                     out.blocked_transcript =
                         Some(BlockedTranscript { messages, ask_tool_use_id: String::new() });
