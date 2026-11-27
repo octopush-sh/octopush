@@ -2492,10 +2492,10 @@ fn wait_command_bounded(
                 result = format!("(exit code {})", status.code().unwrap_or(-1));
             }
             let note = (status.code() == Some(NOT_FOUND_EXIT)).then(|| not_found_note(&result));
-            if result.len() > crate::chat_history::COMMAND_KEEP_BYTES {
+            if result.len() > crate::chat_history::COMMAND_CAPTURE_BYTES {
                 result = crate::chat_history::command_excerpt(
                     &result,
-                    crate::chat_history::COMMAND_KEEP_BYTES,
+                    crate::chat_history::COMMAND_CAPTURE_BYTES,
                     !status.success(),
                     "",
                 );
@@ -2695,8 +2695,8 @@ pub(crate) fn execute_tool(
 }
 
 /// Run `run_command`'s `input` and return its output as captured: up to
-/// `chat_history::COMMAND_KEEP_BYTES`, stdout and stderr in arrival order,
-/// with its exit and sandbox notes. Under `sandbox_roots` it runs under
+/// `chat_history::COMMAND_CAPTURE_BYTES`, stdout and stderr in arrival order,
+/// then its exit and sandbox notes (all within `COMMAND_KEEP_BYTES`). Under `sandbox_roots` it runs under
 /// seatbelt, fail-closed; `cancel` kills its process group.
 fn run_command_kept(
     workspace_path: &Path,
@@ -6122,6 +6122,37 @@ mod continuation_tests {
         let (first, _) = engine.recall_tool_output(&thread, &serde_json::json!({"message_id": id}), RECALL_MAX_LIMIT);
         assert!(first.starts_with(&format!("(chars 1-{RECALL_DEFAULT_LIMIT} of {})\nline 1\n", full.len())), "{}", &first[..80]);
         assert!(!first.contains("truncated"), "nothing of it was cut");
+    }
+
+    #[test]
+    fn output_over_the_keep_cap_recalls_its_end() {
+        use crate::chat_history::{command_excerpt, COMMAND_CAPTURE_BYTES, COMMAND_KEEP_BYTES};
+        // A real capture over 4 MB keeps its last line with room to spare.
+        let ws = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({"command": "head -c 4500000 /dev/zero | tr '\\0' x; echo; echo 'error: LAST LINE'; exit 3"});
+        let (out, ok) = run_command_kept(ws.path(), &input, None, None);
+        assert!(!ok && out.len() <= COMMAND_CAPTURE_BYTES + 100, "{}", out.len());
+        assert!(out.ends_with("error: LAST LINE\n"), "{:?}", &out[out.len().saturating_sub(80)..]);
+        // The shared shell's capture, its exit code and the isolated-shell
+        // prefix on top still fit, so the stored copy ends on the exit code.
+        let raw = format!("{}\nerror: LAST LINE", "y".repeat(4_500_000));
+        let captured = format_command_output(&command_excerpt(&raw, COMMAND_CAPTURE_BYTES, true, ""), 1);
+        let full = format!("(ran in an isolated shell at the workspace root — busy)\n{captured}");
+        assert!(full.len() <= COMMAND_KEEP_BYTES, "{}", full.len());
+        let (_tmp, db, engine, thread) = recall_fixture();
+        let (shown, kept) = cut_command_output("run_command", full.clone(), true);
+        let row = serde_json::json!({"callId": "c", "toolName": "run_command", "toolInput": {}, "result": shown}).to_string();
+        let id = {
+            let d = db.lock();
+            let id = d.insert_chat_message("ws", &thread, "tool", &row, None, None, None, None).unwrap();
+            d.set_chat_tool_original_within(id, &thread, &kept.expect("kept"), COMMAND_KEEP_BYTES).unwrap();
+            id
+        };
+        let recalled = recall_in_pages(&engine, &thread, id, RECALL_MAX_LIMIT);
+        assert_eq!(recalled, full);
+        assert!(recalled.ends_with("error: LAST LINE\n(exit code 1)"), "{:?}", &recalled[recalled.len() - 80..]);
+        let (first, _) = engine.recall_tool_output(&thread, &serde_json::json!({"message_id": id}), RECALL_MAX_LIMIT);
+        assert!(!first.contains("truncated"), "the stored copy wasn't cut again");
     }
 
     #[test]

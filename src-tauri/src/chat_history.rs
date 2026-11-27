@@ -209,6 +209,16 @@ fn excerpt_split(s: &str, budget: usize, head_tenths: usize, recall_hint: &str) 
 /// (4 MB): a longer output keeps its head and tail.
 pub const COMMAND_KEEP_BYTES: usize = 4_000_000;
 
+/// Room within [`COMMAND_KEEP_BYTES`] for what a capture adds after its
+/// cut: the gap marker, the exit code, and the not-found, read-only and
+/// isolated-shell notes. Each of them is a short line.
+pub const COMMAND_NOTE_ROOM: usize = 8_000;
+
+/// Most of one `run_command` output a capture keeps before its notes, so
+/// the stored copy, notes and all, fits in [`COMMAND_KEEP_BYTES`] and
+/// recall ends where the command's output ended.
+pub const COMMAND_CAPTURE_BYTES: usize = COMMAND_KEEP_BYTES - COMMAND_NOTE_ROOM;
+
 /// Most of one `run_command` output its tool row and the model's copy carry.
 pub const COMMAND_SHOWN_BYTES: usize = 50_000;
 

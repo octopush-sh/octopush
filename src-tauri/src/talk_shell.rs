@@ -36,7 +36,8 @@ pub(crate) const TALK_BASH: &str = "/bin/bash";
 
 /// Cap on a `$` command's captured output (bytes), so it can't bloat the DB
 /// row / chat render. The agent's capture keeps up to
-/// `chat_history::COMMAND_KEEP_BYTES`; the chat engine cuts the row's and the
+/// `chat_history::COMMAND_CAPTURE_BYTES`, leaving room for its notes within
+/// `COMMAND_KEEP_BYTES`; the chat engine cuts the row's and the
 /// model's copy and keeps the rest for recall.
 const MAX_OUTPUT_BYTES: usize = crate::chat_history::COMMAND_SHOWN_BYTES;
 
@@ -186,7 +187,7 @@ impl TalkShell {
         // Discard any stale bytes (the idle prompt left in the buffer) so the
         // next prompt marker we see is unambiguously THIS command's completion.
         drain_pending(&rx);
-        let keep = if promote { MAX_OUTPUT_BYTES } else { crate::chat_history::COMMAND_KEEP_BYTES };
+        let keep = if promote { MAX_OUTPUT_BYTES } else { crate::chat_history::COMMAND_CAPTURE_BYTES };
         if let Err(e) = client.write(&id, format!("{command}\n").as_bytes()) {
             handle.lock().rx = Some(rx);
             return Err(e);
@@ -888,7 +889,7 @@ mod tests {
         assert!(capped.starts_with("HEAD") && capped.ends_with("assertion failed: left == right"), "both ends survive");
         let tail = &capped[capped.find("omitted]").unwrap()..];
         assert!(tail.len() > MAX_OUTPUT_BYTES / 2, "a failure keeps more of the end");
-        assert_eq!(cap_output(out.clone(), crate::chat_history::COMMAND_KEEP_BYTES, true), out, "the agent's capture keeps it whole");
+        assert_eq!(cap_output(out.clone(), crate::chat_history::COMMAND_CAPTURE_BYTES, true), out, "the agent's capture keeps it whole");
     }
 
     #[test]
