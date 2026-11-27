@@ -10,7 +10,8 @@ use crate::error::{AppError, AppResult};
 /// The intent taxonomy. `build`/`fix` are code missions (worktree default);
 /// `review`/`probe`/`design`/`perf`/`ops` arrive with later movements but the
 /// enum is validated from day one so the data model never holds a stray value.
-pub const INTENTS: &[&str] = &["build", "fix", "review", "probe", "design", "perf", "ops"];
+/// `test` tests a ticket locally in a throwaway workspace and ships nothing.
+pub const INTENTS: &[&str] = &["build", "fix", "review", "probe", "design", "perf", "ops", "test"];
 /// The git-state isolation axis.
 pub const GIT_ISOLATIONS: &[&str] = &["worktree", "readonly", "ephemeral", "pr"];
 /// The execution isolation axis (`cloud` reserved until M5).
@@ -46,6 +47,37 @@ pub fn validate_exec(exec_isolation: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Whether a mission of `intent` delivers its work: it may push, open a pull
+/// request or publish.
+pub fn delivers(intent: &str) -> bool {
+    matches!(intent, "build" | "fix" | "design" | "ops")
+}
+
+/// Whether a mission ships nothing: its agents may write, build and run in
+/// its checkout, and Talk refuses what would change something elsewhere
+/// (`permissions::PolicyCtx::ships_nothing`). Derived from the two axes and
+/// never stored. A read-only mission is already Plan only, which is stricter.
+pub fn ships_nothing(intent: &str, git_isolation: &str) -> bool {
+    !delivers(intent) && git_isolation != "readonly"
+}
+
+/// Whether the active mission a read gave ships nothing. A read that failed
+/// counts as one that does: a posture never loosens on an error.
+pub fn read_ships_nothing(mission: &AppResult<Option<MissionRow>>) -> bool {
+    match mission {
+        Ok(m) => m.as_ref().is_some_and(|m| ships_nothing(&m.intent, &m.git_isolation)),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not read the workspace's mission; it ships nothing");
+            true
+        }
+    }
+}
+
+/// Whether the active mission of `workspace_id` ships nothing.
+pub fn workspace_ships_nothing(db: &Db, workspace_id: &str) -> bool {
+    read_ships_nothing(&db.active_mission_for_workspace(workspace_id))
+}
+
 fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResult<()> {
     if !INTENTS.contains(&intent) {
         return Err(AppError::Other(format!("unknown mission intent '{intent}'")));
@@ -55,6 +87,18 @@ fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResul
     }
     if !EXEC_ISOLATIONS.contains(&exec_isolation) {
         return Err(AppError::Other(format!("unknown exec isolation '{exec_isolation}'")));
+    }
+    // New missions only: a stored row keeps loading, and one that pairs a
+    // non-delivering intent with a writer checkout reads as ship-nothing.
+    if intent == "test" && git_isolation != "ephemeral" {
+        return Err(AppError::Other(format!(
+            "a '{intent}' mission runs in a throwaway workspace: its git isolation must be 'ephemeral' (got '{git_isolation}')"
+        )));
+    }
+    if !delivers(intent) && matches!(git_isolation, "worktree" | "pr") {
+        return Err(AppError::Other(format!(
+            "a '{intent}' mission ships nothing, so it can't own a '{git_isolation}' checkout: use 'readonly' or 'ephemeral'"
+        )));
     }
     Ok(())
 }

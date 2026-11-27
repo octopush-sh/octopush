@@ -10,7 +10,7 @@ import { ContextHeader } from "./components/ContextHeader";
 import { ModeBand } from "./components/ModeBand";
 import { Companion } from "./components/Companion";
 import { WorkspaceCustomizeMenu } from "./components/WorkspaceCustomizeMenu";
-import { MissionCreator } from "./components/MissionCreator";
+import { MissionCreator, type Intent as MissionIntent } from "./components/MissionCreator";
 import { WorkspaceContextMenu } from "./components/WorkspaceContextMenu";
 import { RenameDialog } from "./components/RenameDialog";
 import { StartsAfterDialog } from "./components/StartsAfterDialog";
@@ -538,8 +538,8 @@ function App() {
   // ── Backlog ticket → create workspace orchestration ──
   const [backlogTicketMenu, setBacklogTicketMenu] = useState<{ issue: Issue; x: number; y: number } | null>(null);
   const [existingWsAlert, setExistingWsAlert] = useState<{ ticketKey: string; summary: string; existingName: string } | null>(null);
-  const [projectPickerForTicket, setProjectPickerForTicket] = useState<{ ticketKey: string; summary: string; candidates: ProjectInfo[] } | null>(null);
-  const [creatorForTicket, setCreatorForTicket] = useState<{ projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string } | null>(null);
+  const [projectPickerForTicket, setProjectPickerForTicket] = useState<{ ticketKey: string; summary: string; candidates: ProjectInfo[]; initialIntent?: MissionIntent } | null>(null);
+  const [creatorForTicket, setCreatorForTicket] = useState<{ projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string; initialIntent?: MissionIntent } | null>(null);
 
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
@@ -2349,7 +2349,7 @@ function App() {
   );
 
   // ── Backlog ticket → create workspace orchestration ──
-  async function continueCreateForTicket(ticketKey: string, summary: string) {
+  async function continueCreateForTicket(ticketKey: string, summary: string, initialIntent?: MissionIntent) {
     const prefix = ticketKey.split("-")[0];
     const candidates = recentProjects.filter((p) => p.jiraProjectKey === prefix);
     if (candidates.length === 0) {
@@ -2366,10 +2366,19 @@ function App() {
         projectPath: candidates[0].path,
         initialTask: summary,
         linkIssueKeyOnCreate: ticketKey,
+        initialIntent,
       });
       return;
     }
-    setProjectPickerForTicket({ ticketKey, summary, candidates });
+    setProjectPickerForTicket({ ticketKey, summary, candidates, initialIntent });
+  }
+
+  // "Test this ticket": the wizard on Test a ticket, the ticket linked. A
+  // workspace the ticket already has is what gets tested, so there is no
+  // existing-workspace alert.
+  async function startTestForTicket(issue: Issue) {
+    setBacklogTicketMenu(null);
+    await continueCreateForTicket(issue.key, issue.summary, "test");
   }
 
   async function startCreateForTicket(issue: Issue) {
@@ -3579,6 +3588,7 @@ function App() {
           x={backlogTicketMenu.x}
           y={backlogTicketMenu.y}
           onCreateWorkspace={() => void startCreateForTicket(backlogTicketMenu.issue)}
+          onTestTicket={() => void startTestForTicket(backlogTicketMenu.issue)}
           onClose={() => setBacklogTicketMenu(null)}
         />
         </ErrorBoundary>
@@ -3615,6 +3625,7 @@ function App() {
               projectPath: picked.path,
               initialTask: projectPickerForTicket.summary,
               linkIssueKeyOnCreate: projectPickerForTicket.ticketKey,
+              initialIntent: projectPickerForTicket.initialIntent,
             });
           }}
           onClose={() => setProjectPickerForTicket(null)}
@@ -3633,12 +3644,13 @@ function App() {
              *  reads at mount, so without this prop a back-to-back flow on
              *  two tickets would keep the first ticket's pre-fill. */}
             <MissionCreator
-              key={creatorForTicket.linkIssueKeyOnCreate}
+              key={`${creatorForTicket.linkIssueKeyOnCreate}:${creatorForTicket.initialIntent ?? ""}`}
               projectId={targetProject.id}
               projectPath={targetProject.path}
               projectJiraKey={targetProject.jiraProjectKey}
               initialTask={creatorForTicket.initialTask}
               linkIssueKeyOnCreate={creatorForTicket.linkIssueKeyOnCreate}
+              initialIntent={creatorForTicket.initialIntent}
               onCreated={() => setCreatorForTicket(null)}
               onCancel={() => setCreatorForTicket(null)}
             />

@@ -237,8 +237,8 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "projectId": { "type": "string" },
                     "title": { "type": "string" },
-                    "intent": { "type": ["string", "null"], "description": "build | fix | review | probe | design | perf | ops. Default 'build'." },
-                    "gitIsolation": { "type": ["string", "null"], "description": "worktree (default) | readonly | ephemeral | pr." },
+                    "intent": { "type": ["string", "null"], "description": "build | fix | review | probe | design | perf | ops | test. Default 'build'." },
+                    "gitIsolation": { "type": ["string", "null"], "description": "worktree | readonly | ephemeral | pr. Default by intent: readonly for review, probe and perf; ephemeral for test (the only one it takes); worktree otherwise. Only build, fix, design and ops take worktree or pr." },
                     "workspaceId": { "type": ["string", "null"], "description": "Optional workspace this mission owns (code missions). Omit for design/probe." },
                     "linkedIssueKey": { "type": ["string", "null"], "description": "Optional issue-tracker key." }
                 },
@@ -835,7 +835,7 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
     if intent != "build" && intent != "fix" {
         return Err(format!(
             "create_workspace only pairs a code mission — intent must be 'build' or 'fix' \
-             (got '{intent}'); use create_mission for review/probe/design/perf/ops"
+             (got '{intent}'); use create_mission for review/probe/design/perf/ops/test"
         ));
     }
 
@@ -903,6 +903,16 @@ fn get_mission(db: &Db, args: &Value) -> Result<Value, String> {
     Ok(json!({ "mission": m }))
 }
 
+/// The git isolation a mission gets when the caller names none: what its
+/// intent may take, so a caller from before the pairing rules still works.
+fn default_git_isolation(intent: &str) -> &'static str {
+    match intent {
+        "review" | "probe" | "perf" => "readonly",
+        "test" => "ephemeral",
+        _ => "worktree",
+    }
+}
+
 fn create_mission(db: &Db, args: &Value) -> Result<Value, String> {
     let project_id = req_str(args, "projectId")?;
     let title = req_str(args, "title")?;
@@ -913,7 +923,7 @@ fn create_mission(db: &Db, args: &Value) -> Result<Value, String> {
     let git_isolation = opt_str(args, "gitIsolation")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "worktree".to_string());
+        .unwrap_or_else(|| default_git_isolation(&intent).to_string());
     let workspace_id = opt_str(args, "workspaceId").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let linked_issue_key = opt_str(args, "linkedIssueKey").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     // A supplied workspace must exist AND belong to this project — MCP hands this
@@ -2097,5 +2107,33 @@ mod tests {
         )
         .expect_err("unknown workspace must be rejected");
         assert!(err2.contains("no workspace"), "err: {err2}");
+    }
+
+    /// An omitted `gitIsolation` defaults by intent, so a caller that named
+    /// only `review` keeps working; a pairing the intent can't take is a
+    /// legible error that names the intent (#1239).
+    #[test]
+    fn create_mission_defaults_git_isolation_by_intent() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        for (intent, expected) in [
+            ("review", "readonly"),
+            ("probe", "readonly"),
+            ("perf", "readonly"),
+            ("test", "ephemeral"),
+            ("build", "worktree"),
+            ("fix", "worktree"),
+            ("design", "worktree"),
+            ("ops", "worktree"),
+        ] {
+            let payload = create_mission(&db, &json!({ "projectId": "p1", "title": "t", "intent": intent }))
+                .unwrap_or_else(|e| panic!("{intent}: {e}"));
+            assert_eq!(payload["mission"]["gitIsolation"], expected, "{intent}");
+        }
+        for (intent, git) in [("review", "worktree"), ("test", "readonly"), ("probe", "pr")] {
+            let err = create_mission(&db, &json!({ "projectId": "p1", "title": "t", "intent": intent, "gitIsolation": git }))
+                .expect_err("a pairing the intent can't take is refused");
+            assert!(err.contains(&format!("'{intent}' mission")), "{err}");
+        }
     }
 }

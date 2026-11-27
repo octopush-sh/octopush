@@ -72,6 +72,7 @@ Current anchors:
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |
 | `header-sandbox` · `header-sandbox-confirm` | Workspace header, with a mission: the sandbox toggle (`Shield` while the sandbox is in effect, `ShieldOff` otherwise; disabled for a read-only mission) · the dialog that confirms turning it off | `HeaderSandbox.tsx` via `ContextHeader.tsx` |
+| `context-ships-nothing` | Workspace header, beside the sandbox Shield: the mute `PackageX` glyph of a mission that ships nothing (only then) | `ContextHeader.tsx` |
 | `pr-chip-checks` | Workspace header, PR chip: the CI checks glyph (only on an open/draft PR whose checks could be read; failing adds "Fix failing checks…" beside it) | `ContextHeader.tsx` |
 | `genesis-key-save` · `genesis-begin` · `genesis-sketch` | Genesis block (Welcome / New-project "From a prompt"): the inline API-key field (only with no key) · the one primary CTA ("Set a crew on it", or "Wake the crew" with a key and no brief) · "or think it through first" | `GenesisPrompt.tsx` |
 | `welcome-new-study` | Welcome: "Begin a new study" on the secondary line | `WelcomeScreen.tsx` |
@@ -141,6 +142,8 @@ Current anchors:
 | `run-switcher-waiting` | ⌘⌥K switcher (or Open beside), while open: the first row's "· waiting on permission" / "· waiting on your input" (only while a listed session waits) | `run/SessionSwitcher.tsx` |
 | `run-pair-input` · `run-pair-pick` | Pairing switcher (Open beside), while open: its query input · its first session row (only when a session is off screen) | `run/SessionSwitcher.tsx` |
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
+| `mission-intent-test` | New-mission wizard step 1: the sixth card, "Test a ticket" | `MissionCreator.tsx` |
+| `backlog-test-ticket` | Backlog ticket menu, while open: "Test this ticket" | `BacklogRowContextMenu.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
 | `mission-setup-conductor` | New-mission wizard step 3: "From .conductor/settings.toml · edit before it runs" (only while the field holds a Conductor repo's setup script exactly as read) | `MissionCreator.tsx` |
 | `mission-share` · `mission-share-install` · `mission-share-sandbox` | New-mission wizard step 3: the "Share with new missions" list (only when the main checkout has a dependency folder or env file to share) · its amber "This setup script runs…" line (only while a dependency folder is on and the setup script installs or cleans) · its amber "A sandboxed mission gets neither the links nor the env files" line (only while an entry is on and Execution is Local sandbox) | `MissionCreator.tsx` |

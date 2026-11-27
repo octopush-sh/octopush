@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Wrench } from "lucide-react";
+import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, PackageX, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { INTENT_ICON } from "../lib/missionIntent";
+import { INTENT_ICON, SHIPS_NOTHING_TITLE, shipsNothing } from "../lib/missionIntent";
 import { checksTitle } from "../lib/prChecks";
 import type { ChecksState, GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
@@ -228,6 +228,18 @@ export function ContextHeader({
           )}
 
           <HeaderSandbox missionId={missionId} execIsolation={missionExecIsolation} gitIsolation={missionGitIsolation} />
+
+          {shipsNothing(missionIntent, missionGitIsolation) && (
+            <span
+              data-tour="context-ships-nothing"
+              title={SHIPS_NOTHING_TITLE}
+              role="img"
+              aria-label="Ships nothing"
+              className="octo-pop-in flex flex-none items-center text-octo-mute"
+            >
+              <PackageX size={10} aria-hidden />
+            </span>
+          )}
 
           {activeIssue && (
             <>

@@ -9835,6 +9835,21 @@ mod orchestrator_tests {
         assert!(!orch.has_concurrent_run(&run_b).await.unwrap());
     }
 
+    /// A crew never starts in a mission that ships nothing (#1239): its
+    /// stages aren't held to the posture yet, so the run stays a draft.
+    #[tokio::test]
+    async fn launch_run_refuses_a_crew_in_a_mission_that_ships_nothing() {
+        let (db, ws) = db_with_workspace();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Arc::new(Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner)));
+        crate::mission::create(&db.lock(), "p1", "test", "Test ENG-42", "ephemeral", "none", Some(&ws), Some("ENG-42")).unwrap();
+        let pipeline_id = db.lock().list_pipelines().unwrap().first().unwrap().id.clone();
+        let run = db.lock().create_run(&ws, &pipeline_id, "task", None, None, &[]).unwrap();
+        let err = crate::orchestrator::launch::launch_run(&orch, &db, &run, None).await.expect_err("the crew is refused");
+        assert!(err.to_string().contains(crate::orchestrator::launch::CREW_SHIPS_NOTHING), "{err}");
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "draft", "nothing started");
+    }
+
     /// A runner that succeeds with a fixed per-stage cost (budget-gate fixtures).
     struct CostRunner {
         cost: f64,
@@ -16623,6 +16638,61 @@ mod mission_tests {
         assert!(crate::mission::validate_axes("build", "bogus").is_err());
         assert!(crate::mission::validate_axes("build", "worktree").is_ok());
         assert!(crate::mission::validate_axes("fix", "ephemeral").is_ok());
+    }
+
+    /// Every (intent, git-state) pair: whether it delivers, whether it ships
+    /// nothing, and whether a new mission may take it (#1239).
+    #[test]
+    fn intent_and_git_state_table() {
+        use crate::mission::{delivers, ships_nothing, validate_axes, GIT_ISOLATIONS, INTENTS};
+        // (intent, delivers, the git states a new mission may take)
+        let table: &[(&str, bool, &[&str])] = &[
+            ("build", true, &["worktree", "readonly", "ephemeral", "pr"]),
+            ("fix", true, &["worktree", "readonly", "ephemeral", "pr"]),
+            ("design", true, &["worktree", "readonly", "ephemeral", "pr"]),
+            ("ops", true, &["worktree", "readonly", "ephemeral", "pr"]),
+            ("review", false, &["readonly", "ephemeral"]),
+            ("probe", false, &["readonly", "ephemeral"]),
+            ("perf", false, &["readonly", "ephemeral"]),
+            ("test", false, &["ephemeral"]),
+        ];
+        assert_eq!(table.len(), INTENTS.len(), "every intent is in the table");
+        for (intent, delivering, allowed) in table {
+            assert_eq!(delivers(intent), *delivering, "{intent}");
+            for git in GIT_ISOLATIONS {
+                assert_eq!(ships_nothing(intent, git), !delivering && *git != "readonly", "{intent} + {git}");
+                let res = validate_axes(intent, git);
+                assert_eq!(res.is_ok(), allowed.contains(git), "{intent} + {git}: {res:?}");
+                if let Err(e) = res {
+                    assert!(e.to_string().contains(&format!("'{intent}' mission")), "the error names the intent: {e}");
+                }
+            }
+        }
+        // The pairing rule holds for the IPC `create_mission` path too.
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        assert!(crate::mission::create(&db, "p1", "review", "r", "worktree", "none", None, None).is_err());
+        assert!(crate::mission::create(&db, "p1", "test", "t", "readonly", "none", None, None).is_err());
+        let m = crate::mission::create(&db, "p1", "test", "t", "ephemeral", "none", None, None).unwrap();
+        assert_eq!((m.intent.as_str(), m.git_isolation.as_str()), ("test", "ephemeral"));
+    }
+
+    /// A stored row `octopush-mcp` could create before the pairing rule
+    /// (`review` + `worktree`) still loads, and now reads as ship-nothing:
+    /// the posture only narrows it.
+    #[test]
+    fn a_stored_review_worktree_row_ships_nothing() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        db.insert_mission("m-old", Some("w1"), "p1", "review", "Old review", "active", None, "worktree", "none", "{}").unwrap();
+        let m = db.active_mission_for_workspace("w1").unwrap().expect("it still loads");
+        assert_eq!(m.git_isolation, "worktree");
+        assert!(crate::mission::workspace_ships_nothing(&db, "w1"));
+        seed_project_ws(&db, "p2", "w2", "task");
+        crate::mission::create(&db, "p2", "build", "b", "worktree", "none", Some("w2"), None).unwrap();
+        assert!(!crate::mission::workspace_ships_nothing(&db, "w2"));
+        assert!(!crate::mission::workspace_ships_nothing(&db, "no-such-workspace"), "no mission ships as before");
+        assert!(crate::mission::read_ships_nothing(&Err(crate::error::AppError::Other("db locked".into()))), "a failed read ships nothing");
     }
 
     #[test]

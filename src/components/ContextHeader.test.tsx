@@ -107,6 +107,29 @@ describe("ContextHeader", () => {
     expect(screen.getByRole("button", { name: "Sandbox on" })).toHaveAttribute("aria-disabled", "true");
   });
 
+  it("shows the test intent and a mute ship-nothing glyph beside the sandbox (#1239)", () => {
+    const header = (intent: string, git: string) => (
+      <ContextHeader {...baseProps} workspaceName="X" branch="test/ENG-42" gitStatus={null} missionIntent={intent} missionId="m1" missionExecIsolation="none" missionGitIsolation={git} />
+    );
+    const { rerender } = render(header("test", "ephemeral"));
+    expect(screen.getByTitle("Mission intent")).toHaveTextContent("test");
+    const glyph = screen.getByRole("img", { name: "Ships nothing" });
+    expect(glyph).toHaveAttribute("data-tour", "context-ships-nothing");
+    expect(glyph).toHaveAttribute(
+      "title",
+      "Runs locally, ships nothing: pushes, pull requests and publishes an agent asks for are refused",
+    );
+    expect(glyph.className).toContain("text-octo-mute");
+    // A delivering mission ships, and a read-only one is Plan only instead.
+    rerender(header("build", "worktree"));
+    expect(screen.queryByRole("img", { name: "Ships nothing" })).toBeNull();
+    rerender(header("review", "readonly"));
+    expect(screen.queryByRole("img", { name: "Ships nothing" })).toBeNull();
+    // A stored review + worktree row reads as ship-nothing.
+    rerender(header("review", "worktree"));
+    expect(screen.getByRole("img", { name: "Ships nothing" })).toBeInTheDocument();
+  });
+
   it("shows no sandbox toggle without a mission", () => {
     render(<ContextHeader {...baseProps} workspaceName="X" branch="feat/x" gitStatus={null} missionExecIsolation="sandbox" />);
     expect(screen.queryByRole("button", { name: /^Sandbox/ })).not.toBeInTheDocument();

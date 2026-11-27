@@ -1,14 +1,19 @@
 import { useEffect, useRef } from "react";
-import { FilePlus2 } from "lucide-react";
+import { ClipboardCheck, FilePlus2 } from "lucide-react";
 
 interface Props {
   x: number;
   y: number;
   onCreateWorkspace: () => void;
+  /** Opens the new-mission wizard on "Test a ticket", with the ticket linked. */
+  onTestTicket: () => void;
   onClose: () => void;
 }
 
-export function BacklogRowContextMenu({ x, y, onCreateWorkspace, onClose }: Props) {
+const ITEM =
+  "flex w-full items-center gap-2 rounded-md px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";
+
+export function BacklogRowContextMenu({ x, y, onCreateWorkspace, onTestTicket, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   // Close on Escape
@@ -50,10 +55,24 @@ export function BacklogRowContextMenu({ x, y, onCreateWorkspace, onClose }: Prop
           onCreateWorkspace();
           onClose();
         }}
-        className="flex w-full items-center gap-2 rounded-md px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+        className={ITEM}
       >
         <FilePlus2 size={12} className="shrink-0" />
         Create workspace
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        data-tour="backlog-test-ticket"
+        title="Build and run this ticket in a throwaway workspace that ships nothing"
+        onClick={() => {
+          onTestTicket();
+          onClose();
+        }}
+        className={ITEM}
+      >
+        <ClipboardCheck size={12} className="shrink-0" />
+        Test this ticket
       </button>
     </div>
   );

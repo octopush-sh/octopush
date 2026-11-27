@@ -4550,11 +4550,11 @@ impl ChatEngine {
         // seatbelt-wrapped execute_tool (bypassing the shared shell) and
         // write_file is confined. A `readonly` mission (review/probe) is
         // read-only-by-construction → Some(vec![]) (temp-only, no workspace
-        // writes); a `sandbox` mission → Some(vec![workspace]). Resolved once/turn.
-        let sandbox_roots: Option<Vec<String>> = self
-            .db
-            .lock()
-            .active_mission_for_workspace(&request.workspace_id)
+        // writes); a `sandbox` mission → Some(vec![workspace]). Resolved once/turn,
+        // with whether the mission ships nothing (#1239).
+        let mission = self.db.lock().active_mission_for_workspace(&request.workspace_id);
+        let ships_nothing = crate::mission::read_ships_nothing(&mission);
+        let sandbox_roots: Option<Vec<String>> = mission
             .ok()
             .flatten()
             .and_then(|m| {
@@ -5140,6 +5140,7 @@ impl ChatEngine {
                         mcp_read_only: &mcp_read_only,
                         delegate_writes: crate::chat_agents::delegate_writes(definition),
                         forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                        ships_nothing,
                     };
                     let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
                     crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))

@@ -19,6 +19,9 @@ use crate::error::{AppError, AppResult};
 
 use super::Orchestrator;
 
+/// Why a crew doesn't start in a mission that ships nothing.
+pub const CREW_SHIPS_NOTHING: &str = "Crews don't run in a mission that ships nothing. Test it in Talk.";
+
 /// Apply every start-time guard, then drive `run_id` (detached for Pro, with
 /// an in-process fallback). `run_id` must already exist as a `draft`/paused
 /// run (the caller created it). Errors are the canonical ones the frontend
@@ -29,6 +32,14 @@ pub async fn launch_run(
     run_id: &str,
     budget_usd: Option<f64>,
 ) -> AppResult<()> {
+    // A crew's stages aren't held to the ship-nothing posture yet, so none
+    // runs in such a mission: nothing in it can push through a crew (#1239).
+    let workspace_id = db.lock().get_run(run_id)?.map(|r| r.workspace_id);
+    if let Some(ws) = workspace_id {
+        if crate::mission::workspace_ships_nothing(&db.lock(), &ws) {
+            return Err(AppError::Other(CREW_SHIPS_NOTHING.into()));
+        }
+    }
     if orch.has_concurrent_run(run_id).await? {
         return Err(AppError::Other(
             "another run in this workspace is already executing".into(),

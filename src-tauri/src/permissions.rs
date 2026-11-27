@@ -108,6 +108,40 @@ pub struct PolicyCtx<'a> {
     /// Plan only is forced by a read-only mission rather than chosen, so a
     /// refusal names the mission and offers no switch.
     pub forced: bool,
+    /// The workspace's mission ships nothing ([`crate::mission::ships_nothing`]):
+    /// in every mode, a command that changes something elsewhere
+    /// ([`remote_effect_local`]) and an MCP tool its server doesn't mark
+    /// read-only are refused.
+    pub ships_nothing: bool,
+}
+
+/// What a ship-nothing mission gives a command that changes something
+/// elsewhere, with what it would change.
+pub fn ship_nothing_command_refusal(what: &str) -> String {
+    format!(
+        "Not run: this mission runs everything locally and ships nothing, so no command that changes something \
+         elsewhere ({what}). Note it in your findings instead."
+    )
+}
+
+/// What a ship-nothing mission gives an MCP tool its server doesn't mark read-only.
+pub const SHIP_NOTHING_MCP: &str = "Not called: this mission ships nothing, and this MCP tool's server doesn't mark \
+     it read-only. Use a read-only tool, or note the step in your findings.";
+
+/// The refusal a ship-nothing mission gives `call` before any mode decides,
+/// or `None` when the mode decides it.
+fn ship_nothing_refusal(call: &ToolCall, ctx: &PolicyCtx) -> Option<String> {
+    if !ctx.ships_nothing {
+        return None;
+    }
+    match classify(call.name) {
+        Class::Exec => {
+            let command = call.input.get("command").and_then(Value::as_str).unwrap_or("");
+            remote_effect_local(command).map(ship_nothing_command_refusal)
+        }
+        Class::Net if !ctx.mcp_read_only.contains(call.name) => Some(SHIP_NOTHING_MCP.to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +213,14 @@ pub const ASK_UNAVAILABLE: &str = "Not done: this conversation is in Ask first m
 ///   type that writes.
 /// - **Ask first:** writes and commands ask.
 /// - **Edit freely:** everything runs, as before modes existed.
+///
+/// A mission that ships nothing refuses, in every mode, a command that
+/// changes something elsewhere and an MCP tool not marked read-only; what it
+/// lets through, the mode then decides.
 pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
+    if let Some(message) = ship_nothing_refusal(call, ctx) {
+        return Decision::Deny { message };
+    }
     let field = |key: &str| call.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     let refuse = |r: Refused| Decision::Deny { message: plan_refusal(r, ctx.forced) };
     match (mode, classify(call.name)) {
@@ -222,7 +263,21 @@ pub fn refusal(decision: Decision) -> Option<String> {
 /// package publishing and release tools, `docker push`,
 /// `kubectl`/`helm`/`terraform` changes); reading and fetching pass.
 pub fn remote_effect(command: &str) -> Option<&'static str> {
-    crate::chat_engine::each_command(command, remote_line).unwrap_or(Some("nests more commands than the check reads"))
+    remote_effect_in(command, false)
+}
+
+/// [`remote_effect`] for a mission that ships nothing, which runs what it
+/// tests on this Mac: the same walk, except that a `curl`, `wget` or httpie
+/// request whose every URL is on a loopback host ([`loopback_url`]) counts
+/// as local. A request with no URL it can read, or one that names a proxy,
+/// a resolve override or a socket, stays remote.
+pub fn remote_effect_local(command: &str) -> Option<&'static str> {
+    remote_effect_in(command, true)
+}
+
+fn remote_effect_in(command: &str, local: bool) -> Option<&'static str> {
+    crate::chat_engine::each_command(command, |line| remote_line(line, local))
+        .unwrap_or(Some("nests more commands than the check reads"))
 }
 
 /// Shell keywords and programs that run the command after them
@@ -234,8 +289,12 @@ const WRAPPERS: &[&str] = &[
 
 type RemoteRule = fn(&[&str]) -> Option<&'static str>;
 
-fn remote_line(line: &str) -> Option<&'static str> {
+fn remote_line(line: &str, local: bool) -> Option<&'static str> {
     let words = crate::chat_engine::command_words(line);
+    // A proxy named anywhere on the line (`HTTPS_PROXY=… curl`, `env
+    // ALL_PROXY=…`, `export http_proxy=…;`, `--proxy`) can send a loopback
+    // request elsewhere, so it keeps none local.
+    let local = local && !words.iter().any(|w| w.role != crate::chat_engine::WordRole::Data && names_proxy(&w.word));
     let mut segments: Vec<Vec<&str>> = Vec::new();
     let mut last = None;
     for w in &words {
@@ -253,26 +312,192 @@ fn remote_line(line: &str) -> Option<&'static str> {
             }
         }
     }
-    segments.iter().find_map(|seg| remote_command(seg))
+    segments.iter().find_map(|seg| remote_command(seg, local))
 }
 
 fn program(w: &str) -> String {
     w.rsplit('/').next().unwrap_or(w).to_ascii_lowercase()
 }
 
-/// `words` from the program on.
-fn remote_command(words: &[&str]) -> Option<&'static str> {
+/// `words` from the program on. With `local`, a request to loopback hosts
+/// only is no remote effect ([`remote_effect_local`]).
+fn remote_command(words: &[&str], local: bool) -> Option<&'static str> {
     let (first, rest) = words.split_first()?;
     let name = program(first);
     if name == "eval" {
-        return remote_effect(&rest.join(" "));
+        return remote_effect_in(&rest.join(" "), local);
     }
     if WRAPPERS.contains(&name.as_str()) {
         // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come first.
         let at = rest.iter().position(|&w| program(w) == "eval" || remote_rule(&program(w)).is_some())?;
-        return remote_command(&rest[at..]);
+        return remote_command(&rest[at..], local);
     }
-    remote_rule(&name)?(rest)
+    let what = remote_rule(&name)?(rest)?;
+    let loopback = match name.as_str() {
+        "curl" => curl_loopback(rest),
+        "wget" => wget_loopback(rest),
+        "http" | "https" | "xh" | "xhs" => httpie_loopback(rest),
+        _ => false,
+    };
+    (!(local && loopback)).then_some(what)
+}
+
+/// A word that names a proxy: a flag (`--proxy`, `--socks5`, `-e
+/// https_proxy=…` reads as its value) or a variable set before a command.
+fn names_proxy(word: &str) -> bool {
+    let w = word.to_ascii_lowercase();
+    let name = match w.split_once('=') {
+        Some((name, _)) if !name.contains('/') => name,
+        _ if w.starts_with('-') => w.as_str(),
+        _ => return false,
+    };
+    name.contains("proxy") || name.starts_with("--socks")
+}
+
+/// Whether `host` is this Mac: `localhost`, a `*.localhost` name,
+/// `127.0.0.0/8` written as four decimal parts, or `::1`. Nothing that only
+/// looks local (`localhost.example.com`, `127.0.0.1.example.com`).
+fn loopback_host(host: &str) -> bool {
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    if let Some(sub) = host.strip_suffix(".localhost") {
+        return !sub.is_empty() && sub.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    parts.len() == 4
+        && parts[0] == "127"
+        && parts.iter().all(|p| (1..=3).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n <= 255))
+}
+
+/// Whether `url` (an `http`/`https` URL, or one with no scheme) names a
+/// loopback host ([`loopback_host`]). Userinfo (`a@b`), escapes and a port
+/// that isn't digits read as not loopback: they could name another host.
+fn loopback_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    let rest = match lower.split_once("://") {
+        Some(("http" | "https", rest)) => rest,
+        Some(_) => return false,
+        None => lower.as_str(),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains(['@', '\\', '%']) {
+        return false;
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, "")) => (h, None),
+            Some((h, p)) => match p.strip_prefix(':') {
+                Some(p) => (h, Some(p)),
+                None => return false,
+            },
+            None => return false,
+        },
+        None => match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        },
+    };
+    port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) && loopback_host(host)
+}
+
+/// The URLs of a request: every word that isn't a flag or a flag's value,
+/// plus what `url_flags` name. `None` when a flag can redirect the request
+/// (`force`), so nothing counts as loopback. `short_valued` are the short
+/// flags that take a value, in a cluster (`-sSd x`, `-XPOST`) too.
+fn request_urls<'a>(
+    args: &[&'a str],
+    long_valued: &[&str],
+    short_valued: &str,
+    url_flags: &[&str],
+    force: &[&str],
+    short_force: &str,
+) -> Option<Vec<&'a str>> {
+    let mut urls = Vec::new();
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((n, v)) => (format!("--{n}"), Some(v)),
+                None => (format!("--{long}"), None),
+            };
+            // Its abbreviations too (`--resol`, `--conf`), which getopt reads
+            // as the whole flag.
+            if force.iter().any(|f| f.starts_with(name.as_str())) {
+                return None;
+            }
+            let takes = url_flags.contains(&name.as_str()) || long_valued.contains(&name.as_str());
+            let value = if takes { attached.or_else(|| it.next().copied()) } else { None };
+            if url_flags.contains(&name.as_str()) {
+                urls.push(value?);
+            }
+        } else if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            for (j, c) in cluster.char_indices() {
+                if short_force.contains(c) {
+                    return None;
+                }
+                if short_valued.contains(c) {
+                    if cluster[j + c.len_utf8()..].is_empty() {
+                        it.next();
+                    }
+                    break;
+                }
+            }
+        } else {
+            urls.push(a);
+        }
+    }
+    Some(urls)
+}
+
+/// Every URL of a `curl` request is on a loopback host.
+fn curl_loopback(args: &[&str]) -> bool {
+    const VALUED: &[&str] = &[
+        "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode", "--json", "--form", "--form-string",
+        "--header", "--request", "--output", "--output-dir", "--user", "--user-agent", "--referer", "--cookie", "--cookie-jar",
+        "--max-time", "--connect-timeout", "--retry", "--retry-delay", "--retry-max-time", "--write-out", "--upload-file",
+        "--cacert", "--capath", "--cert", "--cert-type", "--key", "--key-type", "--dump-header", "--range", "--continue-at",
+        "--limit-rate", "--max-filesize", "--oauth2-bearer", "--trace", "--trace-ascii", "--stderr", "--interface",
+        "--local-port", "--variable", "--url-query", "--quote", "--telnet-option", "--ftp-port", "--speed-limit",
+        "--speed-time", "--time-cond", "--expect100-timeout", "--keepalive-time", "--netrc-file", "--create-file-mode",
+    ];
+    const FORCE: &[&str] = &[
+        "--config", "--resolve", "--connect-to", "--unix-socket", "--abstract-unix-socket", "--doh-url", "--proxy",
+        "--preproxy", "--noproxy", "--socks4", "--socks4a", "--socks5", "--socks5-hostname",
+    ];
+    request_urls(args, VALUED, "dHouAebcmwxrEDCYyzUQtPXFTK", &["--url"], FORCE, "xK")
+        .is_some_and(|urls| !urls.is_empty() && urls.iter().all(|u| loopback_url(u)))
+}
+
+/// Every URL of a `wget` request is on a loopback host. A URL list read
+/// from a file (`-i`), a base (`-B`) or a setting (`-e`) can't be read.
+fn wget_loopback(args: &[&str]) -> bool {
+    const VALUED: &[&str] = &[
+        "--output-document", "--output-file", "--append-output", "--directory-prefix", "--user-agent", "--tries",
+        "--timeout", "--wait", "--waitretry", "--quota", "--level", "--header", "--post-data", "--post-file", "--body-data",
+        "--body-file", "--method", "--user", "--password", "--http-user", "--http-password", "--load-cookies",
+        "--save-cookies", "--referer", "--ca-certificate", "--certificate", "--private-key", "--limit-rate", "--domains",
+        "--reject", "--accept", "--dns-timeout", "--connect-timeout", "--read-timeout",
+    ];
+    const FORCE: &[&str] = &["--input-file", "--base", "--execute", "--config", "--bind-address", "--proxy"];
+    request_urls(args, VALUED, "OoaPUtTwQlDRAXI", &[], FORCE, "iBeY")
+        .is_some_and(|urls| !urls.is_empty() && urls.iter().all(|u| loopback_url(u)))
+}
+
+/// An httpie request's URL is on a loopback host. httpie reads `:3000/x`
+/// as `localhost:3000/x`.
+fn httpie_loopback(args: &[&str]) -> bool {
+    const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    let ops = operands(args, HTTPIE_VALUED);
+    let url = match ops.split_first() {
+        Some((m, rest)) if METHODS.iter().any(|x| m.eq_ignore_ascii_case(x)) => rest.first(),
+        Some((u, _)) => Some(u),
+        None => None,
+    };
+    url.is_some_and(|u| match u.strip_prefix(':') {
+        Some(rest) => loopback_url(&format!("localhost:{rest}")),
+        None => loopback_url(u),
+    })
 }
 
 fn remote_rule(program: &str) -> Option<RemoteRule> {
@@ -413,12 +638,18 @@ fn wget_remote(args: &[&str]) -> Option<&'static str> {
     })
 }
 
+/// httpie's flags that take a value.
+const HTTPIE_VALUED: &[&str] = &[
+    "-a", "--auth", "-A", "--auth-type", "--session", "--session-read-only", "-o", "--output", "-p", "--print", "--proxy",
+    "--timeout", "--verify", "--cert", "--cert-key", "--pretty", "-s", "--style",
+];
+
 /// httpie (`http [METHOD] URL [ITEM…]`): the method it names, else POST
 /// when an item carries data (`a=b`, `a:=1`, `a@file`; `a==b` is a query,
 /// `A:b` a header).
 fn httpie_remote(args: &[&str]) -> Option<&'static str> {
     const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
-    let ops = operands(args, &["-a", "--auth", "-A", "--auth-type", "--session", "--session-read-only", "-o", "--output", "-p", "--print", "--proxy", "--timeout", "--verify", "--cert", "--cert-key", "--pretty", "-s", "--style"]);
+    let ops = operands(args, HTTPIE_VALUED);
     let (method, items) = match ops.split_first() {
         Some((m, rest)) if METHODS.iter().any(|x| m.eq_ignore_ascii_case(x)) => (Some(*m), rest.get(1..).unwrap_or(&[])),
         Some((_, rest)) => (None, rest),
@@ -541,6 +772,8 @@ pub struct ModeGate {
     exec_roots: Option<Vec<String>>,
     /// A read-only mission forces Plan only ([`PolicyCtx::forced`]).
     forced: bool,
+    /// The mission ships nothing ([`PolicyCtx::ships_nothing`]).
+    ships_nothing: bool,
     mcp_read_only: HashSet<String>,
     inner: Option<Box<dyn ToolGate>>,
 }
@@ -550,10 +783,11 @@ impl ModeGate {
         mode: ModeSource,
         exec_roots: Option<Vec<String>>,
         forced: bool,
+        ships_nothing: bool,
         mcp_read_only: HashSet<String>,
         inner: Option<Box<dyn ToolGate>>,
     ) -> Self {
-        Self { mode, exec_roots, forced, mcp_read_only, inner }
+        Self { mode, exec_roots, forced, ships_nothing, mcp_read_only, inner }
     }
 }
 
@@ -565,6 +799,7 @@ impl ToolGate for ModeGate {
             mcp_read_only: &self.mcp_read_only,
             delegate_writes: true,
             forced: self.forced,
+            ships_nothing: self.ships_nothing,
         };
         if let Some(refused) = refusal(decide((self.mode)(), &ToolCall { name, input }, &ctx)) {
             return Some(refused);
@@ -582,7 +817,7 @@ mod tests {
     use serde_json::json;
 
     fn ctx<'a>(roots: Option<&'a [String]>, ro: &'a HashSet<String>, delegate_writes: bool) -> PolicyCtx<'a> {
-        PolicyCtx { exec_roots: roots, mcp_read_only: ro, delegate_writes, forced: false }
+        PolicyCtx { exec_roots: roots, mcp_read_only: ro, delegate_writes, forced: false, ships_nothing: false }
     }
 
     fn deny(r: Refused) -> Decision {
@@ -658,7 +893,7 @@ mod tests {
         let ro = HashSet::new();
         let input = json!({ "path": "a.rs" });
         let sandboxed: &[String] = &[];
-        let forced = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &ro, delegate_writes: false, forced: true };
+        let forced = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &ro, delegate_writes: false, forced: true, ships_nothing: false };
         assert_eq!(
             decide(Mode::Plan, &ToolCall { name: "write_file", input: &input }, &forced),
             Decision::Deny { message: plan_refusal(Refused::Write, true) }
@@ -797,6 +1032,156 @@ mod tests {
             assert_eq!(remote_effect(command), None, "{command}");
         }
         assert!(remote_effect(&"$(".repeat(6)).is_some(), "past the nesting it reads, it refuses");
+    }
+
+    const CURL_SENDS: &str = "curl that sends data, uses a method other than GET, or reads a config file";
+
+    /// A mission that ships nothing (#1239): local work runs as the mode
+    /// allows, and what would change something elsewhere is refused in every
+    /// mode, with text that names the mission. Plan only keeps its own rules.
+    #[test]
+    fn a_mission_that_ships_nothing_runs_locally() {
+        let ro: HashSet<String> = ["mcp__docs__search".to_string()].into();
+        let sandboxed: &[String] = &[];
+        let decide_in = |mode: Mode, ships_nothing: bool, name: &str, input: &Value| {
+            let roots = (mode == Mode::Plan).then_some(sandboxed);
+            let ctx = PolicyCtx { exec_roots: roots, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing };
+            decide(mode, &ToolCall { name, input }, &ctx)
+        };
+        let cmd = |c: &str| json!({ "command": c });
+        let file = json!({ "path": "src/a.rs", "content": "x", "old_string": "a", "new_string": "b" });
+        for c in ["npm ci", "npm test", "npm run build", "git commit -m x", "docker compose up -d", "curl -X POST http://localhost:3000/api/x"] {
+            assert_eq!(decide_in(Mode::Edit, true, "run_command", &cmd(c)), Decision::Allow, "{c}");
+        }
+        for tool in ["write_file", "edit_file", "read_file", "mcp__docs__search", "Agent"] {
+            assert_eq!(decide_in(Mode::Edit, true, tool, &file), Decision::Allow, "{tool}");
+        }
+        let refused = [
+            ("git push", "git push origin main"),
+            ("git push", "bash -c 'git push'"),
+            ("git push", "sudo git push"),
+            ("git push", "env GIT_TRACE=1 git push --tags"),
+            ("a gh command that changes GitHub", "gh pr create --title x --body y"),
+            ("publishes a package or a release", "npm publish"),
+            ("docker push", "docker push registry.example.com/app:1"),
+            ("changes a cluster or infrastructure (kubectl, helm, terraform)", "kubectl apply -f deploy.yaml"),
+            (CURL_SENDS, "curl -X POST https://api.example.com"),
+        ];
+        for mode in [Mode::Edit, Mode::Ask, Mode::Plan] {
+            for (what, c) in refused {
+                let want = Decision::Deny { message: ship_nothing_command_refusal(what) };
+                assert_eq!(decide_in(mode, true, "run_command", &cmd(c)), want, "{c} in {mode:?}");
+            }
+            let mcp = Decision::Deny { message: SHIP_NOTHING_MCP.to_string() };
+            assert_eq!(decide_in(mode, true, "mcp__jira__create_issue", &json!({})), mcp, "{mode:?}");
+            assert_eq!(decide_in(mode, true, "mcp__docs__search", &json!({})), Decision::Allow, "{mode:?}");
+        }
+        // Plan only's own rules still apply on top, a POST to localhost included.
+        assert_eq!(decide_in(Mode::Plan, true, "write_file", &file), deny(Refused::Write));
+        assert_eq!(
+            decide_in(Mode::Plan, true, "run_command", &cmd("curl -X POST http://localhost:3000/api/x")),
+            deny(Refused::Remote(CURL_SENDS))
+        );
+        assert_eq!(decide_in(Mode::Plan, true, "run_command", &cmd("npm test")), Decision::Allow);
+        // Without the posture, Edit freely runs a push as it always has.
+        assert_eq!(decide_in(Mode::Edit, false, "run_command", &cmd("git push")), Decision::Allow);
+        // The refusals name the mission and offer no switch.
+        for text in [ship_nothing_command_refusal("git push"), SHIP_NOTHING_MCP.to_string()] {
+            assert!(text.contains("this mission") && text.contains("ships nothing"), "{text}");
+            assert!(!text.contains("Edit freely") && !text.contains("switch"), "{text}");
+        }
+    }
+
+    /// In a ship-nothing mission a request to this Mac is local; anything
+    /// that only looks local, mixes in another host or could be sent
+    /// elsewhere stays remote. Plan only still refuses every one.
+    #[test]
+    fn loopback_requests_are_local() {
+        let local = [
+            "curl -X POST http://localhost:3000/api/x",
+            "curl -X POST http://127.0.0.1:8080/x -d '{}'",
+            "curl -sS -X PUT 'http://[::1]:3000/items/1' --json '{}'",
+            "curl -X POST http://api.localhost/x",
+            "curl -XPOST HTTP://LOCALHOST:3000/x",
+            "curl -d a=1 localhost:3000/form",
+            "curl -X DELETE http://127.0.0.1/a http://localhost/b",
+            "curl -H 'Host: api.example.com' -X POST http://127.0.0.2:3000",
+            "curl --url http://localhost:3000 -X POST",
+            "wget --post-data=a=1 http://localhost:3000/x",
+            "http POST :3000/items name=x",
+            "http POST localhost:3000/items name=x",
+            "https PUT 127.0.0.1:8443/x a=b",
+            "sudo curl -X POST http://localhost/x",
+        ];
+        for c in local {
+            assert_eq!(remote_effect_local(c), None, "{c}");
+            assert!(remote_effect(c).is_some(), "Plan only still refuses {c}");
+        }
+        let remote = [
+            "curl -X POST https://api.example.com",
+            "curl -X POST http://localhost.example.com/x",
+            "curl -X POST http://127.0.0.1.example.com/x",
+            "curl -X POST http://localhost:3000/x https://api.example.com/y",
+            "curl -X POST http://localhost@api.example.com/x",
+            "curl -X POST http://localhost%2eexample.com/x",
+            "curl -X POST http://127.1/x",
+            "curl -X POST http://0x7f.0.0.1/x",
+            "curl -X POST 'http://[::2]/x'",
+            "curl -X POST http://.localhost/x",
+            "curl -X POST http://localhost:$PORT/x",
+            "curl -X POST $URL",
+            "curl -X POST",
+            "curl -X POST ftp://localhost/x",
+            "curl -x http://proxy.example.com:8080 -X POST http://localhost:3000/x",
+            "curl --prox http://proxy.example.com -X POST http://localhost:3000/x",
+            "HTTPS_PROXY=http://proxy.example.com curl -X POST http://localhost:3000/x",
+            "env ALL_PROXY=socks5://proxy.example.com curl -X POST http://localhost:3000/x",
+            "export http_proxy=http://proxy.example.com; curl -X POST http://localhost:3000/x",
+            "curl --resolve localhost:80:203.0.113.5 -X POST http://localhost/x",
+            "curl --connect-to localhost:80:api.example.com:80 -X POST http://localhost/x",
+            "curl --unix-socket /var/run/docker.sock -X POST http://localhost/images/x/push",
+            "wget --post-data=a=1 -i urls.txt",
+            "wget --post-data=a=1 -e use_proxy=on http://localhost/x",
+            "http POST api.example.com/items name=x",
+            "http POST localhost.example.com/items name=x",
+        ];
+        for c in remote {
+            assert!(remote_effect_local(c).is_some(), "{c}");
+        }
+        // Only requests are read for loopback: a push stays a push.
+        assert_eq!(remote_effect_local("git push http://localhost/repo.git"), Some("git push"));
+        assert_eq!(remote_effect_local("bash -c 'curl -X POST https://api.example.com'"), Some(CURL_SENDS));
+    }
+
+    /// A sub-agent's gate in a ship-nothing mission refuses a push and runs
+    /// the tests, in Edit freely.
+    #[tokio::test]
+    async fn the_mode_gate_keeps_a_mission_shipping_nothing() {
+        let gate = ModeGate::new(Arc::new(|| Mode::Edit), None, false, true, HashSet::new(), None);
+        let push = gate.check("run_command", &json!({ "command": "git push origin HEAD" })).await;
+        assert_eq!(push, Some(ship_nothing_command_refusal("git push")));
+        assert_eq!(gate.check("run_command", &json!({ "command": "npm test" })).await, None);
+        assert_eq!(gate.check("mcp__jira__add_comment", &json!({})).await, Some(SHIP_NOTHING_MCP.to_string()));
+        let shipping = ModeGate::new(Arc::new(|| Mode::Edit), None, false, false, HashSet::new(), None);
+        assert_eq!(shipping.check("run_command", &json!({ "command": "git push origin HEAD" })).await, None);
+    }
+
+    /// The director decides each round's calls with the turn's mission
+    /// posture, and a sub-agent's gate reads it from the workspace's mission.
+    /// An `AppHandle` can't be built in a test, so this reads the sources.
+    #[test]
+    fn the_hosts_read_the_missions_posture() {
+        let engine = include_str!("chat_engine.rs");
+        assert!(engine.contains("let ships_nothing = crate::mission::read_ships_nothing(&mission);"), "the turn reads the posture");
+        let from = engine.find("let mode_denials: HashMap<String, String>").expect("the round's mode decisions");
+        let to = from + engine[from..].find("crate::permissions::decide(mode, &call, &ctx)").expect("the decision");
+        let ctx = &engine[from..to];
+        assert!(ctx.contains("PolicyCtx {") && ctx.contains("ships_nothing,"), "the PolicyCtx in mode_denials reads the mission: {ctx}");
+        let agents = include_str!("chat_agents.rs");
+        let at = agents.find("pub fn mode_gate(").expect("the sub-agent gate");
+        let gate = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
+        assert!(gate.contains("crate::mission::workspace_ships_nothing(&db.lock(), &spec.workspace_id)"), "{gate}");
+        assert!(gate.contains("        ships_nothing,\n"), "{gate}");
     }
 
     #[test]
