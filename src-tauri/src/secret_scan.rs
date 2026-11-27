@@ -691,12 +691,15 @@ pub fn is_sensitive_name(path: &str) -> bool {
     is_env_file(path) || sensitive_file(path).is_some()
 }
 
-/// A project MCP config: Claude Code's `.mcp.json` or `.claude/mcp.json`,
-/// Cursor's `.cursor/mcp.json`, VS Code's `.vscode/mcp.json`.
+/// The project MCP configs: Claude Code's `.mcp.json` and
+/// `.claude/mcp.json`, Cursor's `.cursor/mcp.json`, VS Code's
+/// `.vscode/mcp.json`. Talk's guard reads the same list as places that run
+/// code (`talk_guard`, #1229).
+pub(crate) const MCP_CONFIG_FILES: &[&str] = &[".mcp.json", ".claude/mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"];
+
+/// Whether `path` is a project MCP config ([`MCP_CONFIG_FILES`]).
 fn is_mcp_config(path: &str) -> bool {
-    [".mcp.json", ".claude/mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"]
-        .iter()
-        .any(|f| path == *f || path.ends_with(&format!("/{f}")))
+    MCP_CONFIG_FILES.iter().any(|f| path == *f || path.ends_with(&format!("/{f}")))
 }
 
 /// The zip local-file signature: a Keynote document (`.key`) starts with it.

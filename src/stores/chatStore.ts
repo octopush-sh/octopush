@@ -180,9 +180,13 @@ export interface PendingApproval {
   kind?: ApprovalKind;
   /** The path is a well-known credentials location: the safe answer leads. */
   sensitive?: boolean;
-  /** A command's read outside the workspace (#1201): the folder "Allow
-   *  reading … for this conversation" remembers. */
+  /** The folder "Allow reading/writing … for this conversation" keeps
+   *  (#1201, #1229). */
   rememberDir?: string;
+  /** The card offers "Allow this command for this conversation" (#1229). */
+  rememberCommand?: boolean;
+  /** Plan only withheld the conversation grant it would offer (#1229). */
+  planOnly?: boolean;
   /** An MCP card in Edit freely (#1243): the server and tool its "Always
    *  allow this tool" and "Trust <server>" answers trust app-wide. */
   trustServer?: string;
@@ -192,21 +196,15 @@ export interface PendingApproval {
 export type ApprovalKind = "mcp" | "read" | "write" | "run";
 
 /** The card fields a request carries beyond its command and reason. */
-function approvalMarks(c: {
-  secret?: boolean;
-  coversUncommitted?: boolean;
-  kind?: ApprovalKind;
-  sensitive?: boolean;
-  rememberDir?: string;
-  trustServer?: string;
-  trustTool?: string;
-}) {
+function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command" | "reason">) {
   return {
     ...(c.trustServer && c.trustTool ? { trustServer: c.trustServer, trustTool: c.trustTool } : {}),
     ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
     ...(c.kind ? { kind: c.kind } : {}),
     ...(c.sensitive ? { sensitive: true } : {}),
     ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
+    ...(c.rememberCommand ? { rememberCommand: true } : {}),
+    ...(c.planOnly ? { planOnly: true } : {}),
   };
 }
 
@@ -1220,6 +1218,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     kind?: ApprovalKind;
     sensitive?: boolean;
     rememberDir?: string;
+    rememberCommand?: boolean;
+    planOnly?: boolean;
     trustServer?: string;
     trustTool?: string;
   }>("chat://approval-request", (ev) => {

@@ -375,7 +375,7 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         reason: crate::talk_guard::sub_agent(label, reason),
         denial: denial.to_string(),
         sensitive: false,
-        remember: None,
+        grant: None,
         trust: None,
         diff,
     };
@@ -385,7 +385,7 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
     let path = field("path");
     let marked = crate::secret_scan::is_env_file(&path) || crate::secret_scan::is_sensitive_name(&path);
     let (reason, diff) = match name {
-        "write_file" | "edit_file" if marked || reach.outside_card(None, name, input, false).is_some() => {
+        "write_file" | "edit_file" if marked || reach.outside_card(None, name, input, false, &[]).is_some() => {
             ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None)
         }
         "write_file" | "edit_file" => change_preview(reach.workspace(), name, input, &path),
@@ -1974,6 +1974,10 @@ impl ToolGate for ModeGate {
             None => None,
         }
     }
+
+    fn write_check(&self, name: &str, input: &Value) -> Option<crate::talk_guard::WriteCheck> {
+        self.inner.as_ref().and_then(|g| g.write_check(name, input))
+    }
 }
 
 #[cfg(test)]
@@ -2143,10 +2147,10 @@ mod tests {
         let write = json!({ "path": "a.rs", "content": "new\n" });
         let check = || Some(ask_card(None, "write_file", &write, &reach));
         let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
-        assert_eq!(guard_card(check().unwrap(), &check, deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
         let command = json!({ "command": "npm test" });
         let run = || Some(ask_card(None, "run_command", &command, &reach));
-        assert_eq!(guard_card(run().unwrap(), &run, deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
+        assert_eq!(guard_card(run().unwrap(), || std::future::ready(run()), deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
         assert_eq!(std::fs::read_to_string(ws.path().join("a.rs")).unwrap(), "old\n");
 
         // A sub-agent's gate asks through its approval gate before the guards.
@@ -2198,7 +2202,7 @@ mod tests {
             }
             std::future::ready(ApprovalDecision::Approve)
         };
-        assert_eq!(guard_card(check().unwrap(), &check, approve).await, None, "approved again, it runs");
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), approve).await, None, "approved again, it runs");
         let shown = shown.into_inner();
         assert_eq!(shown, ["@@ -1,1 +1,1 @@\n-old\n+new", "@@ -1,1 +1,1 @@\n-changed meanwhile\n+new"]);
     }
@@ -3118,7 +3122,8 @@ mod tests {
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
             "match crate::permissions::decide(mode, &call, &ctx) {",
             "if mode_asks.contains(&u.id) && skill_refusal.is_none() {",
-            "let check = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
+            "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
+            "if !reach.checked(&granted).await {",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
@@ -3126,7 +3131,7 @@ mod tests {
             "self.talk_shell.available() && exec_roots.is_none()",
             "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
             "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
-            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await",
             "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),\n                    ships_nothing,\n",
         ] {
