@@ -2778,8 +2778,10 @@ fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String
 /// must still resolve inside it, so a folder swapped for a link after the
 /// check can't lead the write out. Then every folder on the way and the
 /// file are opened without following a link (`openat`, `O_NOFOLLOW`), so a
-/// swap after that resolve fails instead of redirecting the write.
-fn write_unfollowed(workspace: &Path, full: &Path, content: &str) -> std::io::Result<()> {
+/// swap after that resolve fails instead of redirecting the write. With a
+/// `check` (Talk's), the full check runs again on the path the walk opens,
+/// inside the workspace or out, and a change refuses the write.
+fn write_unfollowed(workspace: &Path, full: &Path, content: &str, check: Option<&crate::talk_guard::WriteCheck>) -> std::io::Result<()> {
     use std::io::Write;
     let refuse = |why: &str| std::io::Error::other(why.to_string());
     let root = std::fs::canonicalize(workspace)?;
@@ -2797,6 +2799,9 @@ fn write_unfollowed(workspace: &Path, full: &Path, content: &str) -> std::io::Re
     let inside_as_written = full.starts_with(workspace) && !full.components().any(|c| c == std::path::Component::ParentDir);
     if inside_as_written && !parent.starts_with(&root) {
         return Err(refuse("a folder on its path is a link that leads outside the workspace; write by the real path"));
+    }
+    if let Some(check) = check {
+        check.recheck(&parent.join(name)).map_err(|why| refuse(&why))?;
     }
     open_without_links(&parent, name)?.write_all(content.as_bytes())
 }
@@ -2871,9 +2876,10 @@ pub(crate) async fn run_builtin(
     input: &serde_json::Value,
     roots: Option<Vec<String>>,
     cancel: &std::sync::Arc<AtomicBool>,
+    check: Option<crate::talk_guard::WriteCheck>,
 ) -> (String, bool) {
     let (wp, name, input, flag) = (workspace.to_path_buf(), name.to_string(), input.clone(), std::sync::Arc::clone(cancel));
-    tokio::task::spawn_blocking(move || execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&flag)))
+    tokio::task::spawn_blocking(move || execute_tool_checked(&wp, &name, &input, roots.as_deref(), Some(&flag), check.as_ref()))
         .await
         .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
 }
@@ -3070,6 +3076,19 @@ pub(crate) fn execute_tool_cancellable(
     sandbox_roots: Option<&[String]>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> (String, bool) {
+    execute_tool_checked(workspace_path, name, input, sandbox_roots, cancel, None)
+}
+
+/// [`execute_tool_cancellable`] with what a Talk write was checked against
+/// (#1229): `write_file` and `edit_file` check it again where they land.
+pub(crate) fn execute_tool_checked(
+    workspace_path: &Path,
+    name: &str,
+    input: &serde_json::Value,
+    sandbox_roots: Option<&[String]>,
+    cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    check: Option<&crate::talk_guard::WriteCheck>,
+) -> (String, bool) {
     match name {
         // Sub-agents and stages read the head and tail; Talk keeps the
         // whole output for recall (`run_command_kept`).
@@ -3133,7 +3152,7 @@ pub(crate) fn execute_tool_cancellable(
             if let Some(parent) = full.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match write_unfollowed(workspace_path, &full, content) {
+            match write_unfollowed(workspace_path, &full, content, check) {
                 Ok(()) => (format!("Wrote {} bytes to {path}", content.len()), true),
                 Err(e) => (format!("Error writing {path}: {e}"), false),
             }
@@ -3356,7 +3375,7 @@ pub(crate) fn execute_tool_cancellable(
                 }
                 return (format!("Edited {path}: replaced {replaced} occurrence(s)"), true);
             }
-            match write_unfollowed(workspace_path, &full, &updated) {
+            match write_unfollowed(workspace_path, &full, &updated, check) {
                 Ok(()) => (format!("Edited {path}: replaced {replaced} occurrence(s)"), true),
                 Err(e) => (format!("Error writing {path}: {e}"), false),
             }
@@ -5426,9 +5445,13 @@ impl ChatEngine {
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
                 // The thread's grants (#1229) are read at each check, so one
                 // the card just kept answers its recheck; none in Plan only.
+                // What a write was last checked against, to check again as it lands.
+                let write_check: Mutex<Option<crate::talk_guard::WriteCheck>> = Mutex::new(None);
                 let check = || {
                     let grants = self.approvals.grants(&request.thread_id, mode);
-                    crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined, &grants)
+                    let card = crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined, &grants);
+                    *write_check.lock() = reach.write_check(&u.name, &u.input, writes_confined, &grants, card.is_some());
+                    card
                 };
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
@@ -5657,7 +5680,7 @@ impl ChatEngine {
                     // Every other built-in tool, off the runtime thread too: a
                     // long grep never stalls another workspace's turn, and a
                     // walk Stop ended reads as stopped.
-                    let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await;
+                    let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, write_check.lock().take()).await;
                     interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
                     ran
                 };
@@ -7341,7 +7364,7 @@ mod tests {
             ("grep", serde_json::json!({ "pattern": "needle" })),
             ("glob", serde_json::json!({ "pattern": "*.txt" })),
         ] {
-            let (out, ok) = rt.block_on(run_builtin(dir.path(), name, &input, None, &cancel));
+            let (out, ok) = rt.block_on(run_builtin(dir.path(), name, &input, None, &cancel, None));
             assert!(!ok && out.starts_with("Search stopped"), "{name}: {out}");
         }
         // Without a stop they run as before.
@@ -7668,6 +7691,35 @@ mod tests {
         std::fs::write(ws.join("AGENTS.md"), "old").unwrap();
         assert!(edit("CLAUDE.md").1, "a link inside is edited through");
         assert_eq!(std::fs::read_to_string(ws.join("AGENTS.md")).unwrap(), "new");
+    }
+
+    /// A folder swapped for a link after the check: the write checks again
+    /// where it lands, outside the workspace too, and refuses (#1229).
+    #[cfg(unix)]
+    #[test]
+    fn a_write_checks_again_where_it_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap();
+        let (ws, home) = (real.join("ws"), real.join("home"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(home.join("out/sub")).unwrap();
+        std::fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
+        let reach = crate::talk_guard::Reach::new(&ws, None, Some(&home));
+        let grants = [Grant { kind: GrantKind::Write, value: home.join("out").to_string_lossy().into_owned(), shown: "~/out".into() }];
+        let input = serde_json::json!({ "path": home.join("out/sub/x.plist"), "content": "c" });
+        assert_eq!(reach.outside_card(None, "write_file", &input, false, &grants), None, "the granted folder asks nothing");
+        let check = reach.write_check("write_file", &input, false, &grants, false).unwrap();
+        // Then a subfolder becomes a link to where login items run from.
+        std::fs::remove_dir(home.join("out/sub")).unwrap();
+        std::os::unix::fs::symlink(home.join("Library/LaunchAgents"), home.join("out/sub")).unwrap();
+        let (msg, ok) = execute_tool_checked(&ws, "write_file", &input, None, None, Some(&check));
+        assert!(!ok && msg.contains("changed after it was checked"), "{msg}");
+        assert!(!home.join("Library/LaunchAgents/x.plist").exists());
+        // As checked, it lands.
+        std::fs::remove_file(home.join("out/sub")).unwrap();
+        std::fs::create_dir_all(home.join("out/sub")).unwrap();
+        assert!(execute_tool_checked(&ws, "write_file", &input, None, None, Some(&check)).1);
+        assert_eq!(std::fs::read_to_string(home.join("out/sub/x.plist")).unwrap(), "c");
     }
 
     /// The opened file and every folder on the way are never a link.

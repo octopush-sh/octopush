@@ -851,6 +851,8 @@ pub struct SubagentGate {
     /// The thread's mode at each call (#1229): no grant applies in Plan
     /// only. Without one, the gate reads it as Plan only.
     mode: Option<crate::permissions::ModeSource>,
+    /// The write the last `check` let through, checked again as it lands.
+    pending_write: Mutex<Option<crate::talk_guard::WriteCheck>>,
     seq: AtomicU64,
 }
 
@@ -868,6 +870,7 @@ impl SubagentGate {
             reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
             writes_confined: spec.sandbox_roots.is_some(),
             mode: None,
+            pending_write: Mutex::new(None),
             seq: AtomicU64::new(1),
         }
     }
@@ -928,6 +931,7 @@ pub fn gate_texts(label: &str, reason: &str) -> (String, String) {
 impl ToolGate for SubagentGate {
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let mode = self.mode();
+        *self.pending_write.lock() = None;
         let (shown, card_reason, denial) = if name == "run_command" {
             let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
             // The secret guard first (#819); the thread's grant never answers it.
@@ -967,7 +971,11 @@ impl ToolGate for SubagentGate {
                 if self.mcp_writes.contains(name) {
                     Some(crate::talk_guard::mcp_card(label, name, input))
                 } else {
-                    self.reach.outside_card(label, name, input, self.writes_confined, &self.broker.grants(&self.thread_id, mode))
+                    let grants = self.broker.grants(&self.thread_id, mode);
+                    let card = self.reach.outside_card(label, name, input, self.writes_confined, &grants);
+                    // What the write is checked against again as it lands (#1229).
+                    *self.pending_write.lock() = self.reach.write_check(name, input, self.writes_confined, &grants, card.is_some());
+                    card
                 }
             };
             let card = check()?;
@@ -984,6 +992,10 @@ impl ToolGate for SubagentGate {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => None,
             ApprovalDecision::Deny => Some(denial),
         }
+    }
+
+    fn write_check(&self, _name: &str, _input: &serde_json::Value) -> Option<crate::talk_guard::WriteCheck> {
+        self.pending_write.lock().take()
     }
 }
 
@@ -1117,6 +1129,10 @@ impl ToolGate for SkillSubagentGate<'_> {
             Some(inner) => inner.check(name, input).await,
             None => None,
         }
+    }
+
+    fn write_check(&self, name: &str, input: &serde_json::Value) -> Option<crate::talk_guard::WriteCheck> {
+        self.inner.and_then(|g| g.write_check(name, input))
     }
 }
 

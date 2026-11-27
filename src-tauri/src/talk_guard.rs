@@ -85,6 +85,55 @@ impl Grant {
     }
 }
 
+/// What a `write_file` or `edit_file` call was checked against (#1229), so
+/// the write checks it again on the path it resolves to as it lands
+/// (`chat_engine::write_unfollowed`): the target as the check resolved it,
+/// whether the check asked (and the user allowed it), and whether code runs
+/// from there; and what the check needs to run again.
+#[derive(Clone, Debug)]
+pub struct WriteCheck {
+    workspace: PathBuf,
+    main: Option<PathBuf>,
+    home: Option<PathBuf>,
+    name: String,
+    writes_confined: bool,
+    grants: Vec<Grant>,
+    checked: PathBuf,
+    asked: bool,
+    exec: bool,
+}
+
+impl WriteCheck {
+    /// Check the write again on `resolved`, where it lands now (#1229): it
+    /// must be the path the check resolved; and the full check, run again
+    /// there (the always-ask list, a credentials location, the grants),
+    /// must not ask where it didn't, nor find code running from it where it
+    /// didn't. `Err` is the refusal for the model.
+    pub fn recheck(&self, resolved: &Path) -> Result<(), String> {
+        let reach = Reach::new(&self.workspace, self.main.as_deref(), self.home.as_deref());
+        let again = "Call the tool again so it is checked again, and ask the user if it asks.";
+        if !same_path(resolved, &self.checked) {
+            return Err(format!(
+                "Not written: where it leads changed after it was checked (a folder on its way is now a link): it now resolves to {}. {again}",
+                reach.shown(resolved)
+            ));
+        }
+        let asks = reach.outside_card(None, &self.name, &serde_json::json!({ "path": resolved }), self.writes_confined, &self.grants);
+        let exec = reach.runs_code(resolved);
+        match (asks, exec) {
+            (Some(card), _) if !self.asked => Err(format!("Not written: {} now asks before a write ({}). {again}", card.shown, card.reason)),
+            (_, Some(why)) if !self.exec => Err(format!("Not written: code now runs from {} ({why}). {again}", reach.shown(resolved))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Whether `a` and `b` are the same path, by components and without case.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let low = |p: &Path| p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect::<Vec<_>>();
+    low(a) == low(b)
+}
+
 /// An MCP card shows a string argument up to this long, a longer one (a
 /// comment body, a file) as its length, and at most [`MCP_ARGS_MAX`] in all.
 const MCP_ARG_SHOWN: usize = 160;
@@ -183,6 +232,7 @@ fn git_dir_runs(rest: &[String]) -> Option<&'static str> {
         (Some("info"), _) => Some("Git's info files can make Git run programs"),
         (Some("config" | "config.worktree"), 1) => Some("Git's config can make Git run programs"),
         (Some("worktrees"), 3) if at(2) == Some("config.worktree") => Some("Git's config can make Git run programs"),
+        (Some("worktrees"), 3) if matches!(at(2), Some("commondir" | "gitdir")) => Some("Git follows it to the Git folder it names"),
         (Some("modules"), n) => (2..n).find_map(|k| match at(k) {
             Some("hooks") => Some("Git runs a submodule's hooks"),
             Some("info") => Some("Git's info files can make Git run programs"),
@@ -193,21 +243,49 @@ fn git_dir_runs(rest: &[String]) -> Option<&'static str> {
     }
 }
 
-/// Where `workspace`'s repository runs its hooks from when `core.hooksPath`
-/// is set (in any of Git's config scopes), as `git config --path` reads it:
-/// `~` expanded, a relative one from the workspace. `None` when it isn't set
-/// or Git can't say.
-pub fn hooks_path(workspace: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
+/// The folder of the repository `path` is in: the nearest folder above it
+/// that holds a `.git`, file or folder. `None` outside a repository.
+fn repo_dir(path: &Path) -> Option<PathBuf> {
+    path.ancestors().skip(1).find(|a| a.join(".git").symlink_metadata().is_ok()).map(Path::to_path_buf)
+}
+
+/// Where Git runs hooks from for the repository at `repo`, asked now
+/// (#1229): `git rev-parse --git-path hooks`, which honours `core.hooksPath`
+/// from every config scope, with `safe.bareRepository=explicit` so Git never
+/// takes a bare repository it finds on its own, bounded to half a second.
+/// Resolved where it exists. `None` when Git can't say in time.
+pub(crate) fn git_hooks_dir(repo: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("git")
         .arg("-C")
-        .arg(workspace)
-        .args(["config", "--path", "--get", "core.hooksPath"])
+        .arg(repo)
+        .args(["-c", "safe.bareRepository=explicit", "rev-parse", "--git-path", "hooks"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !value.is_empty()).then(|| workspace.join(value))
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if !status.success() || child.stdout.take()?.read_to_string(&mut out).is_err() {
+                    return None;
+                }
+                let dir = repo.join(out.trim_end_matches(['\n', '\r']));
+                return (!out.trim().is_empty()).then(|| std::fs::canonicalize(&dir).unwrap_or(dir));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(5)),
+            // Past the bound, or Git can't be waited on: it says nothing.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// The same, outside home.
@@ -234,6 +312,11 @@ pub struct Reach {
     secrets: Vec<(PathBuf, Option<PathBuf>, &'static str)>,
     /// [`HOME_RUNS_CODE`] and [`SYSTEM_RUNS_CODE`], as named and resolved.
     runs_code: Vec<(PathBuf, Option<PathBuf>, &'static str)>,
+    /// The project's main checkout, as given (for [`Reach::write_check`]).
+    main: Option<PathBuf>,
+    /// Where Git runs hooks from, per repository folder, asked during the
+    /// current check only ([`Reach::hooks_dir`]; cleared as each starts).
+    hooks: parking_lot::Mutex<std::collections::HashMap<PathBuf, Option<PathBuf>>>,
 }
 
 /// The dependency folders a mission may link from its project's main
@@ -276,12 +359,33 @@ impl Reach {
             home,
             secrets,
             runs_code,
+            main: main_checkout.map(Path::to_path_buf),
+            hooks: parking_lot::Mutex::default(),
         }
+    }
+
+    /// A new check starts: nothing Git said earlier counts (#1229).
+    fn fresh(&self) {
+        self.hooks.lock().clear();
+    }
+
+    /// Where Git runs hooks from for the repository `path` is in (and the
+    /// workspace's), when that isn't inside its Git folder: `core.hooksPath`,
+    /// as `git rev-parse --git-path hooks` says now ([`git_hooks_dir`]), once
+    /// per repository and check.
+    fn hooks_dir(&self, path: &Path) -> Vec<PathBuf> {
+        let repos = [repo_dir(path), self.root.as_deref().filter(|r| r.join(".git").symlink_metadata().is_ok()).map(Path::to_path_buf)];
+        let mut memo = self.hooks.lock();
+        repos
+            .into_iter()
+            .flatten()
+            .filter_map(|repo| memo.entry(repo.clone()).or_insert_with(|| git_hooks_dir(&repo)).clone())
+            .collect()
     }
 
     /// [`Reach::new`] with the user's home.
     pub fn of_workspace(workspace: &Path, main_checkout: Option<&Path>) -> Self {
-        Self::new(workspace, main_checkout, dirs::home_dir().as_deref()).with_hooks_path(hooks_path(workspace))
+        Self::new(workspace, main_checkout, dirs::home_dir().as_deref())
     }
 
     /// `path` as the card names it: `~/…` under home, else in full.
@@ -315,24 +419,20 @@ impl Reach {
     /// granted, inside the workspace too.
     fn runs_code(&self, path: &Path) -> Option<&'static str> {
         let names: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+        // A worktree's `.git` file names the Git folder Git uses.
+        if names.last().is_some_and(|n| n == ".git") {
+            return Some("Git follows it to the Git folder it names");
+        }
         // A `.git` folder, or a bare `*.git` one.
         for i in (0..names.len()).filter(|&i| names[i].ends_with(".git")) {
             if let Some(why) = git_dir_runs(&names[i + 1..]) {
                 return Some(why);
             }
         }
-        self.runs_code.iter().find(|(place, resolved, _)| std::iter::once(place).chain(resolved).any(|p| under(path, p))).map(|(_, _, why)| *why)
-    }
-
-    /// Also treat where `core.hooksPath` points as a place that runs code
-    /// (`hooks`, as configured and resolved: husky's `.husky`, a global hooks
-    /// folder). [`Reach::of_workspace`] reads it from the repository.
-    pub fn with_hooks_path(mut self, hooks: Option<PathBuf>) -> Self {
-        if let Some(h) = hooks {
-            let resolved = std::fs::canonicalize(&h).ok();
-            self.runs_code.push((h, resolved, "Git runs its hooks from it (core.hooksPath)"));
+        if let Some((_, _, why)) = self.runs_code.iter().find(|(place, resolved, _)| std::iter::once(place).chain(resolved).any(|p| under(path, p))) {
+            return Some(*why);
         }
-        self
+        self.hooks_dir(path).iter().any(|h| under(path, h)).then_some("Git runs its hooks from it (core.hooksPath)")
     }
 
     /// The grant for exactly `command` run from `cwd` (#1229), bound to that
@@ -362,6 +462,7 @@ impl Reach {
     /// may be covered by one: no credentials location, no place that runs
     /// code, no folder around credentials, and within the check's caps.
     pub fn command_grant(&self, command: &str, cwd: Option<&Path>) -> Option<Grant> {
+        self.fresh();
         let start = cwd.unwrap_or(&self.workspace);
         let exact = self.exact(command, start)?;
         let mut scan = Scan { glob_names: MAX_GLOB_NAMES, ..Scan::default() };
@@ -392,6 +493,7 @@ impl Reach {
     /// write where code runs from ([`Reach::runs_code`]) always asks, inside
     /// the workspace and in a sandboxed mission too, and offers nothing.
     pub fn outside_card(&self, label: Option<&str>, name: &str, input: &Value, writes_confined: bool, grants: &[Grant]) -> Option<ToolCard> {
+        self.fresh();
         let path = |default: &'static str| input.get("path").and_then(|p| p.as_str()).unwrap_or(default).to_string();
         let (kind, verb, act, raw) = match name {
             "read_file" => (CardKind::Read, "reads a file", "read", path("")),
@@ -424,6 +526,29 @@ impl Reach {
             r.shown, r.place
         );
         Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, grant })
+    }
+
+    /// What a `write_file` or `edit_file` call the check just placed is
+    /// checked against again as it lands ([`WriteCheck`], #1229): `asked`,
+    /// the check raised a card the user allowed. `None` for any other tool.
+    pub fn write_check(&self, name: &str, input: &Value, writes_confined: bool, grants: &[Grant], asked: bool) -> Option<WriteCheck> {
+        if !matches!(name, "write_file" | "edit_file") {
+            return None;
+        }
+        let joined = self.workspace.join(input.get("path").and_then(|p| p.as_str()).unwrap_or(""));
+        let checked = resolve(&joined).unwrap_or_else(|| lexical(&joined));
+        let exec = self.runs_code(&checked).is_some();
+        Some(WriteCheck {
+            workspace: self.workspace.clone(),
+            main: self.main.clone(),
+            home: self.home.clone(),
+            name: name.to_string(),
+            writes_confined,
+            grants: grants.to_vec(),
+            checked,
+            asked,
+            exec,
+        })
     }
 
     /// The folder a grant for `real` would cover (the folder itself, or the
@@ -508,6 +633,7 @@ impl Reach {
     /// [`MAX_GLOB_NAMES`] names a glob reads, the command asks. A net, not a
     /// sandbox: a path built at run time isn't followed.
     pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, grants: &[Grant]) -> Option<ToolCard> {
+        self.fresh();
         let start = cwd.unwrap_or(&self.workspace);
         let exact = self.exact(command, start);
         let granted = exact.as_ref().is_some_and(|e| grants.iter().any(|g| g.same(e)));
@@ -656,7 +782,8 @@ impl Reach {
                 None if alt.starts_with('/') => (Path::new("/"), alt.as_str(), None),
                 None => match &lands {
                     Some(l) => {
-                        let plain = !l.careful && !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt);
+                        // `.git` is never plain: a worktree's is a file Git follows.
+                        let plain = !l.careful && !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt) && !unescape(alt).eq_ignore_ascii_case(".git");
                         (l.base, alt.as_str(), plain.then_some(l.fast))
                     }
                     None => match named_credential(alt, alt) {
@@ -1761,16 +1888,18 @@ mod tests {
     #[test]
     fn git_config_fish_bare_repositories_submodules_and_the_hooks_path_ask() {
         let (_d, ws, home) = setup();
-        let reach = Reach::new(&ws, None, Some(&home)).with_hooks_path(Some(ws.join(".husky")));
+        let reach = Reach::new(&ws, None, Some(&home));
         let write = |path: PathBuf| reach.outside_card(None, "write_file", &json!({"path": path, "content": "c"}), false, &[]);
         for path in [
             home.join(".config/git/config"),
             home.join(".config/git/hooks/pre-commit"),
             home.join(".config/fish/functions/ls.fish"),
             home.join(".config/fish/conf.d/x.fish"),
-            ws.join(".husky/pre-commit"),
+            ws.join(".git"),
             ws.join(".git/config.worktree"),
             ws.join(".git/worktrees/w1/config.worktree"),
+            ws.join(".git/worktrees/w1/commondir"),
+            ws.join(".git/worktrees/w1/gitdir"),
             ws.join(".git/modules/libs/a/hooks/post-checkout"),
             ws.join(".git/modules/libs/a/config"),
             home.join("src/tool.git/config"),
@@ -1779,10 +1908,13 @@ mod tests {
             let c = write(path.clone()).unwrap_or_else(|| panic!("{path:?} asks"));
             assert!(c.reason.contains("it runs code") && c.grant.is_none(), "{path:?}: {}", c.reason);
         }
-        for path in [ws.join(".git/worktrees/w1/HEAD"), ws.join(".git/modules/libs/a/HEAD"), ws.join(".huskyrc")] {
+        for path in [ws.join(".git/worktrees/w1/HEAD"), ws.join(".git/modules/libs/a/HEAD"), ws.join(".husky/pre-commit")] {
             assert_eq!(write(path.clone()), None, "{path:?}");
         }
-        assert!(write(ws.join(".husky/pre-push")).is_some_and(|c| c.reason.contains("core.hooksPath")));
+        // A worktree's `.git` file, by a command too: never a plain name.
+        for command in ["echo 'gitdir: /tmp/x' > .git", "cp pointer .GIT"] {
+            assert!(run(&reach, command).is_some_and(|c| c.reason.contains("Git folder it names")), "{command}");
+        }
         #[cfg(unix)]
         {
             // Matched where it resolves: a link in the workspace to a hooks folder.
@@ -1793,18 +1925,32 @@ mod tests {
         }
     }
 
-    /// `core.hooksPath` is read from the repository, as Git reads it.
+    /// `core.hooksPath` is asked of Git for the target's repository at each
+    /// check (#1229), never kept from an earlier one: a husky-style folder
+    /// in another repository asks, and so does one set mid-turn, before and
+    /// as a write lands.
     #[test]
-    fn the_hooks_path_comes_from_the_repository() {
-        let (_d, ws, _home) = setup();
-        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&ws).args(args).output().is_ok_and(|o| o.status.success());
-        if !git(&["init", "-q"]) {
+    fn the_hooks_path_is_asked_per_check_and_never_kept() {
+        let (_d, ws, home) = setup();
+        let git = |dir: &Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(args).output().is_ok_and(|o| o.status.success());
+        if !git(&ws, &["init", "-q"]) {
             return; // No Git here.
         }
-        assert!(git(&["config", "core.hooksPath", ".husky"]));
-        assert_eq!(hooks_path(&ws), Some(ws.join(".husky")));
-        let reach = Reach::of_workspace(&ws, None);
-        let c = reach.outside_card(None, "write_file", &json!({"path": ".husky/pre-commit", "content": "x"}), false, &[]);
-        assert!(c.is_some_and(|c| c.reason.contains("core.hooksPath")), "a write there asks");
+        let reach = Reach::new(&ws, None, Some(&home));
+        let input = json!({"path": ".husky/pre-commit", "content": "x"});
+        assert_eq!(reach.outside_card(None, "write_file", &input, false, &[]), None, "not set: no card");
+        let check = reach.write_check("write_file", &input, false, &[], false).unwrap();
+        // Set mid-turn: the next check asks, and so does the write checked before it.
+        assert!(git(&ws, &["config", "core.hooksPath", ".husky"]));
+        assert!(reach.outside_card(None, "write_file", &input, false, &[]).is_some_and(|c| c.reason.contains("core.hooksPath")));
+        std::fs::create_dir_all(ws.join(".husky")).unwrap();
+        let landed = std::fs::canonicalize(ws.join(".husky")).unwrap().join("pre-commit");
+        assert!(check.recheck(&landed).is_err_and(|e| e.contains("now asks")), "a write checked before lands refused");
+        // A husky-style folder in another repository.
+        let other = home.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(git(&other, &["init", "-q"]) && git(&other, &["config", "core.hooksPath", ".husky"]));
+        let c = reach.outside_card(None, "write_file", &json!({"path": other.join(".husky/pre-push"), "content": "x"}), false, &[]).unwrap();
+        assert!(c.reason.contains("core.hooksPath") && c.grant.is_none(), "{}", c.reason);
     }
 }

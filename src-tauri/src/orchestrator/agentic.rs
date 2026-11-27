@@ -2,7 +2,7 @@
 //! (`build_llm_tools`, `execute_tool`) but, unlike `chat_engine::send_agentic`,
 //! it persists nothing and emits no events — it just runs and returns a result.
 
-use crate::chat_engine::{build_llm_tools, execute_tool_cancellable};
+use crate::chat_engine::{build_llm_tools, execute_tool_checked};
 use crate::error::{AppResult, ProviderErrorKind};
 use crate::orchestrator::types::{BlockedAsk, BlockedQuestion, ToolCallLog};
 use crate::providers::{
@@ -702,6 +702,13 @@ pub(crate) fn parse_ask_director(u: &LlmToolUse) -> BlockedAsk {
 #[async_trait::async_trait]
 pub trait ToolGate: Send + Sync {
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String>;
+
+    /// What a write `check` just let through must still be as it lands
+    /// (#1229, Talk's sub-agents): checked again on the path the write
+    /// resolves to. `None`: nothing more.
+    fn write_check(&self, _name: &str, _input: &serde_json::Value) -> Option<crate::talk_guard::WriteCheck> {
+        None
+    }
 }
 
 /// Tools the loop offers and executes on the caller's behalf, beyond the
@@ -1162,8 +1169,9 @@ pub async fn run_agentic_loop_billed(
                 let input = u.input.clone();
                 let roots = sandbox_roots.map(|r| r.to_vec());
                 let cancel_flag = std::sync::Arc::clone(cancel);
+                let check = gate.and_then(|g| g.write_check(&u.name, &u.input));
                 tokio::task::spawn_blocking(move || {
-                    execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag))
+                    execute_tool_checked(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag), check.as_ref())
                 })
                 .await
                 .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))

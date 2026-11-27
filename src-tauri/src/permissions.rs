@@ -574,6 +574,10 @@ impl ToolGate for ModeGate {
             None => None,
         }
     }
+
+    fn write_check(&self, name: &str, input: &Value) -> Option<crate::talk_guard::WriteCheck> {
+        self.inner.as_ref().and_then(|g| g.write_check(name, input))
+    }
 }
 
 #[cfg(test)]
@@ -973,7 +977,7 @@ mod tests {
             "self.talk_shell.available() && exec_roots.is_none()",
             "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
             "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
-            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, write_check.lock().take()).await",
             "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
         ] {
             assert!(body.contains(call), "the director's loop no longer has: {call}");
