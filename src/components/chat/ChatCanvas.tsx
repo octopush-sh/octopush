@@ -40,6 +40,8 @@ import { OctoStatus } from "./OctoStatus";
 interface Props {
   workspaceId: string;
   workspacePath: string;
+  /** Talk is the mode on screen; a hidden Talk's approval cards ignore keys. */
+  active?: boolean;
   onOpenSettings?: () => void;
   onOpenInEditor?: (path: string) => void;
   /** Re-run a tool's shell command in the RUN-mode terminal (cross-mode, P9). */
@@ -57,6 +59,7 @@ interface Props {
 export function ChatCanvas({
   workspaceId,
   workspacePath,
+  active = true,
   onOpenSettings,
   onOpenInEditor,
   onRunInTerminal,
@@ -386,7 +389,7 @@ export function ChatCanvas({
       }`}
     >
       {isEmpty ? (
-        <EmptyState areaRef={scrollRef} />
+        <EmptyState areaRef={scrollRef} workspaceId={workspaceId} />
       ) : (
         <section aria-label="Conversation" className="mx-auto flex w-full max-w-3xl flex-col gap-6">
           {blocks.flatMap((item, index) => [renderBlock(item, index), turnChangesAfter(index)])}
@@ -430,6 +433,7 @@ export function ChatCanvas({
             <ApprovalCard
               key={`approval-${a.callId}`}
               approval={a}
+              talkActive={active}
               onRespond={(d) => respondApproval(workspaceId, a.callId, d)}
             />
           ))}
@@ -740,7 +744,22 @@ function RowAction({
   );
 }
 
-function EmptyState({ areaRef }: { areaRef: React.RefObject<HTMLDivElement | null> }) {
+/** The empty conversation's starters, as `[label, draft]`. Each fills the
+ *  composer (after whatever is typed) and sends nothing. */
+export const TALK_STARTERS: readonly (readonly [string, string])[] = [
+  ["Review what changed", "@diff "],
+  ["Ask about a file", "@"],
+  ["Explain this workspace", "Explain this workspace."],
+];
+
+function EmptyState({
+  areaRef,
+  workspaceId,
+}: {
+  areaRef: React.RefObject<HTMLDivElement | null>;
+  workspaceId: string;
+}) {
+  const queueDraftInsert = useChatStore((s) => s.queueDraftInsert);
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center">
       <OctoWatcher size={72} areaRef={areaRef} />
@@ -754,6 +773,19 @@ function EmptyState({ areaRef }: { areaRef: React.RefObject<HTMLDivElement | nul
         Ask anything — Octopush will read files, run commands, and write changes
         inside this workspace's worktree.
       </p>
+      <div data-tour="talk-empty-starters" className="flex flex-wrap items-center justify-center gap-2">
+        {TALK_STARTERS.map(([label, draft]) => (
+          <button
+            key={label}
+            type="button"
+            onClick={() => queueDraftInsert(workspaceId, draft)}
+            title={`Start the draft with “${draft.trim()}”; nothing is sent`}
+            className="rounded-md border border-octo-hairline px-3 py-1 font-serif text-[13px] text-octo-sage transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:border-[var(--brass-dim)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          >
+            {label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

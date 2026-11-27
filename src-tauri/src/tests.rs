@@ -1284,6 +1284,108 @@ mod workspace_tests {
     }
 
     #[test]
+    fn a_clock_stepping_back_never_reorders_a_thread() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        for text in ["ask", "answer", "follow-up"] {
+            db.insert_chat_message("ws", &t.id, "user", text, None, None, None, None).unwrap();
+        }
+        // The clock stepped back an hour before the last two rows were written.
+        db.conn_ref()
+            .execute(
+                "UPDATE chat_messages SET created_at = '2020-01-01T00:00:00Z' WHERE thread_id = ?1 AND content != 'ask'",
+                rusqlite::params![t.id],
+            )
+            .unwrap();
+        db.conn_ref()
+            .execute(
+                "UPDATE chat_messages SET created_at = '2019-12-31T23:00:00Z' WHERE thread_id = ?1 AND content = 'follow-up'",
+                rusqlite::params![t.id],
+            )
+            .unwrap();
+        let order: Vec<String> = db.list_chat_messages(&t.id).unwrap().into_iter().map(|m| m.content).collect();
+        assert_eq!(order, ["ask", "answer", "follow-up"]);
+    }
+
+    #[test]
+    fn a_restart_mid_turn_leaves_a_note_on_every_cut_thread() {
+        use crate::chat_engine::RESTART_NOTE;
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let thread = |title: &str, rows: &[(&str, &str)]| {
+            let t = db.create_chat_thread("ws", title).unwrap();
+            for (role, content) in rows {
+                db.insert_chat_message("ws", &t.id, role, content, None, None, None, None).unwrap();
+            }
+            t.id
+        };
+        let agent_tool = r#"{"callId":"toolu_1","toolName":"read_file","toolInput":{},"result":"x","ok":true}"#;
+        let shell_tool = r#"{"callId":"shell-3","toolName":"run_command","toolInput":{"command":"ls"},"result":"a","ok":true}"#;
+        let on_ask = thread("ask", &[("user", "do it")]);
+        let on_tool = thread("tool", &[("user", "do it"), ("assistant_tool_use", "[tool_calls: []]"), ("tool", agent_tool)]);
+        let on_round = thread("round", &[("user", "do it"), ("assistant_tool_use", "[tool_calls: []]")]);
+        let answered = thread("answered", &[("user", "do it"), ("assistant", "done")]);
+        let errored = thread("errored", &[("user", "do it"), ("error", "Anthropic API error 500")]);
+        let shell = thread("shell", &[("tool", shell_tool)]);
+        let running = thread("running", &[("user", "do it")]);
+        let empty = thread("empty", &[]);
+
+        let noted = db.note_interrupted_talk_turns(RESTART_NOTE, &|t: &str| t == running).unwrap();
+        assert_eq!(noted, 3);
+        let last = |t: &str| db.list_chat_messages(t).unwrap().last().map(|m| (m.role.clone(), m.content.clone()));
+        for cut in [&on_ask, &on_tool, &on_round] {
+            assert_eq!(last(cut), Some(("stopped".to_string(), "Interrupted by an app restart.".to_string())));
+        }
+        assert_eq!(last(&answered).unwrap().0, "assistant");
+        assert_eq!(last(&errored).unwrap().0, "error");
+        assert_eq!(last(&shell).unwrap().0, "tool", "a `$` command is a finished exchange");
+        assert_eq!(last(&running).unwrap().0, "user", "a turn still running is left alone");
+        assert_eq!(last(&empty), None);
+        // A second boot adds nothing: those threads now end on the note.
+        assert_eq!(db.note_interrupted_talk_turns(RESTART_NOTE, &|_: &str| false).unwrap(), 1, "only the formerly running one");
+    }
+
+    #[test]
+    fn a_talk_turn_works_in_the_workspace_folder_the_database_names() {
+        use crate::chat_engine::{with_workspace_path_from_db, ChatRequest};
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "feat", Some("/tmp/p/.octopus-worktrees/ws"), "", None).unwrap();
+        db.insert_workspace("bare", "p", "bare", "", "main", None, "", None).unwrap();
+        let request = |workspace: &str, path: &str| -> ChatRequest {
+            serde_json::from_value(serde_json::json!({
+                "workspaceId": workspace, "threadId": "t", "workspacePath": path, "model": "m",
+                "userMessage": "hi", "system": null, "maxTokens": 4096,
+            }))
+            .unwrap()
+        };
+        // Whatever folder the webview names, the turn runs in the workspace's own.
+        let resolved = with_workspace_path_from_db(&db, request("ws", "/Users/someone/.ssh")).unwrap();
+        assert_eq!(resolved.workspace_path, "/tmp/p/.octopus-worktrees/ws");
+        // A workspace with no worktree yet works in its project's root, as before.
+        assert_eq!(with_workspace_path_from_db(&db, request("bare", "/elsewhere")).unwrap().workspace_path, "/tmp/p");
+        // A request may leave the path out entirely.
+        let bare: ChatRequest = serde_json::from_value(serde_json::json!({
+            "workspaceId": "ws", "threadId": "t", "model": "m", "userMessage": "hi", "system": null, "maxTokens": 4096,
+        }))
+        .unwrap();
+        assert_eq!(with_workspace_path_from_db(&db, bare).unwrap().workspace_path, "/tmp/p/.octopus-worktrees/ws");
+        // An unknown workspace runs nothing.
+        assert!(with_workspace_path_from_db(&db, request("gone", "/tmp/p")).is_err());
+    }
+
+    #[test]
+    fn a_stopped_turn_says_what_stays_and_how_to_undo_it() {
+        assert_eq!(
+            crate::chat_engine::STOPPED_NOTE,
+            "Stopped. Changes made before the stop stay; rewind files from your last message to undo them."
+        );
+    }
+
+    #[test]
     fn an_mcp_original_is_kept_for_recall_and_never_loaded_with_the_thread() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();
