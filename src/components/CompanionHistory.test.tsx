@@ -6,9 +6,10 @@
  * delete button is keyboard-reachable.
  */
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
+import { useTourStore } from "../stores/tourStore";
 
 const chats: CompanionHistoryChat[] = [
   { id: "c1", title: "First conversation", meta: "2h ago" },
@@ -27,6 +28,53 @@ function renderHistory(overrides: Partial<React.ComponentProps<typeof CompanionH
   render(<CompanionHistory {...props} />);
   return props;
 }
+
+describe("CompanionHistory — Regenerate title (#1137)", () => {
+  it("sits beside rename, asks for that row's title and waits disabled until it settles", async () => {
+    const user = userEvent.setup();
+    let settle: () => void = () => {};
+    const onRegenerateTitle = vi.fn(() => new Promise<void>((r) => (settle = r)));
+    renderHistory({ onRenameChat: vi.fn(), onRegenerateTitle });
+    const buttons = screen.getAllByRole("button", { name: "Regenerate title" });
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0]).toHaveAttribute("data-tour", "companion-chat-regenerate-title");
+    expect(buttons[0].previousElementSibling).toHaveAccessibleName("Rename conversation");
+    await user.click(buttons[1]);
+    expect(onRegenerateTitle).toHaveBeenCalledWith("c2");
+    expect(buttons[1]).toBeDisabled();
+    await act(async () => settle());
+    expect(buttons[1]).not.toBeDisabled();
+  });
+
+  it("crossfades a new title in", () => {
+    const { rerender } = render(
+      <CompanionHistory chats={chats} activeChatId="c1" onSelectChat={vi.fn()} onNewChat={vi.fn()} />,
+    );
+    const before = screen.getAllByTestId("chat-row-title")[0];
+    rerender(
+      <CompanionHistory
+        chats={[{ ...chats[0], title: "GUIDE-123 · Waive virtualenv findings" }, chats[1]]}
+        activeChatId="c1"
+        onSelectChat={vi.fn()}
+        onNewChat={vi.fn()}
+      />,
+    );
+    const after = screen.getAllByTestId("chat-row-title")[0];
+    expect(after).not.toBe(before);
+    expect(after).toHaveTextContent("GUIDE-123 · Waive virtualenv findings");
+    expect(after.className).toMatch(/octo-fade-in/);
+  });
+
+  it("shows a row's actions while a tour points at its Regenerate title", () => {
+    renderHistory({ onRegenerateTitle: vi.fn() });
+    const target = screen.getAllByRole("button", { name: "Regenerate title" })[0];
+    const bar = target.closest('[data-testid="chat-row-actions"]') as HTMLElement;
+    expect(bar.className).toMatch(/(^|\s)opacity-0(\s|$)/);
+    act(() => useTourStore.setState({ active: true, target }));
+    expect(bar.className).toMatch(/(^|\s)opacity-100(\s|$)/);
+    act(() => useTourStore.setState({ active: false, target: null }));
+  });
+});
 
 describe("CompanionHistory — rendering & actions", () => {
   it("renders one row per chat and an empty message when there are none", () => {

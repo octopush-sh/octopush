@@ -8052,6 +8052,104 @@ pub async fn ai_complete(
     })
 }
 
+/// Ledger origin of a Talk thread's generated title (#1137).
+pub const TITLE_ORIGIN: &str = "title";
+
+/// The fast tier on the provider of `model` (a Talk conversation's model;
+/// `auto` reads as the strong tier's), so a thread's title goes to the
+/// provider the conversation already uses: the tier map's `fast` when it is
+/// one of that provider's models, else that provider's current model named
+/// like `haiku`. `None` when the provider has no fast tier.
+pub fn fast_model_on_provider(
+    router: &crate::provider_router::ProviderRouter,
+    model: &str,
+    tiers: &HashMap<String, String>,
+) -> Option<String> {
+    let model = if model == crate::chat_agents::AUTO_MODEL { tiers.get("strong")?.as_str() } else { model };
+    let (provider, _) = router.find_model(model)?;
+    if let Some(mapped) = tiers.get("fast") {
+        if provider.models.iter().any(|m| m.id == *mapped) {
+            return Some(mapped.clone());
+        }
+    }
+    provider
+        .models
+        .iter()
+        .find(|m| !m.tags.is_empty() && m.superseded_by.is_none() && m.id.to_ascii_lowercase().contains("haiku"))
+        .map(|m| m.id.clone())
+}
+
+/// Record a title call's spend on its thread, as origin [`TITLE_ORIGIN`].
+pub(crate) fn record_title_spend(
+    tokens: &crate::token_engine::TokenEngine,
+    thread_id: &str,
+    event: TokenEvent,
+) -> AppResult<()> {
+    tokens.record_request_in_thread(event, "talk", Some(thread_id), Some(TITLE_ORIGIN))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedTitle {
+    pub text: String,
+    pub model: String,
+    pub cost_usd: f64,
+}
+
+/// Talk: one short call that titles a thread after its first answer (or on
+/// "Regenerate title"), on the fast tier of the conversation's own provider
+/// so nothing goes anywhere new. `None` when that provider has no fast tier;
+/// an error when the call fails or takes over 10 s. The frontend writes the
+/// prompt and keeps the derived title on anything but a clean answer.
+#[tauri::command]
+pub async fn generate_chat_title(
+    state: State<'_, AppState>,
+    thread_id: String,
+    workspace_id: String,
+    model: String,
+    system: String,
+    prompt: String,
+) -> AppResult<Option<GeneratedTitle>> {
+    if let crate::db::BudgetVerdict::Block { scope, spent, limit } =
+        state.db.lock().check_budget(Some(workspace_id.as_str()))?
+    {
+        return Err(AppError::BudgetExceeded { scope, spent, limit });
+    }
+    let tiers = crate::settings::load_settings().map(|s| s.model_tiers).unwrap_or_default();
+    let fast = {
+        let router = crate::provider_router::ProviderRouter::load()?;
+        fast_model_on_provider(&router, &model, &tiers)
+    };
+    let Some(fast) = fast else {
+        return Ok(None);
+    };
+    let (provider, api_base, api_key) = crate::chat_engine::resolve_provider(&fast)?;
+    let req = build_ai_request(&fast, system, prompt, 64, None);
+    let client = crate::chat_engine::shared_http_client();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        provider.complete(&api_base, api_key.as_deref(), &req, client),
+    )
+    .await
+    .map_err(|_| AppError::Other("The title took too long.".into()))??;
+    ensure_not_truncated(&resp.stop_reason)?;
+    let cost = crate::token_engine::request_cost_for(
+        &fast,
+        resp.input_tokens,
+        resp.output_tokens,
+        resp.cache_read_tokens,
+        resp.cache_creation_tokens,
+    );
+    if resp.input_tokens > 0 || resp.output_tokens > 0 {
+        // Best-effort: a recording failure must not lose the title.
+        let event = ai_token_event(Some(workspace_id.as_str()), &fast, &resp, cost);
+        if let Err(e) = record_title_spend(&state.tokens, &thread_id, event) {
+            tracing::warn!(error = %e, "failed to record the title call's spend");
+        }
+    }
+    Ok(Some(GeneratedTitle { text: ai_response_text(resp), model: fast, cost_usd: cost }))
+}
+
 // ─── G4 staging commands ──────────────────────────────────────────
 
 #[tauri::command]

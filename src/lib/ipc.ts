@@ -1922,6 +1922,18 @@ export const ipc = {
       },
     ),
 
+  /** Talk: a thread's title from the fast tier of `model`'s own provider,
+   *  billed to the thread as origin `title` (#1137). Null when that provider
+   *  has no fast tier. */
+  generateChatTitle: (args: {
+    threadId: string;
+    workspaceId: string;
+    model: string;
+    system: string;
+    prompt: string;
+  }) =>
+    invoke<{ text: string; model: string; costUsd: number } | null>("generate_chat_title", args),
+
   // ─── MCP server (Connect to Claude Code) ──────────────────────────
   mcpConnectionStatus: () =>
     invoke<McpStatus>("mcp_connection_status"),
