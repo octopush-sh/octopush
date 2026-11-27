@@ -10,7 +10,8 @@ use crate::error::{AppError, AppResult};
 /// The intent taxonomy. `build`/`fix` are code missions (worktree default);
 /// `review`/`probe`/`design`/`perf`/`ops` arrive with later movements but the
 /// enum is validated from day one so the data model never holds a stray value.
-pub const INTENTS: &[&str] = &["build", "fix", "review", "probe", "design", "perf", "ops"];
+/// `test` tests a ticket in a disposable checkout and ships nothing (#1238).
+pub const INTENTS: &[&str] = &["build", "fix", "review", "probe", "design", "perf", "ops", "test"];
 /// The git-state isolation axis.
 pub const GIT_ISOLATIONS: &[&str] = &["worktree", "readonly", "ephemeral", "pr"];
 /// The execution isolation axis (`cloud` reserved until M5).
@@ -46,12 +47,39 @@ pub fn validate_exec(exec_isolation: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Whether a mission of this intent delivers its work (pushes, opens pull
+/// requests, publishes). The others read, or test, and hand back findings.
+pub fn delivers(intent: &str) -> bool {
+    matches!(intent, "build" | "fix" | "design" | "ops")
+}
+
+/// Whether a mission ships nothing (#1238): it may write, build and run in
+/// its checkout, but Octopush refuses what would change something elsewhere
+/// ([`crate::permissions::PolicyCtx::ships_nothing`]). Derived from the two
+/// stored axes and never stored, so it can't disagree with the intent. A
+/// `readonly` mission is stricter still (Plan only), so it isn't counted.
+pub fn ships_nothing(intent: &str, git_isolation: &str) -> bool {
+    !delivers(intent) && git_isolation != "readonly"
+}
+
 fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResult<()> {
     if !INTENTS.contains(&intent) {
         return Err(AppError::Other(format!("unknown mission intent '{intent}'")));
     }
     if !GIT_ISOLATIONS.contains(&git_isolation) {
         return Err(AppError::Other(format!("unknown git isolation '{git_isolation}'")));
+    }
+    // New missions only: a row stored before this rule keeps loading, and a
+    // non-delivering one on a writer checkout reads as ship-nothing.
+    if intent == "test" && git_isolation != "ephemeral" {
+        return Err(AppError::Other(format!(
+            "a 'test' mission runs in a throwaway checkout, so its git isolation must be 'ephemeral' (got '{git_isolation}')"
+        )));
+    }
+    if !delivers(intent) && matches!(git_isolation, "worktree" | "pr") {
+        return Err(AppError::Other(format!(
+            "a '{intent}' mission delivers nothing, so its git isolation must be 'readonly' or 'ephemeral' (got '{git_isolation}')"
+        )));
     }
     if !EXEC_ISOLATIONS.contains(&exec_isolation) {
         return Err(AppError::Other(format!("unknown exec isolation '{exec_isolation}'")));
@@ -140,4 +168,46 @@ pub fn ensure_for_workspace(
         Some(&ws.id),
         ws.linked_issue_key.as_deref(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every (intent, git-state) pair: whether it delivers, whether it ships
+    /// nothing, and whether a new mission may take it.
+    #[test]
+    fn the_posture_of_every_intent_and_git_state() {
+        for intent in INTENTS {
+            for git in GIT_ISOLATIONS {
+                let delivering = matches!(*intent, "build" | "fix" | "design" | "ops");
+                assert_eq!(delivers(intent), delivering, "{intent}");
+                assert_eq!(ships_nothing(intent, git), !delivering && *git != "readonly", "{intent} on {git}");
+                let allowed = match *intent {
+                    "test" => *git == "ephemeral",
+                    _ if delivering => true,
+                    _ => matches!(*git, "readonly" | "ephemeral"),
+                };
+                let result = validate_axes(intent, git);
+                assert_eq!(result.is_ok(), allowed, "{intent} on {git}: {result:?}");
+                if let Err(e) = result {
+                    assert!(e.to_string().contains(&format!("'{intent}' mission")), "the error names the intent: {e}");
+                }
+            }
+        }
+        assert!(ships_nothing("test", "ephemeral") && !ships_nothing("build", "ephemeral"));
+    }
+
+    /// A row `octopush-mcp` could store before the rule (`review` on its own
+    /// worktree) still loads, and reads as ship-nothing: it only narrows.
+    #[test]
+    fn a_stored_review_on_a_worktree_reads_as_ship_nothing() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.insert_project("p1", "P", "/tmp/octo-mission-posture").unwrap();
+        db.insert_mission("m1", None, "p1", "review", "Old review", "active", None, "worktree", "none", "{}").unwrap();
+        let m = db.get_mission("m1").unwrap().expect("the old row loads");
+        assert!(ships_nothing(&m.intent, &m.git_isolation));
+        assert!(create(&db, "p1", "review", "New review", "worktree", "none", None, None).is_err(), "a new one is refused");
+    }
 }

@@ -237,8 +237,8 @@ pub fn tool_definitions() -> Value {
                 "properties": {
                     "projectId": { "type": "string" },
                     "title": { "type": "string" },
-                    "intent": { "type": ["string", "null"], "description": "build | fix | review | probe | design | perf | ops. Default 'build'." },
-                    "gitIsolation": { "type": ["string", "null"], "description": "worktree (default) | readonly | ephemeral | pr." },
+                    "intent": { "type": ["string", "null"], "description": "build | fix | review | probe | design | perf | ops | test. Default 'build'." },
+                    "gitIsolation": { "type": ["string", "null"], "description": "worktree | readonly | ephemeral | pr. Defaults by intent: readonly for review, probe and perf; ephemeral for test; worktree otherwise. review, probe and perf take only readonly or ephemeral, and test only ephemeral." },
                     "workspaceId": { "type": ["string", "null"], "description": "Optional workspace this mission owns (code missions). Omit for design/probe." },
                     "linkedIssueKey": { "type": ["string", "null"], "description": "Optional issue-tracker key." }
                 },
@@ -910,10 +910,12 @@ fn create_mission(db: &Db, args: &Value) -> Result<Value, String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "build".to_string());
+    // An omitted git-state follows the intent, so a caller that names only
+    // `intent: review` still gets a mission that's allowed (#1239).
     let git_isolation = opt_str(args, "gitIsolation")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "worktree".to_string());
+        .unwrap_or_else(|| default_git_isolation(&intent).to_string());
     let workspace_id = opt_str(args, "workspaceId").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let linked_issue_key = opt_str(args, "linkedIssueKey").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     // A supplied workspace must exist AND belong to this project — MCP hands this
@@ -942,6 +944,15 @@ fn create_mission(db: &Db, args: &Value) -> Result<Value, String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(json!({ "mission": m }))
+}
+
+/// The git-state a mission gets when `create_mission` names none.
+fn default_git_isolation(intent: &str) -> &'static str {
+    match intent {
+        "review" | "probe" | "perf" => "readonly",
+        "test" => "ephemeral",
+        _ => "worktree",
+    }
 }
 
 fn link_workspace_issue(db: &Db, args: &Value) -> Result<Value, String> {
@@ -2032,6 +2043,22 @@ mod tests {
         )
         .expect_err("an out-of-enum intent must be rejected");
         assert!(err.contains("unknown mission intent"), "err: {err}");
+    }
+
+    /// An omitted `gitIsolation` follows the intent, and a pair a new
+    /// mission can't take is a legible error (#1239).
+    #[test]
+    fn create_mission_defaults_the_git_state_by_intent() {
+        let db = test_db();
+        db.insert_project("p1", "P", "/tmp/p1").unwrap();
+        for (intent, git) in [("review", "readonly"), ("probe", "readonly"), ("perf", "readonly"), ("test", "ephemeral"), ("build", "worktree"), ("ops", "worktree")] {
+            let payload = create_mission(&db, &json!({ "projectId": "p1", "title": "t", "intent": intent })).unwrap();
+            assert_eq!(payload["mission"]["gitIsolation"], git, "{intent}");
+        }
+        let err = create_mission(&db, &json!({ "projectId": "p1", "title": "t", "intent": "review", "gitIsolation": "worktree" })).unwrap_err();
+        assert!(err.contains("'review' mission"), "err: {err}");
+        let err = create_mission(&db, &json!({ "projectId": "p1", "title": "t", "intent": "test", "gitIsolation": "readonly" })).unwrap_err();
+        assert!(err.contains("'test' mission"), "err: {err}");
     }
 
     #[test]

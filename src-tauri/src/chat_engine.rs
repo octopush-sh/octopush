@@ -4406,19 +4406,14 @@ impl ChatEngine {
         // write_file is confined. A `readonly` mission (review/probe) is
         // read-only-by-construction → Some(vec![]) (temp-only, no workspace
         // writes); a `sandbox` mission → Some(vec![workspace]). Resolved once/turn.
-        let sandbox_roots: Option<Vec<String>> = self
-            .db
-            .lock()
-            .active_mission_for_workspace(&request.workspace_id)
-            .ok()
-            .flatten()
-            .and_then(|m| {
-                crate::orchestrator::sandbox::sandbox_write_roots(
-                    &m.git_isolation,
-                    &m.exec_isolation,
-                    &request.workspace_path,
-                )
-            });
+        let mission = self.db.lock().active_mission_for_workspace(&request.workspace_id);
+        // A mission that ships nothing (#1238) refuses pushes and remote
+        // changes in every mode. A mission that can't be read is treated as
+        // one: the posture never loosens on an error.
+        let ships_nothing = crate::permissions::mission_ships_nothing(&mission);
+        let sandbox_roots: Option<Vec<String>> = mission.ok().flatten().and_then(|m| {
+            crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, &request.workspace_path)
+        });
 
         // Register a fresh cancellation flag for this turn, keyed by thread,
         // or refuse: a turn already runs there. The guard removes it from the
@@ -4988,6 +4983,7 @@ impl ChatEngine {
                         mcp_read_only: &mcp_read_only,
                         delegate_writes: crate::chat_agents::delegate_writes(definition),
                         forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                        ships_nothing,
                     };
                     let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
                     crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))

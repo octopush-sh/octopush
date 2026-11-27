@@ -1,14 +1,16 @@
 import { useEffect, useRef } from "react";
-import { FilePlus2 } from "lucide-react";
+import { ClipboardCheck, FilePlus2 } from "lucide-react";
 
 interface Props {
   x: number;
   y: number;
   onCreateWorkspace: () => void;
+  /** Opens the creator on Test a ticket, with this ticket linked. */
+  onTestTicket?: () => void;
   onClose: () => void;
 }
 
-export function BacklogRowContextMenu({ x, y, onCreateWorkspace, onClose }: Props) {
+export function BacklogRowContextMenu({ x, y, onCreateWorkspace, onTestTicket, onClose }: Props) {
   const ref = useRef<HTMLDivElement>(null);
 
   // Close on Escape
@@ -55,6 +57,21 @@ export function BacklogRowContextMenu({ x, y, onCreateWorkspace, onClose }: Prop
         <FilePlus2 size={12} className="shrink-0" />
         Create workspace
       </button>
+      {onTestTicket && (
+        <button
+          type="button"
+          role="menuitem"
+          data-tour="backlog-test-ticket"
+          onClick={() => {
+            onTestTicket();
+            onClose();
+          }}
+          className="flex w-full items-center gap-2 rounded-md px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass"
+        >
+          <ClipboardCheck size={12} className="shrink-0" />
+          Test this ticket
+        </button>
+      )}
     </div>
   );
 }

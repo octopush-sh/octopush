@@ -122,6 +122,18 @@ describe("ContextHeader", () => {
     expect(screen.queryByTitle(/sandboxed execution/i)).not.toBeInTheDocument();
   });
 
+  it("shows the test intent and the ship-nothing glyph, and no glyph for a read-only or delivering mission", () => {
+    const { rerender } = render(
+      <ContextHeader {...baseProps} workspaceName="X" branch="test/ENG-42" gitStatus={null} missionIntent="test" missionGitIsolation="ephemeral" />,
+    );
+    expect(screen.getByText("test")).toBeInTheDocument();
+    expect(screen.getByTitle(/ships nothing/i)).toHaveAttribute("data-tour", "context-ships-nothing");
+    rerender(<ContextHeader {...baseProps} workspaceName="X" branch="x" gitStatus={null} missionIntent="review" missionGitIsolation="readonly" />);
+    expect(screen.queryByTitle(/ships nothing/i)).not.toBeInTheDocument();
+    rerender(<ContextHeader {...baseProps} workspaceName="X" branch="x" gitStatus={null} missionIntent="build" missionGitIsolation="ephemeral" />);
+    expect(screen.queryByTitle(/ships nothing/i)).not.toBeInTheDocument();
+  });
+
   it("renders the branch on the chip and again in its provenance popover", () => {
     render(
       <ContextHeader {...baseProps} workspaceName="X" branch="feat/auth" gitStatus={null} />,

@@ -5324,6 +5324,24 @@ mod orchestrator_tests {
         assert!(stages[0].error.as_deref().unwrap().contains("stopped by the director"));
     }
 
+    /// A crew doesn't start in a workspace whose mission ships nothing
+    /// (#1239): its stages don't carry the posture yet. Refused before any
+    /// other gate, so nothing about the run changes.
+    #[tokio::test]
+    async fn launch_run_refuses_a_crew_in_a_mission_that_ships_nothing() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Crew", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        db.lock().insert_mission("m-test", Some(ws.as_str()), "p1", "test", "Test ENG-42", "active", Some("ENG-42"), "ephemeral", "none", "{}").unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Arc::new(Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner)));
+        let err = crate::orchestrator::launch::launch_run(&orch, &db, &run_id, Some(5.0)).await.unwrap_err();
+        assert!(err.to_string().contains(crate::orchestrator::launch::CREW_SHIPS_NOTHING), "{err}");
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert_eq!((run.status.as_str(), run.budget_usd), ("draft", None), "the run is untouched");
+    }
+
     #[tokio::test]
     async fn stop_current_stage_without_inflight_stage_is_a_noop() {
         let (db, _ws) = db_with_workspace();

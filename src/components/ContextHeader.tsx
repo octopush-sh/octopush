@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Shield, Wrench } from "lucide-react";
+import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, PackageX, Shield, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { INTENT_ICON } from "../lib/missionIntent";
+import { INTENT_ICON, shipsNothing } from "../lib/missionIntent";
 import { checksTitle } from "../lib/prChecks";
 import type { ChecksState, GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
@@ -117,6 +117,9 @@ interface Props {
   /** The active mission's execution isolation. `sandbox` adds a mute Shield glyph
    *  to the intent eyebrow. */
   missionExecIsolation?: string | null;
+  /** The active mission's git isolation. With the intent, says whether the
+   *  mission ships nothing, which adds a mute PackageX glyph to the eyebrow. */
+  missionGitIsolation?: string | null;
 }
 
 /**
@@ -150,6 +153,7 @@ export function ContextHeader({
   jiraProjectKey = null,
   missionIntent = null,
   missionExecIsolation = null,
+  missionGitIsolation = null,
 }: Props) {
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const manualKey = workspace?.linkedIssueKey ?? null;
@@ -227,6 +231,16 @@ export function ContextHeader({
               className="octo-pop-in flex flex-none items-center"
             >
               <Shield size={10} aria-hidden />
+            </span>
+          )}
+
+          {shipsNothing(missionIntent, missionGitIsolation) && (
+            <span
+              data-tour="context-ships-nothing"
+              title="Runs locally, ships nothing: pushes, pull requests and publishes an agent asks for are refused"
+              className="octo-pop-in flex flex-none items-center"
+            >
+              <PackageX size={10} aria-hidden />
             </span>
           )}
 

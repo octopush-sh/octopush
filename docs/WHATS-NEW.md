@@ -71,6 +71,7 @@ Current anchors:
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |
+| `context-ships-nothing` | Workspace header eyebrow: the mute `PackageX` glyph (only while the active mission ships nothing, such as Test a ticket) | `ContextHeader.tsx` |
 | `pr-chip-checks` | Workspace header, PR chip: the CI checks glyph (only on an open/draft PR whose checks could be read; failing adds "Fix failing checks…" beside it) | `ContextHeader.tsx` |
 | `genesis-key-save` · `genesis-begin` · `genesis-sketch` | Genesis block (Welcome / New-project "From a prompt"): the inline API-key field (only with no key) · the one primary CTA ("Set a crew on it", or "Wake the crew" with a key and no brief) · "or think it through first" | `GenesisPrompt.tsx` |
 | `welcome-new-study` | Welcome: "Begin a new study" on the secondary line | `WelcomeScreen.tsx` |
@@ -139,6 +140,7 @@ Current anchors:
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
 | `mission-setup-conductor` | New-mission wizard step 3: "From .conductor/settings.toml · edit before it runs" (only while the field holds a Conductor repo's setup script exactly as read) | `MissionCreator.tsx` |
+| `mission-intent-test` · `mission-ships-nothing` · `backlog-test-ticket` | New-mission wizard step 1: the "Test a ticket" card · step 2, Isolation open: its "Runs locally, ships nothing" note (only for that intent) · Backlog ticket menu: "Test this ticket" | `MissionCreator.tsx` · `BacklogRowContextMenu.tsx` |
 | `mission-share` · `mission-share-install` · `mission-share-sandbox` | New-mission wizard step 3: the "Share with new missions" list (only when the main checkout has a dependency folder or env file to share) · its amber "This setup script runs…" line (only while a dependency folder is on and the setup script installs or cleans) · its amber "A sandboxed mission gets neither the links nor the env files" line (only while an entry is on and Execution is Local sandbox) | `MissionCreator.tsx` |
 | `routines-run-now-phase` | Settings › Routines, only while Run now is in flight: the row's phase line ("running the setup script…") | `settings/RoutinesPane.tsx` |
 | `routines-login-expiry` · `mission-control-login-expiry` | Settings › Routines (above the list) · Mission Control header: the claude.ai sign-in note (only within 10 days of its end, or after it) | `ClaudeLoginNote.tsx` via `settings/RoutinesPane.tsx` · `MissionControl.tsx` |
