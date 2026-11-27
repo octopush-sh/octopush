@@ -1869,7 +1869,8 @@ mod tests {
         ];
         for rel in places {
             let c = write(out.join(rel), &granted).unwrap_or_else(|| panic!("{rel} asks under a granted folder"));
-            assert!(c.reason.contains("it runs code") && c.grant.is_none(), "{rel}: {}", c.reason);
+            // `settings.local.json` is also named like a credentials file.
+            assert!((c.reason.contains("it runs code") || c.sensitive) && c.grant.is_none(), "{rel}: {}", c.reason);
         }
         #[cfg(unix)]
         {
@@ -2449,9 +2450,9 @@ mod tests {
     }
 
     /// `core.hooksPath` is asked of Git for the target's repository at each
-    /// check (#1229), never kept from an earlier one: a husky-style folder
-    /// in another repository asks, and so does one set mid-turn, before and
-    /// as a write lands.
+    /// check (#1229), never kept from an earlier one: a hooks folder another
+    /// repository sets asks, and so does one set mid-turn, before and as a
+    /// write lands.
     #[test]
     fn the_hooks_path_is_asked_per_check_and_never_kept() {
         let (_d, ws, home) = setup();
@@ -2469,11 +2470,11 @@ mod tests {
         std::fs::create_dir_all(ws.join(".husky")).unwrap();
         let landed = std::fs::canonicalize(ws.join(".husky")).unwrap().join("pre-commit");
         assert!(check.recheck(&landed).is_err_and(|e| e.contains("now asks")), "a write checked before lands refused");
-        // A husky-style folder in another repository.
+        // A hooks folder another repository sets (`.husky` there asks by name too).
         let other = home.join("other");
         std::fs::create_dir_all(&other).unwrap();
-        assert!(git(&other, &["init", "-q"]) && git(&other, &["config", "core.hooksPath", ".husky"]));
-        let c = reach.outside_card(None, "write_file", &json!({"path": other.join(".husky/pre-push"), "content": "x"}), false, &[]).unwrap();
+        assert!(git(&other, &["init", "-q"]) && git(&other, &["config", "core.hooksPath", ".hooks"]));
+        let c = reach.outside_card(None, "write_file", &json!({"path": other.join(".hooks/pre-push"), "content": "x"}), false, &[]).unwrap();
         assert!(c.reason.contains("core.hooksPath") && c.grant.is_none(), "{}", c.reason);
     }
 
