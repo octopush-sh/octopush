@@ -172,8 +172,9 @@ export function CompanionContext({
 
         {/* Capabilities — the instruction files this conversation follows,
             then the MCP servers it can use, each a toggle for this
-            conversation only. Skills are per message now (`/name` in the
-            text), not a conversation setting, so none is listed here. */}
+            conversation only, and the counts of its skills and sub-agent
+            types. Skills run per message (`/name` in the text), so their
+            list only offers to add one to the draft. */}
         <CompanionInstructions worktreePath={worktreePath} workspaceId={workspaceId} />
         <CompanionMcpScope worktreePath={worktreePath} workspaceId={workspaceId} />
 

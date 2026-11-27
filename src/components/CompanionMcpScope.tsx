@@ -4,6 +4,7 @@ import { ipc } from "../lib/ipc";
 import type { McpServerStatus } from "../lib/types";
 import { useChatStore } from "../stores/chatStore";
 import { useMcpScopeStore } from "../stores/mcpScopeStore";
+import { CompanionCatalogCounts, useTalkCatalog } from "./CompanionCatalog";
 
 // Stable empties so the selectors never hand React a fresh array per render.
 const NO_STATUS: McpServerStatus[] = [];
@@ -77,13 +78,15 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
 /**
  * The Conversation section's "can use" row: one chip per MCP server
  * configured for the workspace (Settings › Integrations and the project's
- * `.claude/mcp.json`). Every server is on in every conversation; clicking a
- * chip turns it off for this conversation only, and clicking again turns it
- * back on. Hidden when no server is configured.
+ * `.claude/mcp.json`), then the `skills · N` and `agents · N` counts. Every
+ * server is on in every conversation; clicking a chip turns it off for this
+ * conversation only, and clicking again turns it back on. Hidden when there
+ * is no server, skill or agent.
  */
 export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?: string; workspaceId?: string }) {
   const { threadId, status, off, loaded } = useMcpScope(worktreePath, workspaceId ?? "");
-  if (status.length === 0) return null;
+  const catalog = useTalkCatalog(worktreePath, workspaceId ?? "");
+  if (status.length === 0 && catalog.skills.length === 0 && catalog.agents.length === 0) return null;
   return (
     <div
       className="octo-rise-in mt-3 flex flex-wrap items-center gap-x-3 gap-y-1"
@@ -92,7 +95,7 @@ export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?
     >
       <span
         className="text-octo-sage"
-        title="MCP servers from Settings › Integrations and this project's .claude/mcp.json. Click one to turn it off or back on in this conversation."
+        title="MCP servers from Settings › Integrations and this project's .claude/mcp.json (click one to turn it off or back on in this conversation), then the skills and sub-agent types this conversation can use."
       >
         can use
       </span>
@@ -133,6 +136,7 @@ export function CompanionMcpScope({ worktreePath, workspaceId }: { worktreePath?
           </button>
         );
       })}
+      <CompanionCatalogCounts catalog={catalog} workspaceId={workspaceId} />
     </div>
   );
 }

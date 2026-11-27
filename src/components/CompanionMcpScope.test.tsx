@@ -19,6 +19,8 @@ vi.mock("../lib/ipc", () => ({
     getThreadMcpDisabled: (...a: unknown[]) => getThreadMcpDisabled(...a),
     setThreadMcpServer: (...a: unknown[]) => setThreadMcpServer(...a),
     onMcpChanged: (h: () => void) => onMcpChanged(h),
+    listSkills: () => Promise.resolve([]),
+    listSubagentTypes: () => Promise.resolve([]),
   },
 }));
 
