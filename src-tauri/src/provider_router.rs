@@ -72,6 +72,31 @@ pub struct ModelInfo {
     /// Builtin metadata, re-applied on every load ([`backfill_superseded_by`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// The most output tokens one request may ask the model for. Every
+    /// request's `max_tokens` is clamped to it ([`clamp_output`]); `None` (a
+    /// custom model without one, a local server) is sent as asked. Builtin
+    /// metadata, re-applied on every load ([`backfill_max_output`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output: Option<u32>,
+}
+
+/// `asked` output tokens bounded by `cap`, the model's
+/// [`ModelInfo::max_output`]. No cap (or a zero one) leaves it as asked.
+pub fn clamp_output(asked: u32, cap: Option<u32>) -> u32 {
+    match cap {
+        Some(cap) if cap > 0 => asked.min(cap),
+        _ => asked,
+    }
+}
+
+/// `model`'s output cap in the live catalog, if the catalog knows one.
+pub fn model_max_output(model: &str) -> Option<u32> {
+    crate::token_engine::catalog().and_then(|r| r.find_model(model).and_then(|(_, m)| m.max_output))
+}
+
+/// `asked` clamped to `model`'s output cap in the live catalog.
+pub fn clamp_to_model_output(model: &str, asked: u32) -> u32 {
+    clamp_output(asked, model_max_output(model))
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -199,6 +224,9 @@ impl ProviderRouter {
 
             // Builtin metadata: which model replaces which (Fable 5.1 → 5.2).
             backfill_superseded_by(&mut list, &defaults);
+
+            // Builtin metadata: each model's output cap (#1157).
+            backfill_max_output(&mut list, &defaults);
 
             // Migration: backfill missing BUILTIN models into an existing
             // provider. The whole-provider append below only fires when the
@@ -573,6 +601,25 @@ pub(crate) fn backfill_superseded_by(list: &mut [ProviderConfig], defaults: &Has
     n
 }
 
+/// Copy `max_output` from the builtins onto the saved models of the same
+/// provider and id. No setting edits it, so a builtin cap always wins (a file
+/// written before the field existed has none); a model the builtins give no
+/// cap keeps whatever it has. Returns how many models changed.
+pub(crate) fn backfill_max_output(list: &mut [ProviderConfig], defaults: &HashMap<String, ProviderConfig>) -> usize {
+    let mut n = 0;
+    for p in list.iter_mut() {
+        let Some(def) = defaults.get(&p.name) else { continue };
+        for m in &mut p.models {
+            let builtin = def.models.iter().find(|x| x.id == m.id).and_then(|x| x.max_output);
+            if builtin.is_some() && m.max_output != builtin {
+                m.max_output = builtin;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
     let mut map = HashMap::new();
 
@@ -587,9 +634,13 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // 2026-10-29): 1M-token context, 128K max output. Prices must
                 // match `token_engine::builtin_prices`. Fable 5.2: pricing page
                 // fetched 2026-11-09. Mythos 5.2 is priced there but not listed
-                // here (limited availability).
+                // here (limited availability). Output caps: 128K for the
+                // current lineup and Opus 4.6, 64K for Sonnet 4.6 and Haiku
+                // 4.5; the other previous models keep 64K, the most Talk and
+                // Direct ever ask for, so the clamp never lowers what they ran with.
                 ModelInfo {
                     id: "claude-fable-5-2".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "Claude Fable 5.2".into(),
                     input_cost_per_m: 8.0,
@@ -603,6 +654,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-opus-5-5".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "Claude Opus 5.5".into(),
                     input_cost_per_m: 4.0,
@@ -616,6 +668,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-5-5".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "Claude Sonnet 5.5".into(),
                     input_cost_per_m: 2.0,
@@ -632,6 +685,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     // per-request paths apply the >100K tier
                     // (`token_engine::request_prices`).
                     id: "claude-haiku-5-5".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "Claude Haiku 5.5".into(),
                     input_cost_per_m: 0.10,
@@ -645,6 +699,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-fable-5-1".into(),
+                    max_output: Some(64_000),
                     // Same prices × 0.8 on every column (token_engine).
                     superseded_by: Some("claude-fable-5-2".into()),
                     display_name: "Claude Fable 5.1".into(),
@@ -659,6 +714,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-fable-5".into(),
+                    max_output: Some(64_000),
                     superseded_by: None,
                     display_name: "Claude Fable 5".into(),
                     input_cost_per_m: 10.0,
@@ -672,6 +728,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-opus-4-8".into(),
+                    max_output: Some(64_000),
                     superseded_by: None,
                     display_name: "Claude Opus 4.8".into(),
                     input_cost_per_m: 5.0,
@@ -685,6 +742,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-5".into(),
+                    max_output: Some(64_000),
                     superseded_by: None,
                     display_name: "Claude Sonnet 5".into(),
                     input_cost_per_m: 2.0,
@@ -698,6 +756,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-haiku-4-5".into(),
+                    max_output: Some(64_000),
                     superseded_by: None,
                     display_name: "Claude Haiku 4.5".into(),
                     input_cost_per_m: 1.0,
@@ -712,6 +771,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // ── Legacy ids retained so historical runs still price correctly ──
                 ModelInfo {
                     id: "claude-opus-4-6".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "Claude Opus 4.6".into(),
                     input_cost_per_m: 5.0,
@@ -725,6 +785,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-4-6".into(),
+                    max_output: Some(64_000),
                     superseded_by: None,
                     display_name: "Claude Sonnet 4.6".into(),
                     input_cost_per_m: 3.0,
@@ -761,6 +822,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // (`token_engine::request_prices`).
                 ModelInfo {
                     id: "gpt-6.2-astra".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "GPT-6.2 Astra".into(),
                     input_cost_per_m: 8.0,
@@ -774,6 +836,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "gpt-6.2-sol".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "GPT-6.2 Sol".into(),
                     input_cost_per_m: 2.0,
@@ -790,6 +853,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // writes $1.25. Prices must match `token_engine::builtin_prices`.
                 ModelInfo {
                     id: "gpt-6.1-terra".into(),
+                    max_output: Some(128_000),
                     superseded_by: None,
                     display_name: "GPT-6.1 Terra".into(),
                     input_cost_per_m: 1.0,
@@ -801,8 +865,10 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     supports_tools: true,
                     tags: vec!["balanced".into()],
                 },
+                // GPT-4o and GPT-4o mini take at most 16,384 output tokens.
                 ModelInfo {
                     id: "gpt-4o".into(),
+                    max_output: Some(16_384),
                     superseded_by: None,
                     display_name: "GPT-4o".into(),
                     input_cost_per_m: 2.50,
@@ -818,6 +884,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
+                    max_output: Some(16_384),
                     superseded_by: None,
                     display_name: "GPT-4o mini".into(),
                     input_cost_per_m: 0.15,
@@ -844,8 +911,10 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "https://api.deepseek.com/v1".into(),
             api_key_env: "DEEPSEEK_API_KEY".into(),
             models: vec![
+                // Output caps: 8K for Chat, 64K for Reasoner.
                 ModelInfo {
                     id: "deepseek-chat".into(),
+                    max_output: Some(8_192),
                     superseded_by: None,
                     display_name: "DeepSeek Chat".into(),
                     input_cost_per_m: 0.14,
@@ -859,6 +928,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "deepseek-reasoner".into(),
+                    max_output: Some(64_000),
                     superseded_by: None,
                     display_name: "DeepSeek Reasoner".into(),
                     input_cost_per_m: 0.55,
@@ -885,8 +955,11 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "http://localhost:11434/v1".into(),
             api_key_env: String::new(),
             models: vec![
+                // No output cap: the local server bounds a reply by the
+                // model's context and doesn't refuse a larger `max_tokens`.
                 ModelInfo {
                     id: "llama3.3".into(),
+                    max_output: None,
                     superseded_by: None,
                     display_name: "Llama 3.3".into(),
                     input_cost_per_m: 0.0,
@@ -900,6 +973,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "qwen2.5-coder".into(),
+                    max_output: None,
                     superseded_by: None,
                     display_name: "Qwen 2.5 Coder".into(),
                     input_cost_per_m: 0.0,
@@ -913,6 +987,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "deepseek-r1".into(),
+                    max_output: None,
                     superseded_by: None,
                     display_name: "DeepSeek R1".into(),
                     input_cost_per_m: 0.0,
@@ -1017,6 +1092,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.superseded_by, None);
+    }
+
+    #[test]
+    fn builtin_models_carry_output_caps_and_clamp_to_them() {
+        let router = ProviderRouter { providers: builtin_providers() };
+        let cap = |id: &str| router.find_model(id).unwrap().1.max_output;
+        // Deep's 64000 fits every Anthropic model; GPT-4o takes 16,384.
+        assert_eq!(clamp_output(64_000, cap("claude-opus-5-5")), 64_000);
+        assert_eq!(clamp_output(64_000, cap("claude-haiku-4-5")), 64_000);
+        assert_eq!(clamp_output(64_000, cap("gpt-4o")), 16_384);
+        assert_eq!(clamp_output(32_768, cap("deepseek-chat")), 8_192);
+        // Every cloud builtin has a cap; a local or custom model isn't clamped.
+        for p in router.providers.values().filter(|p| !p.local) {
+            for m in &p.models {
+                assert!(m.max_output.is_some_and(|c| c >= 4096), "{} has no output cap", m.id);
+            }
+        }
+        assert_eq!(clamp_output(64_000, cap("llama3.3")), 64_000);
+        assert_eq!(clamp_output(64_000, None), 64_000);
+        assert_eq!(clamp_output(64_000, Some(0)), 64_000, "a zero cap is no cap");
+    }
+
+    #[test]
+    fn max_output_is_backfilled_from_the_builtins_and_custom_models_keep_none() {
+        let defaults = builtin_providers();
+        let mut saved = defaults["openai"].clone();
+        for m in &mut saved.models {
+            m.max_output = None;
+        }
+        let mut custom = saved.clone();
+        custom.name = "corp-gateway".into();
+        let mut list = vec![saved, custom];
+        assert_eq!(backfill_max_output(&mut list, &defaults), 5);
+        assert_eq!(list[0].models.iter().find(|m| m.id == "gpt-4o").unwrap().max_output, Some(16_384));
+        assert!(list[1].models.iter().all(|m| m.max_output.is_none()), "a custom provider is left alone");
+        assert_eq!(backfill_max_output(&mut list, &defaults), 0);
+        // An older providers.json without the field still loads.
+        let old: ModelInfo = serde_json::from_str(
+            r#"{"id":"m","displayName":"M","inputCostPerM":1,"outputCostPerM":2,"maxContext":10}"#,
+        )
+        .unwrap();
+        assert_eq!(old.max_output, None);
+        assert_eq!(serde_json::to_value(&list[0].models[0]).unwrap()["maxOutput"], 128_000);
     }
 
     #[test]

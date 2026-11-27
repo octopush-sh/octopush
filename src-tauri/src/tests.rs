@@ -2722,6 +2722,7 @@ mod provider_catalog_tests {
             cache_read_cost_per_m: 0.0, cache_creation_cost_per_m: 0.0,
             max_context: 200_000, supports_vision: false, supports_tools: true, tags: vec![],
             superseded_by: None,
+            max_output: None,
         }
     }
 
