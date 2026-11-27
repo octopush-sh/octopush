@@ -645,9 +645,12 @@ pub fn request_cost_for_split(model: &str, input: u64, output: u64, cache_read: 
 //
 // Claude Code's fast mode marks each request `usage.speed: "fast"` and bills
 // it at a premium (https://code.claude.com/docs/en/fast-mode, checked by the
-// owner 2026-11-03): Opus 5 and Opus 4.8 only, $10/$50 per MTok flat across
-// the 1M context, with the usual cache multipliers on top. On a Claude plan
-// it is billed to usage credits, not the plan.
+// owner 2026-11-03): Opus 5 and Opus 4.8 at $10/$50 per MTok flat across
+// the 1M context, with the usual cache multipliers on top. Fable 5.2 and
+// Mythos 5.2 run in fast mode at $16/$80 (fast-mode page and the pricing
+// page's fast-mode table, checked 2026-11-26): 2× their $8/$40. Opus 5.5's
+// fast rate is not priced yet (#473). On a Claude plan fast mode is billed
+// to usage credits, not the plan.
 
 /// `usage.speed` of a fast-mode request.
 pub const SPEED_FAST: &str = "fast";
@@ -672,6 +675,7 @@ pub fn is_fast(speed: Option<&str>) -> bool {
 /// → $10/$50, a cache hit $0.50 → $1, a 1-hour write $10 → $20.
 fn fast_mode_multiplier(model: &str) -> Option<f64> {
     match normalize_model_id(model).as_str() {
+        "claude-fable-5-2" | "claude-mythos-5-2" => Some(2.0),
         "claude-opus-5" | "claude-opus-4-8" => Some(2.0),
         _ => None,
     }
