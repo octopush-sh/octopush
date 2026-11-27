@@ -67,6 +67,12 @@ impl ContextGuard {
         }
     }
 
+    /// Export the workspace's port block (#1219) to the session's PTY:
+    /// `OCTOPUSH_PORT`, `OCTOPUSH_PORT_COUNT` and `CONDUCTOR_PORT`.
+    pub fn set_ports(&mut self, block: crate::workspace_ports::PortBlock) {
+        self.env_vars.extend(block.env());
+    }
+
     /// Merge the guard's env_vars into the given map (guard wins on conflict).
     pub fn apply_env(&self, target: &mut HashMap<String, String>) {
         for (k, v) in &self.env_vars {
@@ -186,6 +192,19 @@ mod tests {
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature/cool\n").unwrap();
         let guard = ContextGuard::auto_configure("test-5", tmp.path());
         assert_eq!(guard.git_branch.as_deref(), Some("feature/cool"));
+    }
+
+    #[test]
+    fn set_ports_exports_the_block() {
+        let tmp = TempDir::new().unwrap();
+        let mut guard = ContextGuard::auto_configure("test-8", tmp.path());
+        assert!(!guard.env_vars.contains_key("OCTOPUSH_PORT"));
+        guard.set_ports(crate::workspace_ports::PortBlock::new(40030));
+        let mut env = HashMap::new();
+        guard.apply_env(&mut env);
+        assert_eq!(env["OCTOPUSH_PORT"], "40030");
+        assert_eq!(env["OCTOPUSH_PORT_COUNT"], "10");
+        assert_eq!(env["CONDUCTOR_PORT"], "40030");
     }
 
     #[test]

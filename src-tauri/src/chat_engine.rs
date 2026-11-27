@@ -1507,6 +1507,11 @@ pub enum ApprovalDecision {
     Approve,
     /// Approve and stop asking for this conversation (auto-approve the thread).
     ApproveAlways,
+    /// An MCP card's "Always allow this tool" (#1243): approve, and trust the
+    /// tool app-wide in Edit freely. On any other card, one approval.
+    TrustTool,
+    /// An MCP card's "Trust <server>": the same for every tool of the server.
+    TrustServer,
 }
 
 impl ApprovalDecision {
@@ -1515,6 +1520,8 @@ impl ApprovalDecision {
         match s {
             "approve" => ApprovalDecision::Approve,
             "always" => ApprovalDecision::ApproveAlways,
+            "tool" => ApprovalDecision::TrustTool,
+            "server" => ApprovalDecision::TrustServer,
             _ => ApprovalDecision::Deny,
         }
     }
@@ -1548,6 +1555,15 @@ pub struct ApprovalRequestEvent {
     /// its "Allow reading … for this conversation" answer remembers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remember_dir: Option<String>,
+    /// An Ask first card for a file change (#1231): the diff the call makes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    /// An MCP card in Edit freely (#1243): the server and tool its "Trust
+    /// <server>" and "Always allow this tool" answers would trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_tool: Option<String>,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1598,9 +1614,23 @@ pub(crate) struct ApprovalBroker {
     /// Folders a thread's commands may read without asking, each one the
     /// user allowed from a command's card (#1201; in-memory, like the grant).
     read_dirs: Mutex<HashMap<String, Vec<std::path::PathBuf>>>,
+    /// Where an MCP card's lasting answers are kept (`mcp::trust`, #1243):
+    /// app-wide, in the database. `None` (a test) keeps none.
+    trust_db: Option<Arc<Mutex<Db>>>,
 }
 
 impl ApprovalBroker {
+    pub fn with_trust(db: Arc<Mutex<Db>>) -> Self {
+        Self { trust_db: Some(db), ..Self::default() }
+    }
+
+    /// What the user trusts to run without an MCP card in Edit freely, in
+    /// `worktree`, read now, so a revoke in Settings or a changed entry
+    /// applies to the next call.
+    pub fn mcp_trust(&self, worktree: &std::path::Path) -> crate::mcp::trust::TrustView {
+        self.trust_db.as_ref().map(|db| crate::mcp::trust::TrustView::read(db, worktree)).unwrap_or_default()
+    }
+
     pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
         if let Some(parked) = self.approvals.lock().remove(call_id) {
             let _ = parked.tx.send(decision);
@@ -1703,9 +1733,8 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
-        self.record(thread_id, decision, false);
-        decision
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None, None, None).await;
+        self.record(thread_id, decision, false)
     }
 
     /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
@@ -1724,17 +1753,36 @@ impl ApprovalBroker {
         }
         let marks = Some((card.kind, card.sensitive));
         let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
-        self.settle_card(thread_id, decision, &card)
+        let diff = card.diff.as_deref();
+        let trust = card.trust.as_ref();
+        let decision =
+            self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, diff, trust).await;
+        let settled = self.settle_card(thread_id, decision, &card);
+        if trust.is_some() && matches!(decision, ApprovalDecision::TrustTool | ApprovalDecision::TrustServer) {
+            // Settings and the Companion list it.
+            let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+        }
+        settled
     }
 
     /// What an answer to a `talk_guard` card does: "always" on a command's
     /// card that offers a folder lets the thread's commands read it from now
-    /// on and counts as one approval (#1201); any other as [`Self::record`].
+    /// on and counts as one approval (#1201); "tool" or "server" on an MCP
+    /// card that offers trust keeps it app-wide (#1243) and counts as one
+    /// approval; any other as [`Self::record`].
     pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard) -> ApprovalDecision {
-        match (decision, &card.remember) {
-            (ApprovalDecision::ApproveAlways, Some((dir, _))) => {
+        match (decision, &card.remember, &card.trust) {
+            (ApprovalDecision::ApproveAlways, Some((dir, _)), _) => {
                 self.read_dirs.lock().entry(thread_id.to_string()).or_default().push(dir.clone());
+                ApprovalDecision::Approve
+            }
+            (ApprovalDecision::TrustTool | ApprovalDecision::TrustServer, _, Some(offer)) => {
+                let tool = (decision == ApprovalDecision::TrustTool).then_some(offer.tool.as_str());
+                if let Some(db) = &self.trust_db {
+                    if let Err(e) = crate::mcp::trust::grant(&db.lock(), &offer.server, &offer.config, tool) {
+                        tracing::warn!(error = %e, "could not keep the MCP trust; approved this call only");
+                    }
+                }
                 ApprovalDecision::Approve
             }
             _ => self.record(thread_id, decision, !card.kind.grantable()),
@@ -1767,16 +1815,18 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None, None, None)
             .await;
         self.record(thread_id, decision, true)
     }
 
     /// Keep a "don't ask again" grant, except from a card that grants nothing
     /// (`secret`: the secret card, a file outside the workspace), whose
-    /// approval reads as a plain one. Returns the decision to act on.
+    /// approval reads as a plain one, and a trust answer on a card that
+    /// offers none, which is one approval. Returns the decision to act on.
     pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
         match decision {
+            ApprovalDecision::TrustTool | ApprovalDecision::TrustServer => ApprovalDecision::Approve,
             ApprovalDecision::ApproveAlways if secret => ApprovalDecision::Approve,
             ApprovalDecision::ApproveAlways => {
                 self.auto_approve.lock().insert(thread_id.to_string());
@@ -1795,7 +1845,7 @@ impl ApprovalBroker {
 
     /// Emit the card and wait for its answer. `secret` is `Some(covers
     /// uncommitted)` for the secret guard's card, `card` the kind and
-    /// sensitivity of a `talk_guard` card.
+    /// sensitivity of a `talk_guard` card, `diff` an Ask first card's diff.
     #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
@@ -1808,6 +1858,8 @@ impl ApprovalBroker {
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
+        diff: Option<&str>,
+        trust: Option<&crate::talk_guard::TrustOffer>,
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1823,6 +1875,9 @@ impl ApprovalBroker {
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
+            diff: diff.map(str::to_string),
+            trust_server: trust.map(|o| o.server.clone()),
+            trust_tool: trust.map(|o| o.tool.clone()),
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -2776,6 +2831,48 @@ fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String
     tries.into_iter().find(|(o, _)| !o.is_empty() && content.contains(o.as_str()))
 }
 
+/// Why an `edit_file` call can't apply whatever the file holds, or `None`.
+fn edit_input_problem(input: &serde_json::Value) -> Option<String> {
+    let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+    let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    if old_string.is_empty() {
+        return Some("edit_file needs a non-empty `old_string`".to_string());
+    }
+    (old_string == new_string).then(|| "`old_string` and `new_string` are identical — nothing to change".to_string())
+}
+
+/// What an `edit_file` call leaves of `content` and how many occurrences it
+/// replaced, or why it doesn't apply. Pure, so Ask first's card (#1231)
+/// shows the very edit the tool makes.
+pub(crate) fn apply_edit(content: &str, input: &serde_json::Value, path: &str) -> Result<(String, usize), String> {
+    if let Some(problem) = edit_input_problem(input) {
+        return Err(problem);
+    }
+    let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+    let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The model copied the edit from `read_file`'s view (`edit_from_view`).
+    let (old_string, new_string) = edit_from_view(content, old_string, new_string)
+        .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
+    let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
+    let count = content.matches(old_string).count();
+    if count == 0 {
+        return Err(format!(
+            "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
+        ));
+    }
+    if count > 1 && !replace_all {
+        return Err(format!(
+            "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
+        ));
+    }
+    Ok(if replace_all {
+        (content.replace(old_string, new_string), count)
+    } else {
+        (content.replacen(old_string, new_string, 1), 1)
+    })
+}
+
 /// [`execute_tool_cancellable`] with no cancel flag. The app always passes
 /// one ([`run_builtin`]); tests call this.
 #[cfg(test)]
@@ -3096,45 +3193,17 @@ pub(crate) fn execute_tool_cancellable(
         }
         "edit_file" => {
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
-            let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-            if old_string.is_empty() {
-                return ("edit_file needs a non-empty `old_string`".to_string(), false);
-            }
-            if old_string == new_string {
-                return ("`old_string` and `new_string` are identical — nothing to change".to_string(), false);
+            if let Some(problem) = edit_input_problem(input) {
+                return (problem, false);
             }
             let full = workspace_path.join(path);
             let content = match std::fs::read_to_string(&full) {
                 Ok(c) => c,
                 Err(e) => return (format!("Error reading {path}: {e}"), false),
             };
-            // The model copied the edit from `read_file`'s view (`edit_from_view`).
-            let (old_string, new_string) = edit_from_view(&content, old_string, new_string)
-                .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
-            let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
-            let count = content.matches(old_string).count();
-            if count == 0 {
-                return (
-                    format!(
-                        "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
-                    ),
-                    false,
-                );
-            }
-            if count > 1 && !replace_all {
-                return (
-                    format!(
-                        "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
-                    ),
-                    false,
-                );
-            }
-            let (updated, replaced) = if replace_all {
-                (content.replace(old_string, new_string), count)
-            } else {
-                (content.replacen(old_string, new_string, 1), 1)
+            let (updated, replaced) = match apply_edit(&content, input, path) {
+                Ok(edit) => edit,
+                Err(problem) => return (problem, false),
             };
             // Same containment story as write_file: lexical pre-check plus the
             // kernel-enforced sandboxed write when the mission is sandboxed.
@@ -3424,6 +3493,7 @@ impl ChatEngine {
     pub fn new(db: Arc<Mutex<Db>>, daemon: Option<Arc<crate::pty_client::DaemonClient>>) -> Self {
         let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
         talk_shell.set_client(daemon);
+        let approvals = Arc::new(ApprovalBroker::with_trust(Arc::clone(&db)));
         Self {
             // Clone of the process-wide client — shares its connection pool.
             client: shared_http_client().clone(),
@@ -3431,7 +3501,7 @@ impl ChatEngine {
             cancels: Arc::new(Mutex::new(HashMap::new())),
             mcp: Arc::new(crate::mcp::McpRegistry::new()),
             talk_shell,
-            approvals: Arc::new(ApprovalBroker::default()),
+            approvals,
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
             stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -4160,6 +4230,13 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Give the thread's Talk shell the workspace's port block (#1219), for
+    /// when it is next spawned.
+    fn set_shell_ports(&self, workspace_id: &str, thread_id: &str) {
+        let ports = crate::workspace_ports::ensure(&self.db.lock(), workspace_id);
+        self.talk_shell.set_spawn_env(thread_id, ports.map(|b| b.env()).unwrap_or_default());
+    }
+
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
     ///
     /// Persists the command as a user turn (`$ cmd`) and the output as a
@@ -4207,6 +4284,7 @@ impl ChatEngine {
         });
 
         let started = std::time::Instant::now();
+        self.set_shell_ports(&request.workspace_id, &request.thread_id);
         let shell = Arc::clone(&self.talk_shell);
         let thread_id = request.thread_id.clone();
         let workspace_path = request.workspace_path.clone();
@@ -4739,8 +4817,9 @@ impl ChatEngine {
         // the user switched off in this conversation (Companion "can use")
         // are left out and never started for it; the same path as
         // sub-agents'. What it offers is fixed for the turn. Any MCP tool it
-        // didn't discover with `readOnlyHint` asks first (#1147).
-        let mcp_read_only: std::collections::HashSet<String> = {
+        // didn't discover with `readOnlyHint` asks first (#1147), unless Edit
+        // freely lets it run (`talk_guard::McpTools`, #1243).
+        let (mcp_read_only, mcp_tools): (std::collections::HashSet<String>, crate::talk_guard::McpTools) = {
             let discovered = discover_thread_mcp_tools(
                 Arc::clone(&self.mcp),
                 &self.db,
@@ -4755,7 +4834,8 @@ impl ChatEngine {
             // gives the same tool bytes on every turn, so the provider's
             // prompt cache, which starts at the tool list, survives.
             tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
-            discovered.into_iter().filter(|t| t.read_only).map(|t| t.namespaced).collect()
+            let classes = crate::talk_guard::McpTools::new(&discovered);
+            (discovered.into_iter().filter(|t| t.read_only).map(|t| t.namespaced).collect(), classes)
         };
         // Where the file tools may go without asking (#1147). A sandboxed
         // mission's own sandbox refuses a write outside the workspace.
@@ -4834,6 +4914,9 @@ impl ChatEngine {
 
         // Tool rounds in a row cut at the output limit: two end the turn.
         let mut truncations = TruncationStreak::default();
+
+        // The mode the last round ran in, so a switch during the turn is noted.
+        let mut round_mode: Option<crate::permissions::Mode> = None;
 
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
@@ -4934,6 +5017,17 @@ impl ChatEngine {
             usage.add(&request.model, &response);
             self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
             pending_throttle = compute_throttle(&response);
+
+            // A switch during the turn applies from this round, and leaves a
+            // quiet note naming the mode now in force (#1231), before the
+            // round's rows. The v2 transcript skips it (`is_mode_note`).
+            if round_mode.is_some_and(|was| was != mode) {
+                let note = crate::permissions::mode_note(mode);
+                if let Err(e) = self.insert_and_emit_message(&app, &request.workspace_id, &request.thread_id, "stopped", &note, None, None, None, None) {
+                    tracing::warn!(error = %e, "failed to note the permission mode switch");
+                }
+            }
+            round_mode = Some(mode);
 
             tracing::info!(
                 iteration = iteration,
@@ -5077,23 +5171,30 @@ impl ChatEngine {
             messages.push(tool_round_turn(&response));
 
             // The mode decides each call before anything runs (#1146): a call
-            // it refuses gets a fixed result and never reaches a card.
-            let mode_denials: HashMap<String, String> = response
-                .tool_uses
-                .iter()
-                .filter_map(|u| {
-                    let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
-                    let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
-                    let ctx = crate::permissions::PolicyCtx {
-                        exec_roots: exec_roots.as_deref(),
-                        mcp_read_only: &mcp_read_only,
-                        delegate_writes: crate::chat_agents::delegate_writes(definition),
-                        forced: crate::permissions::forced(sandbox_roots.as_deref()),
-                    };
-                    let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
-                    crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
-                })
-                .collect();
+            // it refuses gets a fixed result and never reaches a card; one
+            // Ask first holds waits on its card below (#1231).
+            let mut mode_denials: HashMap<String, String> = HashMap::new();
+            let mut mode_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for u in &response.tool_uses {
+                let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
+                let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
+                let ctx = crate::permissions::PolicyCtx {
+                    exec_roots: exec_roots.as_deref(),
+                    mcp_read_only: &mcp_read_only,
+                    delegate_writes: crate::chat_agents::delegate_writes(definition),
+                    forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                };
+                let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
+                match crate::permissions::decide(mode, &call, &ctx) {
+                    crate::permissions::Decision::Allow => {}
+                    crate::permissions::Decision::Ask { .. } => {
+                        mode_asks.insert(u.id.clone());
+                    }
+                    crate::permissions::Decision::Deny { message } => {
+                        mode_denials.insert(u.id.clone(), message);
+                    }
+                }
+            }
 
             // ── Sub-agents: fan out first ──────────────────────────
             // Every `Agent` call in this response runs CONCURRENTLY (that is
@@ -5263,10 +5364,23 @@ impl ChatEngine {
                 // A tool a skill loaded this turn doesn't allow is refused
                 // before anything asks the user (#1135).
                 let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools).filter(|_| !mode_denied);
+                // Ask first holds a change or a command that doesn't only read
+                // on its card (#1231), its diff checked again once approved: a
+                // file that changed meanwhile asks again. The guards' cards
+                // still ask after it.
+                if mode_asks.contains(&u.id) && skill_refusal.is_none() {
+                    let check = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));
+                    if let Some(card) = check() {
+                        let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                        denied = guard_card(card, &check, ask).await;
+                    }
+                }
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
-                let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
+                let trust = || self.approvals.mcp_trust(Path::new(&request.workspace_path));
+                let mcp = crate::talk_guard::McpCheck { tools: &mcp_tools, mode, trust: &trust };
+                let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp, &reach, writes_confined);
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
@@ -5317,7 +5431,6 @@ impl ChatEngine {
                             )
                             .await
                         {
-                            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {}
                             ApprovalDecision::Deny => {
                                 denied = Some(format!(
                                     "Command not run — the user declined to approve it \
@@ -5325,6 +5438,7 @@ impl ChatEngine {
                                      a safer alternative."
                                 ));
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -5431,6 +5545,7 @@ impl ChatEngine {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
+                    self.set_shell_ports(&request.workspace_id, &request.thread_id);
                     let shell = Arc::clone(&self.talk_shell);
                     let tid = request.thread_id.clone();
                     let wp = request.workspace_path.clone();
@@ -7507,7 +7622,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None,
+            remember_dir: None, diff: None, trust_server: None, trust_tool: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7520,6 +7635,10 @@ mod tests {
         assert!(plain.get("rememberDir").is_none());
         let run = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Run), remember_dir: Some("~/notes".into()), ..ev(false, false) }).unwrap();
         assert_eq!((run["kind"].as_str(), run["rememberDir"].as_str()), (Some("run"), Some("~/notes")));
+        assert!(plain.get("trustServer").is_none() && plain.get("trustTool").is_none());
+        let mcp = ApprovalRequestEvent { kind: Some(CardKind::Mcp), trust_server: Some("s".into()), trust_tool: Some("x".into()), ..ev(false, false) };
+        let mcp = serde_json::to_value(mcp).unwrap();
+        assert_eq!((mcp["trustServer"].as_str(), mcp["trustTool"].as_str()), (Some("s"), Some("x")));
     }
 
     #[test]
@@ -7533,6 +7652,8 @@ mod tests {
             denial: "d".into(),
             sensitive: false,
             remember: Some((dir.clone(), "/tmp/x".into())),
+            diff: None,
+            trust: None,
         };
         assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
         assert_eq!(broker.read_dirs("t"), vec![dir]);
@@ -7554,6 +7675,8 @@ mod tests {
             denial: format!("declined {shown}"),
             sensitive: false,
             remember: None,
+            diff: None,
+            trust: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -7586,9 +7709,57 @@ mod tests {
         let agents = include_str!("chat_agents.rs");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
+        for call in ["self.mcp.card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
             assert!(body.contains(call), "the sub-agent gate calls {call}");
         }
+    }
+
+    #[test]
+    fn an_mcp_card_trusted_in_one_thread_holds_in_every_thread_and_after_a_restart() {
+        use crate::mcp::trust::{fingerprint, load, TrustView};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let users: HashMap<String, crate::mcp::McpServerConfig> =
+            [("sample-server".to_string(), crate::mcp::McpServerConfig { command: "sample".into(), ..Default::default() })].into();
+        let config = fingerprint(&users["sample-server"]);
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let broker = ApprovalBroker::with_trust(Arc::clone(&db));
+        let card = |trust: Option<crate::talk_guard::TrustOffer>| ToolCard {
+            kind: CardKind::Mcp,
+            shown: "mcp__sample-server__post_report {}".into(),
+            reason: "r".into(),
+            denial: "d".into(),
+            sensitive: false,
+            remember: None,
+            trust,
+            diff: None,
+        };
+        let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
+        assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone())), ApprovalDecision::Approve);
+        assert!(!broker.auto_approves("thread-a"), "no thread grant: the trust is app-wide");
+        // A trust answer where none was offered (Plan only, Ask first, a
+        // destructive tool, a project's server, a command) is one approval
+        // and keeps nothing.
+        assert_eq!(broker.settle_card("thread-b", ApprovalDecision::TrustServer, &card(None)), ApprovalDecision::Approve);
+        assert_eq!(broker.record("thread-b", ApprovalDecision::TrustServer, false), ApprovalDecision::Approve);
+        assert!(!load(&db.lock()).iter().any(|t| t.all) && !broker.auto_approves("thread-b"));
+        drop((broker, db));
+        // After a restart, any thread's next call to it runs without a card.
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let view = TrustView::from_configs(load(&db.lock()), &users, &HashMap::new());
+        let tool = crate::mcp::McpToolInfo {
+            server: "sample-server".into(),
+            name: "post_report".into(),
+            namespaced: "mcp__sample-server__post_report".into(),
+            ..Default::default()
+        };
+        let tools = crate::talk_guard::McpTools::new(&[tool]);
+        let edit = crate::permissions::Mode::Edit;
+        assert_eq!(tools.card(None, "mcp__sample-server__post_report", &serde_json::json!({}), edit, &view), None);
+        let restarted = ApprovalBroker::with_trust(Arc::clone(&db));
+        assert_eq!(restarted.settle_card("t", ApprovalDecision::TrustServer, &card(offer)), ApprovalDecision::Approve);
+        assert!(load(&db.lock()).iter().any(|t| t.server == "sample-server" && t.all && t.config == config));
+        assert_eq!(ApprovalDecision::parse("tool"), ApprovalDecision::TrustTool);
+        assert_eq!(ApprovalDecision::parse("server"), ApprovalDecision::TrustServer);
     }
 
     #[test]
@@ -7833,6 +8004,9 @@ mod tests {
             kind: None,
             sensitive: false,
             remember_dir: None,
+            diff: None,
+            trust_server: None,
+            trust_tool: None,
         }
     }
 

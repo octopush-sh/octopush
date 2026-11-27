@@ -71,6 +71,7 @@ Current anchors:
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |
+| `header-ports` | Workspace header, at the eyebrow's right end: the workspace's port range (`40020–40029`; only once the workspace has a block) | `ContextHeader.tsx` |
 | `header-sandbox` · `header-sandbox-confirm` | Workspace header, with a mission: the sandbox toggle (`Shield` while the sandbox is in effect, `ShieldOff` otherwise; disabled for a read-only mission) · the dialog that confirms turning it off | `HeaderSandbox.tsx` via `ContextHeader.tsx` |
 | `pr-chip-checks` | Workspace header, PR chip: the CI checks glyph (only on an open/draft PR whose checks could be read; failing adds "Fix failing checks…" beside it) | `ContextHeader.tsx` |
 | `genesis-key-save` · `genesis-begin` · `genesis-sketch` | Genesis block (Welcome / New-project "From a prompt"): the inline API-key field (only with no key) · the one primary CTA ("Set a crew on it", or "Wake the crew" with a key and no brief) · "or think it through first" | `GenesisPrompt.tsx` |
@@ -131,6 +132,7 @@ Current anchors:
 | `talk-error-action` | Talk: an error card's one action ("Try again", "Configure API key" or "Copy error details"; only on a turn that ended on an error, a tour finds the first) | `chat/ChatCanvas.tsx` |
 | `talk-tool-verdict` | Talk, on a resolved tool row that failed or was denied: its mono verdict after the summary (`exit 1`, `timed out`, `denied`; every such row carries it, a tour finds the first) | `ToolCallCard.tsx` |
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focused only by a click, Tab or ⌘⌥A, never by itself; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
+| `talk-approval-trust` | Talk: an MCP approval card's lasting answers, "Always allow this tool" and "Trust <server>" (only in Edit freely, on a tool not marked destructive, while the card waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
 | `talk-empty-starters` | Talk, in a conversation with no messages yet: the row of starters ("Review what changed" · "Ask about a file" · "Explain this workspace"), each filling the draft without sending | `chat/ChatCanvas.tsx` |
 | `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
@@ -178,6 +180,7 @@ Current anchors:
 | `settings-models-list` | Settings › Models: the selected provider's list of models (only while it has one) | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
+| `settings-mcp-servers` · `settings-mcp-trust` | Settings › Integrations › MCP Servers: the whole section · a server's trust lines with their revoke buttons (only with something trusted) | `settings/McpServersSection.tsx` |
 | `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
 | `settings-mcp-edit` | Settings › Integrations › MCP Servers: the first server's Edit icon button (only with a server configured and no form open on it) | `settings/McpServersSection.tsx` |
 | `settings-mcp-add` · `settings-mcp-type` | Settings › Integrations › MCP Servers: "Add MCP server" (disabled while a form is open) · the open form's Local command / Remote URL choice (only while the add or edit form is open) | `settings/McpServersSection.tsx` · `settings/McpServerForm.tsx` |

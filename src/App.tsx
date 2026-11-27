@@ -1730,7 +1730,7 @@ function App() {
           pushToast({
             level: "error",
             title: "Could not open file",
-            body: String(e),
+            body: String(e).replace(/^other: /, ""),
           }),
         );
       } else {
