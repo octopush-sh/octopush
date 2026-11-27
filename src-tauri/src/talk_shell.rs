@@ -112,6 +112,9 @@ struct Session {
 pub struct TalkShell {
     client: Mutex<Option<Arc<DaemonClient>>>,
     sessions: Mutex<HashMap<String, Arc<Mutex<Session>>>>,
+    /// Per thread, the variables its shell is spawned with besides PATH (the
+    /// workspace's ports, #1219). A shell already running keeps its env.
+    spawn_env: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 impl TalkShell {
@@ -119,7 +122,14 @@ impl TalkShell {
         Self {
             client: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            spawn_env: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set the variables the thread's shell starts with the next time it is
+    /// spawned (its first command, or after a recycle).
+    pub fn set_spawn_env(&self, thread_id: &str, env: Vec<(String, String)>) {
+        self.spawn_env.lock().insert(thread_id.to_string(), env);
     }
 
     pub fn set_client(&self, client: Option<Arc<DaemonClient>>) {
@@ -163,10 +173,11 @@ impl TalkShell {
             let map = self.sessions.lock();
             map.get(thread_id).cloned()
         };
+        let extra = self.spawn_env.lock().get(thread_id).cloned().unwrap_or_default();
         let handle = match existing {
             Some(h) => h,
             None => {
-                let session = Self::ensure_session(&client, thread_id, workspace_path)?;
+                let session = Self::ensure_session(&client, thread_id, workspace_path, &extra)?;
                 let h = Arc::new(Mutex::new(session));
                 let mut map = self.sessions.lock();
                 Arc::clone(map.entry(thread_id.to_string()).or_insert(h))
@@ -210,7 +221,7 @@ impl TalkShell {
             }
             Probe::Dead { output } => {
                 let _ = client.remove(&id);
-                match Self::ensure_session(&client, thread_id, &cwd) {
+                match Self::ensure_session(&client, thread_id, &cwd, &extra) {
                     Ok(fresh) => *handle.lock() = fresh,
                     Err(e) => {
                         self.sessions.lock().remove(thread_id);
@@ -272,7 +283,7 @@ impl TalkShell {
                     _ => {
                         let body = join_nonempty(&[&partial, &note]);
                         let _ = client.remove(&id);
-                        match Self::ensure_session(&client, thread_id, &cwd) {
+                        match Self::ensure_session(&client, thread_id, &cwd, &extra) {
                             Ok(fresh) => *handle.lock() = fresh,
                             Err(e) => {
                                 self.sessions.lock().remove(thread_id);
@@ -332,6 +343,7 @@ impl TalkShell {
     pub fn close(&self, thread_id: &str) {
         let client = self.client.lock().clone();
         let handle = self.sessions.lock().remove(thread_id);
+        self.spawn_env.lock().remove(thread_id);
         if let (Some(client), Some(handle)) = (client, handle) {
             let _ = client.remove(&handle.lock().id);
         }
@@ -344,6 +356,7 @@ impl TalkShell {
         client: &Arc<DaemonClient>,
         thread_id: &str,
         cwd: &str,
+        extra: &[(String, String)],
     ) -> AppResult<Session> {
         let id = format!("talk-{thread_id}");
         let reattaching = client
@@ -359,7 +372,7 @@ impl TalkShell {
         // `/usr/bin` ahead of Homebrew: leave `bash -l`'s PATH alone then.
         let has_login_path = crate::orchestrator::cli_runner::login_env_path().is_some();
         if !reattaching {
-            Self::spawn_bash(client, &id, cwd, &path)?;
+            Self::spawn_bash(client, &id, cwd, &spawn_env(&path, extra))?;
         }
         let nonce = gen_nonce();
         let rx = client.attach(&id, 0)?;
@@ -390,11 +403,18 @@ impl TalkShell {
         }
     }
 
-    fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str, path: &str) -> AppResult<()> {
-        let env = HashMap::from([("PATH".to_string(), path.to_string())]);
-        client.spawn(id, cwd, &env, Some(TALK_BASH), 40, 120)?;
+    fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str, env: &HashMap<String, String>) -> AppResult<()> {
+        client.spawn(id, cwd, env, Some(TALK_BASH), 40, 120)?;
         Ok(())
     }
+}
+
+/// A Talk shell's spawn env: `path` as PATH, plus the thread's `extra`
+/// variables (which never replace PATH).
+fn spawn_env(path: &str, extra: &[(String, String)]) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = extra.iter().filter(|(k, _)| k != "PATH").cloned().collect();
+    env.insert("PATH".to_string(), path.to_string());
+    env
 }
 
 /// The line that gives a Talk shell `path` once (see [`apply_login_path`]):
@@ -791,6 +811,18 @@ mod tests {
         assert!(login_path_line("/a b/it's:/bin").contains("export PATH='/a b/it'\\''s:/bin';"));
     }
 
+    #[test]
+    fn spawn_env_adds_the_extra_variables_but_keeps_path() {
+        let extra = vec![
+            ("OCTOPUSH_PORT".to_string(), "40010".to_string()),
+            ("PATH".to_string(), "/evil".to_string()),
+        ];
+        let env = spawn_env("/usr/bin", &extra);
+        assert_eq!(env["PATH"], "/usr/bin");
+        assert_eq!(env["OCTOPUSH_PORT"], "40010");
+        assert_eq!(spawn_env("/usr/bin", &[]).len(), 1);
+    }
+
     /// One command's captured stream: output then the prompt marker.
     fn stream_buf(output: &str, code: i32, cwd: &str) -> String {
         format!("{output}{RS}{RS}OCTO_DONE_{N}:{code}:{cwd}{RS}{RS}\n")
@@ -1074,6 +1106,24 @@ mod e2e {
         assert_eq!(r.output, "shared", "env lost after a timeout interrupt");
 
         shell.close("u");
+    }
+
+    /// The workspace's port block (#1219) is in the thread's shell, for `$`
+    /// commands and the agent's alike.
+    #[test]
+    #[serial]
+    fn the_shell_starts_with_the_workspace_ports() {
+        let d = boot();
+        let shell = shell_on(&d.sock);
+        let quick = Duration::from_secs(5);
+        shell.set_spawn_env("ports", crate::workspace_ports::PortBlock::new(40060).env());
+
+        let r = done(shell.run("ports", "/tmp", "echo \"$OCTOPUSH_PORT/$OCTOPUSH_PORT_COUNT/$CONDUCTOR_PORT\"", quick, true).unwrap());
+        assert_eq!(r.output, "40060/10/40060");
+        let r = cap(shell.run_capture("ports", "/tmp", "echo \"$OCTOPUSH_PORT\"", quick).unwrap());
+        assert_eq!(r.output, "40060");
+
+        shell.close("ports");
     }
 
     #[test]

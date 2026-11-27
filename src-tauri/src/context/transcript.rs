@@ -166,7 +166,8 @@ pub fn tool_rows(rows: &[Row<'_>]) -> HashMap<String, i64> {
 
 /// The history a v2 turn starts from, on `model`. The ask being answered
 /// (the last user row) goes out whole; `error`, `stopped` and unknown rows
-/// are never replayed; consecutive text turns of one role merge, so roles
+/// are never replayed, and a mode switch's note inside a turn doesn't stop
+/// it replaying as pairs; consecutive text turns of one role merge, so roles
 /// alternate.
 pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
     build_landing(rows, model, &HashSet::new()).0
@@ -267,6 +268,8 @@ fn paired(rows: &[Row<'_>], start: usize, model: &str) -> Option<(Vec<LlmMessage
                 turn.push(round.turn(model));
                 turn.push(LlmMessage { role: LlmRole::User, content: LlmContent::ToolResults(results) });
             }
+            // A mode switch's note between rounds (#1231) was never sent.
+            role if crate::permissions::is_mode_note(role, row.content) => i += 1,
             _ => return None,
         }
     }
@@ -482,6 +485,44 @@ mod tests {
             assert!(out.windows(2).all(|w| w[0].role != w[1].role), "{out:?}");
             assert!(out.iter().any(|m| text(m).contains("[Tool #3: read_file")), "{out:?}");
         }
+    }
+
+    /// A mode switch during a turn leaves a quiet note before the next round
+    /// (#1231); the turn still replays as the pairs it sent, byte for byte.
+    #[test]
+    fn the_v2_transcript_skips_a_mode_note() {
+        use crate::permissions::{is_mode_note, mode_note, Mode};
+        let round = |id: &str| {
+            serde_json::to_string(&RoundRecord {
+                model: "m".into(),
+                raw: vec![],
+                text: String::new(),
+                tool_uses: vec![LlmToolUse { id: id.into(), name: "read_file".into(), input: json!({ "path": "a.rs" }) }],
+            })
+            .unwrap()
+        };
+        let (r1, r2) = (round("tu_1"), round("tu_2"));
+        let (t1, t2) = (tool_record("tu_1", "read_file", "one"), tool_record("tu_2", "read_file", "two"));
+        let note = mode_note(Mode::Ask);
+        assert_eq!(note, "Mode switched to Ask first from this round on.");
+        assert!(is_mode_note("stopped", &note) && !is_mode_note("assistant", &note) && !is_mode_note("stopped", "Generation stopped."));
+        let plain = vec![
+            Row { id: 1, role: "user", content: "read both", ..Row::default() },
+            Row { id: 2, role: "assistant_tool_use", content: "[tool_calls: []]", raw_json: Some(r1.as_str()), ..Row::default() },
+            Row { id: 3, role: "tool", content: &t1, tool_use_id: Some("tu_1"), model_view: Some("one"), ..Row::default() },
+            Row { id: 4, role: "assistant_tool_use", content: "[tool_calls: []]", raw_json: Some(r2.as_str()), ..Row::default() },
+            Row { id: 5, role: "tool", content: &t2, tool_use_id: Some("tu_2"), model_view: Some("two"), ..Row::default() },
+            Row { id: 6, role: "assistant", content: "Done.", ..Row::default() },
+            Row { id: 7, role: "user", content: "next", ..Row::default() },
+        ];
+        // One note before the second round, one before the answer.
+        let mut noted = plain.clone();
+        noted.insert(3, Row { id: 30, role: "stopped", content: &note, ..Row::default() });
+        noted.insert(6, Row { id: 31, role: "stopped", content: &note, ..Row::default() });
+        let (sent, replayed) = (build(&plain, "m"), build(&noted, "m"));
+        assert!(matches!(replayed[1].content, LlmContent::AssistantWithTools { .. }), "{replayed:?}");
+        assert_eq!(format!("{sent:?}"), format!("{replayed:?}"));
+        assert!(!format!("{replayed:?}").contains("Mode switched"));
     }
 
     #[test]

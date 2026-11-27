@@ -27,6 +27,10 @@ pub enum CardKind {
     /// A command naming a path outside the workspace or in a credentials
     /// location (#1201).
     Run,
+    /// A file change Ask first holds (#1231), with its diff.
+    Edit,
+    /// A command Ask first holds (#1231): one that doesn't only read.
+    Exec,
 }
 
 impl CardKind {
@@ -52,6 +56,10 @@ pub struct ToolCard {
     /// commands may read (#1201), a folder the file tools may write, or the
     /// command itself (#1229). Never for a credentials location.
     pub grant: Option<Grant>,
+    /// What an Ask first card for a file change shows (#1231): the unified
+    /// diff the call makes, redacted and capped. Part of the card, so a file
+    /// that changes while the card waits asks again (`guard_card`).
+    pub diff: Option<String>,
     /// What an MCP card offers to trust for good (#1243): only in Edit
     /// freely, never for a tool marked destructive, and only for a
     /// user-level server a project doesn't define (`TrustView::offer`).
@@ -160,7 +168,7 @@ const MCP_ARGS_MAX: usize = 400;
 pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value, destructive: bool) -> ToolCard {
     let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool, destructive);
     let shown = format!("{tool} {}", mcp_args_shown(input));
-    ToolCard { kind: CardKind::Mcp, shown, reason, denial, sensitive: false, grant: None, trust: None }
+    ToolCard { kind: CardKind::Mcp, shown, reason, denial, sensitive: false, grant: None, trust: None, diff: None }
 }
 
 /// What an MCP tool's server says about it, as a card reads it (#1243).
@@ -609,6 +617,11 @@ impl Reach {
         Self::new(workspace, main_checkout, dirs::home_dir().as_deref())
     }
 
+    /// The workspace the file tools join paths onto.
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     /// `path` as the card names it: `~/…` under home, else in full.
     fn shown(&self, path: &Path) -> String {
         match self.home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
@@ -696,6 +709,33 @@ impl Reach {
         (first.is_none() && !scan.over && !scan.ungrantable).then_some(exact)
     }
 
+    /// Whether one of the conversation's `grants` is the user's yes for this
+    /// exact call (#1229), so Ask first (#1231) doesn't hold it on a card: a
+    /// `write_file` or `edit_file` that asks outside the workspace and that a
+    /// write grant covers, or a `run_command` whose exact grant from `cwd`
+    /// (else the workspace) the conversation holds and that reaches nothing
+    /// the grant can't cover. Never an MCP tool, a credentials location or a
+    /// place that runs code (their cards ask whatever is granted), and never
+    /// a write inside the workspace, which no grant names.
+    pub fn granted(&self, name: &str, input: &Value, cwd: Option<&Path>, writes_confined: bool, grants: &[Grant]) -> bool {
+        if grants.is_empty() {
+            return false;
+        }
+        match name {
+            "write_file" | "edit_file" => {
+                self.outside_card(None, name, input, writes_confined, &[]).is_some()
+                    && self.outside_card(None, name, input, writes_confined, grants).is_none()
+            }
+            "run_command" => {
+                let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+                let start = cwd.unwrap_or(&self.workspace);
+                self.exact(command, start).is_some_and(|e| grants.iter().any(|g| g.kind == GrantKind::Command && g.same(&e)))
+                    && self.command_card(None, command, cwd, grants).is_none()
+            }
+            _ => false,
+        }
+    }
+
     /// Scan every line `command` runs ([`Reach::command_card`]).
     fn scan(&self, command: &str, start: &Path, scan: &mut Scan) -> Option<Reached> {
         match crate::chat_engine::each_command(command, |line| self.scan_line(line, start, scan)) {
@@ -751,7 +791,7 @@ impl Reach {
              Work inside the workspace, or ask the user for what you need; do not retry it.",
             r.shown, r.place
         );
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, grant, trust: None })
+        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, grant, trust: None, diff: None })
     }
 
     /// What a `write_file` or `edit_file` call the check just placed is
@@ -891,7 +931,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None })
+        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None, diff: None })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
@@ -1195,7 +1235,7 @@ impl Reached {
 }
 
 /// `reason` with the sub-agent that asks in front, when one does.
-fn sub_agent(label: Option<&str>, reason: String) -> String {
+pub(crate) fn sub_agent(label: Option<&str>, reason: String) -> String {
     match label {
         Some(l) => format!("Sub-agent \u{201c}{l}\u{201d}: {reason}"),
         None => reason,

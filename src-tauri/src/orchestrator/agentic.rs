@@ -710,6 +710,12 @@ pub trait ToolGate: Send + Sync {
     fn write_check(&self, _name: &str, _input: &serde_json::Value) -> Option<crate::talk_guard::WriteCheck> {
         None
     }
+
+    /// A call Talk's Ask first holds (#1231): ask the user on its card, and
+    /// `Some(denial)` when they decline. A gate with nobody to ask refuses.
+    async fn ask_first(&self, _name: &str, _input: &serde_json::Value) -> Option<String> {
+        Some(crate::permissions::CANNOT_ASK.to_string())
+    }
 }
 
 /// Tools the loop offers and executes on the caller's behalf, beyond the

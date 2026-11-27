@@ -964,6 +964,26 @@ pub fn gate_texts(label: &str, reason: &str) -> (String, String) {
 
 #[async_trait::async_trait]
 impl ToolGate for SubagentGate {
+    /// Ask first's card (#1231), on the director's broker with the
+    /// sub-agent's name on it, its diff checked again once approved.
+    async fn ask_first(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+        let mode = self.mode();
+        // The conversation's grant for this exact write folder or command
+        // is the user's yes (#1229): no card. A sub-agent's command runs at
+        // the workspace root.
+        let granted = || self.reach.granted(name, input, None, self.writes_confined, &self.broker.grants(&self.thread_id, mode));
+        if self.reach.checked(&granted).await {
+            return None;
+        }
+        let label = Some(self.label.as_str());
+        let place = || Some(crate::permissions::ask_card(label, name, input, &self.reach));
+        let check = || self.reach.checked(&place);
+        let card = check().await?;
+        let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+        let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode);
+        crate::chat_engine::guard_card(card, &check, ask).await
+    }
+
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let mode = self.mode();
         *self.pending_write.lock() = None;

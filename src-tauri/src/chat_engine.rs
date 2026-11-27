@@ -1621,6 +1621,8 @@ struct Offer {
     plan_only: bool,
     /// An MCP card's app-wide trust (#1243), never a grant.
     trust: Option<crate::talk_guard::TrustOffer>,
+    /// An Ask first card's diff (#1231).
+    diff: Option<String>,
 }
 
 impl Offer {
@@ -1671,6 +1673,9 @@ pub struct ApprovalRequestEvent {
     /// Plan only withheld the conversation grant the card would offer.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub plan_only: bool,
+    /// An Ask first card for a file change (#1231): the diff the call makes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
     /// An MCP card in Edit freely (#1243): the server and tool its "Trust
     /// <server>" and "Always allow this tool" answers would trust.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1920,7 +1925,7 @@ impl ApprovalBroker {
         // A card that would offer a grant says why it doesn't.
         let withheld = mode == crate::permissions::Mode::Plan && card.grant.take().is_some();
         let marks = Some((card.kind, card.sensitive));
-        let offer = Offer { trust: card.trust.clone(), ..Offer::of(card.grant.as_ref(), withheld) };
+        let offer = Offer { trust: card.trust.clone(), diff: card.diff.clone(), ..Offer::of(card.grant.as_ref(), withheld) };
         let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, &offer).await;
         let settled = self.settle_card(thread_id, decision, &card);
         if decision == ApprovalDecision::Grant && card.grant.is_some() {
@@ -2011,7 +2016,8 @@ impl ApprovalBroker {
 
     /// Emit the card and wait for its answer. `secret` is `Some(covers
     /// uncommitted)` for the secret guard's card, `card` the kind and
-    /// sensitivity of a `talk_guard` card, `offer` its grants.
+    /// sensitivity of a `talk_guard` card, `offer` its grants, trust and
+    /// (an Ask first card's) diff.
     #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
@@ -2041,6 +2047,7 @@ impl ApprovalBroker {
             remember_dir: offer.dir.clone(),
             remember_command: offer.command,
             plan_only: offer.plan_only,
+            diff: offer.diff.clone(),
             trust_server: offer.trust.as_ref().map(|o| o.server.clone()),
             trust_tool: offer.trust.as_ref().map(|o| o.tool.clone()),
         };
@@ -3123,6 +3130,48 @@ fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String
     tries.into_iter().find(|(o, _)| !o.is_empty() && content.contains(o.as_str()))
 }
 
+/// Why an `edit_file` call can't apply whatever the file holds, or `None`.
+fn edit_input_problem(input: &serde_json::Value) -> Option<String> {
+    let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+    let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    if old_string.is_empty() {
+        return Some("edit_file needs a non-empty `old_string`".to_string());
+    }
+    (old_string == new_string).then(|| "`old_string` and `new_string` are identical — nothing to change".to_string())
+}
+
+/// What an `edit_file` call leaves of `content` and how many occurrences it
+/// replaced, or why it doesn't apply. Pure, so Ask first's card (#1231)
+/// shows the very edit the tool makes.
+pub(crate) fn apply_edit(content: &str, input: &serde_json::Value, path: &str) -> Result<(String, usize), String> {
+    if let Some(problem) = edit_input_problem(input) {
+        return Err(problem);
+    }
+    let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+    let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The model copied the edit from `read_file`'s view (`edit_from_view`).
+    let (old_string, new_string) = edit_from_view(content, old_string, new_string)
+        .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
+    let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
+    let count = content.matches(old_string).count();
+    if count == 0 {
+        return Err(format!(
+            "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
+        ));
+    }
+    if count > 1 && !replace_all {
+        return Err(format!(
+            "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
+        ));
+    }
+    Ok(if replace_all {
+        (content.replace(old_string, new_string), count)
+    } else {
+        (content.replacen(old_string, new_string, 1), 1)
+    })
+}
+
 /// [`execute_tool_cancellable`] with no cancel flag. The app always passes
 /// one ([`run_builtin`]); tests call this.
 #[cfg(test)]
@@ -3456,45 +3505,17 @@ pub(crate) fn execute_tool_checked(
         }
         "edit_file" => {
             let path = input.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
-            let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-            if old_string.is_empty() {
-                return ("edit_file needs a non-empty `old_string`".to_string(), false);
-            }
-            if old_string == new_string {
-                return ("`old_string` and `new_string` are identical — nothing to change".to_string(), false);
+            if let Some(problem) = edit_input_problem(input) {
+                return (problem, false);
             }
             let full = workspace_path.join(path);
             let content = match std::fs::read_to_string(&full) {
                 Ok(c) => c,
                 Err(e) => return (format!("Error reading {path}: {e}"), false),
             };
-            // The model copied the edit from `read_file`'s view (`edit_from_view`).
-            let (old_string, new_string) = edit_from_view(&content, old_string, new_string)
-                .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
-            let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
-            let count = content.matches(old_string).count();
-            if count == 0 {
-                return (
-                    format!(
-                        "old_string not found in {path} — re-read the file and match the text exactly, including whitespace and indentation"
-                    ),
-                    false,
-                );
-            }
-            if count > 1 && !replace_all {
-                return (
-                    format!(
-                        "old_string appears {count} times in {path} — include more surrounding context to make it unique, or pass replace_all: true"
-                    ),
-                    false,
-                );
-            }
-            let (updated, replaced) = if replace_all {
-                (content.replace(old_string, new_string), count)
-            } else {
-                (content.replacen(old_string, new_string, 1), 1)
+            let (updated, replaced) = match apply_edit(&content, input, path) {
+                Ok(edit) => edit,
+                Err(problem) => return (problem, false),
             };
             // Same containment story as write_file: lexical pre-check plus the
             // kernel-enforced sandboxed write when the mission is sandboxed.
@@ -4505,6 +4526,13 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Give the thread's Talk shell the workspace's port block (#1219), for
+    /// when it is next spawned.
+    fn set_shell_ports(&self, workspace_id: &str, thread_id: &str) {
+        let ports = crate::workspace_ports::ensure(&self.db.lock(), workspace_id);
+        self.talk_shell.set_spawn_env(thread_id, ports.map(|b| b.env()).unwrap_or_default());
+    }
+
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
     ///
     /// Persists the command as a user turn (`$ cmd`) and the output as a
@@ -4552,6 +4580,7 @@ impl ChatEngine {
         });
 
         let started = std::time::Instant::now();
+        self.set_shell_ports(&request.workspace_id, &request.thread_id);
         let shell = Arc::clone(&self.talk_shell);
         let thread_id = request.thread_id.clone();
         let workspace_path = request.workspace_path.clone();
@@ -5182,6 +5211,9 @@ impl ChatEngine {
         // Tool rounds in a row cut at the output limit: two end the turn.
         let mut truncations = TruncationStreak::default();
 
+        // The mode the last round ran in, so a switch during the turn is noted.
+        let mut round_mode: Option<crate::permissions::Mode> = None;
+
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
             // Stop cleanly if the user cancelled this turn. Checked here and
@@ -5281,6 +5313,17 @@ impl ChatEngine {
             usage.add(&request.model, &response);
             self.record_usage(&request.workspace_id, &request.thread_id, &request.model, &response);
             pending_throttle = compute_throttle(&response);
+
+            // A switch during the turn applies from this round, and leaves a
+            // quiet note naming the mode now in force (#1231), before the
+            // round's rows. The v2 transcript skips it (`is_mode_note`).
+            if round_mode.is_some_and(|was| was != mode) {
+                let note = crate::permissions::mode_note(mode);
+                if let Err(e) = self.insert_and_emit_message(&app, &request.workspace_id, &request.thread_id, "stopped", &note, None, None, None, None) {
+                    tracing::warn!(error = %e, "failed to note the permission mode switch");
+                }
+            }
+            round_mode = Some(mode);
 
             tracing::info!(
                 iteration = iteration,
@@ -5424,23 +5467,30 @@ impl ChatEngine {
             messages.push(tool_round_turn(&response));
 
             // The mode decides each call before anything runs (#1146): a call
-            // it refuses gets a fixed result and never reaches a card.
-            let mode_denials: HashMap<String, String> = response
-                .tool_uses
-                .iter()
-                .filter_map(|u| {
-                    let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
-                    let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
-                    let ctx = crate::permissions::PolicyCtx {
-                        exec_roots: exec_roots.as_deref(),
-                        mcp_read_only: &mcp_read_only,
-                        delegate_writes: crate::chat_agents::delegate_writes(definition),
-                        forced: crate::permissions::forced(sandbox_roots.as_deref()),
-                    };
-                    let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
-                    crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
-                })
-                .collect();
+            // it refuses gets a fixed result and never reaches a card; one
+            // Ask first holds waits on its card below (#1231).
+            let mut mode_denials: HashMap<String, String> = HashMap::new();
+            let mut mode_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for u in &response.tool_uses {
+                let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
+                let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
+                let ctx = crate::permissions::PolicyCtx {
+                    exec_roots: exec_roots.as_deref(),
+                    mcp_read_only: &mcp_read_only,
+                    delegate_writes: crate::chat_agents::delegate_writes(definition),
+                    forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                };
+                let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
+                match crate::permissions::decide(mode, &call, &ctx) {
+                    crate::permissions::Decision::Allow => {}
+                    crate::permissions::Decision::Ask { .. } => {
+                        mode_asks.insert(u.id.clone());
+                    }
+                    crate::permissions::Decision::Deny { message } => {
+                        mode_denials.insert(u.id.clone(), message);
+                    }
+                }
+            }
 
             // ── Sub-agents: fan out first ──────────────────────────
             // Every `Agent` call in this response runs CONCURRENTLY (that is
@@ -5610,6 +5660,31 @@ impl ChatEngine {
                 // A tool a skill loaded this turn doesn't allow is refused
                 // before anything asks the user (#1135).
                 let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools).filter(|_| !mode_denied);
+                // Ask first holds a change or a command that doesn't only read
+                // on its card (#1231), its diff checked again once approved: a
+                // file that changed meanwhile asks again. The guards' cards
+                // still ask after it.
+                if mode_asks.contains(&u.id) && skill_refusal.is_none() {
+                    // A grant the conversation holds for this exact write
+                    // folder, or this command from this folder, is the user's
+                    // yes (#1229): Ask first doesn't hold it. MCP trust never
+                    // is, and Plan only refused these calls above.
+                    let ask_cwd = (u.name == "run_command" && self.talk_shell.available() && exec_roots.is_none())
+                        .then(|| self.talk_shell.cwd(&request.thread_id))
+                        .flatten();
+                    let granted = || {
+                        let grants = self.approvals.grants(&request.thread_id, mode);
+                        reach.granted(&u.name, &u.input, ask_cwd.as_deref().map(Path::new), writes_confined, &grants)
+                    };
+                    if !reach.checked(&granted).await {
+                        let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));
+                        let check = || reach.checked(&ask_place);
+                        if let Some(card) = check().await {
+                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
+                            denied = guard_card(card, &check, ask).await;
+                        }
+                    }
+                }
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
@@ -5792,6 +5867,7 @@ impl ChatEngine {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
+                    self.set_shell_ports(&request.workspace_id, &request.thread_id);
                     let shell = Arc::clone(&self.talk_shell);
                     let tid = request.thread_id.clone();
                     let wp = request.workspace_path.clone();
@@ -7870,7 +7946,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None, remember_command: false, plan_only: false, trust_server: None, trust_tool: None,
+            remember_dir: None, remember_command: false, plan_only: false, diff: None, trust_server: None, trust_tool: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7916,7 +7992,7 @@ mod tests {
         assert!(db.lock().thread_grants("t-old").unwrap().is_empty(), "an old conversation holds none");
         let broker = ApprovalBroker::with_db(Arc::clone(&db));
         let dir = Grant { kind: GrantKind::Read, value: "/tmp/x".into(), shown: "/tmp/x".into() };
-        let card = ToolCard { kind: CardKind::Run, shown: "cat /tmp/x/a".into(), reason: "r".into(), denial: "d".into(), sensitive: false, grant: Some(dir.clone()) };
+        let card = ToolCard { kind: CardKind::Run, shown: "cat /tmp/x/a".into(), reason: "r".into(), denial: "d".into(), sensitive: false, grant: Some(dir.clone()), trust: None, diff: None };
         assert_eq!(broker.settle_card("t-old", ApprovalDecision::Grant, &card), ApprovalDecision::Approve);
         assert!(broker.grants("t-old", Mode::Plan).is_empty() && !broker.auto_approves("t-old"), "none in Plan only, no \"don't ask again\"");
         // Kept in the database: a restart keeps it, another conversation has none.
@@ -8151,6 +8227,7 @@ mod tests {
             denial: format!("declined {shown}"),
             sensitive: false,
             grant: None,
+            diff: None,
             trust: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
@@ -8195,6 +8272,82 @@ mod tests {
         }
     }
 
+    /// A conversation that holds a write grant for `~/out`, and a write
+    /// there, as the director meets it in one mode (#1229, #1231): the
+    /// mode's decision, whether Ask first's card asks (unless a grant is the
+    /// user's yes), and whether the outside card asks with the grants.
+    struct GrantedWrite {
+        _dir: tempfile::TempDir,
+        _db: tempfile::NamedTempFile,
+        root: std::path::PathBuf,
+        decision: crate::permissions::Decision,
+        ask_first: bool,
+        outside: bool,
+        reach: crate::talk_guard::Reach,
+        input: serde_json::Value,
+        grants: Vec<Grant>,
+    }
+
+    fn granted_write_in(mode: crate::permissions::Mode) -> GrantedWrite {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (ws, home) = (root.join("ws"), root.join("home"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(home.join("out")).unwrap();
+        let (tmp, db) = old_thread_db();
+        let broker = ApprovalBroker::with_db(Arc::clone(&db));
+        let reach = crate::talk_guard::Reach::new(&ws, None, Some(&home));
+        let input = serde_json::json!({ "path": home.join("out/x.txt"), "content": "c" });
+        let offered = reach.outside_card(None, "write_file", &input, false, &[]).expect("a write outside asks");
+        assert!(offered.grant.as_ref().is_some_and(|g| g.kind == GrantKind::Write), "{offered:?}");
+        broker.settle_card("t-old", ApprovalDecision::Grant, &offered);
+        let read_only = std::collections::HashSet::new();
+        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+        let decision = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: "write_file", input: &input }, &ctx);
+        let grants = broker.grants("t-old", mode);
+        let ask_first = matches!(decision, crate::permissions::Decision::Ask { .. }) && !reach.granted("write_file", &input, None, false, &grants);
+        let outside = reach.outside_card(None, "write_file", &input, false, &grants).is_some();
+        GrantedWrite { _dir: dir, _db: tmp, root, decision, ask_first, outside, reach, input, grants }
+    }
+
+    #[test]
+    fn a_granted_write_runs_in_edit_freely_without_a_card() {
+        let w = granted_write_in(crate::permissions::Mode::Edit);
+        assert!(matches!(w.decision, crate::permissions::Decision::Allow) && !w.ask_first && !w.outside);
+        let check = w.reach.write_check("write_file", &w.input, false, &w.grants, false);
+        let (msg, ok) = execute_tool_checked(&w.root.join("ws"), "write_file", &w.input, None, None, check.as_ref());
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(w.root.join("home/out/x.txt")).unwrap(), "c");
+    }
+
+    #[test]
+    fn a_granted_write_or_command_skips_ask_firsts_card() {
+        let w = granted_write_in(crate::permissions::Mode::Ask);
+        assert!(matches!(w.decision, crate::permissions::Decision::Ask { .. }), "Ask first holds a write");
+        assert!(!w.ask_first && !w.outside, "the grant is the user's yes: no card");
+        assert!(!w.reach.granted("write_file", &w.input, None, false, &[]), "without it, Ask first's card asks");
+        // A command the conversation holds, exactly, from where it runs.
+        let run = |c: &str| serde_json::json!({ "command": c });
+        let command = "echo x > ~/out/a.txt";
+        let mut held = w.grants.clone();
+        held.push(w.reach.command_grant(command, None).expect("the command may be granted"));
+        assert!(w.reach.granted("run_command", &run(command), None, false, &held));
+        assert!(!w.reach.granted("run_command", &run(command), Some(w.root.as_path()), false, &held), "from another folder it asks");
+        assert!(!w.reach.granted("run_command", &run("echo y > ~/out/a.txt"), None, false, &held), "another command asks");
+        // Never an MCP tool, nor a write where code runs or credentials live.
+        assert!(!w.reach.granted("mcp__s__post_x", &serde_json::json!({}), None, false, &held));
+        for path in [w.root.join("home/out/.git/hooks/pre-commit"), w.root.join("home/.ssh/config")] {
+            assert!(!w.reach.granted("write_file", &serde_json::json!({ "path": path, "content": "c" }), None, false, &held), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn a_granted_write_is_refused_in_plan_only() {
+        let w = granted_write_in(crate::permissions::Mode::Plan);
+        assert!(matches!(w.decision, crate::permissions::Decision::Deny { .. }), "Plan only refuses the write, whatever is granted");
+        assert!(w.grants.is_empty() && !w.ask_first && w.outside, "and no grant applies there");
+    }
+
     /// Each lasting answer is kept only from the card that offers it: a
     /// "grant" on an MCP card keeps no conversation grant, and "tool" or
     /// "server" on a write or command card keeps no trust (#1229, #1243).
@@ -8210,6 +8363,7 @@ mod tests {
             sensitive: false,
             grant,
             trust,
+            diff: None,
         };
         let offer = crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: "c".into() };
         let write = Grant { kind: GrantKind::Write, value: "/tmp/octo-sample/out".into(), shown: "/tmp/octo-sample/out".into() };
@@ -8247,6 +8401,7 @@ mod tests {
             sensitive: false,
             grant: None,
             trust,
+            diff: None,
         };
         let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
         assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone())), ApprovalDecision::Approve);
@@ -8521,6 +8676,7 @@ mod tests {
             remember_dir: None,
             remember_command: false,
             plan_only: false,
+            diff: None,
             trust_server: None,
             trust_tool: None,
         }
