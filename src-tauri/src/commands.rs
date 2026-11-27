@@ -2310,6 +2310,25 @@ pub async fn set_thread_mcp_server(
     state.db.lock().set_thread_mcp_server_off(&thread_id, &server, off)
 }
 
+/// A Talk conversation's permission mode (#1146): `plan` (Plan only) or
+/// `edit` (Edit freely, also every conversation that never set one). Talk
+/// reads it at each round boundary.
+#[tauri::command]
+pub async fn get_thread_permission_mode(state: State<'_, AppState>, thread_id: String) -> AppResult<String> {
+    Ok(crate::permissions::thread_mode(&state.db, &thread_id).as_str().to_string())
+}
+
+/// Set a Talk conversation's permission mode, `plan` or `edit`; a turn that
+/// is running takes it from its next round. Ask first isn't settable yet.
+#[tauri::command]
+pub async fn set_thread_permission_mode(state: State<'_, AppState>, thread_id: String, mode: String) -> AppResult<String> {
+    let Some(mode) = crate::permissions::Mode::settable(&mode) else {
+        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan` or `edit`.")));
+    };
+    state.db.lock().set_thread_permission_mode(&thread_id, mode)?;
+    Ok(mode.as_str().to_string())
+}
+
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
 #[tauri::command]
 pub async fn get_mcp_config(

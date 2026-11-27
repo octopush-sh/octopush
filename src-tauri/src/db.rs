@@ -711,6 +711,10 @@ impl Db {
         // before the column — means none is off, so every configured server
         // stays available, as it always was.
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mcp_disabled TEXT")?;
+        // A conversation's permission mode (`permissions::Mode`, #1146):
+        // `plan` or `edit`. NULL, which every row from before the column
+        // has, is Edit freely: what Talk always did.
+        add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN permission_mode TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, created_at);",
         )?;
@@ -3982,6 +3986,29 @@ impl Db {
         Ok(())
     }
 
+    /// A conversation's stored permission mode, as written; `None` for a
+    /// thread that never set one (or no longer exists). Read it through
+    /// `permissions::thread_mode`, which says what each value means.
+    pub fn thread_permission_mode(&self, thread_id: &str) -> AppResult<Option<String>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT permission_mode FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))
+            .optional()?;
+        Ok(raw.flatten())
+    }
+
+    /// Set a conversation's permission mode.
+    pub fn set_thread_permission_mode(&self, thread_id: &str, mode: crate::permissions::Mode) -> AppResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE chat_threads SET permission_mode = ?2 WHERE id = ?1",
+            params![thread_id, mode.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(crate::error::AppError::Other("That conversation no longer exists.".into()));
+        }
+        Ok(())
+    }
+
     /// Turn one MCP server off (or back on) in a conversation, leaving the
     /// others as stored, and return the new list. Read and written under the
     /// one connection the caller holds locked, so two toggles never lose
@@ -4181,9 +4208,11 @@ impl Db {
         // One transaction: a failure part-way leaves no half-copied fork.
         let tx = self.conn.unchecked_transaction()?;
         let thread = self.create_chat_thread(&workspace_id, &format!("{title} · fork"))?;
-        // A fork is the same conversation from here: it keeps its MCP scope.
+        // A fork is the same conversation from here: it keeps its MCP scope
+        // and its permission mode.
         tx.execute(
-            "UPDATE chat_threads SET mcp_disabled = (SELECT mcp_disabled FROM chat_threads WHERE id = ?2) WHERE id = ?1",
+            "UPDATE chat_threads SET (mcp_disabled, permission_mode) = \
+             (SELECT mcp_disabled, permission_mode FROM chat_threads WHERE id = ?2) WHERE id = ?1",
             params![thread.id, thread_id],
         )?;
         let mut pairs = Vec::with_capacity(ids.len());
