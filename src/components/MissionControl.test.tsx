@@ -139,6 +139,29 @@ describe("MissionControl", () => {
     expect(screen.getByText("task c")).toBeTruthy();
   });
 
+  it("keeps each band eyebrow with its own cards: 32px above, 12px to the first row", () => {
+    useRunsStore.setState({
+      runsByWs: {
+        "ws-a": [mkRun("a", "paused")],
+        "ws-b": [mkRun("b", "running")],
+        "ws-c": [mkRun("c", "completed")],
+      },
+      settledAt: { c: Date.now() - 60_000 },
+    });
+    renderRoom();
+    for (const title of ["Needs you", "In flight", "Settled"]) {
+      const eyebrow = screen.getByText(title);
+      // A fixed-height row with no vertical centering slack: the 12px gap is the
+      // eyebrow's margin, not half of a tall row.
+      expect(eyebrow.className).toContain("mb-3");
+      expect(eyebrow.className).toContain("h-3");
+      expect(eyebrow.className).not.toContain("h-11");
+      const section = eyebrow.closest("section")!;
+      expect(section.className.split(" ")).toContain("mt-8");
+      expect(section.className.split(" ")).toContain("first:mt-4");
+    }
+  });
+
   it("draws an in-flight card's running dot in verdigris, not brass", () => {
     useRunsStore.setState({ runsByWs: { "ws-b": [mkRun("b", "running")] } });
     renderRoom();
