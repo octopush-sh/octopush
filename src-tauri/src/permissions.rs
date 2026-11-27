@@ -181,6 +181,17 @@ pub fn ship_nothing_refusal(what: &str) -> String {
     )
 }
 
+/// The fixed result a ship-nothing mission gives a command that would leave
+/// `what` in Talk's shell, where it holds for every command after it.
+pub fn ship_nothing_state_refusal(what: &str) -> String {
+    format!("Not run: this mission ships nothing, and Talk's shell can keep {what} for every command after it. Note the step in your findings instead.")
+}
+
+/// The fixed result a ship-nothing mission gives a command whose program
+/// or subcommand the check can't read.
+pub const SHIP_NOTHING_HIDDEN: &str = "Not run: this mission ships nothing, and this command's program or subcommand comes \
+     from a substitution, a variable or its input, so Octopush can't tell what it runs. Write the command out.";
+
 /// The fixed result a ship-nothing mission gives an MCP tool that isn't read-only.
 pub const SHIP_NOTHING_NET: &str = "Not called: this mission ships nothing, and this MCP tool's server doesn't mark it \
      read-only. Use a read-only tool, or note the step in your findings.";
@@ -208,7 +219,11 @@ pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
     if ctx.ships_nothing {
         match classify(call.name) {
             Class::Exec => {
-                if let Some(what) = remote_effect_local(&field("command")) {
+                let command = field("command");
+                if let Some(message) = ship_nothing_shell_refusal(&command) {
+                    return Decision::Deny { message };
+                }
+                if let Some(what) = remote_effect_local(&command) {
                     return Decision::Deny { message: ship_nothing_refusal(what) };
                 }
             }
@@ -368,18 +383,18 @@ fn bindings(line: &str) -> Bindings {
     b
 }
 
-/// An empty `()` outside quotes: a function definition (`curl() { …; }`).
+/// An empty `()` outside quotes and here-document bodies: a function
+/// definition (`curl() { …; }`).
 fn defines_function(line: &str) -> bool {
-    let (mut quote, mut escaped, mut open) = (None::<char>, false, false);
-    for c in line.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
+    let chars: Vec<char> = line.chars().collect();
+    let (mut quote, mut open, mut i) = (None::<char>, false, 0);
+    let mut heredocs: Vec<String> = Vec::new();
+    while let Some(&c) = chars.get(i) {
+        i += 1;
         match (quote, c) {
             (Some('\''), '\'') => quote = None,
             (Some('\''), _) => {}
-            (_, '\\') => escaped = true,
+            (_, '\\') => i += 1,
             (Some(_), '"') => quote = None,
             (Some(_), _) => {}
             (None, '\'' | '"') => quote = Some(c),
@@ -388,7 +403,37 @@ fn defines_function(line: &str) -> bool {
                 continue;
             }
             (None, ')') if open => return true,
-            (None, c) if open && c.is_whitespace() => continue,
+            (None, ' ' | '\t') if open => continue,
+            // A here-document's delimiter; its body is input, not shell.
+            (None, '<') if chars.get(i) == Some(&'<') && chars.get(i + 1) != Some(&'<') => {
+                i += 1;
+                if chars.get(i) == Some(&'-') {
+                    i += 1;
+                }
+                while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    i += 1;
+                }
+                let from = i;
+                while chars.get(i).is_some_and(|c| !c.is_whitespace() && !";|&<>()".contains(*c)) {
+                    i += 1;
+                }
+                let delimiter: String = chars[from..i].iter().filter(|c| !"'\"\\".contains(**c)).collect();
+                if !delimiter.is_empty() {
+                    heredocs.push(delimiter);
+                }
+            }
+            (None, '\n') if !heredocs.is_empty() => {
+                for delimiter in std::mem::take(&mut heredocs) {
+                    while i < chars.len() {
+                        let end = chars[i..].iter().position(|c| *c == '\n').map_or(chars.len(), |p| i + p);
+                        let body: String = chars[i..end].iter().collect();
+                        i = end + 1;
+                        if body.trim_start_matches('\t') == delimiter {
+                            break;
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         open = false;
@@ -471,8 +516,9 @@ fn remote_command(words: &[&str], scope: Scope) -> Option<&'static str> {
         }
     }
     if WRAPPERS.contains(&name.as_str()) {
-        // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come first.
-        let at = rest.iter().position(|&w| program(w) == "eval" || remote_rule(&program(w)).is_some())?;
+        // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come
+        // first; `env` and `eval` are read as the commands they run.
+        let at = rest.iter().position(|&w| matches!(program(w).as_str(), "eval" | "env") || remote_rule(&program(w)).is_some())?;
         return remote_command(&rest[at..], scope);
     }
     if scope.ship_nothing && name == "git" {
@@ -485,16 +531,186 @@ fn remote_command(words: &[&str], scope: Scope) -> Option<&'static str> {
     (!(scope.loopback_ok && only_loopback(&name, rest))).then_some(what)
 }
 
-/// The command line `env -S <string>` (or `--split-string`) runs, with the
-/// words after it.
+/// The command line `env -S <string>` runs, with the words after it:
+/// `-S` anywhere in an option cluster (`-S`, `-vS`, `-iS'…'`) or
+/// `--split-string`, among the options before the command.
 fn env_split_string(args: &[&str]) -> Option<String> {
-    let at = args.iter().position(|a| *a == "-S" || *a == "--split-string" || a.starts_with("--split-string=") || (a.starts_with("-S") && a.len() > 2))?;
-    let a = args[at];
-    let (split, after) = match a {
-        "-S" | "--split-string" => (args.get(at + 1).copied().unwrap_or(""), args.get(at + 2..).unwrap_or(&[])),
-        _ => (a.strip_prefix("--split-string=").unwrap_or_else(|| &a[2..]), &args[at + 1..]),
+    let joined = |split: &str, after: &[&str]| std::iter::once(split).chain(after.iter().copied()).collect::<Vec<_>>().join(" ");
+    let mut i = 0;
+    while let Some(&a) = args.get(i) {
+        i += 1;
+        if a == "--" || a == "-" || !a.starts_with('-') {
+            return None;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            match long.split_once('=') {
+                Some(("split-string", v)) => return Some(joined(v, &args[i..])),
+                Some(_) => {}
+                None if long == "split-string" => return Some(joined(args.get(i)?, args.get(i + 1..).unwrap_or(&[]))),
+                None if matches!(long, "unset" | "chdir") => i += 1,
+                None => {}
+            }
+            continue;
+        }
+        let cluster = &a[1..];
+        for (j, c) in cluster.char_indices() {
+            let value = &cluster[j + c.len_utf8()..];
+            match c {
+                'S' if value.is_empty() => return Some(joined(args.get(i)?, args.get(i + 1..).unwrap_or(&[]))),
+                'S' => return Some(joined(value, &args[i..])),
+                'u' | 'C' | 'P' => {
+                    if value.is_empty() {
+                        i += 1;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// One command of a line, as the ship-nothing shell checks read it.
+#[derive(Default)]
+struct Segment<'a> {
+    /// `NAME=value` words before the program.
+    assigns: Vec<&'a str>,
+    /// The program and its arguments, each with whether it holds an
+    /// expansion the check doesn't model (a variable, `$(…)`, backticks).
+    words: Vec<(&'a str, bool)>,
+    /// It has a redirection (`exec >log`).
+    redirects: bool,
+}
+
+fn segments(words: &[crate::chat_engine::CommandWord]) -> Vec<Segment<'_>> {
+    let mut out: Vec<Segment> = Vec::new();
+    let mut last = None;
+    for w in words {
+        if last != Some(w.segment) {
+            out.push(Segment::default());
+            last = Some(w.segment);
+        }
+        let Some(seg) = out.last_mut() else { continue };
+        if w.role == crate::chat_engine::WordRole::Data {
+            continue;
+        }
+        if w.redirect {
+            seg.redirects = true;
+        } else if w.role == crate::chat_engine::WordRole::Program || !seg.words.is_empty() {
+            seg.words.push((w.word.as_str(), w.unmodeled));
+        } else {
+            seg.assigns.push(w.word.as_str());
+        }
+    }
+    out
+}
+
+/// A variable whose change in Talk's shell would hold for later commands and
+/// could send a request or a push elsewhere, or run something in its place.
+fn state_variable(name: &str) -> bool {
+    reroute_variable(name)
+        || name == "PATH"
+        || name.starts_with("GIT_")
+        || name.starts_with("SSH_")
+        || matches!(name, "BASH_ENV" | "ENV" | "PROMPT_COMMAND")
+}
+
+const STATE_VARIABLE: &str = "a changed proxy, HOME, PATH, GIT_*, SSH_* or startup variable";
+
+/// What a command would leave in Talk's shell that a later command could
+/// use to ship: an alias, a function, `exec`, `enable`, or a change to a
+/// [`state_variable`] (exported, declared, unset, read, or assigned on its
+/// own line). `env X=1 cmd` and `X=1 cmd` last one command and don't count.
+fn state_change(assigns: &[&str], words: &[(&str, bool)], redirects: bool) -> Option<&'static str> {
+    let named = |w: &str| state_variable(w.split_once('=').map_or(w, |(n, _)| n));
+    let Some((&(first, _), rest)) = words.split_first() else {
+        return assigns.iter().copied().any(named).then_some(STATE_VARIABLE);
     };
-    Some([split].iter().chain(after).copied().collect::<Vec<_>>().join(" "))
+    let args: Vec<&str> = rest.iter().map(|w| w.0).collect();
+    let names = || args.iter().copied().filter(|a| !a.starts_with('-')).any(named);
+    match program(first).as_str() {
+        "alias" if !args.is_empty() => Some("an alias"),
+        "function" => Some("a function definition"),
+        "exec" if !args.is_empty() || redirects => Some("what exec changes"),
+        "enable" if !args.is_empty() => Some("a change to its builtins (enable)"),
+        "export" | "declare" | "typeset" | "readonly" | "local" | "unset" | "read" => names().then_some(STATE_VARIABLE),
+        "printf" => args.windows(2).any(|w| w[0] == "-v" && named(w[1])).then_some(STATE_VARIABLE),
+        // `then export HOME=…` and `builtin alias …` run in the shell too;
+        // `env` only changes the command it runs.
+        p if WRAPPERS.contains(&p) && p != "env" => {
+            let at = rest.iter().position(|(w, _)| !w.starts_with('-'))?;
+            state_change(&[], &rest[at..], redirects)
+        }
+        _ => None,
+    }
+}
+
+/// The operand positions of a tool that ship (`git push`, `gh pr create`):
+/// what an unreadable word there would hide.
+fn verb_depth(program: &str) -> usize {
+    match program {
+        "gh" | "hub" | "glab" => 2,
+        "curl" | "wget" | "http" | "https" | "xh" | "xhs" | "python" | "python3" | "py" => 0,
+        p if remote_rule(p).is_some() => 1,
+        _ => 0,
+    }
+}
+
+/// Whether the check can't tell what a command runs: its program, or the
+/// subcommand of a tool that ships, is a substitution or a variable
+/// (`$G push`, `$(echo git) push`, `git $(echo push)`), or `xargs` hands
+/// such a tool its subcommand from its input (`echo push | xargs git`).
+fn hidden_command(words: &[(&str, bool)], fed: bool) -> bool {
+    let Some((&(first, unmodeled), rest)) = words.split_first() else { return false };
+    if unmodeled {
+        return true;
+    }
+    let name = program(first);
+    if WRAPPERS.contains(&name.as_str()) {
+        let assigns = |w: &str| w.split_once('=').is_some_and(|(n, _)| is_identifier(n));
+        let runs = |&(w, u): &(&str, bool)| {
+            (u && !w.starts_with('-') && !assigns(w)) || remote_rule(&program(w)).is_some() || WRAPPERS.contains(&program(w).as_str())
+        };
+        return rest.iter().position(runs).is_some_and(|at| hidden_command(&rest[at..], fed || name == "xargs"));
+    }
+    let depth = verb_depth(&name);
+    let valued: &[&str] = match name.as_str() {
+        "git" => GIT_VALUED,
+        "gh" | "hub" | "glab" => &["-R", "--repo"],
+        _ => &[],
+    };
+    let mut ops = Vec::new();
+    let mut it = rest.iter();
+    while let Some(&(w, u)) = it.next() {
+        if valued.contains(&w) {
+            it.next();
+        } else if !w.starts_with('-') {
+            ops.push((w, u));
+        }
+    }
+    let api = ops.first().is_some_and(|(w, _)| w.eq_ignore_ascii_case("api"));
+    (fed && ops.len() < depth) || ops.iter().take(depth).enumerate().any(|(i, &(_, u))| u && !(i == 1 && api))
+}
+
+/// In a mission that ships nothing: the refusal for a command that would
+/// leave state in Talk's shell a later command could ship with, or whose
+/// program the check can't read. Nested commands included.
+pub fn ship_nothing_shell_refusal(command: &str) -> Option<String> {
+    crate::chat_engine::each_command(command, |line| {
+        if defines_function(line) {
+            return Some(ship_nothing_state_refusal("a function definition"));
+        }
+        let words = crate::chat_engine::command_words(line);
+        segments(&words).iter().find_map(|seg| {
+            if hidden_command(&seg.words, false) {
+                return Some(SHIP_NOTHING_HIDDEN.to_string());
+            }
+            state_change(&seg.assigns, &seg.words, seg.redirects).map(ship_nothing_state_refusal)
+        })
+    })
+    .ok()
+    .flatten()
 }
 
 /// What a mission that ships nothing gets for `GIT_CONFIG_*` set on a line.
@@ -800,16 +1016,25 @@ fn glab_remote(args: &[&str]) -> Option<&'static str> {
     (!local && writes).then_some("a glab command that changes GitLab")
 }
 
-/// Maven goals that deploy or release: any goal naming `deploy` (`deploy`,
-/// `site:deploy`, `deploy:deploy-file`, `tomcat7:undeploy`), `release:*`, `jib:build`.
+/// Maven goals that deploy, release or push an image: any goal naming
+/// `deploy` (`deploy`, `site:deploy`, `deploy:deploy-file`,
+/// `tomcat7:undeploy`), `release:*`, `jib:build` (not `jib:dockerBuild`),
+/// `dockerfile:push`, `docker:push`, and `spring-boot:build-image` with
+/// `-Dspring-boot.build-image.publish=true`.
 fn maven_remote(args: &[&str]) -> Option<&'static str> {
     let ops = operands(args, &["-f", "--file", "-s", "--settings", "-P", "--activate-profiles", "-pl", "--projects"]);
     ops.iter()
         .any(|o| {
             let o = o.to_ascii_lowercase();
-            o.contains("deploy") || matches!(o.as_str(), "release:prepare" | "release:perform" | "jib:build")
+            o.contains("deploy") || matches!(o.as_str(), "release:prepare" | "release:perform" | "jib:build" | "dockerfile:push" | "docker:push")
         })
         .then_some("a Maven goal that deploys or releases")
+        .or_else(|| {
+            // `spring-boot:build-image` pushes the image when told to publish.
+            let builds = ops.iter().any(|o| o.to_ascii_lowercase().starts_with("spring-boot:build-image"));
+            let publishes = args.iter().any(|a| a.to_ascii_lowercase().contains("build-image.publish=true"));
+            (builds && publishes).then_some("a Maven goal that pushes an image")
+        })
 }
 
 /// Gradle tasks that publish (`gradle publish`, `:lib:publishAllPublicationsToX`)
@@ -1479,6 +1704,97 @@ mod tests {
         }
     }
 
+    /// `env -S` runs its string as a command line, wherever `-S` sits in an
+    /// option cluster and through the wrappers (#1241 review, round 3).
+    #[test]
+    fn env_split_string_is_read_as_the_line_it_runs() {
+        for command in [
+            "env -vS 'git push origin main'",
+            "env -iS'git push origin main'",
+            "env -u HOME -S 'git push'",
+            "env -C /tmp --split-string='git push'",
+            "sudo env -S 'git push'",
+            "nohup env -S 'git push'",
+            "time env -S 'git push'",
+            "command env -S 'git push'",
+            "exec env -S 'git push'",
+            "echo x | xargs env -S 'git push'",
+        ] {
+            assert_eq!(remote_effect(command), Some("git push"), "{command}");
+            assert_eq!(remote_effect_local(command), Some("git push"), "{command}");
+        }
+        assert_eq!(remote_effect("env -S 'npm publish'"), Some("publishes a package or a release"));
+        assert_eq!(remote_effect("env -i PATH=/usr/bin git status"), None);
+    }
+
+    /// Talk's shell keeps its state across commands, so a mission that ships
+    /// nothing refuses what a later command could ship with, and a command
+    /// whose program or subcommand it can't read (#1241 review, round 3).
+    #[test]
+    fn a_ship_nothing_mission_refuses_lasting_shell_state() {
+        let state = |what: &str| Some(ship_nothing_state_refusal(what));
+        let var = state(STATE_VARIABLE);
+        let refused = [
+            ("alias git='git push'", state("an alias")),
+            ("deploy() { git push; }", state("a function definition")),
+            ("function ship { git push; }", state("a function definition")),
+            ("exec bash", state("what exec changes")),
+            ("exec >log", state("what exec changes")),
+            ("enable -n echo", state("a change to its builtins (enable)")),
+            ("export HTTPS_PROXY=http://proxy.example.com", var.clone()),
+            ("export no_proxy=", var.clone()),
+            ("declare -x HOME=/tmp", var.clone()),
+            ("typeset -x PATH=./shims:$PATH", var.clone()),
+            ("readonly -x GIT_SSH_COMMAND=ssh", var.clone()),
+            ("unset NO_PROXY", var.clone()),
+            ("HOME=/tmp", var.clone()),
+            ("PATH=./shims:$PATH", var.clone()),
+            ("SSH_AUTH_SOCK=/tmp/agent.sock", var.clone()),
+            ("BASH_ENV=./startup.sh", var.clone()),
+            ("ENV=./startup.sh", var.clone()),
+            ("PROMPT_COMMAND='git push'", var.clone()),
+            ("read http_proxy < proxy.txt", var.clone()),
+            ("printf -v PATH %s ./shims", var.clone()),
+            ("if true; then export HOME=/tmp; fi", var.clone()),
+            ("git $(echo push)", Some(SHIP_NOTHING_HIDDEN.to_string())),
+            ("$(echo git) push", Some(SHIP_NOTHING_HIDDEN.to_string())),
+            ("$G push", Some(SHIP_NOTHING_HIDDEN.to_string())),
+            ("sudo $G push", Some(SHIP_NOTHING_HIDDEN.to_string())),
+            ("gh pr $(echo create) --fill", Some(SHIP_NOTHING_HIDDEN.to_string())),
+            ("echo push | xargs git", Some(SHIP_NOTHING_HIDDEN.to_string())),
+        ];
+        let ro = HashSet::new();
+        let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing: true };
+        for (command, message) in refused {
+            assert_eq!(ship_nothing_shell_refusal(command), message, "{command}");
+            let input = json!({ "command": command });
+            let decided = decide(Mode::Edit, &ToolCall { name: "run_command", input: &input }, &ctx);
+            assert_eq!(decided, Decision::Deny { message: message.unwrap() }, "refused, never asked: {command}");
+        }
+        for text in [ship_nothing_state_refusal("an alias"), SHIP_NOTHING_HIDDEN.to_string()] {
+            assert!(text.contains("this mission ships nothing") && !text.contains("Edit freely") && !text.contains("switch"), "{text}");
+        }
+        for command in [
+            "export PORT=3000",
+            "NODE_ENV=test npm test",
+            "HOME=/tmp npm test",
+            "unset FOO",
+            "alias",
+            "exec",
+            "git commit -m \"$(date)\"",
+            "git checkout \"$BRANCH\"",
+            "git -C \"$DIR\" status",
+            "gh api \"$ENDPOINT\"",
+            "curl -s \"$URL\"",
+            "find . -name '*.md' | xargs git add",
+            "env PORT=$P npm start",
+            "cat > a.js <<'EOF'\nfunction f() { return 1; }\nEOF",
+            "python3 - <<EOF\ndef f(): pass\nEOF",
+        ] {
+            assert_eq!(ship_nothing_shell_refusal(command), None, "{command}");
+        }
+    }
+
     /// A redirect can take a request's body or method to another host:
     /// curl `-L`, httpie and xh `--follow`, and wget unless `--max-redirect=0`.
     #[test]
@@ -1555,6 +1871,9 @@ mod tests {
             ("a Maven goal that deploys or releases", "./mvnw release:perform"),
             ("a Maven goal that deploys or releases", "mvn site:deploy"),
             ("a Maven goal that deploys or releases", "mvn deploy:deploy-file -Dfile=app.jar"),
+            ("a Maven goal that deploys or releases", "mvn dockerfile:push"),
+            ("a Maven goal that deploys or releases", "mvn compile jib:build"),
+            ("a Maven goal that pushes an image", "mvn spring-boot:build-image -Dspring-boot.build-image.publish=true"),
             ("a Gradle task that publishes", "./gradlew publish"),
             ("a Gradle task that publishes", "gradle :lib:publishAllPublicationsToMavenRepository"),
             ("docker push", "docker-compose push web"),
@@ -1565,7 +1884,7 @@ mod tests {
             assert_eq!(remote_effect(command), Some(why), "{command}");
             assert_eq!(remote_effect_local(command), Some(why), "{command}");
         }
-        for command in ["glab mr list", "glab mr view 12", "glab api projects/1", "git subtree split --prefix=lib", "git subtree -P lib split", "git lfs pull", "mvn -B verify", "mvn dependency:tree", "./gradlew build publishToMavenLocal", "gradle build -x publish", "docker compose up -d", "cargo build --release"] {
+        for command in ["glab mr list", "glab mr view 12", "glab api projects/1", "git subtree split --prefix=lib", "git subtree -P lib split", "git lfs pull", "mvn -B verify", "mvn dependency:tree", "mvn jib:dockerBuild", "mvn spring-boot:build-image", "./gradlew build publishToMavenLocal", "gradle build -x publish", "docker compose up -d", "cargo build --release"] {
             assert_eq!(remote_effect(command), None, "{command}");
         }
     }
