@@ -16618,6 +16618,61 @@ mod mission_tests {
     }
 
     #[test]
+    fn a_readonly_mission_is_never_loosened_on_reuse() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let r = crate::mission::create(&db, "p1", "review", "Review it", "readonly", "none", Some("w1"), None)
+            .unwrap();
+        // The values the create_workspace command (wizard default) and the MCP
+        // binary pass on reuse, plus the other writer modes: all refused.
+        for (intent, git) in [("build", "worktree"), ("fix", "worktree"), ("build", "ephemeral"), ("fix", "pr")] {
+            let err = crate::mission::ensure_for_workspace(&db, &ws, intent, git)
+                .expect_err("a read-only mission must not become a writer");
+            assert!(format!("{err}").contains("read-only"), "readable refusal: {err}");
+            let after = db.get_mission(&r.id).unwrap().unwrap();
+            assert_eq!(after.git_isolation, "readonly");
+            assert_eq!(after.intent, "review", "a refused change leaves the mission untouched");
+            assert_eq!(
+                crate::orchestrator::sandbox::sandbox_write_roots(&after.git_isolation, &after.exec_isolation, "/tmp/wt"),
+                Some(Vec::new()),
+                "still sandboxed, temp-only writes",
+            );
+        }
+        // Staying read-only is fine (an intent change keeps the confinement).
+        let same = crate::mission::ensure_for_workspace(&db, &ws, "probe", "readonly").unwrap();
+        assert_eq!(same.id, r.id);
+        assert_eq!(same.git_isolation, "readonly");
+    }
+
+    #[test]
+    fn a_writer_mission_may_be_tightened_to_readonly() {
+        let db = test_db();
+        seed_project_ws(&db, "p1", "w1", "task");
+        let ws = db.get_workspace("w1").unwrap().unwrap();
+        let a = crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").unwrap();
+        let b = crate::mission::ensure_for_workspace(&db, &ws, "review", "readonly").unwrap();
+        assert_eq!(a.id, b.id);
+        assert_eq!(b.git_isolation, "readonly");
+        // …and once read-only, it stays so.
+        assert!(crate::mission::ensure_for_workspace(&db, &ws, "build", "worktree").is_err());
+    }
+
+    #[test]
+    fn git_isolation_may_only_get_stricter() {
+        use crate::mission::check_git_isolation_change as check;
+        for to in ["worktree", "ephemeral", "pr"] {
+            assert!(check("readonly", to).is_err(), "readonly → {to}");
+        }
+        assert!(check("readonly", "readonly").is_ok());
+        for from in ["worktree", "ephemeral", "pr"] {
+            for to in ["worktree", "ephemeral", "pr", "readonly"] {
+                assert!(check(from, to).is_ok(), "{from} → {to}");
+            }
+        }
+    }
+
+    #[test]
     fn validate_axes_rejects_out_of_enum_values() {
         assert!(crate::mission::validate_axes("nope", "worktree").is_err());
         assert!(crate::mission::validate_axes("build", "bogus").is_err());

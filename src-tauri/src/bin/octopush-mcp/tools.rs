@@ -2066,6 +2066,43 @@ mod tests {
     }
 
     #[test]
+    fn create_workspace_never_loosens_a_readonly_mission() {
+        use tempfile::TempDir;
+        let repo = TempDir::new().unwrap();
+        let path = repo.path();
+        octopush_lib::git_ops::init_repo(path).unwrap();
+        octopush_lib::git_ops::ensure_initial_commit(path).unwrap();
+        let db = parking_lot::Mutex::new(test_db());
+        db.lock().insert_project("p1", "P", path.to_str().unwrap()).unwrap();
+
+        // A workspace whose active mission is a read-only review.
+        let first = create_workspace(&db, &json!({ "projectId": "p1", "task": "t", "branch": "feat-x" }))
+            .expect("first create_workspace");
+        let ws_id = first["workspace"]["id"].as_str().unwrap().to_string();
+        let review = {
+            let d = db.lock();
+            let build = d.mission_for_workspace(&ws_id).unwrap().unwrap();
+            d.archive_mission(&build.id).unwrap();
+            octopush_lib::mission::create(&d, "p1", "review", "Review", "readonly", "none", Some(&ws_id), None)
+                .unwrap()
+        };
+
+        // Asking for the same branch again must not re-pair it as a worktree.
+        let err = create_workspace(&db, &json!({ "projectId": "p1", "task": "t", "branch": "feat-x" }))
+            .expect_err("a read-only mission must not become a worktree mission");
+        assert!(err.contains("read-only"), "err: {err}");
+        let after = db.lock().get_mission(&review.id).unwrap().unwrap();
+        assert_eq!(after.status, "active");
+        assert_eq!(after.intent, "review");
+        assert_eq!(after.git_isolation, "readonly");
+        assert_eq!(
+            octopush_lib::orchestrator::sandbox::sandbox_write_roots(&after.git_isolation, &after.exec_isolation, "/x"),
+            Some(Vec::new()),
+            "the mission stays sandboxed, temp-only writes",
+        );
+    }
+
+    #[test]
     fn create_workspace_rejects_a_non_code_intent_before_any_git_work() {
         let db = parking_lot::Mutex::new(test_db());
         db.lock().insert_project("p1", "P", "/tmp/p1").unwrap();

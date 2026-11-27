@@ -59,6 +59,22 @@ fn validate(intent: &str, git_isolation: &str, exec_isolation: &str) -> AppResul
     Ok(())
 }
 
+/// A mission's git-state may only get stricter after creation, never looser.
+/// `readonly` is what confines review/probe/perf agents (the sandbox resolver
+/// forces temp-only writes for it), so no later pairing may turn it into a
+/// writer (`worktree`/`ephemeral`/`pr`) — whoever asks, the app or the MCP
+/// binary. Moving between the writer modes, or tightening a writer to
+/// `readonly`, stays allowed.
+pub fn check_git_isolation_change(from: &str, to: &str) -> AppResult<()> {
+    if from == "readonly" && to != "readonly" {
+        return Err(AppError::Other(format!(
+            "this workspace's mission is read-only, and a read-only mission can't become \
+             '{to}' — start the '{to}' work in its own workspace"
+        )));
+    }
+    Ok(())
+}
+
 /// Create a mission. Validates the two isolation axes; the writer-uniqueness
 /// invariant (never two active missions writing one checkout) is enforced by the
 /// partial unique index and surfaced as a legible error from `insert_mission`.
@@ -108,6 +124,8 @@ pub fn create(
 /// Idempotent pairing for a code workspace: return the existing active mission
 /// if one already owns the workspace, else create one with the given `intent`
 /// and `git_isolation` (the wizard's Step-1 intent + isolation choice).
+/// Reuse that would loosen a read-only mission is an error
+/// ([`check_git_isolation_change`]).
 /// Guarantees the invariant "no workspace without a mission" from day one, and
 /// stays a no-op when a workspace is reused/restored/adopted (create is
 /// idempotent on `(project_id, branch)` upstream, so callers may call this on
@@ -122,8 +140,10 @@ pub fn ensure_for_workspace(
         // Honor the wizard's latest choice on reuse: re-running the wizard for
         // an existing branch (a collision the UI surfaces) with a different
         // intent/isolation updates the mission in place, so the picked values
-        // are never silently discarded. Idempotent when nothing changed.
+        // are never silently discarded. Idempotent when nothing changed. A
+        // read-only mission is never loosened this way (refused, left as is).
         if existing.intent != intent || existing.git_isolation != git_isolation {
+            check_git_isolation_change(&existing.git_isolation, git_isolation)?;
             db.update_mission_axes(&existing.id, intent, git_isolation)?;
             return Ok(db.get_mission(&existing.id)?.unwrap_or(existing));
         }

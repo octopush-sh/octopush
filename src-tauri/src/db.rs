@@ -3478,6 +3478,8 @@ impl Db {
     /// Update a mission's two axes in place (used when the wizard is re-run for
     /// an already-paired workspace with a different intent/isolation). Safe re:
     /// the writer index — it updates one existing row, never adds a second.
+    /// Raw write: go through `mission::ensure_for_workspace`, which refuses to
+    /// loosen a read-only mission (`mission::check_git_isolation_change`).
     pub fn update_mission_axes(
         &self,
         mission_id: &str,
