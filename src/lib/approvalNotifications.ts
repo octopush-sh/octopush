@@ -25,7 +25,7 @@ export interface ApprovalNotification {
 /** What a card is about, as far as a notification may say. */
 export interface ApprovalCardKind {
   secret?: boolean;
-  kind?: "mcp" | "read" | "write";
+  kind?: "mcp" | "read" | "write" | "run";
 }
 
 /** Pure: the notification for an approval card. */
@@ -36,7 +36,9 @@ export function decideApprovalNotification(card: ApprovalCardKind, workspaceName
       ? "An MCP tool call is waiting for your approval"
       : card.kind === "read" || card.kind === "write"
         ? "A file access outside the workspace is waiting for your approval"
-        : "A command is waiting for your approval";
+        : card.kind === "run"
+          ? "A command reaching outside the workspace is waiting for your approval"
+          : "A command is waiting for your approval";
   return { title: "Talk needs a decision", body: `${workspaceName ?? "A workspace"} — ${what}` };
 }
 
