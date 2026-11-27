@@ -1312,6 +1312,7 @@ impl Orchestrator {
                     },
                 }
             };
+            let skill_shell_off = self.db.lock().workspace_skill_shell_off(&run.workspace_id).unwrap_or(false);
             let ctx = StageContext {
                 workspace_path,
                 task: run.task.clone(),
@@ -1328,6 +1329,7 @@ impl Orchestrator {
                 peers,
                 quiet_claude_code: crate::settings::quiet_claude_code(),
                 mcp,
+                skill_shell_off,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

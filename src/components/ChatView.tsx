@@ -8,7 +8,8 @@ interface Props {
   workspaceId: string;
   workspacePath: string;
   /** Talk is the mode on screen (the canvas stays mounted while hidden).
-   *  Esc stops the running turn only then. */
+   *  Esc stops the running turn only then, and an approval card answers
+   *  its keys only then. */
   active?: boolean;
   onOpenSettings?: () => void;
   /** Open a file (relative or absolute) in the in-app editor. When provided,
@@ -40,6 +41,7 @@ export function ChatView({
       <ChatCanvas
         workspaceId={workspaceId}
         workspacePath={workspacePath}
+        active={active}
         onOpenSettings={onOpenSettings}
         onOpenInEditor={onOpenInEditor}
         onRunInTerminal={onRunInTerminal}

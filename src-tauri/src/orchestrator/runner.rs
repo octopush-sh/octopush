@@ -58,6 +58,11 @@ pub struct StageContext {
     /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (see
     /// `CliDialect::stage_quiet_env`); Codex and `ApiRunner` ignore it.
     pub quiet_claude_code: bool,
+    /// The project's "Don't run skill shell commands in crews" (#1188), read
+    /// from the DB when the stage starts (Direct and Routines alike). A Claude
+    /// CLI stage then gets `disableSkillShellExecution` in its `--settings`
+    /// (see `cli_runner::disable_skill_shell`); Codex and `ApiRunner` ignore it.
+    pub skill_shell_off: bool,
     /// The MCP servers an API stage was given (#1134), when the app drives
     /// it. `None`: no server chosen, a CLI stage, or a run where MCP isn't
     /// available yet (the detached worker, a Routine; the drive says so).

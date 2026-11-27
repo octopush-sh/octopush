@@ -507,6 +507,12 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN share_with_missions TEXT NOT NULL DEFAULT ''",
         )?;
+        // "Don't run skill shell commands in crews" (#1188): 1 adds
+        // `disableSkillShellExecution` to every Claude CLI stage's `--settings`.
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN skill_shell_off INTEGER NOT NULL DEFAULT 0",
+        )?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -2664,6 +2670,33 @@ impl Db {
         Ok(())
     }
 
+    /// Whether the project turns off skill shell commands in its crews
+    /// (false when unset, or no such project).
+    pub fn get_project_skill_shell_off(&self, id: &str) -> AppResult<bool> {
+        let off: Option<i64> = self
+            .conn
+            .query_row("SELECT skill_shell_off FROM projects WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        Ok(off.unwrap_or(0) != 0)
+    }
+
+    pub fn set_project_skill_shell_off(&self, id: &str, off: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET skill_shell_off = ?1 WHERE id = ?2",
+            params![off as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// [`Self::get_project_skill_shell_off`] for the project `workspace_id`
+    /// belongs to; false for an unknown workspace.
+    pub fn workspace_skill_shell_off(&self, workspace_id: &str) -> AppResult<bool> {
+        match self.get_workspace(workspace_id)? {
+            Some(ws) => self.get_project_skill_shell_off(&ws.project_id),
+            None => Ok(false),
+        }
+    }
+
     pub fn update_project(&self, id: &str, name: Option<&str>, tint: Option<&str>) -> AppResult<()> {
         if let Some(name_val) = name {
             self.conn.execute(
@@ -4247,6 +4280,21 @@ impl Db {
         Ok(path.flatten())
     }
 
+    /// The folder a Talk turn in `workspace_id` works in: its worktree, or
+    /// its project's root while it has none. `None` for an unknown workspace.
+    pub fn talk_workspace_path(&self, workspace_id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(NULLIF(w.worktree_path, ''), p.path) FROM workspaces w
+                   JOIN projects p ON p.id = w.project_id
+                 WHERE w.id = ?1",
+                params![workspace_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// The workspace a thread belongs to and its worktree, when it has one.
     pub fn chat_thread_home(&self, thread_id: &str) -> AppResult<Option<(String, Option<String>)>> {
         self.conn
@@ -5580,14 +5628,47 @@ impl Db {
         result
     }
 
-    /// List a single thread's messages in chronological order. (Scoped by
-    /// thread, not workspace — a workspace can hold several conversations.)
+    /// Close every conversation an app restart cut off mid-turn: a thread
+    /// whose last row is a turn's own `user`, `tool` or `assistant_tool_use`
+    /// row, and whose turn `running` doesn't report as still running, gets a
+    /// `stopped` row reading `note`. A `$` command's row (a `shell-` call id)
+    /// is a finished exchange, not a turn cut short. Returns the threads noted.
+    pub fn note_interrupted_talk_turns(&self, note: &str, running: &dyn Fn(&str) -> bool) -> AppResult<usize> {
+        let last: Vec<(String, String, String, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT workspace_id, thread_id, role, content FROM chat_messages
+                 WHERE id IN (SELECT MAX(id) FROM chat_messages WHERE thread_id IS NOT NULL GROUP BY thread_id)
+                   AND role IN ('user', 'tool', 'assistant_tool_use')",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut noted = 0;
+        for (workspace_id, thread_id, role, content) in last {
+            let shell = role == "tool"
+                && serde_json::from_str::<serde_json::Value>(&content)
+                    .ok()
+                    .and_then(|v| v.get("callId")?.as_str().map(|id| id.starts_with("shell-")))
+                    .unwrap_or(false);
+            if shell || running(&thread_id) {
+                continue;
+            }
+            self.insert_chat_message(&workspace_id, &thread_id, "stopped", note, None, None, None, None)?;
+            noted += 1;
+        }
+        Ok(noted)
+    }
+
+    /// List a single thread's messages in the order they were written. (Scoped
+    /// by thread, not workspace — a workspace can hold several conversations.)
+    /// Ordered by `id`, never `created_at`: a clock that steps back mid-turn
+    /// must not reorder the history.
     pub fn list_chat_messages(&self, thread_id: &str) -> AppResult<Vec<ChatMessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, role, content, model, input_tokens, output_tokens, cost_usd, created_at,
                     cache_read_tokens, cache_creation_tokens, context_tokens, context_blocks,
                     raw_json, tool_use_id, model_view, error_kind
-             FROM chat_messages WHERE thread_id = ?1 ORDER BY created_at",
+             FROM chat_messages WHERE thread_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![thread_id], |r| {
             Ok(ChatMessageRow {

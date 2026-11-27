@@ -2005,9 +2005,15 @@ export const ipc = {
   /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
   codexTrustNote: (workspacePath: string) =>
     invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
-  /** The hooks and MCP servers the repo's own Claude Code config runs, or null. Read-only. */
+  /** The hooks, MCP servers and skill shell commands the repo's own Claude Code config runs, or null. Read-only. */
   repoHooksNotice: (workspacePath: string) =>
     invoke<RepoHooksNotice | null>("repo_hooks_notice", { workspacePath }),
+  /** Whether the workspace's project turned on "Don't run skill shell commands in crews". */
+  skillShellOff: (workspaceId: string) =>
+    invoke<boolean>("skill_shell_off", { workspaceId }),
+  /** Turn "Don't run skill shell commands in crews" on or off for the workspace's project. */
+  setSkillShellOff: (workspaceId: string, off: boolean) =>
+    invoke<void>("set_skill_shell_off", { workspaceId, off }),
   /** The models among `models` with a published retirement date
    *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
   modelRetirements: (models: string[]) =>
@@ -2183,12 +2189,15 @@ export interface CodexTrustNote {
   how: string;
 }
 
-/** What a worktree's committed `.claude/settings.json` (hooks, status line)
- *  and `.mcp.json` (servers) run in a Claude Code stage
- *  (`commands::repo_hooks_notice`). */
+/** What a worktree's committed `.claude/settings.json` (hooks, status line),
+ *  `.mcp.json` (servers) and skills and commands (inline shell commands) run
+ *  in a Claude Code stage (`commands::repo_hooks_notice`). */
 export interface RepoHooksNotice {
   hooks: { event: string; matcher: string | null; kind: "command" | "http" | "mcp_tool" | "status_line"; runs: string }[];
   servers: { name: string; runs: string }[];
+  /** Each `!`…`` or ```! block of `.claude/skills/<skill>/SKILL.md` or
+   *  `.claude/commands/<skill>.md`, run as the skill loads. */
+  skillShells: { skill: string; command: string }[];
   /** SHA-256 over the canonical JSON of every entry. */
   hash: string;
 }
