@@ -82,6 +82,9 @@ describe("skills and agents counts", () => {
     expect(s).toHaveAttribute("data-tour", "companion-can-use-skills");
     expect(a).toHaveAttribute("data-tour", "companion-can-use-agents");
     expect(s).toHaveClass("font-mono", "text-octo-mute");
+    // The number changes on every rescan: tabular figures keep it from jittering.
+    expect(within(s).getByText("2")).toHaveClass("octo-tabular");
+    expect(within(a).getByText("3")).toHaveClass("octo-tabular");
     const row = screen.getByTestId("companion-can-use");
     expect(within(row).getByText("docs-server").compareDocumentPosition(s) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
@@ -142,6 +145,45 @@ describe("skills and agents counts", () => {
     expect(useChatStore.getState().draftInsertByWs["ws"]).toBeUndefined();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("keeps the earlier counts on screen while a reload is pending", async () => {
+    await mount();
+    let skillsDone!: (v: SkillMeta[]) => void;
+    let agentsDone!: (v: SubagentTypeMeta[]) => void;
+    listSkills.mockImplementationOnce(() => new Promise((r) => (skillsDone = r)));
+    listSubagentTypes.mockImplementationOnce(() => new Promise((r) => (agentsDone = r)));
+    await act(async () => {
+      useChatStore.setState({ streamingByWs: { ws: true } });
+    });
+    expect(count(/^skills · 2$/)).toBeInTheDocument();
+    expect(count(/^agents · 3$/)).toBeInTheDocument();
+
+    await act(async () => {
+      skillsDone([skills[0]]);
+      agentsDone([agents[0], agents[1]]);
+    });
+    expect(count(/^skills · 1$/)).toBeInTheDocument();
+    expect(count(/^agents · 2$/)).toBeInTheDocument();
+  });
+
+  it("keeps the last reading when a re-read fails, and leaves a count out when the first read for a worktree fails", async () => {
+    const view = await mount();
+    listSkills.mockRejectedValueOnce(new Error("scan failed"));
+    listSubagentTypes.mockResolvedValueOnce([agents[0]]);
+    await act(async () => {
+      useChatStore.setState({ streamingByWs: { ws: true } });
+    });
+    expect(count(/^skills · 2$/)).toBeInTheDocument();
+    expect(count(/^agents · 1$/)).toBeInTheDocument();
+
+    listSkills.mockResolvedValueOnce([skills[1]]);
+    listSubagentTypes.mockRejectedValueOnce(new Error("scan failed"));
+    await act(async () => {
+      view.rerender(<CompanionMcpScope worktreePath="/other" workspaceId="ws" />);
+    });
+    expect(count(/^skills · 1$/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^agents/ })).toBeNull();
   });
 
   it("re-reads the lists when a turn settles and drops a late answer for another worktree", async () => {

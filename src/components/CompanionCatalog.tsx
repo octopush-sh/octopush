@@ -110,7 +110,7 @@ function CatalogCount({
         }}
         className="octo-fade-in -mx-1 rounded px-1 font-mono text-[10px] text-octo-mute transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
       >
-        {label} · {count}
+        {label} · <span className="octo-tabular">{count}</span>
       </button>
       {anchor && (
         <MenuSurface

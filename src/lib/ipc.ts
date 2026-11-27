@@ -1117,8 +1117,9 @@ export const ipc = {
    *  outside the project, or one over 4 MiB. The slash menu lists them. */
   listSkippedSkills: (workspacePath: string) =>
     invoke<SkippedDefinition[]>("list_skipped_skills", { workspacePath }),
-  /** The workspace's `.claude/agents/*.md` definitions — the `subagent_type`s
-   *  Talk's `Agent` tool can run under (project ∪ user, project shadows). */
+  /** The `subagent_type`s Talk's `Agent` tool can run under: the workspace's
+   *  `.claude/agents/*.md` definitions and the built-in types (project ∪ user
+   *  ∪ built-in, project shadows). */
   listSubagentTypes: (workspacePath: string) =>
     invoke<SubagentTypeMeta[]>("list_subagent_types", { workspacePath }),
 
