@@ -64,7 +64,12 @@ pub async fn create_session(
     }
 
     // Auto-configure context from project root.
-    let guard = ContextGuard::auto_configure(&id, root_path);
+    let mut guard = ContextGuard::auto_configure(&id, root_path);
+    // The workspace's port block (#1219), when the root is a workspace's worktree.
+    let ports = crate::workspace_ports::ensure_for_root(&state.db.lock(), &session.project_root);
+    if let Some(block) = ports {
+        guard.set_ports(block);
+    }
     // Store detected context files in the session record.
     session.context_files = guard
         .context_files
@@ -1440,6 +1445,17 @@ pub async fn project_collisions(
     .map_err(|e| AppError::Other(format!("collision scan: {e}")))
 }
 
+/// The workspace's port block (#1219), allocated now if it has none: the
+/// header shows the same range its terminals and Talk shell get. `None` when
+/// the workspace is gone or every block is taken.
+#[tauri::command]
+pub async fn workspace_ports(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<crate::workspace_ports::PortBlock>> {
+    Ok(crate::workspace_ports::ensure(&state.db.lock(), &workspace_id))
+}
+
 /// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
 /// for Mission Control's settled and needs-you cards. `None` when the
 /// workspace or its worktree is gone, it isn't a git repo, or the diff timed
@@ -2334,6 +2350,39 @@ pub async fn list_project_instructions(
     .map_err(|e| AppError::Other(format!("project instructions: {e}")))
 }
 
+/// What the user trusts to run without an MCP card in Edit freely (#1243),
+/// per server, that still holds for its user-level entry (Settings ›
+/// Integrations); with a worktree, without the servers its own
+/// `.claude/mcp.json` defines, where trust never applies (the Companion).
+#[tauri::command]
+pub async fn list_mcp_trust(
+    state: State<'_, AppState>,
+    workspace_path: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let project = workspace_path.map(|w| crate::mcp::project_config(std::path::Path::new(&w))).unwrap_or_default();
+    let user = crate::mcp::load_user_config();
+    Ok(crate::mcp::trust::listed(&state.db.lock(), &user, &project))
+}
+
+/// Revoke the trust in `server`'s `tool`, or in the whole server (no tool).
+/// The next call to it asks again. Returns what is left.
+#[tauri::command]
+pub async fn revoke_mcp_trust(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    tool: Option<String>,
+) -> AppResult<Vec<crate::mcp::trust::McpTrust>> {
+    let user = crate::mcp::load_user_config();
+    let left = {
+        let db = state.db.lock();
+        crate::mcp::trust::revoke(&db, &server, tool.as_deref())?;
+        crate::mcp::trust::listed(&db, &user, &Default::default())
+    };
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+    Ok(left)
+}
+
 /// The MCP servers switched off in one Talk conversation (none by default).
 #[tauri::command]
 pub async fn get_thread_mcp_disabled(state: State<'_, AppState>, thread_id: String) -> AppResult<Vec<String>> {
@@ -2369,12 +2418,12 @@ pub async fn get_thread_permission_mode(state: State<'_, AppState>, thread_id: S
     Ok(ThreadPermissionMode { stored: stored.as_str(), effective: effective.as_str() })
 }
 
-/// Set a Talk conversation's permission mode, `plan` or `edit`; a turn that
-/// is running takes it from its next round. Ask first isn't settable yet.
+/// Set a Talk conversation's permission mode, `plan`, `ask` or `edit`; a
+/// turn that is running takes it from its next round, and notes the switch.
 #[tauri::command]
 pub async fn set_thread_permission_mode(state: State<'_, AppState>, thread_id: String, mode: String) -> AppResult<String> {
     let Some(mode) = crate::permissions::Mode::settable(&mode) else {
-        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan` or `edit`.")));
+        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan`, `ask` or `edit`.")));
     };
     state.db.lock().set_thread_permission_mode(&thread_id, mode)?;
     Ok(mode.as_str().to_string())
@@ -2426,12 +2475,17 @@ pub async fn save_mcp_config(
             }
             // A new secret value leaves the entry as it reads: restart it too.
             registry.apply_save(&old, &saved, &touched);
+            // Trust given to an entry that changed or went lapses (#1243).
+            if let Err(e) = crate::mcp::trust::prune(&db.lock(), &crate::mcp::load_user_config()) {
+                tracing::warn!(error = %e, "couldn't drop the MCP trust of a changed server");
+            }
             Ok(saved)
         },
     )
     .await
     .map_err(|e| crate::error::AppError::Other(e.to_string()))??;
     let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ()); // Companion "can use" reloads
+    let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
     Ok(saved)
 }
 
@@ -4089,6 +4143,13 @@ fn spawn_terminal_session(
     // terminal's span growing while output flows, with negligible cost during
     // heavy output; the span closes on its own after the idle window).
     let ws_for_activity = state.db.lock().workspace_for_terminal(&id).ok().flatten();
+    // The workspace's port block (#1219); a value the caller set wins.
+    if let Some(ws) = &ws_for_activity {
+        let ports = crate::workspace_ports::ensure(&state.db.lock(), ws);
+        if let Some(block) = ports {
+            block.apply_env(&mut env);
+        }
+    }
     let db_for_activity = std::sync::Arc::clone(&state.db);
     let last_beat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, seq, bytes| {
@@ -5984,17 +6045,15 @@ pub struct WriteResult {
     pub mtime: i64,
 }
 
-/// Sync core of `read_file_checked` (testable without a tokio runtime).
+/// Sync core of `read_file_checked` (testable without a tokio runtime). A
+/// named pipe, socket or device is refused, never read (`fs_safe`, #1190).
 pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<FileReadResult> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
+    let (bytes, meta) = match crate::fs_safe::read_regular(std::path::Path::new(path), max_bytes)? {
+        crate::fs_safe::Capped::TooLarge { size } => return Ok(FileReadResult::TooLarge { size }),
+        crate::fs_safe::Capped::Read { bytes, meta } => (bytes, meta),
+    };
     let size = meta.len();
     let mtime = mtime_millis(&meta);
-    if size > max_bytes {
-        return Ok(FileReadResult::TooLarge { size });
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::Other(format!("read_file_checked({path}): {e}")))?;
     if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(FileReadResult::Binary { size, mtime });
     }
@@ -6007,7 +6066,9 @@ pub(crate) fn read_file_checked_inner(path: &str, max_bytes: u64) -> AppResult<F
 #[tauri::command]
 pub async fn read_file_checked(path: String, max_bytes: Option<u64>) -> AppResult<FileReadResult> {
     let path = expand_tilde(&path);
-    read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES))
+    tokio::task::spawn_blocking(move || read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES)))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file_checked: {e}")))?
 }
 
 /// Lines `start..=end` of a file, for Talk's `@path#L10-40` (#1046).
@@ -6032,7 +6093,8 @@ pub(crate) fn read_file_lines_inner(path: &str, start: u32, end: u32, max_bytes:
     let io = |e: std::io::Error| AppError::Other(format!("read_file_lines({path}): {e}"));
     let start = start.max(1);
     let end = end.max(start);
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+    let (file, _) = crate::fs_safe::open_regular(std::path::Path::new(path))?;
+    let mut reader = std::io::BufReader::new(file);
     if reader.fill_buf().map_err(io)?.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
         return Ok(LineRangeResult::Binary);
     }
@@ -6106,12 +6168,14 @@ pub async fn read_file_lines(path: String, start: u32, end: u32, max_bytes: usiz
         .map_err(|e| AppError::Other(format!("read_file_lines: {e}")))?
 }
 
-/// Kept for any non-editor callers that want a plain string read.
+/// Kept for any non-editor callers that want a plain string read. Capped
+/// like `read_file_checked`; a named pipe, socket or device is refused.
 #[tauri::command]
 pub async fn read_file(path: String) -> AppResult<String> {
     let path = expand_tilde(&path);
-    std::fs::read_to_string(&path)
-        .map_err(|e| AppError::Other(format!("read_file({}): {e}", path)))
+    tokio::task::spawn_blocking(move || crate::fs_safe::read_regular_text(std::path::Path::new(&path), READ_CAP_BYTES))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file: {e}")))?
 }
 
 /// Sync core of `write_file` (testable; returns the post-write mtime).

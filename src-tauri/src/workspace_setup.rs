@@ -19,8 +19,12 @@
 //! reads it so the wizard can offer it as a prefill (never run on its own), and
 //! the runner gives every setup script Conductor's `CONDUCTOR_ROOT_PATH`,
 //! `CONDUCTOR_WORKSPACE_PATH` and `CONDUCTOR_WORKSPACE_NAME` unless the user
-//! already exports them ([`runner_env`]). `CONDUCTOR_PORT` is never set:
-//! Octopush allocates no ports.
+//! already exports them ([`runner_env`]). `CONDUCTOR_PORT` isn't the runner's:
+//! every Run terminal of a workspace, the setup terminal included, starts with
+//! the workspace's port block (`workspace_ports`: `OCTOPUSH_PORT`,
+//! `OCTOPUSH_PORT_COUNT` and `CONDUCTOR_PORT` with the same base), and the
+//! runner passes it through to the script untouched. A Routine's headless
+//! setup gets no port yet.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -313,7 +317,9 @@ mod tests {
         for var in [CONDUCTOR_ROOT_ENV, CONDUCTOR_WORKSPACE_PATH_ENV, CONDUCTOR_WORKSPACE_NAME_ENV] {
             assert!(RUNNER.contains(var), "{var}");
         }
-        assert!(!RUNNER.contains("CONDUCTOR_PORT"));
+        // The port comes from the terminal's env, never from the runner.
+        assert!(!RUNNER.contains(crate::workspace_ports::CONDUCTOR_PORT));
+        assert!(!RUNNER.contains(crate::workspace_ports::PORT_ENV));
     }
 
     #[test]
@@ -636,5 +642,28 @@ mod tests {
             stdout.contains("root=/repo root path=/wt/a b name=mine private=unset port=unset"),
             "{stdout}"
         );
+    }
+
+    /// The workspace's port block, set in the terminal's env, reaches the
+    /// script unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn runner_passes_the_workspace_ports_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runner = ensure_runner(dir.path()).unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let script = "echo \"port=$CONDUCTOR_PORT base=$OCTOPUSH_PORT count=$OCTOPUSH_PORT_COUNT\"";
+        let mut env = runner_env(script, "/repo", "/wt/a", "a");
+        crate::workspace_ports::PortBlock::new(40050).apply_env(&mut env);
+        let out = std::process::Command::new(&runner)
+            .arg("-l")
+            .current_dir(cwd.path())
+            .env("SHELL", "/bin/sh")
+            .envs(env)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("port=40050 base=40050 count=10"), "{stdout}");
     }
 }
