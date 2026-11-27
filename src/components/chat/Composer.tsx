@@ -962,7 +962,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             {streaming ? (
               <ComposerActionButton
                 onClick={() => stop(workspaceId)}
-                title="Stop generating"
+                title="Stop (Esc)"
                 label="Stop"
                 glyph="◼"
                 color="var(--color-octo-rouge)"

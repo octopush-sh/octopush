@@ -20,6 +20,8 @@ export type NavigateDetail =
   /** Open one Run terminal of a workspace of the open project (the setup toast). */
   | { kind: "terminal"; workspaceId: string; terminalId: string }
   | { kind: "palette" }
+  /** Talk's ⌘⌥K conversation switcher (switches to Talk first). */
+  | { kind: "conversation-switcher" }
   /** Run's Open beside (⌘D): the pairing switcher, or an empty seat. */
   | { kind: "open-beside" }
   /** The ⌘P file finder of the active workspace. */
@@ -52,6 +54,7 @@ export const SURFACES: Record<string, () => void> = {
   "mode/direct": mode("direct"),
   "run/open-beside": () => navigate({ kind: "open-beside" }),
   "palette": () => navigate({ kind: "palette" }),
+  "talk/switcher": () => navigate({ kind: "conversation-switcher" }),
   "file-finder": () => navigate({ kind: "file-finder" }),
   "mission-control": () => navigate({ kind: "mission-control" }),
   "logbook": () => navigate({ kind: "logbook" }),

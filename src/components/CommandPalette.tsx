@@ -46,6 +46,10 @@ interface Props {
   /** Reveals a rail group (unfolds it, scrolls to it, focuses its header).
    *  The Groups section shows only when this is wired. */
   onRevealGroup?: (groupId: string) => void;
+  /** The Talk group's commands, for the active workspace; absent without
+   *  one. `onCopy` is absent with no conversation, `onFocusApproval` while
+   *  no approval card waits in the conversation Talk shows. */
+  talk?: { onNew: () => void; onSwitch: () => void; onCopy?: () => void; onFocusApproval?: () => void };
 }
 
 export function CommandPalette({
@@ -58,6 +62,7 @@ export function CommandPalette({
   runningByWs,
   onSelectWorkspace,
   onRevealGroup,
+  talk,
 }: Props) {
   const { sessions, activeId, select, kill } = useSessionStore();
   const refresh = useSessionStore((s) => s.refresh);
@@ -225,6 +230,26 @@ export function CommandPalette({
                 two are one keyed list, so React moves a section instead of
                 remounting it on the first keystroke. */}
             {search.trim() === "" ? [workspacesSection, groupsSection] : [groupsSection, workspacesSection]}
+
+            {/* Talk — the active workspace's conversations. Each command
+                shows Talk; the shortcuts are the ones Talk answers. */}
+            {talk && (
+              <Group heading="Talk" tour={tourId("palette-talk")}>
+                <Item glyph="+" label="New conversation" shortcut="⌘⌥N" onSelect={() => run(talk.onNew)} />
+                <Item glyph="⇄" label="Switch conversation…" shortcut="⌘⌥K" onSelect={() => run(talk.onSwitch)} />
+                {talk.onCopy && (
+                  <Item glyph="#" label="Copy conversation as Markdown" onSelect={() => run(talk.onCopy!)} />
+                )}
+                {talk.onFocusApproval && (
+                  <Item
+                    glyph="!"
+                    label="Focus the waiting approval card"
+                    shortcut="⌘⌥A"
+                    onSelect={() => run(talk.onFocusApproval!)}
+                  />
+                )}
+              </Group>
+            )}
 
             {/* Models */}
             {/* The heading already says "Models", so rows carry the bare name.

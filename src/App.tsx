@@ -49,6 +49,8 @@ import { TerminalHost } from "./components/TerminalHost";
 import { RunPanes } from "./components/run/RunPanes";
 import { LINE_FLOOR_PX, LINE_LAST_PX, SessionLine } from "./components/run/SessionLine";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
+import { ConversationSwitcher } from "./components/chat/ConversationSwitcher";
+import { focusOldestCard } from "./components/chat/ApprovalCard";
 import { ReviewTail } from "./components/ReviewTail";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
@@ -1105,6 +1107,14 @@ function App() {
   useEffect(() => {
     setSessionSwitcher(null);
   }, [activeWorkspaceId, activeMode]);
+  // Talk's conversation switcher likewise, though it may open in the very
+  // render that switches to Talk (⌘K's "Switch conversation…").
+  useEffect(() => {
+    setConversationSwitcher(false);
+  }, [activeWorkspaceId]);
+  useEffect(() => {
+    if (activeMode !== "talk") setConversationSwitcher(false);
+  }, [activeMode]);
 
   const setMode = useCallback(
     (next: WorkspaceMode) => {
@@ -1134,6 +1144,7 @@ function App() {
         case "mode": setSettingsTab(null); setMode(d.mode); break;
         // "terminal" is handled next to handleSelectWorkspace, below.
         case "palette": setShowPalette(true); break;
+        case "conversation-switcher": setSettingsTab(null); setMode("talk"); setConversationSwitcher(true); break;
         case "file-finder": setSearchMode("files"); setShowSearch(true); break;
         case "mission-control": setMissionControlOpen(true); break;
         case "logbook": setLogbookOpen(true); break;
@@ -1260,6 +1271,16 @@ function App() {
       // too, hence the open/closed split.
       toggleSessionSwitcher: () =>
         setSessionSwitcher((v) => (v ? null : isModalOpen() ? null : "switch")),
+      toggleConversationSwitcher: () => setConversationSwitcher((v) => (v ? false : !isModalOpen())),
+      // Shown in Talk, where the new conversation is. Never under a dialog.
+      newConversation: () => {
+        if (!activeWorkspaceId || isModalOpen()) return false;
+        setMode("talk");
+        handleNewChat();
+        return true;
+      },
+      // A card never takes the focus by itself; this is the user asking.
+      focusApproval: () => !!activeWorkspaceId && !isModalOpen() && focusOldestCard(),
       // Open beside: the pairing switcher while a session is off screen,
       // else an empty seat. Never under another dialog.
       openBeside: () => {
@@ -1296,7 +1317,7 @@ function App() {
         );
       },
     }),
-    [workspaces, selectWorkspace, setMode, project, toggleCompanion, activeWorkspaceId, setActiveTerminal],
+    [workspaces, selectWorkspace, setMode, project, toggleCompanion, activeWorkspaceId, setActiveTerminal, handleNewChat],
   );
   useGlobalShortcuts(shortcutCtx);
 
@@ -1351,6 +1372,13 @@ function App() {
   const activeChatId = activeWorkspaceId;
   const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
   const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
+  // An approval card waits in the conversation Talk shows (as ChatCanvas
+  // scopes them), for ⌘K's "Focus the waiting approval card".
+  const approvalWaiting = useChatStore((s) =>
+    s
+      .getPendingApprovals(activeWorkspaceId ?? "")
+      .some((a) => !activeThreadId || a.threadId === activeThreadId),
+  );
   // The threads running a turn (for the live pulse in the chat list).
   const streamingThreadIds = useChatStore((s) =>
     activeWorkspaceId ? s.streamingThreadsByWs[activeWorkspaceId] : undefined,
@@ -1451,6 +1479,8 @@ function App() {
   // "pair" is its Open beside mode (⌘D, a pane caption's menu, an empty seat).
   // "talk" is the same pairing, for Talk's seat.
   const [sessionSwitcher, setSessionSwitcher] = useState<"switch" | "pair" | "talk" | null>(null);
+  // ⌘⌥K in Talk — the conversation switcher.
+  const [conversationSwitcher, setConversationSwitcher] = useState(false);
   const openBeside = useCallback(() => void shortcutCtx.openBeside(), [shortcutCtx]);
   // The `run/open-beside` tour surface: the pairing switcher, in Run only.
   // Only the "pair" action: a tour runs on the user's real data, and an empty
@@ -2580,6 +2610,7 @@ function App() {
                     <ChatView
                       workspaceId={activeChatId!}
                       workspacePath={activeWorkspace.worktreePath || project.path}
+                      active={activeMode === "talk"}
                       onOpenSettings={() => setSettingsTab("general")}
                       onOpenInEditor={(p) => navigateToFile(p, "editor")}
                       onRunInTerminal={handleRunInTerminal}
@@ -3024,6 +3055,19 @@ function App() {
         </ErrorBoundary>
       )}
 
+      {conversationSwitcher && activeWorkspaceId && activeMode === "talk" && (
+        <ErrorBoundary surface="Conversation switcher" variant="overlay" onDismiss={() => setConversationSwitcher(false)}>
+        <ConversationSwitcher
+          chats={companionHistoryProps.chats}
+          activeChatId={companionHistoryProps.activeChatId}
+          streamingChatIds={companionHistoryProps.streamingChatIds}
+          onSelect={handleSelectChat}
+          onNew={handleNewChat}
+          onClose={() => setConversationSwitcher(false)}
+        />
+        </ErrorBoundary>
+      )}
+
       <ErrorBoundary surface="Command palette" variant="overlay" onDismiss={() => setShowPalette(false)}>
       <CommandPalette
         open={showPalette}
@@ -3035,6 +3079,31 @@ function App() {
         onToggleTokens={() => setSettingsTab("usage")}
         onOpenPullRequest={
           activeWorkspaceId ? () => usePrStore.getState().openComposer(activeWorkspaceId) : undefined
+        }
+        talk={
+          activeWorkspaceId
+            ? {
+                onNew: () => {
+                  setMode("talk");
+                  handleNewChat();
+                },
+                onSwitch: () => {
+                  setMode("talk");
+                  setConversationSwitcher(true);
+                },
+                onCopy: companionHistoryProps.activeChatId
+                  ? () => handleExportChat(companionHistoryProps.activeChatId!)
+                  : undefined,
+                // A frame later: the palette hands the focus back to its
+                // opener as it closes, and Talk has to be on screen.
+                onFocusApproval: approvalWaiting
+                  ? () => {
+                      setMode("talk");
+                      requestAnimationFrame(() => void focusOldestCard());
+                    }
+                  : undefined,
+              }
+            : undefined
         }
         projects={projectGroups}
         runningByWs={runningByWs}

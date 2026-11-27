@@ -19,6 +19,15 @@ const COPY = {
   secret: { eyebrow: "Possible secret", title: "⌘↵, Enter or Esc leaves it out", lead: ["Leave it out", "Leave it out (⌘↵, Enter or Esc with the card focused)"], other: ["Run regardless", "Run it as it is, once, for exactly these findings"] },
 } as const;
 
+/** The chord that focuses the oldest card waiting in the conversation on
+ *  screen (`focusOldestCard`, the `focus-approval` global shortcut). A card
+ *  only ever takes the focus from the user: this, a click or Tab. */
+export const FOCUS_CARD_CHORD = "⌘⌥A";
+
+/** Every card carries this attribute, so the chord can find the oldest one
+ *  and Talk's Esc can leave a card's focus alone (`talkEscape`). */
+export const APPROVAL_CARD_SELECTOR = "[data-approval-card]";
+
 /** What a command's path card can't promise (#1201), on its tooltip. */
 export const RUN_CHECK_LIMITS =
   "Octopush reads the paths a command names. A shell can build a path it can't see, so this is a net, not a sandbox.";
@@ -51,6 +60,12 @@ export const RUN_CHECK_LIMITS =
  * also takes the safe answer. Held keys (auto-repeat) are ignored. A focused
  * button answers its own keys, as any button does, and the composer's ⌘↵
  * never reaches the card: the card answers only its own focus.
+ *
+ * A card never takes the focus when it appears: a keystroke meant for
+ * something else (a habitual ⌘↵ from the composer) must never answer a
+ * command the user hasn't read. It takes the focus only from the user: a
+ * click, Tab, or ⌘⌥A (`FOCUS_CARD_CHORD`), which focuses the oldest card in
+ * the conversation on screen.
  */
 export function ApprovalCard({ approval, onRespond }: Props) {
   const secret = approval.secret === true;
@@ -71,10 +86,11 @@ export function ApprovalCard({ approval, onRespond }: Props) {
   return (
     <div
       role="group"
+      data-approval-card=""
       tabIndex={0}
       aria-label={`${copy.eyebrow}: ${approval.command}`}
       aria-keyshortcuts={safeLead ? "Meta+Enter Enter Escape" : "Meta+Enter Escape"}
-      title={run ? `${copy.title}. ${RUN_CHECK_LIMITS}` : copy.title}
+      title={`${copy.title} · ${FOCUS_CARD_CHORD} focuses the oldest waiting card${run ? `. ${RUN_CHECK_LIMITS}` : ""}`}
       onKeyDown={onKeyDown}
       data-tour={secret ? tourId("talk-secret-approval") : tourId("talk-approval")}
       className="octo-rise-in my-2 rounded-md border border-[var(--rouge-border)] bg-[var(--rouge-ghost)] px-3 py-2.5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
@@ -153,6 +169,16 @@ export function ApprovalCard({ approval, onRespond }: Props) {
       </div>
     </div>
   );
+}
+
+/** Focus the oldest card waiting under `root` (cards render in the order
+ *  they arrived, so the first is the oldest) and bring it into view. False
+ *  when none waits. Only the user's own ⌘⌥A or ⌘K command calls this. */
+export function focusOldestCard(root: ParentNode = document): boolean {
+  const card = root.querySelector<HTMLElement>(APPROVAL_CARD_SELECTOR);
+  if (!card) return false;
+  card.focus();
+  return true;
 }
 
 /** The answer a key gives a focused card, or null for a key it leaves alone.

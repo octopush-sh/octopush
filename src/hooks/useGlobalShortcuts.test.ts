@@ -51,6 +51,9 @@ function ctx(over: Partial<ShortcutContext> & { modeNow?: WorkspaceMode } = {}):
     toggleCompanion: vi.fn(),
     openSettings: vi.fn(),
     toggleSessionSwitcher: vi.fn(),
+    toggleConversationSwitcher: vi.fn(),
+    newConversation: vi.fn(() => true),
+    focusApproval: vi.fn(() => true),
     openBeside: vi.fn(() => true),
     toggleTalkSeat: vi.fn(() => true),
     terminalIds: () => ["t1", "t2", "t3"],
@@ -78,7 +81,10 @@ describe("matchShortcut", () => {
     [{ key: "L", shift: true }, "logbook"],
     [{ key: "E", shift: true }, "reveal-in-tree"],
     [{ key: "n" }, "new-workspace"],
-    [{ key: "n", alt: true }, "new-workspace"],
+    [{ key: "n", alt: true }, "new-conversation"],
+    // macOS: ⌥N is a dead key; the code decides.
+    [{ key: "Dead", code: "KeyN", alt: true }, "new-conversation"],
+    [{ key: "n", alt: true, shift: true }, null],
     [{ key: "N", shift: true }, null],
     [{ key: "k" }, "palette"],
     [{ key: "p" }, "file-finder"],
@@ -88,10 +94,15 @@ describe("matchShortcut", () => {
     [{ key: "," }, "settings"],
     [{ key: "T", shift: true }, "settings-usage"],
     [{ key: "t" }, null],
-    [{ key: "k", alt: true }, "session-switcher"],
+    [{ key: "k", alt: true }, "switcher"],
     // Option remapped the printed character; the physical key still counts.
-    [{ key: "˚", code: "KeyK", alt: true }, "session-switcher"],
+    [{ key: "˚", code: "KeyK", alt: true }, "switcher"],
     [{ key: "k", alt: true, shift: true }, null],
+    [{ key: "a", alt: true }, "focus-approval"],
+    // macOS: ⌥A prints "å"; the code decides.
+    [{ key: "å", code: "KeyA", alt: true }, "focus-approval"],
+    [{ key: "a" }, null],
+    [{ key: "a", alt: true, shift: true }, null],
     [{ key: "ArrowLeft", alt: true }, "session-step"],
     [{ key: "ArrowRight", alt: true }, "session-step"],
     [{ key: "ArrowRight" }, null],
@@ -223,6 +234,78 @@ describe("handleShortcut", () => {
     expect(c.openCreator).toHaveBeenCalled();
   });
 
+  it("⌘⌥N starts a new conversation in any mode, and leaves the key alone when it can't", () => {
+    for (const modeNow of ["talk", "run", "review", "direct"] as const) {
+      const c = ctx({ modeNow });
+      const e = press({ key: "Dead", code: "KeyN", alt: true });
+      handleShortcut(e, c);
+      expect(c.newConversation).toHaveBeenCalledTimes(1);
+      expect(c.openCreator).not.toHaveBeenCalled();
+      expect(e.preventDefault).toHaveBeenCalled();
+    }
+    const cant = ctx({ newConversation: vi.fn(() => false) });
+    const e = press({ key: "n", alt: true });
+    handleShortcut(e, cant);
+    expect(e.preventDefault).not.toHaveBeenCalled();
+    // ⌘N stays New workspace.
+    const c = ctx();
+    handleShortcut(press({ key: "n" }), c);
+    expect(c.openCreator).toHaveBeenCalled();
+    expect(c.newConversation).not.toHaveBeenCalled();
+  });
+
+  it("⌘⌥A focuses the oldest approval card in Talk only, and leaves the key alone when none waits", () => {
+    const talk = ctx({ modeNow: "talk" });
+    const e = press({ key: "å", code: "KeyA", alt: true });
+    handleShortcut(e, talk);
+    expect(talk.focusApproval).toHaveBeenCalledTimes(1);
+    expect(e.preventDefault).toHaveBeenCalled();
+
+    const none = ctx({ modeNow: "talk", focusApproval: vi.fn(() => false) });
+    const n = press({ key: "a", alt: true });
+    handleShortcut(n, none);
+    expect(none.focusApproval).toHaveBeenCalledTimes(1);
+    expect(n.preventDefault).not.toHaveBeenCalled();
+
+    // The cards are Talk's: elsewhere a hidden card is never focused.
+    for (const modeNow of ["run", "review", "direct"] as const) {
+      const other = ctx({ modeNow });
+      const o = press({ key: "a", alt: true });
+      handleShortcut(o, other);
+      expect(other.focusApproval).not.toHaveBeenCalled();
+      expect(o.preventDefault).not.toHaveBeenCalled();
+    }
+  });
+
+  it("⌘⌥K lists sessions in Run, conversations in Talk, and nothing elsewhere", () => {
+    const run = ctx({ modeNow: "run" });
+    handleShortcut(press({ key: "k", alt: true }), run);
+    expect(run.toggleSessionSwitcher).toHaveBeenCalledTimes(1);
+    expect(run.toggleConversationSwitcher).not.toHaveBeenCalled();
+
+    const talk = ctx({ modeNow: "talk" });
+    const t = press({ key: "˚", code: "KeyK", alt: true });
+    handleShortcut(t, talk);
+    expect(talk.toggleConversationSwitcher).toHaveBeenCalledTimes(1);
+    expect(talk.toggleSessionSwitcher).not.toHaveBeenCalled();
+    expect(t.preventDefault).toHaveBeenCalled();
+
+    for (const modeNow of ["review", "direct"] as const) {
+      const other = ctx({ modeNow });
+      const o = press({ key: "k", alt: true });
+      handleShortcut(o, other);
+      expect(other.toggleSessionSwitcher).not.toHaveBeenCalled();
+      expect(other.toggleConversationSwitcher).not.toHaveBeenCalled();
+      expect(o.preventDefault).not.toHaveBeenCalled();
+    }
+
+    const none = ctx({ modeNow: "talk", activeWorkspaceId: null });
+    const n = press({ key: "k", alt: true });
+    handleShortcut(n, none);
+    expect(none.toggleConversationSwitcher).not.toHaveBeenCalled();
+    expect(n.preventDefault).not.toHaveBeenCalled();
+  });
+
   it("reveals the open file only in Review, and claims ⌘⇧E everywhere", () => {
     const talk = ctx();
     const e = press({ key: "e", shift: true });
@@ -243,7 +326,6 @@ describe("handleShortcut", () => {
     it("do nothing outside Run and leave the key alone", () => {
       const c = ctx({ modeNow: "talk" });
       for (const p of [
-        { key: "k", alt: true },
         { key: "ArrowRight", alt: true },
         { key: "¡", code: "Digit1", alt: true },
       ]) {

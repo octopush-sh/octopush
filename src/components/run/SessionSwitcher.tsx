@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { Plus } from "lucide-react";
-import { ModalShell } from "../ModalShell";
+import { SwitcherFrame, switcherRowClass } from "./SwitcherFrame";
 import { RUN_PANES, useTerminalsStore } from "../../stores/terminalsStore";
 import { besideReplaces, useTerminalLayoutStore } from "../../stores/terminalLayoutStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
@@ -197,45 +197,48 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
   };
 
   const palette = (
-    <ModalShell
+    <SwitcherFrame
       onClose={onClose}
-      align="top"
-      topOffset="pt-[16vh]"
       ariaLabel={pairing ? "Open a session beside" : "Switch session"}
-      initialFocus={inputRef}
-    >
-      <div className="w-[470px] max-w-[92vw] overflow-hidden rounded-xl border border-octo-hairline bg-octo-panel">
-        <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
-          <span className="font-mono text-[10px] tracking-[0.1em] text-octo-brass">
-            {pairing ? "⌘D" : "⌘⌥K"}
-          </span>
-          <input
-            ref={inputRef}
-            autoFocus
-            data-testid="session-switcher-input"
-            data-tour={pairing && !talk ? tourId("run-pair-input") : undefined}
-            value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setSel(0);
-            }}
-            onKeyDown={onKeyDown}
-            placeholder={pairing ? "Which session sits beside this one?" : "Find a session…"}
-            aria-label={pairing ? "Which session sits beside this one?" : "Find a session"}
-            className="flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
-          />
-        </div>
-
-        {pairing && replaces && (
+      glyph={pairing ? "⌘D" : "⌘⌥K"}
+      inputRef={inputRef}
+      query={query}
+      onQuery={(value) => {
+        setQuery(value);
+        setSel(0);
+      }}
+      onKeyDown={onKeyDown}
+      placeholder={pairing ? "Which session sits beside this one?" : "Find a session…"}
+      inputLabel={pairing ? "Which session sits beside this one?" : "Find a session"}
+      inputTestId="session-switcher-input"
+      inputTour={pairing && !talk ? tourId("run-pair-input") : undefined}
+      banner={
+        pairing &&
+        replaces && (
           <div
             data-testid="session-switcher-replaces"
             className="octo-fade-in border-b border-octo-hairline px-4 py-2 font-mono text-[10px] text-octo-mute"
           >
             Replaces the session in the focused pane
           </div>
-        )}
-
-        <div role="listbox" aria-label="Open sessions" className="max-h-[52vh] overflow-y-auto py-1">
+        )
+      }
+      listLabel="Open sessions"
+      hints={
+        <>
+          <span>↑↓ · Move</span>
+          {pairing ? (
+            <span>⏎ · {replaces ? "Replace" : "Beside"}</span>
+          ) : (
+            <>
+              <span>⏎ · Switch</span>
+              <span data-testid="session-switcher-alt-hint">⌥⏎ · {replaces ? "Replace" : "Beside"}</span>
+            </>
+          )}
+          <span>⌫ · Close</span>
+        </>
+      }
+    >
           {matches.length === 0 && query.trim() !== "" && (
             <div className="px-4 py-6 text-center font-serif text-[13px] text-octo-mute">
               No session matches that.
@@ -256,11 +259,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
                 aria-selected={i === selected}
                 onMouseEnter={() => setSel(i)}
                 onClick={() => choose(i)}
-                className={`flex w-full items-center gap-3 border-l-2 px-4 py-2 text-left transition-colors duration-[180ms] ${
-                  i === selected
-                    ? "border-octo-brass bg-[var(--brass-ghost)]"
-                    : "border-transparent hover:bg-octo-panel-2"
-                }`}
+                className={switcherRowClass(i === selected)}
               >
                 <span className="octo-tabular w-4 shrink-0 font-mono text-[10px] text-octo-mute">
                   {index + 1}
@@ -312,11 +311,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
             aria-selected={selected === maxSel}
             onMouseEnter={() => setSel(maxSel)}
             onClick={() => choose(maxSel)}
-            className={`flex w-full items-center gap-3 border-l-2 border-t border-t-octo-hairline px-4 py-2 text-left transition-colors duration-[180ms] ${
-              selected === maxSel
-                ? "border-l-octo-brass bg-[var(--brass-ghost)]"
-                : "border-l-transparent hover:bg-octo-panel-2"
-            }`}
+            className={switcherRowClass(selected === maxSel, "border-t border-t-octo-hairline")}
           >
             <span className="flex w-4 shrink-0 justify-center text-octo-mute">
               <Plus size={12} strokeWidth={1.75} aria-hidden />
@@ -326,24 +321,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
             </span>
           </button>
           )}
-        </div>
-
-        {/* The app's canonical key-hint voice: mono caps, `ESC · CLOSE`. */}
-        <div className="flex gap-4 border-t border-octo-hairline px-4 py-2 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
-          <span>↑↓ · Move</span>
-          {pairing ? (
-            <span>⏎ · {replaces ? "Replace" : "Beside"}</span>
-          ) : (
-            <>
-              <span>⏎ · Switch</span>
-              <span data-testid="session-switcher-alt-hint">⌥⏎ · {replaces ? "Replace" : "Beside"}</span>
-            </>
-          )}
-          <span>⌫ · Close</span>
-          <span>Esc · Dismiss</span>
-        </div>
-      </div>
-    </ModalShell>
+    </SwitcherFrame>
   );
 
   // The confirm is the palette's sibling, not its child: a key pressed in it
