@@ -779,8 +779,8 @@ function EmptyState({
             key={label}
             type="button"
             onClick={() => queueDraftInsert(workspaceId, draft)}
-            title={`Start the draft with “${draft.trim()}”; nothing is sent`}
-            className="rounded-md border border-octo-hairline px-3 py-1 font-serif text-[13px] text-octo-sage transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:border-[var(--brass-dim)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            title={`Add “${draft.trim()}” to the draft; nothing is sent`}
+            className="rounded-md border border-octo-border-strong px-3 py-1 font-serif text-[13px] text-octo-sage transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
           >
             {label}
           </button>

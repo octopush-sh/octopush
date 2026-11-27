@@ -459,6 +459,15 @@ describe("ChatView — renders tool cards in the DOM", () => {
       "Ask about a file",
       "Explain this workspace",
     ]);
+    // The starters add to what is typed, so the title says "add", not "start".
+    expect(within(starters).getByRole("button", { name: "Review what changed" })).toHaveAttribute(
+      "title",
+      "Add “@diff” to the draft; nothing is sent",
+    );
+    expect(within(starters).getByRole("button", { name: "Explain this workspace" })).toHaveAttribute(
+      "title",
+      "Add “Explain this workspace.” to the draft; nothing is sent",
+    );
     const draft = container.querySelector('[data-tour="talk-composer-input"]') as HTMLTextAreaElement;
     fireEvent.click(within(starters).getByRole("button", { name: "Review what changed" }));
     await waitFor(() => expect(draft.value).toBe("@diff "));
