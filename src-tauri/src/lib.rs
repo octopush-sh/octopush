@@ -474,6 +474,7 @@ pub fn run() {
             commands::save_issue_tracker_config,
             // AI primitive (G5)
             commands::ai_complete,
+            commands::generate_chat_title,
             // MCP server integration (Connect to Claude Code)
             commands::mcp_connection_status,
             commands::connect_claude_code,

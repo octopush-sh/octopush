@@ -1,6 +1,8 @@
 import { useMemo, useRef, useState } from "react";
-import { Plus, X, Pencil, Check, Search, Download, Pin, PinOff } from "lucide-react";
+import { Plus, X, Pencil, Check, Search, Download, Pin, PinOff, RefreshCw } from "lucide-react";
 import { CompanionSection } from "./CompanionSection";
+import { tourId } from "../lib/tour/ids";
+import { useTourStore } from "../stores/tourStore";
 
 export interface CompanionHistoryChat {
   id: string;
@@ -16,6 +18,8 @@ interface Props {
   onNewChat: () => void;
   onDeleteChat?: (id: string) => void;
   onRenameChat?: (id: string, title: string) => void;
+  /** Ask the fast tier for a fresh title (#1137). Resolves once it's settled. */
+  onRegenerateTitle?: (id: string) => Promise<unknown> | void;
   /** Export a conversation (e.g. copy as Markdown). */
   onExportChat?: (id: string) => void;
   /** Pin/unpin a conversation to the top of the list. */
@@ -31,10 +35,28 @@ export function CompanionHistory({
   onNewChat,
   onDeleteChat,
   onRenameChat,
+  onRegenerateTitle,
   onExportChat,
   onPinChat,
   streamingChatIds,
 }: Props) {
+  // A tour pointing into a row's actions shows them, as a hover would.
+  const tourTarget = useTourStore((s) => s.target);
+  // Rows whose title is being regenerated (the action waits, disabled).
+  const [regenerating, setRegenerating] = useState<ReadonlySet<string>>(new Set());
+  function regenerate(id: string) {
+    if (!onRegenerateTitle || regenerating.has(id)) return;
+    setRegenerating((s) => new Set(s).add(id));
+    void Promise.resolve(onRegenerateTitle(id))
+      .catch(() => {})
+      .finally(() =>
+        setRegenerating((s) => {
+          const next = new Set(s);
+          next.delete(id);
+          return next;
+        }),
+      );
+  }
   // Roving keyboard nav: ↑/↓ move focus between row buttons (M11).
   const listRef = useRef<HTMLUListElement>(null);
   function onRowKeyDown(e: React.KeyboardEvent) {
@@ -183,9 +205,12 @@ export function CompanionHistory({
                       {/* Two lines, not one: similar titles usually part ways
                           past the first ~35 characters. The full title is the
                           row's tooltip. */}
+                      {/* Keyed by the title, so a new one (generated,
+                          regenerated, renamed) crossfades in. */}
                       <span
+                        key={c.title}
                         data-testid="chat-row-title"
-                        className="line-clamp-2 break-words font-serif text-[12px] leading-tight text-octo-ivory"
+                        className="octo-fade-in line-clamp-2 break-words font-serif text-[12px] leading-tight text-octo-ivory"
                       >
                         {c.title}
                       </span>
@@ -235,7 +260,12 @@ export function CompanionHistory({
                   // of the title; only the buttons catch the pointer.
                   <span
                     data-testid="chat-row-actions"
-                    className="octo-row-actions-fade pointer-events-none absolute inset-y-0 right-0 flex items-center rounded-r-md pl-5 pr-0.5 opacity-0 duration-[220ms] ease-[var(--ease-octo)] group-hover:opacity-100 focus-within:opacity-100"
+                    data-chat-row-actions={c.id}
+                    className={`octo-row-actions-fade pointer-events-none absolute inset-y-0 right-0 flex items-center rounded-r-md pl-5 pr-0.5 duration-[220ms] ease-[var(--ease-octo)] group-hover:opacity-100 focus-within:opacity-100 ${
+                      tourTarget?.closest?.("[data-chat-row-actions]")?.getAttribute("data-chat-row-actions") === c.id
+                        ? "opacity-100"
+                        : "opacity-0"
+                    }`}
                   >
                     {onPinChat && (
                       <button
@@ -262,6 +292,22 @@ export function CompanionHistory({
                         className="pointer-events-auto flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
                       >
                         <Pencil size={12} />
+                      </button>
+                    )}
+                    {onRegenerateTitle && (
+                      <button
+                        type="button"
+                        data-tour={tourId("companion-chat-regenerate-title")}
+                        disabled={regenerating.has(c.id)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          regenerate(c.id);
+                        }}
+                        title={regenerating.has(c.id) ? "Regenerating the title…" : "Regenerate title"}
+                        aria-label="Regenerate title"
+                        className="pointer-events-auto flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-octo-mute focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
+                      >
+                        <RefreshCw size={12} />
                       </button>
                     )}
                     {onExportChat && (

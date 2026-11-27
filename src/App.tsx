@@ -105,7 +105,8 @@ import {
 import type { Group } from "./lib/types";
 import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
-import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
+import { deriveChatTitle, deriveChatMeta, formatRelTime, isPlaceholderTitle } from "./lib/chatTitle";
+import { titleFailureToast } from "./lib/chatTitleGen";
 import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
@@ -1188,6 +1189,15 @@ function App() {
     [activeWorkspaceId],
   );
 
+  const handleRegenerateTitle = useCallback(
+    async (id: string) => {
+      if (!activeWorkspaceId) return;
+      const failure = await useChatStore.getState().regenerateTitle(activeWorkspaceId, id);
+      if (failure) pushToast({ level: "info", ...titleFailureToast(failure) });
+    },
+    [activeWorkspaceId],
+  );
+
   const handlePinChat = useCallback(
     (id: string, pinned: boolean) => {
       if (!activeWorkspaceId) return;
@@ -1547,7 +1557,9 @@ function App() {
           const msgs = activeWsPrimaryMessages ?? [];
           return {
             id: t.id,
-            title: deriveChatTitle(msgs) || t.title,
+            // The stored title (derived at the first send, then generated or
+            // set by the user); derived live only while it's the placeholder.
+            title: isPlaceholderTitle(t.title) && msgs.length > 0 ? deriveChatTitle(msgs) : t.title,
             meta: deriveChatMeta(msgs, tickerNow),
             pinned: t.pinned,
           };
@@ -1566,6 +1578,7 @@ function App() {
         onNewChat: handleNewChat,
         onDeleteChat: handleDeleteChat,
         onRenameChat: handleRenameChat,
+        onRegenerateTitle: handleRegenerateTitle,
         onExportChat: handleExportChat,
         onPinChat: handlePinChat,
         streamingChatIds: streamingThreadIds,
@@ -1576,6 +1589,7 @@ function App() {
       activeThreadId,
       handleSelectChat,
       handleNewChat,
+      handleRegenerateTitle,
       handleDeleteChat,
       handleRenameChat,
       handleExportChat,
