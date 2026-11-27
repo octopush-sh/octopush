@@ -1029,7 +1029,9 @@ impl crate::permissions::Asker for SubagentAsk {
         let preview =
             || crate::ask_first::card(Path::new(&self.workspace_path), &self.reach, Some(self.label.as_str()), name, input, &self.known);
         let ask = |c| self.broker.await_ask_first(&self.app, &self.workspace_id, &self.thread_id, &id, c);
-        crate::ask_first::ask_first(preview, ask).await
+        // The loop refuses a blind overwrite before any gate asks
+        // (`orchestrator::agentic`), and again as the write runs.
+        crate::ask_first::ask_first(preview, ask, || false).await
     }
 }
 
@@ -2443,6 +2445,39 @@ mod tests {
         let (reason, denial) = mcp_gate_texts(Some("Ticket"), "mcp__jira__add_comment");
         assert!(reason.starts_with("Sub-agent \u{201c}Ticket\u{201d}: MCP tool"));
         assert!(reason.contains("may change external state") && denial.contains("do not retry"));
+    }
+
+    /// A sub-agent's blind overwrite is refused before its gate sees it, so
+    /// no card (Ask first's or another) asks about a write that won't run,
+    /// and nothing is written (#1231 with #1165).
+    #[tokio::test]
+    async fn a_blind_overwrite_never_reaches_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "theirs\n").unwrap();
+        let provider = ScriptedProvider {
+            turns: Mutex::new(VecDeque::from(vec![
+                resp("", vec![LlmToolUse { id: "t1".into(), name: "write_file".into(), input: serde_json::json!({ "path": "a.txt", "content": "mine\n" }) }], LlmStopReason::ToolUse),
+                resp("done", vec![], LlmStopReason::EndTurn),
+            ])),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "Writer".into(), prompt: "p".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(3), max_tokens: 1, sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        };
+        let gate = RecordingGate { seen: Mutex::new(vec![]), deny: vec![] };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), None).await.unwrap();
+        assert!(gate.seen.lock().is_empty(), "the gate was asked about a refused write: {:?}", gate.seen.lock());
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "theirs\n");
     }
 
     struct PromptRecordingScripted {

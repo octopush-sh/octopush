@@ -295,8 +295,11 @@ pub fn unified_diff(before: &str, after: &str, known: &[KnownSecret]) -> String 
 /// Ask about the card `preview` builds and, once it is approved, build it
 /// again: the call goes on only if it would still make the change the card
 /// showed. One that changed while the card waited asks again, with what it
-/// now shows. `Some` is the fixed result of a declined call.
-pub async fn ask_first<F, Fut>(preview: impl Fn() -> AskCard, ask: F) -> Option<String>
+/// now shows, unless `refused` says the write rules (#1244's overwrite
+/// guard) now refuse it: it then goes on to that refusal, which runs where
+/// the call runs, and no second card asks about a write that won't happen.
+/// `Some` is the fixed result of a declined call.
+pub async fn ask_first<F, Fut>(preview: impl Fn() -> AskCard, ask: F, refused: impl Fn() -> bool) -> Option<String>
 where
     F: Fn(AskCard) -> Fut,
     Fut: std::future::Future<Output = ApprovalDecision>,
@@ -307,7 +310,7 @@ where
             return Some(crate::permissions::ASK_DECLINED.to_string());
         }
         let now = preview();
-        if now == card {
+        if now == card || refused() {
             return None;
         }
         card = now;
@@ -400,7 +403,7 @@ mod tests {
             },
         ];
         for c in cards {
-            let out = rt.block_on(ask_first(|| c.clone(), |_| async { ApprovalDecision::Deny }));
+            let out = rt.block_on(ask_first(|| c.clone(), |_| async { ApprovalDecision::Deny }, || false));
             assert_eq!(out.as_deref(), Some(ASK_DECLINED));
         }
         assert!(ASK_DECLINED.contains("Ask first") && ASK_DECLINED.contains("Nothing was run or changed"));
@@ -462,6 +465,7 @@ mod tests {
                 }
                 async { ApprovalDecision::Approve }
             },
+            || false,
         ));
         assert_eq!(out, None);
         assert_eq!(*shown.lock().unwrap(), ["@@ -1,1 +1,1 @@\n-one\n+three\n", "@@ -1,1 +1,1 @@\n-two\n+three\n"]);
@@ -489,12 +493,43 @@ mod tests {
                 }
                 async { ApprovalDecision::Approve }
             },
+            || false,
         ));
         assert_eq!(out, None);
         let shown = shown.into_inner().unwrap();
         assert_eq!(shown.len(), 2, "the second card asks about the file as it now is");
         assert_eq!(shown[0], shown[1], "even though both previews read the same");
         assert!(shown[0].contains(" \u{2026} [line cut: 200 more bytes]"), "{}", shown[0]);
+    }
+
+    /// A write the overwrite guard (#1244) refuses once its file moved while
+    /// the card waited gets no second card: it goes on to that refusal,
+    /// which still stops it where it runs.
+    #[test]
+    fn a_write_the_overwrite_guard_now_refuses_asks_once() {
+        let ws = tempfile::tempdir().unwrap();
+        let file = ws.path().join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let seen = parking_lot::Mutex::new(crate::file_seen::FileSeen::default());
+        crate::file_seen::note(&seen, ws.path(), "read_file", &json!({ "path": "a.txt" }), true);
+        let input = json!({ "path": "a.txt", "content": "three\n" });
+        let refused = || crate::file_seen::refusal(&seen, ws.path(), "write_file", &input).is_some();
+        assert!(!refused(), "read first, the write may run");
+        let reach = Reach::new(ws.path(), None, None);
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        let out = runtime().block_on(ask_first(
+            || card(ws.path(), &reach, None, "write_file", &input, &[]),
+            |_| {
+                asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The user changes the file while the card waits.
+                std::fs::write(&file, "two lines\n").unwrap();
+                async { ApprovalDecision::Approve }
+            },
+            refused,
+        ));
+        assert_eq!((out, asks.into_inner()), (None, 1));
+        assert!(refused(), "and the guard refuses the write as it runs");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two lines\n");
     }
 
     /// The preview never reads outside the workspace, shows only the hunks
