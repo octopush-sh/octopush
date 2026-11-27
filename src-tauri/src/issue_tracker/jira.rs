@@ -13,6 +13,13 @@ pub struct JiraConfig {
     pub api_token: String,
 }
 
+impl JiraConfig {
+    /// All three fields filled in: what "Jira is configured" means.
+    pub fn is_complete(&self) -> bool {
+        !self.base_url.is_empty() && !self.email.is_empty() && !self.api_token.is_empty()
+    }
+}
+
 pub struct JiraClient {
     cfg: JiraConfig,
     http: reqwest::Client,
