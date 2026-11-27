@@ -2,7 +2,6 @@ import type { KeyboardEvent } from "react";
 import { ShieldAlert } from "lucide-react";
 import type { PendingApproval } from "../../stores/chatStore";
 import { tourId } from "../../lib/tour/ids";
-import { diffLineStyle } from "../../lib/diffLineStyle";
 
 interface Props {
   approval: PendingApproval;
@@ -56,7 +55,9 @@ export const RUN_CHECK_LIMITS =
  * answered as "always").
  * Since #1231 a conversation in Ask first parks each write here: a file
  * change (`kind: "ask"`) with its diff when it can be shown, or a command
- * that may write (`kind: "ask-run"`). Neither offers "don't ask again".
+ * that may write (`kind: "ask-run"`), and when the change can't be shown
+ * the card says why (`previewNote`). No card offers "don't ask again" while
+ * the conversation is in Ask first (`askFirst`): no grant answers one there.
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -114,6 +115,9 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         {approval.command}
       </pre>
       {approval.diff && <AskDiff diff={approval.diff} />}
+      {approval.previewNote && (
+        <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">{approval.previewNote}</p>
+      )}
       {secret && (
         <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">
           {approval.coversUncommitted
@@ -153,7 +157,7 @@ export function ApprovalCard({ approval, onRespond }: Props) {
         >
           {copy.other[0]}
         </button>
-        {!secret && !outside && !askFirst && (
+        {!secret && !outside && !askFirst && !approval.askFirst && (
           <button
             type="button"
             onClick={() => onRespond("always")}
@@ -178,8 +182,18 @@ export function ApprovalCard({ approval, onRespond }: Props) {
   );
 }
 
-/** An Ask first card's change: the hunks the call would write, each line
- *  in the diff colours Review uses (`diffLineStyle`). */
+/** How a line of an Ask first card's diff reads, by its first character
+ *  only: a removed line whose text starts `--` is still a removed line.
+ *  Review's diff tints (`--diff-add-bg` / `--diff-del-bg`). Pure. */
+export function askLineStyle(line: string): { className: string; background: string } {
+  if (line.startsWith("+")) return { className: "text-octo-verdigris", background: "var(--diff-add-bg)" };
+  if (line.startsWith("-")) return { className: "text-octo-rouge", background: "var(--diff-del-bg)" };
+  return { className: "text-octo-sage", background: "" };
+}
+
+/** An Ask first card's change: the hunks the call would write, then any
+ *  marker or note the engine added (a cut line, the lines not shown, a
+ *  line-ending change). */
 function AskDiff({ diff }: { diff: string }) {
   const lines = diff.endsWith("\n") ? diff.slice(0, -1).split("\n") : diff.split("\n");
   return (
@@ -188,7 +202,7 @@ function AskDiff({ diff }: { diff: string }) {
       className="mt-1 max-h-64 overflow-auto rounded bg-octo-onyx py-1.5 font-mono text-[12px] leading-[1.45]"
     >
       {lines.map((line, i) => {
-        const style = diffLineStyle(line);
+        const style = askLineStyle(line);
         return (
           <div key={i} className={`px-2.5 ${style.className}`} style={style.background ? { background: style.background } : undefined}>
             {line || " "}

@@ -300,6 +300,34 @@ describe("ApprovalCard at the keyboard", () => {
     expect(onRespond).toHaveBeenLastCalledWith("deny");
   });
 
+  it("an Ask first diff colours each line by its first character, and says what it can't show (#1231)", () => {
+    const diff = "@@ -1,2 +1,2 @@\n---flag removed\n+++flag added\n\\ The final newline is removed\n";
+    const { container } = render(
+      <ApprovalCard
+        approval={{ ...base, kind: "ask", command: "notes.md", reason: "edits a file", diff, previewNote: undefined }}
+        onRespond={vi.fn()}
+      />,
+    );
+    const lines = Array.from(container.querySelectorAll("pre")[1].children);
+    expect(lines[1].className).toContain("text-octo-rouge");
+    expect(lines[2].className).toContain("text-octo-verdigris");
+    expect(lines[3].className).toContain("text-octo-sage");
+    cleanup();
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "ask", command: "logo.png", reason: "writes a file", previewNote: "No preview: a binary file. Approving writes it without showing the change." }}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("No preview: a binary file. Approving writes it without showing the change.")).toBeInTheDocument();
+  });
+
+  it("in Ask first, a flagged command's card offers no don't ask again (#1231)", () => {
+    render(<ApprovalCard approval={{ ...base, command: "rm -rf build", reason: "rm -rf", askFirst: true }} onRespond={vi.fn()} />);
+    expect(screen.getByText("Approval needed")).toBeInTheDocument();
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
+  });
+
   it("an Ask first command reads as a shell command, with no diff (#1231)", () => {
     const { container } = render(
       <ApprovalCard

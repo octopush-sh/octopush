@@ -185,6 +185,11 @@ export interface PendingApproval {
   rememberDir?: string;
   /** An Ask first card's file change, as a unified diff (#1231). */
   diff?: string;
+  /** Why an Ask first card shows no diff, said plainly (#1231). */
+  previewNote?: string;
+  /** The conversation is in Ask first: no "don't ask again" answers the
+   *  card, and it offers none (#1231). */
+  askFirst?: boolean;
 }
 
 /** `ask` and `ask-run` are Ask first's cards (#1231): a file change (or
@@ -192,13 +197,24 @@ export interface PendingApproval {
 export type ApprovalKind = "mcp" | "read" | "write" | "run" | "ask" | "ask-run";
 
 /** The card fields a request carries beyond its command and reason. */
-function approvalMarks(c: { secret?: boolean; coversUncommitted?: boolean; kind?: ApprovalKind; sensitive?: boolean; rememberDir?: string; diff?: string }) {
+function approvalMarks(c: {
+  secret?: boolean;
+  coversUncommitted?: boolean;
+  kind?: ApprovalKind;
+  sensitive?: boolean;
+  rememberDir?: string;
+  diff?: string;
+  previewNote?: string;
+  askFirst?: boolean;
+}) {
   return {
     ...(c.secret ? { secret: true, coversUncommitted: c.coversUncommitted === true } : {}),
     ...(c.kind ? { kind: c.kind } : {}),
     ...(c.sensitive ? { sensitive: true } : {}),
     ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
     ...(c.diff ? { diff: c.diff } : {}),
+    ...(c.previewNote ? { previewNote: c.previewNote } : {}),
+    ...(c.askFirst ? { askFirst: true } : {}),
   };
 }
 
@@ -1217,6 +1233,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     sensitive?: boolean;
     rememberDir?: string;
     diff?: string;
+    previewNote?: string;
+    askFirst?: boolean;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;

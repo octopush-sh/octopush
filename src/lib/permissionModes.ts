@@ -24,8 +24,8 @@ export const PERMISSION_MODE_LABELS: Record<PermissionMode, string> = {
 /** One line on what each mode does, for the menu and the tooltip. */
 export const PERMISSION_MODE_HINTS: Record<PermissionMode, string> = {
   plan: "Reads and plans. Nothing is written, and commands run read-only.",
-  ask: "Each file change, and each command that may write, waits for your OK.",
-  edit: "Changes run without asking. Risky commands and anything outside the workspace still ask.",
+  ask: "Each change waits for your OK: file edits, commands that may write, MCP writes. Nothing is approved for later.",
+  edit: "Changes run without asking. Flagged commands, MCP writes and anything outside the workspace still have their cards.",
 };
 
 /** The chord that cycles the mode, only while the focus is in the Composer. */
@@ -39,12 +39,19 @@ export function nextPermissionMode(mode: PermissionMode): PermissionMode {
   return PERMISSION_MODES[(PERMISSION_MODES.indexOf(mode) + 1) % PERMISSION_MODES.length];
 }
 
-/** Whether a key is the mode chord: ⌘⌥P (Ctrl+Alt+P off macOS) by the
- *  physical key, since Option turns `p` into `π` on macOS. A held key never
- *  cycles. Pure. */
+/** Whether a key is the mode chord: ⌘⌥P and nothing else (not ⌃⌥P), by
+ *  the physical key, since Option turns `p` into `π` on macOS. A held key
+ *  never cycles. Pure. */
 export function isModeChord(
   e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat" | "key" | "code">,
 ): boolean {
-  if (!(e.metaKey || e.ctrlKey) || !e.altKey || e.shiftKey || e.repeat) return false;
+  if (!e.metaKey || e.ctrlKey || !e.altKey || e.shiftKey || e.repeat) return false;
   return e.code === "KeyP" || e.key === "p" || e.key === "P";
+}
+
+/** Whether a quiet note row is the one a turn writes when its mode changes
+ *  between rounds ("Ask first from this round on: …",
+ *  `permissions::mode_note`), not a stop. Pure. */
+export function isModeNote(content: string): boolean {
+  return PERMISSION_MODES.some((m) => content.startsWith(`${PERMISSION_MODE_LABELS[m]} from this round on`));
 }

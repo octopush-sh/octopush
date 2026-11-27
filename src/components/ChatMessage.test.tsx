@@ -317,3 +317,21 @@ describe("ChatMessage — an ask sent with @ context (#1150)", () => {
     }
   });
 });
+
+describe("ChatMessage — quiet notes", () => {
+  const note = (content: string) => ({
+    id: 1, workspaceId: "ws", role: "stopped" as const, content, model: null,
+    inputTokens: null, outputTokens: null, costUsd: null, createdAt: "",
+  });
+
+  it("a mode change has its own glyph, not the stop's (#1231)", () => {
+    const { container, unmount } = render(<ChatMessage message={note("Ask first from this round on: each change waits for your OK")} />);
+    const row = container.querySelector('[data-role="stopped"]');
+    expect(row).toHaveAttribute("data-note", "mode");
+    expect(row?.textContent?.startsWith("◐")).toBe(true);
+    unmount();
+    const stop = render(<ChatMessage message={note("Generation stopped.")} />).container.querySelector('[data-role="stopped"]');
+    expect(stop).not.toHaveAttribute("data-note");
+    expect(stop?.textContent?.startsWith("◼")).toBe(true);
+  });
+});

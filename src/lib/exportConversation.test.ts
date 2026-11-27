@@ -40,6 +40,15 @@ describe("conversationToMarkdown", () => {
     expect(md).toContain("ok");
   });
 
+  it("exports a mode change as one, and a stop as a stop (#1231)", () => {
+    const md = conversationToMarkdown("X", [
+      msg({ id: 1, role: "stopped", content: "Ask first from this round on: each change waits for your OK" }),
+      msg({ id: 2, role: "stopped", content: "Generation stopped." }),
+    ]);
+    expect(md).toContain("> _(mode changed)_ Ask first from this round on: each change waits for your OK");
+    expect(md).toContain("> _(stopped)_");
+  });
+
   it("does not throw on a non-JSON tool row", () => {
     const md = conversationToMarkdown("X", [msg({ id: 1, role: "tool", content: "raw blob" })]);
     expect(md).toContain("raw blob");
