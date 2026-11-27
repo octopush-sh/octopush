@@ -513,15 +513,28 @@ impl Reach {
             WordRole::Program => runs(&hit.real),
             WordRole::Data => true,
             WordRole::Argument => false,
-        } || (read && (SYSTEM_READS.iter().any(|d| hit.real.starts_with(d)) || scan.allowed.iter().any(|d| hit.real.starts_with(d))));
+        } || (read
+            && (SYSTEM_READS.iter().any(|d| hit.real.starts_with(d))
+                || scan.allowed.iter().any(|d| hit.real.starts_with(d) && self.rememberable(d))));
         if !quiet {
             if read {
                 let dir = if hit.real.is_dir() { Some(hit.real.as_path()) } else { hit.real.parent() };
-                hit.remember = dir.map(Path::to_path_buf);
+                hit.remember = dir.filter(|d| self.rememberable(d)).map(Path::to_path_buf);
             }
             scan.outside.get_or_insert(hit);
         }
         None
+    }
+
+    /// Whether the conversation may remember `dir` for its commands' reads
+    /// (#1201): never a folder that is, holds or is inside a credentials
+    /// location, as named or where it resolves (`~`, `~/.config`, `/`, a
+    /// link to one of them). Such a read is allowed once at a time.
+    fn rememberable(&self, dir: &Path) -> bool {
+        let real = resolve(dir).unwrap_or_else(|| dir.to_path_buf());
+        self.secrets.iter().all(|(place, resolved, _)| {
+            std::iter::once(place).chain(resolved).all(|p| [dir, real.as_path()].iter().all(|d| !under(d, p) && !under(p, d)))
+        })
     }
 }
 
@@ -614,24 +627,46 @@ fn sub_agent(label: Option<&str>, reason: String) -> String {
 }
 
 /// Which commands of a line read whole folders (#1201), so a folder holding
-/// a credentials location counts as one: `tar`, `zip`, `rsync`, `rg`,
-/// `find`, `du`, `cat` and the like always, `cp`, `scp`, `grep` and `diff`
-/// with a recursive flag (`-r`, `-R`, `-a`, `--recursive`, `--archive`).
-/// `cd ~` and `ls ~` don't. Indexed by segment.
+/// a credentials location counts as one: archivers, copiers and searchers
+/// that always do (`tar`, `ditto`, `cpio`, `pax`, `7z`, `rsync`, `rg`,
+/// `find`, `cat`, `python3 -m zipfile` or `tarfile`…), and those that do
+/// with their recursive flag (`cp -r`/`-R`/`-a`, `scp -r`, `grep -r`/`-R`,
+/// `diff -r`, `gzip -r`/`-R`, `zip -r`, `ls -R`). `cd ~`, `ls ~` and `du`,
+/// which reads only sizes, don't. Indexed by segment.
 fn walking_segments(words: &[CommandWord]) -> Vec<bool> {
-    const ALWAYS: &[&str] = &["tar", "zip", "7z", "rsync", "rg", "ag", "ack", "find", "fd", "du", "cat", "tree"];
-    const RECURSIVE: &[&str] = &["cp", "scp", "grep", "egrep", "fgrep", "zgrep", "diff"];
+    const ALWAYS: &[&str] = &["tar", "ditto", "cpio", "pax", "7z", "rsync", "rg", "ag", "ack", "find", "fd", "cat", "tree", "zipfile", "tarfile"];
+    /// A program, the short flags that make it recurse, its long ones.
+    const RECURSIVE: &[(&str, &str, &[&str])] = &[
+        ("cp", "rRa", &["--recursive", "--archive"]),
+        ("scp", "r", &[]),
+        ("grep", "rR", &["--recursive", "--dereference-recursive"]),
+        ("egrep", "rR", &["--recursive", "--dereference-recursive"]),
+        ("fgrep", "rR", &["--recursive", "--dereference-recursive"]),
+        ("zgrep", "rR", &["--recursive"]),
+        ("diff", "r", &["--recursive"]),
+        ("gzip", "rR", &["--recursive"]),
+        ("zip", "rR", &["--recurse-paths"]),
+        ("ls", "R", &["--recursive"]),
+    ];
     let n = words.last().map_or(0, |w| w.segment + 1);
-    let (mut always, mut named, mut flagged) = (vec![false; n], vec![false; n], vec![false; n]);
-    for w in words.iter().filter(|w| w.role != WordRole::Data) {
-        let t = unescape(&w.pattern);
-        let name = t.rsplit('/').next().unwrap_or_default();
-        always[w.segment] |= ALWAYS.contains(&name);
-        named[w.segment] |= RECURSIVE.contains(&name);
-        flagged[w.segment] |= matches!(t.as_str(), "--recursive" | "--archive" | "--dereference-recursive")
-            || (t.starts_with('-') && !t.starts_with("--") && t.contains(['r', 'R', 'a']));
+    let mut walks = vec![false; n];
+    let mut segment: Vec<String> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if w.role != WordRole::Data {
+            segment.push(unescape(&w.pattern));
+        }
+        if words.get(i + 1).is_some_and(|next| next.segment == w.segment) {
+            continue;
+        }
+        let names = || segment.iter().map(|t| t.rsplit('/').next().unwrap_or_default());
+        let flags = |short: &str, long: &[&str]| {
+            segment.iter().any(|t| long.contains(&t.as_str()) || (t.starts_with('-') && !t.starts_with("--") && t.contains(|c: char| short.contains(c))))
+        };
+        walks[w.segment] = names().any(|n| ALWAYS.contains(&n))
+            || RECURSIVE.iter().any(|&(program, short, long)| names().any(|n| n == program) && flags(short, long));
+        segment.clear();
     }
-    (0..n).map(|s| always[s] || (named[s] && flagged[s])).collect()
+    walks
 }
 
 /// The credentials location or file one of `texts` (spellings of a word)
@@ -651,10 +686,10 @@ fn credential_part(texts: &[String]) -> Option<&'static str> {
 /// The sensitive hit for a word whose expansion the check can't follow
 /// (#1201) when it names a credentials location or file
 /// ([`credential_part`]), read as written, as left after the expansions,
-/// and with quotes, brackets and the like dropped: whatever it would expand
-/// to, it asks.
+/// and with quotes, brackets, spaces and the like dropped (so a name split
+/// across `$(echo ~/.ne )trc` still reads as one).
 fn named_credential(pattern: &str, spliced: &str) -> Option<Reached> {
-    let squeeze = |s: &str| s.chars().filter(|c| !"\\'\"$(){}[]*?@!+|,`".contains(*c)).collect::<String>();
+    let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace() && !"\\'\"$(){}[]*?@!+|,`".contains(*c)).collect::<String>();
     let part = credential_part(&[pattern.to_string(), squeeze(pattern), spliced.to_string(), squeeze(spliced)])?;
     let shown = unescape(pattern);
     Some(Reached {
@@ -1272,13 +1307,40 @@ mod tests {
         let write = run(&reach, "echo x > /usr/local/bin/tool").expect("a write there asks");
         assert_eq!((write.sensitive, write.remember), (false, None), "and offers no folder");
         // A read outside offers its folder (the file's, or the folder itself).
-        assert_eq!(run(&reach, "cat ~/notes.txt").unwrap().remember, Some((home.clone(), "~".to_string())));
+        assert_eq!(run(&reach, "cat ~/sub/x").unwrap().remember, Some((home.join("sub"), "~/sub".to_string())));
         assert_eq!(run(&reach, "ls ~/sub").unwrap().remember, Some((home.join("sub"), "~/sub".to_string())));
-        // Once allowed, reads there run; a credentials location and a write still ask.
-        let allowed = [home.clone()];
-        assert_eq!(reach.command_card(None, "cat ~/notes.txt ~/sub/x", None, &allowed), None);
-        assert!(reach.command_card(None, "cat ~/.ssh/id_ed25519", None, &allowed).is_some_and(|c| c.sensitive && c.remember.is_none()));
-        assert!(reach.command_card(None, "echo x > ~/out.txt", None, &allowed).is_some());
+        // Once allowed, reads there run; a write there and a read elsewhere still ask.
+        let allowed = [home.join("sub")];
+        assert_eq!(reach.command_card(None, "cat ~/sub/x ~/sub/y", None, &allowed), None);
+        assert!(reach.command_card(None, "echo x > ~/sub/out.txt", None, &allowed).is_some());
+        assert!(reach.command_card(None, "cat ~/notes.txt", None, &allowed).is_some());
+    }
+
+    /// A folder that is, holds or is inside a credentials location is never
+    /// offered or honoured as a conversation's read folder.
+    #[test]
+    fn a_folder_around_credentials_is_never_remembered() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&home, ws.join("home-link")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        for command in ["ls ~", "cd ~", "cat ~/notes.txt", "ls ~/.config", "ls /"] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert_eq!((c.sensitive, c.remember), (false, None), "{command}: allowed once at a time");
+        }
+        #[cfg(unix)]
+        assert_eq!(run(&reach, "ls home-link").map(|c| c.remember), Some(None), "a link to home is home");
+        // Whatever grant is in place, these still ask, Deny first.
+        let granted = [home.clone(), home.join(".config"), home.join(".ssh"), PathBuf::from("/"), ws.join("home-link"), home.join("sub")];
+        for command in ["ls ~", "cat ~/notes.txt"] {
+            assert!(reach.command_card(None, command, None, &granted).is_some_and(|c| !c.sensitive), "{command} still asks");
+        }
+        for command in ["ditto ~ ./bk", "gzip -rc ~", "python3 -m zipfile -c o.zip ~", "cat $(echo ~/.ne )trc", "cat ~/.ssh/id_ed25519"] {
+            let c = reach.command_card(None, command, None, &granted).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(c.sensitive && c.remember.is_none(), "{command}: {}", c.reason);
+        }
     }
 
     #[test]
@@ -1298,11 +1360,23 @@ mod tests {
     fn only_a_command_that_reads_whole_folders_treats_home_as_credentials() {
         let (_d, ws, home) = setup();
         let reach = Reach::new(&ws, None, Some(&home));
-        for command in ["cd ~", "ls ~", "ls -la ~/", "cp ~/notes.txt .", "grep token ~/notes.txt"] {
+        for command in ["cd ~", "ls ~", "ls -la ~/", "ls -r ~", "du -sh ~", "cp ~/notes.txt .", "grep token ~/notes.txt", "gzip -c ~/notes.txt"] {
             let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks as outside"));
             assert!(!c.sensitive, "{command}: {}", c.reason);
         }
-        for command in ["tar czf x.tgz ~", "cp -r ~ ./backup", "grep -r token ~", "rg token ~", "find ~ -name x", "du -sh ~", "sudo zip -r x.zip ~"] {
+        for command in [
+            "tar czf x.tgz ~",
+            "cp -r ~ ./backup",
+            "grep -r token ~",
+            "rg token ~",
+            "find ~ -name x",
+            "sudo zip -r x.zip ~",
+            "ditto ~ ./bk",
+            "pax -w -f x.pax ~",
+            "gzip -rc ~",
+            "ls -R ~",
+            "python3 -m tarfile -c o.tar ~",
+        ] {
             let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
             assert!(c.sensitive && c.reason.ends_with("the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
         }
