@@ -190,9 +190,15 @@ function App() {
   const activeMissionIntent = useMissionsStore((s) =>
     activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.intent ?? null : null,
   );
-  // Drives the ContextHeader sandbox (Shield) glyph.
+  // Drive the ContextHeader sandbox (Shield) toggle (#1230).
+  const activeMissionId = useMissionsStore((s) =>
+    activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.id ?? null : null,
+  );
   const activeMissionExecIsolation = useMissionsStore((s) =>
     activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.execIsolation ?? null : null,
+  );
+  const activeMissionGitIsolation = useMissionsStore((s) =>
+    activeWorkspaceId ? s.missionByWorkspaceId[activeWorkspaceId]?.gitIsolation ?? null : null,
   );
 
   // Per-workspace "actively processing" signal for the rail's marching bar.
@@ -2563,7 +2569,9 @@ function App() {
             issueTrackerConfigured={issueTrackerConfigured}
             jiraProjectKey={activeProject?.jiraProjectKey ?? null}
             missionIntent={activeMissionIntent}
+            missionId={activeMissionId}
             missionExecIsolation={activeMissionExecIsolation}
+            missionGitIsolation={activeMissionGitIsolation}
           />
         )}
 
