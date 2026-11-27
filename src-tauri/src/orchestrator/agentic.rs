@@ -58,10 +58,11 @@ pub(crate) fn throttle_notice(wait: u64) -> String {
 
 /// The copy of a tool's result the model reads: capped, and marked as
 /// untrusted output of its tool (`chat_history::mark_untrusted`, #1147)
-/// unless the gate denied the call, whose text is Octopush's own.
+/// unless the gate denied the call, whose text is Octopush's own. A loaded
+/// skill (`Skill`, #1135) is instructions to follow, so it isn't marked.
 fn model_copy(tool: &str, result: &str, denied: bool) -> String {
     let capped = cap_tool_result(result);
-    if denied {
+    if denied || tool == crate::skills::SKILL_TOOL_NAME {
         capped
     } else {
         crate::chat_history::mark_untrusted(tool, &capped)

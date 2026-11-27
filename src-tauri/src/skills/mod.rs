@@ -460,6 +460,202 @@ pub fn skill_prompt_section_with(pinned: Option<&Skill>, named: &[Skill]) -> Str
     out
 }
 
+/// The tool the model loads a skill with on its own (#1135), the way a
+/// `/name` mention loads one for the user.
+pub const SKILL_TOOL_NAME: &str = "Skill";
+
+/// How many skills the system prompt lists by name and description; the
+/// rest are counted, and `Skill` still loads them by name.
+pub const SKILL_LIST_MAX: usize = 50;
+
+/// The longest description a listed skill carries, in chars.
+const SKILL_DESCRIPTION_MAX: usize = 300;
+
+/// The `Skill` tool. Its bytes never change (the skills are listed in the
+/// system prompt instead), so the tool list, where the provider's prompt
+/// cache starts, holds from one turn to the next.
+pub fn skill_tool_definition() -> crate::providers::LlmTool {
+    crate::providers::LlmTool {
+        name: SKILL_TOOL_NAME.to_string(),
+        description: "Load one of the skills listed under \"# Skills\" in your instructions: returns its \
+             instructions, which you then follow. Load a skill when the task matches its description, \
+             before you start the work it covers. A skill that names its tools allows only those \
+             workspace tools for the rest of this turn."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The skill's name, exactly as listed"
+                }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
+/// `text` on one line, at most `max` chars (an ellipsis marks a cut).
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// The section of a system prompt that lists the skills the model may load
+/// with `Skill`: name and description, sorted by name, the first
+/// [`SKILL_LIST_MAX`], then how many more. The skills `invoked` names (by a
+/// `/name` mention, already in the prompt) aren't offered again. A pure
+/// function of the skill files, so the cached system block holds until one
+/// changes. Empty when there is nothing to offer.
+pub fn skill_list_section(skills: &[Skill], invoked: &[&str]) -> String {
+    let mut offered: Vec<&Skill> = skills.iter().filter(|s| !invoked.contains(&s.name.as_str())).collect();
+    if offered.is_empty() {
+        return String::new();
+    }
+    offered.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = String::from(
+        "\n\n# Skills\nWhen the task matches one of these skills, call the Skill tool with its name to load \
+         its instructions first:",
+    );
+    for s in offered.iter().take(SKILL_LIST_MAX) {
+        let description = one_line(&s.description, SKILL_DESCRIPTION_MAX);
+        if description.is_empty() {
+            out.push_str(&format!("\n- {}", s.name));
+        } else {
+            out.push_str(&format!("\n- {}: {}", s.name, description));
+        }
+    }
+    if offered.len() > SKILL_LIST_MAX {
+        out.push_str(&format!(
+            "\n- and {} more, not listed here; Skill loads any of them by name.",
+            offered.len() - SKILL_LIST_MAX
+        ));
+    }
+    out
+}
+
+/// One skill the model loaded with `Skill` in this turn.
+#[derive(Clone, Debug)]
+struct LoadedSkill {
+    name: String,
+    allowed_tools: Option<Vec<String>>,
+}
+
+/// The skills the model loaded with `Skill` in one turn (or one sub-agent
+/// run), and what their `allowed-tools` let it run. Checked when each call
+/// runs rather than by narrowing the tool list, so the tools the provider
+/// caches stay byte for byte the same through the turn.
+#[derive(Clone, Debug, Default)]
+pub struct SkillScope {
+    loaded: Vec<LoadedSkill>,
+}
+
+impl SkillScope {
+    pub fn is_loaded(&self, name: &str) -> bool {
+        self.loaded.iter().any(|s| s.name == name)
+    }
+
+    pub fn add(&mut self, skill: &Skill) {
+        if !self.is_loaded(&skill.name) {
+            self.loaded.push(LoadedSkill { name: skill.name.clone(), allowed_tools: skill.allowed_tools.clone() });
+        }
+    }
+
+    /// Why a call to `tool` is refused, or `None` to run it. Only the
+    /// workspace tools (`restrictable`) are limited, as a `/name` mention
+    /// limits them; MCP, sub-agent, recall and Skill calls always run. The
+    /// grant is the union of the loaded skills' `allowed-tools`, and a loaded
+    /// skill that names none leaves every tool open. A grant that names no
+    /// workspace tool at all (a typo, another tool's names) limits nothing,
+    /// the way the mention path keeps the full set then.
+    pub fn refusal(&self, tool: &str, restrictable: &[String]) -> Option<String> {
+        if !restrictable.iter().any(|t| t == tool) {
+            return None;
+        }
+        if self.loaded.is_empty() || self.loaded.iter().any(|s| s.allowed_tools.is_none()) {
+            return None;
+        }
+        let granted: Vec<&String> = self.loaded.iter().flat_map(|s| s.allowed_tools.iter().flatten()).collect();
+        let usable: Vec<&String> = restrictable.iter().filter(|t| granted.contains(t)).collect();
+        if usable.is_empty() || usable.iter().any(|t| *t == tool) {
+            return None;
+        }
+        let names = self.loaded.iter().map(|s| format!("`{}`", s.name)).collect::<Vec<_>>().join(", ");
+        let (skills, allow) = if self.loaded.len() == 1 { ("skill", "allows") } else { ("skills", "allow") };
+        let usable = usable.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
+        Some(format!(
+            "`{tool}` was not run: the {skills} {names} you loaded this turn {allow} only {usable} among the \
+             workspace tools. Use one of those, or finish without it."
+        ))
+    }
+}
+
+/// Run one `Skill` call against `catalogue` (the worktree's skills): the
+/// skill's instructions, and `ok`. `invoked` are the skills a `/name`
+/// mention already put in the prompt. A loaded skill joins `scope`, so its
+/// `allowed-tools` apply to the calls after it ([`SkillScope::refusal`]).
+/// An unknown or missing name is an error result naming what exists.
+pub fn run_skill_tool(
+    catalogue: &[Skill],
+    invoked: &[&str],
+    scope: &mut SkillScope,
+    input: &serde_json::Value,
+) -> (String, bool) {
+    let asked = input
+        .get("name")
+        .or_else(|| input.get("skill"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().trim_start_matches('/'))
+        .unwrap_or("");
+    if asked.is_empty() {
+        return ("Skill needs a `name`: one of the skills listed under \"# Skills\".".to_string(), false);
+    }
+    if invoked.contains(&asked) {
+        return (
+            format!("The skill `{asked}` is already loaded: the user named it, and its instructions are in your system prompt."),
+            true,
+        );
+    }
+    let Some(skill) = catalogue.iter().find(|s| s.name == asked) else {
+        let known: Vec<String> = catalogue.iter().take(SKILL_LIST_MAX).map(|s| format!("`{}`", s.name)).collect();
+        let hint = if known.is_empty() {
+            "This workspace has no skills.".to_string()
+        } else {
+            format!("The skills here: {}.", known.join(", "))
+        };
+        return (format!("No skill named `{asked}`. {hint}"), false);
+    };
+    if scope.is_loaded(&skill.name) {
+        return (format!("The skill `{}` is already loaded: its instructions are earlier in this turn.", skill.name), true);
+    }
+    scope.add(skill);
+    (skill_tool_result(skill), true)
+}
+
+/// What a loaded skill returns: its name, the tools it allows (when it
+/// names them) and its body, bounded like the skills a message names.
+fn skill_tool_result(skill: &Skill) -> String {
+    let mut out = format!("# Skill: {}\n", skill.name);
+    if let Some(tools) = &skill.allowed_tools {
+        out.push_str(&format!("[For the rest of this turn, this skill allows these tools: {}.]\n", tools.join(", ")));
+    }
+    if skill.body.len() <= SKILLS_CAP_BYTES {
+        out.push_str(&skill.body);
+    } else {
+        tracing::warn!(skill = %skill.name, "skill trimmed: its body passes {SKILLS_CAP_BYTES} bytes");
+        out.push_str(&format!(
+            "[Trimmed: this skill passes the {SKILLS_CAP_BYTES}-byte limit; its beginning and end are kept.]\n{}",
+            crate::orchestrator::runner::cap_to(&skill.body, SKILLS_CAP_BYTES)
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +804,134 @@ mod tests {
     fn no_name_is_rejected() {
         assert!(parse_skill("---\ndescription: x\n---\nbody", "user").is_none());
         assert!(parse_skill("no frontmatter here", "user").is_none());
+    }
+
+    fn skill(name: &str, description: &str, allowed: Option<&[&str]>) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: description.to_string(),
+            body: format!("Body of {name}."),
+            allowed_tools: allowed.map(|a| a.iter().map(|t| t.to_string()).collect()),
+            source: "project".to_string(),
+        }
+    }
+
+    fn workspace_tools() -> Vec<String> {
+        ["run_command", "read_file", "write_file", "edit_file", "list_files", "grep", "glob"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_skill_list_is_sorted_bounded_and_stable() {
+        let mut many: Vec<Skill> = (0..60).rev().map(|i| skill(&format!("s{i:02}"), "Does a thing.", None)).collect();
+        many.push(skill("long", &"word ".repeat(200), None));
+        let section = skill_list_section(&many, &[]);
+        assert!(section.starts_with("\n\n# Skills\n"));
+        let listed: Vec<&str> = section.lines().filter(|l| l.starts_with("- ")).collect();
+        // 50 skills, then the count of the rest.
+        assert_eq!(listed.len(), SKILL_LIST_MAX + 1);
+        assert_eq!(listed[0], "- long: ".to_string() + &one_line(&"word ".repeat(200), SKILL_DESCRIPTION_MAX));
+        assert!(listed[0].chars().count() < SKILL_DESCRIPTION_MAX + 10, "a description is bounded");
+        assert_eq!(listed[1], "- s00: Does a thing.");
+        assert_eq!(listed[SKILL_LIST_MAX], "- and 11 more, not listed here; Skill loads any of them by name.");
+        // The order the files were read in doesn't matter: same skills, same bytes.
+        let mut shuffled = many.clone();
+        shuffled.reverse();
+        assert_eq!(skill_list_section(&shuffled, &[]), section);
+        assert_eq!(skill_list_section(&[], &[]), "");
+    }
+
+    #[test]
+    fn a_skill_named_by_mention_is_not_offered_again() {
+        let all = [skill("review", "Review code.", None), skill("release", "Cut a release.", None)];
+        let section = skill_list_section(&all, &["review"]);
+        assert!(section.contains("- release: Cut a release."));
+        assert!(!section.contains("review:"));
+        assert_eq!(skill_list_section(&all, &["review", "release"]), "");
+        // Asked for anyway, it isn't sent twice.
+        let mut scope = SkillScope::default();
+        let (text, ok) = run_skill_tool(&all, &["review"], &mut scope, &serde_json::json!({"name": "review"}));
+        assert!(ok);
+        assert!(text.contains("already loaded") && !text.contains("Body of review."), "{text}");
+        assert!(!scope.is_loaded("review"));
+    }
+
+    #[test]
+    fn the_skill_tool_loads_the_body_and_its_allowed_tools() {
+        let all = [skill("audit", "Audit the code.", Some(&["read_file", "grep"][..])), skill("free", "", None)];
+        let tools = workspace_tools();
+        let mut scope = SkillScope::default();
+        // Nothing loaded yet: every tool runs.
+        assert!(scope.refusal("write_file", &tools).is_none());
+        let (text, ok) = run_skill_tool(&all, &[], &mut scope, &serde_json::json!({"name": "/audit"}));
+        assert!(ok);
+        assert!(text.starts_with("# Skill: audit\n"));
+        assert!(text.contains("allows these tools: read_file, grep"));
+        assert!(text.contains("Body of audit."));
+        // Its allowed-tools hold for the calls after it.
+        assert!(scope.refusal("read_file", &tools).is_none());
+        let refused = scope.refusal("write_file", &tools).expect("write_file is refused");
+        assert!(refused.contains("`audit`") && refused.contains("`read_file`, `grep`"), "{refused}");
+        // MCP, sub-agent, recall and Skill calls are never limited.
+        for tool in ["mcp__github__create_issue", "Agent", "recall_tool_output", SKILL_TOOL_NAME] {
+            assert!(scope.refusal(tool, &tools).is_none(), "{tool}");
+        }
+        // A second load of the same skill doesn't resend it.
+        let (again, ok) = run_skill_tool(&all, &[], &mut scope, &serde_json::json!({"name": "audit"}));
+        assert!(ok && !again.contains("Body of audit."));
+        // A skill with no allowed-tools opens the full set again.
+        run_skill_tool(&all, &[], &mut scope, &serde_json::json!({"name": "free"}));
+        assert!(scope.refusal("write_file", &tools).is_none());
+    }
+
+    #[test]
+    fn allowed_tools_naming_no_workspace_tool_limit_nothing() {
+        let all = [skill("cc", "", Some(&["Read", "Bash"][..]))];
+        let mut scope = SkillScope::default();
+        run_skill_tool(&all, &[], &mut scope, &serde_json::json!({"name": "cc"}));
+        assert!(scope.refusal("write_file", &workspace_tools()).is_none());
+    }
+
+    #[test]
+    fn an_unknown_or_missing_skill_name_is_an_error() {
+        let all = [skill("review", "", None)];
+        let mut scope = SkillScope::default();
+        let (text, ok) = run_skill_tool(&all, &[], &mut scope, &serde_json::json!({"name": "deploy"}));
+        assert!(!ok);
+        assert!(text.contains("No skill named `deploy`") && text.contains("`review`"), "{text}");
+        let (_, ok) = run_skill_tool(&all, &[], &mut scope, &serde_json::json!({}));
+        assert!(!ok);
+        let (text, ok) = run_skill_tool(&[], &[], &mut scope, &serde_json::json!({"name": "x"}));
+        assert!(!ok && text.contains("no skills"));
+    }
+
+    #[test]
+    fn the_skill_tool_reads_the_project_skill_over_the_users() {
+        let project = tempfile::tempdir().expect("project");
+        let home = tempfile::tempdir().expect("home");
+        write_skill(project.path(), "review", "The project's review.");
+        let user_dir = home.path().join(".claude/skills/review");
+        fs::create_dir_all(&user_dir).expect("mkdir");
+        fs::write(user_dir.join("SKILL.md"), "---\nname: review\ndescription: d\n---\nThe user's review.").expect("write");
+        let user_only = home.path().join(".claude/skills/notes");
+        fs::create_dir_all(&user_only).expect("mkdir");
+        fs::write(user_only.join("SKILL.md"), "---\nname: notes\ndescription: Take notes.\n---\nNotes.").expect("write");
+        let catalogue = scan_skills_in(project.path(), Some(home.path())).found;
+        let mut scope = SkillScope::default();
+        let (text, ok) = run_skill_tool(&catalogue, &[], &mut scope, &serde_json::json!({"name": "review"}));
+        assert!(ok && text.contains("The project's review.") && !text.contains("The user's review."), "{text}");
+        let section = skill_list_section(&catalogue, &[]);
+        assert!(section.contains("- notes: Take notes.") && section.matches("- review").count() == 1, "{section}");
+    }
+
+    #[test]
+    fn the_skill_tool_schema_is_fixed() {
+        let tool = skill_tool_definition();
+        assert_eq!(tool.name, "Skill");
+        assert_eq!(tool.input_schema["required"], serde_json::json!(["name"]));
+        assert_eq!(skill_tool_definition().description, tool.description);
     }
 
     #[test]

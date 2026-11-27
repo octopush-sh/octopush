@@ -3682,12 +3682,6 @@ impl ChatEngine {
         // an edit applies at once; unchanged files give the same text, so the
         // cached system block holds. Read on a blocking thread.
         let instructions = crate::project_instructions::for_workspace_off_runtime(workspace_path.clone()).await;
-        let mut system_prompt = director_system_prompt(
-            request.system.clone(),
-            &request.workspace_path,
-            &instructions.section,
-            doctrine.as_deref(),
-        );
 
         let mut tools = build_llm_tools();
 
@@ -3717,6 +3711,27 @@ impl ChatEngine {
             None => None,
         };
         let invoked: Vec<&crate::skills::Skill> = pinned.iter().chain(named.iter()).collect();
+
+        // ── Skills the model may load itself (#1135) ─────────────
+        // The worktree's skills (project shadowing user) are listed by name
+        // and description after the project's instructions, sorted, so the
+        // list changes only when a skill file does; the `Skill` tool loads
+        // one's body as its result. Those this message names are already in
+        // the prompt and aren't offered again.
+        let skill_catalogue = crate::skills::scan_skills(&workspace_path);
+        let invoked_names: Vec<&str> = invoked.iter().map(|s| s.name.as_str()).collect();
+        let skill_list = crate::skills::skill_list_section(&skill_catalogue, &invoked_names);
+        let mut system_prompt = director_system_prompt(
+            request.system.clone(),
+            &request.workspace_path,
+            &format!("{}{skill_list}", instructions.section),
+            doctrine.as_deref(),
+        );
+        // What the loaded skills' `allowed-tools` let run, checked at each
+        // call: the tool list stays byte-stable through the turn.
+        let mut skill_scope = crate::skills::SkillScope::default();
+        let workspace_tools: Vec<String> = build_llm_tools().into_iter().map(|t| t.name).collect();
+
         if !invoked.is_empty() {
             system_prompt.push_str(&crate::skills::skill_prompt_section_with(pinned.as_ref(), &named));
             // `allowed-tools`: the union across the invoked skills; a skill
@@ -3752,6 +3767,11 @@ impl ChatEngine {
         // allowed-tools list predates this tool, and recalling a stored
         // output is read-only — it can't widen what the skill permits.
         tools.push(recall_tool_definition());
+        // `Skill`, on the same terms: offered whenever the worktree has a
+        // skill, whatever this message names, so the tool list holds.
+        if !skill_catalogue.is_empty() {
+            tools.push(crate::skills::skill_tool_definition());
+        }
 
         // ── Sub-agents ────────────────────────────────────────────
         // `Agent` (+ `Task` alias) — the fan-out tool Claude Code skills
@@ -4205,10 +4225,15 @@ impl ChatEngine {
                 // ask first (#1147); a server switched off here is refused
                 // below without asking.
                 let mut denied: Option<String> = None;
+                // A tool a skill loaded this turn doesn't allow is refused
+                // before anything asks the user (#1135).
+                let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools);
+                let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
                 let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
-                if let Some(card) = (!(mcp_off || is_agent || u.name == RECALL_TOOL_NAME)).then(&check).flatten() {
+                let gated = skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
+                if let Some(card) = gated.then(&check).flatten() {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
                     denied = guard_card(card, &check, ask).await;
                 }
@@ -4217,7 +4242,7 @@ impl ChatEngine {
                 // A denial skips execution and tells the model the user
                 // declined. The secret guard asks first (#819): a thread's
                 // "don't ask again" covers the destructive check, never it.
-                if u.name == "run_command" {
+                if u.name == "run_command" && skill_refusal.is_none() {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     denied = guard_agent_command(
                         &self.approvals,
@@ -4252,6 +4277,9 @@ impl ChatEngine {
                             }
                         }
                     }
+                }
+                if skill_refusal.is_some() {
+                    denied = skill_refusal;
                 }
 
                 // ── Live card: announce the tool is starting ──────────
@@ -4306,6 +4334,8 @@ impl ChatEngine {
                         RECALL_MAX_LIMIT
                     };
                     self.recall_tool_output(&request.thread_id, &u.input, max_limit)
+                } else if is_skill {
+                    crate::skills::run_skill_tool(&skill_catalogue, &invoked_names, &mut skill_scope, &u.input)
                 } else if let Some(refusal) = crate::mcp::is_mcp_tool(&u.name)
                     .then(|| mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)))
                     .flatten()
@@ -4543,7 +4573,9 @@ impl ChatEngine {
                 } else {
                     u.name.clone()
                 };
-                let mark = (!was_denied).then_some(source.as_str());
+                // A loaded skill is instructions to follow, as the same skill
+                // named with `/name` is: it carries no untrusted mark.
+                let mark = (!was_denied && !is_skill).then_some(source.as_str());
                 let content = if v2 {
                     let window = context_guard.budget().window;
                     let view = crate::context::transcript::model_view(&u.name, &result, row_id, window, mark);
