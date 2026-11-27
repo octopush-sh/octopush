@@ -1176,6 +1176,23 @@ impl Db {
             );
             "#,
         )?;
+        // A Talk ask's image attachments (#1159): `path` is the file's name
+        // (`<sha256>.<ext>`) in `chat_attachments::dir()`, which several rows
+        // may share. A row goes with its message; the file goes once no row
+        // names it (`chat_attachments::remove`).
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chat_attachments (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id      INTEGER NOT NULL,
+                path            TEXT NOT NULL,
+                media_type      TEXT NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_attachments_message ON chat_attachments(message_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_attachments_path ON chat_attachments(path);
+            "#,
+        )?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_spend_mission ON spend_events(mission_id, ts_utc);",
         )?;
@@ -4121,12 +4138,62 @@ impl Db {
     }
 
     /// Delete a thread and its messages (messages are removed explicitly since
-    /// chat_messages has no FK to chat_threads).
-    pub fn delete_chat_thread(&self, thread_id: &str) -> AppResult<()> {
+    /// chat_messages has no FK to chat_threads). Returns the attachment files
+    /// no row names any more, for `chat_attachments::remove`.
+    pub fn delete_chat_thread(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let paths = self.chat_attachment_paths("m.thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_agent_log WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
+        self.unreferenced_attachments(paths)
+    }
+
+    /// The attachment files of the messages `filter` (over `chat_messages m`)
+    /// selects, each once.
+    fn chat_attachment_paths(&self, filter: &str, args: impl rusqlite::Params) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT a.path FROM chat_attachments a JOIN chat_messages m ON m.id = a.message_id WHERE {filter}"
+        ))?;
+        let rows = stmt.query_map(args, |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Those of `paths` that no attachment row names.
+    pub fn unreferenced_attachments(&self, paths: Vec<String>) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT EXISTS(SELECT 1 FROM chat_attachments WHERE path = ?1)")?;
+        let mut out = Vec::new();
+        for path in paths {
+            if !stmt.query_row(params![path], |r| r.get::<_, bool>(0))? {
+                out.push(path);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The attachment files of a workspace's messages (they go with it).
+    pub fn workspace_attachment_paths(&self, workspace_id: &str) -> AppResult<Vec<String>> {
+        self.chat_attachment_paths("m.workspace_id = ?1", params![workspace_id])
+    }
+
+    /// Record an image attachment of user row `message_id`.
+    pub fn add_chat_attachment(&self, message_id: i64, path: &str, media_type: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO chat_attachments (message_id, path, media_type) VALUES (?1, ?2, ?3)",
+            params![message_id, path, media_type],
+        )?;
         Ok(())
+    }
+
+    /// A thread's attachments as `(message_id, path, media_type)`, in the
+    /// order they were sent.
+    pub fn list_chat_attachments(&self, thread_id: &str) -> AppResult<Vec<(i64, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.message_id, a.path, a.media_type FROM chat_attachments a
+               JOIN chat_messages m ON m.id = a.message_id
+             WHERE m.thread_id = ?1 ORDER BY a.message_id, a.id",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// The worktree of the workspace a thread belongs to (its checkpoints
@@ -4262,7 +4329,14 @@ impl Db {
                  FROM chat_messages WHERE id = ?2",
                 params![thread.id, old],
             )?;
-            pairs.push((old, tx.last_insert_rowid()));
+            let new = tx.last_insert_rowid();
+            // Its images too: the copies name the same files.
+            tx.execute(
+                "INSERT INTO chat_attachments (message_id, path, media_type)
+                 SELECT ?1, path, media_type FROM chat_attachments WHERE message_id = ?2 ORDER BY id",
+                params![new, old],
+            )?;
+            pairs.push((old, new));
         }
         tx.commit()?;
         Ok((thread, draft, pairs))
@@ -4275,7 +4349,8 @@ impl Db {
     /// refused unless `message_id` is one of this thread's: an id from
     /// another thread (a view that showed the wrong rows) would cut from
     /// wherever its number falls here.
-    pub fn truncate_chat_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
+    /// Returns the attachment files no row names any more.
+    pub fn truncate_chat_after(&self, thread_id: &str, message_id: i64) -> AppResult<Vec<String>> {
         let owner: Option<Option<String>> = self
             .conn
             .query_row("SELECT thread_id FROM chat_messages WHERE id = ?1", params![message_id], |r| r.get(0))
@@ -4285,11 +4360,12 @@ impl Db {
                 "That message isn't part of this conversation, so nothing was deleted.".into(),
             ));
         }
+        let paths = self.chat_attachment_paths("m.thread_id = ?1 AND m.id >= ?2", params![thread_id, message_id])?;
         self.conn.execute(
             "DELETE FROM chat_messages WHERE thread_id = ?1 AND id >= ?2",
             params![thread_id, message_id],
         )?;
-        Ok(())
+        self.unreferenced_attachments(paths)
     }
 
     /// Record a `$`-direct command in the workspace's recall history (upsert:

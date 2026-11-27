@@ -13,7 +13,7 @@ use crate::chat_agents::{
     mcp_off_refusal, thread_mcp_off,
 };
 use crate::chat_history::{
-    build_history, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
+    build_history_landing, effective_subagent_max_iterations, effective_talk_max_iterations, subagent_iterations, window_text, HistoryRole, HistoryRow,
 };
 use crate::context::budget;
 use crate::db::Db;
@@ -22,7 +22,7 @@ use crate::providers::{
     anthropic::AnthropicProvider,
     complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
-    retry_notice, Completion, Effort, LlmBlock, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
+    retry_notice, Completion, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
     LlmRole, LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
@@ -403,7 +403,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub skill: Option<String>,
     /// Inline image attachments for THIS turn (base64). Sent as multimodal
-    /// content blocks alongside the user text. Not persisted in history.
+    /// content blocks alongside the user text, and kept with the ask
+    /// (`chat_attachments`) so later turns send them again.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
     /// Regenerate: the prior turn was already truncated and history ends with the
@@ -3485,7 +3486,10 @@ impl ChatEngine {
     /// cut would take rows the turn is still writing.
     pub fn truncate_after(&self, thread_id: &str, message_id: i64) -> AppResult<()> {
         self.ensure_idle(thread_id)?;
-        self.db.lock().truncate_chat_after(thread_id, message_id)
+        let freed = self.db.lock().truncate_chat_after(thread_id, message_id)?;
+        // The images of the rows it took, unless another row names them.
+        crate::chat_attachments::remove(&freed);
+        Ok(())
     }
 
     /// Which of `thread_ids` have a turn or a sub-agent continuation
@@ -4451,6 +4455,17 @@ impl ChatEngine {
                     tracing::warn!(error = %e, message_id = id, "failed to save the ask's @ context blocks");
                 }
             }
+            // Its images are kept with it (#1159), so later turns send them
+            // again. One that can't be saved still goes with this turn.
+            let dir = crate::chat_attachments::dir();
+            for att in &request.attachments {
+                let saved = crate::chat_attachments::save(&dir, att)
+                    .map_err(AppError::from)
+                    .and_then(|name| self.db.lock().add_chat_attachment(id, &name, &att.media_type));
+                if let Err(e) = saved {
+                    tracing::warn!(error = %e, message_id = id, "failed to keep an image attachment");
+                }
+            }
         }
 
         // Build conversation history (this thread only) as normalized
@@ -4485,14 +4500,24 @@ impl ChatEngine {
             }
         }
 
-        let mut messages: Vec<LlmMessage> = match &transcript {
-            Some(rows) => crate::context::transcript::build(rows, &request.model),
+        // The thread's images (#1159): the asks that carry some make their
+        // turns, and go back on them once the context budget is known.
+        let stored_images = self.db.lock().list_chat_attachments(&request.thread_id).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to read the conversation's image attachments");
+            Vec::new()
+        });
+        let current_ask = history.iter().rev().find(|m| m.role == "user").map(|m| m.id);
+        let with_images = crate::chat_attachments::asks_with_images(&stored_images, current_ask, &request.attachments);
+
+        let (mut messages, landing): (Vec<LlmMessage>, Vec<Vec<i64>>) = match &transcript {
+            Some(rows) => crate::context::transcript::build_landing(rows, &request.model, &with_images),
             None => {
                 let rows: Vec<HistoryRow<'_>> = history
                     .iter()
                     .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str(), context: m.context_blocks.as_deref() })
                     .collect();
-                build_history(&rows)
+                let (turns, landing) = build_history_landing(&rows, &with_images);
+                let messages = turns
                     .into_iter()
                     .map(|t| LlmMessage {
                         role: match t.role {
@@ -4501,44 +4526,10 @@ impl ChatEngine {
                         },
                         content: LlmContent::Text(t.text),
                     })
-                    .collect()
+                    .collect();
+                (messages, landing)
             }
         };
-
-        // Attach this turn's images: replace the current (last) user turn with a
-        // multimodal block carrying the text + image blocks. Attachments aren't
-        // persisted, so they only ride along on the turn that sent them.
-        if !request.attachments.is_empty() {
-            // The just-persisted user message is the last entry. Guard on its
-            // role; warn (rather than silently drop) if it's somehow not a user
-            // turn. The text block is omitted when empty (image-only sends),
-            // since providers reject empty text blocks.
-            match messages.last_mut() {
-                Some(last) if last.role == LlmRole::User => {
-                    // Use the turn's already-built text, not request.user_message:
-                    // the former includes any merged `$`-direct command context
-                    // prepended above, which would otherwise be dropped here.
-                    let text = match &last.content {
-                        LlmContent::Text(t) => t.clone(),
-                        _ => request.user_message.clone(),
-                    };
-                    let mut blocks: Vec<LlmBlock> = Vec::new();
-                    if !text.trim().is_empty() {
-                        blocks.push(LlmBlock::Text(text));
-                    }
-                    for att in &request.attachments {
-                        blocks.push(LlmBlock::Image {
-                            media_type: att.media_type.clone(),
-                            data: att.data.clone(),
-                        });
-                    }
-                    last.content = LlmContent::Multimodal(blocks);
-                }
-                _ => tracing::warn!(
-                    "attachments present but the last message isn't a user turn; images dropped"
-                ),
-            }
-        }
 
         // The project's CLAUDE.md chain (or AGENTS.md), re-read every turn so
         // an edit applies at once; unchanged files give the same text, so the
@@ -4696,6 +4687,24 @@ impl ChatEngine {
             model_budget = model_budget.with_fixed_window();
         }
         let mut context_guard = budget::ContextGuard::new(model_budget, budget::load_learned(&self.db.lock(), &request.model));
+        // Each ask's images back on its turn (#1159), byte-stable inside the
+        // cached prefix. The ask being answered always carries its own; the
+        // earlier ones stay while the history with them fits in half the
+        // window (where the guard aims), and past that go first, oldest
+        // first, each replaced by a note, before any tool result is stubbed.
+        if !with_images.is_empty() {
+            let base = context_guard.estimate(fixed_chars, &messages);
+            let limit = context_guard.budget().share(budget::TARGET_PCT);
+            let blocks = crate::chat_attachments::for_history(
+                &crate::chat_attachments::dir(),
+                &stored_images,
+                current_ask,
+                &request.attachments,
+                base,
+                limit,
+            );
+            crate::chat_attachments::attach(&mut messages, &landing, &blocks);
+        }
         // Each tool call's stored row, which a stub names for recall (the
         // transcript's earlier calls among them).
         let mut tool_rows: HashMap<String, i64> =
@@ -6624,7 +6633,7 @@ mod tests {
             .take_while(|m| m.id <= ask)
             .map(|m| HistoryRow { id: m.id, role: &m.role, content: &m.content, context: m.context_blocks.as_deref() })
             .collect();
-        let legacy: Vec<LlmMessage> = build_history(&legacy_rows)
+        let legacy: Vec<LlmMessage> = crate::chat_history::build_history(&legacy_rows)
             .into_iter()
             .map(|h| LlmMessage {
                 role: if h.role == HistoryRole::User { LlmRole::User } else { LlmRole::Assistant },

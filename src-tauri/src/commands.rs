@@ -1619,10 +1619,14 @@ pub async fn delete_workspace(
     // Remove from DB. The row's runs cascade-delete without a run:// event, so
     // a paused one would keep the Dock badge counting it: refresh it now.
     let db_path = state.db.lock().conn_ref_path(&workspace_id).ok().flatten();
+    // Its Talk images go with its messages (#1159), unless another row names them.
+    let images = state.db.lock().workspace_attachment_paths(&workspace_id).unwrap_or_default();
     // If the row can't go, the workspace stays: reinstate it in the approval
     // broker, so its next approval card isn't denied unseen.
     let deleted = state.db.lock().delete_workspace(&workspace_id);
+    let freed = if deleted.is_ok() { state.db.lock().unreferenced_attachments(images).unwrap_or_default() } else { Vec::new() };
     state.chat.finish_workspace_delete(&workspace_id, deleted)?;
+    crate::chat_attachments::remove(&freed);
     crate::fleet_status::refresh_later(&app);
 
     // Its sandbox build caches go with it, unless another workspace still
@@ -1967,7 +1971,10 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
         })
         .await?;
     }
-    state.db.lock().delete_chat_thread(&thread_id)
+    // And its images, unless another conversation's row names them (#1159).
+    let freed = state.db.lock().delete_chat_thread(&thread_id)?;
+    crate::chat_attachments::remove(&freed);
+    Ok(())
 }
 
 // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
