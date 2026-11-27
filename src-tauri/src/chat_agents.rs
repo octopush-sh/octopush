@@ -1177,7 +1177,7 @@ pub async fn run_one_subagent(
     let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
         .with_mcp_writes(mcp_tools)
         .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
-    let gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));
+    let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));
     let external = McpSubagentTools::granted(
         mcp,
         Path::new(&spec.workspace_path),
@@ -1204,7 +1204,7 @@ pub async fn run_one_subagent(
             }
         }
     }
-    let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &gate, external_ref, started).await;
+    let mut outcome = run_attempt(&model, spec, &client, cancel, &sink, &tool_gate, external_ref, started).await;
     // The definition's `escalate`: one retry on the stronger model when the
     // cheap attempt failed — unless the director stopped the turn. A
     // continuation never escalates: the user chose to give THIS run more
@@ -1230,7 +1230,7 @@ pub async fn run_one_subagent(
             });
             LiveEmitter::new(&sink, &spec.thread_id, &spec.call_id)
                 .notice(&format!("running on {}", plan_line(retry.plan.as_ref().unwrap())));
-            let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &gate, external_ref, std::time::Instant::now()).await;
+            let second = run_attempt(&stronger, &retry, &client, cancel, &sink, &tool_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_escalated(outcome, second);
         }
     }
@@ -1290,7 +1290,7 @@ pub async fn run_one_subagent(
                 &BlockedTranscript { messages: outcome.transcript.clone(), ask_tool_use_id: outcome.ask_tool_use_id.clone() },
                 &continuation_note(None, Some(extra)),
             ));
-            let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &gate, external_ref, std::time::Instant::now()).await;
+            let second = run_attempt(&outcome.model, &more, &client, cancel, &sink, &tool_gate, external_ref, std::time::Instant::now()).await;
             outcome = merge_continued(outcome, second);
             turns_used += extra;
         }

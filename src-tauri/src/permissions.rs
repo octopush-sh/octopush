@@ -840,13 +840,13 @@ mod tests {
         let run = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
         for call in [
             "let spec = &mode_spec(&db, &planned);",
-            "let gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));",
+            "let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));",
             "persist_run(&db, &planned, &outcome);",
         ] {
             assert!(run.contains(call), "the sub-agent runner no longer has: {call}");
         }
         let attempts: Vec<&str> = run.lines().filter(|l| l.contains("run_attempt(")).collect();
         assert_eq!(attempts.len(), 3, "{attempts:?}");
-        assert!(attempts.iter().all(|l| l.contains("&sink, &gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
+        assert!(attempts.iter().all(|l| l.contains("&sink, &tool_gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
     }
 }
