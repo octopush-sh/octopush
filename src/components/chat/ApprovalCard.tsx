@@ -43,6 +43,13 @@ export const FOCUS_CARD_CHORD = "⌘⌥A";
  *  and Talk's Esc can leave a card's focus alone (`talkEscape`). */
 export const APPROVAL_CARD_SELECTOR = "[data-approval-card]";
 
+/** Why a card offers no conversation grant in Plan only (#1229). */
+export const PLAN_ONLY_COPY = "In Plan only, nothing is allowed for the conversation: this asks every time.";
+
+/** The per-command grant's tooltip (#1229). */
+export const COMMAND_GRANT_TITLE =
+  "Run this, and run exactly this command again from this folder without asking for the rest of this conversation: the same words, quotes, operators and redirections. A credentials location, or a place that runs code, still asks. Revoke it in the Companion.";
+
 /** What a command's path card can't promise (#1201), on its tooltip. */
 export const RUN_CHECK_LIMITS =
   "Octopush reads the paths a command names. A shell can build a path it can't see, so this is a net, not a sandbox.";
@@ -65,11 +72,14 @@ export const RUN_CHECK_LIMITS =
  * outside the workspace or in a credentials location (`kind: "run"`) asks
  * the same way, showing the command, and its tooltip says the check is a
  * net, not a sandbox. A read outside that isn't a credentials location also
- * offers "Allow reading <folder> for this conversation" (`rememberDir`,
- * answered as "always"). Since #1243 an MCP card in Edit freely
- * (`trustServer`/`trustTool`) also offers two lasting answers, app-wide and
- * revocable in Settings › Integrations: "Always allow this tool" ("tool")
- * and "Trust <server>" ("server"). The reason line wraps, never cut.
+ * offers "Allow reading <folder> for this conversation" (`rememberDir`). Since
+ * #1229 a write outside offers "Allow writing <folder>…", a command card with
+ * no folder "Allow this command…" (`rememberCommand`), each answered "grant";
+ * in Plan only the card says it offers none (`planOnly`). Since #1243 an MCP
+ * card in Edit freely (`trustServer`/`trustTool`) instead offers two lasting
+ * answers, app-wide and revocable in Settings › Integrations: "Always allow
+ * this tool" ("tool") and "Trust <server>" ("server"); an MCP card never
+ * offers a conversation grant. The reason line wraps, never cut.
  *
  * At the keyboard, only while the card itself has focus: ⌘↵ takes the card's
  * lead answer (Approve; on the secret card the safe "Leave it out") and Esc
@@ -101,6 +111,15 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
   // Where the safe answer leads, it is the first button and Enter takes it.
   const safeLead = secret || sensitive || code !== null;
   const lead = safeLead ? "deny" : "approve";
+  // The grant the card offers for the conversation (#1229): a folder, or the command itself.
+  const dir = !secret && !sensitive && (run || approval.kind === "write") ? approval.rememberDir : undefined;
+  const grant = dir
+    ? run
+      ? { label: `Allow reading ${dir} for this conversation`, title: `Run this, and let commands read ${dir} without asking for the rest of this conversation (a credentials location still asks). Revoke it in the Companion.` }
+      : { label: `Allow writing ${dir} for this conversation`, title: `Allow this, and let the agent's file tools write in ${dir} without asking for the rest of this conversation (reads there still ask). Revoke it in the Companion.` }
+    : !secret && !sensitive && !code && approval.rememberCommand && approval.kind !== "mcp" && (run || !outside)
+      ? { label: "Allow this command for this conversation", title: COMMAND_GRANT_TITLE }
+      : null;
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     const answer = cardKeyAnswer(e, safeLead, talkActive);
     if (!answer) return;
@@ -141,6 +160,7 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
         {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
         {approval.command}
       </pre>
+      {approval.planOnly && !secret && <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">{PLAN_ONLY_COPY}</p>}
       {secret && (
         <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">
           {approval.coversUncommitted
@@ -158,7 +178,7 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
             : run
               ? "Allowing runs it once, and its output goes to your AI provider. "
               : "Allowing lets the agent write it once. "}
-          {run ? "A credentials location always asks." : "Every access outside the workspace asks again."}
+          {run || dir ? "A credentials location always asks." : "Every access outside the workspace asks again."}
         </p>
       )}
       <div className={`mt-2 flex items-center gap-2 ${trust ? "flex-wrap" : ""}`}>
@@ -181,12 +201,22 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
         >
           {copy.other[0]}
         </button>
+        {grant && (
+          <button
+            type="button"
+            onClick={() => onRespond("grant")}
+            title={grant.title}
+            className={`ml-auto truncate font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
+          >
+            {grant.label}
+          </button>
+        )}
         {!secret && !outside && !code && (
           <button
             type="button"
             onClick={() => onRespond("always")}
             title="Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)"
-            className={`ml-auto font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
+            className={`${grant ? "shrink-0" : "ml-auto"} font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
           >
             Approve &amp; don't ask again
           </button>
@@ -210,16 +240,6 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
               Trust {trust.server}
             </button>
           </span>
-        )}
-        {run && !sensitive && approval.rememberDir && (
-          <button
-            type="button"
-            onClick={() => onRespond("always")}
-            title={`Run this, and let commands read ${approval.rememberDir} without asking for the rest of this conversation (a credentials location still asks)`}
-            className={`ml-auto truncate font-mono text-[10px] text-octo-mute hover:text-octo-sage ${QUICK}`}
-          >
-            Allow reading {approval.rememberDir} for this conversation
-          </button>
         )}
       </div>
     </div>

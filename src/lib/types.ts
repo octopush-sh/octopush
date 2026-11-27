@@ -411,7 +411,7 @@ export interface McpTrust {
 
 /** An answer to an approval card: "tool" and "server" are an MCP card's
  *  lasting answers (#1243). */
-export type ApprovalAnswer = "approve" | "always" | "deny" | "tool" | "server";
+export type ApprovalAnswer = "approve" | "always" | "grant" | "deny" | "tool" | "server";
 
 /** What Talk's MCP registry knows about one configured server
  *  (`list_mcp_server_status`): running with N tools, not started yet (it
