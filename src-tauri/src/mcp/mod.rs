@@ -45,6 +45,8 @@ pub use failure::{classify_failure, classify_failure_with, McpFailure};
 pub mod scope;
 // A project's own servers start only once approved, bound to content (#1245).
 pub mod approval;
+// What the user trusts to run without a card in Edit freely (#1243).
+pub mod trust;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct McpServerConfig {
@@ -73,7 +75,7 @@ pub struct McpServerConfig {
 }
 
 /// A tool exposed by an MCP server, surfaced to the agentic loop.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolInfo {
     pub server: String,
@@ -85,6 +87,14 @@ pub struct McpToolInfo {
     /// Anything else is treated as a possible write when a sub-agent calls it.
     #[serde(default)]
     pub read_only: bool,
+    /// `annotations.destructiveHint` as the server set it (`None`: not set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<bool>,
+    /// The server set `readOnlyHint` or `destructiveHint` (either value).
+    /// Only a tool with neither is classified by its name
+    /// (`talk_guard::mcp_class`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub annotated: bool,
 }
 
 /// Put tools in the order every request offers them: by server, then by tool
@@ -1284,6 +1294,7 @@ impl McpRegistry {
             .iter()
             .filter_map(|t| {
                 let tool = t.get("name")?.as_str()?.to_string();
+                let hint = |key: &str| t.get("annotations").and_then(|a| a.get(key)).and_then(Value::as_bool);
                 Some(McpToolInfo {
                     server: name.to_string(),
                     namespaced: namespaced_name(name, &tool),
@@ -1297,11 +1308,9 @@ impl McpRegistry {
                         .get("inputSchema")
                         .cloned()
                         .unwrap_or(json!({ "type": "object" })),
-                    read_only: t
-                        .get("annotations")
-                        .and_then(|a| a.get("readOnlyHint"))
-                        .and_then(|r| r.as_bool())
-                        .unwrap_or(false),
+                    read_only: hint("readOnlyHint").unwrap_or(false),
+                    destructive: hint("destructiveHint"),
+                    annotated: hint("readOnlyHint").is_some() || hint("destructiveHint").is_some(),
                 })
             })
             .collect();

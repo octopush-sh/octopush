@@ -23,7 +23,7 @@ use crate::providers::{
     complete_cancellable, final_failure_text, interruptible_sleep,
     openai_compat::OpenAICompatibleProvider,
     retry_notice, Completion, Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse,
-    LlmRole, LlmStopReason, LlmTool, LlmToolResult, DEFAULT_MAX_RETRIES,
+    LlmRole, LlmStopReason, LlmTool, LlmToolResult, truncated_round_turn, DEFAULT_MAX_RETRIES,
 };
 use crate::provider_router::ProviderRouter;
 use crate::orchestrator::agentic::{
@@ -120,6 +120,15 @@ const MAX_TRUNCATED_ROUNDS: u32 = 2;
 const TRUNCATED_ROUNDS_NOTE: &str = "Stopped: two replies in a row were cut at the output limit mid tool call, \
      so those calls didn't run. Ask for smaller steps, such as one file at a time.";
 
+/// The quiet note a turn the user stopped ends with: what the stop left in
+/// place, and how to undo it.
+pub(crate) const STOPPED_NOTE: &str =
+    "Stopped. Changes made before the stop stay; rewind files from your last message to undo them.";
+
+/// The quiet note a turn the app's restart cut off ends with, added on boot
+/// (`Db::note_interrupted_talk_turns`).
+pub const RESTART_NOTE: &str = "Interrupted by an app restart.";
+
 /// Counts the tool rounds in a row cut at the output limit. Turns are
 /// unlimited by default, so without it a model that keeps writing oversized
 /// `write_file` bodies would retry at the full output cap forever.
@@ -162,6 +171,9 @@ fn director_request(request: &ChatRequest, system: &str, messages: &[LlmMessage]
         // Agentic loop + multi-turn chat: the system prompt, tool schemas and
         // prior turns are re-sent every iteration, so cache them.
         cache: true,
+        // Every request of the thread shares one key, so OpenAI routes them
+        // to the same cache.
+        cache_key: Some(crate::providers::prompt_cache_key(&request.thread_id)),
     }
 }
 
@@ -225,49 +237,6 @@ fn tool_round_turn(response: &LlmResponse) -> LlmMessage {
         role: LlmRole::Assistant,
         content: LlmContent::AssistantWithTools {
             raw: response.raw_content.clone(),
-            text: response.text.clone(),
-            tool_uses: response.tool_uses.clone(),
-        },
-    }
-}
-
-/// The leading complete thinking blocks of a response's content: signed
-/// `thinking` and `redacted_thinking` blocks, up to the first other block.
-/// Empty for an OpenAI Responses turn or a response without thinking.
-fn leading_signed_thinking(raw: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    if crate::providers::openai_compat::is_responses_raw(raw) {
-        return Vec::new();
-    }
-    let nonempty = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.is_empty());
-    raw.iter()
-        .take_while(|b| match b["type"].as_str() {
-            Some("thinking") => nonempty(&b["signature"]),
-            Some("redacted_thinking") => nonempty(&b["data"]),
-            _ => false,
-        })
-        .cloned()
-        .collect()
-}
-
-/// The assistant turn of a round cut off at `max_tokens` mid-tool-use. It is
-/// rebuilt from its text and tool calls, since a cut-off turn can end in a
-/// partial block, but its leading signed thinking blocks are kept in front:
-/// with a thinking budget on, the API rejects a final assistant turn that
-/// doesn't start with one.
-fn truncated_round_turn(response: &LlmResponse) -> LlmMessage {
-    let mut raw = leading_signed_thinking(&response.raw_content);
-    if !raw.is_empty() {
-        if !response.text.is_empty() {
-            raw.push(serde_json::json!({ "type": "text", "text": response.text }));
-        }
-        for u in &response.tool_uses {
-            raw.push(serde_json::json!({ "type": "tool_use", "id": u.id, "name": u.name, "input": u.input }));
-        }
-    }
-    LlmMessage {
-        role: LlmRole::Assistant,
-        content: LlmContent::AssistantWithTools {
-            raw,
             text: response.text.clone(),
             tool_uses: response.tool_uses.clone(),
         },
@@ -377,7 +346,11 @@ pub struct ChatMsg {
 pub struct ChatRequest {
     pub workspace_id: String,
     pub thread_id: String, // The conversation this turn belongs to
-    pub workspace_path: String, // The directory where tools execute
+    /// The directory where tools execute. Whatever the webview sends is
+    /// replaced with the workspace's own folder from the database
+    /// (`with_workspace_path_from_db`) before the turn runs.
+    #[serde(default)]
+    pub workspace_path: String,
     pub model: String,
     pub user_message: String,
     pub system: Option<String>,
@@ -427,6 +400,16 @@ pub struct ChatRequest {
     /// Never sent by the frontend.
     #[serde(skip)]
     pub max_output: Option<u32>,
+}
+
+/// `request` with its `workspace_path` read from the database by its
+/// `workspace_id` (`Db::talk_workspace_path`): a request can't point a turn's
+/// tools at a folder of its choosing. An unknown workspace runs nothing.
+pub(crate) fn with_workspace_path_from_db(db: &Db, request: ChatRequest) -> AppResult<ChatRequest> {
+    let path = db
+        .talk_workspace_path(&request.workspace_id)?
+        .ok_or_else(|| AppError::Other("This conversation's workspace no longer exists.".into()))?;
+    Ok(ChatRequest { workspace_path: path, ..request })
 }
 
 /// A base64 image attachment sent with a user turn.
@@ -1524,6 +1507,11 @@ pub enum ApprovalDecision {
     Approve,
     /// Approve and stop asking for this conversation (auto-approve the thread).
     ApproveAlways,
+    /// An MCP card's "Always allow this tool" (#1243): approve, and trust the
+    /// tool app-wide in Edit freely. On any other card, one approval.
+    TrustTool,
+    /// An MCP card's "Trust <server>": the same for every tool of the server.
+    TrustServer,
 }
 
 impl ApprovalDecision {
@@ -1532,6 +1520,8 @@ impl ApprovalDecision {
         match s {
             "approve" => ApprovalDecision::Approve,
             "always" => ApprovalDecision::ApproveAlways,
+            "tool" => ApprovalDecision::TrustTool,
+            "server" => ApprovalDecision::TrustServer,
             _ => ApprovalDecision::Deny,
         }
     }
@@ -1565,6 +1555,12 @@ pub struct ApprovalRequestEvent {
     /// its "Allow reading … for this conversation" answer remembers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remember_dir: Option<String>,
+    /// An MCP card in Edit freely (#1243): the server and tool its "Trust
+    /// <server>" and "Always allow this tool" answers would trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_tool: Option<String>,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1615,9 +1611,23 @@ pub(crate) struct ApprovalBroker {
     /// Folders a thread's commands may read without asking, each one the
     /// user allowed from a command's card (#1201; in-memory, like the grant).
     read_dirs: Mutex<HashMap<String, Vec<std::path::PathBuf>>>,
+    /// Where an MCP card's lasting answers are kept (`mcp::trust`, #1243):
+    /// app-wide, in the database. `None` (a test) keeps none.
+    trust_db: Option<Arc<Mutex<Db>>>,
 }
 
 impl ApprovalBroker {
+    pub fn with_trust(db: Arc<Mutex<Db>>) -> Self {
+        Self { trust_db: Some(db), ..Self::default() }
+    }
+
+    /// What the user trusts to run without an MCP card in Edit freely, in
+    /// `worktree`, read now, so a revoke in Settings or a changed entry
+    /// applies to the next call.
+    pub fn mcp_trust(&self, worktree: &std::path::Path) -> crate::mcp::trust::TrustView {
+        self.trust_db.as_ref().map(|db| crate::mcp::trust::TrustView::read(db, worktree)).unwrap_or_default()
+    }
+
     pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
         if let Some(parked) = self.approvals.lock().remove(call_id) {
             let _ = parked.tx.send(decision);
@@ -1720,9 +1730,8 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None).await;
-        self.record(thread_id, decision, false);
-        decision
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, None, None).await;
+        self.record(thread_id, decision, false)
     }
 
     /// Ask about a card `talk_guard` raised (#1147): an MCP call, which the
@@ -1741,17 +1750,34 @@ impl ApprovalBroker {
         }
         let marks = Some((card.kind, card.sensitive));
         let remember = card.remember.as_ref().map(|(_, shown)| shown.as_str());
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember).await;
-        self.settle_card(thread_id, decision, &card)
+        let trust = card.trust.as_ref();
+        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, remember, trust).await;
+        let settled = self.settle_card(thread_id, decision, &card);
+        if trust.is_some() && matches!(decision, ApprovalDecision::TrustTool | ApprovalDecision::TrustServer) {
+            // Settings and the Companion list it.
+            let _ = app.emit(crate::mcp::trust::CHANGED_EVENT, ());
+        }
+        settled
     }
 
     /// What an answer to a `talk_guard` card does: "always" on a command's
     /// card that offers a folder lets the thread's commands read it from now
-    /// on and counts as one approval (#1201); any other as [`Self::record`].
+    /// on and counts as one approval (#1201); "tool" or "server" on an MCP
+    /// card that offers trust keeps it app-wide (#1243) and counts as one
+    /// approval; any other as [`Self::record`].
     pub(crate) fn settle_card(&self, thread_id: &str, decision: ApprovalDecision, card: &ToolCard) -> ApprovalDecision {
-        match (decision, &card.remember) {
-            (ApprovalDecision::ApproveAlways, Some((dir, _))) => {
+        match (decision, &card.remember, &card.trust) {
+            (ApprovalDecision::ApproveAlways, Some((dir, _)), _) => {
                 self.read_dirs.lock().entry(thread_id.to_string()).or_default().push(dir.clone());
+                ApprovalDecision::Approve
+            }
+            (ApprovalDecision::TrustTool | ApprovalDecision::TrustServer, _, Some(offer)) => {
+                let tool = (decision == ApprovalDecision::TrustTool).then_some(offer.tool.as_str());
+                if let Some(db) = &self.trust_db {
+                    if let Err(e) = crate::mcp::trust::grant(&db.lock(), &offer.server, &offer.config, tool) {
+                        tracing::warn!(error = %e, "could not keep the MCP trust; approved this call only");
+                    }
+                }
                 ApprovalDecision::Approve
             }
             _ => self.record(thread_id, decision, !card.kind.grantable()),
@@ -1784,16 +1810,18 @@ impl ApprovalBroker {
         covers_uncommitted: bool,
     ) -> ApprovalDecision {
         let decision = self
-            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None)
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted), None, None, None)
             .await;
         self.record(thread_id, decision, true)
     }
 
     /// Keep a "don't ask again" grant, except from a card that grants nothing
     /// (`secret`: the secret card, a file outside the workspace), whose
-    /// approval reads as a plain one. Returns the decision to act on.
+    /// approval reads as a plain one, and a trust answer on a card that
+    /// offers none, which is one approval. Returns the decision to act on.
     pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
         match decision {
+            ApprovalDecision::TrustTool | ApprovalDecision::TrustServer => ApprovalDecision::Approve,
             ApprovalDecision::ApproveAlways if secret => ApprovalDecision::Approve,
             ApprovalDecision::ApproveAlways => {
                 self.auto_approve.lock().insert(thread_id.to_string());
@@ -1825,6 +1853,7 @@ impl ApprovalBroker {
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
+        trust: Option<&crate::talk_guard::TrustOffer>,
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1840,6 +1869,8 @@ impl ApprovalBroker {
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
+            trust_server: trust.map(|o| o.server.clone()),
+            trust_tool: trust.map(|o| o.tool.clone()),
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -2181,7 +2212,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "read_file",
-            "description": "Read the contents of a file in the workspace. For large files, pass offset/limit to read a window of lines instead of the whole file.",
+            "description": "Read the contents of a file in the workspace. Each line comes back led by its line number and a tab; the number isn't part of the file. For large files, pass offset/limit to read a window of lines instead of the whole file.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -2203,7 +2234,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "write_file",
-            "description": "Write content to a file in the workspace. Creates the file and parent directories if they don't exist. Overwrites existing content.",
+            "description": "Write content to a file in the workspace. Creates the file and parent directories if they don't exist. Overwrites existing content: an existing file must have been read with read_file first, and is refused if it changed on disk since.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -2289,7 +2320,7 @@ fn tool_definitions() -> serde_json::Value {
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "The exact text to replace"
+                        "description": "The exact text to replace, without read_file's line-number prefixes"
                     },
                     "new_string": {
                         "type": "string",
@@ -2739,6 +2770,60 @@ fn read_file_head(full: &Path) -> std::io::Result<(String, u64)> {
     Ok((utf8_keeping_cut(bytes, cut)?, size))
 }
 
+/// `lines` as `read_file` shows them to the model: each led by its number,
+/// counting from `first`, right-aligned in six columns and then a tab (the
+/// `cat -n` layout), so the model can cite `path:line` and aim an edit.
+fn number_lines<'a>(lines: impl Iterator<Item = &'a str>, first: usize) -> String {
+    lines
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{line}", first + i))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `text` without the [`number_lines`] prefix on each of its lines, when
+/// every line carries one (a trailing newline aside); `None` otherwise.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let last = lines.len() - 1;
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i == last && line.is_empty() && i > 0 {
+            out.push("");
+            continue;
+        }
+        let rest = line.trim_start_matches(' ');
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 || rest.as_bytes().get(digits) != Some(&b'\t') {
+            return None;
+        }
+        out.push(&rest[digits + 1..]);
+    }
+    Some(out.join("\n"))
+}
+
+/// What `edit_file` matches when `old` isn't in `content` as written, for an
+/// edit copied from `read_file`'s view: `old` without the line numbers (and
+/// `new` too, when it carries them on every line), and, in a file with CRLF
+/// line ends, with its `\r` back (the view drops them). `None` when neither
+/// matches.
+fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String)> {
+    if content.contains(old) {
+        return None;
+    }
+    let mut tries = Vec::new();
+    if let Some(unnumbered) = strip_line_numbers(old) {
+        tries.push((unnumbered, strip_line_numbers(new).unwrap_or_else(|| new.to_string())));
+    }
+    if content.contains("\r\n") {
+        let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+        let restored: Vec<_> = tries.iter().map(|(o, n)| (crlf(o), crlf(n))).collect();
+        tries.extend(restored);
+        tries.push((crlf(old), crlf(new)));
+    }
+    tries.into_iter().find(|(o, _)| !o.is_empty() && content.contains(o.as_str()))
+}
+
 /// [`execute_tool_cancellable`] with no cancel flag. The app always passes
 /// one ([`run_builtin`]); tests call this.
 #[cfg(test)]
@@ -2840,7 +2925,7 @@ pub(crate) fn execute_tool_cancellable(
                 return match read_line_window(&full, start, limit.map(|l| l as usize)) {
                     Ok((window, total)) => {
                         let shown = window.len();
-                        let body = window.join("\n");
+                        let body = number_lines(window.iter().map(String::as_str), start + 1);
                         let body = truncate_char_safe(&body, READ_FILE_MAX_BYTES);
                         let of = match total {
                             Some(total) => format!(" of {total}"),
@@ -2852,13 +2937,18 @@ pub(crate) fn execute_tool_cancellable(
                 };
             }
             match read_file_head(&full) {
-                Ok((head, size)) if size > head.len() as u64 => (
-                    format!(
-                        "{head}... (truncated, {size} bytes total — re-read with `offset`/`limit` to see the rest)"
-                    ),
-                    true,
-                ),
-                Ok((content, _)) => (content, true),
+                Ok((head, size)) => {
+                    let body = number_lines(head.lines(), 1);
+                    if size == head.len() as u64 && body.len() <= READ_FILE_MAX_BYTES {
+                        (body, true)
+                    } else {
+                        // The numbers take room too: what is shown, note
+                        // included, stays within the cap.
+                        let note = format!("... (truncated, {size} bytes total — re-read with `offset`/`limit` to see the rest)");
+                        let body = truncate_char_safe(&body, READ_FILE_MAX_BYTES.saturating_sub(note.len()));
+                        (format!("{body}{note}"), true)
+                    }
+                }
                 Err(e) => (format!("Error reading {path}: {e}"), false),
             }
         }
@@ -3068,6 +3158,10 @@ pub(crate) fn execute_tool_cancellable(
                 Ok(c) => c,
                 Err(e) => return (format!("Error reading {path}: {e}"), false),
             };
+            // The model copied the edit from `read_file`'s view (`edit_from_view`).
+            let (old_string, new_string) = edit_from_view(&content, old_string, new_string)
+                .unwrap_or_else(|| (old_string.to_string(), new_string.to_string()));
+            let (old_string, new_string) = (old_string.as_str(), new_string.as_str());
             let count = content.matches(old_string).count();
             if count == 0 {
                 return (
@@ -3368,6 +3462,10 @@ pub struct ChatEngine {
     /// Threads whose live `$` process the user stopped (`stop_shell`), so its
     /// row reads as stopped when it exits.
     stopped_shells: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per thread, the files the agent read or wrote as it saw them, so a
+    /// `write_file` never overwrites a file blind (#1165). The outer lock
+    /// only hands out a thread's record; checks lock just that one.
+    file_seen: Arc<Mutex<HashMap<String, Arc<Mutex<crate::file_seen::FileSeen>>>>>,
 }
 
 impl ChatEngine {
@@ -3375,18 +3473,20 @@ impl ChatEngine {
         let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
         talk_shell.set_client(daemon);
         // A project's own servers start once approved in its project (#1245).
-        let approvals = Arc::new(crate::mcp::approval::DbApprovals(Arc::clone(&db)));
+        let project_approvals = Arc::new(crate::mcp::approval::DbApprovals(Arc::clone(&db)));
+        let approvals = Arc::new(ApprovalBroker::with_trust(Arc::clone(&db)));
         Self {
             // Clone of the process-wide client — shares its connection pool.
             client: shared_http_client().clone(),
             db,
             cancels: Arc::new(Mutex::new(HashMap::new())),
-            mcp: Arc::new(crate::mcp::McpRegistry::new().with_approvals(approvals)),
+            mcp: Arc::new(crate::mcp::McpRegistry::new().with_approvals(project_approvals)),
             talk_shell,
-            approvals: Arc::new(ApprovalBroker::default()),
+            approvals,
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
             stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            file_seen: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3417,6 +3517,30 @@ impl ChatEngine {
             }
             let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ());
         }
+    }
+
+    /// Why the agent's tool call `name` with `input` must not run in
+    /// `thread_id`: a `write_file` over a file it hasn't read, or that
+    /// changed since (`file_seen`). Off the runtime thread: it may hash the file.
+    async fn file_seen_refusal(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value) -> Option<String> {
+        if !crate::file_seen::guards(name) {
+            return None;
+        }
+        crate::file_seen::refusal_off_thread(self.thread_file_seen(thread_id), workspace, name, input).await
+    }
+
+    /// After the agent's tool call ran in `thread_id`: what it now knows of
+    /// the file. Off the runtime thread: it hashes the file.
+    async fn note_file_seen(&self, thread_id: &str, workspace: &Path, name: &str, input: &serde_json::Value, ok: bool) {
+        if !ok || !crate::file_seen::tracks(name) {
+            return;
+        }
+        crate::file_seen::note_off_thread(self.thread_file_seen(thread_id), workspace, name, input, ok).await;
+    }
+
+    /// The record of what `thread_id`'s agent has seen.
+    fn thread_file_seen(&self, thread_id: &str) -> Arc<Mutex<crate::file_seen::FileSeen>> {
+        Arc::clone(self.file_seen.lock().entry(thread_id.to_string()).or_default())
     }
 
     /// Stop a thread's live `$` process (SIGINT), remembering that the user
@@ -3796,10 +3920,7 @@ impl ChatEngine {
         model: &str,
         usage: &TurnUsage,
     ) -> AppResult<()> {
-        self.finish_with_note(
-            app, workspace_id, thread_id, model, usage,
-            "Generation stopped.",
-        )
+        self.finish_with_note(app, workspace_id, thread_id, model, usage, STOPPED_NOTE)
     }
 
     /// Like `finish_stopped`, but the quiet note explains that a budget cap —
@@ -4414,6 +4535,12 @@ impl ChatEngine {
         request: ChatRequest,
         held: &mut TurnHold,
     ) -> AppResult<()> {
+        // The folder the turn's tools work in comes from the database, as the
+        // checkpoint commands' does, never from the webview.
+        let request = {
+            let db = self.db.lock();
+            with_workspace_path_from_db(&db, request)?
+        };
         // The Auto policy (economy director): the composer sends `auto`; the
         // turn runs on the strong tier's model under the lean-context
         // doctrine, and sub-agents take their tier by role. Resolved once,
@@ -4692,10 +4819,11 @@ impl ChatEngine {
         // the user switched off in this conversation (Companion "can use")
         // are left out and never started for it; the same path as
         // sub-agents'. What it offers is fixed for the turn. Any MCP tool it
-        // didn't discover with `readOnlyHint` asks first (#1147).
+        // didn't discover with `readOnlyHint` asks first (#1147), unless Edit
+        // freely lets it run (`talk_guard::McpTools`, #1243).
         // A project's own server that waits for approval asks first (#1245).
         self.ask_project_servers(&app, &request.workspace_id, &request.workspace_path, &request.thread_id).await;
-        let mcp_read_only: std::collections::HashSet<String> = {
+        let (mcp_read_only, mcp_tools): (std::collections::HashSet<String>, crate::talk_guard::McpTools) = {
             let discovered = discover_thread_mcp_tools(
                 Arc::clone(&self.mcp),
                 &self.db,
@@ -4710,7 +4838,8 @@ impl ChatEngine {
             // gives the same tool bytes on every turn, so the provider's
             // prompt cache, which starts at the tool list, survives.
             tools.extend(discovered.iter().map(crate::chat_agents::mcp_llm_tool));
-            discovered.into_iter().filter(|t| t.read_only).map(|t| t.namespaced).collect()
+            let classes = crate::talk_guard::McpTools::new(&discovered);
+            (discovered.into_iter().filter(|t| t.read_only).map(|t| t.namespaced).collect(), classes)
         };
         // Where the file tools may go without asking (#1147). A sandboxed
         // mission's own sandbox refuses a write outside the workspace.
@@ -5221,7 +5350,9 @@ impl ChatEngine {
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
-                let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
+                let trust = || self.approvals.mcp_trust(Path::new(&request.workspace_path));
+                let mcp = crate::talk_guard::McpCheck { tools: &mcp_tools, mode, trust: &trust };
+                let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp, &reach, writes_confined);
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c);
@@ -5272,7 +5403,6 @@ impl ChatEngine {
                             )
                             .await
                         {
-                            ApprovalDecision::Approve | ApprovalDecision::ApproveAlways => {}
                             ApprovalDecision::Deny => {
                                 denied = Some(format!(
                                     "Command not run — the user declined to approve it \
@@ -5280,6 +5410,7 @@ impl ChatEngine {
                                      a safer alternative."
                                 ));
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -5321,6 +5452,8 @@ impl ChatEngine {
                 // An MCP result whose binary payloads the model reads as
                 // placeholders: the original, kept on the row for recall.
                 let mut mcp_original: Option<String> = None;
+                // A `write_file` the overwrite guard refused (`file_seen`).
+                let mut write_refused = false;
                 let (result, ok) = if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
@@ -5448,12 +5581,18 @@ impl ChatEngine {
                     let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
                     (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
+                } else if let Some(refusal) = self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await {
+                    // A write over a file the agent hasn't read, or that
+                    // changed since: refused, nothing written.
+                    write_refused = true;
+                    (refusal, false)
                 } else {
                     // Every other built-in tool, off the runtime thread too: a
                     // long grep never stalls another workspace's turn, and a
                     // walk Stop ended reads as stopped.
                     let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
+                    self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1).await;
                     ran
                 };
                 // A long command's output: its row and the model read the
@@ -5475,7 +5614,7 @@ impl ChatEngine {
                 });
 
                 // If the tool wrote a file, record it in file_edits for the Review canvas.
-                if (u.name == "write_file" || u.name == "edit_file") && !mode_denied {
+                if (u.name == "write_file" || u.name == "edit_file") && !mode_denied && !write_refused {
                     if let Some(path) = u.input.get("path").and_then(|p| p.as_str()) {
                         let msg_id = if assistant_msg_id >= 0 { Some(assistant_msg_id) } else { None };
                         if let Err(e) = self.db.lock().insert_file_edit(
@@ -5613,7 +5752,9 @@ impl ChatEngine {
                         None => content,
                     }
                 };
-                tool_results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error: false });
+                // A failed or denied call says so (`is_error`), as its row does.
+                let is_error = crate::context::transcript::tool_row_is_error(&tool_record);
+                tool_results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error });
             }
 
             // ── Catch-all file-edit attribution ───────────────────
@@ -6333,6 +6474,35 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_sends_openai_one_stable_prompt_cache_key() {
+        use crate::providers::openai_compat;
+        let mut request = chat_request_on("gpt-5", DEEP);
+        request.thread_id = "thread-42".into();
+        let key = crate::providers::prompt_cache_key("thread-42");
+        // Every request of the turn, the forced close included, carries it.
+        assert_eq!(director_request(&request, "sys", &[], &[]).cache_key.as_deref(), Some(key.as_str()));
+        let mut messages = Vec::new();
+        assert_eq!(forced_close_request(&request, "sys", &mut messages, &[]).cache_key.as_deref(), Some(key.as_str()));
+        // Stable per thread, distinct across threads, and a hash: never the id or a title.
+        assert_eq!(key, crate::providers::prompt_cache_key("thread-42"));
+        assert_ne!(key, crate::providers::prompt_cache_key("thread-43"));
+        assert!(!key.contains("thread-42") && key.len() <= 64, "{key}");
+
+        // OpenAI's own host gets it, on Chat Completions and Responses alike.
+        let req = director_request(&request, "sys", &[], &[]);
+        let mut body = openai_compat::build_request(&req);
+        openai_compat::with_cache_key(&mut body, &req, "https://api.openai.com/v1");
+        assert_eq!(body["prompt_cache_key"], serde_json::json!(key));
+        let mut responses = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
+        openai_compat::with_cache_key(&mut responses, &req, "https://api.openai.com/v1");
+        assert_eq!(responses["prompt_cache_key"], serde_json::json!(key));
+        // Another OpenAI-compatible server may refuse a field it doesn't know.
+        let mut other = openai_compat::build_request(&req);
+        openai_compat::with_cache_key(&mut other, &req, "http://localhost:11434/v1");
+        assert!(other.get("prompt_cache_key").is_none(), "{other}");
+    }
+
+    #[test]
     fn max_tokens_clamped_to_model_cap() {
         // Deep on GPT-4o: every round and the forced close ask for 16,384.
         let mut request = chat_request_on("gpt-4o", DEEP);
@@ -6943,6 +7113,136 @@ mod tests {
     }
 
     #[test]
+    fn read_file_numbers_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::write(wp.join("n.rs"), "fn main() {\r\n    run();\n}\n").unwrap();
+        let (out, ok) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "n.rs" }), None);
+        assert!(ok, "{out}");
+        assert_eq!(out, "     1\tfn main() {\n     2\t    run();\n     3\t}");
+        // A window counts from its first line.
+        let (out, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "n.rs", "offset": 2, "limit": 1 }), None);
+        assert_eq!(out, "(lines 2-2; more follow)\n     2\t    run();");
+        // Line ten and on keep the column.
+        let long = (1..=12).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(wp.join("long.txt"), long).unwrap();
+        let (out, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "long.txt" }), None);
+        assert!(out.ends_with("\n    11\tl11\n    12\tl12"), "{out}");
+    }
+
+    #[test]
+    fn edit_file_strips_copied_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::write(wp.join("f.rs"), "fn a() {\n    one();\n    two();\n}\n").unwrap();
+        // old_string and new_string copied from read_file's numbered view.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({
+                "path": "f.rs",
+                "old_string": "     2\t    one();\n     3\t    two();\n",
+                "new_string": "     2\t    one();\n     3\t    three();\n",
+            }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("f.rs")).unwrap(), "fn a() {\n    one();\n    three();\n}\n");
+        // Only old_string numbered: new_string is written as given.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "f.rs", "old_string": "     4\t}", "new_string": "} // end" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("f.rs")).unwrap(), "fn a() {\n    one();\n    three();\n} // end\n");
+        // Raw text still matches first: a file that holds the numbers keeps them.
+        std::fs::write(wp.join("t.tsv"), "1\tx\n2\ty\n").unwrap();
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "t.tsv", "old_string": "2\ty", "new_string": "2\tz" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("t.tsv")).unwrap(), "1\tx\n2\tz\n");
+        // A line without a number isn't stripped.
+        assert_eq!(strip_line_numbers("     1\ta\nb"), None);
+        assert_eq!(strip_line_numbers("12\ta\n13\tb\n").as_deref(), Some("a\nb\n"));
+    }
+
+    #[test]
+    fn edit_file_copied_from_the_view_keeps_crlf_line_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        std::fs::write(wp.join("w.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+        // The view shows the lines without their `\r`; the edit is copied from it.
+        let (view, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "w.txt" }), None);
+        assert!(!view.contains('\r'), "{view:?}");
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "w.txt", "old_string": "     1\tone\n     2\ttwo", "new_string": "     1\tone\n     2\t2" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("w.txt")).unwrap(), "one\r\n2\r\nthree\r\n");
+        // Unnumbered, too.
+        let (msg, ok) = execute_tool(
+            wp,
+            "edit_file",
+            &serde_json::json!({ "path": "w.txt", "old_string": "2\nthree", "new_string": "2\n3" }),
+            None,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("w.txt")).unwrap(), "one\r\n2\r\n3\r\n");
+        // A file with `\n` line ends gets no `\r`.
+        std::fs::write(wp.join("u.txt"), "a\nb\n").unwrap();
+        assert!(edit_from_view("a\nb\n", "a\nc", "x").is_none());
+        let (msg, ok) = execute_tool(wp, "edit_file", &serde_json::json!({ "path": "u.txt", "old_string": "a\nb", "new_string": "a\nc" }), None);
+        assert!(ok, "{msg}");
+        assert_eq!(std::fs::read_to_string(wp.join("u.txt")).unwrap(), "a\nc\n");
+    }
+
+    /// The numbers take room: a whole-file read of many short lines still
+    /// stays within the cap, and says it was cut.
+    #[test]
+    fn numbered_read_stays_within_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let wp = dir.path();
+        for (name, text) in [("blank.txt", "\n".repeat(99_000)), ("code.rs", "x = 1;\n".repeat(14_000))] {
+            std::fs::write(wp.join(name), &text).unwrap();
+            let (out, ok) = execute_tool(wp, "read_file", &serde_json::json!({ "path": name }), None);
+            assert!(ok, "{name}");
+            assert!(out.len() <= READ_FILE_MAX_BYTES, "{name}: {} bytes", out.len());
+            assert!(out.ends_with(&format!("(truncated, {} bytes total — re-read with `offset`/`limit` to see the rest)", text.len())), "{name}");
+        }
+        // A small file is shown whole, with no note.
+        std::fs::write(wp.join("small.txt"), "a\nb\n").unwrap();
+        let (out, _) = execute_tool(wp, "read_file", &serde_json::json!({ "path": "small.txt" }), None);
+        assert_eq!(out, "     1\ta\n     2\tb");
+    }
+
+    /// Talk's overwrite guard (#1165): the check runs off the runtime thread
+    /// before the tool, the record after it, and a refused write is no
+    /// Review row. An `AppHandle` can't be built in a test, so this reads the
+    /// branch in the source.
+    #[test]
+    fn the_director_loop_guards_write_file() {
+        let engine = include_str!("chat_engine.rs");
+        let from = engine.find("// A `write_file` the overwrite guard refused").expect("the guard's flag");
+        let to = from + engine[from..].find("// Persist tool execution").expect("the tool row");
+        let body = &engine[from..to];
+        let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("the director's loop no longer has: {s}"));
+        let check = at("self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await");
+        let run = at("run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await");
+        let note = at("self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1).await");
+        assert!(check < at("write_refused = true;") && check < run && run < note, "{body}");
+        assert!(body.contains("&& !mode_denied && !write_refused"), "a refused write is recorded as an edit");
+    }
+
+    #[test]
     fn read_file_truncates_multibyte_content_on_a_char_boundary() {
         // Regression: the old `&content[..100_000]` byte slice panicked when
         // byte 100k fell inside a multibyte character.
@@ -7157,14 +7457,14 @@ mod tests {
         let read = |input: serde_json::Value| execute_tool(wp, "read_file", &input, None);
         let (out, ok) = read(serde_json::json!({ "path": "w.txt", "offset": 2, "limit": 3 }));
         assert!(ok, "{out}");
-        assert_eq!(out, "(lines 2-4; more follow)\nline2\nline3\nline4");
+        assert_eq!(out, "(lines 2-4; more follow)\n     2\tline2\n     3\tline3\n     4\tline4");
         // A window that ends at the file's end knows its total.
         std::fs::write(wp.join("short.txt"), "a\nb\nc\n").unwrap();
         let (out, ok) = read(serde_json::json!({ "path": "short.txt", "offset": 2, "limit": 5 }));
         assert!(ok);
-        assert_eq!(out, "(lines 2-3 of 3)\nb\nc");
+        assert_eq!(out, "(lines 2-3 of 3)\n     2\tb\n     3\tc");
         let (out, _) = read(serde_json::json!({ "path": "short.txt", "offset": 3, "limit": 1 }));
-        assert_eq!(out, "(lines 3-3 of 3)\nc");
+        assert_eq!(out, "(lines 3-3 of 3)\n     3\tc");
         // Past the end: nothing shown, the total still told.
         let (out, _) = read(serde_json::json!({ "path": "short.txt", "offset": 9 }));
         assert_eq!(out, "(lines 9-8 of 3)\n");
@@ -7178,7 +7478,7 @@ mod tests {
         // One huge line in a window is cut at the cap, not read whole.
         let (out, ok) = read(serde_json::json!({ "path": "big.txt", "limit": 1 }));
         assert!(ok, "{}", &out[..80]);
-        assert!(out.starts_with("(lines 1-1; more follow)\nxxx"), "{}", &out[..80]);
+        assert!(out.starts_with("(lines 1-1; more follow)\n     1\txxx"), "{}", &out[..80]);
         assert!(out.len() < READ_FILE_MAX_BYTES + 100);
     }
 
@@ -7293,7 +7593,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None,
+            remember_dir: None, trust_server: None, trust_tool: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7306,6 +7606,10 @@ mod tests {
         assert!(plain.get("rememberDir").is_none());
         let run = serde_json::to_value(ApprovalRequestEvent { kind: Some(CardKind::Run), remember_dir: Some("~/notes".into()), ..ev(false, false) }).unwrap();
         assert_eq!((run["kind"].as_str(), run["rememberDir"].as_str()), (Some("run"), Some("~/notes")));
+        assert!(plain.get("trustServer").is_none() && plain.get("trustTool").is_none());
+        let mcp = ApprovalRequestEvent { kind: Some(CardKind::Mcp), trust_server: Some("s".into()), trust_tool: Some("x".into()), ..ev(false, false) };
+        let mcp = serde_json::to_value(mcp).unwrap();
+        assert_eq!((mcp["trustServer"].as_str(), mcp["trustTool"].as_str()), (Some("s"), Some("x")));
     }
 
     #[test]
@@ -7319,6 +7623,7 @@ mod tests {
             denial: "d".into(),
             sensitive: false,
             remember: Some((dir.clone(), "/tmp/x".into())),
+            trust: None,
         };
         assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card), ApprovalDecision::Approve);
         assert_eq!(broker.read_dirs("t"), vec![dir]);
@@ -7340,6 +7645,7 @@ mod tests {
             denial: format!("declined {shown}"),
             sensitive: false,
             remember: None,
+            trust: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -7389,9 +7695,56 @@ mod tests {
         let agents = include_str!("chat_agents.rs");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        for call in ["talk_guard::mcp_card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
+        for call in ["self.mcp.card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
             assert!(body.contains(call), "the sub-agent gate calls {call}");
         }
+    }
+
+    #[test]
+    fn an_mcp_card_trusted_in_one_thread_holds_in_every_thread_and_after_a_restart() {
+        use crate::mcp::trust::{fingerprint, load, TrustView};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let users: HashMap<String, crate::mcp::McpServerConfig> =
+            [("sample-server".to_string(), crate::mcp::McpServerConfig { command: "sample".into(), ..Default::default() })].into();
+        let config = fingerprint(&users["sample-server"]);
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let broker = ApprovalBroker::with_trust(Arc::clone(&db));
+        let card = |trust: Option<crate::talk_guard::TrustOffer>| ToolCard {
+            kind: CardKind::Mcp,
+            shown: "mcp__sample-server__post_report {}".into(),
+            reason: "r".into(),
+            denial: "d".into(),
+            sensitive: false,
+            remember: None,
+            trust,
+        };
+        let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
+        assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone())), ApprovalDecision::Approve);
+        assert!(!broker.auto_approves("thread-a"), "no thread grant: the trust is app-wide");
+        // A trust answer where none was offered (Plan only, Ask first, a
+        // destructive tool, a project's server, a command) is one approval
+        // and keeps nothing.
+        assert_eq!(broker.settle_card("thread-b", ApprovalDecision::TrustServer, &card(None)), ApprovalDecision::Approve);
+        assert_eq!(broker.record("thread-b", ApprovalDecision::TrustServer, false), ApprovalDecision::Approve);
+        assert!(!load(&db.lock()).iter().any(|t| t.all) && !broker.auto_approves("thread-b"));
+        drop((broker, db));
+        // After a restart, any thread's next call to it runs without a card.
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let view = TrustView::from_configs(load(&db.lock()), &users, &HashMap::new());
+        let tool = crate::mcp::McpToolInfo {
+            server: "sample-server".into(),
+            name: "post_report".into(),
+            namespaced: "mcp__sample-server__post_report".into(),
+            ..Default::default()
+        };
+        let tools = crate::talk_guard::McpTools::new(&[tool]);
+        let edit = crate::permissions::Mode::Edit;
+        assert_eq!(tools.card(None, "mcp__sample-server__post_report", &serde_json::json!({}), edit, &view), None);
+        let restarted = ApprovalBroker::with_trust(Arc::clone(&db));
+        assert_eq!(restarted.settle_card("t", ApprovalDecision::TrustServer, &card(offer)), ApprovalDecision::Approve);
+        assert!(load(&db.lock()).iter().any(|t| t.server == "sample-server" && t.all && t.config == config));
+        assert_eq!(ApprovalDecision::parse("tool"), ApprovalDecision::TrustTool);
+        assert_eq!(ApprovalDecision::parse("server"), ApprovalDecision::TrustServer);
     }
 
     #[test]
@@ -7636,6 +7989,8 @@ mod tests {
             kind: None,
             sensitive: false,
             remember_dir: None,
+            trust_server: None,
+            trust_tool: None,
         }
     }
 

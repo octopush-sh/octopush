@@ -449,6 +449,43 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("Tell me a secret.")).toBeInTheDocument();
   });
 
+  it("an empty conversation offers three starters that fill the draft and send nothing", async () => {
+    useChatStore.setState({ draftInsertByWs: {} });
+    vi.mocked(ipcMock.sendChatMessage).mockClear();
+    const { container } = render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    const starters = container.querySelector('[data-tour="talk-empty-starters"]') as HTMLElement;
+    expect(within(starters).getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Review what changed",
+      "Ask about a file",
+      "Explain this workspace",
+    ]);
+    // The starters add to what is typed, so the title says "add", not "start".
+    expect(within(starters).getByRole("button", { name: "Review what changed" })).toHaveAttribute(
+      "title",
+      "Add “@diff” to the draft; nothing is sent",
+    );
+    expect(within(starters).getByRole("button", { name: "Explain this workspace" })).toHaveAttribute(
+      "title",
+      "Add “Explain this workspace.” to the draft; nothing is sent",
+    );
+    const draft = container.querySelector('[data-tour="talk-composer-input"]') as HTMLTextAreaElement;
+    fireEvent.click(within(starters).getByRole("button", { name: "Review what changed" }));
+    await waitFor(() => expect(draft.value).toBe("@diff "));
+    fireEvent.click(within(starters).getByRole("button", { name: "Explain this workspace" }));
+    await waitFor(() => expect(draft.value).toBe("@diff Explain this workspace."));
+    expect(ipcMock.sendChatMessage).not.toHaveBeenCalled();
+  });
+
+  it("the file starter opens the draft on an @", async () => {
+    useChatStore.setState({ draftInsertByWs: {} });
+    vi.mocked(ipcMock.sendChatMessage).mockClear();
+    const { container } = render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    fireEvent.click(screen.getByRole("button", { name: "Ask about a file" }));
+    const draft = container.querySelector('[data-tour="talk-composer-input"]') as HTMLTextAreaElement;
+    await waitFor(() => expect(draft.value).toBe("@"));
+    expect(ipcMock.sendChatMessage).not.toHaveBeenCalled();
+  });
+
   it("renders a stopped marker as a quiet note, not a model bubble", () => {
     useChatStore.setState({
       messagesByWs: {
@@ -459,7 +496,8 @@ describe("ChatView — renders tool cards in the DOM", () => {
             createdAt: "2026-05-17T10:00:00Z",
           },
           {
-            id: 2, workspaceId: "ws-1", role: "stopped", content: "Generation stopped.",
+            id: 2, workspaceId: "ws-1", role: "stopped",
+            content: "Stopped. Changes made before the stop stay; rewind files from your last message to undo them.",
             model: "claude-sonnet-4-6", inputTokens: 100, outputTokens: 20, costUsd: 0.001,
             createdAt: "2026-05-17T10:00:01Z",
           },
@@ -470,7 +508,9 @@ describe("ChatView — renders tool cards in the DOM", () => {
 
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
 
-    const note = screen.getByText("Generation stopped.");
+    const note = screen.getByText(
+      "Stopped. Changes made before the stop stay; rewind files from your last message to undo them.",
+    );
     expect(note).toBeInTheDocument();
     // It must render as the stopped note, never as an assistant bubble with a
     // model eyebrow.
@@ -1184,6 +1224,22 @@ describe("ChatView — context mentions (#962)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove @src/a.ts#L2-3" }));
     expect(ta.value).toBe("why fails");
     expect(screen.queryByText("a.ts#L2-3")).toBeNull();
+  });
+
+  it("says on the chip when a file can't be included, such as a .env that is a named pipe (#1190)", async () => {
+    vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue([".env"]);
+    vi.mocked(ipcMock.readFileChecked).mockRejectedValue(
+      "other: .env is a named pipe, not a file (a secrets manager may serve it). Octopush doesn't read it.",
+    );
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    fireEvent.change(getTextarea(), { target: { value: "use @.env" } });
+    await waitFor(() =>
+      expect(document.querySelector("[data-tour='talk-context-chip']")?.getAttribute("title")).toBe(
+        "Not included: a named pipe, not a file · @.env",
+      ),
+    );
   });
 
   it("sends only the range's lines", async () => {

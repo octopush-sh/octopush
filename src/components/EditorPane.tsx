@@ -373,7 +373,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       try {
         opened = await openAsJump(workspaceId, absolute, { line, from, root: workspacePath });
       } catch (e) {
-        pushToast({ level: "error", title: "Could not open file", body: String(e) });
+        pushToast({ level: "error", title: "Could not open file", body: String(e).replace(/^other: /, "") });
         return;
       }
       // `openFile` declines an oversized file when no confirm handler is passed,
