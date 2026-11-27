@@ -2113,11 +2113,12 @@ done
         assert!(!dump.exists());
         assert_eq!(classify_failure(&err).summary, "The value for MY_TOKEN isn't in the Keychain.");
 
-        // The same entry in a repo's `.claude/mcp.json` gets nothing from
-        // the Keychain: Talk starts it with the file's empty value.
+        // The same entry in a repo's `.claude/mcp.json`, even approved, gets
+        // nothing from the Keychain: Talk starts it with the file's empty value.
         write_servers(dir.path(), &HashMap::from([("example".to_string(), cfg.clone())]));
         let store = Arc::new(secrets::MemoryStore::with(&[("example/MY_TOKEN", "tok-2")]));
-        let reg = McpRegistry::with_secrets(Arc::clone(&store) as Arc<dyn secrets::SecretStore>);
+        let reg = McpRegistry::with_secrets(Arc::clone(&store) as Arc<dyn secrets::SecretStore>)
+            .with_approvals(Arc::new(approval::TrustAll));
         assert!(reg.call(dir.path(), "mcp__example__x", &json!({})).is_err());
         assert_eq!(std::fs::read_to_string(&dump).unwrap(), "");
         assert!(store.reads.lock().is_empty(), "the Keychain wasn't even read");
