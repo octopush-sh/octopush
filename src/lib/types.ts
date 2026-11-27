@@ -399,10 +399,12 @@ export interface McpToolInfo {
 
 /** What the user trusts to run without an MCP approval card in Edit freely
  *  (#1243), app-wide: the whole server (`all`, "Trust <server>") and the
- *  tools allowed one by one (`tools`, "Always allow this tool"). A tool its
+ *  tools allowed one by one (`tools`, "Always allow this tool"), bound to
+ *  the server's user-level entry (`config`, its fingerprint). A tool its
  *  server marks destructive asks whatever this says. */
 export interface McpTrust {
   server: string;
+  config: string;
   all: boolean;
   tools: string[];
 }

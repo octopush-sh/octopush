@@ -1595,10 +1595,11 @@ impl ApprovalBroker {
         Self { trust_db: Some(db), ..Self::default() }
     }
 
-    /// What the user trusts to run without an MCP card in Edit freely, read
-    /// now, so a revoke in Settings applies to the next call.
-    pub fn mcp_trust(&self) -> Vec<crate::mcp::trust::McpTrust> {
-        self.trust_db.as_ref().map(|db| crate::mcp::trust::load(&db.lock())).unwrap_or_default()
+    /// What the user trusts to run without an MCP card in Edit freely, in
+    /// `worktree`, read now, so a revoke in Settings or a changed entry
+    /// applies to the next call.
+    pub fn mcp_trust(&self, worktree: &std::path::Path) -> crate::mcp::trust::TrustView {
+        self.trust_db.as_ref().map(|db| crate::mcp::trust::TrustView::read(db, worktree)).unwrap_or_default()
     }
 
     pub fn respond(&self, call_id: &str, decision: ApprovalDecision) {
@@ -1744,10 +1745,10 @@ impl ApprovalBroker {
                 self.read_dirs.lock().entry(thread_id.to_string()).or_default().push(dir.clone());
                 ApprovalDecision::Approve
             }
-            (ApprovalDecision::TrustTool | ApprovalDecision::TrustServer, _, Some((server, tool))) => {
-                let tool = (decision == ApprovalDecision::TrustTool).then_some(tool.as_str());
+            (ApprovalDecision::TrustTool | ApprovalDecision::TrustServer, _, Some(offer)) => {
+                let tool = (decision == ApprovalDecision::TrustTool).then_some(offer.tool.as_str());
                 if let Some(db) = &self.trust_db {
-                    if let Err(e) = crate::mcp::trust::grant(&db.lock(), server, tool) {
+                    if let Err(e) = crate::mcp::trust::grant(&db.lock(), &offer.server, &offer.config, tool) {
                         tracing::warn!(error = %e, "could not keep the MCP trust; approved this call only");
                     }
                 }
@@ -1826,7 +1827,7 @@ impl ApprovalBroker {
         secret: Option<bool>,
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
-        trust: Option<&(String, String)>,
+        trust: Option<&crate::talk_guard::TrustOffer>,
     ) -> ApprovalDecision {
         if !self.admits(workspace_id) {
             return ApprovalDecision::Deny;
@@ -1842,8 +1843,8 @@ impl ApprovalBroker {
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
-            trust_server: trust.map(|(server, _)| server.clone()),
-            trust_tool: trust.map(|(_, tool)| tool.clone()),
+            trust_server: trust.map(|o| o.server.clone()),
+            trust_tool: trust.map(|o| o.tool.clone()),
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -5287,7 +5288,7 @@ impl ChatEngine {
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
-                let trust = || self.approvals.mcp_trust();
+                let trust = || self.approvals.mcp_trust(Path::new(&request.workspace_path));
                 let mcp = crate::talk_guard::McpCheck { tools: &mcp_tools, mode, trust: &trust };
                 let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp, &reach, writes_confined);
                 let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
@@ -7584,18 +7585,21 @@ mod tests {
         let agents = include_str!("chat_agents.rs");
         let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
         let body = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
-        for call in ["self.mcp.card(", "self.broker.mcp_trust()", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
+        for call in ["self.mcp.card(", "self.reach.outside_card(", "self.reach.command_card(", "guard_card(card, &check"] {
             assert!(body.contains(call), "the sub-agent gate calls {call}");
         }
     }
 
     #[test]
     fn an_mcp_card_trusted_in_one_thread_holds_in_every_thread_and_after_a_restart() {
-        use crate::mcp::trust::covers;
+        use crate::mcp::trust::{fingerprint, load, TrustView};
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let open = || ApprovalBroker::with_trust(Arc::new(Mutex::new(Db::open(tmp.path()).unwrap())));
-        let broker = open();
-        let card = |trust: Option<(String, String)>| ToolCard {
+        let users: HashMap<String, crate::mcp::McpServerConfig> =
+            [("sample-server".to_string(), crate::mcp::McpServerConfig { command: "sample".into(), ..Default::default() })].into();
+        let config = fingerprint(&users["sample-server"]);
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let broker = ApprovalBroker::with_trust(Arc::clone(&db));
+        let card = |trust: Option<crate::talk_guard::TrustOffer>| ToolCard {
             kind: CardKind::Mcp,
             shown: "mcp__sample-server__post_report {}".into(),
             reason: "r".into(),
@@ -7604,18 +7608,19 @@ mod tests {
             remember: None,
             trust,
         };
-        let offer = Some(("sample-server".to_string(), "post_report".to_string()));
+        let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
         assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone())), ApprovalDecision::Approve);
         assert!(!broker.auto_approves("thread-a"), "no thread grant: the trust is app-wide");
-        assert!(covers(&broker.mcp_trust(), "sample-server", "post_report") && !covers(&broker.mcp_trust(), "sample-server", "drop_report"));
         // A trust answer where none was offered (Plan only, Ask first, a
-        // destructive tool, a command) is one approval and keeps nothing.
+        // destructive tool, a project's server, a command) is one approval
+        // and keeps nothing.
         assert_eq!(broker.settle_card("thread-b", ApprovalDecision::TrustServer, &card(None)), ApprovalDecision::Approve);
         assert_eq!(broker.record("thread-b", ApprovalDecision::TrustServer, false), ApprovalDecision::Approve);
-        assert!(!broker.mcp_trust().iter().any(|t| t.all) && !broker.auto_approves("thread-b"));
-        drop(broker);
+        assert!(!load(&db.lock()).iter().any(|t| t.all) && !broker.auto_approves("thread-b"));
+        drop((broker, db));
         // After a restart, any thread's next call to it runs without a card.
-        let restarted = open();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let view = TrustView::from_configs(load(&db.lock()), &users, &HashMap::new());
         let tool = crate::mcp::McpToolInfo {
             server: "sample-server".into(),
             name: "post_report".into(),
@@ -7624,9 +7629,10 @@ mod tests {
         };
         let tools = crate::talk_guard::McpTools::new(&[tool]);
         let edit = crate::permissions::Mode::Edit;
-        assert_eq!(tools.card(None, "mcp__sample-server__post_report", &serde_json::json!({}), edit, &restarted.mcp_trust()), None);
+        assert_eq!(tools.card(None, "mcp__sample-server__post_report", &serde_json::json!({}), edit, &view), None);
+        let restarted = ApprovalBroker::with_trust(Arc::clone(&db));
         assert_eq!(restarted.settle_card("t", ApprovalDecision::TrustServer, &card(offer)), ApprovalDecision::Approve);
-        assert!(restarted.mcp_trust().iter().any(|t| t.server == "sample-server" && t.all));
+        assert!(load(&db.lock()).iter().any(|t| t.server == "sample-server" && t.all && t.config == config));
         assert_eq!(ApprovalDecision::parse("tool"), ApprovalDecision::TrustTool);
         assert_eq!(ApprovalDecision::parse("server"), ApprovalDecision::TrustServer);
     }

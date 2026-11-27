@@ -1165,8 +1165,10 @@ export const ipc = {
   listMcpServerStatus: (workspacePath: string) =>
     invoke<McpServerStatus[]>("list_mcp_server_status", { workspacePath }),
   /** What the user trusts to run without an MCP card in Edit freely, per
-   *  server (#1243). App-wide. */
-  listMcpTrust: () => invoke<McpTrust[]>("list_mcp_trust"),
+   *  server (#1243), that still holds for its user-level entry. With a
+   *  worktree, without the servers its own `.claude/mcp.json` defines. */
+  listMcpTrust: (workspacePath?: string) =>
+    invoke<McpTrust[]>("list_mcp_trust", { workspacePath: workspacePath ?? null }),
   /** Revoke the trust in a server's tool, or in the whole server (`tool`
    *  null); resolves to what is left. The next call asks again. */
   revokeMcpTrust: (server: string, tool: string | null) =>

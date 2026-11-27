@@ -842,11 +842,8 @@ pub struct SubagentGate {
     pub workspace_path: String,
     /// The MCP tools the fan-out discovered: one that may change external
     /// state (create an issue, post a comment) asks the user first, as the
-    /// director's does (`talk_guard::McpTools::card`, #1243): nobody is
-    /// watching a sub-agent otherwise.
-    mcp: crate::talk_guard::McpTools,
-    /// The thread's mode, read at each call (Edit freely when unset).
-    mode: Option<crate::permissions::ModeSource>,
+    /// director's does (#1243): nobody is watching a sub-agent otherwise.
+    mcp: SubagentMcp,
     /// Where the file tools may go without asking: the workspace.
     reach: crate::talk_guard::Reach,
     /// The mission's sandbox refuses a write outside the workspace itself.
@@ -864,8 +861,7 @@ impl SubagentGate {
             call_id: spec.call_id.clone(),
             label: spec.call.description.clone(),
             workspace_path: spec.workspace_path.clone(),
-            mcp: crate::talk_guard::McpTools::default(),
-            mode: None,
+            mcp: SubagentMcp::default(),
             reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
             writes_confined: spec.sandbox_roots.is_some(),
             seq: AtomicU64::new(1),
@@ -880,11 +876,42 @@ impl SubagentGate {
     }
 
     /// Gate the MCP tools among `discovered` that may write, in the thread's
-    /// `mode` as it is at each call.
+    /// `mode` and with the user's trust as they are at each call.
     pub fn with_mcp(mut self, discovered: &[crate::mcp::McpToolInfo], mode: crate::permissions::ModeSource) -> Self {
-        self.mcp = crate::talk_guard::McpTools::new(discovered);
-        self.mode = Some(mode);
+        let (broker, worktree) = (Arc::clone(&self.broker), std::path::PathBuf::from(&self.workspace_path));
+        self.mcp = SubagentMcp::new(discovered, mode, Arc::new(move || broker.mcp_trust(&worktree)));
         self
+    }
+}
+
+/// What a sub-agent's MCP call is checked against (#1243): the fan-out's
+/// tools (`talk_guard::McpTools`), and the thread's mode and the user's
+/// trust, each read at the call.
+#[derive(Default)]
+pub struct SubagentMcp {
+    tools: crate::talk_guard::McpTools,
+    mode: Option<crate::permissions::ModeSource>,
+    trust: Option<Arc<dyn Fn() -> crate::mcp::trust::TrustView + Send + Sync>>,
+}
+
+impl SubagentMcp {
+    pub fn new(
+        discovered: &[crate::mcp::McpToolInfo],
+        mode: crate::permissions::ModeSource,
+        trust: Arc<dyn Fn() -> crate::mcp::trust::TrustView + Send + Sync>,
+    ) -> Self {
+        Self { tools: crate::talk_guard::McpTools::new(discovered), mode: Some(mode), trust: Some(trust) }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains(name)
+    }
+
+    /// The card a call to `name` must pass now, or `None`.
+    pub fn card(&self, label: Option<&str>, name: &str, input: &serde_json::Value) -> Option<crate::talk_guard::ToolCard> {
+        let mode = self.mode.as_ref().map_or(crate::permissions::Mode::Plan, |m| m());
+        let trust = self.trust.as_ref().map(|t| t()).unwrap_or_default();
+        self.tools.card(label, name, input, mode, &trust)
     }
 }
 
@@ -958,8 +985,7 @@ impl ToolGate for SubagentGate {
             let label = Some(self.label.as_str());
             let check = || {
                 if self.mcp.contains(name) {
-                    let mode = self.mode.as_ref().map_or(crate::permissions::Mode::Edit, |m| m());
-                    self.mcp.card(label, name, input, mode, &self.broker.mcp_trust())
+                    self.mcp.card(label, name, input)
                 } else {
                     self.reach.outside_card(label, name, input, self.writes_confined)
                 }
@@ -3069,6 +3095,82 @@ mod tests {
         assert!(provider.sent.lock()[1].1.contains(plan_net.as_str()));
         // An MCP name nobody discovered is refused too.
         assert_eq!(gate.check("mcp__other__delete", &serde_json::json!({})).await, Some(plan_net));
+    }
+
+    /// Stands in for the approval card: records the MCP calls `SubagentMcp`
+    /// would ask about, and denies them.
+    struct AskRecorder {
+        mcp: SubagentMcp,
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl ToolGate for AskRecorder {
+        async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+            let card = self.mcp.contains(name).then(|| self.mcp.card(None, name, input)).flatten()?;
+            self.asked.lock().push(name.to_string());
+            Some(format!("asked: {}", card.reason))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subagent_follows_the_users_trust_and_the_threads_mode() {
+        use crate::mcp::trust::{fingerprint, McpTrust, TrustView};
+        use crate::permissions::Mode;
+        let dir = tempfile::tempdir().unwrap();
+        let (_tmp, db, base) = mode_thread(Mode::Edit, dir.path());
+        let hinted = |name: &str, destructive: Option<bool>| crate::mcp::McpToolInfo {
+            destructive,
+            annotated: destructive.is_some(),
+            ..mcp_info("s", name, false)
+        };
+        let discovered = vec![hinted("get_x", None), hinted("post_x", None), hinted("delete_x", None), hinted("wipe_x", Some(true))];
+        let users: HashMap<String, crate::mcp::McpServerConfig> =
+            [("s".to_string(), crate::mcp::McpServerConfig { command: "s-cmd".into(), ..Default::default() })].into();
+        // The user trusts the whole server; the switch stands in for a revoke.
+        let trusted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let source = {
+            let (trusted, users) = (Arc::clone(&trusted), users.clone());
+            Arc::new(move || {
+                let entry = McpTrust { server: "s".into(), config: fingerprint(&users["s"]), all: true, tools: vec![] };
+                let entries = if trusted.load(Ordering::Relaxed) { vec![entry] } else { vec![] };
+                TrustView::from_configs(entries, &users, &HashMap::new())
+            })
+        };
+        let spec = mode_spec(&db, &base);
+        let mode = crate::permissions::thread_mode_source(Arc::clone(&db), spec.thread_id.clone(), spec.sandbox_roots.clone());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let recorder = AskRecorder { mcp: SubagentMcp::new(&discovered, mode, source), asked: Arc::clone(&asked) };
+        let gate = mode_gate(&db, &spec, base.sandbox_roots.as_deref(), &discovered, Some(Box::new(recorder)));
+        let mcp = FakeMcp { tools: discovered.iter().map(mcp_llm_tool).collect(), calls: Mutex::new(vec![]) };
+        let input = serde_json::json!({});
+        let provider = capturing(vec![
+            resp("", vec![
+                call("t1", "mcp__s__get_x", input.clone()),
+                call("t2", "mcp__s__post_x", input.clone()),
+                call("t3", "mcp__s__wipe_x", input.clone()),
+            ], LlmStopReason::ToolUse),
+            resp("done", vec![], LlmStopReason::EndTurn),
+        ]);
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
+            &Arc::new(AtomicBool::new(false)), &rec, Some(&gate), Some(&mcp)).await.unwrap();
+        assert!(out.ok, "{}", out.report);
+        // Edit freely: the read and the trusted write reach the server; the
+        // tool its server marks destructive asks although the server is trusted.
+        let calls: Vec<String> = mcp.calls.lock().iter().map(|c| c.0.clone()).collect();
+        assert_eq!(calls, vec!["mcp__s__get_x".to_string(), "mcp__s__post_x".to_string()]);
+        assert_eq!(asked.lock().clone(), vec!["mcp__s__wipe_x".to_string()]);
+        // Revoked: the next write asks at once; the read still runs.
+        trusted.store(false, Ordering::Relaxed);
+        assert!(gate.check("mcp__s__post_x", &input).await.is_some_and(|d| d.starts_with("asked")));
+        assert_eq!(gate.check("mcp__s__get_x", &input).await, None);
+        // Plan only, read at the call: trust or not, the unhinted tools are refused.
+        trusted.store(true, Ordering::Relaxed);
+        db.lock().set_thread_permission_mode(&base.thread_id, Mode::Plan).unwrap();
+        let plan_net = crate::permissions::plan_refusal(crate::permissions::Refused::Net, false);
+        for name in ["mcp__s__get_x", "mcp__s__post_x"] {
+            assert_eq!(gate.check(name, &input).await, Some(plan_net.clone()), "{name}");
+        }
     }
 
     #[tokio::test]

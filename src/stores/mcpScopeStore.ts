@@ -24,11 +24,13 @@ interface McpScopeState {
    *  re-reads the list. Resolves false when ignored or failed. */
   toggle: (threadId: string, server: string) => Promise<boolean>;
   /** What the user trusts to run without an MCP card in Edit freely
-   *  (#1243), app-wide (Settings › Integrations, the Companion's chips). */
-  trust: McpTrust[];
-  loadTrust: () => Promise<void>;
-  /** Revoke a server's tool, or the whole server (`tool` null); the list
-   *  becomes what the backend kept. A failure re-reads it and resolves false. */
+   *  (#1243), as it holds in a worktree (its path), or app-wide (`""`,
+   *  Settings › Integrations). */
+  trustByPath: Record<string, McpTrust[]>;
+  loadTrust: (worktreePath?: string) => Promise<void>;
+  /** Revoke a server's tool, or the whole server (`tool` null); the
+   *  app-wide list becomes what the backend kept, and the worktrees' lists
+   *  read again on the change event. A failure re-reads it and resolves false. */
   revokeTrust: (server: string, tool: string | null) => Promise<boolean>;
 }
 
@@ -46,29 +48,32 @@ const statusSeq: Record<string, number> = {};
 const offSeq: Record<string, number> = {};
 /** The tail of each thread's queue of writes. */
 const writeTail: Record<string, Promise<unknown>> = {};
-/** Bumped by every trust read and revoke: only the newest answer is kept. */
-let trustSeq = 0;
+/** Bumped per path by every trust read and revoke: only the newest answer
+ *  is kept. */
+const trustSeq: Record<string, number> = {};
 
 export const useMcpScopeStore = create<McpScopeState>((set, get) => ({
   statusByPath: {},
   offByThread: {},
-  trust: [],
+  trustByPath: {},
 
-  loadTrust: async () => {
-    const seq = ++trustSeq;
+  loadTrust: async (worktreePath = "") => {
+    const seq = (trustSeq[worktreePath] = (trustSeq[worktreePath] ?? 0) + 1);
     try {
-      const trust = await ipc.listMcpTrust();
-      if (seq === trustSeq && Array.isArray(trust)) set({ trust });
+      const trust = await ipc.listMcpTrust(worktreePath || undefined);
+      if (trustSeq[worktreePath] === seq && Array.isArray(trust)) {
+        set((s) => ({ trustByPath: { ...s.trustByPath, [worktreePath]: trust } }));
+      }
     } catch {
       // Keep the last reading.
     }
   },
 
   revokeTrust: async (server, tool) => {
-    const seq = ++trustSeq;
+    const seq = (trustSeq[""] = (trustSeq[""] ?? 0) + 1);
     try {
       const trust = await ipc.revokeMcpTrust(server, tool);
-      if (seq === trustSeq) set({ trust });
+      if (trustSeq[""] === seq) set({ trustByPath: { "": trust } });
       return true;
     } catch {
       await get().loadTrust();

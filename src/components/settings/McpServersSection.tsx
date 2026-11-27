@@ -25,6 +25,8 @@ import { configFromDraft, draftFrom, emptyDraft, type Draft } from "./mcpDraft";
 
 export { draftFrom } from "./mcpDraft";
 
+const NO_TRUST: McpTrust[] = [];
+
 type TestState =
   | { kind: "idle" }
   | { kind: "testing" }
@@ -70,8 +72,8 @@ export function mcpFailureFrom(e: unknown): McpFailure {
  * is edited in the repo, not here.
  *
  * What the user trusts to run without a Talk card (#1243) is listed on its
- * server's row, each line revocable; a trusted server with no row here (a
- * project's own) gets a row of its own, so every trust can be revoked.
+ * server's row, each line revocable. Trust is bound to the row's entry, so
+ * there is none for a server without one.
  */
 export function McpServersSection() {
   const [servers, setServers] = useState<Record<string, McpServerConfig>>({});
@@ -79,7 +81,7 @@ export function McpServersSection() {
   const [tests, setTests] = useState<Record<string, TestState>>({});
   const [form, setForm] = useState<FormState | null>(null);
   const [draft, setDraft] = useState<Draft>(emptyDraft);
-  const trust = useMcpScopeStore((s) => s.trust);
+  const trust = useMcpScopeStore((s) => s.trustByPath[""] ?? NO_TRUST);
   // Per server, bumped when its entry is saved, renamed or removed: a Test
   // or Reconnect started before then reports on an entry that's gone, so
   // its result is dropped.
@@ -123,6 +125,8 @@ export function McpServersSection() {
       // backend, and no secret value comes back.
       const saved = await ipc.saveMcpConfig(next, secrets, renamed);
       if (saved && seq === saveSeq.current) setServers(saved);
+      // A changed entry's trust lapsed with the save.
+      void useMcpScopeStore.getState().loadTrust();
     } catch (e) {
       pushToast({ level: "error", title: "Save failed", body: String(e) });
       // Show what is really saved: the optimistic list may hold "" for a
@@ -238,7 +242,6 @@ export function McpServersSection() {
   if (!loaded) return null;
 
   const entries = Object.entries(servers).sort(([a], [b]) => a.localeCompare(b));
-  const elsewhere = trust.filter((t) => !Object.hasOwn(servers, t.server) && trustFor(trust, t.server));
   const formFor = (mode: FormState) => {
     const original = mode.mode === "edit" ? mode.original : null;
     const oauth = original !== null && servers[original]?.remote?.auth === "oauth";
@@ -351,13 +354,6 @@ export function McpServersSection() {
             </div>
           );
         })}
-        {elsewhere.map((t) => (
-          <div key={t.server} className="octo-rise-in rounded-md border border-octo-hairline bg-octo-panel px-3 py-2.5">
-            <span className="font-mono text-[12px] text-octo-brass">{t.server}</span>
-            <span className="ml-3 text-[11px] text-octo-mute">not configured here (a project&apos;s own server, or removed)</span>
-            <TrustLines trust={t} onRevoke={(tool) => void revoke(t.server, tool)} />
-          </div>
-        ))}
       </div>
 
       {form?.mode === "add" ? (

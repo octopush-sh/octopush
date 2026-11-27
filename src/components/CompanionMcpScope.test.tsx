@@ -21,7 +21,7 @@ vi.mock("../lib/ipc", () => ({
     onMcpChanged: (h: () => void) => onMcpChanged(h),
     listSkills: () => Promise.resolve([]),
     listSubagentTypes: () => Promise.resolve([]),
-    listMcpTrust: () => listMcpTrust(),
+    listMcpTrust: (...a: unknown[]) => listMcpTrust(...a),
   },
 }));
 const listMcpTrust = vi.fn();
@@ -67,7 +67,7 @@ beforeEach(() => {
   listMcpServerStatus.mockReset().mockResolvedValue([docs, remote]);
   getThreadMcpDisabled.mockReset().mockImplementation((t: string) => Promise.resolve(stored[t] ?? []));
   setThreadMcpServer.mockReset().mockImplementation(backendSet);
-  useMcpScopeStore.setState({ statusByPath: {}, offByThread: {}, trust: [] });
+  useMcpScopeStore.setState({ statusByPath: {}, offByThread: {}, trustByPath: {} });
   listMcpTrust.mockReset().mockResolvedValue([]);
   useChatStore.setState({ activeThreadByWs: { ws: "t-1" }, streamingByWs: {} });
 });
@@ -82,11 +82,11 @@ describe("chipTitle / chipTone", () => {
   });
 
   it("says what the user trusts on the server (#1243)", () => {
-    expect(chipTitle(docs, false, true, { server: "docs-server", all: false, tools: ["post_note", "tag_page"] })).toBe(
-      "docs-server · connected · 12 tools · runs post_note, tag_page without asking in Edit freely (Settings › Integrations revokes it) · click to turn off in this conversation",
+    expect(chipTitle(docs, false, true, { server: "docs-server", config: "c", all: false, tools: ["post_note", "tag_page"] })).toBe(
+      "docs-server · connected · 12 tools · runs post_note, tag_page without asking in Edit freely; one it marks destructive still asks (Settings › Integrations revokes it) · click to turn off in this conversation",
     );
-    expect(chipTitle(docs, false, false, { server: "docs-server", all: true, tools: [] })).toBe(
-      "docs-server · connected · 12 tools · runs every tool without asking in Edit freely (Settings › Integrations revokes it)",
+    expect(chipTitle(docs, false, false, { server: "docs-server", config: "c", all: true, tools: [] })).toBe(
+      "docs-server · connected · 12 tools · runs every tool without asking in Edit freely; one it marks destructive still asks (Settings › Integrations revokes it)",
     );
   });
 
@@ -121,9 +121,10 @@ describe("CompanionMcpScope", () => {
   });
 
   it("marks a trusted server's chip and says what it may run (#1243)", async () => {
-    listMcpTrust.mockResolvedValue([{ server: "docs-server", all: true, tools: [] }]);
+    listMcpTrust.mockResolvedValue([{ server: "docs-server", config: "c", all: true, tools: [] }]);
     await mount();
-    expect(listMcpTrust).toHaveBeenCalled();
+    // Read for this worktree: a server its own .claude/mcp.json defines has none.
+    expect(listMcpTrust).toHaveBeenCalledWith("/wt");
     expect(chip("docs-server").querySelector('[data-testid="chip-trusted"]')).not.toBeNull();
     expect(chip("docs-server").title).toContain("runs every tool without asking in Edit freely");
     expect(chip("example-remote").querySelector('[data-testid="chip-trusted"]')).toBeNull();

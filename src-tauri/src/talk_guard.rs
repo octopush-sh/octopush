@@ -7,7 +7,7 @@
 //! not a sandbox, since a shell can build a path no check sees.
 
 use crate::chat_engine::{CommandWord, WordRole};
-use crate::mcp::trust::McpTrust;
+use crate::mcp::trust::TrustView;
 use crate::permissions::Mode;
 use serde::Serialize;
 use serde_json::Value;
@@ -52,9 +52,20 @@ pub struct ToolCard {
     /// thread's commands read from then on, and how the card names it
     /// (#1201): only on a command's card for a read outside the workspace.
     pub remember: Option<(PathBuf, String)>,
-    /// The server and tool an MCP card offers to trust for good (#1243):
-    /// only in Edit freely, and never for a tool marked destructive.
-    pub trust: Option<(String, String)>,
+    /// What an MCP card offers to trust for good (#1243): only in Edit
+    /// freely, never for a tool marked destructive, and only for a
+    /// user-level server a project doesn't define (`TrustView::offer`).
+    pub trust: Option<TrustOffer>,
+}
+
+/// An MCP card's lasting answers: the server, the tool, and the fingerprint
+/// of the server's user-level entry as the card was raised
+/// (`mcp::trust::fingerprint`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustOffer {
+    pub server: String,
+    pub tool: String,
+    pub config: String,
 }
 
 /// An MCP card shows a string argument up to this long, a longer one (a
@@ -99,15 +110,44 @@ pub fn mcp_class(t: &crate::mcp::McpToolInfo) -> McpClass {
 const READ_VERBS: &[&str] =
     &["get", "list", "search", "read", "fetch", "describe", "query", "show", "find", "count", "view", "lookup", "check"];
 
+/// Words that, anywhere after the read verb, make the name a compound that
+/// may write (`get_or_create_issue`, `fetchAndDelete`).
+const NOT_A_READ: &[&str] = &[
+    "and", "or", "then", "delete", "remove", "update", "set", "create", "write", "put", "post", "patch", "modify", "purge",
+    "drop", "insert", "upsert", "merge", "move", "rename", "send", "publish", "push", "apply", "run", "exec",
+];
+
 /// Whether a server's tool name starts with a read verb followed by `_`,
-/// `-` or a camelCase capital: `get_report`, `list-items`, `searchCode`,
-/// but not `search`, `checkout_branch` or `budget_get`.
+/// `-` or a camelCase capital (`get_report`, `list-items`, `searchCode`)
+/// and no later word joins or names a write ([`NOT_A_READ`]); `check_in`
+/// and `checkOut` aren't reads. Not `search`, `checkout_branch` or
+/// `budget_get` either.
 pub fn read_verb_name(name: &str) -> bool {
     READ_VERBS.iter().any(|verb| {
-        name.strip_prefix(*verb)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|c| c == '_' || c == '-' || c.is_ascii_uppercase())
+        let Some(rest) = name.strip_prefix(*verb) else { return false };
+        if !rest.chars().next().is_some_and(|c| c == '_' || c == '-' || c.is_ascii_uppercase()) {
+            return false;
+        }
+        let words = name_words(rest);
+        let checks_in_or_out = *verb == "check" && words.first().is_some_and(|w| w == "in" || w == "out");
+        !checks_in_or_out && !words.iter().any(|w| NOT_A_READ.contains(&w.as_str()))
     })
+}
+
+/// A tool name's words, lowercase, split at anything not a letter or digit
+/// and before each capital (`OrCreate_x` → `or`, `create`, `x`).
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = vec![String::new()];
+    for c in name.chars() {
+        if !c.is_ascii_alphanumeric() || c.is_ascii_uppercase() {
+            words.push(String::new());
+        }
+        if let (true, Some(word)) = (c.is_ascii_alphanumeric(), words.last_mut()) {
+            word.push(c.to_ascii_lowercase());
+        }
+    }
+    words.retain(|w| !w.is_empty());
+    words
 }
 
 /// The MCP tools a turn discovered, by namespaced name: the server, its own
@@ -128,17 +168,18 @@ impl McpTools {
     /// lets a [`McpClass::Reads`] tool run, and a trusted one (`trust`, read
     /// at the call); Plan only and Ask first skip only `readOnlyHint` tools,
     /// whatever the trust. A tool the turn didn't discover asks.
-    pub fn card(&self, label: Option<&str>, name: &str, input: &Value, mode: Mode, trust: &[McpTrust]) -> Option<ToolCard> {
+    pub fn card(&self, label: Option<&str>, name: &str, input: &Value, mode: Mode, trust: &TrustView) -> Option<ToolCard> {
         let Some((server, tool, class)) = self.0.get(name) else { return Some(mcp_card(label, name, input, false)) };
         let edit = mode == Mode::Edit;
         let asks = match class {
             McpClass::ReadOnly => false,
             McpClass::Destructive => true,
             McpClass::Reads => !edit,
-            McpClass::Writes => !(edit && crate::mcp::trust::covers(trust, server, tool)),
+            McpClass::Writes => !(edit && trust.covers(server, tool)),
         };
         let destructive = *class == McpClass::Destructive;
-        let offer = (edit && !destructive).then(|| (server.clone(), tool.clone()));
+        let offer = (edit && !destructive).then(|| trust.offer(server)).flatten();
+        let offer = offer.map(|config| TrustOffer { server: server.clone(), tool: tool.clone(), config: config.to_string() });
         asks.then(|| ToolCard { trust: offer, ..mcp_card(label, name, input, destructive) })
     }
 }
@@ -149,7 +190,7 @@ impl McpTools {
 pub struct McpCheck<'a> {
     pub tools: &'a McpTools,
     pub mode: Mode,
-    pub trust: &'a (dyn Fn() -> Vec<McpTrust> + Sync),
+    pub trust: &'a (dyn Fn() -> TrustView + Sync),
 }
 
 /// An MCP call's arguments as its card shows them: JSON, with each long
@@ -1220,6 +1261,8 @@ mod tests {
         assert_eq!(project_root(&db, "missing"), None);
     }
 
+    use crate::mcp::trust::McpTrust;
+
     /// A tool as its server lists it, with `readOnlyHint` and `destructiveHint`.
     fn tool(server: &str, name: &str, read_only: Option<bool>, destructive: Option<bool>) -> crate::mcp::McpToolInfo {
         crate::mcp::McpToolInfo {
@@ -1233,8 +1276,20 @@ mod tests {
         }
     }
 
-    fn no_trust() -> Vec<McpTrust> {
-        Vec::new()
+    fn no_trust() -> TrustView {
+        TrustView::default()
+    }
+
+    /// The user-level entries of servers `s` and `sample-server`, and a view
+    /// of `entries` against them.
+    fn users() -> std::collections::HashMap<String, crate::mcp::McpServerConfig> {
+        ["s", "sample-server"].iter().map(|n| (n.to_string(), crate::mcp::McpServerConfig { command: format!("{n}-cmd"), ..Default::default() })).collect()
+    }
+
+    fn trusting(all: bool, tools: &[&str]) -> TrustView {
+        let config = crate::mcp::trust::fingerprint(&users()["s"]);
+        let entry = McpTrust { server: "s".into(), config, all, tools: tools.iter().map(|t| t.to_string()).collect() };
+        TrustView::from_configs(vec![entry], &users(), &Default::default())
     }
 
     #[test]
@@ -1247,7 +1302,7 @@ mod tests {
         assert_eq!((c.kind, c.shown.as_str()), (CardKind::Mcp, "mcp__github__merge_pr {\"number\":7}"));
         assert!(c.reason.starts_with("MCP tool `mcp__github__merge_pr` may change external state"));
         assert!(c.kind.grantable(), "the thread's \"don't ask again\" may answer it");
-        assert_eq!(c.trust, Some(("github".to_string(), "merge_pr".to_string())), "Edit freely offers to trust it");
+        assert_eq!(c.trust, None, "no user-level entry for github: nothing to trust");
         assert!(director_card("mcp__other__thing", &json!({}), &mcp, &reach, false).is_some(), "an undiscovered tool asks");
         for (name, input) in [("mcp__github__get_issue", json!({"number": 7})), ("read_file", json!({"path": "a.txt"}))] {
             assert_eq!(director_card(name, &input, &mcp, &reach, false), None, "{name}");
@@ -1264,12 +1319,14 @@ mod tests {
             tool("s", "sync", None, Some(false)),
             tool("s", "wipe", Some(true), Some(true)),
         ]);
-        let asks = |name: &str, trust: &[McpTrust]| tools.card(None, &format!("mcp__s__{name}"), &json!({}), Mode::Edit, trust);
-        assert_eq!(asks("get_x", &[]), None, "a get_ tool without hints runs with no card");
-        assert!(asks("delete_x", &[]).is_some(), "a delete_ tool asks");
-        assert!(asks("get_z", &[]).is_some(), "readOnlyHint: false is the server's word, whatever the name");
-        assert_eq!(asks("sync", &[]), None, "destructiveHint: false runs");
-        let all = vec![McpTrust { server: "s".into(), all: true, tools: vec!["get_y".into()] }];
+        let asks = |name: &str, trust: &TrustView| tools.card(None, &format!("mcp__s__{name}"), &json!({}), Mode::Edit, trust);
+        let none = trusting(false, &[]);
+        assert_eq!(asks("get_x", &none), None, "a get_ tool without hints runs with no card");
+        let c = asks("delete_x", &none).expect("a delete_ tool asks");
+        assert_eq!(c.trust.map(|o| (o.server, o.tool)), Some(("s".to_string(), "delete_x".to_string())), "Edit freely offers to trust it");
+        assert!(asks("get_z", &none).is_some(), "readOnlyHint: false is the server's word, whatever the name");
+        assert_eq!(asks("sync", &none), None, "destructiveHint: false runs");
+        let all = trusting(true, &["get_y"]);
         for name in ["get_y", "wipe"] {
             let c = asks(name, &all).expect("destructiveHint: true asks, even with a get_ name or trust");
             assert!(c.reason.contains("its server marks it destructive") && c.trust.is_none(), "{c:?}");
@@ -1278,11 +1335,30 @@ mod tests {
     }
 
     #[test]
-    fn a_read_verb_needs_a_separator_or_a_capital() {
-        for name in ["get_report", "list-items", "searchCode", "lookup_user", "check_status", "countRows"] {
+    fn trust_is_never_offered_or_applied_for_a_name_a_project_defines() {
+        let tools = McpTools::new(&[tool("s", "post_x", None, None)]);
+        let config = crate::mcp::trust::fingerprint(&users()["s"]);
+        let entry = McpTrust { server: "s".into(), config, all: true, tools: vec![] };
+        let project: std::collections::HashMap<String, crate::mcp::McpServerConfig> = [("s".to_string(), Default::default())].into();
+        let shadowed = TrustView::from_configs(vec![entry], &users(), &project);
+        let c = tools.card(None, "mcp__s__post_x", &json!({}), Mode::Edit, &shadowed).expect("the project's server asks");
+        assert!(c.trust.is_none(), "and its card offers no lasting answer");
+    }
+
+    #[test]
+    fn a_read_verb_needs_a_separator_or_a_capital_and_no_write_after_it() {
+        for name in ["get_report", "list-items", "searchCode", "lookup_user", "check_status", "countRows", "get_settings", "list_orders"] {
             assert!(read_verb_name(name), "{name}");
         }
-        for name in ["search", "getaway", "checkout_branch", "budget_get", "Get_report", "create_report"] {
+        let not_reads = [
+            "search", "getaway", "checkout_branch", "budget_get", "Get_report", "create_report",
+            // Compounds that write, and check-in/out.
+            "get_or_create_issue", "getOrCreateUser", "fetch_and_delete", "list_then_purge", "read_and_update_cache",
+            "find_and_replace_or_insert", "query_exec", "show_and_send", "lookup_then_remove", "get_and_set_flag",
+            "view-and-post", "count_and_drop", "search_upsert", "describe_merge", "fetch_push", "read_write_file",
+            "check_in", "checkIn", "check-out-member", "checkOut", "check_in_guest",
+        ];
+        for name in not_reads {
             assert!(!read_verb_name(name), "{name}");
         }
     }
@@ -1290,7 +1366,7 @@ mod tests {
     #[test]
     fn plan_only_and_ask_first_ignore_trust() {
         let tools = McpTools::new(&[tool("s", "get_x", None, None), tool("s", "post_x", None, None), tool("s", "read_y", Some(true), None)]);
-        let trust = vec![McpTrust { server: "s".into(), all: true, tools: vec!["post_x".into()] }];
+        let trust = trusting(true, &["post_x"]);
         for mode in [Mode::Ask, Mode::Plan] {
             for name in ["mcp__s__get_x", "mcp__s__post_x"] {
                 let c = tools.card(None, name, &json!({}), mode, &trust).unwrap_or_else(|| panic!("{name} asks in {mode:?}"));
@@ -1315,16 +1391,18 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db = parking_lot::Mutex::new(crate::db::Db::open(tmp.path()).unwrap());
         let tools = McpTools::new(&[tool("sample-server", "post_report", None, None)]);
-        let trust = || crate::mcp::trust::load(&db.lock());
+        let users = users();
+        let trust = || TrustView::from_configs(crate::mcp::trust::load(&db.lock()), &users, &Default::default());
         // The check names no conversation: trust from one card holds in all.
         let mcp = McpCheck { tools: &tools, mode: Mode::Edit, trust: &trust };
         let call = || director_card("mcp__sample-server__post_report", &json!({}), &mcp, &reach, false);
-        assert!(call().is_some());
-        crate::mcp::trust::grant(&db.lock(), "sample-server", Some("post_report")).unwrap();
+        let offer = call().and_then(|c| c.trust).expect("a card that offers trust");
+        assert_eq!(offer.config, crate::mcp::trust::fingerprint(&users["sample-server"]));
+        crate::mcp::trust::grant(&db.lock(), "sample-server", &offer.config, Some("post_report")).unwrap();
         assert_eq!(call(), None, "trusted: no card");
         crate::mcp::trust::revoke(&db.lock(), "sample-server", Some("post_report")).unwrap();
         assert!(call().is_some(), "revoked: the very next call asks");
-        crate::mcp::trust::grant(&db.lock(), "sample-server", None).unwrap();
+        crate::mcp::trust::grant(&db.lock(), "sample-server", &offer.config, None).unwrap();
         assert_eq!(call(), None, "the whole server trusted");
         crate::mcp::trust::revoke(&db.lock(), "sample-server", None).unwrap();
         assert!(call().is_some());

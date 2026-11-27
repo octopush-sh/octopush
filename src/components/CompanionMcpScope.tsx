@@ -8,6 +8,7 @@ import { CompanionCatalogCounts, useTalkCatalog } from "./CompanionCatalog";
 
 // Stable empties so the selectors never hand React a fresh array per render.
 const NO_STATUS: McpServerStatus[] = [];
+const NO_TRUST: McpTrust[] = [];
 const NONE_OFF: string[] = [];
 
 const EASE = "transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)]";
@@ -16,7 +17,7 @@ const EASE = "transition-colors duration-[var(--dur-quick)] ease-[var(--ease-oct
 export function trustTitle(t: McpTrust | undefined): string {
   if (!t) return "";
   const what = [t.all ? "every tool" : "", t.tools.length ? t.tools.join(", ") : ""].filter(Boolean).join(" and ");
-  return ` · runs ${what} without asking in Edit freely (Settings › Integrations revokes it)`;
+  return ` · runs ${what} without asking in Edit freely; one it marks destructive still asks (Settings › Integrations revokes it)`;
 }
 
 /** A chip's tooltip: the server, what Talk knows about it, what the user
@@ -51,7 +52,7 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
   const streaming = useChatStore((s) => s.streamingByWs[workspaceId] ?? false);
   const status = useMcpScopeStore((s) => (worktreePath ? s.statusByPath[worktreePath] : undefined) ?? NO_STATUS);
   const loadedOff = useMcpScopeStore((s) => (threadId ? s.offByThread[threadId] : undefined));
-  const trust = useMcpScopeStore((s) => s.trust);
+  const trust = useMcpScopeStore((s) => (worktreePath ? s.trustByPath[worktreePath] : undefined) ?? NO_TRUST);
   const [tick, setTick] = useState(0);
 
   useEffect(() => {
@@ -72,7 +73,7 @@ function useMcpScope(worktreePath: string | undefined, workspaceId: string) {
 
   useEffect(() => {
     if (worktreePath) void useMcpScopeStore.getState().loadStatus(worktreePath);
-    void useMcpScopeStore.getState().loadTrust();
+    if (worktreePath) void useMcpScopeStore.getState().loadTrust(worktreePath);
   }, [worktreePath, threadId, streaming, tick]);
 
   useEffect(() => {

@@ -25,7 +25,7 @@ export const talkMcp: Scenario = {
   commands: {
     ...defaultScenario.commands,
     list_mcp_server_status: STATUS,
-    list_mcp_trust: [{ server: "docs-server", all: false, tools: ["search_docs"] }],
+    list_mcp_trust: [{ server: "docs-server", config: "demo", all: false, tools: ["search_docs"] }],
     get_thread_mcp_disabled: (a) => off[String(a.threadId)] ?? [],
     set_thread_mcp_server: (a) => {
       const t = String(a.threadId);
