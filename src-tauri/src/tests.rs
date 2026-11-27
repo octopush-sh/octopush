@@ -342,6 +342,23 @@ mod workspace_tests {
     }
 
     #[test]
+    fn skill_shell_off_is_per_project_and_off_by_default() {
+        // #1188: "Don't run skill shell commands in crews".
+        let db = test_db();
+        setup_workspace(&db, "a", "wa");
+        setup_workspace(&db, "b", "wb");
+        assert!(!db.get_project_skill_shell_off("a").unwrap());
+        assert!(!db.workspace_skill_shell_off("wa").unwrap());
+        db.set_project_skill_shell_off("a", true).unwrap();
+        assert!(db.workspace_skill_shell_off("wa").unwrap());
+        assert!(!db.workspace_skill_shell_off("wb").unwrap(), "another project keeps its own");
+        assert!(!db.workspace_skill_shell_off("no-such-workspace").unwrap());
+        assert!(!db.get_project_skill_shell_off("no-such-project").unwrap());
+        db.set_project_skill_shell_off("a", false).unwrap();
+        assert!(!db.workspace_skill_shell_off("wa").unwrap());
+    }
+
+    #[test]
     fn count_started_runs_excludes_drafts_and_counts_started() {
         // Guards the free-tier Direct-runs meter/quota: only runs that have
         // *left* `draft` (i.e. were started) this month are counted.
@@ -12129,6 +12146,45 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn a_project_that_turned_skill_shell_off_adds_the_key_to_every_claude_stage() {
+        use crate::orchestrator::cli_runner::{
+            confine_reads_in_sandbox, disable_skill_shell, turn_off_inner_sandbox, CliDialect, CodexWriteScope,
+        };
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #1188: the settings key, beside the guards and the inner-sandbox
+        // override, fresh and resumed, in every isolation.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        for (git, exec) in [("worktree", "sandbox"), ("readonly", "none"), ("worktree", "none")] {
+            let iso = stage_isolation(git, exec, "/ws");
+            for off in [true, false] {
+                for mut args in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, true)] {
+                    let reads = confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args);
+                    let wrapped = turn_off_inner_sandbox(CliDialect::Claude, &iso.exec_isolation, &mut args);
+                    assert_eq!(disable_skill_shell(CliDialect::Claude, off, &mut args), off);
+                    let v = settings(&args);
+                    assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true));
+                    assert_eq!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some(), reads);
+                    assert_eq!(v.get("sandbox").is_some(), wrapped);
+                    if off {
+                        assert_eq!(v["disableSkillShellExecution"], serde_json::json!(true), "{git}/{exec}: {args:?}");
+                    } else {
+                        assert!(v.get("disableSkillShellExecution").is_none(), "off by default: {args:?}");
+                    }
+                    assert!(!args.iter().any(|a| a.contains("PreSkillShellCommand")), "never the hook: {args:?}");
+                }
+            }
+        }
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox, "/ws");
+        let mut same = codex.clone();
+        assert!(!disable_skill_shell(CliDialect::Codex, true, &mut same));
+        assert_eq!(same, codex);
+    }
+
+    #[test]
     fn claude_codes_sandbox_is_off_refusal_is_named_and_not_escalated() {
         use crate::orchestrator::cli_runner::{
             is_inner_sandbox_off, is_plan_limit, name_inner_sandbox_off, parse_cli_result, CliDialect,
@@ -18221,6 +18277,74 @@ mod transcript_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn ingest_prices_fast_fable_5_2_turns_at_16_80_and_leaves_fast_sonnet_unpriced() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/Users/dev/fast-fable";
+        let session = "aaaaaaaa-0000-4000-8000-000000000052";
+        session_on(&db.lock(), "sess-fast-f52", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let turn = |n: u32, model: &str, usage: serde_json::Value| {
+            serde_json::json!({
+                "type": "assistant", "uuid": format!("00000000-0000-4000-8000-00000000052{n}"), "parentUuid": null,
+                "sessionId": session, "timestamp": format!("2026-11-26T09:0{n}:00.000Z"), "cwd": cwd,
+                "isSidechain": false, "version": "2.1.332", "userType": "external", "entrypoint": "cli",
+                "requestId": format!("req_f52_fast_{n}"),
+                "message": {"id": format!("msg_f52_fast_{n}"), "type": "message", "role": "assistant", "model": model,
+                    "stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}], "usage": usage},
+            })
+            .to_string()
+        };
+        let lines = [
+            // Fable 5.2 fast, 5-minute writes.
+            turn(1, "claude-fable-5-2", serde_json::json!({"input_tokens": 1000, "output_tokens": 2000,
+                "cache_read_input_tokens": 10000, "cache_creation_input_tokens": 4000, "speed": "fast"})),
+            // Fable 5.2 fast, 1-hour writes.
+            turn(2, "claude-fable-5-2", serde_json::json!({"input_tokens": 500, "output_tokens": 1000,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 2000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 2000}, "speed": "fast"})),
+            // Sonnet 5.5 has no fast rate.
+            turn(3, "claude-sonnet-5-5", serde_json::json!({"input_tokens": 100, "output_tokens": 100, "speed": "fast"})),
+        ];
+        std::fs::write(pdir.join(format!("{session}.jsonl")), lines.join("\n") + "\n").unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 3);
+
+        let row = |key: &str| -> (f64, String, Option<String>) {
+            db.lock()
+                .conn_ref()
+                .query_row(
+                    "SELECT cost_usd, cost_basis, speed FROM spend_events WHERE idempotency_key = ?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 1K in × $16 + 2K out × $80 + 10K hits × $0.40 + 4K 5-minute writes × $20.
+        let (c1, basis, speed) = row("cc:req_f52_fast_1");
+        assert!(near(c1, (1_000.0 * 16.0 + 2_000.0 * 80.0 + 10_000.0 * 0.40 + 4_000.0 * 20.0) / 1e6), "{c1}");
+        assert_eq!((basis.as_str(), speed.as_deref()), ("computed", Some("fast")));
+        // 500 in × $16 + 1K out × $80 + 2K 1-hour writes × $32.
+        let (c2, basis, _) = row("cc:req_f52_fast_2");
+        assert!(near(c2, (500.0 * 16.0 + 1_000.0 * 80.0 + 2_000.0 * 32.0) / 1e6), "{c2}");
+        assert_eq!(basis, "computed");
+        // Fast Sonnet stays unpriced, never the standard rate.
+        assert_eq!(row("cc:req_f52_fast_3"), (0.0, "unpriced".to_string(), Some("fast".to_string())));
+
+        // The re-pricer keeps the fast rate, and the spend counts in the report.
+        crate::commands::reprice_ledger(&db).unwrap();
+        assert!(near(row("cc:req_f52_fast_1").0, c1) && near(row("cc:req_f52_fast_2").0, c2));
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.unpriced_calls, 1);
+        assert!((rep.totals.cost_usd - (c1 + c2)).abs() < 1e-9, "{} vs {}", rep.totals.cost_usd, c1 + c2);
+    }
+
+    #[test]
     fn ledger_ids_carry_both_the_request_id_and_the_message_id() {
         // A RUN row keyed on the request id, whose message id was recorded
         // beside it; a row keyed on the message id alone; a row of another
@@ -19039,7 +19163,7 @@ mod pricing_table_tests {
     }
 
     #[test]
-    fn fast_mode_prices_opus_5_and_4_8_at_twice_standard_and_nothing_else() {
+    fn fast_mode_prices_opus_5_4_8_and_fable_mythos_5_2_at_twice_standard_and_nothing_else() {
         use crate::token_engine::{fast_prices, is_fast, prices_at_speed, usage_speed};
         let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // Fast-mode docs (2026-11-03): $10/$50 per MTok, cache multipliers on top.
@@ -19048,6 +19172,20 @@ mod pricing_table_tests {
             assert!(near(fast.input_per_m, 10.0) && near(fast.output_per_m, 50.0), "{model}: {fast:?}");
             assert!(near(fast.cache_creation_per_m, 12.50) && near(fast.cache_read_per_m, 1.0), "{model}: {fast:?}");
             assert!(near(fast.cache_creation_1h_per_m, 20.0), "{model}: {fast:?}");
+        }
+        // Fable 5.2 and Mythos 5.2 (fast-mode and pricing pages, 2026-11-26):
+        // $16/$80, 2× their $8/$40, cache multipliers on top.
+        for model in [
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "claude-fable-5-2-20261101",
+            "us.anthropic.claude-fable-5-2-v1:0",
+            "anthropic/claude-mythos-5-2",
+        ] {
+            let fast = fast_prices(model, builtin_prices(model).unwrap()).unwrap_or_else(|| panic!("{model} has no fast rate"));
+            assert!(near(fast.input_per_m, 16.0) && near(fast.output_per_m, 80.0), "{model}: {fast:?}");
+            assert!(near(fast.cache_creation_per_m, 20.0) && near(fast.cache_read_per_m, 0.40), "{model}: {fast:?}");
+            assert!(near(fast.cache_creation_1h_per_m, 32.0), "{model}: {fast:?}");
         }
         // A user-edited base price scales.
         let mut edited = builtin_prices("claude-opus-5").unwrap();

@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import { repoHooksItems, repoHooksLine } from "./repoHooks";
 import type { RepoHooksNotice } from "./ipc";
 
-const notice = (hooks: RepoHooksNotice["hooks"], servers: RepoHooksNotice["servers"]): RepoHooksNotice => ({ hooks, servers, hash: "h" });
+const notice = (
+  hooks: RepoHooksNotice["hooks"],
+  servers: RepoHooksNotice["servers"],
+  skillShells: RepoHooksNotice["skillShells"] = [],
+): RepoHooksNotice => ({ hooks, servers, skillShells, hash: "h" });
 
 describe("repoHooksLine", () => {
   it("counts hooks, the status line and servers", () => {
@@ -19,6 +23,14 @@ describe("repoHooksLine", () => {
       "This repo's own Claude Code config runs a status line, and it runs inside the sandbox.",
     );
   });
+
+  it("counts skill shell commands", () => {
+    const one = [{ skill: "deploy", command: "git status" }];
+    expect(repoHooksLine(notice([], [], one), false)).toBe("This repo's own Claude Code config runs 1 skill shell command.");
+    expect(
+      repoHooksLine(notice([{ event: "Stop", matcher: null, kind: "command", runs: "a" }], [{ name: "db", runs: "x" }], [...one, ...one]), false),
+    ).toBe("This repo's own Claude Code config runs 1 hook, 1 MCP server and 2 skill shell commands.");
+  });
 });
 
 describe("repoHooksItems", () => {
@@ -32,5 +44,19 @@ describe("repoHooksItems", () => {
         [{ name: "db", runs: "npx -y db-mcp" }],
       )),
     ).toEqual(["PostToolUse · linter · lint_file", "PreToolUse Bash · ./guard.sh", "MCP db · npx -y db-mcp"]);
+  });
+
+  it("lists skill shell commands as running when the skill loads, after the rest", () => {
+    expect(
+      repoHooksItems(notice(
+        [],
+        [{ name: "db", runs: "npx db" }],
+        [{ skill: "deploy", command: "git status --short" }, { skill: "db/reset", command: "dropdb app\ncreatedb app" }],
+      )),
+    ).toEqual([
+      "MCP db · npx db",
+      "Runs as the skill loads · /deploy · git status --short",
+      "Runs as the skill loads · /db/reset · dropdb app; createdb app",
+    ]);
   });
 });
