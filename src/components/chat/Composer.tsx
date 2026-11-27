@@ -314,6 +314,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   // another diff or folder stat (#1046); `estimateGenRef` drops answers that
   // land after a send or a workspace switch.
   const [tokensByToken, setTokensByToken] = useState<Record<string, number>>({});
+  /** Why a resolved block can't be included (a named pipe, #1190), by token. */
+  const [missingByToken, setMissingByToken] = useState<Record<string, string>>({});
   const inFlightRef = useRef(new Set<string>());
   const liveTokensRef = useRef(new Set<string>());
   const estimateGenRef = useRef(0);
@@ -341,6 +343,14 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           ...prev,
           ...Object.fromEntries(live.map((b) => [b.ref.token, blockTokens(b.text)])),
         }));
+        setMissingByToken((prev) => {
+          const next = { ...prev };
+          for (const b of live) {
+            if (b.missing) next[b.ref.token] = b.missing;
+            else delete next[b.ref.token];
+          }
+          return next;
+        });
       });
     }, 250);
     return () => clearTimeout(t);
@@ -350,6 +360,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     estimateGenRef.current++;
     inFlightRef.current = new Set();
     setTokensByToken({});
+    setMissingByToken({});
   }
 
   // A message whose blocks the secret guard flagged waits here for the
@@ -884,7 +895,13 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           attachments={attachments}
           onRemove={(i) => removeAttachment(workspaceId, i)}
         />
-        <ContextChips refs={contextRefs} tokensByToken={tokensByToken} onRemove={removeContext} over={contextOver} />
+        <ContextChips
+          refs={contextRefs}
+          tokensByToken={tokensByToken}
+          missingByToken={missingByToken}
+          onRemove={removeContext}
+          over={contextOver}
+        />
         {mention && (
           <MentionPopover
             heading="Add context"

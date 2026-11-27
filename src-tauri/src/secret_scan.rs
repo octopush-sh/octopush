@@ -691,12 +691,15 @@ pub fn is_sensitive_name(path: &str) -> bool {
     is_env_file(path) || sensitive_file(path).is_some()
 }
 
-/// A project MCP config: Claude Code's `.mcp.json` or `.claude/mcp.json`,
-/// Cursor's `.cursor/mcp.json`, VS Code's `.vscode/mcp.json`.
+/// The project MCP configs: Claude Code's `.mcp.json` and
+/// `.claude/mcp.json`, Cursor's `.cursor/mcp.json`, VS Code's
+/// `.vscode/mcp.json`. Talk's guard reads the same list as places that run
+/// code (`talk_guard`, #1229).
+pub(crate) const MCP_CONFIG_FILES: &[&str] = &[".mcp.json", ".claude/mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"];
+
+/// Whether `path` is a project MCP config ([`MCP_CONFIG_FILES`]).
 fn is_mcp_config(path: &str) -> bool {
-    [".mcp.json", ".claude/mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"]
-        .iter()
-        .any(|f| path == *f || path.ends_with(&format!("/{f}")))
+    MCP_CONFIG_FILES.iter().any(|f| path == *f || path.ends_with(&format!("/{f}")))
 }
 
 /// The zip local-file signature: a Keynote document (`.key`) starts with it.
@@ -1041,13 +1044,11 @@ fn new_side(repo: &Repository, path: &str, id: Oid, limit: usize) -> NewSide {
     if !meta.is_file() {
         return NewSide::Missing;
     }
-    if meta.len() > limit as u64 {
-        return NewSide::TooLarge;
-    }
-    match std::fs::read(&p) {
-        // It may have grown since the metadata was read.
-        Ok(bytes) if bytes.len() > limit => NewSide::TooLarge,
-        Ok(bytes) => NewSide::Read(bytes),
+    // Checked again by the open handle: a pipe swapped in since can't hang
+    // the scan (#1190).
+    match crate::fs_safe::read_regular(&p, limit as u64) {
+        Ok(crate::fs_safe::Capped::Read { bytes, .. }) => NewSide::Read(bytes),
+        Ok(crate::fs_safe::Capped::TooLarge { .. }) => NewSide::TooLarge,
         Err(_) => NewSide::Missing,
     }
 }
@@ -1089,9 +1090,8 @@ fn worktree_starts_like_zip(repo: &Repository, path: &str, size: Option<u64>) ->
         return false;
     }
     let mut head = [0u8; 4];
-    std::fs::File::open(&p)
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
-        .is_ok_and(|()| &head == ZIP_MAGIC)
+    crate::fs_safe::open_regular(&p)
+        .is_ok_and(|(mut f, _)| std::io::Read::read_exact(&mut f, &mut head).is_ok() && &head == ZIP_MAGIC)
 }
 
 /// Every hit in `files`, uncapped (the fingerprint covers all of them).

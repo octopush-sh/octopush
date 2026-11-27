@@ -6,7 +6,7 @@
 //! out the servers a conversation switched off, and the status read spawns
 //! nothing.
 
-use super::{load_server_configs, sort_tools, sorted_server_configs, McpRegistry, McpToolInfo};
+use super::{load_server_configs, sort_tools, sorted_server_configs, McpRegistry, McpServerConfig, McpToolInfo};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -64,12 +64,48 @@ impl McpRegistry {
         out
     }
 
+    /// The tools of only the servers in `only` (a Direct stage's choice), in
+    /// [`sort_tools`] order, and why each chosen server gave none: it isn't
+    /// in `pinned` (the run's Settings servers, fixed when it was created),
+    /// or it failed to start (the reason redacted as every start failure
+    /// is). Reads no file, so no `.claude/mcp.json` can add or redefine a
+    /// server here. The other servers are never started.
+    pub fn list_tools_of(
+        &self,
+        pinned: &HashMap<String, McpServerConfig>,
+        only: &[String],
+    ) -> (Vec<McpToolInfo>, Vec<(String, String)>) {
+        let mut out = Vec::new();
+        let mut missing = Vec::new();
+        let mut wanted: Vec<&String> = only.iter().collect();
+        wanted.sort();
+        wanted.dedup();
+        for name in wanted {
+            let Some(cfg) = pinned.get(name) else {
+                let why = "it isn't among the Settings servers pinned when this run was created";
+                missing.push((name.clone(), why.to_string()));
+                continue;
+            };
+            match self.ensure(name, cfg) {
+                Ok((conn, _)) => out.extend(conn.lock().tools.clone()),
+                Err(e) => missing.push((name.clone(), e.trim().lines().next().unwrap_or("").trim().to_string())),
+            }
+        }
+        sort_tools(&mut out);
+        (out, missing)
+    }
+
     /// Every server configured for `worktree` (project ∪ user), sorted, with
     /// what this session knows about it. Reads the registry only: it spawns
     /// nothing, and takes one registry lock at a time and never a
     /// connection's own lock (a call in flight can hold that for a minute).
     pub fn status(&self, worktree: &Path) -> Vec<McpServerStatus> {
-        let cfgs = load_server_configs(worktree);
+        self.status_of(&load_server_configs(worktree))
+    }
+
+    /// [`Self::status`] of the servers in `cfgs` (Settings' own, for a
+    /// Direct stage's chips).
+    pub fn status_of(&self, cfgs: &HashMap<String, McpServerConfig>) -> Vec<McpServerStatus> {
         let mut names: Vec<&String> = cfgs.keys().collect();
         names.sort();
         // A connection or failure counts only for the config on disk now: one
@@ -207,6 +243,31 @@ done
     }
 
     #[test]
+    fn a_stage_gets_only_the_servers_it_chose() {
+        let wt = tempfile::tempdir().unwrap();
+        four_servers(wt.path());
+        // The run's pinned servers: three of the four. `zeta` is defined by
+        // the worktree's `.claude/mcp.json` only.
+        let mut pinned = crate::mcp::project_config(wt.path());
+        pinned.remove("zeta");
+        let reg = McpRegistry::new();
+        let chosen = vec!["mid".to_string(), "gone".to_string(), "alpha".to_string(), "zeta".to_string()];
+        let (tools, missing) = reg.list_tools_of(&pinned, &chosen);
+        let servers: HashSet<&str> = tools.iter().map(|t| t.server.as_str()).collect();
+        assert_eq!(servers, ["alpha", "mid"].into());
+        assert_eq!(tools.len(), 6);
+        let missing: Vec<&str> = missing.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(missing, ["gone", "zeta"], "a server the worktree's file defines is never used");
+        // The servers it didn't choose, or that weren't pinned, were never started.
+        for name in ["beta", "zeta"] {
+            assert_eq!(of(&reg.status(wt.path()), name).state, McpServerState::Idle);
+        }
+        // No choice, no tools and nothing started.
+        let (none, missing) = reg.list_tools_of(&pinned, &[]);
+        assert!(none.is_empty() && missing.is_empty());
+    }
+
+    #[test]
     fn two_rebuilds_send_byte_identical_tool_json() {
         use crate::providers::{LlmContent, LlmMessage, LlmRequest, LlmRole};
         let wt = tempfile::tempdir().unwrap();
@@ -223,6 +284,7 @@ done
                 tool_choice: None,
                 effort: None,
                 cache: true,
+                cache_key: None,
             };
             (
                 crate::providers::anthropic::build_request(&req)["tools"].to_string(),
@@ -257,7 +319,7 @@ done
             namespaced: format!("mcp__{server}__{name}"),
             description: String::new(),
             input_schema: serde_json::json!({}),
-            read_only: false,
+            ..Default::default()
         };
         let mut a = vec![tool("b", "z"), tool("a", "y"), tool("b", "a"), tool("a", "b")];
         let mut b = vec![tool("a", "b"), tool("b", "a"), tool("b", "z"), tool("a", "y")];

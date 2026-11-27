@@ -342,6 +342,23 @@ mod workspace_tests {
     }
 
     #[test]
+    fn skill_shell_off_is_per_project_and_off_by_default() {
+        // #1188: "Don't run skill shell commands in crews".
+        let db = test_db();
+        setup_workspace(&db, "a", "wa");
+        setup_workspace(&db, "b", "wb");
+        assert!(!db.get_project_skill_shell_off("a").unwrap());
+        assert!(!db.workspace_skill_shell_off("wa").unwrap());
+        db.set_project_skill_shell_off("a", true).unwrap();
+        assert!(db.workspace_skill_shell_off("wa").unwrap());
+        assert!(!db.workspace_skill_shell_off("wb").unwrap(), "another project keeps its own");
+        assert!(!db.workspace_skill_shell_off("no-such-workspace").unwrap());
+        assert!(!db.get_project_skill_shell_off("no-such-project").unwrap());
+        db.set_project_skill_shell_off("a", false).unwrap();
+        assert!(!db.workspace_skill_shell_off("wa").unwrap());
+    }
+
+    #[test]
     fn count_started_runs_excludes_drafts_and_counts_started() {
         // Guards the free-tier Direct-runs meter/quota: only runs that have
         // *left* `draft` (i.e. were started) this month are counted.
@@ -895,7 +912,7 @@ mod workspace_tests {
             loop_mode: None, max_iterations: 30, pos_x: Some(10.0), pos_y: Some(20.0),
             parents: vec![], tools: Some(vec!["read_file".into(), "list_files".into()]),
             custom_name: Some("The Plan".into()), instructions: Some("be terse".into()),
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = a.save_pipeline(None, "My Pipe", "d", &[draft.clone()]).unwrap();
         let synced = a.list_custom_pipelines_for_sync().unwrap();
@@ -925,7 +942,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = db.save_pipeline(None, "Local Newer", "d", &[draft.clone()]).unwrap();
         // A pulled copy stamped in the past must be skipped…
@@ -988,7 +1005,7 @@ mod workspace_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let pid = db.save_pipeline(None, "P", "d", &[draft.clone()]).unwrap();
         let (t1, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
@@ -996,6 +1013,54 @@ mod workspace_tests {
         db.save_pipeline(Some(pid.clone()), "P2", "d", &[draft]).unwrap();
         let (t2, _) = db.pipeline_sync_state(&pid).unwrap().unwrap();
         assert!(t2 > t1, "an edit must move the LWW stamp forward");
+    }
+
+    #[test]
+    fn a_stages_mcp_servers_reach_its_runs_and_sync_but_never_a_crew_file() {
+        // #1134: saved on the stage, copied to the run, carried by library
+        // sync; a crew file neither carries them nor sets them on import.
+        let a = test_db();
+        a.seed_builtin_pipelines().unwrap();
+        setup_workspace(&a, "p1", "ws1");
+        let draft = crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m1".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None, escalate_model: None, escalate_effort: None,
+            mcp_servers: vec![" tracker ".into(), "docs".into(), "tracker".into(), "".into()],
+        };
+        let pid = a.save_pipeline(None, "With MCP", "d", &[draft.clone()]).unwrap();
+        let both = vec!["docs".to_string(), "tracker".to_string()];
+        assert_eq!(a.get_pipeline_stages(&pid).unwrap()[0].mcp_servers, both, "trimmed, sorted, once each");
+        let run = a.create_run("ws1", &pid, "t", None, None, &[]).unwrap();
+        let stage = &a.list_run_stages(&run).unwrap()[0];
+        assert_eq!(a.get_stage_mcp_servers(&stage.id).unwrap(), both);
+
+        let synced = a.list_custom_pipelines_for_sync().unwrap();
+        let b = test_db();
+        b.seed_builtin_pipelines().unwrap();
+        assert!(b.upsert_pipeline_from_sync(&synced[0]).unwrap());
+        assert_eq!(b.pipeline_stage_drafts(&pid).unwrap()[0].mcp_servers, both);
+
+        let crew = crate::crew::export(&a, &pid).unwrap();
+        assert!(crew.pipeline.stages[0].mcp_servers.is_empty());
+        assert!(!crate::crew::to_json(&crew).unwrap().contains("mcpServers"));
+        let mut handed = crew.clone();
+        handed.pipeline.name = "Handed over".into();
+        handed.pipeline.stages[0].mcp_servers = vec!["tracker".into()];
+        let imported = crate::crew::import(&b, &handed, &[]).unwrap();
+        assert!(b.get_pipeline_stages(&imported).unwrap()[0].mcp_servers.is_empty());
+
+        // The default: no servers, stored as NULL.
+        let none = crate::db::StageDraft { mcp_servers: vec![], ..draft };
+        let pid2 = a.save_pipeline(None, "Without", "d", &[none]).unwrap();
+        assert!(a.get_pipeline_stages(&pid2).unwrap()[0].mcp_servers.is_empty());
+        let raw: Option<String> = a
+            .conn_ref()
+            .query_row("SELECT mcp_servers FROM pipeline_stages WHERE pipeline_id = ?1", [pid2.as_str()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None);
     }
 
     #[test]
@@ -1080,6 +1145,99 @@ mod workspace_tests {
         db.restore_workspace("w1").unwrap();
         assert_eq!(db.list_workspaces("p").unwrap().len(), 1);
         assert!(db.list_archived_workspaces("p").unwrap().is_empty());
+    }
+
+    // ── Workspace ports (#1219) ─────────────────────────────────────────
+
+    use crate::workspace_ports::{BLOCK_SIZE, RANGE_START};
+
+    #[test]
+    fn workspace_ports_are_unique_and_stable() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", Some("/tmp/octo-ports/a"), "", None).unwrap();
+        db.insert_workspace("w2", "p", "b", "", "feat/b", Some("/tmp/octo-ports/b"), "", None).unwrap();
+        let a = db.ensure_workspace_port_base("w1", |_| true).unwrap();
+        let b = db.ensure_workspace_port_base("w2", |_| true).unwrap();
+        assert_eq!(a, Some(RANGE_START));
+        assert_eq!(b, Some(RANGE_START + BLOCK_SIZE));
+        // Asking again returns the same block, whatever the bind test says now.
+        assert_eq!(db.ensure_workspace_port_base("w1", |_| false).unwrap(), a);
+        // No workspace, no block.
+        assert_eq!(db.ensure_workspace_port_base("nope", |_| true).unwrap(), None);
+    }
+
+    #[test]
+    fn workspace_ports_skip_a_base_in_use() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports2-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+        let got = db.ensure_workspace_port_base("w1", |b| b != RANGE_START).unwrap();
+        assert_eq!(got, Some(RANGE_START + BLOCK_SIZE));
+    }
+
+    #[test]
+    fn archiving_keeps_the_ports_and_deleting_frees_them() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports3-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+        db.insert_workspace("w2", "p", "b", "", "feat/b", None, "", None).unwrap();
+        db.insert_workspace("w3", "p", "c", "", "feat/c", None, "", None).unwrap();
+        let a = db.ensure_workspace_port_base("w1", |_| true).unwrap();
+        db.archive_workspace("w1").unwrap();
+        // The archived workspace still holds its block…
+        assert_ne!(db.ensure_workspace_port_base("w2", |_| true).unwrap(), a);
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(db.ensure_workspace_port_base("w1", |_| true).unwrap(), a);
+        // …and a deleted one gives it back.
+        db.delete_workspace("w1").unwrap();
+        assert_eq!(db.ensure_workspace_port_base("w3", |_| true).unwrap(), a);
+    }
+
+    #[test]
+    fn workspace_ports_survive_a_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("octopush.db");
+        let base = {
+            let db = Db::open(&path).unwrap();
+            db.insert_project("p", "P", "/tmp/octo-ports4-p").unwrap();
+            db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+            db.ensure_workspace_port_base("w1", |b| b != RANGE_START).unwrap()
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.ensure_workspace_port_base("w1", |_| true).unwrap(), base);
+    }
+
+    #[test]
+    fn two_workspaces_can_never_share_a_block() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/octo-ports5-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", None, "", None).unwrap();
+        db.insert_workspace("w2", "p", "b", "", "feat/b", None, "", None).unwrap();
+        db.ensure_workspace_port_base("w1", |_| true).unwrap();
+        let dup = db.conn_ref().execute(
+            "UPDATE workspaces SET port_base = ?1 WHERE id = 'w2'",
+            rusqlite::params![RANGE_START as i64],
+        );
+        assert!(dup.is_err(), "the unique index must refuse a second holder");
+    }
+
+    #[test]
+    fn a_run_session_on_a_worktree_gets_its_workspace_ports() {
+        let db = test_db();
+        let wt = tempfile::TempDir::new().unwrap();
+        let root = wt.path().to_string_lossy().into_owned();
+        db.insert_project("p", "P", "/tmp/octo-ports6-p").unwrap();
+        db.insert_workspace("w1", "p", "a", "", "feat/a", Some(&root), "", None).unwrap();
+        let block = crate::workspace_ports::ensure_for_root(&db, &root).expect("a block");
+        let mut guard = crate::context_guard::ContextGuard::auto_configure("s-ports", wt.path());
+        guard.set_ports(block);
+        let env = crate::commands::run_terminal_env(&guard, "claude-sonnet-5");
+        assert_eq!(env["OCTOPUSH_PORT"], block.base.to_string());
+        assert_eq!(env["OCTOPUSH_PORT_COUNT"], BLOCK_SIZE.to_string());
+        assert_eq!(env["CONDUCTOR_PORT"], block.base.to_string());
+        // A root that is no workspace's worktree gets none.
+        assert_eq!(crate::workspace_ports::ensure_for_root(&db, "/tmp/elsewhere"), None);
     }
 
     #[test]
@@ -1256,6 +1414,26 @@ mod workspace_tests {
     }
 
     #[test]
+    fn project_issue_tracker_round_trip() {
+        let db = test_db();
+        db.insert_project("proj-epiku", "Test Project", "/tmp/proj-epiku").unwrap();
+        // A project that never chose reads as the default.
+        assert_eq!(db.project_issue_tracker("proj-epiku").unwrap(), (None, None));
+        assert_eq!(db.project_issue_tracker("missing").unwrap(), (None, None));
+
+        db.update_project_issue_tracker("proj-epiku", Some("epiku"), Some("sample-project")).unwrap();
+        assert_eq!(
+            db.project_issue_tracker("proj-epiku").unwrap(),
+            (Some("epiku".to_string()), Some("sample-project".to_string()))
+        );
+        // The Jira key is untouched by the choice.
+        assert_eq!(db.get_project("proj-epiku").unwrap().unwrap().jira_project_key, None);
+
+        db.update_project_issue_tracker("proj-epiku", None, None).unwrap();
+        assert_eq!(db.project_issue_tracker("proj-epiku").unwrap(), (None, None));
+    }
+
+    #[test]
     fn chat_threads_crud_and_scoping() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();
@@ -1281,6 +1459,108 @@ mod workspace_tests {
         db.delete_chat_thread(&a.id).unwrap();
         assert_eq!(db.list_chat_threads("ws").unwrap().len(), 1);
         assert_eq!(db.list_chat_messages(&a.id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_clock_stepping_back_never_reorders_a_thread() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        for text in ["ask", "answer", "follow-up"] {
+            db.insert_chat_message("ws", &t.id, "user", text, None, None, None, None).unwrap();
+        }
+        // The clock stepped back an hour before the last two rows were written.
+        db.conn_ref()
+            .execute(
+                "UPDATE chat_messages SET created_at = '2020-01-01T00:00:00Z' WHERE thread_id = ?1 AND content != 'ask'",
+                rusqlite::params![t.id],
+            )
+            .unwrap();
+        db.conn_ref()
+            .execute(
+                "UPDATE chat_messages SET created_at = '2019-12-31T23:00:00Z' WHERE thread_id = ?1 AND content = 'follow-up'",
+                rusqlite::params![t.id],
+            )
+            .unwrap();
+        let order: Vec<String> = db.list_chat_messages(&t.id).unwrap().into_iter().map(|m| m.content).collect();
+        assert_eq!(order, ["ask", "answer", "follow-up"]);
+    }
+
+    #[test]
+    fn a_restart_mid_turn_leaves_a_note_on_every_cut_thread() {
+        use crate::chat_engine::RESTART_NOTE;
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        let thread = |title: &str, rows: &[(&str, &str)]| {
+            let t = db.create_chat_thread("ws", title).unwrap();
+            for (role, content) in rows {
+                db.insert_chat_message("ws", &t.id, role, content, None, None, None, None).unwrap();
+            }
+            t.id
+        };
+        let agent_tool = r#"{"callId":"toolu_1","toolName":"read_file","toolInput":{},"result":"x","ok":true}"#;
+        let shell_tool = r#"{"callId":"shell-3","toolName":"run_command","toolInput":{"command":"ls"},"result":"a","ok":true}"#;
+        let on_ask = thread("ask", &[("user", "do it")]);
+        let on_tool = thread("tool", &[("user", "do it"), ("assistant_tool_use", "[tool_calls: []]"), ("tool", agent_tool)]);
+        let on_round = thread("round", &[("user", "do it"), ("assistant_tool_use", "[tool_calls: []]")]);
+        let answered = thread("answered", &[("user", "do it"), ("assistant", "done")]);
+        let errored = thread("errored", &[("user", "do it"), ("error", "Anthropic API error 500")]);
+        let shell = thread("shell", &[("tool", shell_tool)]);
+        let running = thread("running", &[("user", "do it")]);
+        let empty = thread("empty", &[]);
+
+        let noted = db.note_interrupted_talk_turns(RESTART_NOTE, &|t: &str| t == running).unwrap();
+        assert_eq!(noted, 3);
+        let last = |t: &str| db.list_chat_messages(t).unwrap().last().map(|m| (m.role.clone(), m.content.clone()));
+        for cut in [&on_ask, &on_tool, &on_round] {
+            assert_eq!(last(cut), Some(("stopped".to_string(), "Interrupted by an app restart.".to_string())));
+        }
+        assert_eq!(last(&answered).unwrap().0, "assistant");
+        assert_eq!(last(&errored).unwrap().0, "error");
+        assert_eq!(last(&shell).unwrap().0, "tool", "a `$` command is a finished exchange");
+        assert_eq!(last(&running).unwrap().0, "user", "a turn still running is left alone");
+        assert_eq!(last(&empty), None);
+        // A second boot adds nothing: those threads now end on the note.
+        assert_eq!(db.note_interrupted_talk_turns(RESTART_NOTE, &|_: &str| false).unwrap(), 1, "only the formerly running one");
+    }
+
+    #[test]
+    fn a_talk_turn_works_in_the_workspace_folder_the_database_names() {
+        use crate::chat_engine::{with_workspace_path_from_db, ChatRequest};
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "feat", Some("/tmp/p/.octopus-worktrees/ws"), "", None).unwrap();
+        db.insert_workspace("bare", "p", "bare", "", "main", None, "", None).unwrap();
+        let request = |workspace: &str, path: &str| -> ChatRequest {
+            serde_json::from_value(serde_json::json!({
+                "workspaceId": workspace, "threadId": "t", "workspacePath": path, "model": "m",
+                "userMessage": "hi", "system": null, "maxTokens": 4096,
+            }))
+            .unwrap()
+        };
+        // Whatever folder the webview names, the turn runs in the workspace's own.
+        let resolved = with_workspace_path_from_db(&db, request("ws", "/Users/someone/.ssh")).unwrap();
+        assert_eq!(resolved.workspace_path, "/tmp/p/.octopus-worktrees/ws");
+        // A workspace with no worktree yet works in its project's root, as before.
+        assert_eq!(with_workspace_path_from_db(&db, request("bare", "/elsewhere")).unwrap().workspace_path, "/tmp/p");
+        // A request may leave the path out entirely.
+        let bare: ChatRequest = serde_json::from_value(serde_json::json!({
+            "workspaceId": "ws", "threadId": "t", "model": "m", "userMessage": "hi", "system": null, "maxTokens": 4096,
+        }))
+        .unwrap();
+        assert_eq!(with_workspace_path_from_db(&db, bare).unwrap().workspace_path, "/tmp/p/.octopus-worktrees/ws");
+        // An unknown workspace runs nothing.
+        assert!(with_workspace_path_from_db(&db, request("gone", "/tmp/p")).is_err());
+    }
+
+    #[test]
+    fn a_stopped_turn_says_what_stays_and_how_to_undo_it() {
+        assert_eq!(
+            crate::chat_engine::STOPPED_NOTE,
+            "Stopped. Changes made before the stop stay; rewind files from your last message to undo them."
+        );
     }
 
     #[test]
@@ -3854,7 +4134,7 @@ mod pipeline_crud_tests {
             max_iterations: 25,
             pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
@@ -4091,7 +4371,7 @@ mod pipeline_crud_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         assert!(db.validate_pipeline_stages(&[mk("code_review")]).is_ok());
         assert!(db.validate_pipeline_stages(&[mk("bogus_role")]).is_err());
@@ -4676,6 +4956,99 @@ mod run_crud_tests {
         assert!(db.stage_contexts(&run).unwrap().is_empty(), "an older stage has no reading");
         db.set_run_stage_context(&stage, 42_000, Some(200_000)).unwrap();
         assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(42_000, Some(200_000))));
+    }
+
+    #[test]
+    fn migrate_adds_the_mcp_pin_and_routine_columns_to_an_older_database() {
+        // #1134: a database from before the MCP pin and the Routine stamp has
+        // neither column. Opening it adds both, nullable: its runs read as no
+        // Routine's, with nothing pinned. Opening it again changes nothing.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (run, stage) = {
+            let db = Db::open(tmp.path()).unwrap();
+            let ws = seed_workspace(&db);
+            let pid = db.insert_pipeline("P", "d", false).unwrap();
+            db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+            let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+            let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+            db.conn_ref()
+                .execute_batch(
+                    "UPDATE run_stages SET mcp_servers = '[\"tracker\"]';
+                     ALTER TABLE run_stages DROP COLUMN mcp_pinned;
+                     ALTER TABLE runs DROP COLUMN routine_id;",
+                )
+                .unwrap();
+            (run, stage)
+        };
+        for _ in 0..2 {
+            let db = Db::open(tmp.path()).unwrap();
+            for (table, col) in [("run_stages", "mcp_pinned"), ("runs", "routine_id")] {
+                let mut stmt = db.conn_ref().prepare(&format!("PRAGMA table_info({table})")).unwrap();
+                let cols: Vec<(String, i64)> =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?))).unwrap().map(Result::unwrap).collect();
+                let notnull = cols.iter().find(|(n, _)| n == col).unwrap_or_else(|| panic!("{table}.{col} missing")).1;
+                assert_eq!(notnull, 0, "{table}.{col} must be nullable");
+            }
+            assert_eq!(db.run_routine_id(&run).unwrap(), None);
+            assert!(db.get_stage_mcp_pinned(&stage).unwrap().is_empty(), "an older stage starts no server");
+            assert_eq!(db.get_stage_mcp_servers(&stage).unwrap(), vec!["tracker".to_string()]);
+        }
+    }
+
+    #[test]
+    fn a_runs_mcp_servers_are_pinned_once_from_the_settings_servers() {
+        // #1134: each stage's chosen servers are pinned to their Settings
+        // config when the run is created; one Settings doesn't have isn't
+        // pinned, and a later pin never replaces the first.
+        use crate::mcp::McpServerConfig;
+        use std::collections::HashMap;
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let ws = seed_workspace(&db);
+        let draft = |servers: &[&str]| crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents: vec![], tools: None,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+            mcp_servers: servers.iter().map(|s| s.to_string()).collect(),
+        };
+        let cfg = |command: &str| McpServerConfig {
+            command: command.into(),
+            secret_env: vec!["TOKEN".into()],
+            ..Default::default()
+        };
+        let pid = db.save_pipeline(None, "Pinned", "d", &[draft(&["tracker", "project-only"])]).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.get_stage_mcp_pinned(&stage).unwrap().is_empty(), "nothing is pinned before the pin");
+
+        let settings = HashMap::from([("tracker".to_string(), cfg("settings")), ("docs".to_string(), cfg("docs"))]);
+        db.pin_run_mcp_servers(&run, &settings).unwrap();
+        let pinned = db.get_stage_mcp_pinned(&stage).unwrap();
+        assert_eq!(pinned, HashMap::from([("tracker".to_string(), cfg("settings"))]));
+        let raw: String = db
+            .conn_ref()
+            .query_row("SELECT mcp_pinned FROM run_stages WHERE id = ?1", [stage.as_str()], |r| r.get(0))
+            .unwrap();
+        assert!(raw.contains("\"secret_env\":[\"TOKEN\"]"), "Keychain items by name only: {raw}");
+
+        let rewritten = HashMap::from([
+            ("tracker".to_string(), cfg("rewritten")),
+            ("project-only".to_string(), cfg("rewritten")),
+        ]);
+        db.pin_run_mcp_servers(&run, &rewritten).unwrap();
+        assert_eq!(db.get_stage_mcp_pinned(&stage).unwrap(), pinned, "the first pin stays");
+
+        // A stage that chose no server pins nothing.
+        let none = db.save_pipeline(None, "None", "d", &[draft(&[])]).unwrap();
+        let run = db.create_run(&ws, &none, "t", None, None, &[]).unwrap();
+        db.pin_run_mcp_servers(&run, &settings).unwrap();
+        let raw: Option<String> = db
+            .conn_ref()
+            .query_row("SELECT mcp_pinned FROM run_stages WHERE run_id = ?1", [run.as_str()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None);
     }
 
     #[test]
@@ -8882,7 +9255,7 @@ mod orchestrator_tests {
             checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents, tools,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
     fn ro_tools() -> Option<Vec<String>> {
@@ -9469,7 +9842,7 @@ mod orchestrator_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         };
         let mut impl_d = mk("implement");
         impl_d.escalate_model = Some("strong-model".into());
@@ -11282,6 +11655,185 @@ mod orchestrator_tests {
             reset();
         }
     }
+
+    // ─── #1134: a stage's MCP servers, pinned at creation ────────────────
+
+    /// Records what each stage was given of its MCP servers (the names and
+    /// the pinned configs), and rewrites `rewrite/.claude/mcp.json` with its
+    /// own definitions of those servers, as a stage with file tools could.
+    struct McpSeeingRunner {
+        seen: McpSeen,
+        rewrite: Option<std::path::PathBuf>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for McpSeeingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(ctx.mcp.as_ref().map(|m| (m.servers.clone(), (*m.pinned).clone())));
+            if let Some(wt) = &self.rewrite {
+                std::fs::create_dir_all(wt.join(".claude")).unwrap();
+                let entry = serde_json::json!({ "command": "rewritten-by-a-stage" });
+                std::fs::write(
+                    wt.join(".claude/mcp.json"),
+                    serde_json::json!({ "mcpServers": { "tracker": entry.clone(), "project-only": entry } }).to_string(),
+                )
+                .unwrap();
+            }
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: None, session_id: None, blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    type McpSeen = Arc<Mutex<Vec<Option<(Vec<String>, std::collections::HashMap<String, crate::mcp::McpServerConfig>)>>>>;
+
+    /// An API crew whose stages chose `tracker` and `project-only`.
+    fn mcp_crew(db: &Arc<Mutex<Db>>, stages: usize) -> String {
+        let drafts: Vec<crate::db::StageDraft> = (0..stages)
+            .map(|i| crate::db::StageDraft {
+                mcp_servers: vec!["tracker".into(), "project-only".into()],
+                ..draft_with(if i == 0 { "plan" } else { "implement" }, if i == 0 { vec![] } else { vec![i as i64 - 1] }, None, false)
+            })
+            .collect();
+        db.lock().save_pipeline(None, &format!("MCP crew {stages}"), "d", &drafts).unwrap()
+    }
+
+    fn mcp_cfg(command: &str) -> crate::mcp::McpServerConfig {
+        crate::mcp::McpServerConfig { command: command.into(), ..Default::default() }
+    }
+
+    fn mcp_orch(db: &Arc<Mutex<Db>>, seen: &McpSeen, rewrite: Option<std::path::PathBuf>) -> Orchestrator {
+        Orchestrator::new_with_runner(
+            Arc::clone(db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(McpSeeingRunner { seen: Arc::clone(seen), rewrite }),
+        )
+        .with_mcp(Arc::new(crate::mcp::McpRegistry::new()))
+    }
+
+    fn notices(db: &Arc<Mutex<Db>>, run_id: &str) -> Vec<String> {
+        let stages = db.lock().list_run_stages(run_id).unwrap();
+        stages.iter().flat_map(|s| db.lock().list_stage_log(&s.id).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn an_app_run_uses_the_settings_configs_pinned_when_it_was_created() {
+        let (db, _) = db_with_workspace();
+        let wt = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.lock()
+            .conn_ref()
+            .execute(
+                "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+                 VALUES ('w-pin','p1','W','main',?1,?2,?2)",
+                rusqlite::params![wt.path().to_string_lossy().into_owned(), now],
+            )
+            .unwrap();
+        // The worktree defines its own servers before the run starts.
+        std::fs::create_dir_all(wt.path().join(".claude")).unwrap();
+        std::fs::write(
+            wt.path().join(".claude/mcp.json"),
+            r#"{"mcpServers":{"tracker":{"command":"from-the-project"},"project-only":{"command":"from-the-project"}}}"#,
+        )
+        .unwrap();
+        let pid = mcp_crew(&db, 2);
+        let run_id = db.lock().create_run("w-pin", &pid, "t", None, None, &[]).unwrap();
+        let settings = std::collections::HashMap::from([
+            ("tracker".to_string(), mcp_cfg("from-settings")),
+            ("docs".to_string(), mcp_cfg("docs")),
+        ]);
+        db.lock().pin_run_mcp_servers(&run_id, &settings).unwrap();
+
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        let orch = mcp_orch(&db, &seen, Some(wt.path().to_path_buf()));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let pinned = std::collections::HashMap::from([("tracker".to_string(), mcp_cfg("from-settings"))]);
+        let given = Some((vec!["project-only".to_string(), "tracker".to_string()], pinned));
+        // The second stage runs after the first rewrote .claude/mcp.json.
+        assert_eq!(*seen.lock(), vec![given.clone(), given]);
+    }
+
+    #[tokio::test]
+    async fn a_routine_dispatch_stamps_its_run() {
+        use crate::routines::FireOutcome;
+        let (db, ws) = db_with_workspace();
+        let pid = mcp_crew(&db, 1);
+        db.lock()
+            .insert_routine("r-mcp", &routine_input(&pid, "interval", "3600"), Some("2000-01-01T00:00:00+00:00"), true)
+            .unwrap();
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            Box::new(MockRunner),
+        ));
+        assert_eq!(Arc::clone(&orch).run_routine_now("r-mcp").await.unwrap(), FireOutcome::Dispatched);
+        let runs = db.lock().list_runs(&ws).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(db.lock().run_routine_id(&runs[0].id).unwrap().as_deref(), Some("r-mcp"));
+        // A run the director starts carries no Routine.
+        let other = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        assert_eq!(db.lock().run_routine_id(&other).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn routine_and_detached_runs_never_get_mcp_servers() {
+        let (db, ws) = db_with_workspace();
+        let pid = mcp_crew(&db, 1);
+        let settings = std::collections::HashMap::from([("tracker".to_string(), mcp_cfg("from-settings"))]);
+        let new_run = |routine: Option<&str>| {
+            let db = db.lock();
+            let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+            db.pin_run_mcp_servers(&run, &settings).unwrap();
+            if let Some(r) = routine {
+                db.stamp_run_routine(&run, r).unwrap();
+            }
+            run
+        };
+        let in_routines = "MCP servers aren't available in Routines yet, so this stage runs without them.";
+        let detached = "MCP servers aren't available in detached runs yet, so this stage runs without them.";
+
+        // An older run of a Routine that has fired again since.
+        db.lock().insert_routine("r-mcp", &routine_input(&pid, "interval", "3600"), None, true).unwrap();
+        let older = new_run(Some("r-mcp"));
+        let latest = new_run(Some("r-mcp"));
+        db.lock().stamp_routine_run("r-mcp", &latest, &chrono::Utc::now().to_rfc3339()).unwrap();
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        assert_eq!(mcp_orch(&db, &seen, None).run_to_pause(&older).await.unwrap(), RunStatus::Completed);
+        assert_eq!(*seen.lock(), vec![None]);
+        assert!(notices(&db, &older).iter().any(|n| n.contains(in_routines)), "{:?}", notices(&db, &older));
+
+        // A run of a Routine deleted since.
+        db.lock().delete_routine("r-mcp").unwrap();
+        let orphan = new_run(Some("r-mcp"));
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        assert_eq!(mcp_orch(&db, &seen, None).run_to_pause(&orphan).await.unwrap(), RunStatus::Completed);
+        assert_eq!(*seen.lock(), vec![None]);
+        assert!(notices(&db, &orphan).iter().any(|n| n.contains(in_routines)));
+
+        // A detached run: the worker's drive, even with a registry.
+        let worker_run = new_run(None);
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        let worker = mcp_orch(&db, &seen, None).into_headless();
+        assert_eq!(worker.run_to_pause(&worker_run).await.unwrap(), RunStatus::Completed);
+        assert_eq!(*seen.lock(), vec![None]);
+        assert!(notices(&db, &worker_run).iter().any(|n| n.contains(detached)));
+
+        // The same crew, started in the app, gets its pinned server.
+        let app_run = new_run(None);
+        let seen: McpSeen = Arc::new(Mutex::new(vec![]));
+        assert_eq!(mcp_orch(&db, &seen, None).run_to_pause(&app_run).await.unwrap(), RunStatus::Completed);
+        assert_eq!(seen.lock()[0].as_ref().map(|(_, p)| p.clone()), Some(settings.clone()));
+        assert!(!notices(&db, &app_run).iter().any(|n| n.contains(in_routines) || n.contains(detached)));
+    }
 }
 
 #[cfg(test)]
@@ -12043,6 +12595,45 @@ mod cli_args_tests {
             INNER_SANDBOX_OFF_LABEL,
             "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage"
         );
+    }
+
+    #[test]
+    fn a_project_that_turned_skill_shell_off_adds_the_key_to_every_claude_stage() {
+        use crate::orchestrator::cli_runner::{
+            confine_reads_in_sandbox, disable_skill_shell, turn_off_inner_sandbox, CliDialect, CodexWriteScope,
+        };
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #1188: the settings key, beside the guards and the inner-sandbox
+        // override, fresh and resumed, in every isolation.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        for (git, exec) in [("worktree", "sandbox"), ("readonly", "none"), ("worktree", "none")] {
+            let iso = stage_isolation(git, exec, "/ws");
+            for off in [true, false] {
+                for mut args in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, true)] {
+                    let reads = confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args);
+                    let wrapped = turn_off_inner_sandbox(CliDialect::Claude, &iso.exec_isolation, &mut args);
+                    assert_eq!(disable_skill_shell(CliDialect::Claude, off, &mut args), off);
+                    let v = settings(&args);
+                    assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true));
+                    assert_eq!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some(), reads);
+                    assert_eq!(v.get("sandbox").is_some(), wrapped);
+                    if off {
+                        assert_eq!(v["disableSkillShellExecution"], serde_json::json!(true), "{git}/{exec}: {args:?}");
+                    } else {
+                        assert!(v.get("disableSkillShellExecution").is_none(), "off by default: {args:?}");
+                    }
+                    assert!(!args.iter().any(|a| a.contains("PreSkillShellCommand")), "never the hook: {args:?}");
+                }
+            }
+        }
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox, "/ws");
+        let mut same = codex.clone();
+        assert!(!disable_skill_shell(CliDialect::Codex, true, &mut same));
+        assert_eq!(same, codex);
     }
 
     #[test]
@@ -13300,6 +13891,23 @@ mod file_io_checked_tests {
         }
     }
 
+    /// The editor and Talk's `@file` read through here: a `.env` that is a
+    /// named pipe nothing writes to is refused, not waited on (#1190).
+    #[test]
+    fn refuses_a_named_pipe_and_a_link_to_one_at_once() {
+        use crate::fs_safe::tests::{mkfifo, within_a_second};
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = dir.path().join(".env");
+        mkfifo(&env);
+        let link = dir.path().join("env-link");
+        std::os::unix::fs::symlink(&env, &link).unwrap();
+        for p in [env, link] {
+            let p = p.to_str().unwrap().to_string();
+            let err = within_a_second(move || read_file_checked_inner(&p, 1_000_000)).unwrap_err().to_string();
+            assert!(err.contains("is a named pipe, not a file"), "{err}");
+        }
+    }
+
     #[test]
     fn serializes_kind_tag_as_camel_case() {
         let v = serde_json::to_value(FileReadResult::TooLarge { size: 9 }).unwrap();
@@ -13555,6 +14163,65 @@ mod live_tests {
         assert!(!text.contains("enc-rs_2") && !text.contains("fc-call_2"), "{text}");
         let call_2 = input.iter().find(|i| i["type"] == "function_call" && i["call_id"] == "call_2").unwrap();
         assert!(call_2.get("id").is_none());
+    }
+
+    /// Scripted turns, recording each request as the Anthropic body it becomes.
+    struct AnthropicRecorder { turns: Mutex<VecDeque<LlmResponse>>, bodies: Mutex<Vec<Value>> }
+    #[async_trait::async_trait]
+    impl LlmProvider for AnthropicRecorder {
+        async fn complete(&self, _b: &str, _k: Option<&str>, r: &LlmRequest, _c: &reqwest::Client)
+            -> crate::error::AppResult<LlmResponse> {
+            self.bodies.lock().push(crate::providers::anthropic::build_request(r));
+            Ok(self.turns.lock().pop_front().expect("AnthropicRecorder ran out of turns"))
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_retries_a_truncated_round_with_its_signed_thinking_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = LlmToolUse { id: "t1".into(), name: "write_file".into(),
+            input: json!({ "path": "a.rs", "content": "fn main() {" }) };
+        let mut cut = resp("Writing it.", vec![call.clone()], LlmStopReason::MaxTokens);
+        cut.raw_content = vec![
+            json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
+            json!({ "type": "text", "text": "Writing it." }),
+            json!({ "type": "tool_use", "id": "t1", "name": "write_file", "input": call.input }),
+            // A block cut off mid-way is never replayed.
+            json!({ "type": "thinking", "thinking": "half" }),
+        ];
+        let provider = AnthropicRecorder {
+            turns: Mutex::new(VecDeque::from(vec![cut, resp("done", vec![], LlmStopReason::EndTurn)])),
+            bodies: Mutex::new(vec![]),
+        };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        // Haiku 4.5 thinks only with a budget.
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "claude-haiku-4-5-20251001",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None,
+                                   Some(crate::providers::Effort::High), None, false, None, &[], None,
+                                   None,).await.unwrap();
+        assert_eq!(out.text, "done");
+        assert!(!dir.path().join("a.rs").exists(), "the cut-off call never ran");
+
+        let bodies = provider.bodies.lock();
+        assert_eq!(bodies.len(), 2);
+        let retry = &bodies[1];
+        assert_eq!(retry["thinking"]["type"], "enabled", "{retry}");
+        // The retried assistant turn starts with its signed thinking (the API
+        // 400s one that doesn't while a budget is on), then its text and call.
+        let messages = retry["messages"].as_array().unwrap();
+        let at = messages.iter().rposition(|m| m["role"] == "assistant").unwrap();
+        let turn = &messages[at];
+        let content = turn["content"].as_array().unwrap();
+        assert_eq!((content[0]["type"].as_str(), content[0]["signature"].as_str()), (Some("thinking"), Some("sig-1")), "{turn}");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!((content[2]["type"].as_str(), content[2]["id"].as_str()), (Some("tool_use"), Some("t1")));
+        assert_eq!(content.len(), 3, "the partial block is dropped: {turn}");
+        let results = &messages[at + 1]["content"];
+        assert_eq!(results[0]["tool_use_id"], "t1");
+        assert_eq!(results[0]["is_error"], true);
     }
 
     #[tokio::test]
@@ -18079,6 +18746,74 @@ mod transcript_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn ingest_prices_fast_fable_5_2_turns_at_16_80_and_leaves_fast_sonnet_unpriced() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/Users/dev/fast-fable";
+        let session = "aaaaaaaa-0000-4000-8000-000000000052";
+        session_on(&db.lock(), "sess-fast-f52", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let turn = |n: u32, model: &str, usage: serde_json::Value| {
+            serde_json::json!({
+                "type": "assistant", "uuid": format!("00000000-0000-4000-8000-00000000052{n}"), "parentUuid": null,
+                "sessionId": session, "timestamp": format!("2026-11-26T09:0{n}:00.000Z"), "cwd": cwd,
+                "isSidechain": false, "version": "2.1.332", "userType": "external", "entrypoint": "cli",
+                "requestId": format!("req_f52_fast_{n}"),
+                "message": {"id": format!("msg_f52_fast_{n}"), "type": "message", "role": "assistant", "model": model,
+                    "stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}], "usage": usage},
+            })
+            .to_string()
+        };
+        let lines = [
+            // Fable 5.2 fast, 5-minute writes.
+            turn(1, "claude-fable-5-2", serde_json::json!({"input_tokens": 1000, "output_tokens": 2000,
+                "cache_read_input_tokens": 10000, "cache_creation_input_tokens": 4000, "speed": "fast"})),
+            // Fable 5.2 fast, 1-hour writes.
+            turn(2, "claude-fable-5-2", serde_json::json!({"input_tokens": 500, "output_tokens": 1000,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 2000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 2000}, "speed": "fast"})),
+            // Sonnet 5.5 has no fast rate.
+            turn(3, "claude-sonnet-5-5", serde_json::json!({"input_tokens": 100, "output_tokens": 100, "speed": "fast"})),
+        ];
+        std::fs::write(pdir.join(format!("{session}.jsonl")), lines.join("\n") + "\n").unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 3);
+
+        let row = |key: &str| -> (f64, String, Option<String>) {
+            db.lock()
+                .conn_ref()
+                .query_row(
+                    "SELECT cost_usd, cost_basis, speed FROM spend_events WHERE idempotency_key = ?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 1K in × $16 + 2K out × $80 + 10K hits × $0.40 + 4K 5-minute writes × $20.
+        let (c1, basis, speed) = row("cc:req_f52_fast_1");
+        assert!(near(c1, (1_000.0 * 16.0 + 2_000.0 * 80.0 + 10_000.0 * 0.40 + 4_000.0 * 20.0) / 1e6), "{c1}");
+        assert_eq!((basis.as_str(), speed.as_deref()), ("computed", Some("fast")));
+        // 500 in × $16 + 1K out × $80 + 2K 1-hour writes × $32.
+        let (c2, basis, _) = row("cc:req_f52_fast_2");
+        assert!(near(c2, (500.0 * 16.0 + 1_000.0 * 80.0 + 2_000.0 * 32.0) / 1e6), "{c2}");
+        assert_eq!(basis, "computed");
+        // Fast Sonnet stays unpriced, never the standard rate.
+        assert_eq!(row("cc:req_f52_fast_3"), (0.0, "unpriced".to_string(), Some("fast".to_string())));
+
+        // The re-pricer keeps the fast rate, and the spend counts in the report.
+        crate::commands::reprice_ledger(&db).unwrap();
+        assert!(near(row("cc:req_f52_fast_1").0, c1) && near(row("cc:req_f52_fast_2").0, c2));
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.unpriced_calls, 1);
+        assert!((rep.totals.cost_usd - (c1 + c2)).abs() < 1e-9, "{} vs {}", rep.totals.cost_usd, c1 + c2);
+    }
+
+    #[test]
     fn ledger_ids_carry_both_the_request_id_and_the_message_id() {
         // A RUN row keyed on the request id, whose message id was recorded
         // beside it; a row keyed on the message id alone; a row of another
@@ -18897,7 +19632,7 @@ mod pricing_table_tests {
     }
 
     #[test]
-    fn fast_mode_prices_opus_5_and_4_8_at_twice_standard_and_nothing_else() {
+    fn fast_mode_prices_opus_5_4_8_and_fable_mythos_5_2_at_twice_standard_and_nothing_else() {
         use crate::token_engine::{fast_prices, is_fast, prices_at_speed, usage_speed};
         let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
         // Fast-mode docs (2026-11-03): $10/$50 per MTok, cache multipliers on top.
@@ -18906,6 +19641,20 @@ mod pricing_table_tests {
             assert!(near(fast.input_per_m, 10.0) && near(fast.output_per_m, 50.0), "{model}: {fast:?}");
             assert!(near(fast.cache_creation_per_m, 12.50) && near(fast.cache_read_per_m, 1.0), "{model}: {fast:?}");
             assert!(near(fast.cache_creation_1h_per_m, 20.0), "{model}: {fast:?}");
+        }
+        // Fable 5.2 and Mythos 5.2 (fast-mode and pricing pages, 2026-11-26):
+        // $16/$80, 2× their $8/$40, cache multipliers on top.
+        for model in [
+            "claude-fable-5-2",
+            "claude-mythos-5-2",
+            "claude-fable-5-2-20261101",
+            "us.anthropic.claude-fable-5-2-v1:0",
+            "anthropic/claude-mythos-5-2",
+        ] {
+            let fast = fast_prices(model, builtin_prices(model).unwrap()).unwrap_or_else(|| panic!("{model} has no fast rate"));
+            assert!(near(fast.input_per_m, 16.0) && near(fast.output_per_m, 80.0), "{model}: {fast:?}");
+            assert!(near(fast.cache_creation_per_m, 20.0) && near(fast.cache_read_per_m, 0.40), "{model}: {fast:?}");
+            assert!(near(fast.cache_creation_1h_per_m, 32.0), "{model}: {fast:?}");
         }
         // A user-edited base price scales.
         let mut edited = builtin_prices("claude-opus-5").unwrap();
@@ -21090,7 +21839,7 @@ mod crew_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
@@ -25212,7 +25961,7 @@ mod plan_wait_tests {
             max_iterations: 25, pos_x: None, pos_y: None, parents,
             tools: (!parents_is_root(role)).then(|| vec!["read_file".into(), "list_files".into()]),
             custom_name: None, instructions: None, effort: None,
-            escalate_model: None, escalate_effort: None,
+            escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
     fn parents_is_root(role: &str) -> bool {
@@ -27641,7 +28390,7 @@ mod sync_contract_tests {
             checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
             loop_mode: None, max_iterations: 30, pos_x: None, pos_y: None,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            effort: None, escalate_model: None, escalate_effort: None,
+            effort: None, escalate_model: None, escalate_effort: None, mcp_servers: vec![],
         }
     }
 
@@ -29772,6 +30521,19 @@ mod talk_context_guard_tests {
             read_file_lines_inner(f.path().to_str().unwrap(), 1, 1, 100).unwrap(),
             LineRangeResult::UnsupportedEncoding
         ));
+    }
+
+    /// `@.env#L1-5` on a named pipe nothing writes to: refused, not waited on
+    /// (#1190).
+    #[test]
+    fn a_range_of_a_named_pipe_is_refused_at_once() {
+        use crate::fs_safe::tests::{mkfifo, within_a_second};
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = dir.path().join(".env");
+        mkfifo(&env);
+        let p = env.to_str().unwrap().to_string();
+        let err = within_a_second(move || read_file_lines_inner(&p, 1, 5, 100)).unwrap_err().to_string();
+        assert!(err.contains(".env is a named pipe, not a file"), "{err}");
     }
 
     #[test]

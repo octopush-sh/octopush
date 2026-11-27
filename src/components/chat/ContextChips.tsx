@@ -7,6 +7,8 @@ interface Props {
   refs: ContextRef[];
   /** Estimated tokens per ref token, once its block is resolved. */
   tokensByToken: Record<string, number>;
+  /** Why a resolved block can't be included, by ref token (#1190). */
+  missingByToken?: Record<string, string>;
   onRemove: (token: string) => void;
   /** Mentions past MAX_MENTIONS, sent as plain text. */
   over?: number;
@@ -31,27 +33,38 @@ export const WHAT = {
 /**
  * The context riding with this draft (#962): one chip per `@` token that
  * resolved — a file or line range, a folder listing, a Run session's output,
- * the diff, an earlier conversation (titled) — with its token estimate. The chips mirror the text: removing
- * one removes its token from the draft. Past MAX_MENTIONS (#1046) a quiet
- * line says how many go as plain text. Renders nothing when empty.
+ * the diff, an earlier conversation (titled) — with its token estimate. The
+ * chips mirror the text: removing one removes its token from the draft. A
+ * block that can't be included (a named pipe, say) is a muted, dashed chip
+ * whose tooltip says why, as it will be once sent. Past MAX_MENTIONS (#1046)
+ * a quiet line says how many go as plain text. Renders nothing when empty.
  */
-export function ContextChips({ refs, tokensByToken, onRemove, over = 0 }: Props) {
+export function ContextChips({ refs, tokensByToken, missingByToken = {}, onRemove, over = 0 }: Props) {
   if (refs.length === 0) return null;
   return (
     <div className="flex flex-wrap items-center gap-1.5 px-4 pt-3" aria-label="Context for this message">
       {refs.map((ref, i) => {
         const Icon = ICON[ref.kind];
         const tokens = tokensByToken[ref.token];
+        const missing = missingByToken[ref.token];
+        const title = missing
+          ? `Not included: ${missing} · @${quoteToken(ref.token)}`
+          : `${WHAT[ref.kind]} · @${quoteToken(ref.token)}${tokens != null ? ` · ≈ ${formatTokenCount(tokens)} tokens` : ""}`;
         return (
           <span
             key={ref.token}
             data-tour={i === 0 ? tourId("talk-context-chip") : undefined}
-            title={`${WHAT[ref.kind]} · @${quoteToken(ref.token)}${tokens != null ? ` · ≈ ${formatTokenCount(tokens)} tokens` : ""}`}
-            className="octo-pop-in flex items-center gap-1.5 rounded-md border border-octo-hairline bg-octo-panel py-0.5 pl-1.5 pr-1 font-mono text-[10px] text-octo-sage"
+            title={title}
+            className={`octo-pop-in flex items-center gap-1.5 rounded-md border py-0.5 pl-1.5 pr-1 font-mono text-[10px] ${
+              missing
+                ? "border-dashed border-octo-hairline text-octo-mute"
+                : "border-octo-hairline bg-octo-panel text-octo-sage"
+            }`}
           >
             <Icon size={11} className="text-octo-mute" aria-hidden />
             <span className="max-w-[12rem] truncate">{chipLabel(ref)}</span>
-            {tokens != null && (
+            {missing && <span className="sr-only">, not included: {missing}</span>}
+            {tokens != null && !missing && (
               <span className="octo-tabular text-octo-mute">{formatTokenCount(tokens)}</span>
             )}
             <button

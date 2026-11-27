@@ -7,6 +7,7 @@ import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
 import { TrackRecord, type StageRecord } from "./TrackRecord";
+import { StageMcpServers } from "./StageMcpServers";
 import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
@@ -154,7 +155,7 @@ interface Props {
 }
 
 /** The Companion: edits the selected stage as an agent — archetype, model,
- *  substrate, tools, gate, turn budget, free-form instructions, and (for review
+ *  substrate, tools, MCP servers, gate, turn budget, free-form instructions, and (for review
  *  archetypes) the loop. The archetype is the operability anchor; everything
  *  else is the author's to shape. */
 export function StageInspector({ node, ancestors, loop, issue, record, onPatch, onSetLoop, onClose }: Props) {
@@ -398,6 +399,14 @@ export function StageInspector({ node, ancestors, loop, issue, record, onPatch, 
             </div>
             {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own tools.</span>}
           </div>
+
+          {/* MCP servers — opt-in per stage, API substrate only for now. */}
+          <StageMcpServers
+            substrate={data.substrate}
+            model={data.agentModel}
+            chosen={data.mcpServers}
+            onChange={(next) => onPatch({ mcpServers: next })}
+          />
 
           {/* Max turns */}
           <label className="flex items-center justify-between gap-2">

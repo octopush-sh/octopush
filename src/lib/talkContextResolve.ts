@@ -69,6 +69,13 @@ function note(ref: ContextRef, why: string): string {
   return `\n\n${quoteToken(ref.token)} _(not included: ${why})_`;
 }
 
+/** The backend's refusal to read a named pipe, socket, device or folder
+ *  (`fs_safe`, #1190) as a block's short reason: "a named pipe, not a file". */
+export function notAFileReason(e: unknown): string | null {
+  const m = / is (an? [a-z ]+, not a file)/.exec(e instanceof Error ? e.message : String(e));
+  return m ? m[1] : null;
+}
+
 export async function resolveContextBlock(
   ref: ContextRef,
   workspacePath: string,
@@ -159,8 +166,8 @@ export async function resolveContextBlock(
         };
       }
     }
-  } catch {
-    return missing("unreadable");
+  } catch (e) {
+    return missing(notAFileReason(e) ?? "unreadable");
   }
 }
 

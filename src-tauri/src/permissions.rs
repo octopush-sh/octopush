@@ -10,9 +10,11 @@
 
 use crate::db::Db;
 use crate::orchestrator::agentic::{ToolGate, ASK_DIRECTOR_TOOL, ASK_STAGE_TOOL, SUBMIT_VERDICT_TOOL};
+use crate::talk_guard::{CardKind, Reach, ToolCard};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 /// A conversation's posture. In the UI: Plan only, Ask first, Edit freely.
@@ -44,15 +46,40 @@ impl Mode {
         }
     }
 
-    /// The modes a conversation can be set to in this build. Ask first
-    /// arrives with its approval card.
+    /// The mode a conversation is set to by name.
     pub fn settable(raw: &str) -> Option<Mode> {
         match raw {
             "plan" => Some(Mode::Plan),
+            "ask" => Some(Mode::Ask),
             "edit" => Some(Mode::Edit),
             _ => None,
         }
     }
+
+    /// The mode as the UI names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Plan => "Plan only",
+            Mode::Ask => "Ask first",
+            Mode::Edit => "Edit freely",
+        }
+    }
+}
+
+/// How a mode switch during a turn's note starts ([`mode_note`]).
+const MODE_NOTE_LEAD: &str = "Mode switched to ";
+
+/// The quiet note (role `stopped`) a mode switch during a turn leaves before
+/// the first round that runs in `mode` (#1231), so the record shows which
+/// mode each round ran under.
+pub fn mode_note(mode: Mode) -> String {
+    format!("{MODE_NOTE_LEAD}{} from this round on.", mode.label())
+}
+
+/// Whether a stored row is a [`mode_note`], which the v2 transcript skips so
+/// the turn still replays byte for byte.
+pub fn is_mode_note(role: &str, content: &str) -> bool {
+    role == "stopped" && content.starts_with(MODE_NOTE_LEAD)
 }
 
 /// What a tool call does, as the policy sees it.
@@ -166,9 +193,17 @@ pub fn plan_refusal(refused: Refused, forced: bool) -> String {
     }
 }
 
-/// What a call that Ask first would hold gets until Ask first can ask.
-pub const ASK_UNAVAILABLE: &str = "Not done: this conversation is in Ask first mode, which this version can't ask \
-     in yet. Nothing was changed. Tell the user, who can switch the conversation to Edit freely or Plan only.";
+/// What a call Ask first holds gets from a gate that has no one to ask.
+pub const CANNOT_ASK: &str = "Not done: this conversation is in Ask first mode, and this call had no approval card to \
+     wait on. Nothing was changed. Report what you would change instead.";
+
+/// What a file change gets when the user declines its Ask first card.
+pub const ASK_DECLINED_CHANGE: &str = "Not done: the user declined this change (the conversation is in Ask first \
+     mode). Nothing was written. Ask the user what they want instead; do not retry the same change.";
+
+/// What a command gets when the user declines its Ask first card.
+pub const ASK_DECLINED_COMMAND: &str = "Not run: the user declined this command (the conversation is in Ask first \
+     mode). Nothing ran. Ask the user how to proceed; do not retry the same command.";
 
 /// Whether `call` may run in `mode`.
 ///
@@ -177,7 +212,8 @@ pub const ASK_UNAVAILABLE: &str = "Not done: this conversation is in Ask first m
 ///   changes something elsewhere ([`remote_effect`]). An MCP tool runs only
 ///   when its server marks it read-only, and a sub-agent unless it names a
 ///   type that writes.
-/// - **Ask first:** writes and commands ask.
+/// - **Ask first:** writes ask, and so does a command unless every command
+///   in it only reads ([`reads_only`]). The host asks on [`ask_card`].
 /// - **Edit freely:** everything runs, as before modes existed.
 pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
     let field = |key: &str| call.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
@@ -195,19 +231,243 @@ pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
         (Mode::Plan, Class::Delegate) if !ctx.delegate_writes => Decision::Allow,
         (Mode::Plan, Class::Delegate) => refuse(Refused::Delegate),
         (Mode::Ask, Class::Write) => Decision::Ask { reason: "changes a file".into(), preview: field("path") },
+        (Mode::Ask, Class::Exec) if reads_only(&field("command")) => Decision::Allow,
         (Mode::Ask, Class::Exec) => Decision::Ask { reason: "runs a command".into(), preview: field("command") },
         (Mode::Ask, Class::Net | Class::Delegate) => Decision::Allow,
     }
 }
 
-/// The tool result a call gets instead of running, or `None` when it runs.
-/// Until Ask first can ask, what it would hold is refused, never run.
-pub fn refusal(decision: Decision) -> Option<String> {
-    match decision {
-        Decision::Allow => None,
-        Decision::Deny { message } => Some(message),
-        Decision::Ask { .. } => Some(ASK_UNAVAILABLE.to_string()),
+/// Programs Ask first runs without a card: they only read, whatever their
+/// flags. A short list on purpose; anything else asks.
+const READERS: &[&str] = &["ls", "cat", "head", "tail", "wc", "grep", "diff", "pwd", "echo", "stat", "which"];
+
+/// `git` subcommands that only read, past which no flag writes a file
+/// except `--output` (refused below).
+const GIT_READERS: &[&str] = &["status", "diff", "log", "show", "blame", "ls-files", "rev-parse"];
+
+/// Whether every command `command` runs only reads, so Ask first runs it
+/// without a card (#1231). Read the way the command check reads commands:
+/// every nested one ([`crate::chat_engine::each_command`]), each word as the
+/// shell splits it ([`crate::chat_engine::command_words`]). Each command must
+/// start with a program in [`READERS`] (or `git` with a subcommand in
+/// [`GIT_READERS`] right after it), named plainly, and nothing may redirect
+/// output except to `/dev/null`. Anything the check can't tell asks: a
+/// variable or a path as the program, an assignment before it, a wrapper or
+/// a shell keyword, a script, or nesting past the check's caps.
+pub fn reads_only(command: &str) -> bool {
+    !command.trim().is_empty() && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+}
+
+fn line_reads_only(line: &str) -> bool {
+    use crate::chat_engine::WordRole;
+    let words = crate::chat_engine::command_words(line);
+    if words.iter().any(|w| w.writes && w.word != "/dev/null") {
+        return false;
     }
+    let mut segments: Vec<Vec<&crate::chat_engine::CommandWord>> = Vec::new();
+    let mut last = None;
+    for w in &words {
+        if last != Some(w.segment) {
+            segments.push(Vec::new());
+            last = Some(w.segment);
+        }
+        if let Some(seg) = segments.last_mut() {
+            seg.push(w);
+        }
+    }
+    segments.iter().all(|seg| {
+        let Some((first, rest)) = seg.split_first() else { return true };
+        let plain = first.role == WordRole::Program && !first.unmodeled && first.word == first.pattern && !first.word.contains('/');
+        let args: Vec<&str> = rest.iter().filter(|w| w.role == WordRole::Argument && !w.redirect).map(|w| w.word.as_str()).collect();
+        plain
+            && match first.word.as_str() {
+                "git" => args.first().is_some_and(|sub| GIT_READERS.contains(sub)) && !args.iter().any(|a| a.starts_with("--output") || *a == "--ext-diff"),
+                program => READERS.contains(&program),
+            }
+    })
+}
+
+/// Lines of context around each change in an Ask first card's diff.
+const DIFF_CONTEXT: usize = 3;
+/// The most lines the diff shows; the rest is counted.
+const DIFF_MAX_LINES: usize = 300;
+/// The most of one line the diff shows (bytes).
+const DIFF_LINE_MAX: usize = 400;
+/// Past this many line pairs the changed middle isn't aligned line by line:
+/// it shows as removed, then added.
+const DIFF_MAX_CELLS: usize = 1_000_000;
+/// A file larger than this (bytes) gets no preview.
+const PREVIEW_MAX_BYTES: u64 = 2_000_000;
+
+/// The card Ask first holds `name` on (#1231). A file change shows the
+/// unified diff it makes, the file as it is against the file as the call
+/// would leave it; once approved, the host checks again
+/// (`chat_engine::guard_card`), so a file that changed while the card waited
+/// asks again with its new diff. A path outside the workspace, in a
+/// credentials location or named like an env file or a key gets no preview,
+/// so the card never reads it; the outside-workspace card still asks after
+/// this one. `label` names the sub-agent that asks. It offers no "don't ask
+/// again": Edit freely is the mode for that.
+pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -> ToolCard {
+    let field = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+    let card = |kind, shown: String, reason: String, denial: &str, diff| ToolCard {
+        kind,
+        shown,
+        reason: crate::talk_guard::sub_agent(label, reason),
+        denial: denial.to_string(),
+        sensitive: false,
+        grant: None,
+        trust: None,
+        diff,
+    };
+    if name == "run_command" {
+        return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None);
+    }
+    let path = field("path");
+    let marked = crate::secret_scan::is_env_file(&path) || crate::secret_scan::is_sensitive_name(&path);
+    let (reason, diff) = match name {
+        "write_file" | "edit_file" if marked || reach.outside_card(None, name, input, false, &[]).is_some() => {
+            ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None)
+        }
+        "write_file" | "edit_file" => change_preview(reach.workspace(), name, input, &path),
+        _ => (format!("calls {name}, which can change files"), None),
+    };
+    let shown = if path.is_empty() { name.to_string() } else { path };
+    card(CardKind::Edit, shown, format!("{reason} (Ask first)"), ASK_DECLINED_CHANGE, diff)
+}
+
+/// Why a file change asks, and its diff: the file at `path` under
+/// `workspace` now against what `name` would leave there.
+fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str) -> (String, Option<String>) {
+    let full = workspace.join(path);
+    let no_preview = |why: &str| (format!("changes a file {why}, so the card doesn't preview it"), None);
+    let current = match std::fs::metadata(&full) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(m) if m.is_file() && m.len() <= PREVIEW_MAX_BYTES => match std::fs::read(&full) {
+            Ok(bytes) => match String::from_utf8(bytes).ok().filter(|t| !t.contains('\0')) {
+                Some(text) => Some(text),
+                None => return no_preview("that isn't text"),
+            },
+            Err(_) => return no_preview("that can't be read"),
+        },
+        Ok(m) if m.is_file() => return no_preview("too large to show"),
+        _ => return no_preview("that can't be read"),
+    };
+    let after = match (name, current.as_deref()) {
+        ("write_file", _) => input.get("content").and_then(Value::as_str).unwrap_or("").to_string(),
+        (_, None) => return ("edits a file that doesn't exist".to_string(), None),
+        (_, Some(text)) => match crate::chat_engine::apply_edit(text, input, path) {
+            Ok((updated, _)) => updated,
+            Err(why) => return (format!("edits a file, but the edit doesn't apply to it as it is now: {why}"), None),
+        },
+    };
+    let verb = match (name, &current) {
+        (_, None) => "creates a file",
+        ("edit_file", _) => "edits a file",
+        _ => "writes a file",
+    };
+    let diff = unified_diff(current.as_deref().unwrap_or(""), &after);
+    if diff.is_empty() {
+        return (format!("{verb} without changing a line"), Some(diff));
+    }
+    (verb.to_string(), Some(diff))
+}
+
+/// The unified diff from `old` to `new`: each changed line with
+/// [`DIFF_CONTEXT`] lines around it, under `@@ -a,b +c,d @@` headers, each
+/// line redacted (`secret_scan::redact_line`) and cut to [`DIFF_LINE_MAX`],
+/// at most [`DIFF_MAX_LINES`] lines with the rest counted. Empty when no
+/// line changes. Pure.
+pub fn unified_diff(old: &str, new: &str) -> String {
+    let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let mut ops: Vec<(char, &str)> = a[..pre].iter().map(|l| (' ', *l)).collect();
+    ops.extend(align(&a[pre..a.len() - suf], &b[pre..b.len() - suf]));
+    ops.extend(a[a.len() - suf..].iter().map(|l| (' ', *l)));
+    hunks(&ops)
+}
+
+/// The lines of `a` and `b` as kept (` `), removed (`-`) and added (`+`),
+/// along a longest common subsequence.
+fn align<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
+    let (n, m) = (a.len(), b.len());
+    if n == 0 || m == 0 || n.saturating_mul(m) > DIFF_MAX_CELLS {
+        return a.iter().map(|l| ('-', *l)).chain(b.iter().map(|l| ('+', *l))).collect();
+    }
+    // common[i * w + j]: the lines `a[i..]` and `b[j..]` have in common.
+    let w = m + 1;
+    let mut common = vec![0u32; (n + 1) * w];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            common[i * w + j] = if a[i] == b[j] { common[(i + 1) * w + j + 1] + 1 } else { common[(i + 1) * w + j].max(common[i * w + j + 1]) };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut ops = Vec::with_capacity(n + m);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((' ', a[i]));
+            (i, j) = (i + 1, j + 1);
+        } else if common[(i + 1) * w + j] >= common[i * w + j + 1] {
+            ops.push(('-', a[i]));
+            i += 1;
+        } else {
+            ops.push(('+', b[j]));
+            j += 1;
+        }
+    }
+    ops.extend(a[i..].iter().map(|l| ('-', *l)));
+    ops.extend(b[j..].iter().map(|l| ('+', *l)));
+    ops
+}
+
+fn hunks(ops: &[(char, &str)]) -> String {
+    // Where each op stands in the old and the new file, before it.
+    let (mut old_at, mut new_at) = (Vec::with_capacity(ops.len() + 1), Vec::with_capacity(ops.len() + 1));
+    let (mut o, mut n) = (0usize, 0usize);
+    for (kind, _) in ops {
+        old_at.push(o);
+        new_at.push(n);
+        o += usize::from(*kind != '+');
+        n += usize::from(*kind != '-');
+    }
+    old_at.push(o);
+    new_at.push(n);
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for (i, _) in ops.iter().enumerate().filter(|(_, (kind, _))| *kind != ' ') {
+        let (start, end) = (i.saturating_sub(DIFF_CONTEXT), (i + DIFF_CONTEXT + 1).min(ops.len()));
+        match groups.last_mut() {
+            Some(g) if start <= g.1 => g.1 = end,
+            _ => groups.push((start, end)),
+        }
+    }
+    let range = |at: &[usize], s: usize, e: usize| match at[e] - at[s] {
+        0 => format!("{},0", at[s]),
+        count => format!("{},{count}", at[s] + 1),
+    };
+    let total: usize = groups.iter().map(|(s, e)| e - s + 1).sum();
+    let mut out: Vec<String> = Vec::new();
+    'all: for &(s, e) in &groups {
+        if out.len() + 1 >= DIFF_MAX_LINES {
+            break;
+        }
+        out.push(format!("@@ -{} +{} @@", range(&old_at, s, e), range(&new_at, s, e)));
+        for (kind, line) in &ops[s..e] {
+            if out.len() >= DIFF_MAX_LINES {
+                break 'all;
+            }
+            // Redacted whole, then cut, so a cut never leaves part of a value.
+            let redacted = crate::secret_scan::redact_line(line, &[]);
+            let cut = crate::chat_engine::truncate_char_safe(&redacted, DIFF_LINE_MAX);
+            let more = if cut.len() < redacted.len() { "\u{2026}" } else { "" };
+            out.push(format!("{kind}{cut}{more}"));
+        }
+    }
+    if total > out.len() {
+        out.push(format!("\u{2026} {} more lines", total - out.len()));
+    }
+    out.join("\n")
 }
 
 /// What a command would change outside this Mac, or `None`. Plan only means
@@ -533,9 +793,11 @@ pub fn thread_mode_source(db: Arc<Mutex<Db>>, thread_id: String, roots: Option<V
 }
 
 /// The mode check as a [`ToolGate`], for the loop Talk sub-agents run on:
-/// each call is decided in the thread's mode first, then what the mode
-/// allows goes to `inner` (the sub-agent's approval gate). Sub-agents never
-/// get the `Agent` tool, so a Delegate call is treated as one that writes.
+/// each call is decided in the thread's mode first; one Ask first holds asks
+/// through `inner` ([`ToolGate::ask_first`]: the sub-agent's approval gate,
+/// on the director's broker, its card naming the sub-agent); then what the
+/// mode lets through meets `inner`'s guards. Sub-agents never get the
+/// `Agent` tool, so a Delegate call is treated as one that writes.
 pub struct ModeGate {
     mode: ModeSource,
     exec_roots: Option<Vec<String>>,
@@ -566,13 +828,27 @@ impl ToolGate for ModeGate {
             delegate_writes: true,
             forced: self.forced,
         };
-        if let Some(refused) = refusal(decide((self.mode)(), &ToolCall { name, input }, &ctx)) {
-            return Some(refused);
+        match decide((self.mode)(), &ToolCall { name, input }, &ctx) {
+            Decision::Allow => {}
+            Decision::Deny { message } => return Some(message),
+            Decision::Ask { .. } => {
+                let held = match &self.inner {
+                    Some(gate) => gate.ask_first(name, input).await,
+                    None => Some(CANNOT_ASK.to_string()),
+                };
+                if held.is_some() {
+                    return held;
+                }
+            }
         }
         match &self.inner {
             Some(gate) => gate.check(name, input).await,
             None => None,
         }
+    }
+
+    fn write_check(&self, name: &str, input: &Value) -> Option<crate::talk_guard::WriteCheck> {
+        self.inner.as_ref().and_then(|g| g.write_check(name, input))
     }
 }
 
@@ -610,7 +886,8 @@ mod tests {
             ("write_file", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
             ("edit_file", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
             ("a_tool_nobody_classified", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
-            ("run_command", allow.clone(), ask("runs a command", "ls"), allow.clone()),
+            // `ls` only reads, so Ask first runs it (`ask_first_reader_table`).
+            ("run_command", allow.clone(), allow.clone(), allow.clone()),
             ("mcp__docs__search", allow.clone(), allow.clone(), allow.clone()),
             ("mcp__jira__create_issue", deny(Refused::Net), allow.clone(), allow.clone()),
             ("Agent", allow.clone(), allow.clone(), allow.clone()),
@@ -636,12 +913,205 @@ mod tests {
         let plan = decide(Mode::Plan, &ToolCall { name: "run_command", input: &push }, &ctx(Some(sandboxed), &ro, false));
         assert_eq!(plan, deny(Refused::Remote("git push")));
         assert_eq!(decide(Mode::Edit, &ToolCall { name: "run_command", input: &push }, &ctx(None, &ro, false)), allow);
-        // Every refusal names the mode, and Ask first refuses until it can ask.
+        // Every refusal names the mode.
         for r in [Refused::Write, Refused::Net, Refused::Unconfined, Refused::Delegate, Refused::Remote("git push")] {
             assert!(plan_refusal(r, false).contains("Plan only mode"), "{r:?}");
         }
-        assert_eq!(refusal(ask("runs a command", "ls")), Some(ASK_UNAVAILABLE.to_string()));
-        assert_eq!(refusal(Decision::Allow), None);
+        // Ask first holds a command that doesn't only read, and the push too.
+        let touch = json!({ "command": "touch a.rs" });
+        assert_eq!(decide(Mode::Ask, &ToolCall { name: "run_command", input: &touch }, &ctx(None, &ro, false)), ask("runs a command", "touch a.rs"));
+        assert_eq!(decide(Mode::Ask, &ToolCall { name: "run_command", input: &push }, &ctx(None, &ro, false)), ask("runs a command", "git push origin main"));
+    }
+
+    /// What Ask first runs without a card: commands that only read. Anything
+    /// the check can't tell asks.
+    #[test]
+    fn ask_first_reader_table() {
+        let runs = [
+            "ls", "ls -la src", "cat README.md", "head -n 20 a.rs", "tail -n 5 log.txt", "wc -l a.rs b.rs",
+            "grep -rn 'TODO' src", "diff a.txt b.txt", "pwd", "echo hello", "stat a.rs", "which cargo",
+            "git status", "git status --porcelain", "git diff HEAD~1", "git log --oneline -5", "git show HEAD:a.rs",
+            "git blame a.rs", "git ls-files", "git rev-parse HEAD",
+            "cat a.rs | grep fn | head -3", "ls && git status; pwd", "grep x a.rs 2>/dev/null", "ls >/dev/null 2>&1",
+            "cat < a.rs", "echo $(git rev-parse HEAD)", "cat \"$FILE\"", "grep -c fn a.rs || echo none",
+        ];
+        for command in runs {
+            assert!(reads_only(command), "{command} should run without a card");
+        }
+        let asks = [
+            // Writes, or programs not on the list.
+            "touch a.rs", "rm a.rs", "mkdir x", "cp a b", "sed -i s/a/b/ a.rs", "npm test", "cargo build",
+            "find . -delete", "sort -o a.txt a.txt", "tee out.txt", "python3 -c 'print(1)'",
+            // Output redirected.
+            "echo x > a.rs", "cat a >> b", "ls &> out.txt", "grep x a.rs 2> err.txt",
+            // A reader beside a writer, or nested in one.
+            "ls; rm a.rs", "cat a.rs | tee b.rs", "echo $(rm a.rs)", "ls `touch x`", "cat <(rm -rf x)",
+            // git that writes, or git flags before the subcommand.
+            "git commit -m x", "git push", "git checkout main", "git branch -D x", "git -c core.pager=x log",
+            "git -C .. status", "git diff --output=patch.txt", "git log --output patch.txt", "git diff --ext-diff",
+            // What the check can't tell: a variable or a path as the program,
+            // an assignment before it, a wrapper, a keyword, a script.
+            "$EDITOR a.rs", "/bin/ls", "./ls", "PAGER=x git log", "env ls", "sudo cat a", "xargs cat",
+            "bash -c 'ls'", "sh script.sh", "if true; then ls; fi", "for f in *; do cat $f; done", "",
+        ];
+        for command in asks {
+            assert!(!reads_only(command), "{command} should ask");
+        }
+        assert!(!reads_only(&format!("echo {}", "$(".repeat(6))), "past the nesting it reads, it asks");
+    }
+
+    fn workspace_reach(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Reach) {
+        let (ws, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for (path, content) in files {
+            std::fs::write(ws.path().join(path), content).unwrap();
+        }
+        let reach = Reach::new(ws.path(), None, Some(home.path()));
+        (ws, home, reach)
+    }
+
+    /// In Ask first a file change waits on a card that shows its diff: the
+    /// file as it is against the file as the call would leave it.
+    #[test]
+    fn ask_edit_parks_with_diff() {
+        let ro = HashSet::new();
+        let (ws, _home, reach) = workspace_reach(&[("a.rs", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n")]);
+        let edit = json!({ "path": "a.rs", "old_string": "two", "new_string": "2" });
+        let decided = decide(Mode::Ask, &ToolCall { name: "edit_file", input: &edit }, &ctx(None, &ro, false));
+        assert_eq!(decided, Decision::Ask { reason: "changes a file".into(), preview: "a.rs".into() });
+        let card = ask_card(None, "edit_file", &edit, &reach);
+        assert_eq!((card.kind, card.shown.as_str(), card.reason.as_str()), (CardKind::Edit, "a.rs", "edits a file (Ask first)"));
+        // Three lines of context, and no more.
+        assert_eq!(card.diff.as_deref(), Some("@@ -1,5 +1,5 @@\n one\n-two\n+2\n three\n four\n five"));
+        assert!(!CardKind::Edit.grantable() && !CardKind::Exec.grantable(), "no \"don't ask again\"");
+        assert_eq!(std::fs::read_to_string(ws.path().join("a.rs")).unwrap().lines().nth(1), Some("two"), "nothing is written");
+        // A new file, and a whole file rewritten.
+        let new = ask_card(None, "write_file", &json!({ "path": "b.md", "content": "hello\nworld\n" }), &reach);
+        assert_eq!((new.reason.as_str(), new.diff.as_deref()), ("creates a file (Ask first)", Some("@@ -0,0 +1,2 @@\n+hello\n+world")));
+        assert!(!ws.path().join("b.md").exists());
+        // Credential-looking values are redacted.
+        let token = format!("ghp_{}", "a".repeat(36));
+        let secret = ask_card(None, "write_file", &json!({ "path": "c.sh", "content": format!("GITHUB_TOKEN={token}\n") }), &reach);
+        assert!(secret.diff.as_deref().is_some_and(|d| d.starts_with("@@ -0,0 +1,1 @@\n+GITHUB_TOKEN=") && !d.contains(&token)), "{secret:?}");
+        // Outside the workspace, or named like an env file: no preview, the path named.
+        for path in ["../elsewhere.txt", ".env", "deploy.pem"] {
+            let c = ask_card(None, "write_file", &json!({ "path": path, "content": "x" }), &reach);
+            assert_eq!((c.kind, c.shown.as_str(), c.diff.as_deref()), (CardKind::Edit, path, None), "{path}");
+        }
+        // A command's card shows the command; a sub-agent's names it.
+        let run = ask_card(Some("Fix the tests"), "run_command", &json!({ "command": "npm test" }), &reach);
+        assert_eq!((run.kind, run.shown.as_str()), (CardKind::Exec, "npm test"));
+        assert_eq!(run.reason, "Sub-agent \u{201c}Fix the tests\u{201d}: runs a command (Ask first)");
+        // A long diff is capped, and counts what it leaves out.
+        let long: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let capped = unified_diff("", &long);
+        assert_eq!(capped.lines().count(), DIFF_MAX_LINES + 1);
+        assert!(capped.ends_with(&format!("\u{2026} {} more lines", 1001 - DIFF_MAX_LINES)), "{:?}", capped.lines().last());
+        assert_eq!(unified_diff("same\n", "same\n"), "");
+        assert_eq!(unified_diff("a\nb\nc\n", "a\nc\n"), "@@ -1,3 +1,2 @@\n a\n-b\n c");
+    }
+
+    /// Denied, a call gets a fixed tool result and nothing runs: on the
+    /// director's card, and through a sub-agent's gate.
+    #[tokio::test]
+    async fn deny_returns_fixed_result() {
+        use crate::chat_engine::{guard_card, ApprovalDecision};
+        let (ws, _home, reach) = workspace_reach(&[("a.rs", "old\n")]);
+        let write = json!({ "path": "a.rs", "content": "new\n" });
+        let check = || Some(ask_card(None, "write_file", &write, &reach));
+        let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
+        let command = json!({ "command": "npm test" });
+        let run = || Some(ask_card(None, "run_command", &command, &reach));
+        assert_eq!(guard_card(run().unwrap(), || std::future::ready(run()), deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
+        assert_eq!(std::fs::read_to_string(ws.path().join("a.rs")).unwrap(), "old\n");
+
+        // A sub-agent's gate asks through its approval gate before the guards.
+        struct Declines(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl ToolGate for Declines {
+            async fn check(&self, name: &str, _input: &Value) -> Option<String> {
+                self.0.lock().push(format!("check {name}"));
+                None
+            }
+            async fn ask_first(&self, name: &str, _input: &Value) -> Option<String> {
+                self.0.lock().push(format!("ask {name}"));
+                Some(ASK_DECLINED_CHANGE.to_string())
+            }
+        }
+        let calls = Arc::new(Declines(Mutex::new(Vec::new())));
+        struct Shared(Arc<Declines>);
+        #[async_trait::async_trait]
+        impl ToolGate for Shared {
+            async fn check(&self, name: &str, input: &Value) -> Option<String> {
+                self.0.check(name, input).await
+            }
+            async fn ask_first(&self, name: &str, input: &Value) -> Option<String> {
+                self.0.ask_first(name, input).await
+            }
+        }
+        let gate = ModeGate::new(Arc::new(|| Mode::Ask), None, false, HashSet::new(), Some(Box::new(Shared(Arc::clone(&calls)))));
+        assert_eq!(gate.check("write_file", &write).await.as_deref(), Some(ASK_DECLINED_CHANGE));
+        assert_eq!(gate.check("run_command", &json!({ "command": "git status" })).await, None);
+        assert_eq!(*calls.0.lock(), ["ask write_file", "check run_command"], "a declined call never reaches the tool; a reader skips the card, not the guards");
+        let alone = ModeGate::new(Arc::new(|| Mode::Ask), None, false, HashSet::new(), None);
+        assert_eq!(alone.check("edit_file", &write).await.as_deref(), Some(CANNOT_ASK));
+    }
+
+    /// Once approved, the call runs only if its diff is still the one the
+    /// card showed: a file that changed while the card waited asks again.
+    #[tokio::test]
+    async fn a_file_that_changed_while_its_card_waited_asks_again() {
+        use crate::chat_engine::{guard_card, ApprovalDecision};
+        let (ws, _home, reach) = workspace_reach(&[("a.rs", "old\n")]);
+        let write = json!({ "path": "a.rs", "content": "new\n" });
+        let check = || Some(ask_card(None, "write_file", &write, &reach));
+        let shown = Mutex::new(Vec::<String>::new());
+        let approve = |c: ToolCard| {
+            let first = shown.lock().is_empty();
+            shown.lock().push(c.diff.clone().unwrap_or_default());
+            if first {
+                std::fs::write(ws.path().join("a.rs"), "changed meanwhile\n").unwrap();
+            }
+            std::future::ready(ApprovalDecision::Approve)
+        };
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), approve).await, None, "approved again, it runs");
+        let shown = shown.into_inner();
+        assert_eq!(shown, ["@@ -1,1 +1,1 @@\n-old\n+new", "@@ -1,1 +1,1 @@\n-changed meanwhile\n+new"]);
+    }
+
+    /// A mode change during a turn applies at the next round, where the
+    /// director reads it, and leaves one quiet note naming the mode now in
+    /// force. An `AppHandle` can't be built in a test, so this reads the
+    /// loop's source; the transcript side is `the_v2_transcript_skips_a_mode_note`.
+    #[test]
+    fn mode_switch_applies_next_round_with_note() {
+        for (mode, label) in [(Mode::Plan, "Plan only"), (Mode::Ask, "Ask first"), (Mode::Edit, "Edit freely")] {
+            assert_eq!(mode_note(mode), format!("Mode switched to {label} from this round on."));
+            assert!(is_mode_note("stopped", &mode_note(mode)));
+        }
+        let engine = include_str!("chat_engine.rs");
+        let from = engine.find("// \u{2500}\u{2500}\u{2500} Agentic loop").expect("the director's loop");
+        let to = from + engine[from..].find("// \u{2500}\u{2500}\u{2500} Handle tool use").expect("its tool rounds");
+        let round = &engine[from..to];
+        let read = round.find("permissions::thread_mode(").expect("the boundary reads the mode");
+        let noted = round.find("if round_mode.is_some_and(|was| was != mode) {").expect("a switch is noted");
+        let note = round.find("crate::permissions::mode_note(mode)").expect("the note names the mode");
+        let kept = round.find("round_mode = Some(mode);").expect("the round's mode is kept");
+        assert!(read < noted && noted < note && note < kept, "{round}");
+        assert_eq!(round.matches("mode_note(").count(), 1, "one note per switch");
+        // The mode it reads is the thread's, at that moment.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let thread = {
+            let d = db.lock();
+            d.insert_project("p-sw", "P", "/tmp/octo-mode-switch").unwrap();
+            d.insert_workspace("w-sw", "p-sw", "ws", "", "main", None, "", None).unwrap();
+            d.create_chat_thread("w-sw", "Switch").unwrap().id
+        };
+        let source = thread_mode_source(Arc::clone(&db), thread.clone(), None);
+        assert_eq!(source(), Mode::Edit);
+        db.lock().set_thread_permission_mode(&thread, Mode::settable("ask").unwrap()).unwrap();
+        assert_eq!(source(), Mode::Ask, "the next read sees the switch");
     }
 
     /// Plan only forced by a read-only mission says so, and never offers a
@@ -824,7 +1294,8 @@ mod tests {
         assert_eq!(Mode::from_stored(Some("plan")), Mode::Plan);
         assert_eq!(Mode::from_stored(Some("ask")), Mode::Ask);
         assert_eq!(Mode::from_stored(Some("bypass")), Mode::Plan, "an unknown mode never loosens");
-        assert_eq!((Mode::settable("plan"), Mode::settable("edit"), Mode::settable("ask")), (Some(Mode::Plan), Some(Mode::Edit), None));
+        assert_eq!((Mode::settable("plan"), Mode::settable("edit"), Mode::settable("ask")), (Some(Mode::Plan), Some(Mode::Edit), Some(Mode::Ask)));
+        assert_eq!(Mode::settable("bypass"), None);
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
@@ -965,7 +1436,10 @@ mod tests {
         let body = &engine[from..to];
         for call in [
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
-            "crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx))",
+            "match crate::permissions::decide(mode, &call, &ctx) {",
+            "if mode_asks.contains(&u.id) && skill_refusal.is_none() {",
+            "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
+            "if !reach.checked(&granted).await {",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
@@ -973,7 +1447,7 @@ mod tests {
             "self.talk_shell.available() && exec_roots.is_none()",
             "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
             "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
-            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await",
             "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
         ] {
             assert!(body.contains(call), "the director's loop no longer has: {call}");

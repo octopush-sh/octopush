@@ -63,17 +63,29 @@ pub fn looks_secret(name: &str) -> bool {
     SECRET_NAME.is_match(name)
 }
 
-/// The login Keychain. Each item is read at most once per launch and then
-/// served from memory: an ad-hoc-signed build prompts on every read (as
-/// `auth.rs` notes for the session).
-#[derive(Default)]
+/// The login Keychain, under one service ([`SERVICE`] by default). Each item
+/// is read at most once per launch and then served from memory: an
+/// ad-hoc-signed build prompts on every read (as `auth.rs` notes for the
+/// session).
 pub struct Keychain {
+    service: &'static str,
     cache: Mutex<HashMap<String, Option<String>>>,
 }
 
+impl Default for Keychain {
+    fn default() -> Self {
+        Self::for_service(SERVICE)
+    }
+}
+
 impl Keychain {
-    fn entry(account: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new(SERVICE, account).map_err(|e| format!("the Keychain is unavailable: {e}"))
+    /// The items of another Octopush service (the Epiku token, #1127).
+    pub fn for_service(service: &'static str) -> Self {
+        Self { service, cache: Mutex::default() }
+    }
+
+    fn entry(&self, account: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(self.service, account).map_err(|e| format!("the Keychain is unavailable: {e}"))
     }
 }
 
@@ -82,7 +94,7 @@ impl SecretStore for Keychain {
         if let Some(hit) = self.cache.lock().get(account) {
             return Ok(hit.clone());
         }
-        let value = match Self::entry(account)?.get_password() {
+        let value = match self.entry(account)?.get_password() {
             Ok(v) => Some(v),
             Err(keyring::Error::NoEntry) => None,
             Err(e) => return Err(format!("couldn't read it from the Keychain: {e}")),
@@ -92,7 +104,7 @@ impl SecretStore for Keychain {
     }
 
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
-        Self::entry(account)?
+        self.entry(account)?
             .set_password(value)
             .map_err(|e| format!("couldn't save it to the Keychain: {e}"))?;
         self.cache.lock().insert(account.to_string(), Some(value.to_string()));
@@ -100,7 +112,7 @@ impl SecretStore for Keychain {
     }
 
     fn delete(&self, account: &str) -> Result<(), String> {
-        let result = match Self::entry(account)?.delete_credential() {
+        let result = match self.entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(format!("couldn't delete it from the Keychain: {e}")),
         };

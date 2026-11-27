@@ -4,6 +4,7 @@ pub mod agent_adapter;
 pub mod auth;
 pub mod billing;
 pub mod chat_agents;
+pub mod chat_attachments;
 pub mod chat_engine;
 pub mod chat_history;
 pub mod collisions;
@@ -23,12 +24,15 @@ pub mod entitlement;
 pub mod entitlement_token;
 pub mod error;
 mod file_open;
+mod file_seen;
 mod fleet_status;
+pub mod fs_safe;
 mod menu_bar;
 pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
 pub mod mcp;
+pub mod name_fold;
 pub mod notify_elsewhere;
 pub mod provider_router;
 pub mod providers;
@@ -49,6 +53,7 @@ pub mod talk_guard;
 pub mod permissions;
 pub mod talk_shell;
 pub mod workspace;
+pub mod workspace_ports;
 pub mod workspace_setup;
 pub mod worktree_share;
 pub mod mission;
@@ -268,6 +273,7 @@ pub fn run() {
             commands::workspaces_git_summary,
             commands::project_collisions,
             commands::workspace_diff_size,
+            commands::workspace_ports,
             commands::get_git_diff,
             commands::get_committed_diff,
             // Chat
@@ -301,11 +307,16 @@ pub fn run() {
             commands::read_attachment,
             commands::list_mcp_tools,
             commands::list_mcp_server_status,
+            commands::list_user_mcp_server_status,
+            commands::list_mcp_trust,
+            commands::revoke_mcp_trust,
             commands::list_project_instructions,
             commands::get_thread_mcp_disabled,
             commands::set_thread_mcp_server,
             commands::get_thread_permission_mode,
             commands::set_thread_permission_mode,
+            commands::list_thread_grants,
+            commands::revoke_thread_grant,
             commands::get_mcp_config,
             commands::save_mcp_config,
             commands::test_mcp_server,
@@ -475,6 +486,12 @@ pub fn run() {
             commands::list_issues_in_epic,
             commands::get_issue_tracker_config,
             commands::save_issue_tracker_config,
+            commands::get_project_issue_tracker,
+            commands::set_project_issue_tracker,
+            commands::get_epiku_config,
+            commands::save_epiku_config,
+            commands::remove_epiku_config,
+            commands::check_epiku_connection,
             // AI primitive (G5)
             commands::ai_complete,
             commands::generate_chat_title,
@@ -487,6 +504,8 @@ pub fn run() {
             commands::claude_known_bad_note,
             commands::codex_trust_note,
             commands::repo_hooks_notice,
+            commands::skill_shell_off,
+            commands::set_skill_shell_off,
             commands::model_retirements,
             commands::readiness_check,
             // Role commands
@@ -617,13 +636,23 @@ pub fn run() {
                     Ok(n) => tracing::info!(count = n, "recovered interrupted run stages"),
                     Err(e) => tracing::error!(error = %e, "failed to recover interrupted runs"),
                 }
+                // Talk turns a restart cut off mid-turn end with a note
+                // saying so, instead of no final row at all.
+                let running = |thread: &str| st.chat.is_running(thread);
+                match st.db.lock().note_interrupted_talk_turns(chat_engine::RESTART_NOTE, &running) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "noted Talk turns interrupted by a restart"),
+                    Err(e) => tracing::error!(error = %e, "failed to note interrupted Talk turns"),
+                }
                 let sink = std::sync::Arc::new(orchestrator::events::TauriEventSink {
                     app: app.handle().clone(),
                 });
-                let orch = std::sync::Arc::new(orchestrator::Orchestrator::new(
-                    std::sync::Arc::clone(&st.db),
-                    sink,
-                ));
+                // API stages reach the MCP servers they chose through Talk's
+                // registry (#1134).
+                let orch = std::sync::Arc::new(
+                    orchestrator::Orchestrator::new(std::sync::Arc::clone(&st.db), sink)
+                        .with_mcp(std::sync::Arc::clone(&st.chat.mcp)),
+                );
                 // Detached bridge: re-emits worker-driven runs' persisted
                 // progress as live run://* events, repairs runs whose worker
                 // died, and adopts leases from a previous app session.
@@ -768,8 +797,12 @@ fn restore_active_sessions(app: tauri::AppHandle, state: &AppState) {
             continue;
         }
 
-        let guard =
+        let mut guard =
             crate::context_guard::ContextGuard::auto_configure(&session.id, std::path::Path::new(&session.project_root));
+        let ports = crate::workspace_ports::ensure_for_root(&state.db.lock(), &session.project_root);
+        if let Some(block) = ports {
+            guard.set_ports(block);
+        }
         let mut env = std::collections::HashMap::new();
         guard.apply_env(&mut env);
 

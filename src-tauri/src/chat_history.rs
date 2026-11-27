@@ -571,6 +571,18 @@ pub(crate) fn summarize_tool_row(id: i64, content: &str, budget: usize) -> Optio
 ///
 /// Consecutive same-role turns are merged, so the output alternates.
 pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
+    build_history_landing(rows, &std::collections::HashSet::new()).0
+}
+
+/// [`build_history`], and for each turn the user rows of `with_images`
+/// (asks that carry images, #1159) it holds, so `chat_attachments::attach`
+/// can put their images back. Such an ask makes a turn even when its text
+/// is empty (an image sent alone); with no such ask the turns are
+/// [`build_history`]'s.
+pub fn build_history_landing(
+    rows: &[HistoryRow<'_>],
+    with_images: &std::collections::HashSet<i64>,
+) -> (Vec<HistoryTurn>, Vec<Vec<i64>>) {
     // Pass 1 — how many turns ago each tool row ran. The row being sent is
     // already persisted as the trailing user row, so "user rows after this
     // one, minus that one" counts completed turns since the tool ran.
@@ -607,17 +619,28 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
 
     // Pass 2 — assemble.
     let mut turns: Vec<HistoryTurn> = Vec::new();
+    let mut landing: Vec<Vec<i64>> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
-    let push_turn = |turns: &mut Vec<HistoryTurn>, role: HistoryRole, text: String| {
-        if text.is_empty() {
+    let push_turn = |turns: &mut Vec<HistoryTurn>, landing: &mut Vec<Vec<i64>>, role: HistoryRole, text: String, ask: Option<i64>| {
+        if text.is_empty() && ask.is_none() {
             return;
         }
         match turns.last_mut() {
             Some(last) if last.role == role => {
-                last.text.push_str("\n\n");
-                last.text.push_str(&text);
+                if !text.is_empty() {
+                    if !last.text.is_empty() {
+                        last.text.push_str("\n\n");
+                    }
+                    last.text.push_str(&text);
+                }
+                if let (Some(id), Some(asks)) = (ask, landing.last_mut()) {
+                    asks.push(id);
+                }
             }
-            _ => turns.push(HistoryTurn { role, text }),
+            _ => {
+                turns.push(HistoryTurn { role, text });
+                landing.push(ask.into_iter().collect());
+            }
         }
     };
     let flush = |pending: &mut Vec<String>, tail: &str| -> String {
@@ -649,14 +672,15 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
             }
             "assistant" => {
                 let text = flush(&mut pending, row.content.trim());
-                push_turn(&mut turns, HistoryRole::Assistant, text);
+                push_turn(&mut turns, &mut landing, HistoryRole::Assistant, text, None);
             }
             "user" => {
                 let text = match row.context {
                     Some(ctx) if Some(i) != current => flush(&mut pending, &abridge_context(row.id, row.content, ctx)),
                     _ => flush(&mut pending, row.content),
                 };
-                push_turn(&mut turns, HistoryRole::User, text);
+                let ask = Some(row.id).filter(|id| with_images.contains(id));
+                push_turn(&mut turns, &mut landing, HistoryRole::User, text, ask);
             }
             _ => {}
         }
@@ -664,8 +688,8 @@ pub fn build_history(rows: &[HistoryRow<'_>]) -> Vec<HistoryTurn> {
     // A turn continued with no new message (the error card's "Try again"):
     // what it did before it failed rides on its ask, as on a next one.
     let rest = flush(&mut pending, "");
-    push_turn(&mut turns, HistoryRole::User, rest);
-    turns
+    push_turn(&mut turns, &mut landing, HistoryRole::User, rest, None);
+    (turns, landing)
 }
 
 #[cfg(test)]

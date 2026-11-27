@@ -166,9 +166,18 @@ pub fn tool_rows(rows: &[Row<'_>]) -> HashMap<String, i64> {
 
 /// The history a v2 turn starts from, on `model`. The ask being answered
 /// (the last user row) goes out whole; `error`, `stopped` and unknown rows
-/// are never replayed; consecutive text turns of one role merge, so roles
+/// are never replayed, and a mode switch's note inside a turn doesn't stop
+/// it replaying as pairs; consecutive text turns of one role merge, so roles
 /// alternate.
 pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
+    build_landing(rows, model, &HashSet::new()).0
+}
+
+/// [`build`], and for each message the user rows of `with_images` (asks
+/// that carry images, #1159) it holds, for `chat_attachments::attach`. Such
+/// an ask makes a message even when its text is empty; with no such ask the
+/// messages are [`build`]'s.
+pub fn build_landing(rows: &[Row<'_>], model: &str, with_images: &HashSet<i64>) -> (Vec<LlmMessage>, Vec<Vec<i64>>) {
     let current = rows.iter().rposition(|r| r.role == "user");
     // The turns that replay as pairs, by their ask's index. An empty ask
     // (an image alone) renders as text, so pairs always follow a user message.
@@ -192,6 +201,7 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
     let shortened: usize = rows.iter().filter(|r| r.role == "user").filter_map(|r| Some(shortened_context_len(r.content, r.context?))).sum();
     let mut allowance = plan_tool_history_with(&text_tools, shortened).into_iter();
     let mut out: Vec<LlmMessage> = Vec::new();
+    let mut landing: Vec<Vec<i64>> = Vec::new();
     let mut pending: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rows.len() {
@@ -203,8 +213,10 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
                     Some(ctx) if Some(i - 1) != current => abridge_context(row.id, row.content, ctx),
                     _ => row.content.to_string(),
                 };
-                push_text(&mut out, LlmRole::User, flush(&mut pending, &text));
+                let ask = Some(row.id).filter(|id| with_images.contains(id));
+                push_text(&mut out, &mut landing, LlmRole::User, flush(&mut pending, &text), ask);
                 if let Some((turn, next)) = pairs.remove(&(i - 1)) {
+                    landing.extend(turn.iter().map(|_| Vec::new()));
                     out.extend(turn);
                     i = next;
                 }
@@ -216,14 +228,14 @@ pub fn build(rows: &[Row<'_>], model: &str) -> Vec<LlmMessage> {
                 }
             }
             "tool" => pending.extend(summarize_tool_row(row.id, row.content, allowance.next().unwrap_or(TOOL_HISTORY_STUB))),
-            "assistant" => push_text(&mut out, LlmRole::Assistant, flush(&mut pending, row.content.trim())),
+            "assistant" => push_text(&mut out, &mut landing, LlmRole::Assistant, flush(&mut pending, row.content.trim()), None),
             _ => {}
         }
     }
     // A turn continued with no new message (the error card's "Try again"):
     // what it did before it failed rides on its ask, as on a next one.
-    push_text(&mut out, LlmRole::User, flush(&mut pending, ""));
-    out
+    push_text(&mut out, &mut landing, LlmRole::User, flush(&mut pending, ""), None);
+    (out, landing)
 }
 
 /// A turn's rounds as tool_use and tool_result pairs, then its answer,
@@ -249,15 +261,27 @@ fn paired(rows: &[Row<'_>], start: usize, model: &str) -> Option<(Vec<LlmMessage
                 let mut results = Vec::with_capacity(round.tool_uses.len());
                 for (k, call) in round.tool_uses.iter().enumerate() {
                     let r = rows.get(i + 1 + k).filter(|r| r.role == "tool" && r.tool_use_id == Some(call.id.as_str()))?;
-                    results.push(LlmToolResult { tool_use_id: call.id.clone(), content: r.model_view?.to_string(), is_error: false });
+                    let is_error = serde_json::from_str::<Value>(r.content).is_ok_and(|v| tool_row_is_error(&v));
+                    results.push(LlmToolResult { tool_use_id: call.id.clone(), content: r.model_view?.to_string(), is_error });
                 }
                 i += 1 + results.len();
                 turn.push(round.turn(model));
                 turn.push(LlmMessage { role: LlmRole::User, content: LlmContent::ToolResults(results) });
             }
+            // A mode switch's note between rounds (#1231) was never sent.
+            role if crate::permissions::is_mode_note(role, row.content) => i += 1,
             _ => return None,
         }
     }
+}
+
+/// Whether a tool row's result goes to the model as an error: the call
+/// failed or was denied (the row's stamped `ok` is false). A row from before
+/// the stamp carries no `ok` and reads as it was sent then, not an error.
+/// The live round and its replay both read it here, so a later turn
+/// re-sends the round byte for byte and its cached prefix holds.
+pub(crate) fn tool_row_is_error(row: &Value) -> bool {
+    row.get("ok").and_then(Value::as_bool) == Some(false)
 }
 
 /// A stored tool row's result length, as `chat_history` plans it.
@@ -276,18 +300,28 @@ fn flush(pending: &mut Vec<String>, tail: &str) -> String {
     text
 }
 
-fn push_text(out: &mut Vec<LlmMessage>, role: LlmRole, text: String) {
-    if text.is_empty() {
+/// `text` as a `role` message, merged into the last one when it is a text
+/// message of that role; `ask` is the user row it holds, when it has images.
+fn push_text(out: &mut Vec<LlmMessage>, landing: &mut Vec<Vec<i64>>, role: LlmRole, text: String, ask: Option<i64>) {
+    if text.is_empty() && ask.is_none() {
         return;
     }
     if let Some(LlmMessage { role: last, content: LlmContent::Text(t) }) = out.last_mut() {
         if *last == role {
-            t.push_str("\n\n");
-            t.push_str(&text);
+            if !text.is_empty() {
+                if !t.is_empty() {
+                    t.push_str("\n\n");
+                }
+                t.push_str(&text);
+            }
+            if let (Some(id), Some(asks)) = (ask, landing.last_mut()) {
+                asks.push(id);
+            }
             return;
         }
     }
     out.push(LlmMessage { role, content: LlmContent::Text(text) });
+    landing.push(ask.into_iter().collect());
 }
 
 #[cfg(test)]
@@ -369,6 +403,7 @@ mod tests {
             tool_choice: None,
             effort,
             cache: false,
+            cache_key: None,
         };
         if openai { openai_compat::build_request(&req)["messages"].clone() } else { anthropic::build_request(&req)["messages"].clone() }
     }
@@ -450,6 +485,44 @@ mod tests {
             assert!(out.windows(2).all(|w| w[0].role != w[1].role), "{out:?}");
             assert!(out.iter().any(|m| text(m).contains("[Tool #3: read_file")), "{out:?}");
         }
+    }
+
+    /// A mode switch during a turn leaves a quiet note before the next round
+    /// (#1231); the turn still replays as the pairs it sent, byte for byte.
+    #[test]
+    fn the_v2_transcript_skips_a_mode_note() {
+        use crate::permissions::{is_mode_note, mode_note, Mode};
+        let round = |id: &str| {
+            serde_json::to_string(&RoundRecord {
+                model: "m".into(),
+                raw: vec![],
+                text: String::new(),
+                tool_uses: vec![LlmToolUse { id: id.into(), name: "read_file".into(), input: json!({ "path": "a.rs" }) }],
+            })
+            .unwrap()
+        };
+        let (r1, r2) = (round("tu_1"), round("tu_2"));
+        let (t1, t2) = (tool_record("tu_1", "read_file", "one"), tool_record("tu_2", "read_file", "two"));
+        let note = mode_note(Mode::Ask);
+        assert_eq!(note, "Mode switched to Ask first from this round on.");
+        assert!(is_mode_note("stopped", &note) && !is_mode_note("assistant", &note) && !is_mode_note("stopped", "Generation stopped."));
+        let plain = vec![
+            Row { id: 1, role: "user", content: "read both", ..Row::default() },
+            Row { id: 2, role: "assistant_tool_use", content: "[tool_calls: []]", raw_json: Some(r1.as_str()), ..Row::default() },
+            Row { id: 3, role: "tool", content: &t1, tool_use_id: Some("tu_1"), model_view: Some("one"), ..Row::default() },
+            Row { id: 4, role: "assistant_tool_use", content: "[tool_calls: []]", raw_json: Some(r2.as_str()), ..Row::default() },
+            Row { id: 5, role: "tool", content: &t2, tool_use_id: Some("tu_2"), model_view: Some("two"), ..Row::default() },
+            Row { id: 6, role: "assistant", content: "Done.", ..Row::default() },
+            Row { id: 7, role: "user", content: "next", ..Row::default() },
+        ];
+        // One note before the second round, one before the answer.
+        let mut noted = plain.clone();
+        noted.insert(3, Row { id: 30, role: "stopped", content: &note, ..Row::default() });
+        noted.insert(6, Row { id: 31, role: "stopped", content: &note, ..Row::default() });
+        let (sent, replayed) = (build(&plain, "m"), build(&noted, "m"));
+        assert!(matches!(replayed[1].content, LlmContent::AssistantWithTools { .. }), "{replayed:?}");
+        assert_eq!(format!("{sent:?}"), format!("{replayed:?}"));
+        assert!(!format!("{replayed:?}").contains("Mode switched"));
     }
 
     #[test]
@@ -561,6 +634,47 @@ mod tests {
             }
         }
         assert_eq!(assistants(&messages), before);
+    }
+
+    #[test]
+    fn a_failed_or_denied_call_replays_as_an_error() {
+        // One round of three calls: one passed, one failed, one from before
+        // the outcome stamp (no `ok`).
+        let mut owned = v2_turn(10, &["a".to_string(), "b".to_string(), "c".to_string()]);
+        let stamp = |row: &mut Owned, ok: bool| {
+            let mut v: Value = serde_json::from_str(&row.content).unwrap();
+            v["ok"] = json!(ok);
+            row.content = v.to_string();
+        };
+        stamp(&mut owned[2], true);
+        stamp(&mut owned[3], false);
+        owned.push(Owned { id: 20, role: "user", content: "next".into(), ..Owned::default() });
+        let rows: Vec<Row> = owned.iter().map(Owned::row).collect();
+        let messages = build(&rows, "m");
+        let flags: Vec<bool> = messages
+            .iter()
+            .flat_map(|m| match &m.content {
+                LlmContent::ToolResults(results) => results.iter().map(|r| r.is_error).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(flags, [false, true, false]);
+        // The live round reads the same row the same way.
+        assert!(tool_row_is_error(&json!({ "ok": false, "outcome": "denied" })));
+        assert!(!tool_row_is_error(&json!({ "ok": true })));
+        assert!(!tool_row_is_error(&json!({ "result": "legacy" })));
+        // Anthropic is told.
+        let sent = sent("claude-sonnet-5-5", &messages, false);
+        let failed = sent
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_array())
+            .flatten()
+            .find(|b| b["tool_use_id"] == "tu_10_1")
+            .cloned()
+            .expect("the failed call's result is sent");
+        assert_eq!(failed["is_error"], json!(true), "{sent}");
     }
 
     #[test]

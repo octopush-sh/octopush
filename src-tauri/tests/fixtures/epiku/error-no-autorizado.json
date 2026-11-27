@@ -1,0 +1,1 @@
+{ "error": "no_autorizado", "mensaje": "Envía la cabecera Authorization: Bearer <token>." }
