@@ -365,6 +365,38 @@ const HOME_RUNS_CODE: &[(&str, &str)] = &[
     (".gitconfig", "Git's config can make Git run programs"), (".ssh/config", "ssh runs what it names"),
 ];
 
+/// Whether a write at `names` (a path's components, lowercased) is a
+/// project's agent or CI config, which runs code or instructs an agent the
+/// next time a tool opens the project (#1229): anything under `.claude/`,
+/// `.mcp.json`, `CLAUDE.md` and `AGENTS.md`; `.github/workflows/`,
+/// `.github/actions/`, `.gitlab-ci.yml`, `.circleci/`, `.buildkite/`,
+/// `azure-pipelines.yml`, `Jenkinsfile` and `bitbucket-pipelines.yml`;
+/// `.husky/`, `.envrc`, `.vscode/tasks.json` and `.vscode/launch.json`. At
+/// any depth. Pure.
+fn project_config_runs(names: &[String]) -> Option<&'static str> {
+    let has = |name: &str| names.iter().any(|n| n == name);
+    let pair = |a: &str, b: &str| names.windows(2).any(|w| w[0] == a && w[1] == b);
+    let last = names.last().map(String::as_str);
+    if has(".claude") {
+        return Some("Claude Code loads its settings, hooks, commands, agents and skills from it");
+    }
+    match last {
+        Some(".mcp.json") => return Some("Claude Code starts the MCP servers it names"),
+        Some("claude.md" | "agents.md") => return Some("coding agents follow it as their instructions"),
+        Some(".gitlab-ci.yml" | "azure-pipelines.yml" | "bitbucket-pipelines.yml" | "jenkinsfile") => return Some("CI runs what it says"),
+        Some(".envrc") => return Some("direnv runs it on entering the folder"),
+        _ => {}
+    }
+    if pair(".github", "workflows") || pair(".github", "actions") || has(".circleci") || has(".buildkite") {
+        return Some("CI runs what it says");
+    }
+    if has(".husky") {
+        return Some("husky runs it as a Git hook");
+    }
+    let in_vscode = names.len() >= 2 && names[names.len() - 2] == ".vscode";
+    (in_vscode && matches!(last, Some("tasks.json" | "launch.json"))).then_some("VS Code runs the tasks and launch configurations in it")
+}
+
 /// Whether a write at `rest`, below a Git folder (`.git`, or a bare
 /// `*.git`), makes code run, and what runs it (#1229): `config`,
 /// `config.worktree`, `hooks/`, `info/`, `worktrees/*/config.worktree`,
@@ -650,7 +682,9 @@ impl Reach {
     /// later: Git's hooks, config and info files in any `.git` folder, login
     /// items, shell startup files and SSH's config, each as named and where
     /// it resolves, without case. Such a path always asks and is never
-    /// granted, inside the workspace too.
+    /// granted, inside the workspace too. Outside the workspace, so in any
+    /// folder a grant could cover, a project's agent and CI config too
+    /// ([`project_config_runs`]).
     fn runs_code(&self, path: &Path) -> Option<&'static str> {
         let names: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
         // A worktree's `.git` file names the Git folder Git uses.
@@ -665,6 +699,12 @@ impl Reach {
         }
         if let Some((_, _, why)) = self.runs_code.iter().find(|(place, resolved, _)| std::iter::once(place).chain(resolved).any(|p| under(path, p))) {
             return Some(*why);
+        }
+        // A project's agent or CI config outside the workspace, where a
+        // folder grant reaches (#1229); the workspace's own show in its diff.
+        let in_workspace = self.root.iter().chain(std::iter::once(&self.workspace)).any(|r| under(path, r));
+        if let Some(why) = project_config_runs(&names).filter(|_| !in_workspace) {
+            return Some(why);
         }
         // Fails closed: a repository Git couldn't answer for counts as running code.
         let hooks = self.hooks_dir(path);
@@ -1801,6 +1841,52 @@ mod tests {
         assert!(director_card("mcp__other__thing", &json!({}), &mcp, &reach, false, &[]).is_some(), "an undiscovered tool asks");
         for (name, input) in [("mcp__github__get_issue", json!({"number": 7})), ("read_file", json!({"path": "a.txt"}))] {
             assert_eq!(director_card(name, &input, &mcp, &reach, false, &[]), None, "{name}");
+        }
+    }
+
+    /// A project's agent and CI config outside the workspace runs code the
+    /// next time a tool opens that project (#1229): a write there always
+    /// asks and offers nothing to keep, under a granted folder too, at any
+    /// depth, without case, where it resolves through a link or `..`. The
+    /// workspace's own are unchanged (its diff shows them).
+    #[test]
+    fn agent_and_ci_config_under_a_granted_folder_always_asks() {
+        let (_d, ws, home) = setup();
+        let out = home.join("out");
+        std::fs::create_dir_all(out.join("proj/.claude")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let granted = [Grant { kind: GrantKind::Write, value: out.to_string_lossy().into_owned(), shown: "~/out".into() }];
+        let write = |path: PathBuf, grants: &[Grant]| reach.outside_card(None, "write_file", &json!({"path": path, "content": "c"}), false, grants);
+        assert_eq!(write(out.join("proj/notes.md"), &granted), None, "the folder's grant covers an ordinary file");
+        let places = [
+            "proj/.claude/settings.json", "proj/.claude/settings.local.json", "proj/.claude/hooks/pre.sh", "proj/.claude/commands/x.md",
+            "proj/.claude/agents/a.md", "proj/.claude/skills/s/SKILL.md", "proj/.mcp.json", "proj/CLAUDE.md", "proj/sub/AGENTS.md",
+            "proj/.github/workflows/ci.yml", "proj/.github/actions/setup/action.yml", "proj/.gitlab-ci.yml", "proj/.circleci/config.yml",
+            "proj/.buildkite/pipeline.yml", "proj/azure-pipelines.yml", "proj/Jenkinsfile", "proj/bitbucket-pipelines.yml",
+            "proj/.husky/pre-commit", "proj/.envrc", "proj/.vscode/tasks.json", "proj/.vscode/launch.json",
+            // Without case, at any depth, and through `..`.
+            "PROJ/.Claude/Settings.json", "a/b/c/.GITHUB/Workflows/deploy.YML", "proj/x/../.husky/_/h",
+        ];
+        for rel in places {
+            let c = write(out.join(rel), &granted).unwrap_or_else(|| panic!("{rel} asks under a granted folder"));
+            assert!(c.reason.contains("it runs code") && c.grant.is_none(), "{rel}: {}", c.reason);
+        }
+        #[cfg(unix)]
+        {
+            // A link in the granted folder to a project's `.claude`.
+            std::os::unix::fs::symlink(out.join("proj/.claude"), out.join("cfg")).unwrap();
+            assert!(write(out.join("cfg/settings.json"), &granted).is_some_and(|c| c.reason.contains("Claude Code") && c.grant.is_none()));
+        }
+        // No grant covers them, none is offered for them, and a command
+        // writing one asks even when the conversation holds it exactly.
+        let forged = [Grant { kind: GrantKind::Write, value: out.join("proj/.claude").to_string_lossy().into_owned(), shown: String::new() }];
+        assert!(write(out.join("proj/.claude/settings.json"), &forged).is_some() && !reach.rememberable(&out.join("proj/.github/workflows")));
+        let command = "echo '{}' > ~/out/proj/.claude/settings.json";
+        assert_eq!(reach.command_grant(command, None), None);
+        assert!(reach.command_card(None, command, None, &[reach.exact(command, &ws).unwrap()]).is_some());
+        // The workspace's own: as before.
+        for rel in [".claude/settings.json", ".github/workflows/ci.yml", "CLAUDE.md"] {
+            assert_eq!(write(ws.join(rel), &[]), None, "{rel} in the workspace");
         }
     }
 

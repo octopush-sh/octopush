@@ -8341,6 +8341,31 @@ mod tests {
         }
     }
 
+    /// A hook in a project's `.claude/settings.json`, or a CI workflow,
+    /// under a granted folder (#1229): its card asks in Edit freely and in
+    /// Ask first, and offers nothing to keep.
+    #[test]
+    fn a_claude_hook_or_a_workflow_under_a_granted_folder_asks_in_edit_freely_and_ask_first() {
+        use crate::permissions::{Decision, Mode};
+        for mode in [Mode::Edit, Mode::Ask] {
+            let w = granted_write_in(mode);
+            let home = w.root.join("home");
+            for (path, content) in [
+                (home.join("out/proj/.claude/settings.json"), r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh x"}]}]}}"#),
+                (home.join("out/proj/.github/workflows/ci.yml"), "on: push\njobs: {}\n"),
+            ] {
+                let input = serde_json::json!({ "path": path, "content": content });
+                let read_only = std::collections::HashSet::new();
+                let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+                let decision = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: "write_file", input: &input }, &ctx);
+                assert_eq!(matches!(decision, Decision::Ask { .. }), mode == Mode::Ask, "{mode:?}");
+                assert!(!w.reach.granted("write_file", &input, None, false, &w.grants), "{mode:?}: the grant isn't a yes for {path:?}");
+                let card = w.reach.outside_card(None, "write_file", &input, false, &w.grants).unwrap_or_else(|| panic!("{mode:?}: {path:?} asks"));
+                assert!(card.reason.contains("it runs code") && card.grant.is_none(), "{mode:?}: {}", card.reason);
+            }
+        }
+    }
+
     #[test]
     fn a_granted_write_is_refused_in_plan_only() {
         let w = granted_write_in(crate::permissions::Mode::Plan);
