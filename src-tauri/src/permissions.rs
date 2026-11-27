@@ -218,6 +218,14 @@ pub const ASK_DECLINED_COMMAND: &str = "Not run: the user declined this command 
 pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
     let field = |key: &str| call.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     let refuse = |r: Refused| Decision::Deny { message: plan_refusal(r, ctx.forced) };
+    // In every mode, before any other check: a control character the shared
+    // shell's line editor would act on (`\r` ends the line there) means
+    // what runs isn't what the checks read (#1231).
+    if matches!(classify(call.name), Class::Exec) {
+        if let Some(message) = crate::chat_engine::control_refusal(&field("command")) {
+            return Decision::Deny { message };
+        }
+    }
     match (mode, classify(call.name)) {
         (Mode::Edit, _) | (_, Class::Read | Class::Meta) => Decision::Allow,
         (Mode::Plan, Class::Write) => refuse(Refused::Write),
@@ -256,6 +264,10 @@ const GIT_READERS: &[&str] = &["status", "diff", "log", "show", "blame", "ls-fil
 /// a shell keyword, a script, or nesting past the check's caps.
 pub fn reads_only(command: &str) -> bool {
     !command.trim().is_empty()
+        && crate::chat_engine::control_refusal(command).is_none()
+        // A line continued with `\` can hide an expansion from the check
+        // (`$\⏎{PWD:_}`): it asks.
+        && !command.contains("\\\n")
         && !runs_arithmetic(command)
         && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
 }
@@ -286,11 +298,12 @@ fn runs_arithmetic(command: &str) -> bool {
 }
 
 /// Whether `command` runs `git` from outside `workspace` (#1231): `cwd` is
-/// where it starts (the shared shell's directory, `None` for the workspace
-/// root), resolved on the disk, links followed. Ask first's git readers skip
-/// the card only inside the workspace: elsewhere a repository's own config
-/// (`core.fsmonitor`, a bare repository's) can run code. A directory that
-/// can't be resolved counts as outside.
+/// where it starts (the shared shell's directory, or the workspace root for
+/// a command run elsewhere), resolved on the disk, links followed. Ask
+/// first's git readers skip the card only inside the workspace: elsewhere a
+/// repository's own config (`core.fsmonitor`, a bare repository's) can run
+/// code. An unknown start (`None`: a reattached shell whose directory isn't
+/// read yet) and a directory that can't be resolved count as outside.
 pub fn git_outside(command: &str, cwd: Option<&Path>, workspace: &Path) -> bool {
     use crate::chat_engine::WordRole;
     let runs_git = crate::chat_engine::each_command(command, |line| {
@@ -299,7 +312,7 @@ pub fn git_outside(command: &str, cwd: Option<&Path>, workspace: &Path) -> bool 
     if matches!(runs_git, Ok(None)) {
         return false;
     }
-    let Some(cwd) = cwd else { return false };
+    let Some(cwd) = cwd else { return true };
     match (std::fs::canonicalize(cwd), std::fs::canonicalize(workspace)) {
         (Ok(at), Ok(workspace)) => !at.starts_with(workspace),
         _ => true,
@@ -433,22 +446,28 @@ fn change_bound(full: &Path, input: &Value) -> [u8; 32] {
 /// tool's own words; a file the card wouldn't preview isn't read here.
 pub fn refused_before_card(reach: &Reach, name: &str, input: &Value, roots: Option<&[String]>) -> Option<String> {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("");
-    let full = reach.workspace().join(path);
-    let sandboxed = |verb: &str| {
-        let outside = roots.is_some_and(|roots| !crate::orchestrator::sandbox::is_write_allowed(&full, roots));
-        outside.then(|| format!("Sandboxed: refusing to {verb} outside the mission workspace ({path})"))
-    };
-    match name {
-        "write_file" => sandboxed("write"),
-        "edit_file" if !previewed(reach, name, input, path) => None,
-        "edit_file" => crate::chat_engine::edit_input_problem(input)
-            .or_else(|| match std::fs::read_to_string(&full) {
+    sandbox_refusal(reach, name, input, roots).or_else(|| {
+        (name == "edit_file" && previewed(reach, name, input, path)).then(|| {
+            crate::chat_engine::edit_input_problem(input).or_else(|| match std::fs::read_to_string(reach.workspace().join(path)) {
                 Ok(content) => crate::chat_engine::apply_edit(&content, input, path).err(),
                 Err(e) => Some(format!("Error reading {path}: {e}")),
             })
-            .or_else(|| sandboxed("edit")),
-        _ => None,
-    }
+        })?
+    })
+}
+
+/// A write or edit outside a sandboxed mission's roots, in the tool's own
+/// words, or `None`: refused in every mode before any card asks about it.
+/// Lexical, like the tool's own check; nothing is read.
+pub fn sandbox_refusal(reach: &Reach, name: &str, input: &Value, roots: Option<&[String]>) -> Option<String> {
+    let verb = match name {
+        "write_file" => "write",
+        "edit_file" => "edit",
+        _ => return None,
+    };
+    let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+    let outside = roots.is_some_and(|roots| !crate::orchestrator::sandbox::is_write_allowed(&reach.workspace().join(path), roots));
+    outside.then(|| format!("Sandboxed: refusing to {verb} outside the mission workspace ({path})"))
 }
 
 /// What an Ask first card adds when the change it stood for moved while it
@@ -1123,6 +1142,53 @@ mod tests {
         assert!(!reads_only(&format!("echo {}", "$(".repeat(6))), "past the nesting it reads, it asks");
     }
 
+    /// The shared shell's line editor acts on control characters as keys
+    /// (`\r` ends the line, DEL erases), so a command holding one is
+    /// refused before any check, in every mode: `echo hi\rtouch x` would
+    /// run `touch` with no card.
+    #[test]
+    fn a_control_character_is_refused_in_every_mode_before_any_check() {
+        let ro = HashSet::new();
+        let refused = |mode: Mode, command: &str| {
+            let input = json!({ "command": command });
+            match decide(mode, &ToolCall { name: "run_command", input: &input }, &ctx(None, &ro, false)) {
+                Decision::Deny { message } => Some(message),
+                _ => None,
+            }
+        };
+        for mode in [Mode::Plan, Mode::Ask, Mode::Edit] {
+            let why = refused(mode, "echo hi\rtouch x").unwrap_or_else(|| panic!("{mode:?} let it through"));
+            assert!(why.starts_with("Not run: the command holds the control character U+000D (carriage return)"), "{why}");
+            let plain = refused(mode, "ls\t-la\nls");
+            assert!(plain.is_none_or(|m| !m.contains("control character")), "{mode:?}: a tab and a newline pass");
+        }
+        assert!(!reads_only("echo hi\rtouch x"), "the reader check reads `\\r` as a space; readline ends the line there");
+        // Edit freely's command check is fooled the same way: readline's
+        // DEL erases the `x`, so `rm -rf /` runs.
+        assert_eq!(crate::chat_engine::dangerous_command("rx\u{7f}m -rf /"), None);
+        assert!(refused(Mode::Edit, "rx\u{7f}m -rf /").is_some_and(|w| w.contains("U+007F (delete)")));
+        for (command, named) in [("ls\u{1b}[A", "U+001B (escape)"), ("ls\u{3}", "U+0003 (Ctrl-C)"), ("ls\u{4}", "U+0004 (Ctrl-D)"), ("ls\u{15}", "U+0015 (Ctrl-U)"), ("ls\u{0}", "U+0000"), ("ls\u{9b}", "U+009B")] {
+            assert!(refused(Mode::Edit, command).is_some_and(|w| w.contains(named)), "{command:?}");
+        }
+    }
+
+    /// A line continued with `\` can hide an expansion from the reader
+    /// check: bash joins `$\⏎{PWD:_}` into `${PWD:_}`, which runs `touch`.
+    #[test]
+    fn a_line_continuation_asks() {
+        for command in ["echo $'a[\\x24(touch x)]'; echo $\\\n{PWD:_}", "echo $'a[\\x24(touch x)]'; echo $\\\n[_]", "ls \\\n-la"] {
+            assert!(!reads_only(command), "{command:?} should ask");
+        }
+        // `$'\x24'` decodes to a plain `$`, which bash never expands again.
+        assert!(reads_only("echo $'\\x24'{PWD:_}"));
+        let dir = tempfile::tempdir().unwrap();
+        let run = |command: &str| std::process::Command::new("/bin/bash").arg("-c").arg(command).current_dir(dir.path()).output().unwrap();
+        run("echo 'a[$(touch x)]' >/dev/null; echo $'\\x24'{PWD:_} >/dev/null; echo $'\\x24(touch y)' >/dev/null");
+        assert!(!dir.path().join("x").exists() && !dir.path().join("y").exists(), "bash ran a decoded `$`");
+        run("echo $'a[\\x24(touch z)]' >/dev/null; echo $\\\n{PWD:_} >/dev/null");
+        assert!(dir.path().join("z").exists(), "the continuation does run it: the case the check asks for");
+    }
+
     /// Arithmetic runs what a variable holds, `$_` included, so a reader
     /// that expands it asks: `echo 'a[$(touch x)]'; echo ${PWD:_}` runs
     /// `touch x` in bash.
@@ -1155,7 +1221,9 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(other.path(), ws.path().join("out")).unwrap();
         let w = ws.path();
-        assert!(!git_outside("git status", None, w), "at the workspace root");
+        assert!(!git_outside("git status", Some(w), w), "at the workspace root");
+        assert!(git_outside("git status", None, w), "an unknown start (a reattached shell) asks");
+        assert!(!git_outside("cat a.rs", None, w), "only git is held");
         assert!(!git_outside("git log -1", Some(&w.join("sub")), w));
         assert!(git_outside("git status", Some(other.path()), w));
         assert!(git_outside("ls && git diff", Some(other.path()), w), "any git in the command");
@@ -1335,6 +1403,14 @@ mod tests {
             Some("Sandboxed: refusing to write outside the mission workspace (../elsewhere.txt)")
         );
         assert_eq!(refused("write_file", outside, None), None, "unconfined, the outside card asks");
+        assert_eq!(
+            refused("edit_file", json!({ "path": "../elsewhere.txt", "old_string": "a", "new_string": "b" }), Some(&roots)).as_deref(),
+            Some("Sandboxed: refusing to edit outside the mission workspace (../elsewhere.txt)"),
+            "an edit outside the sandbox, which the card wouldn't preview, is refused too"
+        );
+        let outside_edit = json!({ "path": "../elsewhere.txt", "old_string": "a", "new_string": "b" });
+        assert!(sandbox_refusal(&reach, "edit_file", &outside_edit, Some(&roots)).is_some(), "in every mode");
+        assert_eq!(sandbox_refusal(&reach, "edit_file", &edit("a.rs", "two"), Some(&roots)), None, "only the sandbox's refusal");
         assert_eq!(refused("edit_file", edit("a.rs", "one"), Some(&roots)), None, "an edit that applies");
         assert_eq!(refused("edit_file", edit(".env", "B"), None), None, "a file the card won't read isn't read here");
         // Approved, then the edit stopped applying: its refusal, asked once.

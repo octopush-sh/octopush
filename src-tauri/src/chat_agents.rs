@@ -1008,6 +1008,11 @@ impl ToolGate for SubagentGate {
             let (card_reason, denial) = gate_texts(&self.label, reason);
             (command.to_string(), card_reason, denial)
         } else {
+            // A write outside a sandboxed mission is refused, in every mode,
+            // before a card could ask about it (#1231).
+            if let Some(why) = crate::permissions::sandbox_refusal(&self.reach, name, input, self.sandbox_roots.as_deref()) {
+                return Some(why);
+            }
             // An MCP write, or a file tool reaching outside the workspace,
             // checked again once approved (`guard_card`).
             let label = Some(self.label.as_str());

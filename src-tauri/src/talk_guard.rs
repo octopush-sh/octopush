@@ -458,6 +458,15 @@ impl Reach {
     /// [`MAX_GLOB_NAMES`] names a glob reads, the command asks. A net, not a
     /// sandbox: a path built at run time isn't followed.
     pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, allowed: &[PathBuf]) -> Option<ToolCard> {
+        // A line continued with `\` is read as the shell joins it too
+        // (#1231); the card still shows the command as written.
+        if let Some(joined) = command.contains("\\\n").then(|| crate::chat_engine::bash_joined(command)).flatten() {
+            if joined != command {
+                if let Some(card) = self.command_card(label, &joined, cwd, allowed) {
+                    return Some(ToolCard { shown: command.to_string(), ..card });
+                }
+            }
+        }
         let start = cwd.unwrap_or(&self.workspace);
         let mut scan = Scan { allowed, glob_names: MAX_GLOB_NAMES, ..Scan::default() };
         let first = match crate::chat_engine::each_command(command, |line| self.scan_line(line, start, &mut scan)) {
