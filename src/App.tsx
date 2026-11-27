@@ -141,8 +141,9 @@ import type { GitStatus, TintName, Issue, ProjectInfo, Pr, Workspace } from "./l
 import { archivableMissions, archiveMergedBody, runStatesByWs } from "./lib/railState";
 import { archiveMergedMissions } from "./lib/archiveMerged";
 import { prefillFixChecks } from "./lib/fixChecks";
-import { useIssuesStore } from "./stores/issuesStore";
-import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
+import { isKnownStory, useIssuesStore } from "./stores/issuesStore";
+import { epikuTicketTarget, pickerCandidates, ticketNoun } from "./lib/issueTrackerSelectors";
+import { detectIssueKey, detectTrackerKey } from "./lib/detectIssueKey";
 import { DIFF_ARRIVAL_WAIT_MS, revealDiffTargetWhenReady, stripDiffPrefix } from "./lib/diffJump";
 
 
@@ -1409,27 +1410,24 @@ function App() {
     ipc.listModels().then(setModelCatalog).catch(() => {});
   }, []);
 
-  // Issue tracker config — load once on mount. We only need the boolean:
-  // whether the tracker is configured (all three fields present).
-  const [issueTrackerConfigured, setIssueTrackerConfigured] = useState(false);
-
-  function isIssueTrackerConfigured(cfg: { baseUrl?: string; email?: string; apiToken?: string } | null | undefined): boolean {
-    return !!(cfg?.baseUrl && cfg?.email && cfg?.apiToken);
-  }
-
+  // The active project's issue tracker (#1127): Jira, Epiku or none, resolved
+  // by the backend from the project's choice and what is configured. Re-read
+  // on a project switch and after a tracker setting is saved.
+  const activeTracker = useIssuesStore((s) => s.tracker);
+  const trackerByProject = useIssuesStore((s) => s.trackerByProject);
+  const issueTrackerConfigured = activeTracker !== null;
+  const activeProjectId = activeProject?.id ?? null;
   useEffect(() => {
-    ipc.getIssueTrackerConfig()
-      .then((cfg) => setIssueTrackerConfigured(isIssueTrackerConfigured(cfg)))
-      .catch(() => {});
-  }, []);
-
+    void useIssuesStore.getState().setProject(activeProjectId);
+  }, [activeProjectId]);
+  // Every open project's choice, for the workspace menu and the ticket picker.
+  useEffect(() => {
+    for (const p of recentProjects) void useIssuesStore.getState().loadTracker(p.id);
+  }, [recentProjects]);
   const refreshIssueTrackerConfigured = async () => {
-    try {
-      const cfg = await ipc.getIssueTrackerConfig();
-      setIssueTrackerConfigured(isIssueTrackerConfigured(cfg));
-    } catch {
-      // non-fatal
-    }
+    const issues = useIssuesStore.getState();
+    for (const p of recentProjects) void issues.loadTracker(p.id);
+    await issues.setProject(issues.projectId);
   };
 
   const activeModelMaxContext = useMemo(() => {
@@ -2383,12 +2381,18 @@ function App() {
 
   async function startCreateForTicket(issue: Issue) {
     setBacklogTicketMenu(null);
-    const allWorkspaces = Object.values(workspacesByProjectId).flat();
+    const epiku = epikuTicketTarget(issue, activeTracker, activeProject);
+    const allWorkspaces = epiku ? workspacesByProjectId[epiku.projectId] ?? [] : Object.values(workspacesByProjectId).flat();
     const existing = allWorkspaces.find(
       (w) => w.linkedIssueKey === issue.key || detectIssueKey(w.branch ?? "") === issue.key
     );
     if (existing) {
       setExistingWsAlert({ ticketKey: issue.key, summary: issue.summary, existingName: existing.name });
+      return;
+    }
+    // An Epiku story belongs to the active project, whose backlog listed it.
+    if (epiku) {
+      setCreatorForTicket(epiku);
       return;
     }
     await continueCreateForTicket(issue.key, issue.summary);
@@ -3393,7 +3397,16 @@ function App() {
           recentProjects.find((p) => p.id === workspace.projectId) ??
           (project?.id === workspace.projectId ? project : null);
         const manualKey = workspace.linkedIssueKey ?? null;
-        const detectedKey = detectIssueKeyForProject(wsBranch, proj?.jiraProjectKey ?? null);
+        const wsTracker = trackerByProject[workspace.projectId]?.active ?? null;
+        // Under Epiku a branch's dotted id links only when it is a story of
+        // the loaded list (the active project's) or one getIssue read.
+        const issuesNow = useIssuesStore.getState();
+        const detectedKey = detectTrackerKey(
+          wsBranch,
+          wsTracker,
+          proj?.jiraProjectKey ?? null,
+          (key) => issuesNow.projectId === workspace.projectId && isKnownStory(issuesNow, key),
+        );
         const ticketKey = manualKey ?? detectedKey;
         const wsLinkageKind: "linked" | "unlinked" = ticketKey ? "linked" : "unlinked";
         const wsPath = workspace.worktreePath ?? proj?.path ?? "";
@@ -3457,6 +3470,7 @@ function App() {
             }}
             onClose={() => setContextMenu(null)}
             linkageKind={wsLinkageKind}
+            ticketNoun={ticketNoun(wsTracker)}
             onLinkJira={() => {
               setJiraTicketPickerOpen({ workspaceId: contextMenu.workspaceId, mode: "link" });
               setContextMenu(null);
@@ -3541,13 +3555,19 @@ function App() {
         const pickerProject = pickerWs
           ? recentProjects.find((p) => p.id === pickerWs!.projectId) ?? (project?.id === pickerWs.projectId ? project : null)
           : null;
-        const pickerProjectKey = pickerProject?.jiraProjectKey ?? null;
+        const pickerTracker = pickerProject ? trackerByProject[pickerProject.id]?.active ?? null : null;
+        const pickerProjectKey = pickerTracker === "epiku" ? null : pickerProject?.jiraProjectKey ?? null;
+        const noun = ticketNoun(pickerTracker);
         return (
-          <ErrorBoundary surface="Jira ticket picker" variant="overlay" onDismiss={() => setJiraTicketPickerOpen(null)}>
+          <ErrorBoundary surface="Ticket picker" variant="overlay" onDismiss={() => setJiraTicketPickerOpen(null)}>
           <JiraTicketPickerModal
-            candidates={allIssues ?? []}
+            candidates={pickerCandidates(allIssues, useIssuesStore.getState(), {
+              projectId: pickerProject?.id ?? null,
+              tracker: pickerTracker,
+            })}
             projectKey={pickerProjectKey}
-            title={jiraTicketPickerOpen.mode === "link" ? "Link Jira ticket" : "Change Jira ticket"}
+            projectId={pickerProject?.id ?? null}
+            title={jiraTicketPickerOpen.mode === "link" ? `Link ${noun}` : `Change ${noun}`}
             onPick={async (key) => {
               await ipc.updateWorkspaceLink(jiraTicketPickerOpen.workspaceId, key);
               await useWorkspaceStore.getState().load(pickerWs!.projectId);

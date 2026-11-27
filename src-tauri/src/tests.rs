@@ -1366,6 +1366,26 @@ mod workspace_tests {
     }
 
     #[test]
+    fn project_issue_tracker_round_trip() {
+        let db = test_db();
+        db.insert_project("proj-epiku", "Test Project", "/tmp/proj-epiku").unwrap();
+        // A project that never chose reads as the default.
+        assert_eq!(db.project_issue_tracker("proj-epiku").unwrap(), (None, None));
+        assert_eq!(db.project_issue_tracker("missing").unwrap(), (None, None));
+
+        db.update_project_issue_tracker("proj-epiku", Some("epiku"), Some("sample-project")).unwrap();
+        assert_eq!(
+            db.project_issue_tracker("proj-epiku").unwrap(),
+            (Some("epiku".to_string()), Some("sample-project".to_string()))
+        );
+        // The Jira key is untouched by the choice.
+        assert_eq!(db.get_project("proj-epiku").unwrap().unwrap().jira_project_key, None);
+
+        db.update_project_issue_tracker("proj-epiku", None, None).unwrap();
+        assert_eq!(db.project_issue_tracker("proj-epiku").unwrap(), (None, None));
+    }
+
+    #[test]
     fn chat_threads_crud_and_scoping() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();
