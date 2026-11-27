@@ -972,6 +972,47 @@ impl ToolGate for SubagentGate {
     }
 }
 
+/// Ask first for a sub-agent (#1231): what the mode holds waits on the
+/// director's card, with the sub-agent's name and the change's diff. Each
+/// card gets its own call id (`<agent call id>:ask:<n>`).
+pub struct SubagentAsk {
+    broker: Arc<ApprovalBroker>,
+    app: AppHandle,
+    workspace_id: String,
+    thread_id: String,
+    call_id: String,
+    label: String,
+    workspace_path: String,
+    reach: crate::talk_guard::Reach,
+    seq: AtomicU64,
+}
+
+impl SubagentAsk {
+    pub fn new(broker: Arc<ApprovalBroker>, app: AppHandle, spec: &SubagentSpec) -> Self {
+        Self {
+            broker,
+            app,
+            workspace_id: spec.workspace_id.clone(),
+            thread_id: spec.thread_id.clone(),
+            call_id: spec.call_id.clone(),
+            label: spec.call.description.clone(),
+            workspace_path: spec.workspace_path.clone(),
+            reach: crate::talk_guard::Reach::of_workspace(Path::new(&spec.workspace_path), None),
+            seq: AtomicU64::new(1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::permissions::Asker for SubagentAsk {
+    async fn ask(&self, name: &str, input: &serde_json::Value) -> Option<String> {
+        let id = format!("{}:ask:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+        let preview = || crate::ask_first::card(Path::new(&self.workspace_path), &self.reach, Some(self.label.as_str()), name, input);
+        let ask = |c| self.broker.await_ask_first(&self.app, &self.workspace_id, &self.thread_id, &id, c);
+        crate::ask_first::ask_first(preview, ask).await
+    }
+}
+
 /// The workspace's MCP tools as a sub-agent sees them: the definition's
 /// grant (`McpGrant`) filters the discovered set once per fan-out, and each
 /// call runs off-thread with the same 60s bound Talk's own MCP calls have.
@@ -1371,10 +1412,11 @@ pub async fn run_one_subagent(
     let planned = SubagentSpec { plan: Some(plan.clone()), ..spec.clone() };
     let spec = &mode_spec(&db, &planned);
     let model = plan.model.clone();
-    let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
+    let approval_gate = SubagentGate::new(Arc::clone(&approvals), app.clone(), spec)
         .with_mcp_writes(mcp_tools)
         .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
-    let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));
+    let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)))
+        .with_asker(Box::new(SubagentAsk::new(approvals, app.clone(), spec)));
     let external = McpSubagentTools::granted(
         mcp,
         Path::new(&spec.workspace_path),

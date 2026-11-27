@@ -255,6 +255,9 @@ fn paired(rows: &[Row<'_>], start: usize, model: &str) -> Option<(Vec<LlmMessage
                 turn.push(round.turn(model));
                 turn.push(LlmMessage { role: LlmRole::User, content: LlmContent::ToolResults(results) });
             }
+            // A quiet note between rounds (a mode change, #1231) is the
+            // user's, never the model's: the rounds around it still pair.
+            "stopped" if !turn.is_empty() => i += 1,
             _ => return None,
         }
     }
@@ -450,6 +453,11 @@ mod tests {
             assert!(out.windows(2).all(|w| w[0].role != w[1].role), "{out:?}");
             assert!(out.iter().any(|m| text(m).contains("[Tool #3: read_file")), "{out:?}");
         }
+        // A mode note between a round and its answer (#1231): still paired,
+        // byte for byte as without it, and the note never reaches the model.
+        let note = Row { id: 7, role: "stopped", content: "Ask first from this round on: each change waits for your OK", ..Row::default() };
+        let noted = build(&[user(1, "read it"), atu, tool, note, answer, user(5, "next")], "m");
+        assert_eq!(format!("{noted:?}"), format!("{paired:?}"));
     }
 
     #[test]

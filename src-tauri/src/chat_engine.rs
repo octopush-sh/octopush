@@ -1564,6 +1564,9 @@ pub struct ApprovalRequestEvent {
     /// its "Allow reading … for this conversation" answer remembers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remember_dir: Option<String>,
+    /// An Ask first card's file change, as a unified diff (#1231).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1694,7 +1697,7 @@ impl ApprovalBroker {
     }
 
     /// Park a card (no event, no wait): what `ask` does before it waits.
-    fn park(
+    pub(crate) fn park(
         &self,
         request: ApprovalRequestEvent,
         since_ms: i64,
@@ -1802,6 +1805,21 @@ impl ApprovalBroker {
         }
     }
 
+    /// Ask about a call Ask first holds (#1231): a file change with its diff,
+    /// or a command that may write. No grant answers it, and its approval
+    /// grants nothing: every such call asks.
+    pub async fn await_ask_first(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        card: crate::ask_first::AskCard,
+    ) -> ApprovalDecision {
+        let decision = self.wait_on(app, card.request(workspace_id, thread_id, call_id)).await;
+        self.record(thread_id, decision, true)
+    }
+
     /// Whether the thread's "don't ask again" grant skips a dangerous-command
     /// prompt (never a secret one).
     #[cfg(test)]
@@ -1825,9 +1843,6 @@ impl ApprovalBroker {
         card: Option<(CardKind, bool)>,
         remember: Option<&str>,
     ) -> ApprovalDecision {
-        if !self.admits(workspace_id) {
-            return ApprovalDecision::Deny;
-        }
         let request = ApprovalRequestEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
@@ -1839,7 +1854,17 @@ impl ApprovalBroker {
             kind: card.map(|(k, _)| k),
             sensitive: card.is_some_and(|(_, s)| s),
             remember_dir: remember.map(str::to_string),
+            diff: None,
         };
+        self.wait_on(app, request).await
+    }
+
+    /// Raise `request`'s card and wait for its answer.
+    async fn wait_on(&self, app: &AppHandle, request: ApprovalRequestEvent) -> ApprovalDecision {
+        if !self.admits(&request.workspace_id) {
+            return ApprovalDecision::Deny;
+        }
+        let (workspace_id, thread_id, call_id) = (request.workspace_id.clone(), request.thread_id.clone(), request.call_id.clone());
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
         // The Dock badge and the menu bar Octo count it while it waits.
@@ -1849,11 +1874,7 @@ impl ApprovalBroker {
         // conversation's (or workspace's) deletion, which all answer it. Only
         // a responder dropped unanswered would end here, as a denial.
         let decision = rx.await.unwrap_or(ApprovalDecision::Deny);
-        let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent {
-            workspace_id: workspace_id.to_string(),
-            thread_id: thread_id.to_string(),
-            call_id: call_id.to_string(),
-        });
+        let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent { workspace_id, thread_id, call_id });
         crate::fleet_status::refresh_later(app);
         decision
     }
@@ -4733,6 +4754,9 @@ impl ChatEngine {
 
         // Tool rounds in a row cut at the output limit: two end the turn.
         let mut truncations = TruncationStreak::default();
+        // The mode the last round ran in: a switch during the turn is noted
+        // at the boundary where it takes effect (#1231).
+        let mut mode_watch = crate::permissions::ModeWatch::default();
 
         // ─── Agentic loop ─────────────────────────────────────────
         for iteration in 0..max_iterations.unwrap_or(usize::MAX) {
@@ -4782,6 +4806,11 @@ impl ChatEngine {
                 sandbox_roots.as_deref(),
             );
             let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
+            if let Some(note) = mode_watch.at_round(mode) {
+                if let Err(e) = self.insert_and_emit_message(&app, &request.workspace_id, &request.thread_id, "stopped", &note, None, None, None, None) {
+                    tracing::warn!(error = %e, "failed to note the mode change");
+                }
+            }
 
             let response = loop {
                 let llm_req = director_request(&request, &system_prompt, &messages, &tools);
@@ -4976,7 +5005,10 @@ impl ChatEngine {
             messages.push(tool_round_turn(&response));
 
             // The mode decides each call before anything runs (#1146): a call
-            // it refuses gets a fixed result and never reaches a card.
+            // it refuses gets a fixed result and never reaches a card. One
+            // Ask first holds waits on its own card below (#1231); a host
+            // that can't ask refuses it (a sub-agent call never asks here).
+            let mut mode_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mode_denials: HashMap<String, String> = response
                 .tool_uses
                 .iter()
@@ -4990,7 +5022,13 @@ impl ChatEngine {
                         forced: crate::permissions::forced(sandbox_roots.as_deref()),
                     };
                     let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
-                    crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx)).map(|m| (u.id.clone(), m))
+                    match crate::permissions::decide(mode, &call, &ctx) {
+                        crate::permissions::Decision::Ask { .. } if !is_agent_tool(&u.name) => {
+                            mode_asks.insert(u.id.clone());
+                            None
+                        }
+                        decision => crate::permissions::refusal(decision).map(|m| (u.id.clone(), m)),
+                    }
                 })
                 .collect();
 
@@ -5163,6 +5201,13 @@ impl ChatEngine {
                 // before anything asks the user (#1135).
                 let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools).filter(|_| !mode_denied);
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
+                // Ask first: a write waits on its card, with its diff, before
+                // any guard; what the user approves still meets every guard.
+                if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {
+                    let preview = || crate::ask_first::card(&workspace_path, &reach, None, &u.name, &u.input);
+                    let ask = |c| self.approvals.await_ask_first(&app, &request.workspace_id, &request.thread_id, &u.id, c);
+                    denied = crate::ask_first::ask_first(preview, ask).await;
+                }
                 let mcp_off = crate::mcp::is_mcp_tool(&u.name)
                     && mcp_off_refusal(&u.name, &thread_mcp_off(&self.db, &request.thread_id)).is_some();
                 let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp_read_only, &reach, writes_confined);
@@ -5419,7 +5464,7 @@ impl ChatEngine {
                 });
 
                 // If the tool wrote a file, record it in file_edits for the Review canvas.
-                if (u.name == "write_file" || u.name == "edit_file") && !mode_denied {
+                if (u.name == "write_file" || u.name == "edit_file") && !was_denied {
                     if let Some(path) = u.input.get("path").and_then(|p| p.as_str()) {
                         let msg_id = if assistant_msg_id >= 0 { Some(assistant_msg_id) } else { None };
                         if let Err(e) = self.db.lock().insert_file_edit(
@@ -7237,7 +7282,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None,
+            remember_dir: None, diff: None,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -7563,6 +7608,7 @@ mod tests {
             kind: None,
             sensitive: false,
             remember_dir: None,
+            diff: None,
         }
     }
 

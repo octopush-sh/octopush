@@ -47,6 +47,7 @@ pub mod sync;
 pub mod talk_checkpoints;
 pub mod talk_guard;
 pub mod permissions;
+pub mod ask_first;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;

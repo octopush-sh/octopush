@@ -44,13 +44,22 @@ impl Mode {
         }
     }
 
-    /// The modes a conversation can be set to in this build. Ask first
-    /// arrives with its approval card.
+    /// The modes a conversation can be set to.
     pub fn settable(raw: &str) -> Option<Mode> {
         match raw {
             "plan" => Some(Mode::Plan),
+            "ask" => Some(Mode::Ask),
             "edit" => Some(Mode::Edit),
             _ => None,
+        }
+    }
+
+    /// The mode's name in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Plan => "Plan only",
+            Mode::Ask => "Ask first",
+            Mode::Edit => "Edit freely",
         }
     }
 }
@@ -166,9 +175,13 @@ pub fn plan_refusal(refused: Refused, forced: bool) -> String {
     }
 }
 
-/// What a call that Ask first would hold gets until Ask first can ask.
+/// What a call that Ask first holds gets from a host that can't ask.
 pub const ASK_UNAVAILABLE: &str = "Not done: this conversation is in Ask first mode, which this version can't ask \
      in yet. Nothing was changed. Tell the user, who can switch the conversation to Edit freely or Plan only.";
+
+/// The fixed result of a call the user declined on its Ask first card.
+pub const ASK_DECLINED: &str = "Not done: this conversation is in Ask first mode, and the user declined this call. \
+     Nothing was run or changed. Do not retry it; ask the user how to proceed, or leave the step for them.";
 
 /// Whether `call` may run in `mode`.
 ///
@@ -177,7 +190,8 @@ pub const ASK_UNAVAILABLE: &str = "Not done: this conversation is in Ask first m
 ///   changes something elsewhere ([`remote_effect`]). An MCP tool runs only
 ///   when its server marks it read-only, and a sub-agent unless it names a
 ///   type that writes.
-/// - **Ask first:** writes and commands ask.
+/// - **Ask first:** writes ask, and so does a command unless all it runs
+///   only reads ([`reads_only`]).
 /// - **Edit freely:** everything runs, as before modes existed.
 pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
     let field = |key: &str| call.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
@@ -195,6 +209,7 @@ pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
         (Mode::Plan, Class::Delegate) if !ctx.delegate_writes => Decision::Allow,
         (Mode::Plan, Class::Delegate) => refuse(Refused::Delegate),
         (Mode::Ask, Class::Write) => Decision::Ask { reason: "changes a file".into(), preview: field("path") },
+        (Mode::Ask, Class::Exec) if reads_only(&field("command")) => Decision::Allow,
         (Mode::Ask, Class::Exec) => Decision::Ask { reason: "runs a command".into(), preview: field("command") },
         (Mode::Ask, Class::Net | Class::Delegate) => Decision::Allow,
     }
@@ -471,6 +486,162 @@ fn deploy_remote(args: &[&str]) -> Option<&'static str> {
         .then_some("changes a cluster or infrastructure (kubectl, helm, terraform)")
 }
 
+/// Whether every command `command` runs only reads, so Ask first runs it
+/// without a card (#1231). Read the way the command check reads a command:
+/// each nested one on its own ([`crate::chat_engine::each_command`]; past
+/// its caps, never), each word as the shell splits it
+/// ([`crate::chat_engine::command_words`]). A line only reads when it
+/// redirects no output (but to `/dev/null`) and each of its commands is a
+/// reader named bare ([`PLAIN_READERS`], or one of [`reader_reads`]'s with
+/// no flag that writes or runs something). Anything else asks: a wrapper,
+/// a keyword, a script, a path or a variable as the program. A net for a
+/// workflow aid, not a sandbox; what it lets through still meets the guards.
+pub fn reads_only(command: &str) -> bool {
+    matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+}
+
+/// Programs that only read, whatever their flags.
+const PLAIN_READERS: &[&str] = &[
+    "ls", "cat", "head", "tail", "wc", "pwd", "echo", "printf", "which", "type", "stat", "du", "df", "diff", "cmp",
+    "basename", "dirname", "realpath", "readlink", "grep", "egrep", "fgrep", "cut", "tr", "nl", "tac", "rev", "od",
+    "hexdump", "strings", "jq", "cd", "true", "false", "test", "[", "uname", "whoami", "printenv", "sleep",
+];
+
+/// Git subcommands that only read.
+const GIT_READS: &[&str] =
+    &["status", "diff", "log", "show", "blame", "ls-files", "ls-tree", "rev-parse", "describe", "shortlog", "grep"];
+
+/// `find` actions that delete, write a file or run a program.
+const FIND_ACTS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"];
+
+fn line_reads_only(line: &str) -> bool {
+    use crate::chat_engine::{CommandWord, WordRole};
+    let words = crate::chat_engine::command_words(line);
+    // An output redirection (`>`, `>>`, `&>`, `<>`) outside a here-document's
+    // body writes, but to `/dev/null`.
+    if words.iter().any(|w| w.writes && w.role != WordRole::Data && w.word != "/dev/null") {
+        return false;
+    }
+    let mut segments: Vec<Vec<&CommandWord>> = Vec::new();
+    let mut last = None;
+    for w in words.iter().filter(|w| w.role != WordRole::Data && !w.redirect) {
+        if last != Some(w.segment) {
+            segments.push(Vec::new());
+            last = Some(w.segment);
+        }
+        if let Some(seg) = segments.last_mut() {
+            seg.push(w);
+        }
+    }
+    segments.iter().all(|seg| {
+        // Assignments before the program change only the shell's state.
+        let Some(at) = seg.iter().position(|w| w.role == WordRole::Program) else { return true };
+        let name = seg[at].word.to_ascii_lowercase();
+        !seg[at].unmodeled && !name.contains('/') && reader_reads(&name, &seg[at + 1..])
+    })
+}
+
+/// Whether `program` with `args` only reads.
+fn reader_reads(program: &str, args: &[&crate::chat_engine::CommandWord]) -> bool {
+    if PLAIN_READERS.contains(&program) {
+        return true;
+    }
+    // The rest read unless a flag says otherwise, so a word that may expand
+    // into one asks.
+    if args.iter().any(|w| expands(w)) {
+        return false;
+    }
+    let args: Vec<&str> = args.iter().map(|w| w.word.as_str()).collect();
+    match program {
+        "rg" => !any_arg(&args, |a| long_flag(a, &["--pre"])),
+        "sort" => !any_arg(&args, |a| long_flag(a, &["--output", "--compress-program"]) || short_flag(a, 'o')),
+        "tree" => !any_arg(&args, |a| short_flag(a, 'o')),
+        // A second operand is the file it writes.
+        "uniq" => operands(&args, &["-f", "-s", "-w"]).len() <= 1,
+        "find" => !any_arg(&args, |a| FIND_ACTS.contains(&a)),
+        "git" => git_reads(&args),
+        _ => false,
+    }
+}
+
+fn any_arg(args: &[&str], bad: impl Fn(&str) -> bool) -> bool {
+    args.iter().any(|a| bad(a))
+}
+
+/// `git` past `-C <dir>` and `--no-pager` (any other option before the
+/// subcommand, such as `-c`, asks), running a subcommand that reads, with
+/// no flag that writes a file or runs a program.
+fn git_reads(mut args: &[&str]) -> bool {
+    loop {
+        match args {
+            ["-C", _, rest @ ..] | ["--no-pager", rest @ ..] => args = rest,
+            _ => break,
+        }
+    }
+    match args.split_first() {
+        None => true,
+        Some((sub, flags)) => {
+            GIT_READS.contains(sub)
+                && !flags.iter().any(|a| long_flag(a, &["--output", "--ext-diff", "--open-files-in-pager"]) || short_flag(a, 'O'))
+        }
+    }
+}
+
+/// `word` is one of `longs`, with or without `=value`, or an abbreviation
+/// of one (GNU tools take any unambiguous prefix).
+fn long_flag(word: &str, longs: &[&str]) -> bool {
+    let name = word.split('=').next().unwrap_or(word);
+    name.len() > 2 && name.starts_with("--") && longs.iter().any(|l| l.starts_with(name))
+}
+
+/// `word` is a cluster of short flags holding `flag` (`-ro`).
+fn short_flag(word: &str, flag: char) -> bool {
+    word.len() > 1 && word.starts_with('-') && !word.starts_with("--") && word[1..].contains(flag)
+}
+
+/// A word the shell may turn into other words: a variable, a `$(…)`, or an
+/// unquoted glob or brace (`pattern` writes quoted ones after a `\`).
+fn expands(w: &crate::chat_engine::CommandWord) -> bool {
+    let mut chars = w.pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '{' | '*' | '?' | '[' => return true,
+            _ => {}
+        }
+    }
+    w.unmodeled
+}
+
+/// The quiet note a turn writes when its mode changes between rounds (#1231).
+pub fn mode_note(mode: Mode) -> String {
+    let what = match mode {
+        Mode::Plan => ": nothing is written",
+        Mode::Ask => ": each change waits for your OK",
+        Mode::Edit => "",
+    };
+    format!("{} from this round on{what}", mode.label())
+}
+
+/// The mode a turn's last round ran in, so the next boundary can note a
+/// change: the mode is read at each boundary, so a switch made while a
+/// round runs applies from the next one.
+#[derive(Default)]
+pub struct ModeWatch(Option<Mode>);
+
+impl ModeWatch {
+    /// The note for a round that runs in `now`, when the one before ran in
+    /// another mode.
+    pub fn at_round(&mut self, now: Mode) -> Option<String> {
+        match self.0.replace(now) {
+            Some(before) if before != now => Some(mode_note(now)),
+            _ => None,
+        }
+    }
+}
+
 /// The mode a call runs in: a read-only mission forces Plan only, since a
 /// mode can narrow a mission's isolation, never widen it.
 pub fn effective(mode: Mode, mission_roots: Option<&[String]>) -> Mode {
@@ -511,6 +682,13 @@ pub fn thread_mode(db: &Mutex<Db>, thread_id: &str) -> Mode {
 /// A thread's stored mode, and the mode its turns run in now: Plan only
 /// when its workspace's active mission is read-only.
 pub fn thread_modes(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode) {
+    let (stored, effective, _) = thread_mode_state(db, thread_id);
+    (stored, effective)
+}
+
+/// [`thread_modes`], and whether a read-only mission forces the mode, so the
+/// Composer's control can say so and refuse a change.
+pub fn thread_mode_state(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode, bool) {
     let stored = thread_mode(db, thread_id);
     let db = db.lock();
     let mission = db
@@ -520,7 +698,7 @@ pub fn thread_modes(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode) {
         .and_then(|w| db.active_mission_for_workspace(&w).ok().flatten());
     // Only whether the roots are empty matters here, not the workspace's path.
     let roots = mission.and_then(|m| crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, ""));
-    (stored, effective(stored, roots.as_deref()))
+    (stored, effective(stored, roots.as_deref()), forced(roots.as_deref()))
 }
 
 /// How a gate learns the mode at the moment a call is checked.
@@ -532,10 +710,19 @@ pub fn thread_mode_source(db: Arc<Mutex<Db>>, thread_id: String, roots: Option<V
     Arc::new(move || effective(thread_mode(&db, &thread_id), roots.as_deref()))
 }
 
+/// How a gate asks the user about a call Ask first holds (#1231).
+#[async_trait::async_trait]
+pub trait Asker: Send + Sync {
+    /// `None` once the user approves it (the call then meets the guards),
+    /// else the fixed result it gets instead of running.
+    async fn ask(&self, name: &str, input: &Value) -> Option<String>;
+}
+
 /// The mode check as a [`ToolGate`], for the loop Talk sub-agents run on:
 /// each call is decided in the thread's mode first, then what the mode
 /// allows goes to `inner` (the sub-agent's approval gate). Sub-agents never
 /// get the `Agent` tool, so a Delegate call is treated as one that writes.
+/// A call Ask first holds goes to `asker`; without one it is refused.
 pub struct ModeGate {
     mode: ModeSource,
     exec_roots: Option<Vec<String>>,
@@ -543,6 +730,7 @@ pub struct ModeGate {
     forced: bool,
     mcp_read_only: HashSet<String>,
     inner: Option<Box<dyn ToolGate>>,
+    asker: Option<Box<dyn Asker>>,
 }
 
 impl ModeGate {
@@ -553,7 +741,13 @@ impl ModeGate {
         mcp_read_only: HashSet<String>,
         inner: Option<Box<dyn ToolGate>>,
     ) -> Self {
-        Self { mode, exec_roots, forced, mcp_read_only, inner }
+        Self { mode, exec_roots, forced, mcp_read_only, inner, asker: None }
+    }
+
+    /// Ask the user about what Ask first holds, before `inner` checks it.
+    pub fn with_asker(mut self, asker: Box<dyn Asker>) -> Self {
+        self.asker = Some(asker);
+        self
     }
 }
 
@@ -566,8 +760,19 @@ impl ToolGate for ModeGate {
             delegate_writes: true,
             forced: self.forced,
         };
-        if let Some(refused) = refusal(decide((self.mode)(), &ToolCall { name, input }, &ctx)) {
-            return Some(refused);
+        let decision = decide((self.mode)(), &ToolCall { name, input }, &ctx);
+        let asks = matches!(decision, Decision::Ask { .. });
+        match &self.asker {
+            Some(asker) if asks => {
+                if let Some(declined) = asker.ask(name, input).await {
+                    return Some(declined);
+                }
+            }
+            _ => {
+                if let Some(refused) = refusal(decision) {
+                    return Some(refused);
+                }
+            }
         }
         match &self.inner {
             Some(gate) => gate.check(name, input).await,
@@ -594,7 +799,7 @@ mod tests {
         let ro: HashSet<String> = ["mcp__docs__search".to_string()].into();
         let sandboxed: &[String] = &[];
         let ws: &[String] = &["/ws".to_string()];
-        let input = json!({ "path": "a.rs", "command": "ls" });
+        let input = json!({ "path": "a.rs", "command": "cargo test" });
         let d = |mode, name: &str, roots: Option<&[String]>, delegate_writes| {
             decide(mode, &ToolCall { name, input: &input }, &ctx(roots, &ro, delegate_writes))
         };
@@ -610,7 +815,7 @@ mod tests {
             ("write_file", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
             ("edit_file", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
             ("a_tool_nobody_classified", deny(Refused::Write), ask("changes a file", "a.rs"), allow.clone()),
-            ("run_command", allow.clone(), ask("runs a command", "ls"), allow.clone()),
+            ("run_command", allow.clone(), ask("runs a command", "cargo test"), allow.clone()),
             ("mcp__docs__search", allow.clone(), allow.clone(), allow.clone()),
             ("mcp__jira__create_issue", deny(Refused::Net), allow.clone(), allow.clone()),
             ("Agent", allow.clone(), allow.clone(), allow.clone()),
@@ -636,6 +841,9 @@ mod tests {
         let plan = decide(Mode::Plan, &ToolCall { name: "run_command", input: &push }, &ctx(Some(sandboxed), &ro, false));
         assert_eq!(plan, deny(Refused::Remote("git push")));
         assert_eq!(decide(Mode::Edit, &ToolCall { name: "run_command", input: &push }, &ctx(None, &ro, false)), allow);
+        // Ask first runs a command that only reads without a card.
+        let read = json!({ "command": "git status && ls -la" });
+        assert_eq!(decide(Mode::Ask, &ToolCall { name: "run_command", input: &read }, &ctx(None, &ro, false)), allow);
         // Every refusal names the mode, and Ask first refuses until it can ask.
         for r in [Refused::Write, Refused::Net, Refused::Unconfined, Refused::Delegate, Refused::Remote("git push")] {
             assert!(plan_refusal(r, false).contains("Plan only mode"), "{r:?}");
@@ -816,7 +1024,8 @@ mod tests {
         assert_eq!(Mode::from_stored(Some("plan")), Mode::Plan);
         assert_eq!(Mode::from_stored(Some("ask")), Mode::Ask);
         assert_eq!(Mode::from_stored(Some("bypass")), Mode::Plan, "an unknown mode never loosens");
-        assert_eq!((Mode::settable("plan"), Mode::settable("edit"), Mode::settable("ask")), (Some(Mode::Plan), Some(Mode::Edit), None));
+        assert_eq!((Mode::settable("plan"), Mode::settable("edit"), Mode::settable("ask")), (Some(Mode::Plan), Some(Mode::Edit), Some(Mode::Ask)));
+        assert_eq!(Mode::settable("bypass"), None);
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         {
@@ -920,7 +1129,105 @@ mod tests {
         db.lock().set_thread_permission_mode(&thread, Mode::Edit).unwrap();
         db.lock().insert_mission("m-ro", Some("w-eff"), "p-eff", "review", "Review it", "active", None, "readonly", "none", "{}").unwrap();
         assert_eq!(thread_modes(&db, &thread), (Mode::Edit, Mode::Plan), "the mission forces Plan only");
+        assert_eq!(thread_mode_state(&db, &thread), (Mode::Edit, Mode::Plan, true), "and says it forces it");
         assert_eq!(thread_modes(&db, "gone"), (Mode::Edit, Mode::Edit));
+        assert!(!thread_mode_state(&db, "gone").2);
+    }
+
+    /// Ask first runs a command without a card only when everything it runs
+    /// reads; anything the check can't tell asks.
+    #[test]
+    fn ask_first_runs_only_readers_without_a_card() {
+        let readers = [
+            "ls -la src",
+            "cat Cargo.toml | head -20",
+            "grep -rn 'fn main' src 2>/dev/null",
+            "ls -la 2>&1 | tail -5",
+            "git status --short && git diff HEAD~1 --stat",
+            "git -C ../repo --no-pager log --oneline -5",
+            "git",
+            "rg -n 'TODO|FIXME' src",
+            "find . -name '*.rs' -type f",
+            "sort -u names.txt | uniq -c",
+            "cd src && ls",
+            "wc -l $(git ls-files)",
+            "LC_ALL=C grep -c x a.txt",
+            "tree -L 2",
+            "jq '.version' package.json",
+            "cat <<'EOF'\nrm -rf / > x\nEOF",
+        ];
+        for c in readers {
+            assert!(reads_only(c), "{c}");
+        }
+        let writers = [
+            "echo x > out.txt",
+            "cat a >> b",
+            "ls &> listing.txt",
+            "cat <>f",
+            "rm -rf build",
+            "cargo test",
+            "sed -i 's/a/b/' f",
+            "tee out.txt",
+            "find . -name '*.tmp' -delete",
+            "find . -exec rm {} \\;",
+            "find . $FLAG",
+            "find . -{delete,print}",
+            "git commit -m x",
+            "git checkout main",
+            "git -c core.pager=sh log",
+            "git diff --output=patch.diff",
+            "git log --out=x",
+            "git grep --open-files-in-pager=vi x",
+            "sort -o sorted.txt names.txt",
+            "sort -ro out names.txt",
+            "sort --compress-program=sh names",
+            "uniq in.txt out.txt",
+            "rg --pre ./decode.sh x",
+            "tree -o listing.txt",
+            "cat x | sh",
+            "ls; touch new",
+            "ls $(touch y)",
+            "./scripts/check.sh",
+            "/bin/ls",
+            "$CMD",
+            "bash -c 'ls'",
+            "xargs cat",
+            "env ls",
+            "for f in *.md; do cat \"$f\"; done",
+        ];
+        for c in writers {
+            assert!(!reads_only(c), "{c}");
+        }
+        assert!(!reads_only(&"$(".repeat(6)), "past the nesting it reads, it asks");
+    }
+
+    /// A switch made while a round runs applies from the next round, whose
+    /// boundary writes the note once; the round before ran in the old mode.
+    #[test]
+    fn mode_switch_applies_next_round_with_note() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Mutex::new(Db::open(tmp.path()).unwrap());
+        let thread = {
+            let d = db.lock();
+            d.insert_project("p-note", "P", "/tmp/octo-mode-note").unwrap();
+            d.insert_workspace("w-note", "p-note", "ws", "", "main", None, "", None).unwrap();
+            d.create_chat_thread("w-note", "Switch").unwrap().id
+        };
+        let ro = HashSet::new();
+        let write = json!({ "path": "a.rs", "content": "x" });
+        let decided = |mode| decide(mode, &ToolCall { name: "write_file", input: &write }, &ctx(None, &ro, false));
+        let mut watch = ModeWatch::default();
+        let round1 = thread_mode(&db, &thread);
+        assert_eq!((watch.at_round(round1), decided(round1)), (None, Decision::Allow), "round 1 runs in Edit freely");
+        // The user picks Ask first while round 1 runs.
+        db.lock().set_thread_permission_mode(&thread, Mode::Ask).unwrap();
+        let round2 = thread_mode(&db, &thread);
+        assert_eq!(watch.at_round(round2), Some(mode_note(Mode::Ask)));
+        assert!(matches!(decided(round2), Decision::Ask { .. }), "from round 2 a write asks");
+        assert_eq!(watch.at_round(thread_mode(&db, &thread)), None, "one note per change");
+        for m in [Mode::Plan, Mode::Ask, Mode::Edit] {
+            assert!(mode_note(m).starts_with(&format!("{} from this round on", m.label())), "{m:?}");
+        }
     }
 
     /// A Plan only command runs off the turn's runtime thread and stops with
@@ -957,7 +1264,11 @@ mod tests {
         let body = &engine[from..to];
         for call in [
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
-            "crate::permissions::refusal(crate::permissions::decide(mode, &call, &ctx))",
+            "match crate::permissions::decide(mode, &call, &ctx) {",
+            "decision => crate::permissions::refusal(decision).map(|m| (u.id.clone(), m)),",
+            "if let Some(note) = mode_watch.at_round(mode) {",
+            "if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {",
+            "denied = crate::ask_first::ask_first(preview, ask).await;",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
@@ -974,7 +1285,8 @@ mod tests {
         let run = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
         for call in [
             "let spec = &mode_spec(&db, &planned);",
-            "let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));",
+            "let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)))",
+            ".with_asker(Box::new(SubagentAsk::new(approvals, app.clone(), spec)));",
             "persist_run(&db, &planned, &outcome);",
         ] {
             assert!(run.contains(call), "the sub-agent runner no longer has: {call}");

@@ -25,6 +25,9 @@ pub enum CardKind {
     /// A command naming a path outside the workspace or in a credentials
     /// location (#1201).
     Run,
+    /// A write Ask first holds (#1231): a file change, with its diff, or a
+    /// command that may write. Its approval grants nothing.
+    Ask,
 }
 
 impl CardKind {

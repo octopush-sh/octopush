@@ -2350,26 +2350,28 @@ pub async fn set_thread_mcp_server(
 
 /// A Talk conversation's permission mode (#1146), as stored and as its
 /// turns run it: `plan` (Plan only), `edit` (Edit freely, also every
-/// conversation that never set one) or `ask`. `effective` is `plan` when the
-/// workspace's active mission is read-only, whatever is stored.
+/// conversation that never set one) or `ask` (Ask first). `effective` is
+/// `plan` when the workspace's active mission is read-only, whatever is
+/// stored, and `forced` says so.
 #[derive(serde::Serialize)]
 pub struct ThreadPermissionMode {
     stored: &'static str,
     effective: &'static str,
+    forced: bool,
 }
 
 #[tauri::command]
 pub async fn get_thread_permission_mode(state: State<'_, AppState>, thread_id: String) -> AppResult<ThreadPermissionMode> {
-    let (stored, effective) = crate::permissions::thread_modes(&state.db, &thread_id);
-    Ok(ThreadPermissionMode { stored: stored.as_str(), effective: effective.as_str() })
+    let (stored, effective, forced) = crate::permissions::thread_mode_state(&state.db, &thread_id);
+    Ok(ThreadPermissionMode { stored: stored.as_str(), effective: effective.as_str(), forced })
 }
 
-/// Set a Talk conversation's permission mode, `plan` or `edit`; a turn that
-/// is running takes it from its next round. Ask first isn't settable yet.
+/// Set a Talk conversation's permission mode, `plan`, `ask` or `edit`; a
+/// turn that is running takes it from its next round (#1231).
 #[tauri::command]
 pub async fn set_thread_permission_mode(state: State<'_, AppState>, thread_id: String, mode: String) -> AppResult<String> {
     let Some(mode) = crate::permissions::Mode::settable(&mode) else {
-        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan` or `edit`.")));
+        return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan`, `ask` or `edit`.")));
     };
     state.db.lock().set_thread_permission_mode(&thread_id, mode)?;
     Ok(mode.as_str().to_string())
