@@ -308,7 +308,6 @@ pub fn run() {
             commands::list_user_mcp_server_status,
             commands::list_mcp_trust,
             commands::revoke_mcp_trust,
-            commands::list_user_mcp_server_status,
             commands::list_project_instructions,
             commands::get_thread_mcp_disabled,
             commands::set_thread_mcp_server,

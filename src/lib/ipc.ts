@@ -1190,9 +1190,6 @@ export const ipc = {
    *  null); resolves to what is left. The next call asks again. */
   revokeMcpTrust: (server: string, tool: string | null) =>
     invoke<McpTrust[]>("revoke_mcp_trust", { server, tool }),
-  /** The Settings › Integrations servers only, with their live status: what
-   *  a Direct stage can choose. Spawns nothing. */
-  listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
   /** The instruction files Talk follows in a worktree (its CLAUDE.md chain,
    *  or AGENTS.md), each with its token estimate, and how many skipped files
    *  weren't listed. Reads only. */
