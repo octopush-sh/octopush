@@ -21,8 +21,10 @@ vi.mock("../lib/ipc", () => ({
     onMcpChanged: (h: () => void) => onMcpChanged(h),
     listSkills: () => Promise.resolve([]),
     listSubagentTypes: () => Promise.resolve([]),
+    listMcpTrust: (...a: unknown[]) => listMcpTrust(...a),
   },
 }));
+const listMcpTrust = vi.fn();
 
 /** The backend's per-thread lists: one server set per write, as the command does. */
 let stored: Record<string, string[]> = {};
@@ -65,7 +67,8 @@ beforeEach(() => {
   listMcpServerStatus.mockReset().mockResolvedValue([docs, remote]);
   getThreadMcpDisabled.mockReset().mockImplementation((t: string) => Promise.resolve(stored[t] ?? []));
   setThreadMcpServer.mockReset().mockImplementation(backendSet);
-  useMcpScopeStore.setState({ statusByPath: {}, offByThread: {} });
+  useMcpScopeStore.setState({ statusByPath: {}, offByThread: {}, trustByPath: {} });
+  listMcpTrust.mockReset().mockResolvedValue([]);
   useChatStore.setState({ activeThreadByWs: { ws: "t-1" }, streamingByWs: {} });
 });
 
@@ -76,6 +79,15 @@ describe("chipTitle / chipTone", () => {
     expect(chipTitle({ ...docs, state: "idle", tools: null }, false, false)).toBe("docs-server · not started yet · it starts on first use");
     expect(chipTitle(remote, false, true)).toBe("example-remote · failed: spawn /x: No such file · click to turn off in this conversation");
     expect(chipTitle(remote, true, true)).toBe("example-remote · off in this conversation · click to turn it back on");
+  });
+
+  it("says what the user trusts on the server (#1243)", () => {
+    expect(chipTitle(docs, false, true, { server: "docs-server", config: "c", all: false, tools: ["post_note", "tag_page"] })).toBe(
+      "docs-server · connected · 12 tools · runs post_note, tag_page without asking in Edit freely; one it marks destructive still asks (Settings › Integrations revokes it) · click to turn off in this conversation",
+    );
+    expect(chipTitle(docs, false, false, { server: "docs-server", config: "c", all: true, tools: [] })).toBe(
+      "docs-server · connected · 12 tools · runs every tool without asking in Edit freely; one it marks destructive still asks (Settings › Integrations revokes it)",
+    );
   });
 
   it("colours by status, never brass, and off is mute", () => {
@@ -106,6 +118,16 @@ describe("CompanionMcpScope", () => {
     expect(d.querySelector("svg")).toHaveClass("text-octo-verdigris");
     expect(chip("example-remote").querySelector("svg")).toHaveClass("text-octo-rouge");
     expect(chip("example-remote").title).toContain("failed: spawn /x: No such file");
+  });
+
+  it("marks a trusted server's chip and says what it may run (#1243)", async () => {
+    listMcpTrust.mockResolvedValue([{ server: "docs-server", config: "c", all: true, tools: [] }]);
+    await mount();
+    // Read for this worktree: a server its own .claude/mcp.json defines has none.
+    expect(listMcpTrust).toHaveBeenCalledWith("/wt");
+    expect(chip("docs-server").querySelector('[data-testid="chip-trusted"]')).not.toBeNull();
+    expect(chip("docs-server").title).toContain("runs every tool without asking in Edit freely");
+    expect(chip("example-remote").querySelector('[data-testid="chip-trusted"]')).toBeNull();
   });
 
   it("a click turns a server off in this conversation only, persists it, and a second click turns it back on", async () => {

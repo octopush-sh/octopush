@@ -1041,13 +1041,11 @@ fn new_side(repo: &Repository, path: &str, id: Oid, limit: usize) -> NewSide {
     if !meta.is_file() {
         return NewSide::Missing;
     }
-    if meta.len() > limit as u64 {
-        return NewSide::TooLarge;
-    }
-    match std::fs::read(&p) {
-        // It may have grown since the metadata was read.
-        Ok(bytes) if bytes.len() > limit => NewSide::TooLarge,
-        Ok(bytes) => NewSide::Read(bytes),
+    // Checked again by the open handle: a pipe swapped in since can't hang
+    // the scan (#1190).
+    match crate::fs_safe::read_regular(&p, limit as u64) {
+        Ok(crate::fs_safe::Capped::Read { bytes, .. }) => NewSide::Read(bytes),
+        Ok(crate::fs_safe::Capped::TooLarge { .. }) => NewSide::TooLarge,
         Err(_) => NewSide::Missing,
     }
 }
@@ -1089,9 +1087,8 @@ fn worktree_starts_like_zip(repo: &Repository, path: &str, size: Option<u64>) ->
         return false;
     }
     let mut head = [0u8; 4];
-    std::fs::File::open(&p)
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
-        .is_ok_and(|()| &head == ZIP_MAGIC)
+    crate::fs_safe::open_regular(&p)
+        .is_ok_and(|(mut f, _)| std::io::Read::read_exact(&mut f, &mut head).is_ok() && &head == ZIP_MAGIC)
 }
 
 /// Every hit in `files`, uncapped (the fingerprint covers all of them).
