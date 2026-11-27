@@ -1226,6 +1226,22 @@ describe("ChatView — context mentions (#962)", () => {
     expect(screen.queryByText("a.ts#L2-3")).toBeNull();
   });
 
+  it("says on the chip when a file can't be included, such as a .env that is a named pipe (#1190)", async () => {
+    vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue([".env"]);
+    vi.mocked(ipcMock.readFileChecked).mockRejectedValue(
+      "other: .env is a named pipe, not a file (a secrets manager may serve it). Octopush doesn't read it.",
+    );
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    fireEvent.change(getTextarea(), { target: { value: "use @.env" } });
+    await waitFor(() =>
+      expect(document.querySelector("[data-tour='talk-context-chip']")?.getAttribute("title")).toBe(
+        "Not included: a named pipe, not a file · @.env",
+      ),
+    );
+  });
+
   it("sends only the range's lines", async () => {
     await act(async () => {
       render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);

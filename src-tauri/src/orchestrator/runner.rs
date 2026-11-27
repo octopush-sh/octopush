@@ -653,6 +653,7 @@ mod mcp_tests {
             description: String::new(),
             input_schema: serde_json::json!({ "type": "object" }),
             read_only,
+            ..Default::default()
         }
     }
 

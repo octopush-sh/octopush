@@ -319,7 +319,7 @@ done
             namespaced: format!("mcp__{server}__{name}"),
             description: String::new(),
             input_schema: serde_json::json!({}),
-            read_only: false,
+            ..Default::default()
         };
         let mut a = vec![tool("b", "z"), tool("a", "y"), tool("b", "a"), tool("a", "b")];
         let mut b = vec![tool("a", "b"), tool("b", "a"), tool("b", "z"), tool("a", "y")];

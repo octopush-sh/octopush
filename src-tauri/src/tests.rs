@@ -13759,6 +13759,23 @@ mod file_io_checked_tests {
         }
     }
 
+    /// The editor and Talk's `@file` read through here: a `.env` that is a
+    /// named pipe nothing writes to is refused, not waited on (#1190).
+    #[test]
+    fn refuses_a_named_pipe_and_a_link_to_one_at_once() {
+        use crate::fs_safe::tests::{mkfifo, within_a_second};
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = dir.path().join(".env");
+        mkfifo(&env);
+        let link = dir.path().join("env-link");
+        std::os::unix::fs::symlink(&env, &link).unwrap();
+        for p in [env, link] {
+            let p = p.to_str().unwrap().to_string();
+            let err = within_a_second(move || read_file_checked_inner(&p, 1_000_000)).unwrap_err().to_string();
+            assert!(err.contains("is a named pipe, not a file"), "{err}");
+        }
+    }
+
     #[test]
     fn serializes_kind_tag_as_camel_case() {
         let v = serde_json::to_value(FileReadResult::TooLarge { size: 9 }).unwrap();
@@ -30372,6 +30389,19 @@ mod talk_context_guard_tests {
             read_file_lines_inner(f.path().to_str().unwrap(), 1, 1, 100).unwrap(),
             LineRangeResult::UnsupportedEncoding
         ));
+    }
+
+    /// `@.env#L1-5` on a named pipe nothing writes to: refused, not waited on
+    /// (#1190).
+    #[test]
+    fn a_range_of_a_named_pipe_is_refused_at_once() {
+        use crate::fs_safe::tests::{mkfifo, within_a_second};
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = dir.path().join(".env");
+        mkfifo(&env);
+        let p = env.to_str().unwrap().to_string();
+        let err = within_a_second(move || read_file_lines_inner(&p, 1, 5, 100)).unwrap_err().to_string();
+        assert!(err.contains(".env is a named pipe, not a file"), "{err}");
     }
 
     #[test]
