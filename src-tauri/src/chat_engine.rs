@@ -5680,7 +5680,9 @@ impl ChatEngine {
                     // Every other built-in tool, off the runtime thread too: a
                     // long grep never stalls another workspace's turn, and a
                     // walk Stop ended reads as stopped.
-                    let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, write_check.lock().take()).await;
+                    // Taken first: the lock never lives across the await.
+                    let landing = write_check.lock().take();
+                    let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await;
                     interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
                     ran
                 };
