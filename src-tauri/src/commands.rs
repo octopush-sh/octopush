@@ -8167,6 +8167,7 @@ pub fn build_ai_request(
         // One-shot: the prefix is never re-sent, so a cache write would just be a
         // wasted 1.25× surcharge with no read to repay it. Keep caching off.
         cache: false,
+        cache_key: None,
     }
 }
 
@@ -8751,6 +8752,25 @@ pub async fn repo_hooks_notice(workspace_path: String) -> AppResult<Option<crate
     tokio::task::spawn_blocking(move || crate::repo_hooks::read(std::path::Path::new(&workspace_path)))
         .await
         .map_err(|e| AppError::Other(format!("repo hooks task failed: {e}")))
+}
+
+/// Direct launcher: whether the project of `workspace_id` turned on "Don't
+/// run skill shell commands in crews" (#1188). False for an unknown workspace.
+#[tauri::command]
+pub async fn skill_shell_off(state: State<'_, AppState>, workspace_id: String) -> AppResult<bool> {
+    state.db.lock().workspace_skill_shell_off(&workspace_id)
+}
+
+/// Direct launcher: turn "Don't run skill shell commands in crews" on or off
+/// for the project of `workspace_id`; every Claude CLI stage of its crews and
+/// Routines reads it when it starts.
+#[tauri::command]
+pub async fn set_skill_shell_off(state: State<'_, AppState>, workspace_id: String, off: bool) -> AppResult<()> {
+    let db = state.db.lock();
+    let ws = db
+        .get_workspace(&workspace_id)?
+        .ok_or_else(|| AppError::Other(format!("no workspace {workspace_id}")))?;
+    db.set_project_skill_shell_off(&ws.project_id, off)
 }
 
 /// Direct launcher, Readiness and Routines: the models among `models` with a
