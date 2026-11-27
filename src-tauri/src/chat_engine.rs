@@ -3256,13 +3256,29 @@ impl ChatEngine {
         let _ = self.db.lock().record_activity(workspace_id, "talk", "chat");
     }
 
+    /// Each of `n_agents` sub-agents' share of the workspace's budget
+    /// headroom (`chat_agents::budget_share`); `None` with no budget set. A
+    /// read error is logged and leaves the run unbounded, as before budgets
+    /// reached sub-agents.
+    fn subagent_budget_share(&self, workspace_id: &str, n_agents: usize) -> Option<f64> {
+        let headroom = self.db.lock().budget_headroom(Some(workspace_id));
+        match headroom {
+            Ok(h) => crate::chat_agents::budget_share(h, n_agents),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the budget headroom for sub-agents");
+                None
+            }
+        }
+    }
+
     /// Sub-agent spend goes to the ledger under ITS model (a `model`
     /// override may differ from the thread's) and under its call id, so the
     /// Companion's conversation cost splits director from crew. An escalated
     /// sub-agent bills every attempt at its own model's price, so each
     /// attempt is its own ledger row. The row takes the attempt's own cost,
     /// priced per request by the agentic loop (Haiku 5.5's long tier); a $0
-    /// attempt is priced (or marked unpriced) by the ledger.
+    /// attempt is priced (or marked unpriced) by the ledger. A failed
+    /// attempt bills the rounds it ran before the error.
     fn record_subagent_spend(&self, workspace_id: &str, thread_id: &str, call_id: &str, o: &AgentOutcome) {
         let origin = subagent_origin(call_id);
         for a in o.billed_attempts() {
@@ -3651,6 +3667,8 @@ impl ChatEngine {
         // the plan is that model, its tier, and the role's effort.
         spec.call.model = Some(run.model.clone());
         spec.max_iterations = extra_turns;
+        // The budget's headroom as it is now, all of it this run's.
+        spec.spend_limit = self.subagent_budget_share(&run.workspace_id, 1);
         {
             let (known_models, tiers) = model_catalog();
             let mut plan = plan_subagent(&SubagentSpec { policy_auto: false, ..spec.clone() }, &known_models, &tiers);
@@ -4697,6 +4715,7 @@ impl ChatEngine {
                             policy_auto,
                             resume: None,
                             plan: None,
+                            spend_limit: None,
                         };
                         let plan = plan_subagent(&spec, &known_models, &tiers);
                         spec.plan = Some(plan.clone());
@@ -4734,6 +4753,19 @@ impl ChatEngine {
                 }
                 if !specs.is_empty() {
                     tracing::info!(agents = specs.len(), "fanning out sub-agents");
+                    // The budget gate above only runs between rounds, after
+                    // the whole fan-out returns: each sub-agent gets its share
+                    // of the headroom as its own spend limit, so together
+                    // they stop at the budget. No budget, or an overridden
+                    // turn, leaves them unbounded.
+                    let share = if request.override_budget {
+                        None
+                    } else {
+                        self.subagent_budget_share(&request.workspace_id, specs.len())
+                    };
+                    for spec in specs.iter_mut() {
+                        spec.spend_limit = share;
+                    }
                     let done = run_subagents(
                         app.clone(),
                         Arc::clone(&self.db),
@@ -5551,6 +5583,99 @@ mod continuation_tests {
         engine.record_subagent_spend("ws-1", "t-2", "call-2", &unknown);
         let c = db.lock().thread_cost("t-2", None).unwrap();
         assert_eq!((c.unpriced_calls, c.subagents_usd), (1, 0.0));
+    }
+
+    /// Two tool rounds, then a request the provider refuses for good.
+    struct TwoRoundsThenRefuses {
+        left: std::sync::atomic::AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for TwoRoundsThenRefuses {
+        async fn complete(
+            &self,
+            _b: &str,
+            _k: Option<&str>,
+            _req: &crate::providers::LlmRequest,
+            _c: &reqwest::Client,
+        ) -> AppResult<crate::providers::LlmResponse> {
+            if self.left.fetch_sub(1, Ordering::Relaxed) == 0 {
+                return Err(AppError::Provider {
+                    kind: crate::error::ProviderErrorKind::BadRequest,
+                    retry_after: None,
+                    message: "prompt is too long".into(),
+                });
+            }
+            Ok(crate::providers::LlmResponse {
+                text: "reading".into(),
+                tool_uses: vec![crate::providers::LlmToolUse {
+                    id: format!("t{}", self.left.load(Ordering::Relaxed)),
+                    name: "list_files".into(),
+                    input: serde_json::json!({"path": "."}),
+                }],
+                stop_reason: crate::providers::LlmStopReason::ToolUse,
+                input_tokens: 10_000,
+                output_tokens: 100,
+                ..Default::default()
+            })
+        }
+    }
+    struct NoSink;
+    impl crate::orchestrator::events::EventSink for NoSink {
+        fn emit(&self, _e: &str, _p: serde_json::Value) {}
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn failed_subagent_spend_is_recorded() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = ChatEngine::new(Arc::clone(&db), None);
+        let model = "claude-opus-5-5";
+        let round = token_engine::request_cost_for(model, 10_000, 100, 0, 0);
+        assert!(round > 0.0, "the model is priced");
+        // A budget the two rounds cross.
+        db.lock().upsert_budget("global", "", "daily", round * 1.5).unwrap();
+
+        let spec = SubagentSpec {
+            call_id: "call-1".into(),
+            call: crate::chat_agents::parse_agent_call(&serde_json::json!({"description": "Map", "prompt": "List the files."})).unwrap(),
+            workspace_id: "ws-1".into(),
+            thread_id: "t-1".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: model.into(),
+            max_iterations: None,
+            max_tokens: 4096,
+            sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        };
+        let provider = TwoRoundsThenRefuses { left: std::sync::atomic::AtomicU64::new(2) };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let o = crate::chat_agents::run_subagent_core(
+            &provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &NoSink, None, None,
+        )
+        .await
+        .unwrap();
+        assert!(!o.ok, "{}", o.report);
+        assert!((o.cost_usd - round * 2.0).abs() < 1e-9, "the outcome carries both rounds: {}", o.cost_usd);
+        // The thread receipt reads the outcome's figures from the tool row.
+        let row = serde_json::to_value(&o).unwrap();
+        assert_eq!(row["inputTokens"], 20_000);
+        assert!((row["costUsd"].as_f64().unwrap() - round * 2.0).abs() < 1e-9);
+
+        engine.record_subagent_spend("ws-1", "t-1", "call-1", &o);
+        let c = db.lock().thread_cost("t-1", None).unwrap();
+        assert_eq!(c.calls, 1, "the failed attempt is a ledger row");
+        assert!((c.subagents_usd - round * 2.0).abs() < 1e-9, "{}", c.subagents_usd);
+        // And the budget sees it.
+        let verdict = db.lock().check_budget(Some("ws-1")).unwrap();
+        assert!(matches!(verdict, crate::db::BudgetVerdict::Block { .. }), "{verdict:?}");
+        assert_eq!(db.lock().budget_headroom(Some("ws-1")).unwrap(), Some(0.0));
     }
 
     #[test]

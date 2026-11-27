@@ -23,7 +23,7 @@ use crate::db::Db;
 use crate::error::AppResult;
 use crate::chat_engine::{continuation_note, dangerous_command, guard_agent_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
 use crate::orchestrator::agentic::resume_messages_for_continuation;
-use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
+use crate::orchestrator::agentic::{run_agentic_loop_billed, user_messages, AgenticResult, BlockedTranscript, ExternalTools, LoopFailure, ToolGate};
 use crate::orchestrator::events::EventSink;
 use crate::orchestrator::live::LiveEmitter;
 use crate::providers::{Effort, LlmMessage, LlmProvider, LlmTool};
@@ -210,6 +210,15 @@ pub struct AgentOutcome {
     pub closed_at_cap: bool,
     /// The sub-agent stopped to ask a question it could not resolve alone.
     pub blocked: bool,
+    /// The loop errored (retries exhausted, a context 400…) after the
+    /// rounds this outcome bills. Not a turn cap: more turns are not asked
+    /// for at the cap gate, though the run can be continued from its journal.
+    #[serde(skip)]
+    pub errored: bool,
+    /// The run closed because its spend reached its limit (its share of the
+    /// budget, or its definition's `max-cost`), not because turns ran out.
+    #[serde(skip)]
+    pub spend_stopped: bool,
     pub model: String,
     /// The tier `model` is mapped to in Settings › Models (`fast` /
     /// `balanced` / `strong`), when it is one — the crew card's tier mix.
@@ -293,6 +302,7 @@ pub fn report_from_result(out: &AgenticResult, max_iterations: Option<usize>) ->
     // A cap ending only exists when a limit was configured; the wording
     // names it when it can.
     let limit = match max_iterations {
+        _ if out.spend_stopped => "spend limit".to_string(),
         Some(n) => format!("{n}-turn tool limit"),
         None => "turn limit".to_string(),
     };
@@ -325,6 +335,24 @@ pub fn report_from_result(out: &AgenticResult, max_iterations: Option<usize>) ->
         format!("Sub-agent hit its {limit} without producing a report."),
         false,
     )
+}
+
+/// The most one run may spend (USD): the lower of its share of the budget
+/// headroom and its definition's `max-cost`. `None` when neither is set.
+pub fn subagent_spend_limit(share: Option<f64>, max_cost: Option<f64>) -> Option<f64> {
+    match (share, max_cost) {
+        (Some(s), Some(c)) => Some(s.min(c)),
+        (s, c) => s.or(c),
+    }
+}
+
+/// Each sub-agent's share of the budget headroom when `n_agents` run at
+/// once, so together they cannot spend past it before the director's next
+/// budget check. `None` (no budget set, or the turn overrode it) is
+/// unbounded; a spent budget gives each a zero share (one round, then the
+/// close).
+pub fn budget_share(headroom: Option<f64>, n_agents: usize) -> Option<f64> {
+    headroom.map(|h| h.max(0.0) / n_agents.max(1) as f64)
 }
 
 /// Everything a sub-agent needs from the parent turn, owned so the run can
@@ -362,6 +390,11 @@ pub struct SubagentSpec {
     /// the director asked for when that was not honored.
     #[serde(default)]
     pub plan: Option<SubagentPlan>,
+    /// This run's share of the budget headroom (USD), set at the fan-out
+    /// (`budget_share`); the definition's `max-cost` caps it further as the
+    /// run starts. Not saved: a later continuation takes its share anew.
+    #[serde(skip)]
+    pub spend_limit: Option<f64>,
 }
 
 /// The resolved shape of one sub-agent run — model, tier and effort — plus
@@ -1041,7 +1074,8 @@ pub async fn run_subagent_core(
     };
     let allowed_tools = spec.definition.as_ref().and_then(|d| d.tools.as_deref());
     let effort = spec.plan.as_ref().and_then(|p| p.effort);
-    let out = run_agentic_loop(
+    let spend_limit = subagent_spend_limit(spec.spend_limit, spec.definition.as_ref().and_then(|d| d.max_cost));
+    let result = run_agentic_loop_billed(
         provider,
         api_base,
         api_key,
@@ -1057,19 +1091,33 @@ pub async fn run_subagent_core(
         effort,
         spec.sandbox_roots.as_deref(),
         false,
-        None,
+        spend_limit,
         &[],
         Some(&skill_gate as &dyn ToolGate),
         Some(&skill_tools as &dyn ExternalTools),
     )
-    .await?;
-    let (report, ok) = report_from_result(&out, spec.max_iterations);
+    .await;
+    // A loop that errored after real rounds still spent them: the outcome
+    // carries their usage (the ledger and the budget see it) and their
+    // transcript (the run can be continued), and fails.
+    let (out, report, ok, errored) = match result {
+        Ok(out) => {
+            let (report, ok) = report_from_result(&out, spec.max_iterations);
+            (out, report, ok, false)
+        }
+        Err(f) => {
+            let LoopFailure { error, partial } = *f;
+            (partial, format!("Sub-agent failed: {error}"), false, true)
+        }
+    };
     Ok(AgentOutcome {
         report,
         ok,
         finished: out.finished,
         closed_at_cap: out.closed_at_cap,
         blocked: out.blocked.is_some(),
+        errored,
+        spend_stopped: out.spend_stopped,
         model: model.to_string(),
         tier: None,
         effort,
@@ -1430,9 +1478,10 @@ pub fn spec_edits_files(spec: &SubagentSpec) -> bool {
 
 /// A run that stopped because its turns ran out — with or without a usable
 /// forced close — and left a transcript to continue from. A blocked run
-/// (a question) and a run that could not start are not this.
+/// (a question), a run that could not start, one that errored and one its
+/// spend limit closed are not this: more turns would not fix them.
 pub fn ran_out_of_turns(o: &AgentOutcome) -> bool {
-    !o.blocked && !o.transcript.is_empty() && (o.closed_at_cap || !o.finished)
+    !o.blocked && !o.errored && !o.spend_stopped && !o.transcript.is_empty() && (o.closed_at_cap || !o.finished)
 }
 
 /// Fold a continuation (more turns on the same transcript) into one outcome:
@@ -1646,6 +1695,7 @@ mod tests {
             escalate: None,
             max_turns: None,
             effort: None,
+            max_cost: None,
             source: "project".into(),
         }
     }
@@ -1711,6 +1761,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -1742,6 +1793,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         assert_eq!(pick_subagent_model(&base, &known, &no_tiers), "conv-model");
         let with_def = SubagentSpec { definition: Some(def("x", None, Some("haiku"))), ..base.clone() };
@@ -1807,6 +1859,7 @@ mod tests {
             default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None,
             definition: None, policy_auto: false, resume: None,
             plan: None,
+            spend_limit: None,
         };
         assert!(spec_edits_files(&base), "no definition → the full tool set");
         let with = |tools: Vec<&str>| SubagentSpec { definition: Some(def("x", Some(tools), None)), ..base.clone() };
@@ -1853,6 +1906,7 @@ mod tests {
             policy_auto: true,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         (known, tiers, base)
     }
@@ -1951,6 +2005,7 @@ mod tests {
             policy_auto: true,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         assert_eq!(pick_subagent_model(&base, &known, &tiers), "haiku", "no model → fast under Auto");
         // A definition's tier still wins; a call's explicit model still wins.
@@ -2012,6 +2067,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let ok = AgentOutcome { ok: true, finished: true, model: "sonnet".into(), ..Default::default() };
         assert!(!should_escalate(&ok));
@@ -2155,6 +2211,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -2230,6 +2287,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let gate = RecordingGate { seen: Mutex::new(vec![]), deny: vec!["mcp__jira__add_comment"] };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -2292,6 +2350,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -2356,6 +2415,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec,
@@ -2415,6 +2475,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let gate = DenyRuns { seen: Mutex::new(vec![]) };
         let rec = Recorder { entries: Mutex::new(vec![]) };
@@ -2464,6 +2525,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();
@@ -2481,6 +2543,169 @@ mod tests {
         assert_eq!(entries[0]["stageId"], "call-1");
         let kinds: Vec<&str> = entries.iter().map(|p| p["entry"]["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
+    }
+
+    /// Answers its scripted turns, then fails every request with an error
+    /// that is not retried (a context 400). Panics past `max_calls`, so a
+    /// loop that never stops fails the test instead of hanging it.
+    struct FailsAfter {
+        turns: Mutex<VecDeque<LlmResponse>>,
+        calls: AtomicU64,
+        max_calls: u64,
+        seen: Mutex<Vec<Vec<LlmMessage>>>,
+    }
+    impl FailsAfter {
+        fn new(turns: Vec<LlmResponse>, max_calls: u64) -> Self {
+            Self { turns: Mutex::new(VecDeque::from(turns)), calls: AtomicU64::new(0), max_calls, seen: Mutex::new(vec![]) }
+        }
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for FailsAfter {
+        async fn complete(&self, _b: &str, _k: Option<&str>, req: &LlmRequest, _c: &reqwest::Client) -> AppResult<LlmResponse> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert!(n <= self.max_calls, "the loop never stopped ({n} calls)");
+            self.seen.lock().push(req.messages.clone());
+            self.turns.lock().pop_front().ok_or_else(|| crate::error::AppError::Provider {
+                kind: crate::error::ProviderErrorKind::BadRequest,
+                retry_after: None,
+                message: "prompt is too long".into(),
+            })
+        }
+    }
+
+    fn read_turn(id: &str, input_tokens: u64) -> LlmResponse {
+        LlmResponse {
+            input_tokens,
+            ..resp(
+                "reading",
+                vec![LlmToolUse { id: id.into(), name: "read_file".into(), input: serde_json::json!({"path": "a.rs"}) }],
+                LlmStopReason::ToolUse,
+            )
+        }
+    }
+
+    fn core_spec(dir: &std::path::Path) -> SubagentSpec {
+        SubagentSpec {
+            call_id: "call-f".into(),
+            call: parse_agent_call(&serde_json::json!({"description": "Inspect a.rs", "prompt": "Read a.rs and report."})).unwrap(),
+            workspace_id: "ws".into(),
+            thread_id: "th".into(),
+            workspace_path: dir.to_string_lossy().into_owned(),
+            default_model: "m".into(),
+            max_iterations: None,
+            max_tokens: 4096,
+            sandbox_roots: None,
+            definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+            spend_limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_subagent_is_continuable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        // Two real rounds, then the provider refuses the third request.
+        let provider = FailsAfter::new(vec![read_turn("t1", 10), read_turn("t2", 10)], 3);
+        let spec = core_spec(dir.path());
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec, &cancel, &rec, None, None)
+            .await
+            .expect("a failed loop is a failed outcome, not an error");
+        assert!(!out.ok && out.errored && !out.finished, "{}", out.report);
+        assert!(out.report.starts_with("Sub-agent failed:") && out.report.contains("prompt is too long"), "{}", out.report);
+        // The two rounds' usage, not zero.
+        assert_eq!((out.input_tokens, out.output_tokens, out.tool_calls), (20, 10, 2));
+        assert_eq!(out.billed_attempts()[0].input_tokens, 20);
+        // Their conversation is the resume point: the ask, then two rounds.
+        assert_eq!(out.transcript.len(), 5, "{:?}", out.transcript);
+        assert!(!ran_out_of_turns(&out), "an error is not a turn cap: the cap gate does not ask");
+
+        // Saved like any other run, so the crew journal can continue it.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        persist_run(&db, &spec, &out);
+        let saved = db.lock().get_chat_agent_run("call-f").unwrap().expect("the failed run was saved");
+        let transcript: BlockedTranscript = serde_json::from_str(&saved.transcript_json).unwrap();
+        assert_eq!(transcript.messages.len(), 5);
+        assert!(transcript.ask_tool_use_id.is_empty(), "a continuation, not an answered ask");
+
+        // Continuing resumes on those rounds instead of starting over.
+        let more = SubagentSpec {
+            resume: Some(resume_messages_for_continuation(&transcript, &continuation_note(None, None))),
+            ..spec.clone()
+        };
+        let provider = FailsAfter::new(vec![resp("Report: a.rs is an empty main.", vec![], LlmStopReason::EndTurn)], 1);
+        let done = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &more, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(done.ok && done.continued, "{}", done.report);
+        let sent = provider.seen.lock()[0].clone();
+        assert!(sent.len() >= 5, "the saved rounds were sent again: {sent:?}");
+
+        // A failure before any round completes has nothing to continue.
+        let provider = FailsAfter::new(vec![], 1);
+        let none = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), "m", &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert!(!none.ok && none.errored && none.transcript.is_empty());
+        assert_eq!(none.input_tokens + none.output_tokens, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn subagent_spend_limit_closes_run() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let model = "claude-opus-5-5";
+        let round = crate::token_engine::request_cost_for(model, 10_000, 5, 0, 0);
+        assert!(round > 0.0, "the model is priced");
+        // A sub-agent that would read forever: every turn calls a tool.
+        let looping = || FailsAfter::new((0..10).map(|i| read_turn(&format!("t{i}"), 10_000)).collect(), 10);
+
+        // Its share of the headroom is 1.5 rounds: round 2 crosses it, its
+        // tools are voided and the close answers.
+        let spec = SubagentSpec { spend_limit: Some(round * 1.5), ..core_spec(dir.path()) };
+        let provider = looping();
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 3, "two rounds and the close");
+        assert!(out.spend_stopped && out.finished && out.ok, "{}", out.report);
+        assert!(out.report.contains("reached its spend limit"), "{}", out.report);
+        assert_eq!(out.tool_calls, 1, "the second round's call was not run");
+        assert!((out.cost_usd - round * 3.0).abs() < 1e-9, "every request is billed: {}", out.cost_usd);
+        assert!(!ran_out_of_turns(&out), "more turns would not help: the money ran out");
+
+        // A definition's `max-cost` caps it the same way when it is tighter.
+        let mut capped = def("explorer", None, None);
+        capped.max_cost = Some(round * 0.5);
+        let spec = SubagentSpec { definition: Some(capped), spend_limit: Some(10.0), ..core_spec(dir.path()) };
+        let provider = looping();
+        let out = run_subagent_core(&provider, "http://x", None, &reqwest::Client::new(), model, &spec, &cancel, &rec, None, None)
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2, "one round and the close");
+        assert!(out.spend_stopped, "{}", out.report);
+    }
+
+    #[test]
+    fn a_spend_limit_is_the_tighter_of_the_share_and_the_definitions_cap() {
+        assert_eq!(subagent_spend_limit(None, None), None, "no budget, no cap: unbounded");
+        assert_eq!(subagent_spend_limit(Some(2.0), None), Some(2.0));
+        assert_eq!(subagent_spend_limit(None, Some(0.5)), Some(0.5));
+        assert_eq!(subagent_spend_limit(Some(2.0), Some(0.5)), Some(0.5));
+        assert_eq!(subagent_spend_limit(Some(0.25), Some(0.5)), Some(0.25));
+        assert_eq!(budget_share(None, 3), None);
+        assert_eq!(budget_share(Some(3.0), 3), Some(1.0), "the headroom is split across the fan-out");
+        assert_eq!(budget_share(Some(-1.0), 2), Some(0.0), "a spent budget leaves nothing");
+        assert_eq!(budget_share(Some(1.0), 0), Some(1.0));
     }
 
     /// A sub-agent's `run_command` gets the PATH CLI stages spawn with (#1087).
@@ -2513,6 +2738,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         let rec = Recorder { entries: Mutex::new(vec![]) };
         let client = reqwest::Client::new();
@@ -2567,6 +2793,7 @@ mod tests {
             policy_auto: false,
             resume: None,
             plan: None,
+            spend_limit: None,
         };
         (tmp, Arc::new(Mutex::new(db)), spec)
     }
