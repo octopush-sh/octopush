@@ -33,7 +33,7 @@ export const PLAN_ONLY_COPY = "In Plan only, nothing is allowed for the conversa
 
 /** The per-command grant's tooltip (#1229). */
 export const COMMAND_GRANT_TITLE =
-  "Run this, and run exactly this command again without asking for the rest of this conversation: the same words, quotes, operators and redirections. A credentials location still asks. Revoke it in the Companion.";
+  "Run this, and run exactly this command again from this folder without asking for the rest of this conversation: the same words, quotes, operators and redirections. A credentials location, or a place that runs code, still asks. Revoke it in the Companion.";
 
 /** What a command's path card can't promise (#1201), on its tooltip. */
 export const RUN_CHECK_LIMITS =

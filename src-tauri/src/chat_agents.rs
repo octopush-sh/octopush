@@ -978,7 +978,7 @@ impl ToolGate for SubagentGate {
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         match self
             .broker
-            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, mode)
+            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, self.reach.command_grant(&shown, None), mode)
             .await
         {
             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => None,

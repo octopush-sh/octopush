@@ -699,17 +699,8 @@ fn dangerous_line(command: &str) -> Option<&'static str> {
                 return Some("recursive force delete (rm)");
             }
         }
-        if let Some(pi) = tokens.iter().position(|t| *t == "push") {
-            let after = &tokens[pi + 1..];
-            // Every `--force…` flag (`--force-with-lease=…`, `--force-if-includes`)
-            // and a `+main` / `+HEAD:main` refspec force-update the ref.
-            if flag_after(pi, 'f', "--force") || after.iter().any(|t| t.starts_with("--force") || (t.len() > 1 && t.starts_with('+'))) {
-                return Some("force-push rewrites remote history");
-            }
-            // `--delete`, `-d`, or a `:branch` refspec deletes the remote ref.
-            if flag_after(pi, 'd', "--delete") || after.iter().any(|t| t.len() > 1 && t.starts_with(':')) {
-                return Some("deletes a remote branch or tag (git push)");
-            }
+        if let Some(reason) = push_rewrite(&tokens) {
+            return Some(reason);
         }
         if let Some(ci) = tokens.iter().position(|t| *t == "clean") {
             // `git clean -f` deletes untracked files; `-n` (dry run) has no `f`.
@@ -748,6 +739,39 @@ fn dangerous_line(command: &str) -> Option<&'static str> {
         ("git reset --hard", "discards uncommitted changes (git reset --hard)"),
     ];
     RULES.iter().find(|(n, _)| c.contains(*n)).map(|(_, r)| *r)
+}
+
+/// A force push or a remote delete among one segment's lowercased `tokens`,
+/// whatever program runs the `push` (`git`, `hg`, `yadm`, a quoted `ssh`
+/// command): its reason. Pure.
+fn push_rewrite(tokens: &[&str]) -> Option<&'static str> {
+    let pi = tokens.iter().position(|t| *t == "push")?;
+    let after = &tokens[pi + 1..];
+    let flag = |ch: char, long: &str| after.iter().any(|t| *t == long || (t.starts_with('-') && !t.starts_with("--") && t.contains(ch)));
+    // Every `--force…` flag (`--force-with-lease=…`, `--force-if-includes`)
+    // and a `+main` / `+HEAD:main` refspec force-update the ref.
+    if flag('f', "--force") || after.iter().any(|t| t.starts_with("--force") || (t.len() > 1 && t.starts_with('+'))) {
+        return Some("force-push rewrites remote history");
+    }
+    // `--delete`, `-d`, or a `:branch` refspec deletes the remote ref.
+    if flag('d', "--delete") || after.iter().any(|t| t.len() > 1 && t.starts_with(':')) {
+        return Some("deletes a remote branch or tag (git push)");
+    }
+    None
+}
+
+/// Whether `command` force-pushes or deletes a remote ref anywhere in it,
+/// nested commands included and whatever runs the push (#1229): such a
+/// command never gets a conversation grant. Past the nesting caps it counts.
+pub(crate) fn rewrites_remote(command: &str) -> bool {
+    let line = |l: &str| {
+        let normalized = l.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        normalized
+            .split([';', '|', '&', '\n'])
+            .any(|seg| push_rewrite(&seg.split_whitespace().map(shell_word).collect::<Vec<_>>()).is_some())
+            .then_some(())
+    };
+    each_command(command, line).map_or(true, |found| found.is_some())
 }
 
 /// A function that pipes itself into itself in the background and is then
@@ -1821,8 +1845,10 @@ impl ApprovalBroker {
     /// Ask the user to approve a command `dangerous_command` flags and wait
     /// for the answer. The card waits as long as it takes (see the type's
     /// doc): never a silent denial. The thread's "don't ask again" answers
-    /// it unseen, and outside Plan only so does a grant for this exact
-    /// command (#1229), which a remote side effect never has.
+    /// it unseen, and outside Plan only so does a held `grant`: the one this
+    /// command from this folder may have (`Reach::command_grant`, #1229),
+    /// which a remote side effect, a force push or a remote delete, and a
+    /// command reaching a path that can't be granted never have.
     #[allow(clippy::too_many_arguments)]
     pub async fn await_command(
         &self,
@@ -1832,14 +1858,15 @@ impl ApprovalBroker {
         call_id: &str,
         command: &str,
         reason: &str,
+        grant: Option<Grant>,
         mode: crate::permissions::Mode,
     ) -> ApprovalDecision {
-        let (answered, offer) = self.command_offer(thread_id, command, mode);
+        let (answered, offer) = self.command_offer(thread_id, grant.as_ref(), mode);
         if answered {
             return ApprovalDecision::Approve;
         }
         let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, &offer).await;
-        let settled = self.settle_command(thread_id, decision, command, offer.command);
+        let settled = self.settle_command(thread_id, decision, grant.as_ref(), offer.command);
         if decision == ApprovalDecision::Grant {
             let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
         }
@@ -1848,11 +1875,9 @@ impl ApprovalBroker {
 
     /// Whether a flagged command is answered unseen, and what its card
     /// offers otherwise (#1229). Pure but for the grants it reads.
-    fn command_offer(&self, thread_id: &str, command: &str, mode: crate::permissions::Mode) -> (bool, Offer) {
+    fn command_offer(&self, thread_id: &str, grant: Option<&Grant>, mode: crate::permissions::Mode) -> (bool, Offer) {
         let plan = mode == crate::permissions::Mode::Plan;
-        // None for a remote side effect, or an expansion the check can't follow.
-        let grant = Grant::command(command);
-        let held = grant.as_ref().is_some_and(|g| self.grants(thread_id, mode).iter().any(|h| h.same(g)));
+        let held = grant.is_some_and(|g| self.grants(thread_id, mode).iter().any(|h| h.same(g)));
         let answered = held || self.auto_approve.lock().contains(thread_id);
         (answered, Offer { command: grant.is_some() && !plan, plan_only: grant.is_some() && plan, ..Offer::default() })
     }
@@ -1860,9 +1885,9 @@ impl ApprovalBroker {
     /// What an answer to a flagged command's card does: "grant" keeps this
     /// exact command for the thread when the card offered it, "always" the
     /// thread's "don't ask again" (as [`Self::record`]).
-    pub(crate) fn settle_command(&self, thread_id: &str, decision: ApprovalDecision, command: &str, offered: bool) -> ApprovalDecision {
-        if let Some(g) = Grant::command(command).filter(|_| offered && decision == ApprovalDecision::Grant) {
-            self.keep(thread_id, &g);
+    pub(crate) fn settle_command(&self, thread_id: &str, decision: ApprovalDecision, grant: Option<&Grant>, offered: bool) -> ApprovalDecision {
+        if let Some(g) = grant.filter(|_| offered && decision == ApprovalDecision::Grant) {
+            self.keep(thread_id, g);
         }
         self.record(thread_id, decision, false)
     }
@@ -2744,6 +2769,28 @@ fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String
     out
 }
 
+/// Talk's unsandboxed `write_file` (#1229): it never follows a link at the
+/// file it opens (`O_NOFOLLOW`), so a link swapped in after the check can't
+/// send the write elsewhere. A link already there is written through its
+/// target, resolved now, only when that is inside the workspace
+/// (`CLAUDE.md -> AGENTS.md`); one that leads out is refused.
+fn write_unfollowed(workspace: &Path, full: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut target = full.to_path_buf();
+    if std::fs::symlink_metadata(full).is_ok_and(|m| m.file_type().is_symlink()) {
+        let real = crate::talk_guard::resolve(full).ok_or_else(|| std::io::Error::other("its links go too deep to follow"))?;
+        if !real.starts_with(std::fs::canonicalize(workspace)?) {
+            return Err(std::io::Error::other("it is a link that leads outside the workspace; write the file it points to by its own path"));
+        }
+        target = real;
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NOFOLLOW);
+    open.open(&target)?.write_all(content.as_bytes())
+}
+
 /// Talk's `run_command` with `input` in `workspace` under `roots`, on a
 /// blocking thread, so the turn's runtime thread stays free; `cancel` (Stop)
 /// kills it mid-run. The output comes back as kept (`run_command_kept`): the
@@ -3031,7 +3078,7 @@ pub(crate) fn execute_tool_cancellable(
             if let Some(parent) = full.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            match std::fs::write(&full, content) {
+            match write_unfollowed(workspace_path, &full, content) {
                 Ok(()) => (format!("Wrote {} bytes to {path}", content.len()), true),
                 Err(e) => (format!("Error writing {path}: {e}"), false),
             }
@@ -5346,10 +5393,11 @@ impl ChatEngine {
                     // A path outside the workspace or in a credentials
                     // location asks every time (#1201), read from where the
                     // command runs: the shared shell's cwd when it runs there.
+                    let shared = self.talk_shell.available() && exec_roots.is_none();
+                    let shell_cwd = || shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
                     if denied.is_none() {
-                        let shared = self.talk_shell.available() && exec_roots.is_none();
                         let check = || {
-                            let cwd = shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
+                            let cwd = shell_cwd();
                             let grants = self.approvals.grants(&request.thread_id, mode);
                             reach.command_card(None, command, cwd.as_deref().map(Path::new), &grants)
                         };
@@ -5359,9 +5407,11 @@ impl ChatEngine {
                         }
                     }
                     if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
+                        // Its grant is bound to where it runs, and checks where it reaches (#1229).
+                        let grant = reach.command_grant(command, shell_cwd().as_deref().map(Path::new));
                         match self
                             .approvals
-                            .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, mode)
+                            .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, grant, mode)
                             .await
                         {
                             ApprovalDecision::Approve | ApprovalDecision::ApproveAlways | ApprovalDecision::Grant => {}
@@ -7437,10 +7487,12 @@ mod tests {
         broker.settle_card("t-old", ApprovalDecision::Approve, &card);
         broker.settle_card("t-old", ApprovalDecision::Grant, &ToolCard { grant: None, ..card });
         assert_eq!(broker.grants("t-old", Mode::Edit).len(), 1);
-        // A command grant shows as written; a fork starts with none; a revoke forgets one.
-        broker.settle_command("t-old", ApprovalDecision::Grant, "npm  run build", true);
+        // A command grant shows as written, with its folder; a fork starts with none; a revoke forgets one.
+        let (_ws, reach) = scratch_reach();
+        broker.settle_command("t-old", ApprovalDecision::Grant, reach.command_grant("npm  run build", None).as_ref(), true);
         let held = db.lock().thread_grants("t-old").unwrap();
-        assert_eq!((held.len(), held[1].kind, held[1].shown.as_str()), (2, GrantKind::Command, "npm run build"));
+        assert_eq!((held.len(), held[1].kind), (2, GrantKind::Command));
+        assert!(held[1].shown.starts_with("npm run build (in "), "{}", held[1].shown);
         let id = db.lock().insert_chat_message("w1", "t-old", "user", "go on", None, None, None, None).unwrap();
         let (fork, ..) = db.lock().fork_chat_thread("t-old", id).unwrap();
         assert!(db.lock().thread_grants(&fork.id).unwrap().is_empty(), "a fork starts with none");
@@ -7448,46 +7500,97 @@ mod tests {
         assert_eq!(broker.grants("t-old", Mode::Edit), vec![held[1].clone()], "revoked, it asks again");
     }
 
+    /// A workspace beside a home, both scratch, and their `Reach`.
+    fn scratch_reach() -> (tempfile::TempDir, crate::talk_guard::Reach) {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, home) = (dir.path().join("ws"), dir.path().join("home"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let reach = crate::talk_guard::Reach::new(&ws, None, Some(&home));
+        (dir, reach)
+    }
+
     #[test]
-    fn a_command_grant_is_for_that_command_only_and_never_for_a_remote_side_effect() {
+    fn a_command_grant_is_for_that_command_from_that_folder_only() {
         use crate::permissions::Mode::{Edit, Plan};
         let (_tmp, db) = old_thread_db();
+        let (_ws, reach) = scratch_reach();
         let broker = ApprovalBroker::with_db(Arc::clone(&db));
-        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", Edit);
+        let at = |c: &str, cwd: Option<&str>| reach.command_grant(c, cwd.map(Path::new));
+        let root = at("rm -rf node_modules", None);
+        let (answered, offer) = broker.command_offer("t-old", root.as_ref(), Edit);
         assert!(!answered && offer.command && !offer.plan_only, "a flagged command offers itself");
-        broker.settle_command("t-old", ApprovalDecision::Grant, "rm -rf build", true);
-        assert!(broker.command_offer("t-old", "rm  -rf 'build'", Edit).0, "the same command, spelled another way");
-        for other in ["rm -rf build && rm -rf ~", "rm -rf build2", "rm -rf build; ls", "sudo rm -rf build", "rm -rf build &"] {
-            assert!(!broker.command_offer("t-old", other, Edit).0, "{other}");
+        broker.settle_command("t-old", ApprovalDecision::Grant, root.as_ref(), true);
+        assert!(broker.command_offer("t-old", at("rm  -rf 'node_modules'", None).as_ref(), Edit).0, "the same command, spelled another way");
+        // The same text from another folder is another command.
+        assert!(!broker.command_offer("t-old", at("rm -rf node_modules", Some("/opt/homebrew/lib")).as_ref(), Edit).0);
+        for other in ["rm -rf node_modules && rm -rf ~", "rm -rf node_modules2", "rm -rf node_modules; ls", "sudo rm -rf node_modules", "rm -rf node_modules &"] {
+            assert!(!broker.command_offer("t-old", at(other, None).as_ref(), Edit).0, "{other}");
         }
-        let (answered, offer) = broker.command_offer("t-old", "rm -rf build", Plan);
+        let (answered, offer) = broker.command_offer("t-old", root.as_ref(), Plan);
         assert!(!answered && !offer.command && offer.plan_only, "never in Plan only, and the card says so");
-        // A force push asks as on main, and its card never offers a grant nor keeps one.
-        let (answered, offer) = broker.command_offer("t-old", "git push --force origin main", Edit);
+        // A card with no grant to offer keeps none; "don't ask again" works as on main, in either mode.
+        let (answered, offer) = broker.command_offer("t-old", None, Edit);
         assert!(!answered && !offer.command && !offer.plan_only);
-        assert_eq!(broker.settle_command("t-old", ApprovalDecision::Grant, "git push --force origin main", false), ApprovalDecision::Approve);
-        assert!(db.lock().thread_grants("t-old").unwrap().iter().all(|g| !g.shown.contains("push")));
-        // "Don't ask again" works as on main, in either mode.
-        assert_eq!(broker.settle_command("t-old", ApprovalDecision::ApproveAlways, "git clean -fd", false), ApprovalDecision::ApproveAlways);
-        for (command, mode) in [("git push --force origin main", Edit), ("git clean -fd", Plan)] {
-            assert!(broker.command_offer("t-old", command, mode).0, "{command}");
+        assert_eq!(broker.settle_command("t-old", ApprovalDecision::Grant, None, false), ApprovalDecision::Approve);
+        assert_eq!(db.lock().thread_grants("t-old").unwrap().len(), 1);
+        assert_eq!(broker.settle_command("t-old", ApprovalDecision::ApproveAlways, None, false), ApprovalDecision::ApproveAlways);
+        for mode in [Edit, Plan] {
+            assert!(broker.command_offer("t-old", None, mode).0);
         }
+    }
+
+    /// A force push or a remote delete never has a grant, whatever runs the
+    /// push (#1229); the flagged card still asks for it, as on main.
+    #[test]
+    fn a_force_push_or_a_remote_delete_is_never_granted() {
+        let (_ws, reach) = scratch_reach();
+        for c in [
+            "git push --force origin main", "git push origin +main", "git push origin :old", "git push -d origin old",
+            "hg push -f", "yadm push --force", "ssh host 'git push --force'", "ssh host \"git push origin :main\"",
+            "rm -rf build && git push --force", "bash -c 'git push -f'",
+        ] {
+            assert!(rewrites_remote(c), "{c}");
+            assert!(dangerous_command(c).is_some(), "{c} asks");
+            assert_eq!(reach.command_grant(c, None), None, "{c}: never a grant");
+        }
+        for c in ["rm -rf build", "git push origin main", "hg pull -f"] {
+            assert!(!rewrites_remote(c), "{c}");
+        }
+        assert!(reach.command_grant("rm -rf build", None).is_some());
     }
 
     /// Edit freely gains no card (#1229): a plain push, a `gh` write and a
     /// publish run without one, as on main, and none can be granted.
     #[test]
     fn a_plain_push_in_edit_freely_asks_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let (ws, home) = (dir.path().join("ws"), dir.path().join("home"));
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        let reach = crate::talk_guard::Reach::new(&ws, None, Some(&home));
+        let (_ws, reach) = scratch_reach();
         for c in ["git push origin main", "git push", "gh pr create --fill", "npm publish"] {
             assert_eq!(dangerous_command(c), None, "{c}: no flagged-command card");
             assert_eq!(reach.command_card(None, c, None, &[]), None, "{c}: no path card");
-            assert!(crate::talk_guard::Grant::command(c).is_none(), "{c}: never a grant");
+            assert!(reach.command_grant(c, None).is_none(), "{c}: never a grant");
         }
+    }
+
+    /// `write_file` never follows a link at the file it opens out of the
+    /// workspace (#1229); a link inside is written through its target.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_never_follows_a_link_out_of_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, out) = (dir.path().join("ws"), dir.path().join("out"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "a").unwrap();
+        std::os::unix::fs::symlink(ws.join("AGENTS.md"), ws.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink(out.join("x.txt"), ws.join("leak.txt")).unwrap();
+        let write = |p: &str| execute_tool_cancellable(&ws, "write_file", &serde_json::json!({ "path": p, "content": "new" }), None, None);
+        assert!(write("CLAUDE.md").1, "a link inside is written through");
+        assert_eq!(std::fs::read_to_string(ws.join("AGENTS.md")).unwrap(), "new");
+        let (msg, ok) = write("leak.txt");
+        assert!(!ok && msg.contains("leads outside the workspace"), "{msg}");
+        assert!(!out.join("x.txt").exists());
+        assert!(write("plain.txt").1);
     }
 
     #[test]

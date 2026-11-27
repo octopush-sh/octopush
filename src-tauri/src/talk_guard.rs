@@ -79,24 +79,6 @@ pub enum GrantKind {
 const GRANT_SHOWN_MAX: usize = 200;
 
 impl Grant {
-    /// The grant for exactly `command`, or `None` when it can't have one: it
-    /// holds an expansion the check can't follow, so what it runs can change
-    /// between calls ([`crate::chat_engine::command_key`]), or it changes
-    /// something outside this Mac ([`crate::permissions::remote_effect`]).
-    pub fn command(command: &str) -> Option<Grant> {
-        if crate::permissions::remote_effect(command).is_some() {
-            return None;
-        }
-        let value = crate::chat_engine::command_key(command)?;
-        let line = command.split_whitespace().collect::<Vec<_>>().join(" ");
-        let shown = if line.len() > GRANT_SHOWN_MAX {
-            format!("{}\u{2026}", crate::chat_engine::truncate_char_safe(&line, GRANT_SHOWN_MAX))
-        } else {
-            line
-        };
-        Some(Grant { kind: GrantKind::Command, value, shown })
-    }
-
     /// The same grant: its kind and value, however it was shown.
     pub fn same(&self, other: &Grant) -> bool {
         self.kind == other.kind && self.value == other.value
@@ -177,6 +159,20 @@ const HOME_SECRETS: &[(&str, &str)] = &[
 /// The same, outside home.
 const SYSTEM_SECRETS: &[(&str, &str)] = &[("/Library/Keychains", "keychains")];
 
+/// Where a write makes code run later (#1229), under home, and what runs it.
+/// A path there always asks and is never granted; Git's own places are
+/// matched anywhere ([`Reach::runs_code`]).
+const HOME_RUNS_CODE: &[(&str, &str)] = &[
+    ("Library/LaunchAgents", "macOS runs login items from it"), ("Library/LaunchDaemons", "macOS runs login items from it"),
+    (".zshrc", "every new shell runs it"), (".zprofile", "every new shell runs it"), (".zshenv", "every new shell runs it"),
+    (".zlogin", "every new shell runs it"), (".bashrc", "every new shell runs it"), (".bash_profile", "every new shell runs it"),
+    (".bash_login", "every new shell runs it"), (".profile", "every new shell runs it"),
+    (".config/fish/config.fish", "every new shell runs it"), (".ssh/config", "ssh runs what it names"),
+];
+
+/// The same, outside home.
+const SYSTEM_RUNS_CODE: &[(&str, &str)] = &[("/Library/LaunchAgents", "macOS runs login items from it"), ("/Library/LaunchDaemons", "macOS runs login items from it")];
+
 /// Whether `path` is `prefix` or inside it, by components and without case.
 fn under(path: &Path, prefix: &Path) -> bool {
     let mut p = path.components();
@@ -196,6 +192,8 @@ pub struct Reach {
     linked: Vec<PathBuf>,
     home: Option<PathBuf>,
     secrets: Vec<(PathBuf, Option<PathBuf>, &'static str)>,
+    /// [`HOME_RUNS_CODE`] and [`SYSTEM_RUNS_CODE`], as named and resolved.
+    runs_code: Vec<(PathBuf, Option<PathBuf>, &'static str)>,
 }
 
 /// The dependency folders a mission may link from its project's main
@@ -225,12 +223,19 @@ impl Reach {
             .chain(SYSTEM_SECRETS.iter().map(|(p, why)| (PathBuf::from(*p), *why)))
             .map(|(place, why)| (place.clone(), std::fs::canonicalize(&place).ok(), why))
             .collect();
+        let runs_code = HOME_RUNS_CODE
+            .iter()
+            .filter_map(|(rel, why)| home.as_deref().map(|h| (h.join(rel), *why)))
+            .chain(SYSTEM_RUNS_CODE.iter().map(|(p, why)| (PathBuf::from(*p), *why)))
+            .map(|(place, why)| (place.clone(), std::fs::canonicalize(&place).ok(), why))
+            .collect();
         Self {
             workspace: workspace.to_path_buf(),
             root: std::fs::canonicalize(workspace).ok(),
             linked: linked_folders(main_checkout),
             home,
             secrets,
+            runs_code,
         }
     }
 
@@ -263,6 +268,66 @@ impl Reach {
         None
     }
 
+    /// What runs code from `path` (#1229), when a write there makes code run
+    /// later: Git's hooks, config and info files in any `.git` folder, login
+    /// items, shell startup files and SSH's config, each as named and where
+    /// it resolves, without case. Such a path always asks and is never
+    /// granted, inside the workspace too.
+    fn runs_code(&self, path: &Path) -> Option<&'static str> {
+        let names: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect();
+        for i in (0..names.len()).filter(|&i| names[i] == ".git") {
+            match names.get(i + 1).map(String::as_str) {
+                Some("hooks") => return Some("Git runs its hooks"),
+                Some("config") if names.len() == i + 2 => return Some("Git's config can make Git run programs"),
+                Some("info") => return Some("Git's info files can make Git run programs"),
+                _ => {}
+            }
+        }
+        self.runs_code.iter().find(|(place, resolved, _)| std::iter::once(place).chain(resolved).any(|p| under(path, p))).map(|(_, _, why)| *why)
+    }
+
+    /// The grant for exactly `command` run from `cwd` (#1229), bound to that
+    /// folder as it resolves: the same text from another folder is another
+    /// command. `None` when the command holds an expansion the check can't
+    /// follow, so what it runs can change between calls
+    /// ([`crate::chat_engine::command_key`]); when it changes something
+    /// outside this Mac ([`crate::permissions::remote_effect`]); or when it
+    /// force-pushes or deletes a remote ref, whatever runs the push
+    /// ([`crate::chat_engine::rewrites_remote`]).
+    fn exact(&self, command: &str, cwd: &Path) -> Option<Grant> {
+        if crate::permissions::remote_effect(command).is_some() || crate::chat_engine::rewrites_remote(command) {
+            return None;
+        }
+        let key = crate::chat_engine::command_key(command)?;
+        let dir = resolve(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        let value = serde_json::to_string(&(dir.to_string_lossy(), key)).ok()?;
+        let mut line = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.len() > GRANT_SHOWN_MAX {
+            line = format!("{}\u{2026}", crate::chat_engine::truncate_char_safe(&line, GRANT_SHOWN_MAX));
+        }
+        Some(Grant { kind: GrantKind::Command, value, shown: format!("{line} (in {})", self.shown(&dir)) })
+    }
+
+    /// The grant a flagged command's card may offer (#1229): [`Self::exact`]
+    /// from `cwd` (else the workspace), when every path the command reaches
+    /// may be covered by one: no credentials location, no place that runs
+    /// code, no folder around credentials, and within the check's caps.
+    pub fn command_grant(&self, command: &str, cwd: Option<&Path>) -> Option<Grant> {
+        let start = cwd.unwrap_or(&self.workspace);
+        let exact = self.exact(command, start)?;
+        let mut scan = Scan { glob_names: MAX_GLOB_NAMES, ..Scan::default() };
+        let first = self.scan(command, start, &mut scan);
+        (first.is_none() && !scan.over && !scan.ungrantable).then_some(exact)
+    }
+
+    /// Scan every line `command` runs ([`Reach::command_card`]).
+    fn scan(&self, command: &str, start: &Path, scan: &mut Scan) -> Option<Reached> {
+        match crate::chat_engine::each_command(command, |line| self.scan_line(line, start, scan)) {
+            Ok(found) => found,
+            Err(_) => self.scan_line(command, start, scan),
+        }
+    }
+
     /// The card a file tool's call must pass, or `None` when its target,
     /// resolved as the tool will open it ([`resolve`]), is inside the
     /// workspace (or, for a read, in a linked dependency folder). An absolute
@@ -274,7 +339,9 @@ impl Reach {
     /// outside, so a write doesn't ask (an `edit_file` still reads first, so
     /// it asks as a read). `label` names the sub-agent that asks. A write
     /// outside that isn't a credentials location offers its folder for the
-    /// conversation (#1229), and doesn't ask in a folder `grants` covers.
+    /// conversation (#1229), and doesn't ask in a folder `grants` covers. A
+    /// write where code runs from ([`Reach::runs_code`]) always asks, inside
+    /// the workspace and in a sandboxed mission too, and offers nothing.
     pub fn outside_card(&self, label: Option<&str>, name: &str, input: &Value, writes_confined: bool, grants: &[Grant]) -> Option<ToolCard> {
         let path = |default: &'static str| input.get("path").and_then(|p| p.as_str()).unwrap_or(default).to_string();
         let (kind, verb, act, raw) = match name {
@@ -286,11 +353,12 @@ impl Reach {
             "edit_file" => (CardKind::Write, "edits a file", "edit", path("")),
             _ => return None,
         };
-        if kind == CardKind::Write && writes_confined {
+        let writes = matches!(name, "write_file" | "edit_file");
+        let r = self.reached(&self.workspace.join(&raw), kind == CardKind::Read, name == "grep", writes)?;
+        if kind == CardKind::Write && writes_confined && !r.exec {
             return None;
         }
-        let r = self.reached(&self.workspace.join(&raw), kind == CardKind::Read, name == "grep")?;
-        let open = kind == CardKind::Write && !r.sensitive && !r.deep;
+        let open = kind == CardKind::Write && !r.sensitive && !r.deep && !r.exec;
         if open && covered(self, grants, GrantKind::Write, &r.real) {
             return None;
         }
@@ -298,6 +366,8 @@ impl Reach {
             .then(|| self.folder_of(&r.real))
             .flatten()
             .map(|d| Grant { kind: GrantKind::Write, value: d.to_string_lossy().into_owned(), shown: self.shown(&d) });
+        // A sandboxed edit asks as a read, but writes where code runs from.
+        let verb = if r.exec && kind == CardKind::Read && writes { "edits a file" } else { verb };
         let reason = sub_agent(label, r.reason(verb));
         let denial = format!(
             "Tool call not made \u{2014} the user declined to let it {act} {}, {}. \
@@ -320,7 +390,9 @@ impl Reach {
     /// credentials location, or name-marked where that counts (see
     /// [`Reach::outside_card`]). `walks`: the caller reads what the folder
     /// holds, so a folder holding a credentials location counts as one.
-    fn reached(&self, joined: &Path, read: bool, walks: bool) -> Option<Reached> {
+    /// `exec`: a write there, or a command naming it, must ask where code
+    /// runs from ([`Reach::runs_code`]), inside the workspace too.
+    fn reached(&self, joined: &Path, read: bool, walks: bool, exec: bool) -> Option<Reached> {
         // Links too deep to follow: where it leads is unknown, so it asks.
         let (real, too_deep) = match resolve(joined) {
             Some(real) => (real, false),
@@ -339,7 +411,8 @@ impl Reach {
             (_, _, true) => Some("its name marks it as a key or credentials file"),
             _ => None,
         };
-        if inside && location.is_none() && by_name.is_none() {
+        let exec = exec.then(|| self.runs_code(&real).or_else(|| self.runs_code(&lexical(joined)))).flatten();
+        if inside && location.is_none() && by_name.is_none() && exec.is_none() {
             return None;
         }
         let place = match (inside, location.is_some()) {
@@ -349,8 +422,11 @@ impl Reach {
             (true, false) => "in the workspace",
         };
         let sensitive = location.is_some() || by_name.is_some();
-        let why = location.or(by_name.map(str::to_string)).or(too_deep.then(|| "its links go too deep to follow".to_string()));
-        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, folder: None, read })
+        let why = location
+            .or(by_name.map(str::to_string))
+            .or(exec.map(|e| format!("it runs code: {e}")))
+            .or(too_deep.then(|| "its links go too deep to follow".to_string()));
+        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, folder: None, read, exec: exec.is_some() })
     }
 
     /// The card an agent's `run_command` must pass (#1201), or `None`. Every
@@ -373,22 +449,22 @@ impl Reach {
     /// other path outside the workspace asks, except a read under the
     /// system's folders ([`SYSTEM_READS`]) or in a folder a read grant in
     /// `grants` covers, and any path in a folder that may be granted when
-    /// `grants` holds this exact command (#1229). The card offers a read's
-    /// folder, else the command ([`Grant::command`]), when that folder may
-    /// be granted (`ToolCard::grant`). A program that runs, a pseudo-device and
+    /// `grants` holds this exact command from this folder (#1229). A word
+    /// naming a place that runs code ([`Reach::runs_code`]) asks, inside the
+    /// workspace too, whatever is granted. The card offers a read's folder,
+    /// else the command ([`Reach::exact`]), when every path that asks may be
+    /// granted (`ToolCard::grant`). A program that runs, a pseudo-device and
     /// a here-document's body ask only for a credentials location. Past
     /// [`MAX_COMMAND_PATHS`] paths, [`MAX_COMMAND_WORDS`] words or
     /// [`MAX_GLOB_NAMES`] names a glob reads, the command asks. A net, not a
     /// sandbox: a path built at run time isn't followed.
     pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, grants: &[Grant]) -> Option<ToolCard> {
         let start = cwd.unwrap_or(&self.workspace);
-        let exact = Grant::command(command);
+        let exact = self.exact(command, start);
         let granted = exact.as_ref().is_some_and(|e| grants.iter().any(|g| g.same(e)));
         let mut scan = Scan { grants, granted, glob_names: MAX_GLOB_NAMES, ..Scan::default() };
-        let first = match crate::chat_engine::each_command(command, |line| self.scan_line(line, start, &mut scan)) {
-            Ok(found) => found,
-            Err(_) => self.scan_line(command, start, &mut scan),
-        };
+        let first = self.scan(command, start, &mut scan);
+        let ungrantable = scan.ungrantable;
         let (reason, denial, sensitive, grant) = match (first, scan.over, scan.outside) {
             (Some(r), ..) | (None, false, Some(r)) => (
                 r.reason(&format!("reaches {}", r.shown)),
@@ -400,7 +476,7 @@ impl Reach {
                 r.sensitive,
                 match (r.folder, r.read) {
                     (Some(d), true) => Some(Grant { kind: GrantKind::Read, value: d.to_string_lossy().into_owned(), shown: self.shown(&d) }),
-                    (Some(_), false) => exact,
+                    (Some(_), false) => exact.filter(|_| !ungrantable),
                     (None, _) => None,
                 },
             ),
@@ -432,7 +508,9 @@ impl Reach {
             let fast = !holds_home
                 && self.root.as_deref().is_some_and(|r| real.starts_with(r))
                 && self.secrets.iter().all(|(place, resolved, _)| std::iter::once(place).chain(resolved).all(|p| !under(&real, p) && !under(p, &real)));
-            Cwd { logical, real, fast }
+            // In a `.git` folder, or where code runs from, a name is never plain.
+            let careful = real.components().any(|c| c.as_os_str().eq_ignore_ascii_case(".git")) || self.runs_code(&real).is_some();
+            Cwd { logical, real, fast: fast && !careful, careful }
         };
         // Where the command stands (`None`: after a `cd` the check can't
         // follow), and `Some(-P)` while a `cd` waits for its target.
@@ -462,8 +540,8 @@ impl Reach {
             // A `cd`'s target lands where bash's logical path does; any other
             // path from where the command physically stands.
             let lands = cwd.as_ref().map(|c| match target && cd == Some(false) {
-                true => Lands { base: &c.logical, lexical: true, fast: false },
-                false => Lands { base: &c.real, lexical: false, fast: c.fast },
+                true => Lands { base: &c.logical, lexical: true, fast: false, careful: c.careful },
+                false => Lands { base: &c.real, lexical: false, fast: c.fast, careful: c.careful },
             });
             let ctx = Ctx { role: w.role, walk: walking[w.segment], writes: w.writes };
             let (hit, leads) = self.scan_word(w, &text, lands, ctx, scan);
@@ -529,7 +607,7 @@ impl Reach {
                 None if alt.starts_with('/') => (Path::new("/"), alt.as_str(), None),
                 None => match &lands {
                     Some(l) => {
-                        let plain = !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt);
+                        let plain = !l.careful && !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt);
                         (l.base, alt.as_str(), plain.then_some(l.fast))
                     }
                     None => match named_credential(alt, alt) {
@@ -576,7 +654,8 @@ impl Reach {
         if !scan.seen.insert((path.to_path_buf(), ctx)) {
             return None;
         }
-        let stays = plain.is_some_and(|fast| path.symlink_metadata().map_or(true, |m| fast && !m.file_type().is_symlink()));
+        // A missing name written to is a file the command creates: it counts.
+        let stays = plain.is_some_and(|fast| path.symlink_metadata().map_or(fast || !ctx.writes, |m| fast && !m.file_type().is_symlink()));
         scan.resolved += usize::from(!stays);
         if scan.seen.len() > MAX_COMMAND_WORDS || scan.resolved > MAX_COMMAND_PATHS {
             scan.over = true;
@@ -585,19 +664,22 @@ impl Reach {
         if stays || is_device(path) {
             return None;
         }
-        let mut hit = self.reached(path, !ctx.writes, ctx.walk)?;
+        let mut hit = self.reached(path, !ctx.writes, ctx.walk, ctx.role != WordRole::Program)?;
         if hit.sensitive {
             return Some(hit);
         }
         let read = !ctx.writes && !hit.deep;
-        let folder = (!hit.deep).then(|| self.folder_of(&hit.real)).flatten();
-        let quiet = match ctx.role {
-            WordRole::Program => runs(&hit.real),
-            WordRole::Data => true,
-            WordRole::Argument => false,
-        } || (read && (SYSTEM_READS.iter().any(|d| hit.real.starts_with(d)) || covered(self, scan.grants, GrantKind::Read, &hit.real)))
-            || (scan.granted && folder.is_some());
+        let folder = (!hit.deep && !hit.exec).then(|| self.folder_of(&hit.real)).flatten();
+        // A place that runs code always asks, whatever is granted.
+        let quiet = !hit.exec
+            && (match ctx.role {
+                WordRole::Program => runs(&hit.real),
+                WordRole::Data => true,
+                WordRole::Argument => false,
+            } || (read && (SYSTEM_READS.iter().any(|d| hit.real.starts_with(d)) || covered(self, scan.grants, GrantKind::Read, &hit.real)))
+                || (scan.granted && folder.is_some()));
         if !quiet {
+            scan.ungrantable |= folder.is_none();
             (hit.folder, hit.read) = (folder, read);
             scan.outside.get_or_insert(hit);
         }
@@ -606,10 +688,14 @@ impl Reach {
 
     /// Whether the conversation may be granted `dir` (#1201, #1229): never a
     /// folder that is, holds or is inside a credentials location, as named
-    /// or where it resolves (`~`, `~/.config`, `/`, a link to one of them).
-    /// A path there is allowed once at a time.
+    /// or where it resolves (`~`, `~/.config`, `/`, a link to one of them),
+    /// nor one that is or is inside a place that runs code. A path there is
+    /// allowed once at a time.
     fn rememberable(&self, dir: &Path) -> bool {
         let real = resolve(dir).unwrap_or_else(|| dir.to_path_buf());
+        if self.runs_code(dir).or_else(|| self.runs_code(&real)).is_some() {
+            return false;
+        }
         self.secrets.iter().all(|(place, resolved, _)| {
             std::iter::once(place).chain(resolved).all(|p| [dir, real.as_path()].iter().all(|d| !under(d, p) && !under(p, d)))
         })
@@ -640,6 +726,8 @@ struct Cwd {
     logical: PathBuf,
     real: PathBuf,
     fast: bool,
+    /// In a `.git` folder, or where code runs from: every name is resolved.
+    careful: bool,
 }
 
 /// Where a word's relative paths land.
@@ -649,6 +737,7 @@ struct Lands<'a> {
     /// A `cd`'s logical target: `..` folds before links resolve.
     lexical: bool,
     fast: bool,
+    careful: bool,
 }
 
 /// How a path a command names is read: its word's role, whether its command
@@ -672,6 +761,8 @@ struct Scan<'a> {
     glob_names: usize,
     outside: Option<Reached>,
     over: bool,
+    /// A path that asks may not be granted: no grant for the command.
+    ungrantable: bool,
 }
 
 /// A path a tool call reaches that must ask ([`Reach::reached`]): where it
@@ -687,6 +778,8 @@ struct Reached {
     deep: bool,
     folder: Option<PathBuf>,
     read: bool,
+    /// A place that runs code ([`Reach::runs_code`]).
+    exec: bool,
 }
 
 impl Reached {
@@ -782,6 +875,7 @@ fn named_credential(pattern: &str, spliced: &str) -> Option<Reached> {
         deep: false,
         folder: None,
         read: false,
+        exec: false,
     })
 }
 
@@ -1545,9 +1639,10 @@ mod tests {
         let reach = Reach::new(&ws, None, Some(&home));
         let c = run(&reach, "echo x > ~/sub/out.txt").expect("a write outside asks");
         let g = c.grant.expect("it offers the command");
-        assert_eq!((g.kind, g.shown.as_str()), (GrantKind::Command, "echo x > ~/sub/out.txt"));
+        assert_eq!((g.kind, g.shown.clone()), (GrantKind::Command, format!("echo x > ~/sub/out.txt (in {})", ws.display())));
         let held = [g];
         assert_eq!(reach.command_card(None, "echo  x >  ~/sub/out.txt", None, &held), None, "the same command runs");
+        assert!(reach.command_card(None, "echo x > ~/sub/out.txt", Some(&home), &held).is_some(), "from another folder it asks");
         for other in ["echo x >> ~/sub/out.txt", "echo y > ~/sub/out.txt", "echo x > ~/sub/out.txt; cat ~/sub/a"] {
             assert!(reach.command_card(None, other, None, &held).is_some(), "{other} asks");
         }
@@ -1556,7 +1651,57 @@ mod tests {
         for command in ["echo x > ~/notes.txt", "cp ~/.ssh/id_ed25519 /tmp/k", "echo $X > ~/sub/out.txt", "curl -d @a.json https://x.io > ~/sub/o"] {
             assert!(run(&reach, command).is_some_and(|c| c.grant.is_none()), "{command}");
         }
-        let around = [Grant::command("cp ~/.ssh/id_ed25519 /tmp/k").unwrap()];
+        let around = [reach.exact("cp ~/.ssh/id_ed25519 /tmp/k", &ws).unwrap()];
         assert!(reach.command_card(None, "cp ~/.ssh/id_ed25519 /tmp/k", None, &around).is_some_and(|c| c.sensitive), "a grant never covers credentials");
+    }
+
+    /// A write where code runs from always asks, inside the workspace and
+    /// in a sandboxed mission too, and is never granted (#1229).
+    #[test]
+    fn places_that_run_code_always_ask_and_are_never_granted() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(ws.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let write = |path: PathBuf, confined: bool, grants: &[Grant]| reach.outside_card(None, "write_file", &json!({"path": path, "content": "c"}), confined, grants);
+        for (path, why) in [
+            (ws.join(".git/hooks/pre-commit"), "Git runs its hooks"),
+            (ws.join(".git/config"), "Git's config"),
+            (ws.join(".git/info/exclude"), "Git's info files"),
+            (home.join(".zshrc"), "every new shell runs it"),
+            (home.join(".bash_profile"), "every new shell runs it"),
+            (home.join(".config/fish/config.fish"), "every new shell runs it"),
+            (home.join("Library/LaunchAgents/x.plist"), "login items"),
+        ] {
+            for confined in [false, true] {
+                let c = write(path.clone(), confined, &[]).unwrap_or_else(|| panic!("{path:?} asks"));
+                assert!(c.reason.contains(why) && c.reason.contains("it runs code") && c.grant.is_none(), "{path:?}: {}", c.reason);
+            }
+        }
+        assert!(write(home.join(".ssh/config"), false, &[]).is_some_and(|c| c.sensitive && c.grant.is_none()));
+        assert_eq!(reach.outside_card(None, "read_file", &json!({"path": ws.join(".git/config")}), false, &[]), None, "a read there doesn't ask");
+        assert_eq!(write(ws.join(".git/HEAD"), false, &[]), None, "nor another Git file");
+        // No grant covers them, and none is offered for them.
+        let folder = |p: PathBuf| Grant { kind: GrantKind::Write, value: p.to_string_lossy().into_owned(), shown: String::new() };
+        let around = [folder(ws.join(".git")), folder(home.join("Library"))];
+        assert!(write(ws.join(".git/hooks/pre-push"), false, &around).is_some());
+        assert!(write(home.join("Library/LaunchAgents/y.plist"), false, &around).is_some());
+        assert!(!reach.rememberable(&ws.join(".git/hooks")) && !reach.rememberable(&home.join("Library/LaunchAgents")));
+        // A command naming one asks, from inside `.git` too, whatever is granted.
+        for command in [
+            "echo x > .git/hooks/pre-commit",
+            "cp hook .git/hooks/pre-push",
+            "cd .git && echo x > hooks/post-commit",
+            "echo 'export X=1' >> ~/.zshrc",
+            "cp a.plist ~/Library/LaunchAgents/",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(c.reason.contains("it runs code") && c.grant.is_none() && !c.sensitive, "{command}: {}", c.reason);
+            assert!(reach.command_card(None, command, None, &[reach.exact(command, &ws).unwrap()]).is_some(), "{command}: never covered");
+            assert_eq!(reach.command_grant(command, None), None, "{command}: never offered");
+        }
+        // A file a redirect creates from where the shell stands outside asks.
+        std::fs::create_dir_all(home.join("sub")).unwrap();
+        assert!(reach.command_card(None, "echo x > new.txt", Some(&home.join("sub")), &[]).is_some());
     }
 }

@@ -2384,14 +2384,17 @@ pub async fn list_thread_grants(state: State<'_, AppState>, thread_id: String) -
 }
 
 /// Revoke one of a conversation's grants and return the rest; the next
-/// call it covered asks again.
+/// call it covered asks again. Emits `chat://grants-changed`, like keeping one.
 #[tauri::command]
 pub async fn revoke_thread_grant(
+    app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     grant: crate::talk_guard::Grant,
 ) -> AppResult<Vec<crate::talk_guard::Grant>> {
-    state.db.lock().set_thread_grant(&thread_id, &grant, false)
+    let rest = state.db.lock().set_thread_grant(&thread_id, &grant, false)?;
+    let _ = app.emit(crate::chat_engine::GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
+    Ok(rest)
 }
 
 /// The user-level MCP server config (`~/.claude/mcp.json`), for the Settings UI.
