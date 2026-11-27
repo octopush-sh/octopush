@@ -2569,6 +2569,20 @@ fn wait_command_bounded(
 pub(crate) const READ_ONLY_NOTE: &str = "(This command ran under the read-only sandbox: it can read the workspace \
      and write temp files, but it can't change the workspace.)";
 
+/// [`READ_ONLY_NOTE`] when a read-only mission forced Plan only (#1230).
+pub(crate) const READ_ONLY_MISSION_NOTE: &str = "(This command ran under the read-only sandbox because this workspace's \
+     mission is read-only: it can read the workspace and write temp files, but it can't change the workspace.)";
+
+/// `out` with its read-only note naming the read-only mission when one
+/// forced the sandbox (`forced`), as the policy's refusals do. Pure.
+pub(crate) fn name_forced_mission(out: String, forced: bool) -> String {
+    if forced {
+        out.replace(READ_ONLY_NOTE, READ_ONLY_MISSION_NOTE)
+    } else {
+        out
+    }
+}
+
 /// `out` with [`READ_ONLY_NOTE`] when a command on the read-only profile
 /// (`Some([])`) failed on a refused write.
 fn with_read_only_note(mut out: String, ok: bool, sandbox_roots: Option<&[String]>) -> String {
@@ -5398,9 +5412,9 @@ impl ChatEngine {
                 } else if u.name == "run_command" {
                     // On the sandbox (Plan only, a sandboxed mission) or without
                     // the shared shell: off the runtime thread, and Stop kills it.
-                    let ran = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
+                    let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
-                    ran
+                    (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
                 } else {
                     // Every other built-in tool, off the runtime thread too: a
                     // long grep never stalls another workspace's turn, and a

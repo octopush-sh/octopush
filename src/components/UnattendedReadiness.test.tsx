@@ -118,8 +118,22 @@ describe("UnattendedReadiness", () => {
     useMissionsStore.setState({ missionByWorkspaceId: { w1: mission("sandbox") } });
     render(<UnattendedReadiness workspaceId="w1" />);
     fireEvent.click(screen.getByText(/^sandboxed$/i));
+    // It asks first, as the header's Shield does (#1230).
+    expect(screen.getByRole("dialog", { name: "Turn off the sandbox" })).toBeInTheDocument();
+    expect(updateMissionMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Let its agents write outside the workspace" }));
     await waitFor(() =>
       expect(updateMissionMock).toHaveBeenCalledWith("m1", null, null, null, "none"),
     );
+  });
+
+  it("keeping the sandbox from the launcher changes nothing", () => {
+    setEntitled([]);
+    useMissionsStore.setState({ missionByWorkspaceId: { w1: mission("sandbox") } });
+    render(<UnattendedReadiness workspaceId="w1" />);
+    fireEvent.click(screen.getByText(/^sandboxed$/i));
+    fireEvent.click(screen.getByRole("button", { name: "Keep the sandbox" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(updateMissionMock).not.toHaveBeenCalled();
   });
 });

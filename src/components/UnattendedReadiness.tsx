@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Moon, Shield, Lock } from "lucide-react";
 import { useEntitlement } from "../hooks/useEntitlement";
 import { useMissionsStore } from "../stores/missionsStore";
 import { useUpgradeStore } from "../stores/upgradeStore";
 import { pushToast } from "./Toasts";
 import { sandboxOnBody } from "../lib/shareWithMissions";
+import { SandboxOffDialog } from "./HeaderSandbox";
 
 /**
  * The unattended-readiness + sandbox affordance in the Direct launcher foot.
@@ -27,12 +28,17 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
   const [enabling, setEnabling] = useState(false);
 
   const sandboxed = execIso === "sandbox";
-  const toggleSandbox = async () => {
-    if (!missionId || enabling) return;
-    const next = sandboxed ? "none" : "sandbox";
+  // Turning it off asks first (#1230), on the mission it was opened for.
+  const [confirmFor, setConfirmFor] = useState<string | null>(null);
+  const confirming = confirmFor !== null && confirmFor === missionId && sandboxed && gitIso !== "readonly";
+  useEffect(() => {
+    if (confirmFor !== null && !confirming) setConfirmFor(null);
+  }, [confirmFor, confirming]);
+  const change = async (id: string, next: "none" | "sandbox") => {
+    setConfirmFor(null);
     setEnabling(true);
     try {
-      const { unlinked, uncopied, keptCopies } = await setExecIsolation(missionId, next);
+      const { unlinked, uncopied, keptCopies } = await setExecIsolation(id, next);
       pushToast(
         next === "sandbox"
           ? { level: "success", title: "Sandbox enabled", body: sandboxOnBody({ unlinked, uncopied, keptCopies }) }
@@ -81,7 +87,11 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
       ) : missionId ? (
         <button
           type="button"
-          onClick={() => void toggleSandbox()}
+          onClick={() => {
+            if (!missionId || enabling) return;
+            if (sandboxed) setConfirmFor(missionId);
+            else void change(missionId, "sandbox");
+          }}
           disabled={enabling}
           title={
             sandboxed
@@ -96,6 +106,7 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
           {enabling ? "…" : sandboxed ? "sandboxed" : "sandbox it"}
         </button>
       ) : null}
+      {confirming && <SandboxOffDialog onCancel={() => setConfirmFor(null)} onConfirm={() => confirmFor && void change(confirmFor, "none")} />}
     </div>
   );
 }
