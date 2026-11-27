@@ -337,7 +337,7 @@ mod tests {
         let reach = Reach::new(ws.path(), None, None);
         let input = json!({ "path": "src/a.rs", "old_string": "    1", "new_string": "    2" });
         let ro = HashSet::new();
-        let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false };
+        let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, cwd: None, workspace: None };
         assert!(matches!(decide(Mode::Ask, &ToolCall { name: "edit_file", input: &input }, &ctx), Decision::Ask { .. }));
 
         let card = card(ws.path(), &reach, None, "edit_file", &input, &[]);

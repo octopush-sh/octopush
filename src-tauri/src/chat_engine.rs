@@ -2845,6 +2845,7 @@ fn run_command_kept(
         c.arg("-c").arg(cmd).env("PATH", &path);
         c
     };
+    command.envs(crate::talk_shell::git_hardening_env());
     command.current_dir(workspace_path);
     let (out, ok) = wait_command_bounded(command, timeout_secs, cancel);
     (with_read_only_note(out, ok, sandbox_roots), ok)
@@ -4859,6 +4860,18 @@ impl ChatEngine {
             let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
             // In Ask first no "don't ask again" answers a card (#1231).
             let grants = mode != crate::permissions::Mode::Ask;
+            // Where a command starts: the shared shell's directory when it
+            // runs there, else the workspace root. Ask first's git readers
+            // count only inside the workspace (#1231).
+            let command_dir = || {
+                let shared = self.talk_shell.available() && exec_roots.is_none();
+                shared
+                    .then(|| self.talk_shell.cwd(&request.thread_id))
+                    .flatten()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| workspace_path.clone())
+            };
+            let round_dir = command_dir();
             if let Some(note) = mode_watch.at_round(mode) {
                 if let Err(e) = self.insert_and_emit_message(&app, &request.workspace_id, &request.thread_id, "stopped", &note, None, None, None, None) {
                     tracing::warn!(error = %e, "failed to note the mode change");
@@ -5073,6 +5086,8 @@ impl ChatEngine {
                         mcp_read_only: &mcp_read_only,
                         delegate_writes: crate::chat_agents::delegate_writes(definition),
                         forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                        cwd: Some(round_dir.as_path()),
+                        workspace: Some(workspace_path.as_path()),
                     };
                     let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
                     match crate::permissions::decide(mode, &call, &ctx) {
@@ -5256,7 +5271,17 @@ impl ChatEngine {
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
                 // Ask first: a write waits on its card, with its diff, before
                 // any guard; what the user approves still meets every guard.
-                if denied.is_none() && skill_refusal.is_none() && mode_asks.contains(&u.id) {
+                // A command it let through is read again where it will run:
+                // an earlier `cd` this round may have moved the shared shell.
+                let moved = mode == crate::permissions::Mode::Ask
+                    && u.name == "run_command"
+                    && !mode_denied
+                    && !mode_asks.contains(&u.id)
+                    && {
+                        let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        !crate::permissions::reads_only(command, Some(command_dir().as_path()), Some(workspace_path.as_path()))
+                    };
+                if denied.is_none() && skill_refusal.is_none() && (mode_asks.contains(&u.id) || moved) {
                     let preview = || crate::ask_first::card(&workspace_path, &reach, None, &u.name, &u.input, &known);
                     let ask = |c| self.approvals.await_ask_first(&app, &request.workspace_id, &request.thread_id, &u.id, c);
                     denied = crate::ask_first::ask_first(preview, ask).await;
@@ -7965,6 +7990,33 @@ mod login_path_tests {
         assert_eq!(lines[2], "unset");
         assert!(lines[3].contains("build-cache") && lines[3].ends_with("/cargo"), "the sandbox's cache wins: {lines:?}");
         assert_eq!(lines[4], "/bin/bash", "the pinned bash, not the one first on the PATH");
+    }
+
+    /// Every Talk command runs with git's bare-repository hardening (#1231):
+    /// a bare repository found by walking up is refused, one named still
+    /// works, and an environment's own entries are kept.
+    #[test]
+    fn talk_commands_never_use_a_bare_repository_by_accident() {
+        assert_eq!(
+            crate::talk_shell::git_hardening_after(Some("2")),
+            [("GIT_CONFIG_COUNT", "3"), ("GIT_CONFIG_KEY_2", "safe.bareRepository"), ("GIT_CONFIG_VALUE_2", "explicit")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        assert_eq!(crate::talk_shell::git_hardening_after(None)[0], ("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("planted");
+        let made = std::process::Command::new("git").args(["init", "--bare", "-q"]).arg(&planted).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // No git here: nothing to run.
+        }
+        let run = |command: &str| {
+            let input = serde_json::json!({ "command": command });
+            with_login_shell_env(&[], || execute_tool(&planted, "run_command", &input, None))
+        };
+        let (out, ok) = run("git status");
+        assert!(!ok && out.contains("safe.bareRepository"), "{out}");
+        let (out, ok) = run("git --git-dir=. rev-parse --is-bare-repository");
+        assert!(ok && out.contains("true"), "{out}");
     }
 
     #[test]

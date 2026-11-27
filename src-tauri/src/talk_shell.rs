@@ -34,6 +34,26 @@ use std::time::{Duration, Instant};
 /// commands behave as the user's `$` commands do.
 pub(crate) const TALK_BASH: &str = "/bin/bash";
 
+/// Git's own hardening for every Talk command, in every mode (#1231): a
+/// bare repository is used only when named (`safe.bareRepository=explicit`),
+/// so one planted in a folder can't bring its config (hooks,
+/// `core.fsmonitor`) into a `git status`. Set by the engine through
+/// `GIT_CONFIG_COUNT`, after any entries the environment already holds; a
+/// command can't undo it without asking in Ask first (assignments ask).
+pub(crate) fn git_hardening_env() -> Vec<(String, String)> {
+    git_hardening_after(std::env::var("GIT_CONFIG_COUNT").ok().as_deref())
+}
+
+/// [`git_hardening_env`] after `count` entries already set. Pure.
+pub(crate) fn git_hardening_after(count: Option<&str>) -> Vec<(String, String)> {
+    let n = count.and_then(|c| c.trim().parse::<usize>().ok()).unwrap_or(0);
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), (n + 1).to_string()),
+        (format!("GIT_CONFIG_KEY_{n}"), "safe.bareRepository".to_string()),
+        (format!("GIT_CONFIG_VALUE_{n}"), "explicit".to_string()),
+    ]
+}
+
 /// Cap on a `$` command's captured output (bytes), so it can't bloat the DB
 /// row / chat render. The agent's capture keeps up to
 /// `chat_history::COMMAND_CAPTURE_BYTES`, leaving room for its notes within
@@ -391,7 +411,8 @@ impl TalkShell {
     }
 
     fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str, path: &str) -> AppResult<()> {
-        let env = HashMap::from([("PATH".to_string(), path.to_string())]);
+        let mut env = HashMap::from([("PATH".to_string(), path.to_string())]);
+        env.extend(git_hardening_env());
         client.spawn(id, cwd, &env, Some(TALK_BASH), 40, 120)?;
         Ok(())
     }

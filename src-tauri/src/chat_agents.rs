@@ -1590,6 +1590,7 @@ pub fn mode_gate(
         mcp_tools.iter().filter(|t| t.read_only).map(|t| t.namespaced.clone()).collect(),
         inner,
     )
+    .with_workspace(std::path::PathBuf::from(&spec.workspace_path))
 }
 
 /// What Plan only refuses to start (#1146): a defined agent type whose tools
@@ -3159,7 +3160,14 @@ mod tests {
         let (none, sandboxed): (std::collections::HashSet<String>, &[String]) = (Default::default(), &[]);
         assert!(!delegate_writes(None) && delegate_writes(Some(&def("implementer", Some(vec!["edit_file"]), None))));
         assert!(!delegate_writes(Some(&def("explorer", Some(vec!["read_file", "grep"]), None))));
-        let ctx = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &none, delegate_writes: delegate_writes(None), forced: false };
+        let ctx = PolicyCtx {
+            exec_roots: Some(sandboxed),
+            mcp_read_only: &none,
+            delegate_writes: delegate_writes(None),
+            forced: false,
+            cwd: None,
+            workspace: None,
+        };
         let untyped = serde_json::json!({"prompt": "look around"});
         assert_eq!(decide(Mode::Plan, &ToolCall { name: "Agent", input: &untyped }, &ctx), Decision::Allow);
 
