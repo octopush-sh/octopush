@@ -1622,7 +1622,9 @@ pub async fn delete_workspace(
     // If the row can't go, the workspace stays: reinstate it in the approval
     // broker, so its next approval card isn't denied unseen.
     let deleted = state.db.lock().delete_workspace(&workspace_id);
-    state.chat.finish_workspace_delete(&workspace_id, deleted)?;
+    // Its Talk images go with its messages (#1159), unless another row names them.
+    let freed = state.chat.finish_workspace_delete(&workspace_id, deleted)?;
+    crate::chat_attachments::remove(&freed);
     crate::fleet_status::refresh_later(&app);
 
     // Its sandbox build caches go with it, unless another workspace still
@@ -1967,7 +1969,10 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
         })
         .await?;
     }
-    state.db.lock().delete_chat_thread(&thread_id)
+    // And its images, unless another conversation's row names them (#1159).
+    let freed = state.db.lock().delete_chat_thread(&thread_id)?;
+    crate::chat_attachments::remove(&freed);
+    Ok(())
 }
 
 // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
@@ -4914,7 +4919,9 @@ pub async fn delete_project(
 
     // Remove from database. Workspaces not listed above (archived ones) and
     // their runs cascade with the project, so refresh the Dock badge too.
-    state.db.lock().delete_project(&project_id)?;
+    // Their Talk images go too, unless another row names them (#1159).
+    let freed = state.db.lock().delete_project(&project_id)?;
+    crate::chat_attachments::remove(&freed);
     crate::fleet_status::refresh_later(&app);
     Ok(())
 }
