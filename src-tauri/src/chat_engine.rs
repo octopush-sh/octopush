@@ -2855,7 +2855,7 @@ fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String
 }
 
 /// Why an `edit_file` call can't apply whatever the file holds, or `None`.
-fn edit_input_problem(input: &serde_json::Value) -> Option<String> {
+pub(crate) fn edit_input_problem(input: &serde_json::Value) -> Option<String> {
     let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
     let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
     if old_string.is_empty() {
@@ -2957,6 +2957,8 @@ fn run_command_kept(
         c.arg("-c").arg(cmd).env("PATH", &path);
         c
     };
+    // Git uses a bare repository only when named (#1231).
+    command.envs(crate::talk_shell::git_hardening_env());
     command.current_dir(workspace_path);
     let (out, ok) = wait_command_bounded(command, timeout_secs, cancel);
     (with_read_only_note(out, ok, sandbox_roots), ok)
@@ -5403,11 +5405,33 @@ impl ChatEngine {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))
                 };
-                if (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none() {
-                    let check = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));
-                    if let Some(card) = check() {
-                        let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants);
-                        denied = guard_card(card, &check, ask).await;
+                // A change the tool would refuse whatever the user answers gets
+                // that refusal, never an approvable card: the overwrite guard's
+                // (#1165; inside the workspace only, so it never tells whether a
+                // file exists outside), the mission sandbox's, an edit that
+                // doesn't apply (#1231).
+                let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();
+                let inside = || reach.outside_card(None, &u.name, &u.input, false).is_none();
+                let seen = self.thread_file_seen(&request.thread_id);
+                let refused = || {
+                    crate::permissions::refused_before_card(&reach, &u.name, &u.input, exec_roots.as_deref())
+                        .or_else(|| inside().then(|| crate::file_seen::refusal(&seen, &workspace_path, &u.name, &u.input)).flatten())
+                };
+                let mut pre_refused = if held {
+                    match crate::permissions::refused_before_card(&reach, &u.name, &u.input, exec_roots.as_deref()) {
+                        None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,
+                        other => other,
+                    }
+                } else {
+                    None
+                };
+                if held && pre_refused.is_none() {
+                    let check = || crate::permissions::ask_card(None, &u.name, &u.input, &reach);
+                    let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants);
+                    match crate::permissions::guard_ask_first(check(), check, refused, ask).await {
+                        crate::permissions::AskOutcome::Approved => {}
+                        crate::permissions::AskOutcome::Declined(denial) => denied = Some(denial),
+                        crate::permissions::AskOutcome::Refused(why) => pre_refused = Some(why),
                     }
                 }
                 let is_skill = u.name == crate::skills::SKILL_TOOL_NAME;
@@ -5416,7 +5440,10 @@ impl ChatEngine {
                 let trust = || self.approvals.mcp_trust(Path::new(&request.workspace_path));
                 let mcp = crate::talk_guard::McpCheck { tools: &mcp_tools, mode, trust: &trust };
                 let check = || crate::talk_guard::director_card(&u.name, &u.input, &mcp, &reach, writes_confined);
-                let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
+                let gated = denied.is_none()
+                    && pre_refused.is_none()
+                    && skill_refusal.is_none()
+                    && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 if let Some(card) = gated.then(&check).flatten() {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, grants);
                     denied = guard_card(card, &check, ask).await;
@@ -5646,7 +5673,11 @@ impl ChatEngine {
                     let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
                     (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
-                } else if let Some(refusal) = self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await {
+                } else if let Some(refusal) = match pre_refused.take() {
+                    // Refused before Ask first's card could ask (#1231).
+                    Some(early) => Some(early),
+                    None => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,
+                } {
                     // A write over a file the agent hasn't read, or that
                     // changed since: refused, nothing written.
                     write_refused = true;
@@ -7717,6 +7748,7 @@ mod tests {
             remember: Some((dir.clone(), "/tmp/x".into())),
             diff: None,
             trust: None,
+            bound: None,
         };
         assert_eq!(broker.settle_card("t", ApprovalDecision::ApproveAlways, &card, true), ApprovalDecision::Approve);
         assert_eq!(broker.read_dirs("t"), vec![dir]);
@@ -7740,6 +7772,7 @@ mod tests {
             remember: None,
             diff: None,
             trust: None,
+            bound: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -7795,6 +7828,7 @@ mod tests {
             remember: None,
             trust,
             diff: None,
+            bound: None,
         };
         let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
         assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone()), true), ApprovalDecision::Approve);
@@ -8353,6 +8387,32 @@ mod login_path_tests {
         assert_eq!(lines[2], "unset");
         assert!(lines[3].contains("build-cache") && lines[3].ends_with("/cargo"), "the sandbox's cache wins: {lines:?}");
         assert_eq!(lines[4], "/bin/bash", "the pinned bash, not the one first on the PATH");
+    }
+
+    /// A bare repository planted in a folder never brings its config into a
+    /// Talk command's git (#1231); one named with `--git-dir` still works.
+    #[test]
+    fn talk_commands_never_use_a_bare_repository_by_accident() {
+        assert_eq!(
+            crate::talk_shell::git_hardening_after(Some("2")),
+            [("GIT_CONFIG_COUNT", "3"), ("GIT_CONFIG_KEY_2", "safe.bareRepository"), ("GIT_CONFIG_VALUE_2", "explicit")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        assert_eq!(crate::talk_shell::git_hardening_after(None)[0], ("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("planted");
+        let made = std::process::Command::new("git").args(["init", "--bare", "-q"]).arg(&planted).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // No git here: nothing to run.
+        }
+        let run = |command: &str| {
+            let input = serde_json::json!({ "command": command });
+            with_login_shell_env(&[], || execute_tool(&planted, "run_command", &input, None))
+        };
+        let (out, ok) = run("git status");
+        assert!(!ok && out.contains("safe.bareRepository"), "{out}");
+        let (out, ok) = run("git --git-dir=. rev-parse --is-bare-repository");
+        assert!(ok && out.contains("true"), "{out}");
     }
 
     #[test]
