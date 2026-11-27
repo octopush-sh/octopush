@@ -645,6 +645,8 @@ import type {
   GitStatus,
   Issue,
   IssueTrackerConfig,
+  ProjectIssueTracker,
+  EpikuConfigView,
   Mission,
   UpdatedMission,
   LogbookMissionRow,
@@ -1692,10 +1694,24 @@ export const ipc = {
     invoke<WorkspaceCacheSizes>("get_workspace_cache_sizes", { workspacePath }),
 
   // ─── Issue Tracker ────────────────────────────────────────────
-  listMyIssues: () => invoke<Issue[]>("list_my_issues"),
-  getIssue: (key: string) => invoke<Issue>("get_issue", { key }),
-  listIssuesInEpic: (epicKey: string) =>
-    invoke<Issue[]>("list_issues_in_epic", { epicKey }),
+  // `projectId` picks that project's tracker (Jira, Epiku); none = Jira.
+  listMyIssues: (projectId?: string | null) =>
+    invoke<Issue[]>("list_my_issues", { projectId: projectId ?? null }),
+  getIssue: (key: string, projectId?: string | null) =>
+    invoke<Issue>("get_issue", { key, projectId: projectId ?? null }),
+  listIssuesInEpic: (epicKey: string, projectId?: string | null) =>
+    invoke<Issue[]>("list_issues_in_epic", { epicKey, projectId: projectId ?? null }),
+  getProjectIssueTracker: (projectId: string) =>
+    invoke<ProjectIssueTracker>("get_project_issue_tracker", { projectId }),
+  setProjectIssueTracker: (projectId: string, choice: string | null, epikuProject: string | null) =>
+    invoke<void>("set_project_issue_tracker", { projectId, choice, epikuProject }),
+  getEpikuConfig: () => invoke<EpikuConfigView | null>("get_epiku_config"),
+  /** `token` null keeps the saved one (same base URL only). */
+  saveEpikuConfig: (baseUrl: string, project: string, token: string | null) =>
+    invoke<EpikuConfigView>("save_epiku_config", { baseUrl, project, token }),
+  removeEpikuConfig: () => invoke<void>("remove_epiku_config"),
+  /** The "Connected" gate: the project's story count, or the reason it failed. */
+  checkEpikuConnection: () => invoke<number>("check_epiku_connection"),
   getIssueTrackerConfig: () =>
     invoke<IssueTrackerConfig | null>("get_issue_tracker_config"),
   saveIssueTrackerConfig: (config: IssueTrackerConfig) =>

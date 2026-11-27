@@ -18,6 +18,19 @@ export function isIssueKey(text: string): boolean {
   return KEY_EXACT.test(text);
 }
 
+/** The ticket a branch names for a project's tracker (#1127): under Epiku, a
+ *  dotted story id (`ST-2.3`, the shape only Epiku uses); otherwise a key of
+ *  the project's Jira key ({@link detectIssueKeyForProject}). */
+export function detectTrackerKey(
+  branch: string,
+  tracker: "jira" | "epiku" | null,
+  jiraProjectKey: string | null,
+): string | null {
+  if (tracker !== "epiku") return detectIssueKeyForProject(branch, jiraProjectKey);
+  const key = detectIssueKey(branch);
+  return key && key.includes(".") ? key : null;
+}
+
 /** Like {@link detectIssueKey} but only returns a key that belongs to the
  *  project's configured Jira key (e.g. "OCT" → accepts "OCT-12", rejects
  *  "UTF-8"). Returns null when the project has no configured key, so we never

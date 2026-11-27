@@ -60,12 +60,15 @@ function sortByStatusPriorityKey(issues: Issue[]): Issue[] {
 }
 
 /** "Mine" — the user's open assignments in this Jira project, minus the
- *  active ticket (it's already shown in the ContextHeader). */
+ *  active ticket (it's already shown in the ContextHeader). `wholeList`: the
+ *  list is the project's already (Epiku, #1127), so no key-prefix filter. */
 export function selectBacklog(
   allIssues: Issue[],
   projectKey: string | null,
   activeKey: string | null,
+  wholeList = false,
 ): Issue[] {
+  if (wholeList) return sortByStatusPriorityKey(allIssues.filter((i) => i.key !== activeKey));
   if (projectKey == null) return [];
   const prefix = projectKey + "-";
   return sortByStatusPriorityKey(

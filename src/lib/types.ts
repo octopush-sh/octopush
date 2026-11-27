@@ -1266,6 +1266,25 @@ export interface IssueTrackerConfig {
   apiToken: string;
 }
 
+/** The trackers a project can read (#1127). */
+export type TrackerKind = "jira" | "epiku";
+
+/** A project's tracker choice (`get_project_issue_tracker`): `choice` null is
+ *  the default (Jira where it's configured); `active` is what it reads now. */
+export interface ProjectIssueTracker {
+  choice: TrackerKind | "none" | null;
+  /** The Epiku project it reads; null = the one in Settings. */
+  epikuProject: string | null;
+  active: TrackerKind | null;
+}
+
+/** Settings' view of the Epiku connection. The token never comes back. */
+export interface EpikuConfigView {
+  baseUrl: string;
+  project: string;
+  hasToken: boolean;
+}
+
 // ─── Templates ────────────────────────────────────────────────────
 
 export interface SessionTemplate {

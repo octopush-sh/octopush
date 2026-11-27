@@ -117,6 +117,11 @@ describe("selectBacklog", () => {
     expect(selectBacklog(issues, null, null)).toEqual([]);
   });
 
+  it("keeps the whole list, whatever the prefix, for an Epiku project", () => {
+    const stories = [issue("ST-1.1", "Story"), issue("HU-2.1", "Story", { statusCategory: "inProgress" }), issue("ST-1.2", "Story")];
+    expect(selectBacklog(stories, null, "ST-1.2", true).map((i) => i.key)).toEqual(["HU-2.1", "ST-1.1"]);
+  });
+
   it("sorts by statusCategory (inProgress, todo, unknown, done) then priority then key", () => {
     const mixed = [
       issue("P-3", "Story", { statusCategory: "todo", priority: "Low" }),

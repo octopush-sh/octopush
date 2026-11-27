@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectIssueKey, detectIssueKeyForProject, isIssueKey } from "./detectIssueKey";
+import { detectIssueKey, detectIssueKeyForProject, detectTrackerKey, isIssueKey } from "./detectIssueKey";
 
 describe("detectIssueKey", () => {
   it("extracts the first Jira-style key from a branch", () => {
@@ -63,5 +63,18 @@ describe("detectIssueKeyForProject", () => {
   });
   it("does not detect lowercase keys", () => {
     expect(detectIssueKeyForProject("feat/oct-12", "OCT")).toBeNull();
+  });
+});
+
+describe("detectTrackerKey", () => {
+  it("takes a dotted story id under Epiku, whatever its prefix", () => {
+    expect(detectTrackerKey("feat/ST-2.3-login", "epiku", null)).toBe("ST-2.3");
+    expect(detectTrackerKey("feat/HU-1.1", "epiku", "OCT")).toBe("HU-1.1");
+    expect(detectTrackerKey("fix/UTF-8-encoding", "epiku", null)).toBeNull();
+  });
+  it("keeps Jira's project-key rule otherwise", () => {
+    expect(detectTrackerKey("feat/OCT-12-login", "jira", "OCT")).toBe("OCT-12");
+    expect(detectTrackerKey("feat/ST-2.3", "jira", "OCT")).toBeNull();
+    expect(detectTrackerKey("feat/OCT-12", null, "OCT")).toBe("OCT-12");
   });
 });
