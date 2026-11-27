@@ -1019,10 +1019,10 @@ mod tests {
         let write = json!({ "path": "a.rs", "content": "new\n" });
         let check = || Some(ask_card(None, "write_file", &write, &reach));
         let deny = |_: ToolCard| std::future::ready(ApprovalDecision::Deny);
-        assert_eq!(guard_card(check().unwrap(), &check, deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), deny).await.as_deref(), Some(ASK_DECLINED_CHANGE));
         let command = json!({ "command": "npm test" });
         let run = || Some(ask_card(None, "run_command", &command, &reach));
-        assert_eq!(guard_card(run().unwrap(), &run, deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
+        assert_eq!(guard_card(run().unwrap(), || std::future::ready(run()), deny).await.as_deref(), Some(ASK_DECLINED_COMMAND));
         assert_eq!(std::fs::read_to_string(ws.path().join("a.rs")).unwrap(), "old\n");
 
         // A sub-agent's gate asks through its approval gate before the guards.
@@ -1074,7 +1074,7 @@ mod tests {
             }
             std::future::ready(ApprovalDecision::Approve)
         };
-        assert_eq!(guard_card(check().unwrap(), &check, approve).await, None, "approved again, it runs");
+        assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), approve).await, None, "approved again, it runs");
         let shown = shown.into_inner();
         assert_eq!(shown, ["@@ -1,1 +1,1 @@\n-old\n+new", "@@ -1,1 +1,1 @@\n-changed meanwhile\n+new"]);
     }
