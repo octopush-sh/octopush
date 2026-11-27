@@ -76,8 +76,8 @@ pub enum ProjectServerState {
 }
 
 /// A server a worktree's `.claude/mcp.json` defines, as its approval shows
-/// it: the exact command, its arguments and its env, each value shown unless
-/// it looks like a secret ([`masks_env`]).
+/// it: the exact command, its arguments and its env, each value shown with
+/// only its secret-shaped parts masked ([`env_value_shown`]).
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectServer {
@@ -100,17 +100,36 @@ impl ProjectServer {
     }
 }
 
-/// Whether the card hides an env value: under a name that reads as a
-/// credential (`TOKEN`, `KEY`, `SECRET`, `PASSWORD`…; `mcp::secret_env_name`),
-/// or shaped like one by the secret guard's rules (`secret_scan::redact_line`,
-/// a provider token, a bearer or a URL password). Every other value shows:
-/// `PATH` picks the binary, and `NODE_PATH` or `npm_config_*` what it loads.
-/// Pure.
-pub fn masks_env(name: &str, value: &str) -> bool {
-    let assigned = format!("{name}={value}");
-    super::secret_env_name(name)
-        || crate::secret_scan::redact_line(value, &[]) != value
-        || crate::secret_scan::redact_line(&assigned, &[]) != assigned
+/// Env names whose value decides what the program runs or loads: never
+/// hidden whole on the card, whatever they hold. Pure.
+pub fn runs_code_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(upper.as_str(), "NODE_OPTIONS" | "NODE_PATH" | "PATH" | "PYTHONPATH" | "PYTHONSTARTUP" | "PERL5OPT" | "RUBYOPT" | "BASH_ENV" | "ENV")
+        || ["LD_", "DYLD_", "NPM_CONFIG_"].iter().any(|p| upper.starts_with(p))
+}
+
+/// Whether a value reads as code or options rather than a bare secret: a
+/// `--import`, `--require` or `-r`, a `data:` URL, a path, or an `=` option.
+fn looks_like_code(value: &str) -> bool {
+    let words: Vec<&str> = value.split_whitespace().collect();
+    value.contains("--import") || value.contains("--require") || value.contains("data:")
+        || words.iter().any(|w| *w == "-r" || (w.starts_with('-') && w.contains('=')))
+        || words.iter().any(|w| w.starts_with(['/', '~', '.']) || w.contains(['/', '\\']))
+}
+
+/// How the card shows an env value: `None` to hide it whole, or the value
+/// with only its secret-shaped spans replaced (`secret_scan::redact_line`:
+/// provider tokens, bearers, URL passwords, credential assignments), the
+/// rest verbatim. A value is hidden whole only under a name that reads as a
+/// credential (`TOKEN`, `KEY`, `SECRET`, `PASSWORD`…; `mcp::secret_env_name`)
+/// when nothing in it looks like code ([`looks_like_code`]), and never for
+/// a variable that decides what runs ([`runs_code_env`]): a payload can't
+/// hide behind a token. Pure.
+pub fn env_value_shown(name: &str, value: &str) -> Option<String> {
+    if super::secret_env_name(name) && !runs_code_env(name) && !looks_like_code(value) {
+        return None;
+    }
+    Some(crate::secret_scan::redact_line(value, &[]))
 }
 
 /// What the card shows for a hidden env value, after its name.
@@ -176,9 +195,9 @@ fn display(cfg: &McpServerConfig) -> String {
     if !names.is_empty() {
         let env: Vec<String> = names
             .into_iter()
-            .map(|n| match masks_env(n, &cfg.env[n]) {
-                true => format!("{}={HIDDEN_VALUE}", visible(n)),
-                false => format!("{}={}", visible(n), visible(&shell_quote(&cfg.env[n]))),
+            .map(|n| match env_value_shown(n, &cfg.env[n]) {
+                None => format!("{}={HIDDEN_VALUE}", visible(n)),
+                Some(v) => format!("{}={}", visible(n), visible(&shell_quote(&v))),
             })
             .collect();
         line.push_str(&format!(" \u{b7} env {}", env.join(", ")));
@@ -358,10 +377,42 @@ mod tests {
         assert_eq!(
             server.display,
             "npx docs-server \u{b7} env DOCS_PASSWORD=(hidden), NODE_PATH=./vendor/hooks, PATH=/tmp/shim:/usr/bin, \
-             UPSTREAM=(hidden), npm_config_prefix=/tmp/npm"
+             UPSTREAM='[redacted]', npm_config_prefix=/tmp/npm"
         );
         assert!(!server.shown().contains(&token) && !server.shown().contains("hunter2"));
-        assert!(!masks_env("PATH", "/usr/local/bin:/usr/bin") && !masks_env("NODE_OPTIONS", "--require ./x.js"));
+    }
+
+    #[test]
+    fn a_payload_never_hides_behind_a_token() {
+        let token = format!("ghp_{}", "a1B2".repeat(9));
+        let payload = format!("--import=data:text/javascript,process.exit(0) --title={token}");
+        // Only the token is masked; the code beside it shows.
+        assert_eq!(
+            env_value_shown("NODE_OPTIONS", &payload).as_deref(),
+            Some("--import=data:text/javascript,process.exit(0) --title=[redacted]")
+        );
+        // Under a secret's name, code still shows: only its token goes.
+        for name in ["API_TOKEN", "NODE_OPTIONS_SECRET"] {
+            let shown = env_value_shown(name, &payload).unwrap_or_else(|| panic!("{name} hid it whole"));
+            assert!(shown.starts_with("--import=data:text/javascript,process.exit(0)") && !shown.contains(&token), "{shown}");
+        }
+        assert_eq!(env_value_shown("API_TOKEN", "-r ./hook.js").as_deref(), Some("-r ./hook.js"));
+        // A variable that decides what runs is never hidden whole.
+        for name in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "npm_config_KEY", "BASH_ENV", "ENV", "PERL5OPT", "RUBYOPT"] {
+            assert!(env_value_shown(name, "x").is_some(), "{name}");
+        }
+        // A bare secret under a secret's name is hidden whole.
+        assert_eq!(env_value_shown("DOCS_PASSWORD", "hunter2"), None);
+        assert_eq!(env_value_shown("AUTH_KEY", &token), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let entry = serde_json::json!({ "mcpServers": { "docs": { "command": "node", "args": ["d.js"], "env": { "NODE_OPTIONS": payload } } } });
+        write(dir.path(), &entry.to_string());
+        let server = &project_servers(dir.path(), &HashMap::new(), &NoApprovals)[0].0;
+        assert_eq!(
+            server.display,
+            "node d.js \u{b7} env NODE_OPTIONS='--import=data:text/javascript,process.exit(0) --title=[redacted]'"
+        );
     }
 
     #[test]
