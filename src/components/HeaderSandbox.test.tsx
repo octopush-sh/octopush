@@ -51,6 +51,28 @@ describe("HeaderSandbox", () => {
     expect(setExecIsolation).not.toHaveBeenCalled();
   });
 
+  it("Enter never confirms", () => {
+    mount("sandbox");
+    fireEvent.click(screen.getByRole("button", { name: "Sandbox on" }));
+    fireEvent.keyDown(window, { key: "Enter" });
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Enter" });
+    expect(screen.getByRole("dialog", { name: "Turn off the sandbox" })).toBeInTheDocument();
+    expect(setExecIsolation).not.toHaveBeenCalled();
+  });
+
+  it("a dialog opened on one mission closes on a switch, and never acts on the next one", () => {
+    const view = mount("sandbox");
+    fireEvent.click(screen.getByRole("button", { name: "Sandbox on" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    view.rerender(<HeaderSandbox missionId="m2" execIsolation="sandbox" gitIsolation="worktree" />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Let its agents write outside the workspace" })).toBeNull();
+    // Back on m1, it doesn't come back by itself.
+    view.rerender(<HeaderSandbox missionId="m1" execIsolation="sandbox" gitIsolation="worktree" />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(setExecIsolation).not.toHaveBeenCalled();
+  });
+
   it("turning the sandbox on doesn't ask", async () => {
     mount("none");
     const off = screen.getByRole("button", { name: "Sandbox off" });
