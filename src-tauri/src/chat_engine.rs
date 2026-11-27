@@ -7462,7 +7462,7 @@ mod tests {
         let body = &engine[from..to];
         let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("the director's loop no longer has: {s}"));
         let check = at("self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await");
-        let run = at("run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel).await");
+        let run = at("run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await");
         let note = at("self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1).await");
         assert!(check < at("write_refused = true;") && check < run && run < note, "{body}");
         assert!(body.contains("&& !mode_denied && !write_refused"), "a refused write is recorded as an edit");
