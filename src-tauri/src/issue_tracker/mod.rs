@@ -60,6 +60,11 @@ pub struct Issue {
     /// the parent's `subtasks`.
     #[serde(default)]
     pub subtasks: Vec<LinkedIssueRef>,
+    /// The ticket's description as plain text, cut at 8,000 characters
+    /// (`jira::description_text`). `None` for list endpoints, which don't
+    /// fetch it, and for a ticket without one.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Read capabilities v1 needs. Implemented per tracker (native async-in-trait;
