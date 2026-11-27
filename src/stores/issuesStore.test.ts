@@ -7,7 +7,7 @@ const mockIpc = {
 };
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 
-const { useIssuesStore } = await import("./issuesStore");
+const { useIssuesStore, isKnownStory } = await import("./issuesStore");
 
 const ISSUES: Issue[] = [
   { key: "PROJ-123", summary: "Login", statusName: "In Progress", statusCategory: "inProgress", issueType: "Story", priority: "High", url: "u", parentKey: null, subtask: false, hierarchyLevel: 0 },
@@ -68,5 +68,12 @@ describe("issuesStore", () => {
     await pending;
     expect(useIssuesStore.getState().issues).toBeNull();
     expect(useIssuesStore.getState().loading).toBe(false);
+  });
+  it("knows a story from the loaded list or from a getIssue read, nothing else", () => {
+    const state = { issues: ISSUES, detailByKey: { "ST-1.4": { ...ISSUES[0], key: "ST-1.4" } } };
+    expect(isKnownStory(state, "PROJ-123")).toBe(true);
+    expect(isKnownStory(state, "ST-1.4")).toBe(true);
+    expect(isKnownStory(state, "UTF-8.1")).toBe(false);
+    expect(isKnownStory({ issues: null, detailByKey: {} }, "constructor")).toBe(false);
   });
 });

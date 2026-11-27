@@ -1258,6 +1258,9 @@ export interface Issue {
   blockedBy?: LinkedIssueRef[];
   /** Direct children of this ticket. */
   subtasks?: LinkedIssueRef[];
+  /** The ticket's description as plain text (Jira's ADF converted, cut at
+   *  8,000 characters). Populated by getIssue; null for list payloads. */
+  description?: string | null;
 }
 
 export interface IssueTrackerConfig {

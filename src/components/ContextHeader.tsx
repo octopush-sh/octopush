@@ -9,7 +9,7 @@ import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
 import { issueTypeToken } from "../lib/issueTrackerSelectors";
 import { detectTrackerKey } from "../lib/detectIssueKey";
-import { useIssuesStore } from "../stores/issuesStore";
+import { useIssuesStore, useKnownStory } from "../stores/issuesStore";
 import { copyToClipboard } from "../lib/clipboard";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { HeaderSandbox } from "./HeaderSandbox";
@@ -104,8 +104,8 @@ interface Props {
   onFixChecks?: (pr: Pr) => void | Promise<void>;
   /** The active workspace. A manually linked ticket (linkedIssueKey) wins;
    *  otherwise a branch-detected key gated on the project's Jira key
-   *  (detectIssueKeyForProject), or a dotted story id under Epiku
-   *  (detectTrackerKey). */
+   *  (detectIssueKeyForProject), or under Epiku a dotted id that is one of
+   *  the project's stories (detectTrackerKey). */
   workspace?: Workspace | null;
   /** Whether the issue tracker is configured. When false, no ticket is
    *  shown even if a key is present — the eyebrow reads "Workspace" and the
@@ -163,7 +163,8 @@ export function ContextHeader({
   const unstaged = gitStatus?.changedFiles.length ?? 0;
   const manualKey = workspace?.linkedIssueKey ?? null;
   const tracker = useIssuesStore((s) => s.tracker);
-  const detectedKey = detectTrackerKey(branch, tracker, jiraProjectKey ?? null);
+  const isKnownStory = useKnownStory();
+  const detectedKey = detectTrackerKey(branch, tracker, jiraProjectKey ?? null, isKnownStory);
   const resolvedKey = manualKey ?? detectedKey;
   const activeKey = resolvedKey && issueTrackerConfigured ? resolvedKey : null;
   const activeIssue = useActiveIssue(activeKey);

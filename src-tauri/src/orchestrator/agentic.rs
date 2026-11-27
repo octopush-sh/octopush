@@ -8,7 +8,7 @@ use crate::orchestrator::types::{BlockedAsk, BlockedQuestion, ToolCallLog};
 use crate::providers::{
     complete_with_retry, interruptible_sleep, retry_notice, Effort, LlmContent, LlmMessage,
     LlmProvider, LlmRequest, LlmResponse, LlmRole, LlmStopReason, LlmTool, LlmToolResult,
-    LlmToolUse, DEFAULT_MAX_RETRIES,
+    LlmToolUse, truncated_round_turn, DEFAULT_MAX_RETRIES,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -840,6 +840,9 @@ pub async fn run_agentic_loop_billed(
     }
     let mut messages: Vec<LlmMessage> = initial_messages;
     let mut out = AgenticResult::default();
+    // The files this loop's tools read or wrote, as they saw them, so a
+    // `write_file` never overwrites a file blind (`file_seen`).
+    let file_seen = std::sync::Arc::new(parking_lot::Mutex::new(crate::file_seen::FileSeen::default()));
     // Why the loop left its turn budget: the iteration cap (default) or a
     // mid-stage budget stop. Drives the forced-close notice below.
     let mut budget_stopped = false;
@@ -994,16 +997,10 @@ pub async fn run_agentic_loop_billed(
         if matches!(resp.stop_reason, LlmStopReason::MaxTokens) && !resp.tool_uses.is_empty() {
             // Truncation path: do NOT replay raw_content verbatim. A turn cut off
             // at max_tokens can carry an unsigned/partial trailing thinking block,
-            // and replaying it 400s the next request. Empty raw makes the
-            // serializer rebuild from text + tool_uses instead (per the design).
-            messages.push(LlmMessage {
-                role: LlmRole::Assistant,
-                content: LlmContent::AssistantWithTools {
-                    raw: vec![],
-                    text: resp.text.clone(),
-                    tool_uses: resp.tool_uses.clone(),
-                },
-            });
+            // and replaying it 400s the next request. The turn is rebuilt from
+            // text + tool_uses, its leading signed thinking kept in front (a
+            // budget-thinking model 400s an assistant turn without it).
+            messages.push(truncated_round_turn(&resp));
             let errs: Vec<LlmToolResult> = resp
                 .tool_uses
                 .iter()
@@ -1162,8 +1159,16 @@ pub async fn run_agentic_loop_billed(
                 let input = u.input.clone();
                 let roots = sandbox_roots.map(|r| r.to_vec());
                 let cancel_flag = std::sync::Arc::clone(cancel);
+                let seen = std::sync::Arc::clone(&file_seen);
                 tokio::task::spawn_blocking(move || {
-                    execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag))
+                    // A write over a file this loop hasn't read, or that
+                    // changed since, is refused (#1165).
+                    if let Some(refusal) = crate::file_seen::refusal(&seen, &wp, &name, &input) {
+                        return (refusal, false);
+                    }
+                    let (result, ok) = execute_tool_cancellable(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag));
+                    crate::file_seen::note(&seen, &wp, &name, &input, ok);
+                    (result, ok)
                 })
                 .await
                 .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))

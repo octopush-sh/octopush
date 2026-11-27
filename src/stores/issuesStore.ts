@@ -1,3 +1,4 @@
+import { useCallback } from "react";
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import type { Issue, ProjectIssueTracker, TrackerKind } from "../lib/types";
@@ -43,6 +44,22 @@ interface IssuesState {
 /** The cache scope of a project's tracker. */
 export function trackerScope(projectId: string | null, tracker: TrackerKind | null): string | null {
   return tracker === "epiku" ? `epiku:${projectId}` : tracker;
+}
+
+/** Whether `key` is one of the loaded stories, or one `getIssue` read: what
+ *  lets a dotted id in an Epiku branch count as linked (`detectTrackerKey`). */
+export function isKnownStory(
+  state: { issues: Issue[] | null; detailByKey: Record<string, Issue> },
+  key: string,
+): boolean {
+  return (state.issues ?? []).some((i) => i.key === key) || Object.prototype.hasOwnProperty.call(state.detailByKey, key);
+}
+
+/** {@link isKnownStory} over the current caches, re-made when they change. */
+export function useKnownStory(): (key: string) => boolean {
+  const issues = useIssuesStore((s) => s.issues);
+  const detailByKey = useIssuesStore((s) => s.detailByKey);
+  return useCallback((key: string) => isKnownStory({ issues, detailByKey }, key), [issues, detailByKey]);
 }
 
 let projectSeq = 0;
