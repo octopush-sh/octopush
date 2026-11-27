@@ -1041,7 +1041,7 @@ export const ipc = {
   /** The approval cards still waiting on a thread, oldest first (a reloaded
    *  webview shows them again: a card waits until it is answered). */
   pendingApprovals: (threadId: string) =>
-    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write"; sensitive?: boolean }>>(
+    invoke<Array<{ workspaceId: string; threadId: string; callId: string; command: string; reason: string; secret?: boolean; coversUncommitted?: boolean; kind?: "mcp" | "read" | "write" | "run"; sensitive?: boolean; rememberDir?: string }>>(
       "pending_approvals",
       { threadId },
     ),

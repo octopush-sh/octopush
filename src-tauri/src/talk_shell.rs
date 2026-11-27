@@ -128,6 +128,14 @@ impl TalkShell {
         self.client.lock().is_some()
     }
 
+    /// Where the thread's shell is now, as it last reported (`None` before
+    /// its first command): where an agent command's relative paths land.
+    pub fn cwd(&self, thread_id: &str) -> Option<String> {
+        let handle = self.sessions.lock().get(thread_id).cloned()?;
+        let cwd = handle.lock().cwd.clone();
+        (!cwd.is_empty()).then_some(cwd)
+    }
+
     /// Run a command in the thread's shell.
     ///
     /// `promote = true` ($-direct): if it hasn't finished within `timeout`,

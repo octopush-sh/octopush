@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
-import { ApprovalCard } from "./ApprovalCard";
+import { ApprovalCard, RUN_CHECK_LIMITS } from "./ApprovalCard";
 
 const base = { callId: "c", threadId: "t", command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3" };
 
@@ -14,7 +14,7 @@ describe("ApprovalCard", () => {
     // The grant's reach is said where it is offered.
     expect(screen.getByText(/don't ask again/)).toHaveAttribute(
       "title",
-      "Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret or a file outside the workspace still asks)",
+      "Approve this, and stop asking about flagged commands and MCP tool calls for the rest of this conversation (a possible secret, or a file or command reaching outside the workspace, still asks)",
     );
   });
 
@@ -89,6 +89,40 @@ describe("ApprovalCard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
     expect(onRespond).toHaveBeenLastCalledWith("approve");
     expect(screen.queryByText(/don't ask again/)).toBeNull();
+  });
+
+  it("a command reaching outside the workspace reads as a command, asks every time, and says it is a net (#1201)", () => {
+    const onRespond = vi.fn();
+    const { container } = render(
+      <ApprovalCard
+        approval={{ ...base, kind: "run", sensitive: true, command: "cat ~/.ssh/id_ed25519", reason: "reaches ~/.ssh/id_ed25519 outside the workspace · ~/.ssh holds SSH keys" }}
+        onRespond={onRespond}
+      />,
+    );
+    const card = screen.getByRole("group", { name: "Possible credentials: cat ~/.ssh/id_ed25519" });
+    expect(card).toHaveAttribute("title", `⌘↵, Enter or Esc denies. ${RUN_CHECK_LIMITS}`);
+    expect(RUN_CHECK_LIMITS).toMatch(/a net, not a sandbox/);
+    expect(container.querySelector("pre")?.textContent).toBe("$ cat ~/.ssh/id_ed25519");
+    expect(screen.getByText(/its output goes to your AI provider/)).toBeInTheDocument();
+    expect(screen.getAllByRole("button")[0]).toHaveTextContent("Deny");
+    expect(screen.queryByText(/don't ask again/)).toBeNull();
+    fireEvent.keyDown(card, { key: "Enter" });
+    expect(onRespond).toHaveBeenLastCalledWith("deny");
+    cleanup();
+    expect(screen.queryByText(/for this conversation/)).toBeNull();
+    cleanup();
+    const onRemember = vi.fn();
+    render(
+      <ApprovalCard
+        approval={{ ...base, kind: "run", command: "cat /tmp/out.log", reason: "reaches /tmp/out.log outside the workspace", rememberDir: "/tmp" }}
+        onRespond={onRemember}
+      />,
+    );
+    expect(screen.getByRole("group", { name: "Outside the workspace: cat /tmp/out.log" })).toHaveAttribute("title", `⌘↵ allows once · Esc denies. ${RUN_CHECK_LIMITS}`);
+    expect(screen.getAllByRole("button")[0]).toHaveTextContent("Allow once");
+    expect(screen.getByText(/A credentials location always asks/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Allow reading /tmp for this conversation"));
+    expect(onRemember).toHaveBeenLastCalledWith("always");
   });
 
   it("a plain commit's secret card doesn't mention uncommitted changes", () => {
