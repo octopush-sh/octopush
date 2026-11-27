@@ -568,6 +568,13 @@ export interface CommittedDiff {
   diff: string;
 }
 
+/** `workspace_ports::PortBlock`: the workspace's ports, `base` up to
+ *  `base + count - 1`. */
+export interface PortBlock {
+  base: number;
+  count: number;
+}
+
 /** `git_ops::DiffSize`: files and lines from the merge base with `base` to
  *  the working tree (commits, edits and untracked files). `base` is null when
  *  the workspace has none that resolves: the size is then the uncommitted
@@ -1230,6 +1237,11 @@ export const ipc = {
    *  null when the workspace or its worktree is gone. */
   workspaceDiffSize: (workspaceId: string) =>
     invoke<DiffSize | null>("workspace_diff_size", { workspaceId }),
+  /** The workspace's block of local ports (#1219), allocated on first ask;
+   *  its Run terminals and Talk shell get it as `OCTOPUSH_PORT` and
+   *  `OCTOPUSH_PORT_COUNT`. null when the workspace is gone or none is free. */
+  workspacePorts: (workspaceId: string) =>
+    invoke<PortBlock | null>("workspace_ports", { workspaceId }),
   /** What the workspace committed since its base (Review's "Since base");
    *  null when the worktree is gone or git timed out. */
   getCommittedDiff: (workspaceId: string, ignoreWhitespace?: boolean) =>

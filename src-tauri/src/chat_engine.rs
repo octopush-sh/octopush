@@ -4160,6 +4160,13 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Give the thread's Talk shell the workspace's port block (#1219), for
+    /// when it is next spawned.
+    fn set_shell_ports(&self, workspace_id: &str, thread_id: &str) {
+        let ports = crate::workspace_ports::ensure(&self.db.lock(), workspace_id);
+        self.talk_shell.set_spawn_env(thread_id, ports.map(|b| b.env()).unwrap_or_default());
+    }
+
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
     ///
     /// Persists the command as a user turn (`$ cmd`) and the output as a
@@ -4207,6 +4214,7 @@ impl ChatEngine {
         });
 
         let started = std::time::Instant::now();
+        self.set_shell_ports(&request.workspace_id, &request.thread_id);
         let shell = Arc::clone(&self.talk_shell);
         let thread_id = request.thread_id.clone();
         let workspace_path = request.workspace_path.clone();
@@ -5431,6 +5439,7 @@ impl ChatEngine {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
+                    self.set_shell_ports(&request.workspace_id, &request.thread_id);
                     let shell = Arc::clone(&self.talk_shell);
                     let tid = request.thread_id.clone();
                     let wp = request.workspace_path.clone();

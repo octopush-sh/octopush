@@ -64,7 +64,12 @@ pub async fn create_session(
     }
 
     // Auto-configure context from project root.
-    let guard = ContextGuard::auto_configure(&id, root_path);
+    let mut guard = ContextGuard::auto_configure(&id, root_path);
+    // The workspace's port block (#1219), when the root is a workspace's worktree.
+    let ports = crate::workspace_ports::ensure_for_root(&state.db.lock(), &session.project_root);
+    if let Some(block) = ports {
+        guard.set_ports(block);
+    }
     // Store detected context files in the session record.
     session.context_files = guard
         .context_files
@@ -1444,6 +1449,17 @@ pub async fn project_collisions(
 /// for Mission Control's settled and needs-you cards. `None` when the
 /// workspace or its worktree is gone, it isn't a git repo, or the diff timed
 /// out — the card then shows nothing rather than a made-up zero.
+/// The workspace's port block (#1219), allocated now if it has none: the
+/// header shows the same range its terminals and Talk shell get. `None` when
+/// the workspace is gone or every block is taken.
+#[tauri::command]
+pub async fn workspace_ports(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<crate::workspace_ports::PortBlock>> {
+    Ok(crate::workspace_ports::ensure(&state.db.lock(), &workspace_id))
+}
+
 #[tauri::command]
 pub async fn workspace_diff_size(
     state: State<'_, AppState>,
@@ -4089,6 +4105,13 @@ fn spawn_terminal_session(
     // terminal's span growing while output flows, with negligible cost during
     // heavy output; the span closes on its own after the idle window).
     let ws_for_activity = state.db.lock().workspace_for_terminal(&id).ok().flatten();
+    // The workspace's port block (#1219); a value the caller set wins.
+    if let Some(ws) = &ws_for_activity {
+        let ports = crate::workspace_ports::ensure(&state.db.lock(), ws);
+        if let Some(block) = ports {
+            block.apply_env(&mut env);
+        }
+    }
     let db_for_activity = std::sync::Arc::clone(&state.db);
     let last_beat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, seq, bytes| {
