@@ -104,6 +104,7 @@ import type { Group } from "./lib/types";
 import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta, formatRelTime, isPlaceholderTitle } from "./lib/chatTitle";
+import { titleFailureToast } from "./lib/chatTitleGen";
 import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
@@ -1182,14 +1183,8 @@ function App() {
   const handleRegenerateTitle = useCallback(
     async (id: string) => {
       if (!activeWorkspaceId) return;
-      const ok = await useChatStore.getState().regenerateTitle(activeWorkspaceId, id);
-      if (!ok) {
-        pushToast({
-          level: "info",
-          title: "The title stays as it is",
-          body: "No new title came back. Map a fast tier for this provider in Settings › Models, or try again.",
-        });
-      }
+      const failure = await useChatStore.getState().regenerateTitle(activeWorkspaceId, id);
+      if (failure) pushToast({ level: "info", ...titleFailureToast(failure) });
     },
     [activeWorkspaceId],
   );

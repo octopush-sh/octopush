@@ -115,10 +115,56 @@ describe("generated thread titles", () => {
 
   it("regenerates over any title on request", async () => {
     seed("Release checklist", firstTurn());
-    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBe(true);
+    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBeNull();
     expect(titleNow()).toBe("GUIDE-123 · Waive virtualenv findings");
+  });
+
+  it("says why a regenerate brought no title, and keeps the current one", async () => {
+    seed("Release checklist", firstTurn());
     generate.mockResolvedValueOnce(null);
-    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBe(false);
-    expect(titleNow()).toBe("GUIDE-123 · Waive virtualenv findings");
+    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBe("no-fast-tier");
+    generate.mockRejectedValueOnce(new Error("provider down"));
+    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBe("failed");
+    generate.mockRejectedValueOnce({ kind: "BudgetExceeded", scope: "workspace daily", spent: 5, limit: 5 });
+    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBe("budget");
+    seed("Release checklist", [msg("user", ASK)]);
+    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBe("no-answer");
+    expect(titleNow()).toBe("Release checklist");
+    expect(rename).not.toHaveBeenCalled();
+  });
+
+  it("reads a thread whose title isn't ours once, not on every turn end", async () => {
+    seed("Release checklist", firstTurn());
+    listMessages.mockClear();
+    const done = () => handlers["chat://stream"]({ payload: { workspaceId: "ws-1", threadId: "t1", delta: "", done: true } });
+    done();
+    await vi.waitFor(() => expect(listMessages).toHaveBeenCalledTimes(1));
+    await useChatStore.getState().autoTitleThread("ws-1", "t1");
+    done();
+    await useChatStore.getState().autoTitleThread("ws-1", "t1");
+    expect(listMessages).toHaveBeenCalledTimes(1);
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it("reads a background thread past its first turn once", async () => {
+    const messages = [...firstTurn(), msg("user", "and now?"), msg("assistant", "Done.")];
+    seed(deriveChatTitle(messages), messages);
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t-other" } });
+    listMessages.mockClear();
+    await useChatStore.getState().autoTitleThread("ws-1", "t1");
+    await useChatStore.getState().autoTitleThread("ws-1", "t1");
+    expect(listMessages).toHaveBeenCalledTimes(1);
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it("skips the read for the shown thread once its loaded rows are past the first turn", async () => {
+    const messages = [...firstTurn(), msg("user", "and now?"), msg("assistant", "Done.")];
+    seed(deriveChatTitle(messages), messages);
+    useChatStore.setState({ messagesByWs: { "ws-1": messages } });
+    listMessages.mockClear();
+    await useChatStore.getState().autoTitleThread("ws-1", "t1");
+    expect(listMessages).not.toHaveBeenCalled();
+    expect(generate).not.toHaveBeenCalled();
+    useChatStore.setState({ messagesByWs: {} });
   });
 });

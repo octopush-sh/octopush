@@ -1,4 +1,5 @@
 import { ipc } from "./ipc";
+import { isBudgetExceeded } from "./budgetError";
 import type { ChatMessage } from "./types";
 import { deriveChatTitle, isPlaceholderTitle, ticketKey, titleSource } from "./chatTitle";
 
@@ -66,18 +67,43 @@ export function isAutoTitle(title: string, messages: ChatMessage[]): boolean {
   return isPlaceholderTitle(title) || title === deriveChatTitle(messages);
 }
 
-/** Ask for a thread's title. Null — keep the derived title — when there is
- *  nothing to title yet, the provider has no fast tier, the call fails or it
- *  takes longer than `timeoutMs`. */
+/** Why no title came back: nothing to title yet, the provider has no fast
+ *  tier, a budget limit blocked the call, or the call failed or ran late. */
+export type TitleFailure = "no-answer" | "no-fast-tier" | "budget" | "failed";
+
+export type TitleOutcome = { title: string } | { failure: TitleFailure };
+
+/** The info toast for a "Regenerate title" that brought nothing back: what
+ *  actually happened, and what the user can do about it. */
+export function titleFailureToast(failure: TitleFailure): { title: string; body: string } {
+  const title = "The title stays as it is";
+  switch (failure) {
+    case "no-answer":
+      return { title, body: "This conversation has no answer to title yet. Try again once the first reply lands." };
+    case "no-fast-tier":
+      return {
+        title,
+        body: "This conversation's provider has no fast model to write titles. Map a fast tier for it in Settings › Models.",
+      };
+    case "budget":
+      return { title, body: "A budget limit is blocking new spend, so no title call was made." };
+    case "failed":
+      return { title, body: "The title call failed or took longer than 10 seconds. Try again in a moment." };
+  }
+}
+
+/** Ask for a thread's title. A failure — keep the derived title — when there
+ *  is nothing to title yet, the provider has no fast tier, a budget blocks
+ *  it, the call fails or it takes longer than `timeoutMs`. */
 export async function requestChatTitle(
   args: { threadId: string; workspaceId: string; model: string; messages: ChatMessage[] },
   timeoutMs: number = TITLE_TIMEOUT_MS,
-): Promise<string | null> {
+): Promise<TitleOutcome> {
   const req = titleRequest(args.messages);
-  if (!req) return null;
+  if (!req) return { failure: "no-answer" };
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs);
+  const late = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), timeoutMs);
   });
   try {
     const res = await Promise.race([
@@ -90,9 +116,12 @@ export async function requestChatTitle(
       }),
       late,
     ]);
-    return res ? cleanGeneratedTitle(res.text, req.key) : null;
-  } catch {
-    return null;
+    if (res === "late") return { failure: "failed" };
+    if (!res) return { failure: "no-fast-tier" };
+    const title = cleanGeneratedTitle(res.text, req.key);
+    return title ? { title } : { failure: "failed" };
+  } catch (e) {
+    return { failure: isBudgetExceeded(e) ? "budget" : "failed" };
   } finally {
     clearTimeout(timer);
   }

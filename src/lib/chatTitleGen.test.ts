@@ -6,7 +6,8 @@ vi.mock("./ipc", () => ({
 }));
 
 const { ipc } = await import("./ipc");
-const { cleanGeneratedTitle, isAutoTitle, requestChatTitle, titleRequest, TITLE_TIMEOUT_MS } = await import("./chatTitleGen");
+const { cleanGeneratedTitle, isAutoTitle, requestChatTitle, titleFailureToast, titleRequest, TITLE_TIMEOUT_MS } =
+  await import("./chatTitleGen");
 const { deriveChatTitle } = await import("./chatTitle");
 
 const generate = vi.mocked(ipc.generateChatTitle);
@@ -95,29 +96,46 @@ describe("requestChatTitle", () => {
   it("returns the cleaned title", async () => {
     generate.mockResolvedValue({ text: "Waive virtualenv findings.", model: "claude-haiku-5-5", costUsd: 0.0004 });
     const msgs = thread("/ship-ticket https://acme.atlassian.net/browse/GUIDE-123");
-    expect(await requestChatTitle(args(msgs))).toBe("GUIDE-123 · Waive virtualenv findings");
+    expect(await requestChatTitle(args(msgs))).toEqual({ title: "GUIDE-123 · Waive virtualenv findings" });
     expect(generate).toHaveBeenCalledWith(
       expect.objectContaining({ threadId: "t1", workspaceId: "ws-1", model: "claude-opus-5-5" }),
     );
   });
 
-  it("falls back (null) with no fast tier, on a failure, or after 10 s", async () => {
+  it("says why it falls back: no fast tier, a budget block, a failure, or after 10 s", async () => {
     generate.mockResolvedValueOnce(null);
-    expect(await requestChatTitle(args(thread("fix it")))).toBeNull();
+    expect(await requestChatTitle(args(thread("fix it")))).toEqual({ failure: "no-fast-tier" });
+
+    generate.mockRejectedValueOnce({ kind: "BudgetExceeded", scope: "workspace daily", spent: 5, limit: 5 });
+    expect(await requestChatTitle(args(thread("fix it")))).toEqual({ failure: "budget" });
 
     generate.mockRejectedValueOnce(new Error("provider down"));
-    expect(await requestChatTitle(args(thread("fix it")))).toBeNull();
+    expect(await requestChatTitle(args(thread("fix it")))).toEqual({ failure: "failed" });
+
+    generate.mockResolvedValueOnce({ text: '  ""  ', model: "claude-haiku-5-5", costUsd: 0 });
+    expect(await requestChatTitle(args(thread("fix it")))).toEqual({ failure: "failed" });
 
     vi.useFakeTimers();
     generate.mockReturnValueOnce(new Promise(() => {}));
     const late = requestChatTitle(args(thread("fix it")));
     await vi.advanceTimersByTimeAsync(TITLE_TIMEOUT_MS);
-    expect(await late).toBeNull();
+    expect(await late).toEqual({ failure: "failed" });
     expect(TITLE_TIMEOUT_MS).toBe(10_000);
   });
 
   it("doesn't call before there is an answer", async () => {
-    expect(await requestChatTitle(args([msg("user", "hi")]))).toBeNull();
+    expect(await requestChatTitle(args([msg("user", "hi")]))).toEqual({ failure: "no-answer" });
     expect(generate).not.toHaveBeenCalled();
+  });
+});
+
+describe("titleFailureToast", () => {
+  it("says what happened for each failure", () => {
+    expect(titleFailureToast("no-fast-tier").body).toMatch(/no fast model.*Settings › Models/);
+    expect(titleFailureToast("failed").body).toMatch(/failed or took longer than 10 seconds/);
+    expect(titleFailureToast("failed").body).not.toMatch(/fast tier/);
+    expect(titleFailureToast("budget").body).toMatch(/budget limit/);
+    expect(titleFailureToast("no-answer").body).toMatch(/no answer to title yet/);
+    expect(titleFailureToast("budget").title).toBe("The title stays as it is");
   });
 });

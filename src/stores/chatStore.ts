@@ -10,7 +10,7 @@ import { useAttentionStore } from "./attentionStore";
 import { focus } from "../lib/focus";
 import { notifyApprovalWaiting } from "../lib/approvalNotifications";
 import { deriveChatTitle } from "../lib/chatTitle";
-import { isAutoTitle, requestChatTitle } from "../lib/chatTitleGen";
+import { isAutoTitle, requestChatTitle, type TitleFailure } from "../lib/chatTitleGen";
 import { helperModelNow } from "../lib/helperModels";
 import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
 import { parseSentContext, typedText, type SentContextBlock } from "../lib/sentContext";
@@ -725,9 +725,10 @@ interface ChatState {
   /** After a thread's first turn: give it a generated title, once, when its
    *  title is still the derived one (#1137). Never over a title the user set. */
   autoTitleThread: (workspaceId: string, threadId: string) => Promise<void>;
-  /** "Regenerate title": the same call, on request, over any title. False
-   *  when no title came back (the current one stays). */
-  regenerateTitle: (workspaceId: string, threadId: string) => Promise<boolean>;
+  /** "Regenerate title": the same call, on request, over any title. Null
+   *  once the new title landed, else why none came back (the current one
+   *  stays). */
+  regenerateTitle: (workspaceId: string, threadId: string) => Promise<TitleFailure | null>;
   /** Pin/unpin a conversation (pinned sort to the top). */
   pinThread: (workspaceId: string, threadId: string, pinned: boolean) => Promise<void>;
   deleteThread: (workspaceId: string, threadId: string) => Promise<void>;
@@ -2019,17 +2020,33 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (autoTitled.has(threadId) || titling.has(threadId)) return;
       const findThread = () => (get().threadsByWs[workspaceId] ?? EMPTY_THREADS).find((t) => t.id === threadId);
       if (!findThread()) return;
+      // The shown thread's rows are already loaded: once it is past its first
+      // turn, it never needs the read.
+      const s = get();
+      if (s.activeThreadByWs[workspaceId] === threadId) {
+        const loaded = s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES;
+        if (loaded.filter((m) => m.role === "user").length > 1) {
+          autoTitled.add(threadId);
+          return;
+        }
+      }
       titling.add(threadId);
       try {
         const messages = (await ipc.listChatMessages(threadId)) as ChatMessage[];
         // Only the first turn, and only once it has an answer.
-        if (messages.filter((m) => m.role === "user").length !== 1) return;
+        if (messages.filter((m) => m.role === "user").length > 1) {
+          autoTitled.add(threadId);
+          return;
+        }
         const answer = messages.find((m) => m.role === "assistant" && m.content.trim());
         if (!answer) return;
         const before = findThread();
-        if (!before || !isAutoTitle(before.title, messages)) return;
+        if (!before) return;
+        // Decided once, whatever comes back: a title that isn't ours is never
+        // replaced on its own, so its later turns skip the read too.
         autoTitled.add(threadId);
-        const title = await requestChatTitle({
+        if (!isAutoTitle(before.title, messages)) return;
+        const outcome = await requestChatTitle({
           threadId,
           workspaceId,
           model: answer.model ?? get().model,
@@ -2037,8 +2054,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
         // Renamed while the call ran: the user's title stays.
         const now = findThread();
-        if (!title || !now || now.title !== before.title) return;
-        await get().renameThread(workspaceId, threadId, title);
+        if (!("title" in outcome) || !now || now.title !== before.title) return;
+        await get().renameThread(workspaceId, threadId, outcome.title);
       } catch {
         // Best-effort: the derived title stays.
       } finally {
@@ -2047,22 +2064,22 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     regenerateTitle: async (workspaceId, threadId) => {
-      if (titling.has(threadId)) return false;
+      if (titling.has(threadId)) return "failed";
       titling.add(threadId);
       try {
         const messages = (await ipc.listChatMessages(threadId)) as ChatMessage[];
         const answer = messages.find((m) => m.role === "assistant" && m.content.trim());
-        const title = await requestChatTitle({
+        const outcome = await requestChatTitle({
           threadId,
           workspaceId,
           model: answer?.model ?? get().model,
           messages,
         });
-        if (!title) return false;
-        await get().renameThread(workspaceId, threadId, title);
-        return true;
+        if (!("title" in outcome)) return outcome.failure;
+        await get().renameThread(workspaceId, threadId, outcome.title);
+        return null;
       } catch {
-        return false;
+        return "failed";
       } finally {
         titling.delete(threadId);
       }
