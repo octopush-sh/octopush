@@ -2064,7 +2064,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     regenerateTitle: async (workspaceId, threadId) => {
-      if (titling.has(threadId)) return "failed";
+      if (titling.has(threadId)) return "busy";
       titling.add(threadId);
       try {
         const messages = (await ipc.listChatMessages(threadId)) as ChatMessage[];

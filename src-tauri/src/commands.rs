@@ -8159,9 +8159,22 @@ pub async fn generate_chat_title(
     )
     .await
     .map_err(|_| AppError::Other("The title took too long.".into()))??;
-    ensure_not_truncated(&resp.stop_reason)?;
+    Ok(Some(bill_title_reply(&state.tokens, &thread_id, &workspace_id, fast, resp)))
+}
+
+/// Bill a title reply to its thread and keep its text. Every reply that came
+/// back is paid for, so this runs on all of them, a truncated one too: it is
+/// not rejected, because the frontend keeps only the first line and an empty
+/// cleanup keeps the derived title. Unit-testable.
+pub(crate) fn bill_title_reply(
+    tokens: &crate::token_engine::TokenEngine,
+    thread_id: &str,
+    workspace_id: &str,
+    model: String,
+    resp: crate::providers::LlmResponse,
+) -> GeneratedTitle {
     let cost = crate::token_engine::request_cost_for(
-        &fast,
+        &model,
         resp.input_tokens,
         resp.output_tokens,
         resp.cache_read_tokens,
@@ -8169,12 +8182,12 @@ pub async fn generate_chat_title(
     );
     if resp.input_tokens > 0 || resp.output_tokens > 0 {
         // Best-effort: a recording failure must not lose the title.
-        let event = ai_token_event(Some(workspace_id.as_str()), &fast, &resp, cost);
-        if let Err(e) = record_title_spend(&state.tokens, &thread_id, event) {
+        let event = ai_token_event(Some(workspace_id), &model, &resp, cost);
+        if let Err(e) = record_title_spend(tokens, thread_id, event) {
             tracing::warn!(error = %e, "failed to record the title call's spend");
         }
     }
-    Ok(Some(GeneratedTitle { text: ai_response_text(resp), model: fast, cost_usd: cost }))
+    GeneratedTitle { text: ai_response_text(resp), model, cost_usd: cost }
 }
 
 // ─── G4 staging commands ──────────────────────────────────────────

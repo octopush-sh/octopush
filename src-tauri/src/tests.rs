@@ -30577,8 +30577,9 @@ mod crew_report_tests {
 /// `title`.
 #[cfg(test)]
 mod chat_title_tests {
-    use crate::commands::{fast_model_on_provider, record_title_spend, TITLE_ORIGIN};
+    use crate::commands::{bill_title_reply, fast_model_on_provider, record_title_spend, TITLE_ORIGIN};
     use crate::db::Db;
+    use crate::providers::{LlmResponse, LlmStopReason};
     use crate::provider_router::{builtin_providers, ProviderRouter};
     use crate::token_engine::{TokenEngine, TokenEvent};
     use parking_lot::Mutex;
@@ -30644,5 +30645,27 @@ mod chat_title_tests {
         assert_eq!((row.surface.as_str(), row.origin.as_deref()), ("talk", Some(TITLE_ORIGIN)));
         assert_eq!(TITLE_ORIGIN, "title");
         assert!(row.single_request());
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_truncated_title_reply_is_still_billed_and_kept() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Arc::new(Mutex::new(Db::open(tmp.path()).unwrap()));
+        let engine = TokenEngine::new(Arc::clone(&db));
+        let resp = LlmResponse {
+            text: "GUIDE-123 · Waive virtualenv findings\nBecause the".into(),
+            stop_reason: LlmStopReason::MaxTokens,
+            input_tokens: 400,
+            output_tokens: 64,
+            ..Default::default()
+        };
+        let title = bill_title_reply(&engine, "t-2", "ws-1", "claude-haiku-5-5".into(), resp);
+        assert!(title.text.starts_with("GUIDE-123 · Waive virtualenv findings"), "{}", title.text);
+        assert_eq!(title.model, "claude-haiku-5-5");
+        let c = db.lock().thread_cost("t-2", None).unwrap();
+        assert_eq!(c.calls, 1);
+        assert!((c.spent_usd - title.cost_usd).abs() < 1e-12, "{} vs {}", c.spent_usd, title.cost_usd);
     }
 }

@@ -119,6 +119,20 @@ describe("generated thread titles", () => {
     expect(titleNow()).toBe("GUIDE-123 · Waive virtualenv findings");
   });
 
+  it("says a title is on its way when regenerate meets the first answer's call", async () => {
+    const messages = firstTurn();
+    seed(deriveChatTitle(messages), messages);
+    let answer: (v: { text: string; model: string; costUsd: number }) => void = () => {};
+    generate.mockReturnValueOnce(new Promise((r) => (answer = r)));
+    const run = useChatStore.getState().autoTitleThread("ws-1", "t1");
+    await vi.waitFor(() => expect(generate).toHaveBeenCalled());
+    expect(await useChatStore.getState().regenerateTitle("ws-1", "t1")).toBe("busy");
+    expect(generate).toHaveBeenCalledTimes(1);
+    answer({ text: "Waive virtualenv findings", model: "claude-haiku-5-5", costUsd: 0 });
+    await run;
+    expect(titleNow()).toBe("GUIDE-123 · Waive virtualenv findings");
+  });
+
   it("says why a regenerate brought no title, and keeps the current one", async () => {
     seed("Release checklist", firstTurn());
     generate.mockResolvedValueOnce(null);

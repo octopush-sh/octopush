@@ -137,5 +137,7 @@ describe("titleFailureToast", () => {
     expect(titleFailureToast("budget").body).toMatch(/budget limit/);
     expect(titleFailureToast("no-answer").body).toMatch(/no answer to title yet/);
     expect(titleFailureToast("budget").title).toBe("The title stays as it is");
+    expect(titleFailureToast("busy").body).toMatch(/already being written/);
+    expect(titleFailureToast("busy").body).not.toMatch(/failed|10 seconds/);
   });
 });

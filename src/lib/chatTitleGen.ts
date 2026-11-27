@@ -68,8 +68,10 @@ export function isAutoTitle(title: string, messages: ChatMessage[]): boolean {
 }
 
 /** Why no title came back: nothing to title yet, the provider has no fast
- *  tier, a budget limit blocked the call, or the call failed or ran late. */
-export type TitleFailure = "no-answer" | "no-fast-tier" | "budget" | "failed";
+ *  tier, a budget limit blocked the call, the call failed or ran late, or
+ *  (`busy`, from regenerate only) a title call for the thread is already
+ *  running. */
+export type TitleFailure = "no-answer" | "no-fast-tier" | "budget" | "failed" | "busy";
 
 export type TitleOutcome = { title: string } | { failure: TitleFailure };
 
@@ -89,6 +91,11 @@ export function titleFailureToast(failure: TitleFailure): { title: string; body:
       return { title, body: "A budget limit is blocking new spend, so no title call was made." };
     case "failed":
       return { title, body: "The title call failed or took longer than 10 seconds. Try again in a moment." };
+    case "busy":
+      return {
+        title: "A title is on its way",
+        body: "A title is already being written for this conversation. It appears when that call finishes.",
+      };
   }
 }
 
