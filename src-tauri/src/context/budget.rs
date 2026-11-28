@@ -427,22 +427,39 @@ pub fn stub(result: &str, row: Option<i64>) -> String {
 /// window, by the documented shapes: the Anthropic API's "prompt is too
 /// long" and "exceed context limit" `invalid_request_error`s, the OpenAI
 /// API's `context_length_exceeded` code and its "maximum context length is"
-/// message (which OpenAI-compatible servers reuse), and the llama.cpp
-/// server's `exceed_context_size_error`. An output cap above the model's
-/// limit is another error and doesn't match.
+/// message (which OpenAI-compatible servers reuse), the llama.cpp server's
+/// `exceed_context_size_error` and, from builds older than that type, its
+/// "exceeds the available context size" `invalid_request_error`. LM Studio
+/// ("context length of only N") and Mistral ("N maximum context length")
+/// match only with the window's figure in place, so prose about a context
+/// length doesn't. An output cap above the model's limit is another error
+/// and doesn't match.
 pub fn is_context_overflow(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    ["prompt is too long", "exceed context limit", "context_length_exceeded", "maximum context length is", "exceed_context_size_error"]
-        .iter()
-        .any(|p| m.contains(p))
+    [
+        "prompt is too long",
+        "exceed context limit",
+        "context_length_exceeded",
+        "maximum context length is",
+        "exceed_context_size_error",
+        "exceeds the available context size",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
+        || OVERFLOW_WITH_FIGURE.is_match(&m)
 }
 
+/// The overflow wordings that are only specific with their figure.
+static OVERFLOW_WITH_FIGURE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"context length of only \d+|\d+ maximum context length").expect("overflow wording pattern")
+});
 static PROMPT_FIGURE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)prompt is too long:\s*(\d+)|context limit:\s*(\d+)|resulted in\s*(\d+)|\((\d+) in the messages|"n_prompt_tokens"\s*:\s*(\d+)"#)
+    Regex::new(r#"(?i)prompt is too long:\s*(\d+)|context limit:\s*(\d+)|resulted in\s*(\d+)|\((\d+) in the messages|"n_prompt_tokens"\s*:\s*(\d+)|prompt contains\s*(\d+)"#)
         .expect("prompt figure pattern")
 });
 static LIMIT_FIGURE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)>\s*(\d+)|maximum context length is\s*(\d+)|"n_ctx"\s*:\s*(\d+)"#).expect("limit figure pattern")
+    Regex::new(r#"(?i)>\s*(\d+)|maximum context length is\s*(\d+)|"n_ctx"\s*:\s*(\d+)|context length of only\s*(\d+)|(\d+)\s*maximum context length"#)
+        .expect("limit figure pattern")
 });
 
 /// The prompt size and the window (tokens) a context-length error reports,
@@ -691,6 +708,78 @@ mod tests {
         assert_eq!((guard.budget().window, guard.learned().window), (DEFAULT_WINDOW_TOKENS, None));
         // The reserve never takes more than half of a small window.
         assert_eq!(ContextBudget::for_model(Some(8_000), 32_768, None).reserve, 4_000);
+    }
+
+    /// `message`, an error body in the shape a server answers an oversized
+    /// prompt with, as the OpenAI-compatible provider reports it (label,
+    /// status, body): a context-length error with these figures, which gets
+    /// the turn its single shortened retry and leaves the reported window
+    /// learned.
+    fn retries_once(message: &str, prompt: Option<u64>, limit: Option<u64>) {
+        assert!(is_context_overflow(message), "{message}");
+        assert_eq!(overflow_figures(message), (prompt, limit), "{message}");
+        let mut guard = ContextGuard::new(ContextBudget::for_model(Some(200_000), 8_000, None), Learned::default());
+        let mut messages = vec![user("go")];
+        for i in 1..=3 {
+            messages.extend(round(&[format!("t{i}").as_str()], &[30_000], false));
+        }
+        guard.sent(0, &messages);
+        let e = provider_error(ProviderErrorKind::BadRequest, message);
+        let first = guard.after_failure(&e, &mut messages, 0, &rows(3));
+        let line = first.retry.as_deref().unwrap_or_default();
+        assert!(line.starts_with("prompt too long for this model — shortened 2 earlier tool results"), "{first:?}");
+        assert_eq!(guard.learned().window, limit, "{message}");
+        guard.sent(0, &messages);
+        assert_eq!(guard.after_failure(&e, &mut messages, 0, &rows(3)).retry, None, "once per round: {message}");
+    }
+
+    #[test]
+    fn lm_studio_context_length_of_only_is_an_overflow() {
+        // A 400 whose `error` is a bare string.
+        retries_once(
+            r#"OpenAI-compat API error 400 Bad Request: {"error":"Trying to keep the first 9210 tokens when context the overflows. However, the model is loaded with context length of only 8192 tokens, which is not enough."}"#,
+            None,
+            Some(8_192),
+        );
+    }
+
+    #[test]
+    fn mistral_maximum_context_length_is_an_overflow() {
+        // The documented `invalid_request_prompt_too_long` (code 3059).
+        retries_once(
+            r#"OpenAI-compat API error 400 Bad Request: {"object":"error","message":"Prompt 40011 > 32768 maximum context length","type":"invalid_request_prompt_too_long","param":null,"code":"3059","raw_status_code":400}"#,
+            None,
+            Some(32_768),
+        );
+        // The earlier `invalid_request_error`, which also gives the prompt.
+        retries_once(
+            r#"OpenAI-compat API error 400 Bad Request: {"object":"error","message":"Prompt contains 65673 tokens, too large for model with 32768 maximum context length","type":"invalid_request_error","param":null,"code":3051}"#,
+            Some(65_673),
+            Some(32_768),
+        );
+    }
+
+    #[test]
+    fn older_llama_cpp_available_context_size_is_an_overflow() {
+        // Builds from before `exceed_context_size_error`: no figures.
+        retries_once(
+            r#"OpenAI-compat API error 400 Bad Request: {"error":{"code":400,"message":"the request exceeds the available context size, try increasing the context size or enable context shift","type":"invalid_request_error"}}"#,
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn generic_context_wording_is_not_an_overflow() {
+        for message in [
+            r#"OpenAI-compat API error 400 Bad Request: {"error":{"message":"the maximum context length for this model is set when it is loaded","type":"invalid_request_error"}}"#,
+            r#"OpenAI-compat API error 400 Bad Request: {"error":"load the model with a context length of only what the task needs"}"#,
+            r#"OpenAI-compat API error 400 Bad Request: {"object":"error","message":"requested 8192 tokens; maximum context length must be a power of two","type":"invalid_request_error"}"#,
+            r#"OpenAI-compat API error 400 Bad Request: {"error":{"message":"the reply exceeds the maximum length of 4096 characters","type":"invalid_request_error"}}"#,
+            "the available context size is shown under the model's settings",
+        ] {
+            assert!(!is_context_overflow(message), "{message}");
+        }
     }
 
     #[test]
