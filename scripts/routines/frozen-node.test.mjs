@@ -217,7 +217,7 @@ test("frozen-node.sh end, on this runner: a sandbox that keeps forking does not 
   assert.match(job, /permissions:\n      contents: read\n/);
   assert.doesNotMatch(job, /secrets\.|github\.token|TOKEN/);
   assert.match(job, /while :; do \(sleep 0 &\); done/, "the fork loop");
-  assert.match(job, /rc=0; \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" end "\$c" \|\| rc=\$\?/);
+  assert.match(job, /rc=0; \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" end "\$c" 2> "\$RUNNER_TEMP\/end\.err" \|\| rc=\$\?/);
   assert.match(job, /ps -u octo-sandbox -o stat= \| grep -qv '\^Z'/);
   assert.match(job, /grep -qx 'populated 0' \/sys\/fs\/cgroup\/octo-sandbox\/cgroup\.events/);
 });
