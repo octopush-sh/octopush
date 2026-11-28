@@ -60,6 +60,9 @@ pub struct TerminalInfo {
     pub running: bool,
     pub cwd: String,
     pub started_at: i64,
+    /// The shell's process (#1231), when the daemon names it: a daemon
+    /// older than this field doesn't.
+    pub pid: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +196,7 @@ impl DaemonClient {
                 running: v["running"].as_bool().unwrap_or(false),
                 cwd: v["cwd"].as_str().unwrap_or("").to_string(),
                 started_at: v["started_at"].as_i64().unwrap_or(0),
+                pid: v["pid"].as_u64().and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0),
             })
             .collect();
         Ok(infos)
