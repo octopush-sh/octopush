@@ -5467,13 +5467,17 @@ impl ChatEngine {
                 sandbox_roots.as_deref(),
             );
             let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
-            // Ask first and Plan only want the shared shell strict, without
-            // the profile's aliases and functions (#1231); it is made so
-            // before its next command.
-            self.talk_shell.set_strict(
-                &request.thread_id,
-                matches!(mode, crate::permissions::Mode::Ask | crate::permissions::Mode::Plan),
-            );
+            // Entering Ask first or Plan only, from any mode, starts a fresh
+            // shell and cleans it (#1231): restart, don't clean what earlier
+            // commands left. So does a shell this process hasn't used yet (one
+            // reattached after a restart may have been in Edit freely).
+            let strict_mode = matches!(mode, crate::permissions::Mode::Ask | crate::permissions::Mode::Plan);
+            let entered = self.talk_shell.set_strict(&request.thread_id, strict_mode);
+            if strict_mode && self.talk_shell.available() && (entered || !self.talk_shell.has_session(&request.thread_id)) {
+                let (shell, tid, wp) = (Arc::clone(&self.talk_shell), request.thread_id.clone(), request.workspace_path.clone());
+                let label = mode.label();
+                let _ = tokio::task::spawn_blocking(move || shell.restart_strict(&tid, &wp, label)).await;
+            }
 
             let response = loop {
                 let llm_req = director_request(&request, &system_prompt, &messages, &tools);
@@ -5906,16 +5910,38 @@ impl ChatEngine {
                 // (#1165; inside the workspace only, so it never tells whether a
                 // file exists outside), the mission sandbox's, an edit that
                 // doesn't apply (#1231).
-                // A reader runs in the shared shell without a card only once
-                // that shell is sure to be strict (#1231): an alias or a profile
-                // function could turn `ls` or `git` into a writer.
-                let loose_shell = mode == crate::permissions::Mode::Ask
+                // A reader runs in the shared shell without a card only in a
+                // shell started fresh, cleaned and proven so (#1231): an alias, a
+                // function or a trap could turn `ls` or `git` into a writer. One
+                // that ran anything else since starts fresh first; one that
+                // can't be proven clean asks, and its card says why.
+                let reader_shell = mode == crate::permissions::Mode::Ask
                     && !mode_denied
                     && u.name == "run_command"
+                    && !mode_asks.contains(&u.id)
                     && self.talk_shell.available()
-                    && exec_roots.is_none()
-                    && !self.talk_shell.strict_wanted(&request.thread_id);
-                let held = (mode_asks.contains(&u.id) || git_outside || loose_shell) && skill_refusal.is_none();
+                    && exec_roots.is_none();
+                let loose_shell: Option<String> = if reader_shell {
+                    let state = match self.talk_shell.strictness(&request.thread_id) {
+                        crate::talk_shell::Strictness::Unchecked => {
+                            let (shell, tid, wp) = (Arc::clone(&self.talk_shell), request.thread_id.clone(), request.workspace_path.clone());
+                            tokio::task::spawn_blocking(move || shell.restart_strict(&tid, &wp, "Ask first"))
+                                .await
+                                .unwrap_or_else(|e| crate::talk_shell::Strictness::Failed(e.to_string()))
+                        }
+                        state => state,
+                    };
+                    match state {
+                        crate::talk_shell::Strictness::Verified => None,
+                        crate::talk_shell::Strictness::Failed(why) => Some(why),
+                        crate::talk_shell::Strictness::Unchecked => Some("the shell isn't checked yet".to_string()),
+                    }
+                } else {
+                    None
+                };
+                let held = (mode_asks.contains(&u.id) || git_outside || loose_shell.is_some()) && skill_refusal.is_none();
+                // It runs on Ask first's read-only verdict: the shell stays proven.
+                let read_only_run = reader_shell && !held;
                 let inside = || reach.outside_card(None, &u.name, &u.input, false, &[]).is_none();
                 let seen = self.thread_file_seen(&request.thread_id);
                 let refused = || {
@@ -5947,7 +5973,13 @@ impl ChatEngine {
                         reach.granted(&u.name, &u.input, ask_cwd.as_deref().map(Path::new), writes_confined, &grants)
                     };
                     if !reach.checked(&granted).await {
-                        let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));
+                        let ask_place = || {
+                            let card = crate::permissions::ask_card(None, &u.name, &u.input, &reach);
+                            Some(match &loose_shell {
+                                Some(why) => ToolCard { reason: format!("{} Even a command that only reads asks here: {why}.", card.reason), ..card },
+                                None => card,
+                            })
+                        };
                         let check = || reach.checked(&ask_place);
                         if let Some(card) = check().await {
                             let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
@@ -6162,8 +6194,9 @@ impl ChatEngine {
                     // a true hang is interrupted. Cancellable: if Stop is pressed
                     // while it blocks, interrupt the shell so the capture returns
                     // promptly instead of waiting out the full timeout.
-                    let jh = tokio::task::spawn_blocking(move || {
-                        shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(600))
+                    let jh = tokio::task::spawn_blocking(move || match read_only_run {
+                        true => shell.run_capture_read_only(&tid, &wp, &command, std::time::Duration::from_secs(600)),
+                        false => shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(600)),
                     });
                     tokio::pin!(jh);
                     let join_result = loop {
