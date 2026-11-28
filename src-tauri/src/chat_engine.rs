@@ -3805,19 +3805,51 @@ impl ChatEngine {
     pub fn new(db: Arc<Mutex<Db>>, daemon: Option<Arc<crate::pty_client::DaemonClient>>) -> Self {
         let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
         talk_shell.set_client(daemon);
+        // A project's own servers start once approved in its project (#1245).
+        let project_approvals = Arc::new(crate::mcp::approval::DbApprovals(Arc::clone(&db)));
         let approvals = Arc::new(ApprovalBroker::with_db(Arc::clone(&db)));
         Self {
             // Clone of the process-wide client — shares its connection pool.
             client: shared_http_client().clone(),
             db,
             cancels: Arc::new(Mutex::new(HashMap::new())),
-            mcp: Arc::new(crate::mcp::McpRegistry::new()),
+            mcp: Arc::new(crate::mcp::McpRegistry::new().with_approvals(project_approvals)),
             talk_shell,
             approvals,
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
             stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
             file_seen: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Before a turn discovers its MCP tools: each server of the project's
+    /// own `.claude/mcp.json` that waits for approval (new, or changed since
+    /// approved) and isn't off in the conversation asks on a card, Deny
+    /// first (#1245). Allowed, the approval is stored for the project, bound
+    /// to the entry the card showed; denied, the server stays stopped this
+    /// turn, and the next turn asks again.
+    async fn ask_project_servers(&self, app: &AppHandle, workspace_id: &str, workspace_path: &str, thread_id: &str) {
+        use crate::mcp::approval::ProjectServerState::{Changed, Waiting};
+        let off = thread_mcp_off(&self.db, thread_id);
+        let (mcp, wt) = (Arc::clone(&self.mcp), std::path::PathBuf::from(workspace_path));
+        let listed = tokio::task::spawn_blocking(move || mcp.project_servers(&wt)).await.unwrap_or_default();
+        for server in listed.into_iter().filter(|s| matches!(s.state, Waiting | Changed) && !off.contains(&s.name)) {
+            let call_id = format!("mcp-server-{}", uuid::Uuid::new_v4());
+            let card = crate::talk_guard::server_card(&server);
+            let mode = crate::permissions::thread_mode(&self.db, thread_id);
+            if self.approvals.await_card(app, workspace_id, thread_id, &call_id, card, mode).await == ApprovalDecision::Deny {
+                continue;
+            }
+            let (db, mcp, wt) = (Arc::clone(&self.db), Arc::clone(&self.mcp), std::path::PathBuf::from(workspace_path));
+            let stored = tokio::task::spawn_blocking(move || {
+                crate::mcp::approval::approve(&db, &mcp, &wt, &server.name, &server.hash)
+            })
+            .await;
+            if let Ok(Err(e)) = stored {
+                tracing::warn!(error = %e, "project MCP server not approved");
+            }
+            let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ());
         }
     }
 
@@ -5115,6 +5147,8 @@ impl ChatEngine {
         // sub-agents'. What it offers is fixed for the turn. Any MCP tool it
         // didn't discover with `readOnlyHint` asks first (#1147), unless Edit
         // freely lets it run (`talk_guard::McpTools`, #1243).
+        // A project's own server that waits for approval asks first (#1245).
+        self.ask_project_servers(&app, &request.workspace_id, &request.workspace_path, &request.thread_id).await;
         let (mcp_read_only, mcp_tools): (std::collections::HashSet<String>, crate::talk_guard::McpTools) = {
             let discovered = discover_thread_mcp_tools(
                 Arc::clone(&self.mcp),
@@ -8264,6 +8298,23 @@ mod tests {
     /// the sub-agent gate must ask `talk_guard` and check again through
     /// `guard_card` before a tool runs (#1147). An `AppHandle` can't be built
     /// in a test, so this reads the two call sites in the source.
+    /// A project's own servers ask before the turn discovers its MCP tools
+    /// (#1245), and an approval goes through `approval::approve`, which binds
+    /// it to the entry the card showed. Read in the source, as above.
+    #[test]
+    fn a_turn_asks_about_project_servers_before_it_discovers_tools() {
+        let engine = include_str!("chat_engine.rs");
+        let turn = engine.find("async fn run_agentic_turn(").expect("the director's turn");
+        let asks = turn + engine[turn..].find("self.ask_project_servers(").expect("the turn asks");
+        let discovers = turn + engine[turn..].find("discover_thread_mcp_tools(").expect("the turn discovers");
+        assert!(asks < discovers, "it asks before anything starts");
+        let at = engine.find("async fn ask_project_servers(").unwrap();
+        let body = &engine[at..at + engine[at..].find("\n    }\n").unwrap()];
+        for call in ["talk_guard::server_card(", "await_card(", "mcp::approval::approve("] {
+            assert!(body.contains(call), "ask_project_servers calls {call}");
+        }
+    }
+
     #[test]
     fn the_director_loop_and_the_subagent_gate_call_the_guard() {
         let engine = include_str!("chat_engine.rs");
