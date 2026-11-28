@@ -18,10 +18,19 @@
 #                            of its own, or if the step's environment carries a
 #                            variable that makes bash, node, git or the loader
 #                            run other code
-#   frozen-node.sh guard [tree…]    the same, after killing whatever the sandbox
-#                            user still runs (and its crontab) and proving it
-#                            gone. A job that never created that user ran
-#                            nothing untrusted: guard passes there.
+#   frozen-node.sh end [checkout…]  the sandbox is over: kill every process of the
+#                            sandbox user at once (kill -1 as that user, until
+#                            none is left; exit 1 if one survives), remove its
+#                            crontab and lock the account, so nothing can start
+#                            as it again. Then, for each checkout it could write
+#                            (whose own .git was moved out before the sandbox):
+#                            close its top directory to other users, remove any
+#                            .git there (actions/checkout's post step would run
+#                            git in it), and exit 1 if there was one
+#   frozen-node.sh guard [tree…]    end (no checkouts), then verify
+#
+# A job that never created the sandbox user ran nothing untrusted: end and
+# guard pass there, and touch nothing.
 #
 # Each extra tree (a checkout's .git, which actions/checkout's post step runs
 # git in; a copy of these scripts the runner executes) is checked like the
@@ -49,7 +58,7 @@ die() { echo "::error::frozen-node: $*" >&2; exit 1; }
 show() { if [[ "$QUIET" == 1 ]]; then echo "$(grep -c . <<<"$1") path(s), not named in this log"; else head -n 5 <<<"$1" | tr '\n' ' '; fi; }
 
 [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${RUNNER_TEMP:-}" ]] || { echo "frozen-node: GitHub Actions only" >&2; exit 64; }
-case "${1:-}" in freeze|verify|guard) ;; *) echo "usage: frozen-node.sh freeze [tree…] | verify [tree…] | guard [tree…]" >&2; exit 64 ;; esac
+case "${1:-}" in freeze|verify|guard|end) ;; *) echo "usage: frozen-node.sh freeze [tree…] | verify [tree…] | guard [tree…] | end [checkout…]" >&2; exit 64 ;; esac
 DIGEST="$RUNNER_TEMP/octo-node.digest"
 
 globals=()
@@ -60,8 +69,46 @@ if [[ "$1" == freeze ]]; then
     globals+=("$p")
   done
 fi
-if [[ "$1" == guard ]] && ! id -u "$SANDBOX_USER" >/dev/null 2>&1; then
+if [[ "$1" == guard || "$1" == end ]] && ! id -u "$SANDBOX_USER" >/dev/null 2>&1; then
   echo "no $SANDBOX_USER user in this job: nothing untrusted has run"
+  exit 0
+fi
+
+# Every process of the sandbox user, killed at once: kill(-1) as that user
+# reaches all of them in one pass, so one that keeps forking can't outrun it
+# (pkill walks /proc and can). Its crontab goes, and the account is locked and
+# expired, so nothing starts as it again; repeated until none is left.
+# (A zombie runs nothing: only processes that can still run count.)
+alive() { ps -u "$SANDBOX_USER" -o stat= 2>/dev/null | grep -qv '^Z'; }
+end_sandbox() {
+  local uid gid
+  uid="$(id -u "$SANDBOX_USER")" gid="$(id -g "$SANDBOX_USER")"
+  sudo crontab -r -u "$SANDBOX_USER" >/dev/null 2>&1 || true
+  sudo usermod --lock --expiredate 1 --shell /usr/sbin/nologin "$SANDBOX_USER" >/dev/null 2>&1 || die "could not lock $SANDBOX_USER"
+  for _ in $(seq 1 50); do
+    alive || return 0
+    # bash's own kill: kill(-1) spares only its caller.
+    sudo setpriv --reuid="$uid" --regid="$gid" --clear-groups /usr/bin/bash -c 'kill -KILL -1' >/dev/null 2>&1 || true
+    sleep 0.1
+  done
+  ! alive || die "$SANDBOX_USER processes survived"
+}
+
+if [[ "$1" == end ]]; then
+  end_sandbox
+  planted=0
+  for c in "${@:2}"; do
+    [[ -d "$c" && ! -L "$c" && "$(stat -c %u "$c")" == "$(id -u)" ]] || die "not a checkout of the runner's: $c"
+    # Its top directory first: from here no one else can create a .git in it.
+    sudo chmod o-w "$c"
+    if [[ -e "$c/.git" || -L "$c/.git" ]]; then
+      sudo rm -rf -- "$c/.git"
+      : > "$RUNNER_TEMP/planted-git"
+      planted=$((planted + 1))
+    fi
+  done
+  ((planted == 0)) || die "$planted checkout(s) had a .git of the sandbox's: removed"
+  echo "$SANDBOX_USER ended and locked${2:+; its checkouts are closed and have no .git}"
   exit 0
 fi
 
@@ -209,10 +256,7 @@ case "$1" in
     check
     ;;
   guard)
-    sudo crontab -r -u "$SANDBOX_USER" >/dev/null 2>&1 || true
-    sudo pkill -KILL -u "$SANDBOX_USER" >/dev/null 2>&1 || true
-    for _ in $(seq 1 25); do pgrep -u "$SANDBOX_USER" >/dev/null 2>&1 || break; sleep 0.2; done
-    if pgrep -u "$SANDBOX_USER" >/dev/null 2>&1; then die "$SANDBOX_USER processes survived the kill"; fi
+    end_sandbox
     check
     ;;
 esac

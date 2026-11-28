@@ -17,6 +17,7 @@ const live = (text) => text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n
 const steps = (text) => live(text).split("\n      - ").slice(1).map((s) => ({ name: /^name: (.*)$/m.exec(s)?.[1] ?? s.split("\n")[0], text: s }));
 const at = (list, prefix) => { const i = list.findIndex((s) => s.name.startsWith(prefix)); assert.ok(i >= 0, prefix); return i; };
 const GUARD = /\/usr\/bin\/bash "\$RUNNER_TEMP\/routines\/frozen-node\.sh" guard "\$RUNNER_TEMP\/routines"/;
+const END = (checkout) => `/usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" end "${checkout}"`;
 const SHELL = /\n        shell: \/usr\/bin\/bash --noprofile --norc -e \{0\}\n/;
 
 const BUILDERS = [
@@ -69,10 +70,14 @@ for (const b of BUILDERS) {
       const cmds = run.replace(/^        run: \|?\n?/, "").split("\n").map((l) => l.trim()).filter(Boolean);
       if (i === 0 || i === firstGuard) {
         assert.ok(/^(job_path="\$PATH"|PATH=\/usr\/sbin:\/usr\/bin:\/sbin:\/bin)$/.test(cmds[0]), `${s.name}: PATH is reset before anything runs`);
+      } else if (i === after.length - 1) {
+        assert.deepEqual(cmds.slice(0, 1), [END(b.checkout)], `${s.name}: the sandbox ended and the checkout's .git gone before the post steps`);
+        assert.match(cmds[1], GUARD);
       } else {
         const first = cmds[0] === "set -euo pipefail" ? cmds[1] : cmds[0];
         assert.match(first, GUARD, `${s.name}: the guard runs before anything else`);
       }
+      assert.doesNotMatch(run, /\bpkill\b/, `${s.name}: the sandbox user is ended by frozen-node.sh (kill -1 as that user), not by pkill`);
       assert.doesNotMatch(run, /\bnpx?\b|\bsource\b|^\s*\. /m, `${s.name}: no npm, npx or sourced file after the agent`);
       assert.doesNotMatch(run.replace(/\$RUNNER_TEMP\/routines\//g, ""), /\bscripts\//, `${s.name}: only the trusted copy of the routines runs`);
       assert.doesNotMatch(s.text, /\n          (GIT_[A-Z_]+|NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|LD_[A-Z_]+): /, `${s.name}: no variable that makes git, node, bash or the loader run other code`);
@@ -84,20 +89,26 @@ for (const b of BUILDERS) {
     assert.match(after[firstGuard].text, new RegExp(`frozen-node\\.sh" guard "\\$RUNNER_TEMP/routines" "\\$RUNNER_TEMP/${b.gitDir.replace(".", "\\.")}"\\n`));
     // The last step checks once more before the actions' post steps run.
     const last = after[after.length - 1];
-    assert.equal(last.name, "Nothing the post steps run has changed");
+    assert.equal(last.name, "Nothing the post steps run has changed, and no checkout has a .git of the sandbox's");
     assert.match(last.text, /\n        if: always\(\) && steps\.pick\.outputs\.kind != ''\n/);
     assert.match(last.text, GUARD);
   });
 
-  test(`${b.file}: a .git the sandbox made in the checkout is removed whatever fails, and stops publishing`, () => {
+  test(`${b.file}: the sandbox user is ended before a .git it made in the checkout is removed, and again before the post steps`, () => {
     const list = steps(wf(b.file));
     const after = list.slice(at(list, "Build (Claude agent") + 1);
-    const co = b.checkout.replace(/[$/]/g, (c) => `\\${c}`);
-    const remove = new RegExp(`if \\[ -d "\\$RUNNER_TEMP/${b.gitDir.replace(".", "\\.")}" \\] && \\{ \\[ -e "${co}/\\.git" \\] \\|\\| \\[ -L "${co}/\\.git" \\]; \\}; then\\n\\s+sudo rm -rf "${co}/\\.git"; `);
-    assert.match(after[0].text, remove, "only once the real one was moved out, in the always-run stop step");
-    assert.ok(after[0].text.indexOf("pkill -KILL -u octo-sandbox") < after[0].text.search(remove), "after the sandbox is killed");
+    // The stop step (always run): PATH reset, then `end` with the checkout, before anything else.
+    const stop = after[0].text.slice(after[0].text.indexOf("        run: |\n")).split("\n").map((l) => l.trim()).filter(Boolean);
+    const e = stop.indexOf(END(b.checkout));
+    assert.ok(e > 0 && e <= 3, "end comes first, after the PATH reset");
+    assert.ok(stop.slice(0, e).every((l) => /^(run: \||job_path="\$PATH"|PATH=\/usr\/sbin:\/usr\/bin:\/sbin:\/bin)$/.test(l)));
+    // The last step (always run) ends it again with the checkout, so actions/checkout's post step finds no .git.
+    const last = after[after.length - 1];
+    assert.match(last.text, /\n        if: always\(\) && steps\.pick\.outputs\.kind != ''\n/);
+    assert.ok(last.text.includes(END(b.checkout)));
+    // Publishing refuses after a planted .git (end fails its step and leaves a marker).
     const gone = after.find((s) => /\n        id: sandbox-gone\n/.test(s.text));
-    assert.match(gone.text, /echo "::error::[^"]*had a \.git of the sandbox's \(removed\): not publishing"; exit 1/);
+    if (gone !== after[0]) assert.match(gone.text, /if \[ -e "\$RUNNER_TEMP\/planted-git" \]; then echo "::error::[^"]*had a \.git of the sandbox's \(removed\): not publishing"; exit 1; fi/);
   });
 
   test(`${b.file}: permissions and action pins are unchanged by the frozen Node`, () => {
@@ -146,11 +157,29 @@ test("frozen-node.sh freeze: global packages only at exact versions, refused bef
   }
 });
 
-test("frozen-node.sh guard: a job that never created the sandbox user passes without checking anything", (t) => {
+test("frozen-node.sh guard and end: a job that never created the sandbox user passes without touching anything", (t) => {
   if (spawnSync("id", ["-u", "octo-sandbox"]).status === 0) return t.skip("this machine has an octo-sandbox user");
-  const r = run(["guard", "/nonexistent"], { GITHUB_ACTIONS: "true", RUNNER_TEMP: mkdtempSync(join(tmpdir(), "frozen-")) });
-  assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /no octo-sandbox user in this job: nothing untrusted has run/);
+  for (const cmd of ["guard", "end"]) {
+    const r = run([cmd, "/nonexistent"], { GITHUB_ACTIONS: "true", RUNNER_TEMP: mkdtempSync(join(tmpdir(), "frozen-")) });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /no octo-sandbox user in this job: nothing untrusted has run/);
+  }
+});
+
+test("frozen-node.sh end: every process at once, the account locked, the checkout closed before its .git goes", () => {
+  const src = readFileSync(new URL("./frozen-node.sh", import.meta.url), "utf8");
+  const fn = src.slice(src.indexOf("end_sandbox() {"), src.indexOf("\n}\n", src.indexOf("end_sandbox() {")));
+  const lock = fn.indexOf('sudo usermod --lock --expiredate 1 --shell /usr/sbin/nologin "$SANDBOX_USER"');
+  const kill = fn.indexOf(`sudo setpriv --reuid="$uid" --regid="$gid" --clear-groups /usr/bin/bash -c 'kill -KILL -1'`);
+  assert.ok(fn.indexOf("crontab -r -u") >= 0 && lock > 0 && kill > lock, "crontab gone and the account locked, then kill(-1) as that user");
+  assert.match(fn, /for _ in \$\(seq 1 50\); do\n\s+alive \|\| return 0\n/, "until no process can run, a bounded number of times");
+  assert.match(fn, /! alive \|\| die "\$SANDBOX_USER processes survived"/);
+  assert.match(src, /alive\(\) \{ ps -u "\$SANDBOX_USER" -o stat= 2>\/dev\/null \| grep -qv '\^Z'; \}/, "a zombie runs nothing");
+  assert.doesNotMatch(live(src), /\bpkill\b/, "never pkill, which walks /proc and a forking process can outrun");
+  const end = src.slice(src.indexOf('if [[ "$1" == end ]]; then'), src.indexOf("\nfi\n", src.indexOf('if [[ "$1" == end ]]; then')));
+  assert.ok(end.indexOf("end_sandbox") < end.indexOf('sudo chmod o-w "$c"') && end.indexOf('sudo chmod o-w "$c"') < end.indexOf('sudo rm -rf -- "$c/.git"'), "ended, then closed, then removed");
+  assert.match(end, /\(\(planted == 0\)\) \|\| die /, "a removed .git fails the step");
+  assert.match(src.slice(src.indexOf("\n  guard)\n")), /^\n  guard\)\n    end_sandbox\n    check\n/);
 });
 
 test("frozen-node.sh: what verify refuses (the checks themselves, read from the script)", () => {
@@ -164,9 +193,6 @@ test("frozen-node.sh: what verify refuses (the checks themselves, read from the 
   // Variables that make bash, node, git or the loader run other code.
   assert.match(src, /for v in BASH_ENV ENV NODE_OPTIONS NODE_PATH LD_PRELOAD LD_AUDIT; do/);
   assert.match(src, /GIT_TERMINAL_PROMPT\|GIT_AUTHOR_NAME\|GIT_AUTHOR_EMAIL\|GIT_COMMITTER_NAME\|GIT_COMMITTER_EMAIL\) ;;\n\s+GIT_\*\) echo "environment: \$v" ;;/);
-  // guard: the sandbox's crontab and processes go first, proved gone.
-  const guard = src.slice(src.indexOf("\n  guard)\n"));
-  assert.ok(guard.indexOf("crontab -r -u") < guard.indexOf("pkill -KILL -u") && guard.indexOf("pkill -KILL -u") < guard.indexOf("die \"$SANDBOX_USER processes survived the kill\"") && guard.indexOf("survived the kill") < guard.indexOf("check"));
   // freeze: the packages are installed by the runner before the tree is closed, in place, with an empty environment.
   const freeze = src.slice(src.indexOf("\n  freeze)\n"), src.indexOf("\n  verify)\n"));
   assert.ok(freeze.indexOf("npm\" install --global --prefix \"$NODE\"") < freeze.indexOf("sudo chown -R root:root \"$NODE\""));

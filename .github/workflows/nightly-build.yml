@@ -188,22 +188,20 @@ jobs:
         id: sandbox-gone
         if: always() && steps.pick.outputs.kind != ''
         # Nothing the checks started may keep changing files while they're
-        # scanned and committed. The checkout's .git is in the runner's temp
-        # dir: one here now was made by the sandbox, and actions/checkout's post
-        # step would run git in it. Not resolved through PATH: guard checks PATH.
+        # scanned and committed. `end` kills every process of the sandbox user
+        # at once and locks the account, then closes the checkout's top
+        # directory and removes a .git there: the checkout's own is in the
+        # runner's temp dir, one here now is the sandbox's, and actions/checkout's
+        # post step would run git in it. It fails the step if there was one.
+        # Not resolved through PATH: guard checks PATH.
         shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
           job_path="$PATH"
           PATH=/usr/sbin:/usr/bin:/sbin:/bin
-          sudo pkill -KILL -u octo-sandbox || true
+          /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" end "$GITHUB_WORKSPACE"
           sudo find "$GITHUB_WORKSPACE" -type l -user octo-sandbox -delete || true
-          planted=""
-          if [ -d "$RUNNER_TEMP/repo.git" ] && { [ -e "$GITHUB_WORKSPACE/.git" ] || [ -L "$GITHUB_WORKSPACE/.git" ]; }; then
-            sudo rm -rf "$GITHUB_WORKSPACE/.git"; planted=1
-          fi
           chmod -R o-w "$GITHUB_WORKSPACE" || true
           PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines" "$RUNNER_TEMP/repo.git"
-          if [ -n "$planted" ]; then echo "::error::the checkout had a .git of the sandbox's (removed): not publishing"; exit 1; fi
 
       - name: Publish
         if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
@@ -234,9 +232,11 @@ jobs:
           /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines"
           node "$RUNNER_TEMP/routines/jobs.mjs" release "$KIND" "$NUM" || true
 
-      - name: Nothing the post steps run has changed
+      - name: Nothing the post steps run has changed, and no checkout has a .git of the sandbox's
         # The actions' post steps (setup-node's cache, checkout's clean-up) run
         # after this one, on the runner's own Node and git.
         if: always() && steps.pick.outputs.kind != ''
         shell: /usr/bin/bash --noprofile --norc -e {0}
-        run: /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines"
+        run: |
+          /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" end "$GITHUB_WORKSPACE"
+          /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines"
