@@ -50,16 +50,18 @@ export function pickerCandidates(
   return same ? issues ?? [] : [];
 }
 
-/** "Create workspace" on an Epiku story: the wizard opens on the active
- *  project, whose backlog listed it. `null` under Jira, which finds the
- *  project by the key's prefix. */
+/** "Create workspace" or "Test this ticket" (`initialIntent: "test"`) on an
+ *  Epiku story: the wizard opens on the active project, whose backlog listed
+ *  it. `null` under Jira, which finds the project by the key's prefix. */
 export function epikuTicketTarget(
   issue: Pick<Issue, "key" | "summary">,
   activeTracker: TrackerKind | null,
   activeProject: Pick<ProjectInfo, "id" | "path"> | null,
-): { projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string } | null {
+  initialIntent?: "test",
+): { projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string; initialIntent?: "test" } | null {
   if (activeTracker !== "epiku" || !activeProject) return null;
-  return { projectId: activeProject.id, projectPath: activeProject.path, initialTask: issue.summary, linkIssueKeyOnCreate: issue.key };
+  const target = { projectId: activeProject.id, projectPath: activeProject.path, initialTask: issue.summary, linkIssueKeyOnCreate: issue.key };
+  return initialIntent ? { ...target, initialIntent } : target;
 }
 
 // Order maps the spec's "inProgress → todo → unknown → done" rule.
