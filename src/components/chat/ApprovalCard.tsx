@@ -22,6 +22,16 @@ const COPY = {
   outside: { eyebrow: "Outside the workspace", title: "⌘↵ allows once · Esc denies", lead: ["Allow once", "Allow once (⌘↵ with the card focused)"], other: ["Deny", "Deny (Esc with the card focused)"] },
   sensitive: { eyebrow: "Possible credentials", title: "⌘↵, Enter or Esc denies", lead: ["Deny", "Deny (⌘↵, Enter or Esc with the card focused)"], other: ["Allow once", "Allow this one access; the next one asks again"] },
   secret: { eyebrow: "Possible secret", title: "⌘↵, Enter or Esc leaves it out", lead: ["Leave it out", "Leave it out (⌘↵, Enter or Esc with the card focused)"], other: ["Run regardless", "Run it as it is, once, for exactly these findings"] },
+  config: { eyebrow: "Runs commands", title: "⌘↵, Enter or Esc denies", lead: ["Deny", "Deny (⌘↵, Enter or Esc with the card focused)"], other: ["Allow once", "Allow this one change; the next one asks again"] },
+  server: { eyebrow: "Project MCP server", title: "⌘↵, Enter or Esc denies", lead: ["Deny", "Deny (⌘↵, Enter or Esc with the card focused)"], other: ["Allow", "Start it, now and while its entry stays the same"] },
+} as const;
+
+/** What a `config` or `server` card adds under what it shows (#1245). */
+export const CODE_CARD_BODY = {
+  config:
+    "This file can make Octopush or Claude Code run commands, so a change to it always asks. Allowing lets this one call go ahead.",
+  server:
+    "This project's .claude/mcp.json defines this server. Allowing starts it now and in later turns while its entry stays the same; any change asks again. Revoke it in Settings › Integrations or in the Companion.",
 } as const;
 
 /** The chord that focuses the oldest card waiting in the conversation on
@@ -90,14 +100,16 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
   const run = approval.kind === "run";
   const outside = approval.kind === "read" || approval.kind === "write" || run;
   const sensitive = outside && approval.sensitive === true;
-  const copy = COPY[secret ? "secret" : sensitive ? "sensitive" : outside ? "outside" : "command"];
+  // A file that runs commands, or a project's MCP server (#1245).
+  const code = approval.kind === "config" || approval.kind === "server" ? approval.kind : null;
+  const copy = COPY[secret ? "secret" : (code ?? (sensitive ? "sensitive" : outside ? "outside" : "command"))];
   // An MCP card in Edit freely offers to stop asking for good (#1243).
   const trust =
     approval.kind === "mcp" && approval.trustServer && approval.trustTool
       ? { server: approval.trustServer, tool: approval.trustTool }
       : null;
   // Where the safe answer leads, it is the first button and Enter takes it.
-  const safeLead = secret || sensitive;
+  const safeLead = secret || sensitive || code !== null;
   const lead = safeLead ? "deny" : "approve";
   // The grant the card offers for the conversation (#1229): a folder, or the command itself.
   const dir = !secret && !sensitive && (run || approval.kind === "write") ? approval.rememberDir : undefined;
@@ -105,7 +117,7 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
     ? run
       ? { label: `Allow reading ${dir} for this conversation`, title: `Run this, and let commands read ${dir} without asking for the rest of this conversation (a credentials location still asks). Revoke it in the Companion.` }
       : { label: `Allow writing ${dir} for this conversation`, title: `Allow this, and let the agent's file tools write in ${dir} without asking for the rest of this conversation (reads there still ask). Revoke it in the Companion.` }
-    : !secret && !sensitive && approval.rememberCommand && approval.kind !== "mcp" && (run || !outside)
+    : !secret && !sensitive && !code && approval.rememberCommand && approval.kind !== "mcp" && (run || !outside)
       ? { label: "Allow this command for this conversation", title: COMMAND_GRANT_TITLE }
       : null;
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -139,7 +151,11 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
           {approval.reason}
         </span>
       </div>
-      <pre className="mt-2 overflow-x-auto rounded bg-octo-onyx px-2.5 py-1.5 font-mono text-[12px] text-octo-ivory">
+      {/* Wrapped, never scrolled: nothing it shows sits out of view (#1245). */}
+      <pre
+        data-testid="approval-shown"
+        className="mt-2 whitespace-pre-wrap break-all rounded bg-octo-onyx px-2.5 py-1.5 font-mono text-[12px] text-octo-ivory"
+      >
         {/* Only a shell command reads as one. */}
         {(approval.kind === undefined || run) && <span className="text-octo-brass">$ </span>}
         {approval.command}
@@ -153,6 +169,7 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
           Approving runs it once, for exactly these findings.
         </p>
       )}
+      {code && <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">{CODE_CARD_BODY[code]}</p>}
       {outside && (
         <p className="mt-2 text-[12px] leading-relaxed text-octo-sage">
           {sensitive ? "This may hold credentials. " : ""}
@@ -194,7 +211,7 @@ export function ApprovalCard({ approval, onRespond, talkActive = true }: Props) 
             {grant.label}
           </button>
         )}
-        {!secret && !outside && (
+        {!secret && !outside && !code && (
           <button
             type="button"
             onClick={() => onRespond("always")}

@@ -157,6 +157,32 @@ pub struct LlmToolUse {
     pub id: String,
     pub name: String,
     pub input: serde_json::Value,
+    /// Set when the provider sent arguments that aren't valid JSON (a local
+    /// model's slip, or a call cut at the output limit): the error result the
+    /// model gets instead of a run, with the raw text's start. `input` is then
+    /// `{}`, so every provider can still replay the turn. Never executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_error: Option<String>,
+}
+
+/// Parse a tool call's arguments string. Invalid JSON gives `{}` and the
+/// `input_error` the model reads instead of a result (`LlmToolUse`). Empty
+/// arguments (some servers send `""` for a call with no parameters) are `{}`.
+pub fn parse_tool_arguments(raw: &str) -> (serde_json::Value, Option<String>) {
+    if raw.trim().is_empty() {
+        return (serde_json::json!({}), None);
+    }
+    match serde_json::from_str(raw) {
+        Ok(input) => (input, None),
+        Err(e) => {
+            let head: String = raw.chars().take(200).collect();
+            let error = format!(
+                "The arguments were not valid JSON: {e}. First 200 characters: {head}\n\
+                 The tool did not run. Call it again with the arguments as one complete JSON object."
+            );
+            (serde_json::json!({}), Some(error))
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

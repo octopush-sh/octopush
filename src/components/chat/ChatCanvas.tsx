@@ -24,7 +24,7 @@ import {
 } from "../../lib/talkError";
 import { parseSentContext, typedText } from "../../lib/sentContext";
 import { expandDraft } from "../../lib/talkContextResolve";
-import { sessionRefs } from "../../lib/talkContext";
+import { chatRefs, sessionRefs } from "../../lib/talkContext";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
@@ -178,7 +178,9 @@ export function ChatCanvas({
       setResolving(true);
       try {
         const sessions = sessionRefs(useTerminalsStore.getState().getTerminals(workspaceId));
-        const { content, context } = await expandDraft(text, workspacePath, sessions);
+        const chat = useChatStore.getState();
+        const chats = chatRefs(chat.getThreads(workspaceId), chat.getActiveThread(workspaceId));
+        const { content, context } = await expandDraft(text, workspacePath, sessions, chats, workspaceId);
         await editAndResend(workspaceId, workspacePath, id, content, undefined, context);
       } finally {
         resolvingRef.current = false;

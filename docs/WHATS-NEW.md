@@ -132,11 +132,13 @@ Current anchors:
 | `talk-crew-ending` | Talk crew card, on a finished sub-agent's row: its ending word (`stopped`, `turn limit`, `needs a decision`; only on a row that ended one of those ways; a tour finds the first) | `chat/CrewCard.tsx` |
 | `talk-error-action` | Talk: an error card's one action ("Try again", "Configure API key" or "Copy error details"; only on a turn that ended on an error, a tour finds the first) | `chat/ChatCanvas.tsx` |
 | `talk-tool-verdict` | Talk, on a resolved tool row that failed or was denied: its mono verdict after the summary (`exit 1`, `timed out`, `denied`; every such row carries it, a tour finds the first) | `ToolCallCard.tsx` |
+| `companion-project-servers` | Companion › Conversation, under "can use": the "project servers" row, one chip per server of the project's `.claude/mcp.json` with its state, and a revoke button on an approved one (only while the project defines one) | `CompanionProjectServers.tsx` |
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focused only by a click, Tab or ⌘⌥A, never by itself; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
 | `talk-approval-trust` | Talk: an MCP approval card's lasting answers, "Always allow this tool" and "Trust <server>" (only in Edit freely, on a tool not marked destructive, while the card waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
 | `talk-empty-starters` | Talk, in a conversation with no messages yet: the row of starters ("Review what changed" · "Ask about a file" · "Explain this workspace"), each filling the draft without sending | `chat/ChatCanvas.tsx` |
 | `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
+| `talk-mention-chats` · `talk-mention-symbols` | Talk composer, `@` popover: the Conversations group (the workspace's other conversations; only while one is listed) · the Definitions group (where the identifier typed is defined; only once the search found one) | `chat/MentionPopover.tsx` via `chat/Composer.tsx` |
 | `talk-context-cap` | Talk composer, at the end of the context chips: "10 at most · 2 more sent as text" (only while the draft names more than 10 mentions) | `chat/ContextChips.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
 | `run-session-waiting` | Session line: the brass dot of the first session Claude Code's hooks say waits on you while it isn't in focus: on its cell, or on the `+N` / `N sessions` button when it has no cell (only while one does) | `run/SessionLine.tsx` |
@@ -184,6 +186,7 @@ Current anchors:
 | `settings-integrations-epiku` · `settings-epiku-status` | Settings › Integrations › Issue tracking: the Epiku entry in the tracker list · its connection status line ("Connected · 2 stories", only once Epiku is selected) | `settings/IssueTrackingSection.tsx` |
 | `project-issue-tracker` | Project menu › Issue tracking…, while open: the Jira · Epiku · None choice | `JiraProjectKeyModal.tsx` |
 | `settings-mcp-servers` · `settings-mcp-trust` | Settings › Integrations › MCP Servers: the whole section · a server's trust lines with their revoke buttons (only with something trusted) | `settings/McpServersSection.tsx` |
+| `settings-mcp-project-approvals` | Settings › Integrations, under MCP Servers: "Approved project servers", each with its revoke button (only while one is approved) | `settings/ProjectMcpApprovals.tsx` |
 | `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
 | `settings-mcp-edit` | Settings › Integrations › MCP Servers: the first server's Edit icon button (only with a server configured and no form open on it) | `settings/McpServersSection.tsx` |
 | `settings-mcp-add` · `settings-mcp-type` | Settings › Integrations › MCP Servers: "Add MCP server" (disabled while a form is open) · the open form's Local command / Remote URL choice (only while the add or edit form is open) | `settings/McpServersSection.tsx` · `settings/McpServerForm.tsx` |
@@ -275,6 +278,7 @@ cover.
 | `direct-running` | `default` with a crew at work in the active workspace: its Implement stage runs on Claude Code (the CLI substrate) with a context reading of 142k / 200k (`ctx 71%`), and no effort, escalation or ran-on note, so the run card shows the reading. |
 | `talk-work` | `default` with a longer Talk thread in the active workspace: an ask, narration and two rounds of tool calls (the second, six calls, folds into one summary row), a long answer with code and a list, then a short follow-up and its answer. Turn times are minutes before the page loads. |
 | `talk-mcp` | `default` with three MCP servers in the Companion's "can use" row: `docs-server` connected with 12 tools, `example-remote` failed to start, `issue-tracker` not started yet and off in the open conversation. Toggles last until the page reloads. |
+| `talk-mention-chats` | `default` with an older conversation in the active workspace ("Auth refactor": one ask and its answer, with a digest for `@chat:`) and a `parseToken` definition in `src/lib/tokens.ts` that a whole-word search finds, so Talk's `@` popover shows its Conversations and Definitions groups. |
 
 Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/clips/README.md).
 

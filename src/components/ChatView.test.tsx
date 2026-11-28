@@ -53,6 +53,8 @@ vi.mock("../lib/ipc", () => ({
     deleteChatThread: vi.fn().mockResolvedValue(undefined),
     listSkills: vi.fn().mockResolvedValue([]),
     listSkippedSkills: vi.fn().mockResolvedValue([]),
+    searchWorkspaceText: vi.fn().mockResolvedValue([]),
+    chatThreadDigest: vi.fn().mockResolvedValue({ summary: null, asks: [], lastAnswer: null }),
     readAttachment: vi.fn().mockResolvedValue({ mediaType: "image/png", data: "", name: "x.png" }),
   },
 }));
@@ -1302,6 +1304,61 @@ describe("ChatView — context mentions (#962)", () => {
     expect(list.textContent).toContain("src/");
     fireEvent.change(ta, { target: { value: "@src/a.ts#L1", selectionStart: 12, selectionEnd: 12 } });
     expect(screen.queryByRole("listbox", { name: "Worktree files" })).toBeNull();
+  });
+
+  it("lists the workspace's other conversations and attaches one titled (#1162)", async () => {
+    const thread = (id: string, title: string) => ({
+      id, workspaceId: "ws-1", title, createdAt: "2026-05-17T09:00:00Z", updatedAt: "2026-05-17T09:00:00Z",
+    });
+    vi.mocked(ipcMock.listChatThreads).mockResolvedValue([thread("t1", "Conversation"), thread("t2", "Auth refactor")]);
+    vi.mocked(ipcMock.chatThreadDigest).mockResolvedValue({ summary: null, asks: ["fix login"], lastAnswer: "Done." });
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    act(() => {
+      useChatStore.setState({
+        threadsByWs: { "ws-1": [thread("t1", "Conversation"), thread("t2", "Auth refactor")] },
+        activeThreadByWs: { "ws-1": "t1" },
+      });
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "@chat:", selectionStart: 6, selectionEnd: 6 } });
+    const group = await screen.findByRole("group", { name: "Conversations" });
+    expect(group).toHaveAttribute("data-tour", "talk-mention-chats");
+    // The conversation being typed in is never offered.
+    expect(group.textContent).toContain("Auth refactor");
+    expect(group.textContent).not.toContain("chat:conversation");
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(ta.value).toBe("@chat:auth-refactor ");
+    expect(await screen.findByText("Auth refactor", { selector: "span" })).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.keyDown(ta, { key: "Enter" });
+    });
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    expect(ipcMock.chatThreadDigest).toHaveBeenCalledWith("ws-1", "t2");
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toContain('Conversation "Auth refactor" · asks and last answer');
+  });
+
+  it("offers an identifier's definitions and inserts the chosen one's line range (#1162)", async () => {
+    vi.mocked(ipcMock.searchWorkspaceText).mockResolvedValue([
+      { file: "src/lib/b.ts", line: 4, col: 17, preview: "export function parseToken(s: string) {" },
+    ]);
+    vi.mocked(ipcMock.readFileLines).mockResolvedValue({
+      kind: "text", content: "export function parseToken(s: string) {\n  return s;\n}", start: 4, end: 6, total: 9, cut: false,
+    });
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "see @parseToken", selectionStart: 15, selectionEnd: 15 } });
+    const group = await screen.findByRole("group", { name: "Definitions" });
+    expect(group).toHaveAttribute("data-tour", "talk-mention-symbols");
+    expect(group.textContent).toContain("parseToken");
+    expect(group.textContent).toContain("src/lib/b.ts:4–6");
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(ta.value).toBe("see @src/lib/b.ts#L4-6 ");
+    expect(await screen.findByText("b.ts#L4-6")).toBeInTheDocument();
   });
 });
 

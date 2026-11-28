@@ -3976,19 +3976,51 @@ impl ChatEngine {
     pub fn new(db: Arc<Mutex<Db>>, daemon: Option<Arc<crate::pty_client::DaemonClient>>) -> Self {
         let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
         talk_shell.set_client(daemon);
+        // A project's own servers start once approved in its project (#1245).
+        let project_approvals = Arc::new(crate::mcp::approval::DbApprovals(Arc::clone(&db)));
         let approvals = Arc::new(ApprovalBroker::with_db(Arc::clone(&db)));
         Self {
             // Clone of the process-wide client — shares its connection pool.
             client: shared_http_client().clone(),
             db,
             cancels: Arc::new(Mutex::new(HashMap::new())),
-            mcp: Arc::new(crate::mcp::McpRegistry::new()),
+            mcp: Arc::new(crate::mcp::McpRegistry::new().with_approvals(project_approvals)),
             talk_shell,
             approvals,
             continuing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             cap_gate: Arc::new(CapGate::default()),
             stopped_shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
             file_seen: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Before a turn discovers its MCP tools: each server of the project's
+    /// own `.claude/mcp.json` that waits for approval (new, or changed since
+    /// approved) and isn't off in the conversation asks on a card, Deny
+    /// first (#1245). Allowed, the approval is stored for the project, bound
+    /// to the entry the card showed; denied, the server stays stopped this
+    /// turn, and the next turn asks again.
+    async fn ask_project_servers(&self, app: &AppHandle, workspace_id: &str, workspace_path: &str, thread_id: &str) {
+        use crate::mcp::approval::ProjectServerState::{Changed, Waiting};
+        let off = thread_mcp_off(&self.db, thread_id);
+        let (mcp, wt) = (Arc::clone(&self.mcp), std::path::PathBuf::from(workspace_path));
+        let listed = tokio::task::spawn_blocking(move || mcp.project_servers(&wt)).await.unwrap_or_default();
+        for server in listed.into_iter().filter(|s| matches!(s.state, Waiting | Changed) && !off.contains(&s.name)) {
+            let call_id = format!("mcp-server-{}", uuid::Uuid::new_v4());
+            let card = crate::talk_guard::server_card(&server);
+            let mode = crate::permissions::thread_mode(&self.db, thread_id);
+            if self.approvals.await_card(app, workspace_id, thread_id, &call_id, card, mode).await == ApprovalDecision::Deny {
+                continue;
+            }
+            let (db, mcp, wt) = (Arc::clone(&self.db), Arc::clone(&self.mcp), std::path::PathBuf::from(workspace_path));
+            let stored = tokio::task::spawn_blocking(move || {
+                crate::mcp::approval::approve(&db, &mcp, &wt, &server.name, &server.hash)
+            })
+            .await;
+            if let Ok(Err(e)) = stored {
+                tracing::warn!(error = %e, "project MCP server not approved");
+            }
+            let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ());
         }
     }
 
@@ -5286,6 +5318,8 @@ impl ChatEngine {
         // sub-agents'. What it offers is fixed for the turn. Any MCP tool it
         // didn't discover with `readOnlyHint` asks first (#1147), unless Edit
         // freely lets it run (`talk_guard::McpTools`, #1243).
+        // A project's own server that waits for approval asks first (#1245).
+        self.ask_project_servers(&app, &request.workspace_id, &request.workspace_path, &request.thread_id).await;
         let (mcp_read_only, mcp_tools): (std::collections::HashSet<String>, crate::talk_guard::McpTools) = {
             let discovered = discover_thread_mcp_tools(
                 Arc::clone(&self.mcp),
@@ -5649,7 +5683,8 @@ impl ChatEngine {
             // Ask first holds waits on its card below (#1231).
             let mut mode_denials: HashMap<String, String> = HashMap::new();
             let mut mode_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for u in &response.tool_uses {
+            // A call with invalid arguments gets its parse error instead.
+            for u in response.tool_uses.iter().filter(|u| u.input_error.is_none()) {
                 let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
                 let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
                 let ctx = crate::permissions::PolicyCtx {
@@ -5690,9 +5725,13 @@ impl ChatEngine {
                 for u in response.tool_uses.iter().filter(|u| is_agent_tool(&u.name)) {
                     // A call the mode refused opens its card and fails there,
                     // like a malformed one.
+                    // So does one whose arguments weren't valid JSON.
                     let parsed = match mode_denials.get(&u.id) {
                         Some(refused) => Err(refused.clone()),
-                        None => parse_agent_call(&u.input),
+                        None => match &u.input_error {
+                            Some(bad) => Err(bad.clone()),
+                            None => parse_agent_call(&u.input),
+                        },
                     };
                     let mut planned: Option<(SubagentSpec, SubagentPlan)> = None;
                     if let Ok(call) = &parsed {
@@ -5835,9 +5874,15 @@ impl ChatEngine {
                 // The mode's refusal comes first; a sub-agent's is its outcome.
                 let mode_denied = mode_denials.contains_key(&u.id);
                 let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();
+                // Arguments that weren't valid JSON: the parse error is the
+                // result; nothing asks and nothing runs (a sub-agent's is its
+                // outcome).
+                let bad_input = u.input_error.clone().filter(|_| !is_agent);
                 // A tool a skill loaded this turn doesn't allow is refused
                 // before anything asks the user (#1135).
-                let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools).filter(|_| !mode_denied);
+                let skill_refusal = skill_scope
+                    .refusal(&u.name, &workspace_tools)
+                    .filter(|_| !mode_denied && bad_input.is_none());
                 // Ask first holds a change or a command that doesn't only read
                 // on its card (#1231), its diff checked again once approved: a
                 // file that changed meanwhile asks again. The guards' cards
@@ -5936,6 +5981,7 @@ impl ChatEngine {
                 let gated = denied.is_none()
                     && pre_refused.is_none()
                     && skill_refusal.is_none()
+                    && bad_input.is_none()
                     && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 let first = if gated { check().await } else { None };
                 if let Some(card) = first {
@@ -5947,7 +5993,7 @@ impl ChatEngine {
                 // A denial skips execution and tells the model the user
                 // declined. The secret guard asks first (#819): a thread's
                 // "don't ask again" covers the destructive check, never it.
-                if u.name == "run_command" && denied.is_none() && skill_refusal.is_none() {
+                if u.name == "run_command" && denied.is_none() && skill_refusal.is_none() && bad_input.is_none() {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     denied = guard_agent_command(
                         &self.approvals,
@@ -6042,7 +6088,9 @@ impl ChatEngine {
                 let mut mcp_original: Option<String> = None;
                 // A `write_file` the overwrite guard refused (`file_seen`).
                 let mut write_refused = false;
-                let (result, ok) = if let Some(msg) = denied {
+                let (result, ok) = if let Some(msg) = bad_input {
+                    (msg, false)
+                } else if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
                     let outcome = agent_outcomes.remove(&u.id).unwrap_or_else(|| AgentOutcome {
@@ -6318,7 +6366,7 @@ impl ChatEngine {
                 };
                 // A loaded skill is instructions to follow, as the same skill
                 // named with `/name` is: it carries no untrusted mark.
-                let mark = (!was_denied && !is_skill).then_some(source.as_str());
+                let mark = (!was_denied && !is_skill && u.input_error.is_none()).then_some(source.as_str());
                 // A cut command output: the model's copy names its row.
                 let result = match (&command_full, row_id) {
                     (Some(full), Some(id)) => {
@@ -6347,8 +6395,9 @@ impl ChatEngine {
                         None => content,
                     }
                 };
-                // A failed or denied call says so (`is_error`), as its row does.
-                let is_error = crate::context::transcript::tool_row_is_error(&tool_record);
+                // A failed or denied call says so (`is_error`), as its row does;
+                // so does one whose arguments weren't valid JSON.
+                let is_error = u.input_error.is_some() || crate::context::transcript::tool_row_is_error(&tool_record);
                 tool_results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error });
             }
 
@@ -6833,6 +6882,7 @@ mod continuation_tests {
                     id: format!("t{}", self.left.load(Ordering::Relaxed)),
                     name: "list_files".into(),
                     input: serde_json::json!({"path": "."}),
+                    input_error: None,
                 }],
                 stop_reason: crate::providers::LlmStopReason::ToolUse,
                 input_tokens: 10_000,
@@ -7267,6 +7317,7 @@ mod tests {
                 id: "tu_1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({ "path": "a.rs" }),
+                input_error: None,
             }],
             stop_reason: stop,
             input_tokens: 1,
@@ -7327,7 +7378,7 @@ mod tests {
     fn round_response(text: &str, calls: &[(&str, &str)]) -> LlmResponse {
         let tool_uses: Vec<crate::providers::LlmToolUse> = calls
             .iter()
-            .map(|(id, name)| crate::providers::LlmToolUse { id: (*id).into(), name: (*name).into(), input: serde_json::json!({ "path": "src/a.rs" }) })
+            .map(|(id, name)| crate::providers::LlmToolUse { id: (*id).into(), name: (*name).into(), input: serde_json::json!({ "path": "src/a.rs" }), input_error: None })
             .collect();
         let mut raw = vec![
             serde_json::json!({ "type": "thinking", "thinking": "plan", "signature": format!("sig-{}", calls[0].0) }),
@@ -8517,6 +8568,23 @@ mod tests {
     /// the sub-agent gate must ask `talk_guard` and check again through
     /// `guard_card` before a tool runs (#1147). An `AppHandle` can't be built
     /// in a test, so this reads the two call sites in the source.
+    /// A project's own servers ask before the turn discovers its MCP tools
+    /// (#1245), and an approval goes through `approval::approve`, which binds
+    /// it to the entry the card showed. Read in the source, as above.
+    #[test]
+    fn a_turn_asks_about_project_servers_before_it_discovers_tools() {
+        let engine = include_str!("chat_engine.rs");
+        let turn = engine.find("async fn run_agentic_turn(").expect("the director's turn");
+        let asks = turn + engine[turn..].find("self.ask_project_servers(").expect("the turn asks");
+        let discovers = turn + engine[turn..].find("discover_thread_mcp_tools(").expect("the turn discovers");
+        assert!(asks < discovers, "it asks before anything starts");
+        let at = engine.find("async fn ask_project_servers(").unwrap();
+        let body = &engine[at..at + engine[at..].find("\n    }\n").unwrap()];
+        for call in ["talk_guard::server_card(", "await_card(", "mcp::approval::approve("] {
+            assert!(body.contains(call), "ask_project_servers calls {call}");
+        }
+    }
+
     #[test]
     fn the_director_loop_and_the_subagent_gate_call_the_guard() {
         let engine = include_str!("chat_engine.rs");

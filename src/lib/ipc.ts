@@ -660,6 +660,8 @@ import type {
   McpToolInfo,
   McpServerConfig,
   McpServerStatus,
+  ProjectMcpServer,
+  ProjectMcpApproval,
   McpTrust,
   ApprovalAnswer,
   InstructionList,
@@ -1052,6 +1054,14 @@ export const ipc = {
     contextBlocks?: string;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
+  /** What `@chat:` attaches of another conversation (#1162): its summary
+   *  row, or its asks (typed text only) and last answer. Refused for a
+   *  conversation outside `workspaceId`. */
+  chatThreadDigest: (workspaceId: string, threadId: string) =>
+    invoke<{ summary: string | null; asks: string[]; lastAnswer: string | null }>("chat_thread_digest", {
+      workspaceId,
+      threadId,
+    }),
   /** What the thread has cost so far, from the ledger (Companion). */
   getThreadCost: (threadId: string) => invoke<ThreadCost>("get_thread_cost", { threadId }),
   /** What the Claude Code session in a Run terminal has used (context size,
@@ -1203,6 +1213,15 @@ export const ipc = {
   /** The Settings › Integrations servers only, with their live status: what
    *  a Direct stage can choose. Spawns nothing. */
   listUserMcpServerStatus: () => invoke<McpServerStatus[]>("list_user_mcp_server_status"),
+  /** The worktree's own `.claude/mcp.json` servers and where each stands
+   *  (#1245). Spawns nothing. */
+  listProjectMcpServers: (workspacePath: string) =>
+    invoke<ProjectMcpServer[]>("list_project_mcp_servers", { workspacePath }),
+  listProjectMcpApprovals: () => invoke<ProjectMcpApproval[]>("list_project_mcp_approvals"),
+  /** Revoke a project server's approval and stop it; by project id, or by a
+   *  worktree of the project. */
+  revokeProjectMcpServer: (server: string, where: { projectId: string } | { workspacePath: string }) =>
+    invoke<boolean>("revoke_project_mcp_server", { server, ...where }),
   /** What the user trusts to run without an MCP card in Edit freely, per
    *  server (#1243), that still holds for its user-level entry. With a
    *  worktree, without the servers its own `.claude/mcp.json` defines. */

@@ -967,7 +967,9 @@ pub async fn run_agentic_loop_billed(
         // messages, and do NOT continue. The result is unfinished (it's a block,
         // not a completed answer); the caller parks the stage and re-runs it
         // once the director answers.
-        if let Some(u) = resp.tool_uses.iter().find(|u| u.name == ASK_DIRECTOR_TOOL) {
+        // A question whose arguments aren't valid JSON is not one: it gets
+        // its error result in the execution loop, and the model asks again.
+        if let Some(u) = resp.tool_uses.iter().find(|u| u.name == ASK_DIRECTOR_TOOL && u.input_error.is_none()) {
             let ask = parse_ask_director(u);
             emitter.notice(&format!("paused to ask the director: {}", ask.summary));
             // Persist the conversation INCLUDING the asking turn, so the
@@ -1089,6 +1091,15 @@ pub async fn run_agentic_loop_billed(
         // Execute each tool, collect results + log.
         let mut results: Vec<LlmToolResult> = Vec::new();
         for u in &resp.tool_uses {
+            // Arguments that weren't valid JSON never run (they would run on
+            // `{}`): the model reads the parse error and calls again.
+            if let Some(error) = &u.input_error {
+                emitter.tool(&u.name, &crate::orchestrator::live::tool_hint(&u.input));
+                emitter.tool_result(false, &crate::orchestrator::live::summarize(error));
+                out.tool_calls.push(ToolCallLog { name: u.name.clone(), input: u.input.clone(), result: error.clone() });
+                results.push(LlmToolResult { tool_use_id: u.id.clone(), content: error.clone(), is_error: true });
+                continue;
+            }
             // Inter-stage consultation: answered by the PEER stage's model in
             // a one-shot completion (async — handled here, not in
             // execute_tool). Errors come back as error results so the asking
