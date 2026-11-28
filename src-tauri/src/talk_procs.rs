@@ -334,6 +334,10 @@ enum Holder {
     Ours(i32),
     /// Another job: the command is gone, and this one must not be signalled.
     Other,
+    /// The recorded group, its leader gone: the terminal still names it a
+    /// moment after it ended, or members outlive the leader. Its start can't
+    /// be checked, so it isn't signalled; it isn't another job either.
+    Leaderless,
     /// No job: the shell is at its prompt.
     Nobody,
 }
@@ -358,6 +362,7 @@ fn judge(record: &ProcRecord, job: Option<(i32, Option<u64>)>) -> Holder {
     match (job, record.pgid, record.pgid_started) {
         (None, ..) => Holder::Nobody,
         (Some((group, Some(at))), Some(g), Some(was)) if group == g && at == was => Holder::Ours(group),
+        (Some((group, None)), Some(g), Some(_)) if group == g => Holder::Leaderless,
         (Some(_), ..) => Holder::Other,
     }
 }
@@ -585,7 +590,7 @@ impl TalkProcs {
                         ProcKind::Promoted => match judge(&record, job_on(running_pid)) {
                             Holder::Ours(_) => (true, false),
                             Holder::Other => (false, true),
-                            Holder::Nobody => (false, false),
+                            Holder::Nobody | Holder::Leaderless => (false, false),
                         },
                     };
                     if !alive {
@@ -653,7 +658,7 @@ impl TalkProcs {
             match self.holder(&record) {
                 Holder::Ours(_) => {}
                 Holder::Other => self.mark_lost(thread_id, &record.id),
-                Holder::Nobody => self.finish(thread_id, &record.id, None, false),
+                Holder::Nobody | Holder::Leaderless => self.finish(thread_id, &record.id, None, false),
             }
         }
     }
@@ -1069,7 +1074,7 @@ impl TalkProcs {
                 let target = match (restored, judge(record, job)) {
                     (true, Holder::Ours(group)) => Some(group),
                     (true, Holder::Other) => return Stopping::Gone,
-                    (true, Holder::Nobody) => return Stopping::Ended,
+                    (true, Holder::Nobody | Holder::Leaderless) => return Stopping::Ended,
                     (false, _) => job.map(|(group, _)| group),
                 };
                 if let Some(group) = target {
@@ -1686,7 +1691,8 @@ mod tests {
         assert_eq!(judge(&r, Some((4242, Some(77)))), Holder::Ours(4242));
         assert_eq!(judge(&r, Some((4242, Some(78)))), Holder::Other, "the group's id used again");
         assert_eq!(judge(&r, Some((5151, Some(77)))), Holder::Other, "another job");
-        assert_eq!(judge(&r, Some((4242, None))), Holder::Other, "a start the OS can't say");
+        assert_eq!(judge(&r, Some((4242, None))), Holder::Leaderless, "its group, its leader gone: not signalled, not another job");
+        assert_eq!(judge(&r, Some((5151, None))), Holder::Other);
         assert_eq!(judge(&r, None), Holder::Nobody);
         let unknown = record(1, ProcKind::Promoted);
         assert_eq!(judge(&unknown, Some((4242, Some(77)))), Holder::Other, "without a recorded job, nothing is its own");
