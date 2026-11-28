@@ -50,18 +50,29 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// The variables the launcher reads a command's argv from.
 const ARGC_ENV: &str = "OCTOPUSH_PROC_ARGC";
 const ARG_ENV: &str = "OCTOPUSH_PROC_ARG_";
+/// The variable that says how long the launcher waits for its start line.
+const WAIT_ENV: &str = "OCTOPUSH_PROC_WAIT";
+/// How long the launcher waits for its start line, in seconds.
+const START_WAIT_SECS: u64 = 10;
+/// The exit code of a launcher whose start line never came: it ran nothing.
+pub const NO_START_LINE: i32 = 125;
 
 /// The script the daemon runs for a background command. The daemon starts
-/// every terminal's program with `-l`, which this ignores. It waits for the
-/// line Octopush writes once it is attached (10 seconds at most), so no
-/// output and no exit is missed. The command's argv comes in [`ARGC_ENV`] and
-/// `OCTOPUSH_PROC_ARG_<i>`, which leave the environment before it runs.
-/// Privileged mode (`-p`) reads no `BASH_ENV` and imports no function from
-/// the environment, and the command gets neither.
+/// every terminal's program with `-l`, which this ignores. It runs nothing
+/// until Octopush writes its start line, once the process is recorded,
+/// attached and checked again (`TalkProcs::start`): a line that doesn't come
+/// within [`WAIT_ENV`] seconds (10) means the start was abandoned, so it
+/// exits with [`NO_START_LINE`] and the command never runs. The command's
+/// argv comes in [`ARGC_ENV`] and `OCTOPUSH_PROC_ARG_<i>`, which leave the
+/// environment before it runs. Privileged mode (`-p`) reads no `BASH_ENV`
+/// and imports no function from the environment, and the command gets
+/// neither.
 pub(crate) const LAUNCHER: &str = r#"#!/bin/bash -p
 # Octopush starts one Talk background command through this file (#1160).
-read -r -t 10 _octo_go || true
-unset _octo_go
+if ! read -r -t "${OCTOPUSH_PROC_WAIT:-10}" _octo_go; then
+  exit 125
+fi
+unset _octo_go OCTOPUSH_PROC_WAIT
 n=${OCTOPUSH_PROC_ARGC:-0}
 args=()
 i=0
@@ -176,6 +187,11 @@ pub struct ProcRecord {
     /// a pid used again later never passes for it.
     #[serde(default)]
     pub pgid_started: Option<u64>,
+    /// Recorded before its spawn, and not yet given its start line: a
+    /// record still starting after a restart was never confirmed, so what
+    /// it started is stopped, and without one it is dropped.
+    #[serde(default)]
+    pub starting: bool,
 }
 
 impl ProcRecord {
@@ -438,18 +454,19 @@ impl ProcStore {
 
     /// Keep `records` as the conversation's list; none removes its file.
     /// Best effort, as the shell's directory is (`talk_shell::CwdStore`).
-    fn write(&self, thread_id: &str, records: &[ProcRecord]) {
-        let Some(file) = self.file(thread_id) else { return };
+    fn write(&self, thread_id: &str, records: &[ProcRecord]) -> bool {
+        let Some(file) = self.file(thread_id) else { return false };
         if records.is_empty() {
-            let _ = std::fs::remove_file(&file);
-            return;
+            return std::fs::remove_file(&file).is_ok() || !file.exists();
         }
         let part = file.with_extension("json.part");
         let wrote = self.ensure_dir().is_ok()
             && serde_json::to_vec_pretty(records).ok().is_some_and(|bytes| std::fs::write(&part, bytes).is_ok());
         if !wrote || std::fs::rename(&part, &file).is_err() {
             tracing::warn!(thread_id, "could not keep the conversation's background processes");
+            return false;
         }
+        true
     }
 
     /// Every conversation's records. A file that can't be read, or a record
@@ -573,11 +590,28 @@ impl TalkProcs {
         let client = self.client();
         let terminals = client.as_ref().and_then(|c| c.list_terminals().ok()).unwrap_or_default();
         let mut attach = Vec::new();
+        let mut abandoned = Vec::new();
         let mut threads = std::collections::BTreeSet::new();
         {
             let mut st = self.state.lock();
             for mut record in records {
                 threads.insert(record.thread_id.clone());
+                // Never confirmed: Octopush quit between the record and the
+                // start line. What it started, as the process it started as,
+                // is stopped; without that, the record goes.
+                if record.starting {
+                    let term = terminals.iter().find(|t| t.id == record.term_id);
+                    if term.is_some() {
+                        abandoned.push(record.term_id.clone());
+                    }
+                    let started = term.filter(|t| t.running).and_then(|t| t.pid).is_some_and(|pid| same_process(&record, pid));
+                    if !started {
+                        continue;
+                    }
+                    record.starting = false;
+                    record.ended_at = Some(now());
+                    record.stopped = true;
+                }
                 if record.running() {
                     let term = terminals.iter().find(|t| t.id == record.term_id);
                     let running_pid = term.filter(|t| t.running).and_then(|t| t.pid);
@@ -611,6 +645,10 @@ impl TalkProcs {
         }
         drop(loaded);
         if let Some(client) = client {
+            // The daemon kills its own child and drops the terminal.
+            for term in abandoned {
+                let _ = client.remove(&term);
+            }
             for (thread, id, term) in attach {
                 match client.attach(&term, 0) {
                     Ok(rx) => self.spawn_reader(thread, id, rx),
@@ -682,14 +720,31 @@ impl TalkProcs {
     }
 
     /// Keep the conversation's records on disk and tell the panel.
-    fn persist(&self, thread_id: &str) {
-        {
+    fn persist(&self, thread_id: &str) -> bool {
+        let kept = {
             let _order = self.persisting.lock();
             let records: Vec<ProcRecord> =
                 self.state.lock().threads.get(thread_id).map(|l| l.iter().map(|e| e.record.clone()).collect()).unwrap_or_default();
-            self.store.lock().clone().write(thread_id, &records);
-        }
+            self.store.lock().clone().write(thread_id, &records)
+        };
         self.tell(thread_id, None);
+        kept
+    }
+
+    /// Change `id`'s record with `change`, and keep it.
+    fn update(&self, thread_id: &str, id: &str, change: impl FnOnce(&mut ProcRecord)) -> bool {
+        if let Some(e) = self.state.lock().threads.get_mut(thread_id).and_then(|l| l.iter_mut().find(|e| e.record.id == id)) {
+            change(&mut e.record);
+        }
+        self.persist(thread_id)
+    }
+
+    /// Forget `id`'s record, on disk too: its start was abandoned.
+    fn forget(&self, thread_id: &str, id: &str) {
+        if let Some(list) = self.state.lock().threads.get_mut(thread_id) {
+            list.retain(|e| e.record.id != id);
+        }
+        self.persist(thread_id);
     }
 
     fn tell(&self, thread_id: &str, workspace: Option<&str>) {
@@ -810,9 +865,9 @@ impl TalkProcs {
 
         let gate = self.gate.lock();
         let taken: Vec<String> = client.list_terminals().map(|ts| ts.into_iter().filter(|t| t.running).map(|t| t.id).collect()).unwrap_or_default();
-        let mut record = {
-            let st = self.state.lock();
-            let list = st.threads.get(&spec.thread_id).map(Vec::as_slice).unwrap_or_default();
+        let record = {
+            let mut st = self.state.lock();
+            let list = st.threads.entry(spec.thread_id.clone()).or_default();
             let running: Vec<String> = list.iter().filter(|e| e.record.running()).map(|e| e.record.id.clone()).collect();
             if running.len() >= MAX_RUNNING {
                 return Err(format!(
@@ -824,7 +879,7 @@ impl TalkProcs {
             while taken.contains(&term_id(&spec.thread_id, n)) {
                 n += 1;
             }
-            ProcRecord {
+            let record = ProcRecord {
                 id: format!("proc-{n}"),
                 n,
                 term_id: term_id(&spec.thread_id, n),
@@ -843,39 +898,56 @@ impl TalkProcs {
                 lost: false,
                 pgid: None,
                 pgid_started: None,
+                starting: true,
+            };
+            list.push(Entry { record: record.clone(), out: OutputRing::new(RING_BYTES), restored: false });
+            record
+        };
+        let (thread, id) = (record.thread_id.as_str(), record.id.as_str());
+        // On disk before the spawn: a quit or a crash from here on leaves a
+        // record that names what it started.
+        if !self.persist(thread) {
+            self.forget(thread, id);
+            return Err("Not started: its record couldn't be kept on disk, so it couldn't be stopped after a restart.".to_string());
+        }
+        let pid = match client.spawn(&record.term_id, &spec.cwd, &env, Some(&launcher), 40, 120) {
+            Ok(pid) => pid,
+            Err(e) => {
+                self.forget(thread, id);
+                return Err(format!("Not started: {e}"));
             }
         };
-        let pid = client.spawn(&record.term_id, &spec.cwd, &env, Some(&launcher), 40, 120).map_err(|e| format!("Not started: {e}"))?;
-        let kill = |why: String| {
+        let abandon = |why: String| {
             let _ = client.remove(&record.term_id);
+            self.forget(thread, id);
             Err(why)
         };
+        // Its group is its own (the daemon makes it a session leader); with
+        // its start time, a pid used again later never matches it.
+        let (pgid, pgid_started) = (i32::try_from(pid).ok(), crate::talk_shell::process_started(pid));
+        self.update(thread, id, |r| {
+            r.pgid = pgid;
+            r.pgid_started = pgid_started;
+        });
         let rx = match client.attach(&record.term_id, 0) {
             Ok(rx) => rx,
-            Err(e) => return kill(format!("Not started: {e}")),
+            Err(e) => return abandon(format!("Not started: {e}")),
         };
         if spec.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-            return kill(STOPPED_WHILE_STARTING.to_string());
+            return abandon(STOPPED_WHILE_STARTING.to_string());
         }
         let posture = (spec.posture_now)();
         if posture.stricter_than(&spec.posture) {
-            return kill(changed_while_starting(posture));
+            return abandon(changed_while_starting(posture));
         }
-        // Its group is its own (the daemon makes it a session leader); with
-        // its start time, a pid used again later never matches it.
-        record.pgid = i32::try_from(pid).ok();
-        record.pgid_started = crate::talk_shell::process_started(pid);
-        self.state.lock().threads.entry(record.thread_id.clone()).or_default().push(Entry {
-            record: record.clone(),
-            out: OutputRing::new(RING_BYTES),
-            restored: false,
-        });
         self.spawn_reader(record.thread_id.clone(), record.id.clone(), rx);
-        // Registered: the launcher may run the command now.
-        let _ = client.write(&record.term_id, b"\n");
+        // Recorded, attached and checked: the launcher may run the command.
+        if let Err(e) = client.write(&record.term_id, b"\n") {
+            return abandon(format!("Not started: its start line couldn't be sent ({e})."));
+        }
+        self.update(thread, id, |r| r.starting = false);
         drop(gate);
-        self.prune(&record.thread_id);
-        self.persist(&record.thread_id);
+        self.prune(thread);
 
         // What it prints at once, or that it ended at once.
         let deadline = Instant::now() + START_PEEK;
@@ -883,7 +955,7 @@ impl TalkProcs {
             std::thread::sleep(Duration::from_millis(50));
         }
         let st = self.state.lock();
-        let e = st.threads.get(&record.thread_id).and_then(|l| l.iter().find(|e| e.record.id == record.id));
+        let e = st.threads.get(thread).and_then(|l| l.iter().find(|e| e.record.id == id));
         let (view, output, cursor) = match e {
             Some(e) => (e.record.view(), clean(&e.out.since(0).0), e.out.total),
             None => (record.view(), String::new(), 0),
@@ -924,6 +996,7 @@ impl TalkProcs {
                 lost: false,
                 pgid: job.map(|(group, _)| group),
                 pgid_started: job.and_then(|(_, started)| started),
+                starting: false,
             };
             list.push(Entry { record: record.clone(), out: OutputRing::new(RING_BYTES), restored: false });
             record
@@ -1214,7 +1287,8 @@ fn argv_for(spec: &StartSpec) -> Result<Launch, String> {
 /// last, and the argv for the launcher. Pure but for the PATH and git reads.
 fn launch_env(extra: &[(String, String)], argv: &[String], sandbox: Vec<(String, String)>) -> HashMap<String, String> {
     let mut env: HashMap<String, String> =
-        extra.iter().filter(|(k, _)| k != "PATH" && k != ARGC_ENV && !k.starts_with(ARG_ENV)).cloned().collect();
+        extra.iter().filter(|(k, _)| k != "PATH" && k != ARGC_ENV && k != WAIT_ENV && !k.starts_with(ARG_ENV)).cloned().collect();
+    env.insert(WAIT_ENV.to_string(), START_WAIT_SECS.to_string());
     env.extend(crate::talk_shell::git_hardening_env());
     env.extend(sandbox);
     env.insert("PATH".to_string(), crate::orchestrator::cli_runner::resolved_cli_path());
@@ -1470,6 +1544,7 @@ mod tests {
             lost: false,
             pgid: None,
             pgid_started: None,
+            starting: false,
         }
     }
 
@@ -2045,6 +2120,112 @@ mod e2e_races {
         procs.close_thread("t-e");
     }
 
+    /// Spawn the launcher as a start does, for `command`, waiting `wait`
+    /// seconds for its start line, which this never sends. Returns its pid.
+    fn spawn_unconfirmed(d: &super::e2e::Daemon, client: &DaemonClient, term: &str, command: &str, wait: u64) -> u32 {
+        let store = ProcStore(Some(d.tmp.path().join("talk-procs")));
+        let launcher = store.ensure_launcher().unwrap();
+        let argv = vec!["/bin/bash".to_string(), "-c".to_string(), command.to_string()];
+        let mut env = launch_env(&[], &argv, Vec::new());
+        env.insert(WAIT_ENV.to_string(), wait.to_string());
+        client.spawn(term, "/tmp", &env, Some(launcher.to_str().unwrap()), 40, 120).unwrap()
+    }
+
+    /// A launcher whose start line doesn't come in time runs nothing: it
+    /// exits with [`NO_START_LINE`] instead of running the command (#1160).
+    #[test]
+    #[serial]
+    fn without_its_start_line_the_launcher_runs_nothing() {
+        let d = super::e2e::boot();
+        let client = daemon_client(&d);
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("ran");
+        spawn_unconfirmed(&d, &client, "talkproc-t-w-1", &format!("touch '{}'", marker.display()), 1);
+        let rx = client.attach("talkproc-t-w-1", 0).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let code = loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(TermEvent::Exit { code }) => break code,
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(Instant::now() < deadline, "it kept waiting"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(code, Some(NO_START_LINE));
+        assert!(!marker.exists(), "the command ran without its start line");
+        let _ = client.remove("talkproc-t-w-1");
+    }
+
+    /// A start keeps its record on disk before the spawn and fills in the
+    /// group and start time once known, all before its start line (#1160).
+    #[test]
+    #[serial]
+    fn a_start_is_recorded_before_its_command_runs() {
+        let d = super::e2e::boot();
+        let procs = super::e2e::procs_on(&d);
+        let store = ProcStore(Some(d.tmp.path().join("talk-procs")));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        // Read once the process is spawned, before its start line.
+        let posture_now: PostureSource = Arc::new(move || {
+            *kept.lock() = store.read_all();
+            super::e2e::EDIT
+        });
+        let started = procs.start(StartSpec { posture_now, ..super::e2e::spec("t-p1", "sleep 300", "/tmp") }).unwrap();
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starting && seen[0].pgid.is_some() && seen[0].pgid_started.is_some(), "{:?}", seen[0]);
+        let store = ProcStore(Some(d.tmp.path().join("talk-procs")));
+        let now = store.read_all();
+        assert!(!now[0].starting && now[0].running(), "confirmed once its line was sent: {:?}", now[0]);
+        assert!(procs.stop("t-p1", &started.view.id).unwrap().stopped);
+        procs.close_thread("t-p1");
+    }
+
+    /// After a restart, a record still starting was never confirmed: with
+    /// its process still there, as the process it started as, it is
+    /// stopped; without, it is dropped, and a terminal it left goes too
+    /// (#1160).
+    #[test]
+    #[serial]
+    fn a_starting_record_is_cleaned_up_on_restore() {
+        let d = super::e2e::boot();
+        let client = daemon_client(&d);
+        let store = ProcStore(Some(d.tmp.path().join("talk-procs")));
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("ran");
+        let touch = format!("touch '{}'", marker.display());
+        let starting = |n: u64, pgid: Option<i32>, pgid_started: Option<u64>| ProcRecord {
+            id: format!("proc-{n}"),
+            n,
+            term_id: term_id("t-q", n),
+            thread_id: "t-q".into(),
+            starting: true,
+            pgid,
+            pgid_started,
+            ..tests_record()
+        };
+        // 1: spawned, its group recorded, never given its line.
+        let pid = spawn_unconfirmed(&d, &client, &term_id("t-q", 1), &touch, 60);
+        let one = starting(1, i32::try_from(pid).ok(), crate::talk_shell::process_started(pid));
+        // 2: recorded, and Octopush quit before the spawn.
+        let two = starting(2, None, None);
+        // 3: spawned, and Octopush quit before its group was recorded.
+        spawn_unconfirmed(&d, &client, &term_id("t-q", 3), &touch, 60);
+        let three = starting(3, None, None);
+        store.write("t-q", &[one, two, three]);
+
+        let procs = super::e2e::procs_on(&d);
+        let listed = procs.list("t-q");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].id, "proc-1");
+        assert!(listed[0].stopped && !listed[0].running, "{listed:?}");
+        assert!(running_terms(&client, "talkproc-t-q-").is_empty(), "an unconfirmed process runs on");
+        assert_eq!(store.read_all().iter().map(|r| (r.id.clone(), r.starting)).collect::<Vec<_>>(), vec![("proc-1".to_string(), false)]);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "an unconfirmed command ran");
+        procs.close_thread("t-q");
+    }
+
     /// A command run in a shell and promoted, as the agent's would be.
     fn live_in(shell: &crate::talk_shell::TalkShell, thread: &str, command: &str) -> crate::talk_shell::LiveRun {
         match shell.run(thread, "/tmp", command, Duration::from_millis(500), true).unwrap() {
@@ -2146,5 +2327,6 @@ fn tests_record() -> ProcRecord {
         lost: false,
         pgid: None,
         pgid_started: None,
+        starting: false,
     }
 }
