@@ -1158,7 +1158,7 @@ impl Reach {
     fn scan_line(&self, line: &str, start: &Path, scan: &mut Scan) -> Option<Reached> {
         let words = crate::chat_engine::command_words(line);
         let walking = walking_segments(&words);
-        let following = following_segments(&words, &walking);
+        let (following, lists) = following_segments(&words, &walking);
         // A plain name costs one lookup, not a full resolve: missing, it is
         // no path the command reads; and it stays where the command stands
         // unless it is a link when that is in the workspace, the workspace
@@ -1177,8 +1177,11 @@ impl Reach {
         // follow), and `Some(-P)` while a `cd` waits for its target.
         let mut cwd = Some(here(start.to_path_buf()));
         let mut cd: Option<bool> = None;
+        // The `cd` waiting is a `pushd`: with no folder, `+N`, `-N` or `-n`,
+        // where it leaves the command isn't known.
+        let mut pushd = false;
         let mut segment = 0;
-        for w in &words {
+        for (i, w) in words.iter().enumerate() {
             if scan.over {
                 return None;
             }
@@ -1189,14 +1192,17 @@ impl Reach {
                 }
                 segment = w.segment;
                 if cd.take().is_some() {
-                    cwd = self.home.clone().map(&here);
+                    // A bare `cd` goes home; a bare `pushd` swaps its stack's top two.
+                    cwd = if pushd { None } else { self.home.clone().map(&here) };
                 }
+                pushd = false;
             }
             let text = unescape(&w.pattern);
             let target = cd.is_some() && w.role == WordRole::Argument;
-            if target && text.starts_with('-') {
+            if target && (text.starts_with('-') || (pushd && text.starts_with('+'))) {
                 match text.as_str() {
                     "-" => (cwd, cd) = (None, None),
+                    _ if pushd => (cwd, cd, pushd) = (None, None, false),
                     t if t.contains('P') => cd = Some(true),
                     _ => {}
                 }
@@ -1213,15 +1219,19 @@ impl Reach {
             if hit.is_some() {
                 return hit;
             }
+            for list in lists.iter().filter(|l| l.word == i) {
+                self.list_hit(list, w, cwd.as_ref(), scan);
+            }
             if target {
                 // `cd -P` stands where the link leads; plain `cd` on its name.
                 let physical = cd == Some(true);
                 cwd = leads.map(|p| here(if physical { resolve(&p).unwrap_or(p) } else { p }));
-                cd = None;
+                (cd, pushd) = (None, false);
             }
             if w.role == WordRole::Program {
                 match text.rsplit('/').next().unwrap_or_default() {
-                    "cd" | "pushd" => cd = Some(false),
+                    "cd" => cd = Some(false),
+                    "pushd" => (cd, pushd) = (Some(false), true),
                     "popd" => cwd = None,
                     _ => {}
                 }
@@ -1235,19 +1245,63 @@ impl Reach {
 
     /// The folder segment `segment`'s command stands in, as one it names,
     /// when it follows links and may walk there (#1208, [`Follow::here`]):
-    /// `rg -L token` reads `.`, and a searcher's first word may be its
-    /// pattern, not a folder. After a `cd` the check can't follow, nothing.
+    /// `rg -L token` reads `.`, a searcher's first word may be its pattern,
+    /// not a folder, and `ls | zip -r -@ o.zip` walks the names it reads.
+    /// Where it stands unknown (after `cd -`, `popd` or a `cd` the check
+    /// can't follow), or reading names from a list the check can't place,
+    /// the scan is cut, so the command asks.
     fn here_hit(&self, following: &[Follow], walking: &[bool], segment: usize, cwd: Option<&Cwd>, scan: &mut Scan) -> Option<Reached> {
         let follow = following.get(segment).copied().unwrap_or_default();
-        let c = cwd.filter(|_| follow.links && follow.here)?;
+        if !(follow.links && follow.here) {
+            return None;
+        }
+        let Some(c) = cwd else {
+            scan.cut.get_or_insert_with(unplaced_cwd);
+            return None;
+        };
+        if follow.unplaced {
+            let why = "it reads the names it walks from a list the check can't place".to_string();
+            scan.cut.get_or_insert(LinkCut { shown: self.shown(&c.real), why });
+        }
         let walk = walking.get(segment).copied().unwrap_or(false);
         self.path_hit(&c.real, Ctx { role: WordRole::Argument, walk, writes: false, follow: true }, None, scan)
+    }
+
+    /// A list a walker that follows links reads the names it walks from
+    /// (#1208, [`ListName`]): the scan reads the folder the command stands
+    /// in, so a list elsewhere (or where the check can't place it: a
+    /// variable, a glob, `~user`) cuts it short, and the command asks,
+    /// whatever is granted.
+    fn list_hit(&self, list: &ListName, w: &CommandWord, cwd: Option<&Cwd>, scan: &mut Scan) {
+        let text = list.attached.clone().unwrap_or_else(|| unescape(&w.pattern));
+        let placed = !(w.unmodeled || text.contains(['*', '?', '[']));
+        let path = match text.strip_prefix('~') {
+            _ if !placed => None,
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => self.home.as_deref().map(|h| h.join(rest.trim_start_matches('/'))),
+            Some(_) => None,
+            None if text.starts_with('/') => Some(PathBuf::from(&text)),
+            None => cwd.map(|c| c.real.join(&text)),
+        };
+        let root = cwd.map(|c| resolve(&c.real).unwrap_or_else(|| c.real.clone()));
+        let inside = path.as_ref().zip(root.as_ref()).is_some_and(|(p, r)| under(&resolve(p).unwrap_or_else(|| lexical(p)), r));
+        if !inside {
+            let named = path.as_deref().map_or(text, |p| self.shown(&lexical(p)));
+            let why = format!("it reads the names it walks from {named}, outside that folder");
+            let shown = root.as_deref().map_or_else(|| unplaced_cwd().shown, |r| self.shown(r));
+            scan.cut.get_or_insert(LinkCut { shown, why });
+        }
     }
 
     /// One word of a command: the sensitive hit if it has one, and where it
     /// leads when that is one path (where a `cd` goes).
     fn scan_word(&self, w: &CommandWord, text: &str, lands: Option<Lands>, ctx: Ctx, scan: &mut Scan) -> (Option<Reached>, Option<PathBuf>) {
+        // A walker that follows links, given a folder the check can't
+        // place, can't have it scanned: it asks (#1208).
+        let follows = ctx.follow && ctx.role == WordRole::Argument && !ctx.writes && !text.starts_with('-');
         if w.unmodeled {
+            if follows {
+                scan.cut.get_or_insert_with(|| LinkCut { shown: unescape(&w.pattern), why: "a folder the check can't place, built while the command runs".to_string() });
+            }
             return (named_credential(&w.pattern, &w.spliced), None);
         }
         // A program named without a `/` is found on the PATH; a flag is none.
@@ -1281,7 +1335,12 @@ impl Reach {
                 // `~user`, `~+`, `~-`: where it leads isn't known here.
                 Some(_) => match named_credential(alt, alt) {
                     Some(hit) => return (Some(hit), None),
-                    None => continue,
+                    None => {
+                        if follows {
+                            scan.cut.get_or_insert_with(|| LinkCut { shown: unescape(alt), why: "a folder the check can't place".to_string() });
+                        }
+                        continue;
+                    }
                 },
                 None if alt.starts_with('/') => (Path::new("/"), alt.as_str(), None),
                 None => match &lands {
@@ -1292,7 +1351,12 @@ impl Reach {
                     }
                     None => match named_credential(alt, alt) {
                         Some(hit) => return (Some(hit), None),
-                        None => continue,
+                        None => {
+                            if follows {
+                                scan.cut.get_or_insert_with(unplaced_cwd);
+                            }
+                            continue;
+                        }
                     },
                 },
             };
@@ -1354,8 +1418,9 @@ impl Reach {
             return None;
         }
         // A walker that follows links reads where each link in a folder it
-        // gets leads (#1208), a plain name's folder too.
-        if ctx.follow && ctx.role == WordRole::Argument && !ctx.writes {
+        // gets leads (#1208), a plain name's folder too, and one its
+        // here-document names.
+        if ctx.follow && ctx.role != WordRole::Program && !ctx.writes {
             if let Some(hit) = self.links_hit(path, scan) {
                 return Some(hit);
             }
@@ -1599,6 +1664,16 @@ struct LinkCaps {
 /// the time cap first.
 const LINK_CAPS: LinkCaps = LinkCaps { entries: 100_000, depth: 64, time: std::time::Duration::from_secs(2) };
 
+/// The cut for a walker that follows links from where the command stands,
+/// when that isn't known (#1208): after `cd -`, `popd`, a bare `pushd` or a
+/// `cd` the check can't follow (`cd "$PWD"`).
+fn unplaced_cwd() -> LinkCut {
+    LinkCut {
+        shown: "a folder the check can't place".to_string(),
+        why: "an earlier cd, pushd or popd left it where the check can't follow".to_string(),
+    }
+}
+
 /// What scanning a folder for links found (#1208, [`Reach::scan_links`]).
 #[derive(Clone)]
 enum LinkScan {
@@ -1699,14 +1774,31 @@ fn walking_segments(words: &[CommandWord]) -> Vec<bool> {
 }
 
 /// Whether a command follows links into the folders it walks (#1208), and
-/// whether it may walk the folder it stands in.
+/// where else the names it walks may come from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Follow {
     links: bool,
-    /// Given no folder it reads `.`, or its first word may be its pattern
-    /// rather than a folder (`rg -L token`, `grep -R token`): where it
+    /// Given no folder it reads `.`, its first word may be its pattern
+    /// rather than a folder (`rg -L token`, `grep -R token`), or it reads
+    /// the names it walks at run time ([`Follow::stdin`], a list): where it
     /// stands counts as a folder it names.
     here: bool,
+    /// It reads the names it walks from its input (`zip -@`, `xargs`,
+    /// `cpio`, `pax`, `tar -T -`), so the command before it in a pipe names
+    /// them.
+    stdin: bool,
+    /// It reads them from a list the check can't place (`tar cfT x.tar
+    /// list`, an old-style bundle): it asks.
+    unplaced: bool,
+}
+
+/// A list a walker that follows links reads the names it walks from
+/// (#1208): the word that names it, and the list's path when that word
+/// holds a flag too (`-Tlist`, `-i@list`); otherwise the word is the path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListName {
+    word: usize,
+    attached: Option<String>,
 }
 
 /// When a walker that follows links may walk the folder it stands in.
@@ -1720,7 +1812,8 @@ enum Here {
 
 /// A walker that follows links: whenever it walks unless `off` says not
 /// to (`always`), or when `on` tells it to. Each is short flags, then long
-/// ones.
+/// ones; a long one in `on` may be abbreviated ([`long_option`]), one in
+/// `off` only counts in full.
 struct Follows {
     program: &'static str,
     always: bool,
@@ -1773,6 +1866,22 @@ const FOLLOWERS: &[Follows] = &[
     Follows { program: "ack", always: false, on: ("", &["--follow"]), off: NO_FLAGS, here: Here::Always },
 ];
 
+/// Long options of a walker, in full, that start like one it follows links
+/// with or reads names from (`tar --file`, `rsync --include`): never an
+/// abbreviation of it.
+const FULL_LONG: &[(&str, &[&str])] = &[("tar", &["--file"]), ("rsync", &["--include"])];
+
+/// Whether `typed` (a word as written, `--name=value` whole) is the long
+/// option `name`, or an abbreviation getopt-style parsers take for it
+/// (`--de` for `--dereference`), and not one of `full`, other options of
+/// the program written out. An abbreviation that could also mean another
+/// option counts too: the program refuses it or picks one, and counting it
+/// only scans more.
+fn long_option(typed: &str, name: &str, full: &[&str]) -> bool {
+    let flag = typed.split_once('=').map_or(typed, |(f, _)| f);
+    flag == name || (flag.len() > 2 && flag.starts_with("--") && name.starts_with(flag) && !full.contains(&flag))
+}
+
 /// Which commands of a line follow links into the folders they walk
 /// (#1208, [`FOLLOWERS`]), given which walk ([`walking_segments`]; `du`
 /// always does): `zip -r` (not `-y`), `scp -r`, `diff -r`, `7z` and
@@ -1781,45 +1890,149 @@ const FOLLOWERS: &[Follows] = &[
 /// (also in an old-style bundle, `tar czhf`), `gzip -rf`, `pax -L`,
 /// `cpio -L`, `find -L`/`-follow`, `du -L`, `ls -RL`, `tree -l`, `grep -R`
 /// (and BSD's `-S`), `rg -L`, `fd -L`, `ag -f` and `ack --follow` when told
-/// to. Indexed by segment.
-fn following_segments(words: &[CommandWord], walking: &[bool]) -> Vec<Follow> {
+/// to, long options abbreviated too. Indexed by segment; with the lists
+/// they read the names they walk from ([`names_from`]).
+fn following_segments(words: &[CommandWord], walking: &[bool]) -> (Vec<Follow>, Vec<ListName>) {
     let mut out = vec![Follow::default(); walking.len()];
-    let mut segment: Vec<String> = Vec::new();
+    let mut lists = Vec::new();
+    // Whether each segment reads its input from a pipe, not a redirect.
+    let mut piped = vec![false; walking.len()];
+    let mut seg: Vec<usize> = Vec::new();
     for (i, w) in words.iter().enumerate() {
         if w.role != WordRole::Data {
-            segment.push(unescape(&w.pattern));
+            seg.push(i);
         }
         if words.get(i + 1).is_some_and(|next| next.segment == w.segment) {
             continue;
         }
-        let names: Vec<&str> = segment.iter().map(|t| t.rsplit('/').next().unwrap_or_default()).collect();
-        let short = |t: &str, chars: &str| t.starts_with('-') && !t.starts_with("--") && t[1..].contains(|c: char| chars.contains(c));
-        let flags = |chars: &str, long: &[&str]| segment.iter().any(|t| long.contains(&t.as_str()) || short(t.as_str(), chars));
+        let texts: Vec<String> = seg.iter().map(|&j| unescape(&words[j].pattern)).collect();
+        let typed: Vec<&str> = seg.iter().map(|&j| words[j].word.as_str()).collect();
+        let names: Vec<&str> = texts.iter().map(|t| t.rsplit('/').next().unwrap_or_default()).collect();
+        let full = |program: &str| FULL_LONG.iter().find(|(p, _)| *p == program).map_or(&[][..], |(_, f)| *f);
+        let flags = |program: &str, (chars, long): (&str, &[&str]), abbreviated: bool| {
+            typed.iter().any(|t| {
+                short_flag(t, chars) || long.iter().any(|n| if abbreviated { long_option(t, n, full(program)) } else { *t == *n })
+            })
+        };
         // `tar czhf x.tgz .`: an old-style bundle of flags after the program.
         let bundle = names
             .iter()
             .position(|n| *n == "tar")
-            .and_then(|at| segment.get(at + 1))
+            .and_then(|at| typed.get(at + 1))
             .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphabetic()));
         let walks = walking.get(w.segment).copied().unwrap_or(false) || names.contains(&"du");
         let mut follow = Follow::default();
         for f in FOLLOWERS.iter().filter(|f| walks && names.contains(&f.program)) {
-            let told = flags(f.on.0, f.on.1) || (f.program == "tar" && bundle.is_some_and(|b| b.contains(|c: char| f.on.0.contains(c))));
-            if (f.always && !flags(f.off.0, f.off.1)) || (!f.always && told) {
+            let told = flags(f.program, f.on, true) || (f.program == "tar" && bundle.is_some_and(|b| b.contains(|c: char| f.on.0.contains(c))));
+            if (f.always && !flags(f.program, f.off, false)) || (!f.always && told) {
                 follow.links = true;
                 follow.here |= match f.here {
                     Here::Never => false,
                     Here::Always => true,
-                    Here::With(chars) => segment.iter().any(|t| short(t.as_str(), chars)),
+                    Here::With(chars) => typed.iter().any(|t| short_flag(t, chars)),
                 };
             }
+        }
+        if follow.links {
+            let before = lists.len();
+            names_from(words, &seg, &typed, &names, bundle.copied(), &mut follow, &mut lists);
+            follow.here |= follow.stdin || follow.unplaced || lists.len() > before;
+        }
+        let redirected = seg.iter().any(|&j| words[j].redirect && !words[j].writes);
+        if let Some(slot) = piped.get_mut(w.segment) {
+            *slot = seg.iter().any(|&j| words[j].stdin) && !redirected;
         }
         if let Some(slot) = out.get_mut(w.segment) {
             *slot = follow;
         }
-        segment.clear();
+        seg.clear();
     }
-    out
+    // A walker that reads the names it walks from a pipe walks what the
+    // command before it names: that command's folders are scanned too.
+    for s in 1..out.len() {
+        if out[s].stdin && piped[s] {
+            out[s - 1].links = true;
+        }
+    }
+    (out, lists)
+}
+
+/// Whether `typed` is a bundle of short flags holding one of `chars`.
+fn short_flag(typed: &str, chars: &str) -> bool {
+    typed.starts_with('-') && !typed.starts_with("--") && typed[1..].contains(|c: char| chars.contains(c))
+}
+
+/// Where a segment that follows links reads the names it walks at run time
+/// (#1208), noted in `follow` and `lists`: from its input (`zip -@`,
+/// `xargs`, `cpio`, `pax`, a list named `-`), or from a list file
+/// (`tar -T`/`--files-from`, `rsync --files-from`/`--include-from`,
+/// `xargs -a`/`--arg-file`, `7z @list`/`-i@list`, an input redirect). `seg`
+/// holds the segment's word indices, `typed` and `names` its words as
+/// written and their program names.
+fn names_from(words: &[CommandWord], seg: &[usize], typed: &[&str], names: &[&str], bundle: Option<&str>, follow: &mut Follow, lists: &mut Vec<ListName>) {
+    let has = |program: &str| names.contains(&program);
+    // The list a flag at `k` names: `-T list`, `-Tlist`, `--files-from=list`
+    // or `--files-from list`.
+    let named = |k: usize, attached: Option<&str>| match attached {
+        Some(rest) if !rest.is_empty() => Some(ListName { word: seg[k], attached: Some(rest.to_string()) }),
+        _ if typed[k].contains('=') => Some(ListName { word: seg[k], attached: None }),
+        _ => seg.get(k + 1).map(|&j| ListName { word: j, attached: None }),
+    };
+    // A list named `-` is the input; a flag with no list after it can't be placed.
+    let note = |list: Option<ListName>, follow: &mut Follow, lists: &mut Vec<ListName>| match list {
+        None => follow.unplaced = true,
+        Some(l) if l.attached.clone().unwrap_or_else(|| unescape(&words[l.word].pattern)) == "-" => follow.stdin = true,
+        Some(l) => lists.push(l),
+    };
+    for (k, &t) in typed.iter().enumerate() {
+        let single = t.starts_with('-') && !t.starts_with("--");
+        if has("tar") {
+            if single && t.contains('T') {
+                let rest = &t[t.find('T').map_or(t.len(), |at| at + 1)..];
+                note(named(k, Some(rest)), follow, lists);
+            } else if long_option(t, "--files-from", &["--file"]) {
+                note(named(k, None), follow, lists);
+            }
+        }
+        if has("rsync") && (long_option(t, "--files-from", &[]) || long_option(t, "--include-from", &["--include"])) {
+            note(named(k, None), follow, lists);
+        }
+        if has("zip") && single && t.contains('@') {
+            follow.stdin = true;
+        }
+        if has("7z") {
+            if t.starts_with('@') {
+                note(Some(ListName { word: seg[k], attached: None }), follow, lists);
+            } else if single && t.starts_with("-i") && t.contains('@') {
+                let rest = &t[t.find('@').map_or(t.len(), |at| at + 1)..];
+                note(named(k, Some(rest)), follow, lists);
+            }
+        }
+    }
+    // `xargs`: names from its input, or from `-a`/`--arg-file`, among the
+    // flags before the program it runs.
+    if let Some(at) = names.iter().position(|n| *n == "xargs") {
+        follow.stdin = true;
+        let program = (at + 1..typed.len()).find(|&k| FOLLOWERS.iter().any(|f| f.program == names[k])).unwrap_or(typed.len());
+        for (k, &t) in typed.iter().enumerate().take(program).skip(at + 1) {
+            if t == "-a" || long_option(t, "--arg-file", &[]) {
+                note(named(k, None), follow, lists);
+            } else if let Some(rest) = t.strip_prefix("-a") {
+                note(named(k, Some(rest)), follow, lists);
+            }
+        }
+    }
+    if has("cpio") || has("pax") {
+        follow.stdin = true;
+    }
+    // `tar cfT x.tar list`: which word is the list depends on the bundle's order.
+    if has("tar") && bundle.is_some_and(|b| b.contains('T')) {
+        follow.unplaced = true;
+    }
+    // A command reading names from its input reads them from a redirect.
+    if follow.stdin {
+        lists.extend(seg.iter().filter(|&&j| words[j].redirect && !words[j].writes).map(|&j| ListName { word: j, attached: None }));
+    }
 }
 
 /// The credentials location or file one of `texts` (spellings of a word)
@@ -3023,6 +3236,160 @@ mod tests {
             assert_eq!(run(&reach, "zip -ry out.zip ."), None, "{why}: a walker that doesn't follow links isn't scanned");
         }
         assert_eq!(run(&capped(1000, 64, 60), command), None, "within the caps it runs");
+    }
+
+    /// A workspace with a link to home, and a plain one beside it (#1208).
+    #[cfg(unix)]
+    fn linked_and_plain() -> (tempfile::TempDir, Reach, Reach, PathBuf, PathBuf, PathBuf) {
+        let (d, ws, home) = setup();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink(&home, ws.join("home-link")).unwrap();
+        let plain = d.path().join("plain");
+        std::fs::create_dir_all(plain.join("src")).unwrap();
+        std::fs::write(plain.join("src/a.txt"), "a").unwrap();
+        let plain = std::fs::canonicalize(plain).unwrap();
+        let (linked, clean) = (Reach::new(&ws, None, Some(&home)), Reach::new(&plain, None, Some(&home)));
+        (d, linked, clean, ws, plain, home)
+    }
+
+    /// Whether `c` is a link scan cut short (#1208): it asks, not Deny
+    /// first, with no grant, ending with `why`.
+    fn cut_short(c: &ToolCard, why: &str) -> bool {
+        c.kind == CardKind::Run && !c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in ") && c.reason.ends_with(why)
+    }
+
+    /// A walker that follows links and reads the names it walks at run
+    /// time (from its input, `xargs` or a list) has the folder it stands in
+    /// scanned, and the command before it in a pipe (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn names_given_at_run_time_have_the_folder_scanned() {
+        let (_d, linked, clean, _ws, _plain, home) = linked_and_plain();
+        let granted = home.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        std::os::unix::fs::symlink(&home, granted.join("back")).unwrap();
+        for command in [
+            "ls | zip -r -@ o.zip",
+            "find . | xargs tar -chf o.tar",
+            "tar -chf o.tar -T list",
+            "tar -chf o.tar --files-from=list",
+            "find . | tar -chf o.tar -T -",
+            "rsync -aL --files-from=list . out/",
+            "xargs -a list cp -rL -t out",
+            "7z a o.7z @list",
+            "zip -r -@ o.zip < list",
+            "find . -print0 | cpio -0 -oL > o.cpio",
+            "pax -wL -f o.pax",
+        ] {
+            let c = run(&linked, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+            assert_eq!(run(&clean, command), None, "{command}: a plain folder runs");
+        }
+        // A pipe's first command names the folders the walker goes through.
+        let c = clean.command_card(None, "find ~/granted | zip -r -@ o.zip", None, &reads(std::slice::from_ref(&granted))).expect("its link back home asks");
+        assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{}", c.reason);
+    }
+
+    /// A list of names outside the folder the scan reads, or that the check
+    /// can't place, asks, whatever is granted (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn a_list_of_names_outside_the_scanned_folder_asks() {
+        let (_d, _linked, clean, _ws, _plain, home) = linked_and_plain();
+        let granted = home.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let outside = "outside that folder";
+        for command in [
+            "tar -chf o.tar -T ../list",
+            "tar -chf o.tar --files-from=/tmp/list",
+            "tar -chf o.tar --files ../list",
+            "tar -chf o.tar -T~/granted/list",
+            "rsync -aL --files-from=../list . out/",
+            "rsync -aL --include-from ../list . out/",
+            "xargs -a ../list tar -chf o.tar",
+            "xargs --arg-file=../list tar -chf o.tar",
+            "zip -r -@ o.zip < ../list",
+            "7z a o.7z @../list",
+            "7z a o.7z -i@../list",
+            "tar -chf o.tar -T \"$LIST\"",
+        ] {
+            let c = clean.command_card(None, command, None, &reads(std::slice::from_ref(&granted))).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, outside) || c.reason.contains("can't place"), "{command}: {}", c.reason);
+            assert!(!c.sensitive && c.grant.is_none(), "{command}");
+        }
+        let c = run(&clean, "tar chfT o.tar list").expect("a list in an old-style bundle asks");
+        assert!(cut_short(&c, "it reads the names it walks from a list the check can't place"), "{}", c.reason);
+        // Inside it, and options that aren't lists, run.
+        for command in ["tar -chf o.tar -T list", "tar -chf o.tar --files-from=src/list", "tar -czh --file=o.tgz .", "rsync -aL --include=x . out/"] {
+            assert_eq!(run(&clean, command), None, "{command}");
+        }
+    }
+
+    /// Long options as getopt reads them (#1208): an abbreviation of one
+    /// that follows links counts as it; one that stops following only
+    /// counts in full.
+    #[cfg(unix)]
+    #[test]
+    fn an_abbreviated_long_option_counts_as_the_one_it_abbreviates() {
+        let (_d, linked, _clean, _ws, _plain, _home) = linked_and_plain();
+        for command in [
+            "tar --de -czf o.tgz .",
+            "tar --deref -czf o.tgz .",
+            "rsync -a --copy-l . out/",
+            "rsync -a --copy-unsafe . out/",
+            "rsync -a --copy-d . out/",
+            "cp -R --deref . out",
+            "du --dereference-a .",
+            "ls -R --deref",
+            "grep -r --dereference-rec token .",
+            "rg --fol token",
+            "fd --fol x",
+            "ag --fol token",
+            "ack --fol token",
+            "gzip -r --for .",
+            // An abbreviation never turns following off.
+            "zip -r --sym o.zip .",
+            "diff -r --no-d . out",
+        ] {
+            let c = run(&linked, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+        }
+        for command in ["tar -cz --file=o.tgz .", "tar -cz --file o.tgz .", "zip -r --symlinks o.zip .", "rg --files", "ls -R --directory"] {
+            assert_eq!(run(&linked, command), None, "{command}");
+        }
+    }
+
+    /// Where the command stands after `cd "$PWD"`, `cd -`, `popd` or a bare
+    /// `pushd` isn't known: a walker that follows links from there asks
+    /// instead of going unscanned (#1208), and so does one given a folder
+    /// built while the command runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_walker_that_follows_links_from_an_unknown_folder_asks() {
+        let (_d, linked, clean, _ws, _plain, _home) = linked_and_plain();
+        let why = "an earlier cd, pushd or popd left it where the check can't follow";
+        for reach in [&linked, &clean] {
+            for command in [
+                "cd \"$PWD\" && zip -r o.zip .",
+                "cd - && zip -r o.zip .",
+                "cd $(pwd) && tar -czhf o.tgz .",
+                "pushd src && popd && zip -r o.zip .",
+                "pushd && zip -r o.zip .",
+                "pushd +1 && zip -r o.zip .",
+                "pushd -n src && zip -r o.zip .",
+                "cd - && rg -L token",
+            ] {
+                let c = run(reach, command).unwrap_or_else(|| panic!("{command} asks"));
+                assert!(cut_short(&c, why), "{command}: {}", c.reason);
+            }
+            let c = run(reach, "zip -r o.zip \"$PWD\"").expect("a folder built at run time asks");
+            assert!(cut_short(&c, "a folder the check can't place, built while the command runs"), "{}", c.reason);
+            // Not following links, or from a folder the check places, runs.
+            for command in ["cd - && zip -ry o.zip .", "cd \"$PWD\" && ls", "pushd src && zip -r ../o.zip .", "cd src && zip -r ../o.zip ."] {
+                assert_eq!(run(reach, command), None, "{command}");
+            }
+        }
     }
 
     /// Stop ends a link scan at once (#1208): the command asks rather than
