@@ -13,17 +13,22 @@
 //!   check (`permissions::shim_refusal`) and, when the call ships nothing,
 //!   runs the real program, found by absolute path when the shims were
 //!   written, outside the workspace and the shims' own folder. A shim never
-//!   searches PATH. A refused call exits 1 with one line on stderr.
-//! - **A push rewrite**: `GIT_CONFIG_*` entries that rewrite every push URL
-//!   to a path that can't exist ([`PUSH_BASE`], `url.<base>.pushInsteadOf`
-//!   with an empty prefix, which every URL starts with), whichever remote
-//!   `git push` picks (`remote.pushDefault`, `branch.<name>.pushRemote`, a
-//!   name or a URL), so a git the shims don't reach (one named by absolute
-//!   path) can't push to a remote's URL either. Git never rewrites a
-//!   remote's own `pushurl` this way: the check refuses setting one.
+//!   searches PATH. A refused call exits 1 with one line on stderr. The git
+//!   shim refuses every push outright, runs git's own commands only (never
+//!   an alias), and runs git with [`GIT_SHIM_OVERRIDES`].
+//! - **A push rewrite**, for a git the shims don't reach (one named by its
+//!   full path): `GIT_CONFIG_*` entries that rewrite a push URL to a path
+//!   that can't exist ([`PUSH_BASE`], `url.<base>.pushInsteadOf` with an
+//!   empty prefix, which every URL starts with, and the usual schemes),
+//!   whichever remote `git push` picks. Git takes the longest matching
+//!   prefix and never rewrites a remote's own `pushurl`, so a longer
+//!   `pushInsteadOf` or a `pushurl` in a config file wins over it; the check
+//!   refuses setting either.
 //! - **A token scrub**: the publish and deploy tokens in [`SCRUBBED`] are
-//!   removed from the environment, and `GIT_ASKPASS`/`SSH_ASKPASS` name a
-//!   refuser. The user's keychain and files are never touched.
+//!   removed from the environment, `credential.helper` is set empty (so no
+//!   saved credential, the keychain's included, reaches git), and
+//!   `GIT_ASKPASS`/`SSH_ASKPASS` name a refuser. The user's keychain and
+//!   files are never touched.
 //!
 //! The shims live in the app's data folder, one read-only folder per
 //! workspace, checked and rewritten where they differ each time a barrier
@@ -368,12 +373,23 @@ impl BarrierReport {
 }
 
 /// The `GIT_CONFIG_*` pairs of the barrier, in order: git's hardening
-/// (`talk_shell::git_hardening_env`) and the push rewrite.
+/// (`talk_shell::git_hardening_env`), an empty `credential.helper`, which
+/// empties the list of helpers every config read before it named (the
+/// keychain's included), and the push rewrite.
 fn git_pairs() -> Vec<(String, String)> {
-    let mut pairs = vec![("safe.bareRepository".to_string(), "explicit".to_string())];
+    let mut pairs = vec![
+        ("safe.bareRepository".to_string(), "explicit".to_string()),
+        ("credential.helper".to_string(), String::new()),
+    ];
     pairs.extend(PUSH_PREFIXES.iter().map(|p| (rewrite_key(), p.to_string())));
     pairs
 }
+
+/// What a git shim puts before the caller's arguments: `-c` settings,
+/// which git reads after every config file and the environment, so a
+/// config the agent wrote or a cleared environment can't undo them: no
+/// credential helper, and a bare repository used only when named.
+const GIT_SHIM_OVERRIDES: &[&str] = &["-c", "credential.helper=", "-c", "safe.bareRepository=explicit"];
 
 /// The push rewrite's key.
 fn rewrite_key() -> String {
@@ -588,8 +604,8 @@ fn probe(helper: &Path) -> Result<(), String> {
 /// arguments. A call the ship-nothing check refuses
 /// (`permissions::shim_refusal`) exits 1 with one line on stderr; one with
 /// no real program exits 127; any other becomes the real program (`exec`),
-/// with its arguments and environment as they came. [`PROBE`] answers
-/// [`PROBE_REPLY`].
+/// with its arguments and environment as they came, git with
+/// [`GIT_SHIM_OVERRIDES`] first. [`PROBE`] answers [`PROBE_REPLY`].
 pub fn shim_main(args: Vec<std::ffi::OsString>) -> i32 {
     if args.len() == 1 && args[0] == PROBE {
         println!("{PROBE_REPLY}");
@@ -612,6 +628,11 @@ pub fn shim_main(args: Vec<std::ffi::OsString>) -> i32 {
              (this mission ships nothing)."
         );
         return 127;
+    }
+    if name == "git" {
+        let mut with: Vec<std::ffi::OsString> = GIT_SHIM_OVERRIDES.iter().map(std::ffi::OsString::from).collect();
+        with.extend(rest.iter().cloned());
+        return exec(real, &with);
     }
     exec(real, rest)
 }
@@ -766,6 +787,61 @@ mod tests {
         assert!(ok, "{out}");
         let (ok, out) = r.run("git -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m two && git log --oneline | wc -l");
         assert!(ok && out.trim() == "2", "{out}");
+    }
+
+    /// The review's reproduction (#1287): a git config the agent wrote and
+    /// named for the command (`XDG_CONFIG_HOME`), holding an alias to
+    /// `push`, a `pushInsteadOf` longer than the rewrite's prefixes, and a
+    /// credential helper that holds a token. The Talk check refuses the
+    /// prefix; through the shim the alias and the credential store are
+    /// refused; and no git, by name or by full path, gets the token, since
+    /// the barrier empties `credential.helper`. Without the barrier the same
+    /// config does hand the token out.
+    #[test]
+    fn a_config_the_agent_wrote_neither_pushes_nor_hands_out_a_token() {
+        let r = repo();
+        let real = r.real_git();
+        let cfg = r.ws.join("cfg");
+        std::fs::create_dir_all(cfg.join("git")).unwrap();
+        let creds = r.ws.join("creds");
+        std::fs::write(&creds, "https://user:ghp_saved_token@example.com\n").unwrap();
+        let remote = r.remote.to_str().unwrap();
+        let config = format!(
+            "[alias]\n\tp = push\n\tStatus = push\n[url \"{remote}\"]\n\tpushInsteadOf = {remote}\n[credential]\n\thelper = store --file={}\n",
+            creds.display()
+        );
+        std::fs::write(cfg.join("git/config"), config).unwrap();
+        for line in ["XDG_CONFIG_HOME=cfg git p origin main", "XDG_CONFIG_HOME=cfg git push origin main"] {
+            assert!(crate::permissions::ship_nothing_shell_refusal(line).is_some(), "{line}");
+        }
+        let with_cfg = "export XDG_CONFIG_HOME=\"$PWD/cfg\";";
+        for call in ["git p origin main", "git Status", "git push origin main"] {
+            let (ok, out) = r.run(&format!("{with_cfg} {call}"));
+            assert!(!ok && out.contains("Octopush refused `git`"), "{call}: {out}");
+        }
+        assert!(!r.pushed(), "the remote got the push");
+        let fill = "printf 'protocol=https\\nhost=example.com\\n\\n' |";
+        let (ok, out) = r.run(&format!("{with_cfg} {fill} git credential fill"));
+        assert!(!ok && out.contains("Octopush refused `git`") && !out.contains("ghp_saved_token"), "{out}");
+        let (_, out) = r.run(&format!("{with_cfg} {fill} '{}' credential fill", real.display()));
+        assert!(!out.contains("ghp_saved_token"), "by full path: {out}");
+        // The same config, without the barrier, hands the token out.
+        let mut plain = Command::new(&real);
+        plain
+            .args(["credential", "fill"])
+            .current_dir(&r.ws)
+            .env("XDG_CONFIG_HOME", &cfg)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut child = plain.spawn().unwrap();
+        {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"protocol=https\nhost=example.com\n\n").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("ghp_saved_token"), "the test's config is real");
     }
 
     /// A spawn behind the barrier has no token, the askpass refuser, and the
