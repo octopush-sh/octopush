@@ -1046,3 +1046,40 @@ describe("ContextHeader — PR chip checks", () => {
     expect(button).toHaveAttribute("title", "Fix failing checks…");
   });
 });
+
+describe("ContextHeader — a branch-detected Epiku story (#1283)", () => {
+  const doneStory = {
+    key: "ST-1.1", summary: "Sample story", statusName: "Done", statusCategory: "done" as const,
+    issueType: "Story", priority: null, url: "https://epiku.example.com/?proyecto=sample-project",
+    parentKey: null, subtask: false, hierarchyLevel: 0,
+  };
+
+  beforeEach(() => {
+    vi.mocked(ipc.getIssue).mockReset();
+    // The Companion is collapsed: no backlog list loaded.
+    useIssuesStore.setState({
+      issues: null, tracker: "epiku", projectId: "p1", scope: "epiku:p1",
+      detailByKey: {}, detailLoadingByKey: {},
+    });
+  });
+  afterEach(() => {
+    vi.mocked(ipc.getIssue).mockReset().mockResolvedValue(null as never);
+    useIssuesStore.setState({ tracker: null, projectId: null, scope: null, detailByKey: {}, detailLoadingByKey: {} });
+  });
+
+  it("shows the chip for a done story with no backlog loaded, read with the project id", async () => {
+    vi.mocked(ipc.getIssue).mockResolvedValue(doneStory as never);
+    renderHeader({ workspace: makeWorkspace({ branch: "feat/ST-1.1-sample" }), issueTrackerConfigured: true });
+    expect(await screen.findByText("ST-1.1")).toBeInTheDocument();
+    expect(screen.getByText("Sample story")).toBeInTheDocument();
+    expect(ipc.getIssue).toHaveBeenCalledWith("ST-1.1", "p1");
+  });
+
+  it("links nothing for a dotted token the tracker doesn't know", async () => {
+    vi.mocked(ipc.getIssue).mockRejectedValue(new Error("no_encontrada"));
+    renderHeader({ workspace: makeWorkspace({ name: "sample-ws", branch: "fix/UTF-8.1-decoding" }), issueTrackerConfigured: true });
+    await waitFor(() => expect(ipc.getIssue).toHaveBeenCalledWith("UTF-8.1", "p1"));
+    expect(screen.queryByText("UTF-8.1")).not.toBeInTheDocument();
+    expect(screen.getByText("sample-ws")).toBeInTheDocument();
+  });
+});
