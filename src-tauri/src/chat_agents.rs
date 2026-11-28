@@ -2374,7 +2374,7 @@ mod tests {
         let provider = ToolRecordingScripted {
             inner: ScriptedProvider {
                 turns: Mutex::new(VecDeque::from(vec![
-                    resp("", vec![LlmToolUse { id: "t1".into(), name: "mcp__jira__get_issue".into(), input: serde_json::json!({"key": "PROJ-1"}) }], LlmStopReason::ToolUse),
+                    resp("", vec![LlmToolUse { id: "t1".into(), name: "mcp__jira__get_issue".into(), input: serde_json::json!({"key": "PROJ-1"}), input_error: None }], LlmStopReason::ToolUse),
                     resp("Brief: fix the billing rounding.", vec![], LlmStopReason::EndTurn),
                 ])),
             },
@@ -2450,8 +2450,8 @@ mod tests {
         let provider = ScriptedProvider {
             turns: Mutex::new(VecDeque::from(vec![
                 resp("", vec![
-                    LlmToolUse { id: "t1".into(), name: "mcp__jira__add_comment".into(), input: serde_json::json!({"body": "hi"}) },
-                    LlmToolUse { id: "t2".into(), name: "mcp__jira__get_issue".into(), input: serde_json::json!({"key": "PROJ-1"}) },
+                    LlmToolUse { id: "t1".into(), name: "mcp__jira__add_comment".into(), input: serde_json::json!({"body": "hi"}), input_error: None },
+                    LlmToolUse { id: "t2".into(), name: "mcp__jira__get_issue".into(), input: serde_json::json!({"key": "PROJ-1"}), input_error: None },
                 ], LlmStopReason::ToolUse),
                 resp("done", vec![], LlmStopReason::EndTurn),
             ])),
@@ -2511,8 +2511,8 @@ mod tests {
         let provider = PromptRecordingScripted {
             inner: ScriptedProvider {
                 turns: Mutex::new(VecDeque::from(vec![
-                    resp("", vec![LlmToolUse { id: "t1".into(), name: "Skill".into(), input: serde_json::json!({"name": "audit"}) }], LlmStopReason::ToolUse),
-                    resp("", vec![LlmToolUse { id: "t2".into(), name: "write_file".into(), input: serde_json::json!({"path": "x.txt", "content": "hi"}) }], LlmStopReason::ToolUse),
+                    resp("", vec![LlmToolUse { id: "t1".into(), name: "Skill".into(), input: serde_json::json!({"name": "audit"}), input_error: None }], LlmStopReason::ToolUse),
+                    resp("", vec![LlmToolUse { id: "t2".into(), name: "write_file".into(), input: serde_json::json!({"path": "x.txt", "content": "hi"}), input_error: None }], LlmStopReason::ToolUse),
                     resp("audited", vec![], LlmStopReason::EndTurn),
                 ])),
             },
@@ -2640,8 +2640,8 @@ mod tests {
         let cmd = format!("rm -rf {}", victim.display());
         let provider = ScriptedProvider {
             turns: Mutex::new(VecDeque::from(vec![
-                resp("cleaning", vec![LlmToolUse { id: "t1".into(), name: "run_command".into(), input: serde_json::json!({"command": cmd}) }], LlmStopReason::ToolUse),
-                resp("safe read", vec![LlmToolUse { id: "t2".into(), name: "read_file".into(), input: serde_json::json!({"path": "keep.txt"}) }], LlmStopReason::ToolUse),
+                resp("cleaning", vec![LlmToolUse { id: "t1".into(), name: "run_command".into(), input: serde_json::json!({"command": cmd}), input_error: None }], LlmStopReason::ToolUse),
+                resp("safe read", vec![LlmToolUse { id: "t2".into(), name: "read_file".into(), input: serde_json::json!({"path": "keep.txt"}), input_error: None }], LlmStopReason::ToolUse),
                 resp("Report: could not delete; file still present.", vec![], LlmStopReason::EndTurn),
             ])),
         };
@@ -2684,6 +2684,7 @@ mod tests {
                         id: "t1".into(),
                         name: "read_file".into(),
                         input: serde_json::json!({"path": "a.rs"}),
+                        input_error: None,
                     }],
                     LlmStopReason::ToolUse,
                 ),
@@ -2757,7 +2758,7 @@ mod tests {
             input_tokens,
             ..resp(
                 "reading",
-                vec![LlmToolUse { id: id.into(), name: "read_file".into(), input: serde_json::json!({"path": "a.rs"}) }],
+                vec![LlmToolUse { id: id.into(), name: "read_file".into(), input: serde_json::json!({"path": "a.rs"}), input_error: None }],
                 LlmStopReason::ToolUse,
             )
         }
@@ -3008,6 +3009,7 @@ mod tests {
                         id: "t1".into(),
                         name: "run_command".into(),
                         input: serde_json::json!({"command": "printf '%s' \"$PATH\" > path.txt"}),
+                        input_error: None,
                     }],
                     LlmStopReason::ToolUse,
                 ),
@@ -3056,7 +3058,7 @@ mod tests {
     }
 
     fn call(id: &str, name: &str, input: serde_json::Value) -> LlmToolUse {
-        LlmToolUse { id: id.into(), name: name.into(), input }
+        LlmToolUse { id: id.into(), name: name.into(), input, input_error: None }
     }
 
     /// A database with one conversation in `mode`, and an untyped sub-agent

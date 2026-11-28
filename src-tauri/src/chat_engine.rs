@@ -5503,7 +5503,8 @@ impl ChatEngine {
             // Ask first holds waits on its card below (#1231).
             let mut mode_denials: HashMap<String, String> = HashMap::new();
             let mut mode_asks: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for u in &response.tool_uses {
+            // A call with invalid arguments gets its parse error instead.
+            for u in response.tool_uses.iter().filter(|u| u.input_error.is_none()) {
                 let agent_type = is_agent_tool(&u.name).then(|| parse_agent_call(&u.input).ok()).flatten().and_then(|c| c.subagent_type);
                 let definition = agent_type.and_then(|t| crate::skills::agents::find_agent_definition(&agent_defs, &t));
                 let ctx = crate::permissions::PolicyCtx {
@@ -5545,9 +5546,13 @@ impl ChatEngine {
                 for u in response.tool_uses.iter().filter(|u| is_agent_tool(&u.name)) {
                     // A call the mode refused opens its card and fails there,
                     // like a malformed one.
+                    // So does one whose arguments weren't valid JSON.
                     let parsed = match mode_denials.get(&u.id) {
                         Some(refused) => Err(refused.clone()),
-                        None => parse_agent_call(&u.input),
+                        None => match &u.input_error {
+                            Some(bad) => Err(bad.clone()),
+                            None => parse_agent_call(&u.input),
+                        },
                     };
                     let mut planned: Option<(SubagentSpec, SubagentPlan)> = None;
                     if let Ok(call) = &parsed {
@@ -5690,9 +5695,15 @@ impl ChatEngine {
                 // The mode's refusal comes first; a sub-agent's is its outcome.
                 let mode_denied = mode_denials.contains_key(&u.id);
                 let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();
+                // Arguments that weren't valid JSON: the parse error is the
+                // result; nothing asks and nothing runs (a sub-agent's is its
+                // outcome).
+                let bad_input = u.input_error.clone().filter(|_| !is_agent);
                 // A tool a skill loaded this turn doesn't allow is refused
                 // before anything asks the user (#1135).
-                let skill_refusal = skill_scope.refusal(&u.name, &workspace_tools).filter(|_| !mode_denied);
+                let skill_refusal = skill_scope
+                    .refusal(&u.name, &workspace_tools)
+                    .filter(|_| !mode_denied && bad_input.is_none());
                 // Ask first holds a change or a command that doesn't only read
                 // on its card (#1231), its diff checked again once approved: a
                 // file that changed meanwhile asks again. The guards' cards
@@ -5737,7 +5748,7 @@ impl ChatEngine {
                 };
                 // Git is asked off the async worker, as each check starts.
                 let check = || reach.checked(&place);
-                let gated = denied.is_none() && skill_refusal.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
+                let gated = denied.is_none() && skill_refusal.is_none() && bad_input.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 let first = if gated { check().await } else { None };
                 if let Some(card) = first {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
@@ -5748,7 +5759,7 @@ impl ChatEngine {
                 // A denial skips execution and tells the model the user
                 // declined. The secret guard asks first (#819): a thread's
                 // "don't ask again" covers the destructive check, never it.
-                if u.name == "run_command" && denied.is_none() && skill_refusal.is_none() {
+                if u.name == "run_command" && denied.is_none() && skill_refusal.is_none() && bad_input.is_none() {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
                     denied = guard_agent_command(
                         &self.approvals,
@@ -5837,7 +5848,9 @@ impl ChatEngine {
                 let mut mcp_original: Option<String> = None;
                 // A `write_file` the overwrite guard refused (`file_seen`).
                 let mut write_refused = false;
-                let (result, ok) = if let Some(msg) = denied {
+                let (result, ok) = if let Some(msg) = bad_input {
+                    (msg, false)
+                } else if let Some(msg) = denied {
                     (msg, false)
                 } else if is_agent {
                     let outcome = agent_outcomes.remove(&u.id).unwrap_or_else(|| AgentOutcome {
@@ -6109,7 +6122,7 @@ impl ChatEngine {
                 };
                 // A loaded skill is instructions to follow, as the same skill
                 // named with `/name` is: it carries no untrusted mark.
-                let mark = (!was_denied && !is_skill).then_some(source.as_str());
+                let mark = (!was_denied && !is_skill && u.input_error.is_none()).then_some(source.as_str());
                 // A cut command output: the model's copy names its row.
                 let result = match (&command_full, row_id) {
                     (Some(full), Some(id)) => {
@@ -6138,8 +6151,9 @@ impl ChatEngine {
                         None => content,
                     }
                 };
-                // A failed or denied call says so (`is_error`), as its row does.
-                let is_error = crate::context::transcript::tool_row_is_error(&tool_record);
+                // A failed or denied call says so (`is_error`), as its row does;
+                // so does one whose arguments weren't valid JSON.
+                let is_error = u.input_error.is_some() || crate::context::transcript::tool_row_is_error(&tool_record);
                 tool_results.push(LlmToolResult { tool_use_id: u.id.clone(), content, is_error });
             }
 
@@ -6624,6 +6638,7 @@ mod continuation_tests {
                     id: format!("t{}", self.left.load(Ordering::Relaxed)),
                     name: "list_files".into(),
                     input: serde_json::json!({"path": "."}),
+                    input_error: None,
                 }],
                 stop_reason: crate::providers::LlmStopReason::ToolUse,
                 input_tokens: 10_000,
@@ -7058,6 +7073,7 @@ mod tests {
                 id: "tu_1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({ "path": "a.rs" }),
+                input_error: None,
             }],
             stop_reason: stop,
             input_tokens: 1,
@@ -7118,7 +7134,7 @@ mod tests {
     fn round_response(text: &str, calls: &[(&str, &str)]) -> LlmResponse {
         let tool_uses: Vec<crate::providers::LlmToolUse> = calls
             .iter()
-            .map(|(id, name)| crate::providers::LlmToolUse { id: (*id).into(), name: (*name).into(), input: serde_json::json!({ "path": "src/a.rs" }) })
+            .map(|(id, name)| crate::providers::LlmToolUse { id: (*id).into(), name: (*name).into(), input: serde_json::json!({ "path": "src/a.rs" }), input_error: None })
             .collect();
         let mut raw = vec![
             serde_json::json!({ "type": "thinking", "thinking": "plan", "signature": format!("sig-{}", calls[0].0) }),
