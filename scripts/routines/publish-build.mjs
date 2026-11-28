@@ -32,7 +32,7 @@
 // OCTOPUSH_UNMERGEABLE_FILE (files whose conflict with main Git can't mark —
 // binary, deleted on one side: any at all parks the PR, whatever the agent did).
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, lstatSync, openSync, fstatSync, closeSync, constants } from "node:fs";
 import { join } from "node:path";
 import { makeGh, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, isPrivateLane, markPrivate, safeError, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { humanOnlyFor } from "./automerge.mjs";
@@ -95,9 +95,19 @@ export function parseResult(text, kind) {
 /** A line Git writes into a conflicted file (any conflict style; with /m, `$` also ends a CRLF line's text). */
 const CONFLICT_MARKER = /^(<{7}|\|{7}|>{7})( |$)|^={7}$/m;
 export const hasConflictMarkers = (text) => CONFLICT_MARKER.test(String(text ?? ""));
+/**
+ * A regular file's text, or null for anything else: opened without following a
+ * link at its last component (O_NOFOLLOW) and without blocking on a FIFO, then
+ * checked on the open file itself, so nothing can be swapped in between.
+ */
+export function readRegular(p) {
+  let fd;
+  try { fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch { return null; }
+  try { return fstatSync(fd).isFile() ? readFileSync(fd, "utf8") : null; } catch { return null; } finally { closeSync(fd); }
+}
 /** The conflicted files that still carry a marker (pure but for reading them). */
 export function unresolvedConflicts(paths) {
-  return paths.filter((p) => { try { return lstatSync(p).isFile() && hasConflictMarkers(readFileSync(p, "utf8")); } catch { return false; } });
+  return paths.filter((p) => hasConflictMarkers(readRegular(p) ?? ""));
 }
 /** The list nightly-build.yml wrote, or none. */
 export function conflictList(file) {
@@ -229,7 +239,11 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   // Where the job's issue lives: an app-issue job's issue is in the app repo.
   const [jobGh, jobRepo] = kind === "app-issue" ? [appGh, APP_REPO] : [gh, repo];
   const file = join(".agent-out", "result.json");
-  const parsed = existsSync(file) ? parseResult(readFileSync(file, "utf8"), kind) : { error: "the agent wrote no .agent-out/result.json" };
+  // A real directory and a regular file: never a link to something else the runner can read.
+  const outDir = (() => { try { return lstatSync(".agent-out").isDirectory(); } catch { return false; } })();
+  const text = outDir ? readRegular(file) : null;
+  const parsed = text !== null ? parseResult(text, kind)
+    : { error: existsSync(file) ? "the agent's .agent-out/result.json is not a regular file" : "the agent wrote no .agent-out/result.json" };
   rmSync(".agent-out", { recursive: true, force: true });
   rmSync(REF_DIR, { recursive: true, force: true });
   // Main conflicts with the branch where Git leaves no marker: the merge was aborted, nothing to push.
@@ -252,6 +266,9 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   // A committed symlink could point the reviewer (or anyone) at /proc or runner files.
   const links = all.filter((p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } });
   if (links.length) { park(jobGh, jobRepo, kind, n, `It created symlinks, which agents may not commit: ${links.join(", ")}.`); return 1; }
+  // Nor a FIFO, a socket or a device (reading one could hang or reach past the checkout).
+  const special = all.filter((p) => { try { const st = lstatSync(p); return !st.isFile() && !st.isSymbolicLink() && !st.isDirectory(); } catch { return false; } });
+  if (special.length) { park(jobGh, jobRepo, kind, n, `It created FIFOs, sockets or devices, which agents may not commit: ${special.join(", ")}.`); return 1; }
   // Main's merge was committed with its conflicts for the agent to resolve: none may reach the branch unresolved.
   const unresolved = unresolvedConflicts(conflicts);
   if (unresolved.length) { park(jobGh, jobRepo, kind, n, `It left merge conflict markers in: ${unresolved.join(", ")}. Resolve them (main was merged into the branch) and push.`); return 1; }
@@ -261,7 +278,7 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
     .filter((e) => e.xy.includes("D") || !CACHE.some((re) => re.test(e.path)))
     .map((e) => e.path);
   if (!paths.length && !mergeOnly) { park(jobGh, jobRepo, kind, n, "It changed only cache files."); return 1; }
-  const contents = paths.filter((p) => existsSync(p)).map((p) => { try { return readFileSync(p, "utf8"); } catch { return ""; } });
+  const contents = paths.map(readRegular).filter((t) => t !== null);
   if (leaks([...contents, r.title ?? "", r.summary ?? ""], [...secrets, token])) {
     park(jobGh, jobRepo, kind, n, "Its output contained a secret value, so nothing was pushed. Look at the workflow run.");
     return 1;

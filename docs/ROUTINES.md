@@ -214,6 +214,28 @@ trusted:
 - **The builder runs code only through `octo-check`** (typecheck, tests, changeset check) — a
   root-owned copy of `scripts/routines/agent-check.sh` that runs the checks as a separate user with
   an empty environment, so code the agent writes can't reach the token.
+- **Nothing the sandbox can write runs as the runner.** In the three builders (`nightly-build`,
+  `web-build`, `epiku-build`), Node and the Claude Code CLI are a root-owned, read-only copy made
+  by `scripts/routines/frozen-node.sh freeze` before the agent's branch or repo arrives (the
+  CLI is installed into it there, with no token in the step), and everything on `PATH`, the
+  runner, the actions' code and `~/.config` is closed to other users. Code runs as `octo-sandbox`
+  only through `octo-sandbox-exec` (`scripts/routines/sandbox-exec.sh`, installed root-owned by
+  `agent-sandbox-setup.sh`), which puts it in one cgroup v2 per job that nothing in it can leave,
+  with no way to gain privileges; without cgroup v2 the setup refuses. After the agent,
+  `frozen-node.sh end` writes the cgroup's `cgroup.kill` first, which ends every member at once,
+  forks in flight included. It fails the step unless the cgroup is empty and no process of the
+  user runs anywhere, then locks the account. Only then does it close the checkout's top
+  directory and remove any `.git` there. `publish-build.mjs` reads the agent's files only as
+  regular files, without following links (`readRegular`), and refuses FIFOs and devices. CI's
+  `sandbox-end` job proves `end` on the runner image against a process that keeps forking. Every later step, and the last
+  one before the actions' post steps, starts with `frozen-node.sh guard` (`end`, then the checks): the frozen
+  copy is unchanged, nothing the runner executes is writable by or belongs to that user, the moved
+  `.git` has no hook or command-running config, and the step's environment sets no `GIT_*`,
+  `NODE_OPTIONS`, `BASH_ENV` or loader variable; otherwise the step fails and nothing is
+  published. Those steps run on `/usr/bin/bash`, not a shell found through `PATH`. A `.git` the
+  sandbox made in the checkout (whose own `.git` was moved out) means the build is not published;
+  the last step runs `end` again, so `actions/checkout`'s post step (`persist-credentials: false`)
+  finds no `.git` to run git in.
 - **Agents only write files.** Fixed steps then validate them, scan everything for the token, and
   do the GitHub writes with the workflow's token — from a copy of `scripts/routines` taken from
   `main` before any agent branch is checked out, with the checkout's `.git` moved out of the
