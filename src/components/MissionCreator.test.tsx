@@ -403,8 +403,43 @@ describe("MissionCreator", () => {
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       const call = mockCreate.mock.calls[0];
       expect([call[4], call[5], call[7], call[8]]).toEqual(["test/ENG-42", "origin/ENG-42-sign-in", "test", "ephemeral"]);
-      // The brief waits in the composer, unsent.
+      // The brief waits in the composer, unsent, read from the project's tracker.
+      expect(ipcModule.ipc.getIssue).toHaveBeenCalledWith("ENG-42", "proj-1");
       expect(mockSeedComposer).toHaveBeenCalledWith(mockWorkspace.id, expect.stringContaining("Open /login?next=/billing and sign in."));
+    });
+
+    it("tests an Epiku story: from its dotted branch onto `test/ST-1.1`, with the story's text in the brief", async () => {
+      vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({ local: ["main", "feat/ST-1.10-other", "feat/ST-1.1-sample"], remote: [] });
+      vi.mocked(ipcModule.ipc.getIssue).mockResolvedValue({
+        key: "ST-1.1",
+        summary: "Sample story title",
+        url: "https://epiku.example.com/?proyecto=sample-project",
+        description: "Sample story markdown",
+      } as never);
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = vi.fn();
+      render(
+        <MissionCreator
+          projectId="sample-project-id"
+          projectPath="/home/user/sample-project"
+          onCreated={onCreated}
+          onCancel={vi.fn()}
+          initialTask="Sample story title"
+          linkIssueKeyOnCreate="ST-1.1"
+          initialIntent="test"
+        />,
+      );
+      await gotoTask();
+      await screen.findByTitle(/^Base branch: feat\/ST-1\.1-sample/);
+      expect(screen.getByLabelText("Branch name")).toHaveValue("test/ST-1.1");
+      await beginMission();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(ipcModule.ipc.getIssue).toHaveBeenCalledWith("ST-1.1", "sample-project-id");
+      expect(mockSeedComposer).toHaveBeenCalledWith(
+        mockWorkspace.id,
+        expect.stringContaining("Test ST-1.1: Sample story title\nhttps://epiku.example.com/?proyecto=sample-project\n\nDescription:\nSample story markdown"),
+      );
     });
 
     it("sends `ephemeral` from a pull request too, based on its head", async () => {

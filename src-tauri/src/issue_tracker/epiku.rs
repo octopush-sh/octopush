@@ -349,6 +349,81 @@ impl EpikuClient {
     }
 }
 
+/// A story's markdown as plain text, like Jira's description: headings,
+/// quote marks, rules, bold and inline-code marks dropped; `*`/`+` list
+/// items as `- `; links as `text (url)`, images as their alt text; fenced
+/// code kept as it is, between ``` lines. Line by line, never fails.
+fn markdown_text(md: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for line in md.lines() {
+        let body = line.trim_start();
+        if body.starts_with("```") || body.starts_with("~~~") {
+            in_code = !in_code;
+            out.push("```".to_string());
+            continue;
+        }
+        if in_code {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent = &line[..line.len() - body.len()];
+        let mut body = body;
+        while let Some(rest) = body.strip_prefix('>') {
+            body = rest.trim_start();
+        }
+        let hashes = body.trim_start_matches('#');
+        if hashes.len() < body.len() && (hashes.is_empty() || hashes.starts_with(' ')) {
+            body = hashes.trim_start();
+        }
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.len() >= 3 && ['-', '*', '_'].iter().any(|&m| compact.chars().all(|c| c == m)) {
+            out.push(String::new());
+            continue;
+        }
+        let item = body.strip_prefix("* ").or_else(|| body.strip_prefix("+ "));
+        let body = match item {
+            Some(rest) => format!("- {}", markdown_inline(rest)),
+            None => markdown_inline(body),
+        };
+        out.push(format!("{indent}{body}"));
+    }
+    out.join("\n")
+}
+
+/// One line's inline markdown as plain text (see [`markdown_text`]).
+fn markdown_inline(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('[') {
+        let image = rest[..open].ends_with('!');
+        let head = if image { &rest[..open - 1] } else { &rest[..open] };
+        out.push_str(head);
+        let after = &rest[open + 1..];
+        let link = after
+            .find(']')
+            .filter(|&close| after[close + 1..].starts_with('('))
+            .and_then(|close| after[close + 2..].find(')').map(|end| (close, close + 2 + end)));
+        match link {
+            Some((close, end)) => {
+                let (text, url) = (&after[..close], &after[close + 2..end]);
+                if image || text == url || url.is_empty() {
+                    out.push_str(text);
+                } else {
+                    out.push_str(&format!("{text} ({url})"));
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[head.len()..=open]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("**", "").replace('`', "")
+}
+
 impl IssueTracker for EpikuClient {
     /// The project's stories that aren't done. Epiku can't filter by
     /// assignee yet, so the picker searches all of them; `detalle=true`
@@ -359,12 +434,13 @@ impl IssueTracker for EpikuClient {
     }
 
     /// One story with its blockers, its dependents and its epic resolved,
-    /// and its `markdown` as the description (cut like Jira's).
+    /// and its `markdown` as the plain-text description (cut like Jira's).
     async fn get_issue(&self, key: &str) -> AppResult<Issue> {
         let v = self.get(&story_path(key), &[]).await?;
         let mut issue =
             issue_from_story(&v, &self.board_url()).ok_or_else(|| AppError::Other(NOT_EPIKU.into()))?;
-        issue.description = super::jira::description_text(&v["markdown"]);
+        let text = v["markdown"].as_str().map(markdown_text).unwrap_or_default();
+        issue.description = super::jira::description_text(&serde_json::Value::String(text));
         Ok(issue)
     }
 
@@ -505,6 +581,17 @@ mod tests {
         assert_eq!(issues[2].status_category, StatusCategory::Todo);
         // Like Jira's list, the backlog carries no description.
         assert!(issues.iter().all(|i| i.description.is_none()));
+    }
+
+    #[test]
+    fn markdown_text_reads_a_story_as_plain_text() {
+        let md = "# Sample heading\n\n> Sample **quoted** note\n\n* Sample `item`\n+ Another item\n- [ ] Sample criterion\n\n---\n\nSee [the sample](https://example.com/sample) and ![a diagram](d.png).\n\n```sh\n# kept as it is\nnpm test **x**\n```";
+        assert_eq!(
+            markdown_text(md),
+            "Sample heading\n\nSample quoted note\n\n- Sample item\n- Another item\n- [ ] Sample criterion\n\n\n\nSee the sample (https://example.com/sample) and a diagram.\n\n```\n# kept as it is\nnpm test **x**\n```"
+        );
+        // Not markdown marks: a hashtag, an unclosed bracket, a bare bracket pair.
+        assert_eq!(markdown_text("#123 [draft ST-1.1 [x] done"), "#123 [draft ST-1.1 [x] done");
     }
 
     #[tokio::test]
