@@ -14,6 +14,12 @@
 //! hooks call), it is not an MCP server: it reads one hook payload from stdin,
 //! queues one `hook_signals` row in the database and exits.
 //!
+//! Run as `octopush-mcp barrier <program> <real path> <args…>` (what the PATH
+//! shims of a workspace whose mission ships nothing call, #1275), it is not
+//! an MCP server either: it reads the call with the ship-nothing check and
+//! either refuses it or becomes the real program (`ship_barrier::shim_main`).
+//! It never opens the database or reads stdin, which is the program's.
+//!
 //! The loop is deliberately synchronous: stdio MCP is one JSON object per line,
 //! and a single rusqlite connection is neither needed on multiple threads nor
 //! `Sync`, so a plain read→handle→write loop is the simplest correct design.
@@ -28,6 +34,11 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 fn main() {
+    // `octopush-mcp barrier …`: a PATH shim's call (#1275), before anything
+    // else runs.
+    if std::env::args_os().nth(1).is_some_and(|a| a == octopush_lib::ship_barrier::HELPER_MODE) {
+        std::process::exit(octopush_lib::ship_barrier::shim_main(std::env::args_os().skip(2).collect()));
+    }
     // `octopush-mcp hook --octopush-hook`: what the Claude Code hooks Octopush
     // installs in a worktree run (#287) — one payload on stdin, one queued
     // signal, never an error that could reach Claude.

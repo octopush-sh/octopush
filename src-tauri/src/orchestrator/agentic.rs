@@ -716,6 +716,13 @@ pub trait ToolGate: Send + Sync {
     async fn ask_first(&self, _name: &str, _input: &serde_json::Value) -> Option<String> {
         Some(crate::permissions::CANNOT_ASK.to_string())
     }
+
+    /// Whether the workspace's mission ships nothing (#1238): the commands
+    /// the loop runs then start behind the process barrier
+    /// (`ship_barrier`).
+    fn ships_nothing(&self) -> bool {
+        false
+    }
 }
 
 /// Tools the loop offers and executes on the caller's behalf, beyond the
@@ -1199,6 +1206,9 @@ pub async fn run_agentic_loop_billed(
                 let roots = sandbox_roots.map(|r| r.to_vec());
                 let cancel_flag = std::sync::Arc::clone(cancel);
                 let check = gate.and_then(|g| g.write_check(&u.name, &u.input));
+                // A command in a mission that ships nothing starts behind
+                // the process barrier (#1238).
+                let ships_nothing = gate.is_some_and(|g| g.ships_nothing());
                 let seen = std::sync::Arc::clone(&file_seen);
                 tokio::task::spawn_blocking(move || {
                     // A write over a file this loop hasn't read, or that
@@ -1206,7 +1216,8 @@ pub async fn run_agentic_loop_billed(
                     if let Some(refusal) = crate::file_seen::refusal(&seen, &wp, &name, &input) {
                         return (refusal, false);
                     }
-                    let (result, ok) = execute_tool_checked(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag), check.as_ref());
+                    let (result, ok) =
+                        execute_tool_checked(&wp, &name, &input, roots.as_deref(), Some(&cancel_flag), check.as_ref(), ships_nothing);
                     crate::file_seen::note(&seen, &wp, &name, &input, ok);
                     (result, ok)
                 })

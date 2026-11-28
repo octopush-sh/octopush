@@ -24,11 +24,21 @@ const PTY_SERVER: &str = "octopush-pty-server";
 /// the empty placeholder `build.rs` stages for Tauri's `externalBin` is ever
 /// returned. Requires `cargo build --bin octopush-pty-server` first (CI does).
 pub(crate) fn pty_server_bin() -> PathBuf {
+    sidecar_bin(PTY_SERVER, &["OCTOPUSH_PTY_SERVER_BIN", "CARGO_BIN_EXE_octopush-pty-server"])
+}
+
+/// The real `octopush-mcp` binary, found as [`pty_server_bin`] finds the
+/// daemon (`OCTOPUSH_MCP_BIN` overrides): what a ship-nothing workspace's
+/// PATH shims call (`ship_barrier`). Requires `cargo build --bins` (CI does).
+pub(crate) fn mcp_bin() -> PathBuf {
+    sidecar_bin("octopush-mcp", &["OCTOPUSH_MCP_BIN", "CARGO_BIN_EXE_octopush-mcp"])
+}
+
+/// One of the crate's binaries, `name`, looked up as [`pty_server_bin`]
+/// describes, `vars` first.
+fn sidecar_bin(name: &str, vars: &[&str]) -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for var in [
-        "OCTOPUSH_PTY_SERVER_BIN",
-        "CARGO_BIN_EXE_octopush-pty-server",
-    ] {
+    for var in vars {
         if let Some(p) = std::env::var_os(var) {
             candidates.push(PathBuf::from(p));
         }
@@ -37,20 +47,20 @@ pub(crate) fn pty_server_bin() -> PathBuf {
     let exe = std::env::current_exe().ok();
     if let Some(exe) = &exe {
         for dir in exe.ancestors().skip(1) {
-            candidates.push(dir.join(PTY_SERVER));
+            candidates.push(dir.join(name));
             if is_target_root(dir, target_dir.as_deref()) {
                 break;
             }
         }
     }
     if let Some(dir) = &target_dir {
-        candidates.push(dir.join("debug").join(PTY_SERVER));
+        candidates.push(dir.join("debug").join(name));
     }
     candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("debug")
-            .join(PTY_SERVER),
+            .join(name),
     );
 
     let mut rejected = Vec::new();
@@ -72,7 +82,7 @@ pub(crate) fn pty_server_bin() -> PathBuf {
         |p| format!("{}/debug", p.display()),
     );
     panic!(
-        "{PTY_SERVER} not found; run `cargo build --bin {PTY_SERVER}` first. \
+        "{name} not found; run `cargo build --bin {name}` first. \
          Looked next to {exe_desc} and its ancestors up to the first `target` dir, \
          in $CARGO_TARGET_DIR ({target_desc}) and in {}/target/debug. Rejected: [{}]",
         env!("CARGO_MANIFEST_DIR"),

@@ -67,6 +67,10 @@ pub struct StageContext {
     /// it. `None`: no server chosen, a CLI stage, or a run where MCP isn't
     /// available yet (the detached worker, a Routine; the drive says so).
     pub mcp: Option<StageMcp>,
+    /// The workspace's mission ships nothing (#1238), derived from the DB
+    /// when the stage starts: a CLI stage's process then starts behind the
+    /// process barrier (`cli_runner::apply_stage_env`, `ship_barrier`).
+    pub ships_nothing: bool,
 }
 
 /// An API stage's MCP servers, resolved in the app process: the registry

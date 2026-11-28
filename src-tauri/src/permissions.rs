@@ -959,13 +959,29 @@ fn remote_command(words: &[&str], scope: Scope) -> Option<&'static str> {
     if WRAPPERS.contains(&name.as_str()) {
         // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come
         // first; `env` and `eval` are read as the commands they run.
-        let at = rest.iter().position(|&w| matches!(program(w).as_str(), "eval" | "env") || remote_rule(&program(w)).is_some())?;
+        let known = |w: &str| remote_rule(w).is_some() || (scope.ship_nothing && ship_known(w));
+        let at = rest.iter().position(|&w| matches!(program(w).as_str(), "eval" | "env") || known(&program(w)))?;
         return remote_command(&rest[at..], scope);
     }
-    if scope.ship_nothing && name == "git" {
-        // What both modes refuse names itself first (`-c alias.p=push`).
-        if let Some(what) = git_remote(rest).or_else(|| git_rebinds(rest)) {
-            return Some(what);
+    if scope.ship_nothing {
+        if name == "git" {
+            // What both modes refuse names itself first (`-c alias.p=push`).
+            if let Some(what) = git_remote_with(rest, GIT_VALUED_SHIP).or_else(|| git_rebinds(rest)).or_else(|| git_ships(rest)) {
+                return Some(what);
+            }
+        }
+        // A package runner starts a program by name (`npx vercel deploy`):
+        // it is read as that program.
+        if let Some(at) = runner_target(&name, rest) {
+            let target = package_program(rest[at]);
+            if remote_rule(&target).is_some() || ship_known(&target) {
+                let mut words = vec![target.as_str()];
+                words.extend_from_slice(&rest[at + 1..]);
+                return remote_command(&words, scope);
+            }
+        }
+        if let Some(effect) = ship_effect(&name, rest) {
+            return effect;
         }
     }
     let what = remote_rule(&name)?(rest)?;
@@ -1666,10 +1682,14 @@ const GIT_CONFIG_REDIRECT: &str = "git configuration that can send a push or a r
 
 /// Git keys that can send a push or a request somewhere else, or run
 /// something in its place: aliases, includes, URL rewrites, `http.*`, the
-/// ssh command.
+/// ssh command, and a remote's own push URL (`remote.<name>.pushurl`),
+/// which git never rewrites with the process barrier's `pushInsteadOf`
+/// (`ship_barrier`). Read with or without its `=value`.
 fn redirecting_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
+    let k = k.split('=').next().unwrap_or_default();
     ["alias", "include", "url.", "http", "core.sshcommand"].iter().any(|p| k.starts_with(p))
+        || (k.starts_with("remote.") && k.ends_with(".pushurl"))
 }
 
 /// In a mission that ships nothing: a git command that sets a redirecting
@@ -1888,13 +1908,18 @@ fn is_read_method(m: &str) -> bool {
 }
 
 fn git_remote(args: &[&str]) -> Option<&'static str> {
+    git_remote_with(args, GIT_VALUED)
+}
+
+/// [`git_remote`], reading `valued` as git's global options that take a value.
+fn git_remote_with(args: &[&str], valued: &[&str]) -> Option<&'static str> {
     // An alias set on the command line can run any of these (`-c alias.p=push`).
     let alias = args.windows(2).any(|w| matches!(w[0], "-c" | "--config-env") && w[1].to_ascii_lowercase().starts_with("alias."))
         || args.iter().any(|a| a.to_ascii_lowercase().starts_with("--config-env=alias."));
     if alias {
         return Some("a git alias set on the command line");
     }
-    let ops = operands(args, GIT_VALUED);
+    let ops = operands(args, valued);
     let op = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
     match (op(0).as_deref(), op(1).as_deref()) {
         (Some("push"), _) => Some("git push"),
@@ -1913,6 +1938,280 @@ fn git_remote(args: &[&str]) -> Option<&'static str> {
 
 /// Git's global options that take a value.
 const GIT_VALUED: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"];
+
+/// [`GIT_VALUED`] and the newer global options that take a value too
+/// (`git --attr-source HEAD push`), for a mission that ships nothing only,
+/// so Plan only reads git as before.
+const GIT_VALUED_SHIP: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source", "--super-prefix"];
+
+/// What a mission that ships nothing refuses of git beyond the push family
+/// [`git_remote`] refuses in both modes: a pull request mailed or written
+/// for upstream (`request-pull`, `imap-send`), a commit sent to another
+/// version control system (`svn dcommit`/`set-tree`, `p4 submit`,
+/// `cvsexportcommit`), and a remote's own push URL (`git remote set-url
+/// --push`), which the process barrier's push rewrite doesn't reach.
+fn git_ships(args: &[&str]) -> Option<&'static str> {
+    let ops = operands(args, GIT_VALUED_SHIP);
+    let op = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
+    match (op(0).as_deref(), op(1).as_deref()) {
+        (Some("request-pull"), _) => Some("git request-pull"),
+        (Some("imap-send"), _) => Some("git imap-send"),
+        (Some("svn"), Some("dcommit" | "set-tree")) => Some("git svn dcommit"),
+        (Some("p4"), Some("submit")) => Some("git p4 submit"),
+        (Some("cvsexportcommit"), _) => Some("git cvsexportcommit"),
+        (Some("remote"), Some("set-url")) if args.contains(&"--push") => Some(GIT_CONFIG_REDIRECT),
+        _ => None,
+    }
+}
+
+/// Where a package runner names the program it starts, in `args`: `npx
+/// vercel`, `pnpx`, `bunx`, `npm exec`/`npm x`, `pnpm exec`/`pnpm dlx`,
+/// `yarn dlx`/`yarn exec`, `bun x`, and `yarn <bin>`, which runs a
+/// package's program by its name. A runner's own flags come first.
+fn runner_target(runner: &str, args: &[&str]) -> Option<usize> {
+    const VALUED: &[&str] = &["-p", "--package", "-c", "--call", "-w", "--workspace", "--filter", "--dir", "-C", "--cwd"];
+    // The positions of the words that aren't flags or a flag's value.
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if VALUED.contains(&args[i]) {
+            i += 2;
+            continue;
+        }
+        if !args[i].starts_with('-') {
+            words.push(i);
+        }
+        i += 1;
+    }
+    let sub = words.first().map(|&i| args[i].to_ascii_lowercase());
+    let runs = match runner {
+        "npx" | "pnpx" | "bunx" => return words.first().copied(),
+        "npm" => matches!(sub.as_deref(), Some("exec" | "x")),
+        "pnpm" | "yarn" => matches!(sub.as_deref(), Some("exec" | "dlx")),
+        "bun" => sub.as_deref() == Some("x"),
+        _ => return None,
+    };
+    if runs {
+        words.get(1).copied()
+    } else if matches!(runner, "yarn" | "pnpm") {
+        // `yarn vercel deploy` runs the package's `vercel`.
+        words.first().copied()
+    } else {
+        None
+    }
+}
+
+/// The program a runner's package word starts: the name without its scope
+/// or version (`vercel@latest`, `@scope/tool@2`), or the program a package
+/// installs under another name (`netlify-cli` installs `netlify`).
+fn package_program(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    let name = match lower.strip_prefix('@') {
+        Some(scoped) => {
+            let full = scoped.split('@').next().unwrap_or(scoped);
+            match full {
+                "railway/cli" => return "railway".to_string(),
+                _ => full.rsplit('/').next().unwrap_or(full).to_string(),
+            }
+        }
+        None => lower.split('@').next().unwrap_or(&lower).to_string(),
+    };
+    match name.as_str() {
+        "netlify-cli" => "netlify".to_string(),
+        "firebase-tools" => "firebase".to_string(),
+        "aws-cdk" => "cdk".to_string(),
+        _ => program(&name),
+    }
+}
+
+/// Hosted deploy CLIs, and the subcommands of each that stay on this Mac or
+/// only read. Any other call is refused, a bare one included (`vercel` and
+/// `surge` deploy when run alone), and so is one that names a delivering
+/// verb anywhere ([`DELIVERING_VERBS`]), so a flag's value the check reads
+/// as the subcommand can't hide one.
+const HOSTED_CLIS: &[(&str, &[&str])] = &[
+    ("vercel", VERCEL_LOCAL),
+    ("now", VERCEL_LOCAL),
+    ("netlify", NETLIFY_LOCAL),
+    ("ntl", NETLIFY_LOCAL),
+    ("fly", FLY_LOCAL),
+    ("flyctl", FLY_LOCAL),
+    ("heroku", HEROKU_LOCAL),
+    ("firebase", FIREBASE_LOCAL),
+    ("wrangler", WRANGLER_LOCAL),
+    ("railway", RAILWAY_LOCAL),
+    ("surge", SURGE_LOCAL),
+    ("pulumi", PULUMI_LOCAL),
+    ("serverless", SERVERLESS_LOCAL),
+    ("sls", SERVERLESS_LOCAL),
+    ("cdk", CDK_LOCAL),
+    ("eb", EB_LOCAL),
+];
+const VERCEL_LOCAL: &[&str] = &["dev", "build", "help", "whoami", "ls", "list", "inspect", "logs", "pull"];
+const NETLIFY_LOCAL: &[&str] = &[
+    "dev", "serve", "build", "status", "help", "logs", "functions:serve", "functions:list", "functions:build", "sites:list",
+    "env:list", "env:get",
+];
+const FLY_LOCAL: &[&str] = &["status", "logs", "version", "help", "doctor", "releases"];
+const HEROKU_LOCAL: &[&str] = &[
+    "local", "local:start", "local:run", "logs", "help", "version", "whoami", "auth:whoami", "apps", "apps:info", "config",
+    "config:get", "ps", "releases", "releases:info", "addons", "status", "domains",
+];
+const FIREBASE_LOCAL: &[&str] = &["emulators:start", "emulators:exec", "serve", "help", "projects:list", "apps:list", "login:list"];
+const WRANGLER_LOCAL: &[&str] = &["dev", "whoami", "help", "types", "tail", "pages"];
+const RAILWAY_LOCAL: &[&str] = &["status", "logs", "whoami", "list", "help"];
+const SURGE_LOCAL: &[&str] = &["list", "whoami", "help"];
+const PULUMI_LOCAL: &[&str] = &["preview", "whoami", "about", "version", "help", "logs"];
+const SERVERLESS_LOCAL: &[&str] = &["offline", "package", "print", "info", "logs", "help"];
+const CDK_LOCAL: &[&str] = &["synth", "diff", "list", "ls", "doctor", "docs", "help"];
+const EB_LOCAL: &[&str] = &["status", "health", "logs", "list", "printenv", "local", "help"];
+
+/// Cloud CLIs (`aws`, `gcloud`, `gsutil`, `bq`, `az`, `doctl`): a call runs
+/// only when it reads, naming a read verb ([`CLOUD_READS`]) and no
+/// delivering one ([`DELIVERING_VERBS`]).
+const CLOUD_CLIS: &[&str] = &["aws", "gcloud", "gsutil", "bq", "az", "doctl"];
+const CLOUD_READS: &[&str] = &["list", "ls", "describe", "show", "get", "info", "help", "version", "whoami", "logs", "read", "status", "tail", "inspect"];
+/// Prefixes of the cloud CLIs' read operations (`aws ec2 describe-instances`).
+const CLOUD_READ_PREFIXES: &[&str] = &["describe-", "list-", "get-", "show-"];
+
+/// Verbs that deliver or change something on a hosted service. Words a
+/// read names too (`gcloud run services list`, `gcloud secrets list`,
+/// `serverless offline start`) aren't here: a call runs only from a local
+/// subcommand or a read verb anyway.
+const DELIVERING_VERBS: &[&str] = &[
+    "deploy", "publish", "release", "promote", "rollback", "redeploy", "up", "push", "apply", "destroy", "delete", "remove",
+    "rm", "create", "put", "set", "unset", "add", "scale", "upload", "invoke", "import", "update", "patch", "cancel", "kill",
+    "suspend", "detach", "attach", "enable", "disable", "migrate", "move", "mv", "cp", "submit", "transfer", "approve",
+    "merge", "purge", "reset", "reboot", "terminate", "resize", "install", "uninstall", "ssh", "console", "proxy", "tunnel",
+];
+
+/// Flags that only print, which any of these CLIs takes alone.
+const INFO_FLAGS: &[&str] = &["--version", "-v", "-V", "--help", "-h", "help", "version"];
+
+/// Programs only a mission that ships nothing reads ([`ship_effect`]).
+const SHIP_ONLY: &[&str] = &["ssh", "scp", "sftp", "rsync", "autossh", "cloudflared", "ngrok", "lt", "localtunnel", "bore", "zrok", "tailscale"];
+
+/// Whether [`ship_effect`] knows `program`.
+fn ship_known(program: &str) -> bool {
+    SHIP_ONLY.contains(&program) || CLOUD_CLIS.contains(&program) || HOSTED_CLIS.iter().any(|(p, _)| *p == program)
+}
+
+/// Whether the ship-nothing check has a rule for `program`, so a PATH shim
+/// for it refuses what it should (`ship_barrier::SHIMMED`).
+pub fn shim_knows(program: &str) -> bool {
+    remote_rule(program).is_some() || ship_known(program)
+}
+
+/// Whether `args` only ask for a version or help.
+fn info_only(args: &[&str]) -> bool {
+    !args.is_empty() && args.iter().all(|a| INFO_FLAGS.contains(&a.to_ascii_lowercase().as_str()))
+}
+
+/// Whether any of `args` is a delivering verb ([`DELIVERING_VERBS`]).
+fn names_delivery(args: &[&str]) -> bool {
+    args.iter().any(|a| DELIVERING_VERBS.contains(&a.to_ascii_lowercase().as_str()))
+}
+
+/// Whether a scp, sftp or rsync operand names another machine: a URL
+/// (`rsync://`, `scp://`, `sftp://`, `ssh://`), or a colon before any slash
+/// (`host:path`, `user@host:path`, `host::module`, `[::1]:path`), as those
+/// tools read it. `./a:b` is a local path.
+fn names_remote(operand: &str) -> bool {
+    let lower = operand.to_ascii_lowercase();
+    if ["rsync://", "scp://", "sftp://", "ssh://"].iter().any(|s| lower.starts_with(s)) {
+        return true;
+    }
+    operand.split_once(':').is_some_and(|(before, _)| !before.contains('/'))
+}
+
+/// What a program only a mission that ships nothing reads would change
+/// elsewhere: `None` when the check doesn't know the program, `Some(None)`
+/// when this call stays on this Mac. Remote shells and copies (`ssh`, `scp`,
+/// `sftp`, `rsync` to or from another machine), tunnels that make this Mac
+/// reachable (`ssh` itself, `autossh`, `cloudflared`, `ngrok`, localtunnel,
+/// `bore`, `zrok`, `tailscale funnel`/`serve`/`file`), hosted deploy CLIs
+/// ([`HOSTED_CLIS`]) and cloud CLIs ([`CLOUD_CLIS`]). A word that only asks
+/// for a version or help runs. Every operand counts, flag values included,
+/// so a value the check misreads can only refuse more.
+fn ship_effect(program: &str, args: &[&str]) -> Option<Option<&'static str>> {
+    const SSH: &str = "ssh to another machine, or a tunnel through it";
+    const COPY: &str = "a copy to or from another machine (scp, sftp, rsync)";
+    const TUNNEL: &str = "a tunnel that makes this Mac reachable from elsewhere";
+    const HOSTED: &str = "a hosted deploy CLI command that deploys or changes something there";
+    const CLOUD: &str = "a cloud CLI command that changes something there, or that the check can't read as a read";
+    let ops: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+    if let Some((_, local)) = HOSTED_CLIS.iter().find(|(p, _)| *p == program) {
+        let stays = info_only(args)
+            || (ops.first().is_some_and(|op| local.contains(&op.to_ascii_lowercase().as_str())) && !names_delivery(&ops));
+        return Some((!stays).then_some(HOSTED));
+    }
+    if CLOUD_CLIS.contains(&program) {
+        let reads = ops.iter().any(|o| {
+            let o = o.to_ascii_lowercase();
+            CLOUD_READS.contains(&o.as_str()) || CLOUD_READ_PREFIXES.iter().any(|p| o.starts_with(p))
+        });
+        let stays = info_only(args) || (reads && !names_delivery(&ops));
+        return Some((!stays).then_some(CLOUD));
+    }
+    let effect = match program {
+        // `-V` prints the version, `-G` the configuration, `-Q` what it
+        // supports: none of them connects. Git fetching over ssh runs.
+        "ssh" => {
+            let prints = args.iter().any(|a| matches!(*a, "-V" | "-G") || a.starts_with("-Q"));
+            (!prints && !git_fetch_over_ssh(args)).then_some(SSH)
+        }
+        "scp" | "rsync" => ops.iter().any(|o| names_remote(o)).then_some(COPY),
+        "sftp" => Some(COPY),
+        "autossh" | "lt" | "localtunnel" => Some(TUNNEL),
+        "cloudflared" | "ngrok" | "bore" | "zrok" => (!info_only(args)).then_some(TUNNEL),
+        "tailscale" => ops.first().is_some_and(|o| matches!(o.to_ascii_lowercase().as_str(), "funnel" | "serve" | "file")).then_some(TUNNEL),
+        _ => return None,
+    };
+    Some(effect)
+}
+
+/// Whether an ssh call is git fetching (`git fetch`, `clone`, `ls-remote`,
+/// `archive --remote`): its remote command, the last word, is
+/// `git-upload-pack` or `git-upload-archive`, and every word before the
+/// host is one git passes (protocol v2's `-o SendEnv=GIT_PROTOCOL`, a
+/// port, an address family). A push runs `git-receive-pack`, which isn't
+/// one, so through the ssh shim even a git the shims don't reach can't
+/// push over ssh; nor can a call that forwards a port.
+fn git_fetch_over_ssh(args: &[&str]) -> bool {
+    let Some((command, rest)) = args.split_last() else { return false };
+    let command = command.trim_start();
+    if !(command.starts_with("git-upload-pack ") || command.starts_with("git-upload-archive ")) {
+        return false;
+    }
+    let Some((host, flags)) = rest.split_last() else { return false };
+    if host.starts_with('-') {
+        return false;
+    }
+    let port = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let mut i = 0;
+    while i < flags.len() {
+        match flags[i] {
+            "-o" if flags.get(i + 1) == Some(&"SendEnv=GIT_PROTOCOL") => i += 2,
+            "-p" if flags.get(i + 1).is_some_and(|p| port(p)) => i += 2,
+            "-oSendEnv=GIT_PROTOCOL" | "-4" | "-6" | "-T" => i += 1,
+            f if f.strip_prefix("-p").is_some_and(port) => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// In a mission that ships nothing, what a PATH shim's call would change
+/// elsewhere (`ship_barrier`): `program` run with `args`, read by the same
+/// walk as an agent's command ([`remote_effect_local`]) but on the words as
+/// the program got them, with no shell in between to parse. No request to
+/// loopback counts as local here: the shim can't see the environment that
+/// would route it.
+pub fn shim_refusal(program: &str, args: &[&str]) -> Option<&'static str> {
+    let mut words = vec![program];
+    words.extend_from_slice(args);
+    remote_command(&words, Scope { ship_nothing: true, loopback_ok: false })
+}
 
 /// `gh` verbs that change GitHub, in groups other than the local ones.
 const GH_WRITES: &[&str] = &[
@@ -2261,6 +2560,10 @@ impl ToolGate for ModeGate {
 
     fn write_check(&self, name: &str, input: &Value) -> Option<crate::talk_guard::WriteCheck> {
         self.inner.as_ref().and_then(|g| g.write_check(name, input))
+    }
+
+    fn ships_nothing(&self) -> bool {
+        self.ships_nothing
     }
 }
 
@@ -3546,6 +3849,211 @@ mod tests {
         // A mission that can't be read counts as one that ships nothing.
         assert!(mission_ships_nothing(&Err(crate::error::AppError::Other("locked".into()))));
         assert!(!mission_ships_nothing(&Ok(None)));
+        // The loop's commands start behind the process barrier only in the
+        // posture (#1275).
+        assert!(gate.ships_nothing() && !open.ships_nothing());
+    }
+
+    /// The classifier gaps slice 2 closes (#1275), in a mission that ships
+    /// nothing: remote shells and copies, tunnels, hosted deploy and cloud
+    /// CLIs, a package runner's program, and git's other ways to deliver.
+    /// Plan only, and so a Build or Fix mission, reads them as before.
+    #[test]
+    fn a_ship_nothing_mission_refuses_remote_shells_tunnels_and_deploy_clis() {
+        let refused = [
+            "ssh deploy@example.com 'systemctl restart app'",
+            "ssh example.com",
+            "ssh -L 8080:localhost:80 example.com",
+            "ssh -R 9000:localhost:3000 example.com",
+            "ssh -D 1080 example.com",
+            "ssh -o SendEnv=GIT_PROTOCOL git@example.com \"git-receive-pack 'org/repo.git'\"",
+            "ssh -L 8080:localhost:80 git@example.com \"git-upload-pack 'org/repo.git'\"",
+            "scp dist/app.tgz deploy@example.com:/srv/",
+            "scp -P 2222 example.com:/etc/hosts .",
+            "sftp deploy@example.com",
+            "rsync -avz dist/ deploy@example.com:/srv/www/",
+            "rsync -a rsync://example.com/module/ ./out",
+            "rsync -a example.com::module ./out",
+            "autossh -M 0 -R 9000:localhost:3000 example.com",
+            "cloudflared tunnel run",
+            "cloudflared tunnel --url http://localhost:3000",
+            "ngrok http 3000",
+            "lt --port 3000",
+            "bore local 3000 --to bore.pub",
+            "tailscale funnel 3000",
+            "vercel",
+            "vercel --prod",
+            "vercel deploy --prebuilt",
+            "vercel env add SECRET production",
+            "netlify deploy --prod",
+            "netlify env:set KEY value",
+            "fly deploy",
+            "flyctl secrets set KEY=value",
+            "heroku config:set KEY=value",
+            "heroku run bash",
+            "firebase deploy --only hosting",
+            "wrangler deploy",
+            "wrangler pages deploy dist",
+            "railway up",
+            "surge ./dist example.surge.sh",
+            "pulumi up --yes",
+            "cdk deploy",
+            "serverless deploy",
+            "eb deploy",
+            "aws s3 cp dist s3://bucket/ --recursive",
+            "aws s3 sync . s3://bucket",
+            "aws lambda update-function-code --function-name f --zip-file fileb://f.zip",
+            "gcloud run deploy service --source .",
+            "gcloud app deploy",
+            "gsutil cp a.txt gs://bucket/",
+            "az webapp up",
+            "doctl apps create --spec app.yaml",
+            "npx vercel deploy",
+            "npx vercel@latest --prod",
+            "npm exec -- netlify-cli deploy",
+            "pnpm dlx wrangler deploy",
+            "yarn firebase deploy",
+            "bunx surge ./dist",
+            "git request-pull v1.0 https://example.com/repo.git main",
+            "git imap-send",
+            "git svn dcommit",
+            "git p4 submit",
+            "git cvsexportcommit -w /tmp/cvs HEAD",
+            "git remote set-url --push origin git@example.com:org/repo.git",
+            "git config remote.origin.pushurl git@example.com:org/repo.git",
+            "git -c remote.origin.pushurl=git@example.com:org/repo.git fetch",
+            "git --attr-source HEAD push origin main",
+        ];
+        for command in refused {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        let local = [
+            "ssh -V",
+            "ssh -G example.com",
+            "ssh -o SendEnv=GIT_PROTOCOL git@example.com \"git-upload-pack 'org/repo.git'\"",
+            "ssh -p 2222 git@example.com \"git-upload-pack 'org/repo.git'\"",
+            "scp a.txt b.txt",
+            "rsync -a src/ dst/",
+            "rsync -a ./a:b dst/",
+            "cloudflared --version",
+            "ngrok version",
+            "tailscale status",
+            "vercel dev",
+            "vercel build",
+            "vercel --version",
+            "netlify dev",
+            "netlify build",
+            "fly logs",
+            "heroku local web",
+            "heroku logs --tail",
+            "firebase emulators:start --only functions",
+            "wrangler dev",
+            "wrangler pages dev dist",
+            "pulumi preview",
+            "cdk synth",
+            "serverless offline start",
+            "aws sts get-caller-identity",
+            "aws s3 ls s3://bucket",
+            "aws ec2 describe-instances",
+            "gcloud run services list",
+            "gcloud config list",
+            "az account show",
+            "npx vercel dev",
+            "npx eslint .",
+            "yarn build",
+            "yarn wrangler dev",
+            "git remote add upstream https://example.com/repo.git",
+            "git remote -v",
+            "git fetch origin",
+        ];
+        for command in local {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+        // Plan only reads none of these programs: the posture alone adds them.
+        for command in ["ssh example.com", "vercel deploy", "aws s3 cp a s3://b/", "npx vercel deploy", "git request-pull v1 x", "git remote set-url --push origin x"] {
+            assert_eq!(remote_effect(command), None, "{command}");
+        }
+        // The director's refusal in Edit freely, and none for a mission
+        // that delivers.
+        let ro = HashSet::new();
+        let decide_in = |ships_nothing: bool, command: &str| {
+            let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing };
+            let input = json!({ "command": command });
+            decide(Mode::Edit, &ToolCall { name: "run_command", input: &input }, &ctx)
+        };
+        for command in ["ssh example.com", "vercel deploy", "rsync -a dist/ example.com:/srv/"] {
+            assert!(matches!(decide_in(true, command), Decision::Deny { .. }), "{command}");
+            assert_eq!(decide_in(false, command), Decision::Allow, "{command}");
+        }
+    }
+
+    /// A PATH shim's call is read by the same rules, on the words as the
+    /// program got them (#1275).
+    #[test]
+    fn a_shim_call_is_read_by_the_ship_nothing_rules() {
+        let refused: &[(&str, &[&str])] = &[
+            ("git", &["push", "origin", "main"]),
+            ("git", &["push", "--mirror", "origin"]),
+            ("git", &["-c", "remote.origin.pushurl=/tmp/r.git", "push", "origin", "main"]),
+            ("git", &["--attr-source", "HEAD", "push"]),
+            ("git", &["-C", "sub", "push"]),
+            ("git", &["send-email", "0001.patch"]),
+            ("git", &["request-pull", "v1", "origin"]),
+            ("git", &["remote", "set-url", "--push", "origin", "x"]),
+            ("gh", &["pr", "create", "--fill"]),
+            ("glab", &["mr", "create"]),
+            ("npm", &["publish"]),
+            ("cargo", &["publish"]),
+            ("twine", &["upload", "dist/*"]),
+            ("docker", &["push", "example/app"]),
+            ("vercel", &["--prod"]),
+            ("netlify", &["deploy"]),
+            ("fly", &["deploy"]),
+            ("heroku", &["releases:rollback"]),
+            ("firebase", &["deploy"]),
+            ("ssh", &["git@example.com", "git-receive-pack 'org/repo.git'"]),
+            ("ssh", &["-R", "9000:localhost:3000", "example.com"]),
+            ("rsync", &["-a", "dist/", "example.com:/srv/"]),
+            ("npx", &["vercel", "deploy"]),
+        ];
+        for (program, args) in refused {
+            assert!(shim_refusal(program, args).is_some(), "{program} {args:?}");
+        }
+        let runs: &[(&str, &[&str])] = &[
+            ("git", &["status"]),
+            ("git", &["commit", "-m", "push"]),
+            ("git", &["log", "--grep", "push"]),
+            ("git", &["fetch", "origin"]),
+            ("git", &["-c", "user.name=t", "commit", "-m", "x"]),
+            ("gh", &["pr", "view", "12"]),
+            ("npm", &["test"]),
+            ("npm", &["install"]),
+            ("cargo", &["build"]),
+            ("vercel", &["dev"]),
+            ("ssh", &["-o", "SendEnv=GIT_PROTOCOL", "git@example.com", "git-upload-pack 'org/repo.git'"]),
+            ("ssh", &["-G", "example.com"]),
+            ("rsync", &["-a", "src/", "dst/"]),
+        ];
+        for (program, args) in runs {
+            assert_eq!(shim_refusal(program, args), None, "{program} {args:?}");
+        }
+    }
+
+    /// Every command the hosts run for a mission that ships nothing starts
+    /// behind the process barrier (#1275): the director's, through the
+    /// confined runner; a sub-agent's, through its gate. Read in the
+    /// source, as above.
+    #[test]
+    fn the_hosts_start_commands_behind_the_barrier() {
+        let agentic = include_str!("orchestrator/agentic.rs");
+        assert!(agentic.contains("let ships_nothing = gate.is_some_and(|g| g.ships_nothing());"));
+        assert!(agentic.contains("check.as_ref(), ships_nothing);"));
+        let engine = include_str!("chat_engine.rs");
+        assert!(engine.contains("match crate::ship_barrier::Barrier::for_workspace(workspace_path) {"));
+        assert!(engine.contains("run_command_kept(workspace_path, input, sandbox_roots, cancel, ships_nothing);"));
+        let cli = include_str!("orchestrator/cli_runner.rs");
+        assert!(cli.contains("let barrier = if ctx.ships_nothing {"));
+        assert!(cli.contains("barrier.as_ref().map(|b| (b, path_env.as_str())),"));
     }
 
     #[test]
@@ -3703,7 +4211,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             });
-            crate::chat_engine::run_confined(ws.path(), &json!({ "command": "sleep 30" }), None, &cancel).await
+            crate::chat_engine::run_confined(ws.path(), &json!({ "command": "sleep 30" }), None, &cancel, false).await
         });
         assert!(!ok, "{out}");
         assert!(started.elapsed() < std::time::Duration::from_secs(15), "Stop didn't reach the command: {out}");
@@ -3736,10 +4244,10 @@ mod tests {
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
             "let mut was_denied = denied.is_some() || mode_denied;",
             "self.talk_shell.available() && exec_roots.is_none()",
-            "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
+            "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel, ships_nothing).await",
             "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
-            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await",
-            "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing, ships_nothing).await",
+            "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel, ships_nothing).await",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),\n                    ships_nothing,\n",
         ] {
             assert!(body.contains(call), "the director's loop no longer has: {call}");

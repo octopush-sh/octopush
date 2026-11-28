@@ -88,7 +88,12 @@ pub async fn create_session(
         engine.scan_and_record(sid, seq, bytes);
     });
 
-    let env = run_terminal_env(&guard, &session.agent.model);
+    let mut env = run_terminal_env(&guard, &session.agent.model);
+    // A workspace whose mission ships nothing (#1238): behind the process
+    // barrier, or not at all.
+    let barrier = crate::ship_barrier::terminal_env_for_root(&state.db, &session.project_root)
+        .map_err(|why| AppError::Other(crate::ship_barrier::terminal_refusal(&why)))?;
+    env.extend(barrier);
 
     // Spawn PTY
     state.pty.lock().spawn(
@@ -4262,6 +4267,12 @@ fn spawn_terminal_session(
         if let Some(block) = ports {
             block.apply_env(&mut env);
         }
+        // A workspace whose mission ships nothing (#1238): its terminals,
+        // the setup terminal included, start behind the process barrier,
+        // or not at all. An agent CLI started in one is an agent too.
+        let barrier = crate::ship_barrier::terminal_env_for(&state.db, ws)
+            .map_err(|why| AppError::Other(crate::ship_barrier::terminal_refusal(&why)))?;
+        env.extend(barrier);
     }
     let db_for_activity = std::sync::Arc::clone(&state.db);
     let last_beat = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));

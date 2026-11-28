@@ -1315,7 +1315,7 @@ fn a_users_own_context_window_export_is_never_overridden() {
 #[test]
 fn codex_stages_get_no_context_window_variable() {
     let mut command = tokio::process::Command::new("codex");
-    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None);
+    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None, None);
     let keys: Vec<String> = command.as_std().get_envs().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
     assert!(!keys.iter().any(|k| k == MAX_CONTEXT_TOKENS_ENV || k == DISABLE_1M_CONTEXT_ENV), "{keys:?}");
 }
@@ -1390,7 +1390,7 @@ fn a_gateway_named_claude_model_gets_the_full_prompt() {
     }
     // Codex never gets it.
     let mut command = tokio::process::Command::new("codex");
-    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None);
+    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None, None);
     assert!(!command.as_std().get_envs().any(|(k, _)| k == SIMPLE_SYSTEM_PROMPT_ENV));
 }
 
@@ -1418,7 +1418,7 @@ fn a_users_own_system_prompt_export_is_never_overridden() {
 /// [`stage_spawn_env`] for a Claude stage on `model`.
 fn stage_spawn_env_for(model: &str) -> HashMap<String, Option<String>> {
     let mut command = tokio::process::Command::new("claude");
-    apply_stage_env(&mut command, CliDialect::Claude, model, None, false, None);
+    apply_stage_env(&mut command, CliDialect::Claude, model, None, false, None, None);
     command
         .as_std()
         .get_envs()
@@ -1459,7 +1459,7 @@ fn stage_spawn_env(
     quiet: bool,
 ) -> HashMap<String, Option<String>> {
     let mut command = tokio::process::Command::new("claude");
-    apply_stage_env(&mut command, dialect, "claude-sonnet-5", effort, quiet, None);
+    apply_stage_env(&mut command, dialect, "claude-sonnet-5", effort, quiet, None, None);
     command
         .as_std()
         .get_envs()
