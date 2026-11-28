@@ -18,8 +18,10 @@
 # gone — before anything else runs. The audit (whose Chromium runs the site's
 # JavaScript) runs as octo-sandbox too, from scripts and a browser installed
 # root-owned in /opt/pw before the checkout; only regular, size-capped result
-# files come back out. A separate job on a fresh runner mints an issues-only
-# token and files the findings.
+# files come back out. Node is frozen-node.sh's root-owned copy, and after each
+# sandboxed step `frozen-node.sh verify` proves nothing the runner executes next
+# has changed. A separate job on a fresh runner mints an issues-only token and
+# files the findings.
 # 00:49 Bogotá, after the app audit.
 name: web-audit
 
@@ -55,9 +57,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
+      - name: Node 22, root-owned and read-only (frozen-node.sh, instead of setup-node)
+        run: bash scripts/routines/frozen-node.sh freeze
 
       - name: Trusted scripts and Chromium, root-owned (before the site is checked out)
         # /opt/pw: read-only for everyone else. The sandbox runs the audit from
@@ -117,19 +118,27 @@ jobs:
           OCTO_CHECK_PROFILE: web-audit
         run: |
           set -euo pipefail
+          # The build needs no history: the site's checkout keeps no .git.
+          rm -rf "$GITHUB_WORKSPACE/site/.git"
           OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/site" bash "$RUNNER_TEMP/scripts/routines/agent-sandbox-setup.sh"
           octo-check site   # install (no scripts) + build, in one sandboxed call
 
-      - name: Nothing of the site's code is still running
+      - name: Nothing of the site's code is still running, and nothing it could reach has changed
         if: always()
+        # Not resolved through PATH: this step checks PATH.
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
-          sudo pkill -KILL -u octo-sandbox || true
+          job_path="$PATH"
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          # The whole sandbox cgroup at once (the audit runs in it next).
+          sudo -n /usr/local/sbin/octo-sandbox-exec --kill
           sudo find "$GITHUB_WORKSPACE/site" -type l -user octo-sandbox -delete || true
           chmod -R o-w "$GITHUB_WORKSPACE/site" || true
           sleep 1
           if pgrep -u octo-sandbox >/dev/null; then
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
           fi
+          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" verify
 
       - name: Audit as octo-sandbox (Chromium over the static dist/, every page, three window sizes)
         id: audit
@@ -140,7 +149,7 @@ jobs:
         run: |
           set +e
           node_dir="$(dirname "$(readlink -f "$(command -v node)")")"
-          timeout --kill-after=30 1800 sudo -n -u octo-sandbox /usr/bin/env -i \
+          timeout --kill-after=30 1800 sudo -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i \
             PATH="$node_dir:/usr/bin:/bin" HOME=/tmp/octo-sandbox-home LANG=C.UTF-8 \
             NODE_PATH=/opt/pw/node_modules PLAYWRIGHT_BROWSERS_PATH=/opt/pw/browsers \
             "$node_dir/node" /opt/pw/scripts/web-audit/audit.mjs --site "$GITHUB_WORKSPACE/site" --out /tmp/octo-sandbox-home/out
@@ -149,32 +158,44 @@ jobs:
           # 0 = clean, 1 = findings (filed by the next job); anything else is the audit failing.
           [ "$rc" -le 1 ] || exit "$rc"
 
-      - name: Nothing of the audit is still running
+      - name: Nothing of the audit is still running, and nothing it could reach has changed
         if: always()
+        # The sandbox's last use: `end` kills every process of the sandbox user
+        # at once, locks the account, closes the site's checkout and removes a
+        # .git there (the build removed the site's own), which actions/checkout's
+        # post step would run git in.
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
-          sudo pkill -KILL -u octo-sandbox || true
+          job_path="$PATH"
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/site"
           sleep 1
           if pgrep -u octo-sandbox >/dev/null; then
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
           fi
+          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" verify
 
       - name: Take the results out of the sandbox (regular files only, size-capped)
         if: always() && steps.audit.outputs.rc != ''
-        # Nothing of the sandbox runs any more, so nothing can swap a file for a
-        # link between the check and the copy. find -P never follows links,
-        # starting point included; only findings.json and shots/*.png, by name.
+        # Nothing of the sandbox runs any more (the step above ended its cgroup),
+        # and nothing here follows a link: not on the way (the home, out, shots),
+        # not in find -P, not when reading (dd iflag=nofollow, as root). Only
+        # findings.json and shots/*.png, by name.
         run: |
           set -euo pipefail
-          src=/tmp/octo-sandbox-home/out dst="$RUNNER_TEMP/web-audit"
+          home=/tmp/octo-sandbox-home src=/tmp/octo-sandbox-home/out dst="$RUNNER_TEMP/web-audit"
           mkdir -p "$dst/shots"
-          if ! sudo test -d "$src" || sudo test -L "$src"; then echo "::warning::the audit left no output directory"; exit 0; fi
+          for d in "$home" "$src"; do
+            if ! sudo test -d "$d" || sudo test -L "$d"; then echo "::warning::the audit left no output directory"; exit 0; fi
+          done
+          if sudo test -L "$src/shots"; then echo "::error::the audit's shots directory is a link"; exit 1; fi
           sudo find -P "$src" -maxdepth 2 -type f -size -20M -print0 | while IFS= read -r -d '' f; do
             rel="${f#"$src"/}"
             [[ "$rel" =~ ^(findings\.json|shots/[A-Za-z0-9._-]+\.png)$ ]] || continue
             # The repo is private but this repo's artifacts are public: no
             # screenshots of the legal pages (they are the owner's to publish).
             [[ "$rel" =~ ^shots/(privacy|terms|refunds)-- ]] && continue
-            sudo cat -- "$f" > "$dst/$rel"
+            sudo dd if="$f" iflag=nofollow,nonblock status=none > "$dst/$rel"
           done
           [ -f "$dst/findings.json" ] || echo "::warning::the audit left no findings.json"
 
@@ -186,6 +207,14 @@ jobs:
           path: ${{ runner.temp }}/web-audit
           retention-days: 3
           if-no-files-found: ignore
+
+      - name: The sandbox user is ended, and the site's checkout has no .git for checkout's post step
+        if: always()
+        shell: /usr/bin/bash --noprofile --norc -e {0}
+        run: |
+          # Without the frozen Node's script, freeze never finished and no sandbox ran.
+          [ -f "$RUNNER_TEMP/frozen-node.sh" ] || exit 0
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/site"
 
   file:
     needs: audit

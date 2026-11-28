@@ -284,7 +284,16 @@ trusted:
   `astro check`, the consistency gate) runs only through `octo-check` as `octo-sandbox` — another
   user, without sudo, with an empty environment, that can't read the runner's processes — and the
   key is used only before the sandbox exists and after a step has killed every sandbox process and
-  checked that none survived. The web audit's read token is revoked (`if: always()`) and proved dead
+  checked that none survived. The release PR is split the same way: `promote.yml`'s `web-gate`
+  job runs the website's `build-crew-pricing.mjs`, `npm ci` and consistency gate as
+  `octo-sandbox` (inline, on a copy of the checkout without its `.git`) only after its one token
+  (contents read, minted in its first step) has cloned the site, left nothing in the clone and been
+  revoked, and hands only a patch and a result file (pass or fail, the failing checks' names) to
+  `web-version`. That job, on a fresh runner, runs
+  no code from either repo, checks the patch, applies it with git and opens the PR. Jobs that
+  run code as `octo-sandbox` (`web-gate`, `web-audit`'s `audit`) take Node from
+  `scripts/routines/frozen-node.sh`, a root-owned, read-only copy, instead of `setup-node`, and
+  run `frozen-node.sh verify` after the sandbox, before the runner executes anything else. The web audit's read token is revoked (`if: always()`) and proved dead
   before the build; the audit itself — whose Chromium runs the built site's JavaScript — also runs
   as `octo-sandbox`, from scripts and a browser installed root-owned in `/opt/pw` before the
   checkout, and only regular, size-capped `findings.json` and screenshots come back out of the

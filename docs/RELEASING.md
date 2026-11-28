@@ -73,21 +73,44 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
   now reports the version. Answering `promote <version>` in the daily ideas digest
   (VISION.md §9) dispatches exactly this workflow.
 
-  Its second job, `web-version`, then opens an octopush-web PR (`release/v<version>`)
-  that sets `src/data/release.ts` `VERSION` to the new stable and adds a changelog
-  entry for every release since the landing's last version, written from the
-  release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`). An
-  older `release/v*` PR still open is closed as superseded. The PM merges it
-  (VISION.md §8), or the owner does with `merge web#N`; until then the website's
-  consistency gate fails for web builds.
-  Its third job, `homebrew-tap`, renders `packaging/homebrew-tap/Casks/octopush.rb`
+  Its `homebrew-tap` job renders `packaging/homebrew-tap/Casks/octopush.rb`
   with the version and the `Octopush.dmg` sha256, checks it with `brew style` +
   `brew audit`, and pushes it to `octopush-sh/homebrew-tap` (see
-  [`DISTRIBUTION.md`](DISTRIBUTION.md) → "Homebrew cask"). Neither job can undo the
-  promotion.
-  If only `web-version` or `homebrew-tap` failed, use **Re-run failed jobs**: re-running
-  all jobs stops at promote's "not a prerelease" check, because the version is already
-  stable.
+  [`DISTRIBUTION.md`](DISTRIBUTION.md) → "Homebrew cask").
+  Two jobs then build the website's release PR (`release/v<version>`), after
+  `homebrew-tap` whatever its result, because the website's consistency gate checks
+  the cask:
+  - `web-gate` sets `src/data/release.ts` `VERSION` to the new stable, adds a
+    changelog entry for every release since the landing's last version, written
+    from the release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`),
+    and regenerates `src/data/crew-pricing.json` with the website's
+    `scripts/build-crew-pricing.mjs`, reading the app checked out at `v<version>`.
+    It then runs the website's `npm ci` and `npm run consistency` against that tag
+    (`OCTOPUSH_APP_DIR`, `OCTOPUSH_STABLE_VERSION=<version>`, `OCTOPUSH_STRICT_RELEASE=1`).
+    Its first step mints its only token (contents read, octopush-web alone); the job
+    clones with it, keeps no credential in the clone and revokes it, proved dead, or
+    fails. Only then does the website's code run, as `octo-sandbox` (see
+    [`ROUTINES.md`](ROUTINES.md) → the website lane). Only a patch of those three
+    files and a result file (pass or fail, and the failing checks' names) leave the
+    job. Its log is public, like every log of this repo's Actions: it shows the
+    version and pricing checks only (the gate's check lines and count), whose subjects
+    are public on the site; the website's files and install output stay on the runner.
+  - `web-version`, on a fresh runner that runs no code from either repo, checks the
+    patch: only the `VERSION` line, lines added to the changelog, and a
+    `crew-pricing.json` for this version. It applies the patch with git and opens or
+    refreshes the PR, with the result in its body: passed, or failed with the
+    failing checks' names and marked at the top so a person fixes them on the branch before
+    merging. A failed gate still opens the PR. It never force-pushes: if the branch
+    already has commits the job didn't make, it leaves the branch alone and says so
+    in the job summary.
+  An older `release/v*` PR still open is closed as superseded. The PM merges it
+  (VISION.md §8), or the owner does with `merge web#N`; until then the website's
+  consistency gate fails for web builds. None of these jobs can undo the promotion.
+  If only `homebrew-tap`, `web-gate` or `web-version` failed, use **Re-run failed jobs**:
+  re-running all jobs stops at promote's "not a prerelease" check, because the version
+  is already stable. Re-running a failed `homebrew-tap` re-runs the two website jobs
+  after it, which refreshes the PR and its gate result, unless someone has committed
+  to the branch.
 
   **Owner-only is enforced, once set up:** the job runs in the `stable` environment.
   Repo → Settings → Environments → New environment `stable` → *Required reviewers*:
