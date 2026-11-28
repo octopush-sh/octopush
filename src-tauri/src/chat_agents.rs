@@ -2507,7 +2507,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "theirs\n").unwrap();
         let provider = ScriptedProvider {
             turns: Mutex::new(VecDeque::from(vec![
-                resp("", vec![LlmToolUse { id: "t1".into(), name: "write_file".into(), input: serde_json::json!({ "path": "a.txt", "content": "mine\n" }) }], LlmStopReason::ToolUse),
+                resp("", vec![LlmToolUse { id: "t1".into(), name: "write_file".into(), input: serde_json::json!({ "path": "a.txt", "content": "mine\n" }), input_error: None }], LlmStopReason::ToolUse),
                 resp("done", vec![], LlmStopReason::EndTurn),
             ])),
         };

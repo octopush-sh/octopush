@@ -411,6 +411,11 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None, None);
     }
     let path = field("path");
+    // A file in the workspace that runs commands (`talk_guard::RUNS_CODE`)
+    // keeps its preview, and says so: its own Config card asks after this
+    // one (#1245).
+    let runs_code = matches!(name, "write_file" | "edit_file")
+        && reach.outside_card(None, name, input, false, &[]).is_some_and(|c| c.kind == CardKind::Config);
     let (reason, diff, bound) = match name {
         "write_file" | "edit_file" if !previewed(reach, name, input, &path) => {
             ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None, None)
@@ -1919,7 +1924,8 @@ mod tests {
             "tokio::task::spawn_blocking(move || shell.restart_strict(&tid, &wp, label)).await;",
             "true => shell.run_capture_read_only(&tid, &wp, &command, std::time::Duration::from_secs(600)),",
             "if held && pre_refused.is_none() {",
-            "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
+            "let card = crate::permissions::ask_card(None, &u.name, &u.input, &reach);",
+            "Some(why) => ToolCard { reason: format!(\"{} Even a command that only reads asks here: {why}.\", card.reason), ..card },",
             "if !reach.checked(&granted).await {",
             "match crate::permissions::guard_ask_first(card, &check, refused, ask).await {",
             "None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,",
