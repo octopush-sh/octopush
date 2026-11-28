@@ -716,6 +716,11 @@ mod tests {
     /// the turn its single shortened retry and leaves the reported window
     /// learned.
     fn retries_once(message: &str, prompt: Option<u64>, limit: Option<u64>) {
+        retries_once_after(ProviderErrorKind::BadRequest, message, prompt, limit);
+    }
+
+    /// [`retries_once`] for an error the provider classified as `kind`.
+    fn retries_once_after(kind: ProviderErrorKind, message: &str, prompt: Option<u64>, limit: Option<u64>) {
         assert!(is_context_overflow(message), "{message}");
         assert_eq!(overflow_figures(message), (prompt, limit), "{message}");
         let mut guard = ContextGuard::new(ContextBudget::for_model(Some(200_000), 8_000, None), Learned::default());
@@ -724,7 +729,7 @@ mod tests {
             messages.extend(round(&[format!("t{i}").as_str()], &[30_000], false));
         }
         guard.sent(0, &messages);
-        let e = provider_error(ProviderErrorKind::BadRequest, message);
+        let e = provider_error(kind, message);
         let first = guard.after_failure(&e, &mut messages, 0, &rows(3));
         let line = first.retry.as_deref().unwrap_or_default();
         assert!(line.starts_with("prompt too long for this model — shortened 2 earlier tool results"), "{first:?}");
@@ -741,6 +746,27 @@ mod tests {
             None,
             Some(8_192),
         );
+    }
+
+    /// LM Studio may answer the same overflow with a 500: the provider
+    /// classifies it as a bad request, so the guard answers it too. A
+    /// generic 500 stays a server error, left to the retry layer.
+    #[test]
+    fn lm_studio_overflow_answered_with_a_500_retries_once() {
+        let body = r#"{"error":{"message":"Trying to keep the first 9210 tokens when context the overflows. However, the model is loaded with context length of only 8192 tokens, which is not enough.","type":"internal_error","param":null,"code":"unknown"}}"#;
+        let kind = crate::providers::classify_status(500, None, None, body);
+        retries_once_after(kind, &format!("OpenAI-compat API error 500 Internal Server Error: {body}"), None, Some(8_192));
+
+        let generic = r#"{"error":{"message":"The model crashed while loading its context. Reload it and try again.","type":"internal_error","param":null,"code":"unknown"}}"#;
+        let kind = crate::providers::classify_status(500, None, None, generic);
+        assert_eq!(kind, ProviderErrorKind::ServerError);
+        let mut guard = ContextGuard::new(ContextBudget::for_model(Some(200_000), 8_000, None), Learned::default());
+        let mut messages = vec![user("go")];
+        messages.extend(round(&["t1"], &[30_000], false));
+        messages.extend(round(&["t2"], &[30_000], false));
+        guard.sent(0, &messages);
+        let e = provider_error(kind, &format!("OpenAI-compat API error 500 Internal Server Error: {generic}"));
+        assert_eq!(guard.after_failure(&e, &mut messages, 0, &rows(2)), AfterFailure { save: false, retry: None, stubbed: vec![] });
     }
 
     #[test]

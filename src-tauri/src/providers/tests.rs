@@ -1921,6 +1921,62 @@ mod cancellable {
         assert_eq!(classify_status(401, None, Some(true), "{}"), Auth);
     }
 
+    /// LM Studio's answer to a prompt too long for the loaded model, as a 500.
+    const LM_STUDIO_OVERFLOW_500: &str = r#"{"error":{"message":"Trying to keep the first 9210 tokens when context the overflows. However, the model is loaded with context length of only 8192 tokens, which is not enough.","type":"internal_error","param":null,"code":"unknown"}}"#;
+    /// A 500 that mentions the context but not that the prompt overflows it.
+    const GENERIC_500: &str = r#"{"error":{"message":"The model crashed while loading its context. Reload it and try again.","type":"internal_error","param":null,"code":"unknown"}}"#;
+
+    #[test]
+    fn a_500_that_says_the_prompt_is_too_long_is_a_bad_request() {
+        use super::super::classify_status;
+        use ProviderErrorKind::*;
+        assert_eq!(classify_status(500, None, None, LM_STUDIO_OVERFLOW_500), BadRequest);
+        // Only a 500, and only with an overflow wording.
+        assert_eq!(classify_status(500, None, None, GENERIC_500), ServerError);
+        assert_eq!(classify_status(503, None, None, LM_STUDIO_OVERFLOW_500), ServerError);
+        // Other statuses keep their kind, whatever the body.
+        assert_eq!(classify_status(400, None, None, LM_STUDIO_OVERFLOW_500), BadRequest);
+        assert_eq!(classify_status(413, None, None, LM_STUDIO_OVERFLOW_500), Other);
+    }
+
+    /// A whole 500 answer carrying `body`.
+    fn answered_500(body: &str) -> &'static str {
+        let response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        Box::leak(response.into_boxed_str())
+    }
+
+    #[tokio::test]
+    async fn a_500_overflow_fails_at_once_and_a_generic_500_stays_a_server_error() {
+        let provider = super::super::openai_compat::OpenAICompatibleProvider { provider: "custom".into() };
+        let cancel = AtomicBool::new(false);
+
+        let addr = test_server(Reply::Whole(answered_500(LM_STUDIO_OVERFLOW_500))).await;
+        let (client, base) = (remote_client(addr), format!("http://llm.test:{}/v1", addr.port()));
+        let (out, retries) = tokio::time::timeout(Duration::from_secs(5), call(&provider, &client, &base, &cancel, DEFAULT_MAX_RETRIES))
+            .await
+            .expect("an overflow is not retried with a backoff");
+        assert!(retries.lock().unwrap().is_empty(), "no wait announced");
+        let error = match out {
+            Completion::Failed { error, retries: 0 } => error,
+            other => panic!("expected a failure with no retry, got {other:?}"),
+        };
+        assert_eq!(error.provider_kind(), ProviderErrorKind::BadRequest, "{error}");
+        assert!(error.to_string().starts_with("OpenAI-compat API error 500"), "the status stays in the message: {error}");
+
+        // A generic 500 is still a server error, which the retry layer retries.
+        let addr = test_server(Reply::Whole(answered_500(GENERIC_500))).await;
+        let (client, base) = (remote_client(addr), format!("http://llm.test:{}/v1", addr.port()));
+        let (out, _) = tokio::time::timeout(Duration::from_secs(5), call(&provider, &client, &base, &cancel, 0)).await.expect("no retries asked");
+        let error = match out {
+            Completion::Failed { error, .. } => error,
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        assert_eq!(error.provider_kind(), ProviderErrorKind::ServerError, "{error}");
+    }
+
     #[test]
     fn should_retry_header_is_read_as_a_boolean() {
         use super::super::parse_should_retry;
