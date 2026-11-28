@@ -132,6 +132,7 @@ Current anchors:
 | `talk-crew-ending` | Talk crew card, on a finished sub-agent's row: its ending word (`stopped`, `turn limit`, `needs a decision`; only on a row that ended one of those ways; a tour finds the first) | `chat/CrewCard.tsx` |
 | `talk-error-action` | Talk: an error card's one action ("Try again", "Configure API key" or "Copy error details"; only on a turn that ended on an error, a tour finds the first) | `chat/ChatCanvas.tsx` |
 | `talk-tool-verdict` | Talk, on a resolved tool row that failed or was denied: its mono verdict after the summary (`exit 1`, `timed out`, `denied`; every such row carries it, a tour finds the first) | `ToolCallCard.tsx` |
+| `companion-project-servers` | Companion › Conversation, under "can use": the "project servers" row, one chip per server of the project's `.claude/mcp.json` with its state, and a revoke button on an approved one (only while the project defines one) | `CompanionProjectServers.tsx` |
 | `talk-approval` | Talk: an approval card waiting on you for a command the agent flagged (focused only by a click, Tab or ⌘⌥A, never by itself; with it focused, ⌘↵ approves and Esc denies; only while one waits) | `chat/ApprovalCard.tsx` |
 | `talk-approval-trust` | Talk: an MCP approval card's lasting answers, "Always allow this tool" and "Trust <server>" (only in Edit freely, on a tool not marked destructive, while the card waits) | `chat/ApprovalCard.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
@@ -185,6 +186,7 @@ Current anchors:
 | `settings-integrations-epiku` · `settings-epiku-status` | Settings › Integrations › Issue tracking: the Epiku entry in the tracker list · its connection status line ("Connected · 2 stories", only once Epiku is selected) | `settings/IssueTrackingSection.tsx` |
 | `project-issue-tracker` | Project menu › Issue tracking…, while open: the Jira · Epiku · None choice | `JiraProjectKeyModal.tsx` |
 | `settings-mcp-servers` · `settings-mcp-trust` | Settings › Integrations › MCP Servers: the whole section · a server's trust lines with their revoke buttons (only with something trusted) | `settings/McpServersSection.tsx` |
+| `settings-mcp-project-approvals` | Settings › Integrations, under MCP Servers: "Approved project servers", each with its revoke button (only while one is approved) | `settings/ProjectMcpApprovals.tsx` |
 | `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
 | `settings-mcp-edit` | Settings › Integrations › MCP Servers: the first server's Edit icon button (only with a server configured and no form open on it) | `settings/McpServersSection.tsx` |
 | `settings-mcp-add` · `settings-mcp-type` | Settings › Integrations › MCP Servers: "Add MCP server" (disabled while a form is open) · the open form's Local command / Remote URL choice (only while the add or edit form is open) | `settings/McpServersSection.tsx` · `settings/McpServerForm.tsx` |

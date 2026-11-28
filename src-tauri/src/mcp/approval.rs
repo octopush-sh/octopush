@@ -325,6 +325,21 @@ mod tests {
     }
 
     #[test]
+    fn settings_lists_each_approval_with_its_project_until_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("app.db")).unwrap();
+        db.insert_project("p1", "Sample", "/tmp/sample").unwrap();
+        db.approve_project_mcp_server("p1", "docs", "h1").unwrap();
+        let listed = db.list_project_mcp_approvals().unwrap();
+        assert_eq!(
+            listed.iter().map(|a| (a.project_id.as_str(), a.project_name.as_str(), a.server.as_str())).collect::<Vec<_>>(),
+            [("p1", "Sample", "docs")]
+        );
+        assert!(db.revoke_project_mcp_server("p1", "docs").unwrap());
+        assert!(db.list_project_mcp_approvals().unwrap().is_empty());
+    }
+
+    #[test]
     fn the_card_shows_the_exact_argv_with_nothing_hidden() {
         let dir = tempfile::tempdir().unwrap();
         let pad = " ".repeat(300);
