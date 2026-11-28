@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { currentVersion, bumpReleaseTs, versionsBetween, changelogEntry, changelogDate, insertEntries, apply, plain } from "./web-version.mjs";
+import { spawnSync } from "node:child_process";
+import { currentVersion, bumpReleaseTs, versionsBetween, changelogEntry, changelogDate, insertEntries, apply, plain, gateResult, releasePrBody } from "./web-version.mjs";
 
 const BODY = `## Octopush 0.4.93
 
@@ -114,4 +115,69 @@ test("a folded beta is labelled Beta and a stable the landing skipped stays Stab
   assert.ok(log.includes('## v0.4.96\n\n<p class="changelog-date">Stable <time datetime="2026-11-25">'), "the promoted version");
   assert.ok(log.includes('## v0.4.95\n\n<p class="changelog-date">Stable <time datetime="2026-11-24">'), "a stable the landing skipped");
   assert.ok(log.includes('## v0.4.94\n\n<p class="changelog-date">Beta <time datetime="2026-11-23">'), "a beta folded into the stable");
+});
+
+// What octopush-web's scripts/consistency-check.mjs prints (colours included).
+const GATE_OK = "\n── Launch consistency gate ──\n\n\x1b[32m✓\x1b[0m landing VERSION = 0.4.153\n\x1b[33m▸\x1b[0m dist/ not built — skipping the copy gate (run npm run build first)\n\n41 passed · 0 failed · 1 skipped\n\n";
+const GATE_BAD = "\x1b[32m✓\x1b[0m landing VERSION = 0.4.153\n\x1b[31m✗\x1b[0m src/data/crew-pricing.json drifts from the stable app v0.4.153: $.prices.x: committed 1 != stable 2.\n\x1b[31m✗\x1b[0m Homebrew cask is at 0.4.152, VERSION in src/data/release.ts is 0.4.153: the tap lags\n\n39 passed · 2 failed · 1 skipped\n\nNote: until the first GitHub release is published…\n";
+const CREW_LOG = "wrote src/data/crew-pricing.json from octopush v0.4.153 (OCTOPUSH_STABLE_VERSION): 14 prices, 9 catalog models, 6 roles, 4 presets, reference claude-fable-5-2\n";
+
+test("the gate's verdict: passed, failed with its ✗ lines, broken before its checks, or never run", () => {
+  assert.deepEqual(gateResult(GATE_OK, "0"), { state: "passed", summary: "41 passed · 0 failed · 1 skipped", failed: [], tail: [] });
+  const bad = gateResult(GATE_BAD, "1");
+  assert.equal(bad.state, "failed");
+  assert.equal(bad.summary, "39 passed · 2 failed · 1 skipped");
+  assert.equal(bad.failed.length, 2);
+  assert.match(bad.failed[0], /^✗ src\/data\/crew-pricing\.json drifts/);
+  assert.doesNotMatch(bad.failed.join("\n"), /\x1b/, "no terminal colours in the PR");
+  const npm = gateResult("npm error code ECONNRESET\nnpm error network aborted\n", "1");
+  assert.equal(npm.state, "failed");
+  assert.deepEqual(npm.tail, ["npm error code ECONNRESET", "npm error network aborted"], "no ✗ line: the end of the log instead");
+  for (const rc of ["", undefined, null]) assert.equal(gateResult(GATE_BAD, rc).state, "missing");
+  assert.equal(gateResult("", "124").state, "failed", "a timeout is a failure");
+});
+
+test("the release PR body: a passed gate and a regenerated crew pricing", () => {
+  const body = releasePrBody({ version: "0.4.153", pr: "250", gate: gateResult(GATE_OK, "0"),
+    crew: { rc: "0", log: CREW_LOG, changed: true, shaBefore: "a", shaAfter: "a" }, runUrl: "https://github.com/o/r/actions/runs/1" });
+  assert.match(body, /^v0\.4\.153 was promoted to stable/, "no alert when the gate passed");
+  assert.match(body, /Reply `merge web#250` in the digest to publish it\./);
+  assert.match(body, /regenerated `src\/data\/crew-pricing\.json` from the app at `v0\.4\.153`; this PR carries the change\./);
+  assert.match(body, /wrote src\/data\/crew-pricing\.json from octopush v0\.4\.153/);
+  assert.doesNotMatch(body, /sourceSha256/, "the estimator source didn't change");
+  assert.match(body, /### Consistency gate\n\n\*\*Passed\*\*: `npm run consistency` with `OCTOPUSH_APP_DIR` set to the app checked out at `v0\.4\.153`, `OCTOPUSH_STABLE_VERSION=0\.4\.153` and `OCTOPUSH_STRICT_RELEASE=1`.*\(\[run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/1\)\)\. 41 passed · 0 failed · 1 skipped\./);
+  assert.match(releasePrBody({ version: "0.4.153", pr: "250", gate: gateResult(GATE_OK, "0"), crew: { rc: "0", log: CREW_LOG, changed: false } }), /: no change\./);
+});
+
+test("the release PR body: a failed gate is marked at the top and lists its failing checks", () => {
+  const body = releasePrBody({ version: "0.4.153", pr: "250", gate: gateResult(GATE_BAD, "1"), crew: { rc: "0", log: CREW_LOG, changed: true, shaBefore: "a", shaAfter: "b" } });
+  assert.match(body, /^> \[!CAUTION\]\n> \*\*The consistency gate failed\*\* with the app at `v0\.4\.153`\./);
+  assert.match(body, /Once the gate passes, reply `merge web#250`/);
+  assert.match(body, /\*\*Failed\*\*: .*39 passed · 2 failed · 1 skipped\.\n\n````text\n✗ src\/data\/crew-pricing\.json drifts[^\n]*\n✗ Homebrew cask is at 0\.4\.152[^\n]*\n````/);
+  assert.match(body, /> \[!IMPORTANT\]\n> `estimator\.sourceSha256` changed: .*`src\/lib\/crewEstimate\.ts`/, "a changed estimator source asks for the TS mirror");
+  const many = gateResult(Array.from({ length: 60 }, (_, i) => `✗ check ${i}`).join("\n"), "1");
+  assert.match(releasePrBody({ version: "0.4.153", pr: "1", gate: many }), /✗ check 39\n… 20 more lines in the run log\n````/, "capped at 40 lines");
+});
+
+test("the release PR body: a crew pricing that could not be regenerated, and a gate that never ran", () => {
+  const body = releasePrBody({ version: "0.4.153", pr: "250", gate: gateResult("", ""), crew: { rc: "1", log: "build-crew-pricing: builtin_prices not found\n" } });
+  assert.match(body, /^> \[!WARNING\]\n> \*\*The consistency gate did not run\*\*\. Run `OCTOPUSH_APP_DIR=\.\.\/octopush OCTOPUSH_STABLE_VERSION=0\.4\.153 npm run consistency`/);
+  assert.match(body, /\*\*Could not be regenerated\*\* from the app at `v0\.4\.153` \(exit 1\); the file is unchanged\..*\n\n````text\nbuild-crew-pricing: builtin_prices not found\n````/);
+  assert.match(body, /### Consistency gate\n\n\*\*Did not run\*\*/);
+  assert.match(releasePrBody({ version: "0.4.153", pr: "250", gate: gateResult("", ""), crew: { rc: "" } }), /\*\*Not regenerated\*\*: the step did not run\./);
+});
+
+test("web-version.mjs body reads its inputs from the environment", () => {
+  const dir = mkdtempSync(join(tmpdir(), "webv-"));
+  writeFileSync(join(dir, "gate.log"), GATE_BAD);
+  writeFileSync(join(dir, "crew.log"), CREW_LOG);
+  const script = new URL("./web-version.mjs", import.meta.url).pathname;
+  const env = { PATH: process.env.PATH, GATE_LOG: join(dir, "gate.log"), GATE_RC: "1", CREW_LOG: join(dir, "crew.log"), CREW_RC: "0", CREW_CHANGED: "1", CREW_SHA_BEFORE: "a", CREW_SHA_AFTER: "a", RUN_URL: "https://x/runs/9" };
+  const r = spawnSync(process.execPath, [script, "body", "0.4.153", "250"], { encoding: "utf8", env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^> \[!CAUTION\]/);
+  assert.match(r.stdout, /this PR carries the change/);
+  assert.match(r.stdout, /\(\[run\]\(https:\/\/x\/runs\/9\)\)/);
+  assert.equal(spawnSync(process.execPath, [script, "body", "0.4", "250"], { encoding: "utf8", env }).status, 64);
+  assert.equal(spawnSync(process.execPath, [script, "body", "0.4.153", "x"], { encoding: "utf8", env }).status, 64);
 });

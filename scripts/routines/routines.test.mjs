@@ -1054,6 +1054,53 @@ test("workflows: website code runs only as octo-sandbox, and the App key only ou
   assert.match(build, /pgrep -u octo-sandbox/);
 });
 
+test("workflows: promote's website PR regenerates the crew pricing and runs the gate against the promoted tag, as octo-sandbox (#1178)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const wf = readFileSync(new URL("../../.github/workflows/promote.yml", import.meta.url), "utf8");
+  const job = wf.slice(wf.indexOf("\n  web-version:\n"), wf.indexOf("\n  homebrew-tap:\n"));
+  const live = job.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+  /** One step, from its `- name:` line to the next step. */
+  const step = (name) => { const i = live.indexOf(`- name: ${name}`); assert.ok(i > 0, name); const j = live.indexOf("\n      - ", i + 1); return live.slice(i, j < 0 ? undefined : j); };
+  // After the tap (the gate reads its cask), whatever the tap's result, never after a failed promotion.
+  assert.match(live, /\n    needs: \[promote, homebrew-tap\]\n    if: \$\{\{ !cancelled\(\) && needs\.promote\.result == 'success' \}\}\n/);
+  assert.match(live, /\n    permissions:\n      contents: read /, "no wider permissions");
+  // The app at the promoted tag, in its own directory, without credentials.
+  assert.match(live, /uses: actions\/checkout@v7\n        with:\n          ref: refs\/tags\/v\$\{\{ github\.event\.inputs\.version \}\}\n          path: app-stable\n          persist-credentials: false\n/);
+  for (const [, action, ref] of wf.matchAll(/uses: (\S+)@(\S+)/g)) {
+    assert.equal(ref, { "actions/checkout": "v7", "actions/setup-node": "v7", "actions/create-github-app-token": "v3" }[action], `${action} pinned like the rest of the file`);
+  }
+  const gate = step("Crew pricing and the consistency gate");
+  assert.doesNotMatch(gate, /TOKEN|secrets\.|github\.token/, "no token in the sandbox step");
+  assert.match(gate, /OCTO_CHECK_PROFILE=web OCTOPUSH_CHECKOUT="\$gate" bash scripts\/routines\/agent-sandbox-setup\.sh/);
+  assert.match(gate, /rm -rf "\$gate\/\.git"/, "the sandbox never gets the .git that is pushed");
+  assert.match(gate, /timeout --kill-after=15 "\$secs" sudo -n -u octo-sandbox \/usr\/bin\/env -i \\\n/);
+  assert.match(gate, /OCTOPUSH_APP_DIR="\$app" OCTOPUSH_STABLE_VERSION="\$VERSION" OCTOPUSH_STRICT_RELEASE=1/);
+  assert.match(gate, /GIT_CONFIG_KEY_0=safe\.directory GIT_CONFIG_VALUE_0="\$app"/, "git reads the runner's checkout as another user");
+  assert.match(gate, /sandbox 120 node scripts\/build-crew-pricing\.mjs 2>&1 \| tee "\$RUNNER_TEMP\/crew\.log" \|\| crew=\$\?/);
+  assert.match(gate, /sandbox 600 bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent consistency' 2>&1 \| tee "\$RUNNER_TEMP\/gate\.log" \|\| rc=\$\?/, "a failed gate is recorded, not fatal");
+  // The website's code runs nowhere else in the job.
+  for (const re of [/build-crew-pricing/g, /npm ci/g, /npm run/g]) assert.equal((live.match(re) ?? []).length, 1, `${re} only inside the sandbox`);
+  // The App key only before the sandbox exists; nothing is pushed unless every sandbox process is gone.
+  const setupAt = live.indexOf("agent-sandbox-setup.sh");
+  for (let i = live.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = live.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) assert.ok(i < setupAt, "the App key appears only before the sandbox");
+  const gone = step("Nothing of the website's code is still running");
+  assert.match(gone, /if: always\(\)/);
+  assert.match(gone, /pgrep -u octo-sandbox[^\n]*\n[^\n]*exit 1/);
+  const pr = step("Open the web version PR");
+  assert.match(pr, /if: \$\{\{ !cancelled\(\) && steps\.bump\.outcome == 'success' && steps\.sandbox-gone\.outcome == 'success' \}\}/);
+  assert.ok(live.indexOf("- name: Web token") < live.indexOf("id: bump") && live.indexOf("id: bump") < setupAt && setupAt < live.indexOf("id: sandbox-gone") && live.indexOf("id: sandbox-gone") < live.indexOf("- name: Open the web version PR"));
+  // Only the regenerated JSON comes back: a plain file at exactly its path.
+  assert.match(pr, /src="\$\(realpath -e "\$gate\/\$crew_json" 2>\/dev\/null \|\| true\)"\n\s+if \[ "\$src" = "\$gate\/\$crew_json" \] && \[ -f "\$src" \] && \[ "\$\(stat -c %s "\$src"\)" -lt 2000000 \]/);
+  assert.match(pr, /withtoken git -C "\$web" -c core\.hooksPath=\/dev\/null push /);
+  assert.match(pr, /node scripts\/web-version\.mjs body "\$VERSION" "\$new" > "\$RUNNER_TEMP\/pr-body\.md"/);
+  assert.match(pr, /webapi -X PATCH "repos\/\$WEB\/pulls\/\$new" -F body=@"\$RUNNER_TEMP\/pr-body\.md"/);
+  // Tokens reach git through the environment only, and expressions reach scripts only through env:.
+  assert.doesNotMatch(live, /x-access-token:\$\{\{|https:\/\/[^\s"]*@github\.com/);
+  const runs = [...live.matchAll(/\n(\s+)run: \|\n((?:\1  [^\n]*\n|[ \t]*\n)*)/g)];
+  assert.ok(runs.length >= 4, "run blocks found");
+  for (const m of runs) assert.doesNotMatch(m[2], /\$\{\{/, "an expression inside a run: block");
+});
+
 test("octo-check web: install, site, routes; build and all fail on a dist that shadows /download, /api or /update", async () => {
   const { spawnSync } = await import("node:child_process");
   const { readFileSync, mkdirSync } = await import("node:fs");

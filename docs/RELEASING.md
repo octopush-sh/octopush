@@ -73,21 +73,32 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
   now reports the version. Answering `promote <version>` in the daily ideas digest
   (VISION.md §9) dispatches exactly this workflow.
 
-  Its second job, `web-version`, then opens an octopush-web PR (`release/v<version>`)
-  that sets `src/data/release.ts` `VERSION` to the new stable and adds a changelog
-  entry for every release since the landing's last version, written from the
-  release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`). An
-  older `release/v*` PR still open is closed as superseded. The PM merges it
-  (VISION.md §8), or the owner does with `merge web#N`; until then the website's
-  consistency gate fails for web builds.
-  Its third job, `homebrew-tap`, renders `packaging/homebrew-tap/Casks/octopush.rb`
+  Its `homebrew-tap` job renders `packaging/homebrew-tap/Casks/octopush.rb`
   with the version and the `Octopush.dmg` sha256, checks it with `brew style` +
   `brew audit`, and pushes it to `octopush-sh/homebrew-tap` (see
-  [`DISTRIBUTION.md`](DISTRIBUTION.md) → "Homebrew cask"). Neither job can undo the
-  promotion.
+  [`DISTRIBUTION.md`](DISTRIBUTION.md) → "Homebrew cask").
+  Its `web-version` job runs after it, whatever its result, because the website's
+  consistency gate checks the cask. It opens an octopush-web PR (`release/v<version>`)
+  that sets `src/data/release.ts` `VERSION` to the new stable, adds a changelog
+  entry for every release since the landing's last version, written from the
+  release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`), and
+  regenerates `src/data/crew-pricing.json` with the website's
+  `scripts/build-crew-pricing.mjs`, reading the app checked out at `v<version>`.
+  It then runs the website's `npm ci` and `npm run consistency` against that tag
+  (`OCTOPUSH_APP_DIR`, `OCTOPUSH_STABLE_VERSION=<version>`,
+  `OCTOPUSH_STRICT_RELEASE=1`) and puts the result in the PR body: passed, or
+  failed with the failing checks, marked at the top so a person fixes them on the
+  branch before merging. A failed gate still opens the PR. The website's scripts
+  run as the unprivileged `octo-sandbox` user, with no token, on a copy of the
+  checkout without its `.git` (see [`ROUTINES.md`](ROUTINES.md) → the website lane);
+  only the regenerated JSON comes back out. An older `release/v*` PR still open is
+  closed as superseded. The PM merges it (VISION.md §8), or the owner does with
+  `merge web#N`; until then the website's consistency gate fails for web builds.
+  Neither job can undo the promotion.
   If only `web-version` or `homebrew-tap` failed, use **Re-run failed jobs**: re-running
   all jobs stops at promote's "not a prerelease" check, because the version is already
-  stable.
+  stable. Re-running a failed `homebrew-tap` re-runs `web-version` after it, which
+  refreshes the PR and its gate result.
 
   **Owner-only is enforced, once set up:** the job runs in the `stable` environment.
   Repo → Settings → Environments → New environment `stable` → *Required reviewers*:
