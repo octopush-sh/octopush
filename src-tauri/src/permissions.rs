@@ -833,13 +833,33 @@ fn venv_activate(path: &str) -> bool {
     workspace_path(&w) && (path == "bin/activate" || path.ends_with("/bin/activate"))
 }
 
-/// The simple commands of `command` when its shape is plain: joined by `|`,
-/// `&&`, `||`, `;` or newlines; every word bare, `'single'`, or `"double"`
-/// with no `$`, backtick, backslash or `!`; no brace expansion (`{}` alone,
-/// as `find -exec` takes it, is a word); no `<` of any kind, `(`, `)` or a
-/// lone `&`; and only `>/dev/null`, `2>/dev/null`, `2>&1`, and `>`/`>>` to a
+/// The characters a command [`plain_shape`] never holds: every way into an
+/// expansion (`$`, a backtick, `{` and `}` of a brace expansion), quoting
+/// that changes what the next character means (`\`), history expansion
+/// (`!`), and a here-document (`<<`, checked as a pair).
+const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!'];
+
+/// Whether `command` has a plain shape: none of [`NOT_PLAIN`] anywhere in
+/// its raw text, quoted or not, and no `<<`. A whitelist on purpose, not a
+/// list of tricks: bash builds code from many shapes a check doesn't model
+/// (`{$,}{PWD:_}` makes `${PWD:_}` by brace expansion, whose arithmetic runs
+/// the command `$_` holds after `echo $'a[\x24(touch x)]'`), and each new one
+/// was a bypass. Without these characters no expansion, substitution or
+/// line join can happen, so what the check reads is what runs. Ask first's
+/// readers need the same shape (#1267): one function for both. Pure.
+pub fn plain_shape(command: &str) -> bool {
+    !command.contains(NOT_PLAIN) && !command.contains("<<")
+}
+
+/// The simple commands of `command` when it is plain: of [`plain_shape`];
+/// joined by `|`, `&&`, `||`, `;` or newlines; words bare, `'single'` or
+/// `"double"`; no `<` of any kind, `(`, `)` or a lone `&`; and only
+/// `>/dev/null`, `2>/dev/null`, `2>&1`, and `>`/`>>` to a
 /// [`workspace_path`]. `None` when it isn't.
 fn plain_commands(command: &str) -> Option<Vec<Vec<PlainWord>>> {
+    if !plain_shape(command) {
+        return None;
+    }
     let chars: Vec<char> = command.chars().collect();
     let boundary = |j: usize| chars.get(j).is_none_or(|c| c.is_whitespace() || ";|&<>()".contains(*c));
     let mut commands: Vec<Vec<PlainWord>> = vec![Vec::new()];
@@ -900,7 +920,7 @@ fn plain_commands(command: &str) -> Option<Vec<Vec<PlainWord>>> {
                 };
             }
             c if c.is_whitespace() => i += 1,
-            '<' | '(' | ')' | '$' | '`' | '\\' | '!' => return None,
+            '<' | '(' | ')' => return None,
             '#' if word.is_none() => {
                 while chars.get(i).is_some_and(|c| *c != '\n') {
                     i += 1;
@@ -915,21 +935,10 @@ fn plain_commands(command: &str) -> Option<Vec<Vec<PlainWord>>> {
             }
             '"' => {
                 let end = (i + 1..chars.len()).find(|&j| chars[j] == '"')?;
-                if chars[i + 1..end].iter().any(|c| "$`\\!".contains(*c)) {
-                    return None;
-                }
                 let w = word.get_or_insert_with(|| PlainWord { starts_quoted: true, ..PlainWord::default() });
                 w.quoted = true;
                 w.text.extend(&chars[i + 1..end]);
                 i = end + 1;
-            }
-            '{' | '}' => {
-                if c == '{' && word.is_none() && next == Some('}') && boundary(i + 2) {
-                    word = Some(PlainWord { text: "{}".into(), ..PlainWord::default() });
-                    i += 2;
-                } else {
-                    return None;
-                }
             }
             c => {
                 let w = word.get_or_insert_with(PlainWord::default);
@@ -2773,6 +2782,15 @@ mod tests {
             "fc -s status=push",
             "{git,push,origin,HEAD}",
             "/usr/bin/gi? push",
+            // Brace expansion builds `${PWD:_}`, whose arithmetic runs `$_`.
+            "echo $'a[\\x24(touch x)]'; echo {$,}{PWD:_}",
+            // No `$`, backtick, brace, backslash or `!`, even quoted.
+            "echo '$HOME'",
+            "echo 'a{b,c}'",
+            "curl -X POST http://localhost:3000/x -d '{\"a\":1}'",
+            "find . -name '*.ts' -exec grep -n TODO {} +",
+            "echo 'a\\b'",
+            "echo 'hi!'",
             // Expansions, nesting and the rest of the shape rules.
             "echo $(whoami)",
             "echo \"$HOME\"",
@@ -2823,7 +2841,7 @@ mod tests {
             ". venv/bin/activate && pytest -q",
             "cd app && npm ci && npm test",
             "git commit -m \"fix: keep the return path\"",
-            "curl -X POST http://localhost:3000/api/x -H 'Content-Type: application/json' -d '{\"a\":1}'",
+            "curl -X POST http://localhost:3000/api/x -H 'Content-Type: application/json' -d @body.json",
             "ls src/*.ts",
             "npm run build > build.log 2>&1",
             "npm test >> logs/test.log",
@@ -2833,7 +2851,6 @@ mod tests {
             "bash scripts/test.sh",
             "NODE_ENV=test npm test",
             "grep -rn TODO src || true",
-            "find . -name '*.ts' -exec grep -n TODO {} +",
             "npm test # the unit suite",
             "git status\ngit diff --stat",
         ] {
