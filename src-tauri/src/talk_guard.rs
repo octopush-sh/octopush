@@ -1753,26 +1753,26 @@ const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
 /// When a program runs a string as commands (#1208, [`RUNS_STRINGS`]).
 enum Takes {
-    /// Its arguments, whatever its flags (`eval`, `watch`, `alias`).
+    /// Its arguments, whatever its flags (`eval`, `alias`).
     Always,
     /// With one of these short flags or long ones (`sh -c`, `env -S`).
     With(&'static str, &'static [&'static str]),
 }
 
-/// Every program the check knows to run a string, or its other arguments,
-/// as commands, in one place (#1208): the code-string rule
-/// ([`code_names_walker`]) reads all of them. `.` counts only as the
-/// command's program; a shell also when `xargs`, `find -exec` or `fd -x`
-/// runs it, or it reads its input; and a function definition (`NAME()`,
-/// `function NAME`) has its whole line read as its body.
+/// Every program the check knows to run a string as commands, in one
+/// place (#1208): the code-string rule ([`code_names_walker`]) reads all of
+/// them. `.` counts only as the command's program; a shell also when it
+/// reads its input; and a function definition (`NAME()`, `function NAME`)
+/// has its whole line read as its body. A program that runs its other
+/// words as a command (`timeout 30 cmd`, `xargs cmd`, `watch cmd`) is a
+/// wrapper instead ([`WRAPPERS`]).
 const RUNS_STRINGS: &[(&str, Takes)] = &[
     ("eval", Takes::Always),
     ("source", Takes::Always),
     (".", Takes::Always),
     ("alias", Takes::Always),
     ("function", Takes::Always),
-    ("watch", Takes::Always),
-    ("script", Takes::Always),
+    ("script", Takes::With("c", &["--command"])),
     ("parallel", Takes::Always),
     ("sh", Takes::With("c", &[])),
     ("bash", Takes::With("c", &[])),
@@ -1807,12 +1807,11 @@ fn code_in(line: &str, words: &[CommandWord], depth: usize) -> bool {
     let defines = DEFINES.get_or_init(|| regex::Regex::new(r"(?:^|[\s;&|({])[A-Za-z_][A-Za-z0-9_.:-]*[ \t]*\([ \t]*\)").unwrap());
     let name = |w: &CommandWord| unescape(&w.pattern).rsplit('/').next().unwrap_or_default().to_string();
     let asks = |code: String| depth >= 4 || code_asks(&code, depth + 1);
-    let joined = |ws: &[CommandWord], skip: Option<usize>| {
-        ws.iter().enumerate().filter(|(k, _)| Some(*k) != skip).map(|(_, w)| w.word.as_str()).collect::<Vec<_>>().join(" ")
-    };
-    // A function definition: its body may span the line.
+    let joined = |ws: &[CommandWord]| ws.iter().map(|w| w.word.as_str()).collect::<Vec<_>>().join(" ");
+    // A function definition: its body may span the line, read as it is
+    // written there.
     let function = defines.is_match(&unquoted(line)) || words.iter().any(|w| w.role == WordRole::Program && name(w) == "function");
-    if function && asks(joined(words, None)) {
+    if function && words_ask(words) {
         return true;
     }
     let mut from = 0;
@@ -1820,7 +1819,6 @@ fn code_in(line: &str, words: &[CommandWord], depth: usize) -> bool {
         let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
         let seg = &words[from..to];
         let names: Vec<String> = seg.iter().map(name).collect();
-        let fed = names.iter().any(|n| matches!(n.as_str(), "xargs" | "find" | "fd"));
         for (k, w) in seg.iter().enumerate() {
             if w.role == WordRole::Data {
                 continue;
@@ -1833,22 +1831,25 @@ fn code_in(line: &str, words: &[CommandWord], depth: usize) -> bool {
             // that gives it (with what the flag holds after an `=`).
             let code = match takes {
                 Takes::Always if n == "alias" => Some(rest.iter().map(|o| o.word.split_once('=').map_or(o.word.as_str(), |(_, v)| v)).collect::<Vec<_>>().join(" ")),
-                Takes::Always => Some(joined(rest, None)),
+                Takes::Always => Some(joined(rest)),
                 Takes::With(short, long) => {
                     let at = rest.iter().position(|o| short_flag(&o.word, short) || long.iter().any(|l| long_option(&o.word, l, &[]).is_some()));
                     match at {
                         Some(f) => {
                             let held = rest[f].word.split_once('=').filter(|_| rest[f].word.starts_with("--")).map_or("", |(_, v)| v);
-                            Some(format!("{held} {}", joined(&rest[f + 1..], None)))
+                            Some(format!("{held} {}", joined(&rest[f + 1..])))
                         }
-                        None => (shell && fed).then(|| joined(rest, None)),
+                        None => None,
                     }
                 }
             };
             if code.is_some_and(&asks) {
                 return true;
             }
-            if shell && w.role == WordRole::Program && (w.stdin || w.inline) && asks(joined(words, Some(from + k))) {
+            // A shell reading its input runs what the rest of the line
+            // gives it: each word written to it (`echo '…' | sh`) and each
+            // line of a here-document, read as a line of commands.
+            if shell && w.role == WordRole::Program && (w.stdin || w.inline) && asks(input_lines(words, from + k)) {
                 return true;
             }
         }
@@ -1865,9 +1866,42 @@ fn code_in(line: &str, words: &[CommandWord], depth: usize) -> bool {
 /// ([`WALK_FLAGS`]), or such code of its own.
 fn code_asks(code: &str, depth: usize) -> bool {
     let words = crate::chat_engine::command_words(code);
-    let walking = walking_segments(&words);
-    let follows = following_segments(&words, &walking).iter().any(|f| f.links);
-    follows || (words.iter().any(unknown_word) && words.iter().any(walk_flag)) || code_in(code, &words, depth)
+    words_ask(&words) || code_in(code, &words, depth)
+}
+
+/// [`code_asks`] for code already read into `words`, without its own
+/// strings.
+fn words_ask(words: &[CommandWord]) -> bool {
+    let walking = walking_segments(words);
+    let follows = following_segments(words, &walking).iter().any(|f| f.links);
+    follows || (words.iter().any(unknown_word) && words.iter().any(walk_flag))
+}
+
+/// What a shell reading its input (the word at `shell`) may run (#1208):
+/// each argument of the rest of the line on a line of its own, and each
+/// line of a here-document as written. Programs are left out.
+fn input_lines(words: &[CommandWord], shell: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut data: Option<(usize, String)> = None;
+    for w in words.iter().enumerate().filter(|&(k, w)| k != shell && w.role != WordRole::Program).map(|(_, w)| w) {
+        if w.role == WordRole::Data {
+            match &mut data {
+                Some((segment, line)) if *segment == w.segment => {
+                    line.push(' ');
+                    line.push_str(&w.word);
+                }
+                _ => {
+                    lines.extend(data.take().map(|(_, l)| l));
+                    data = Some((w.segment, w.word.clone()));
+                }
+            }
+        } else {
+            lines.extend(data.take().map(|(_, l)| l));
+            lines.push(w.word.clone());
+        }
+    }
+    lines.extend(data.map(|(_, l)| l));
+    lines.join("\n")
 }
 
 /// A word the check can't know (#1208): an expansion it doesn't model, a
@@ -1883,9 +1917,90 @@ fn walk_flag(w: &CommandWord) -> bool {
     w.role != WordRole::Data && (short_flag(&w.word, WALK_FLAGS.0) || WALK_FLAGS.1.iter().any(|l| long_option(&w.word, l, &[]).is_some()))
 }
 
-/// Programs that run the next program they're given: a program named at
-/// run time after one of them is still named at run time.
-const WRAPPERS: &[&str] = &["sudo", "doas", "env", "nice", "nohup", "time", "timeout", "xargs", "command", "exec", "builtin", "caffeinate", "stdbuf"];
+/// Programs that run their other words as a command (argv, not a string;
+/// #1208), the short flags of theirs that take a value, and how many plain
+/// words come before the command (`timeout 30 cmd`, BSD's `script file
+/// cmd`). A wrapper is unwrapped ([`unwrapped`]): the command it runs is
+/// read like any other.
+const WRAPPERS: &[(&str, &str, usize)] = &[
+    ("sudo", "CDghpRrtTUu", 0),
+    ("doas", "uC", 0),
+    ("env", "uCPS", 0),
+    ("nice", "n", 0),
+    ("nohup", "", 0),
+    ("time", "fo", 0),
+    ("timeout", "sk", 1),
+    ("xargs", "IJLnPsdEaRS", 0),
+    ("command", "", 0),
+    ("exec", "a", 0),
+    ("builtin", "", 0),
+    ("caffeinate", "wt", 0),
+    ("stdbuf", "ioe", 0),
+    ("watch", "n", 0),
+    ("script", "cFt", 1),
+    // Reserved words before a command, read the same way.
+    ("{", "", 0),
+    ("!", "", 0),
+    ("if", "", 0),
+    ("then", "", 0),
+    ("else", "", 0),
+    ("elif", "", 0),
+    ("do", "", 0),
+    ("while", "", 0),
+    ("until", "", 0),
+];
+
+/// The index in `seg` of the command a word at `at` runs once its wrappers
+/// are unwrapped (#1208, [`WRAPPERS`]): past their flags (and the values
+/// of those that take one), `NAME=value` for `env`, and their plain words.
+/// `None` when nothing follows.
+fn unwrapped(seg: &[&CommandWord], at: usize) -> Option<usize> {
+    let mut k = at;
+    for _ in 0..8 {
+        let name = unescape(&seg.get(k)?.pattern).rsplit('/').next().unwrap_or_default().to_string();
+        let Some((_, values, plain)) = WRAPPERS.iter().find(|(p, ..)| *p == name) else { return Some(k) };
+        let (mut i, mut plain) = (k + 1, *plain);
+        while let Some(w) = seg.get(i) {
+            let t = w.word.as_str();
+            if t == "--" {
+                i += 1;
+                break;
+            }
+            let assignment = name == "env" && t.split_once('=').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+            if t.len() > 1 && t.starts_with('-') {
+                let takes_value = !t.starts_with("--") && t.chars().last().is_some_and(|c| values.contains(c));
+                i += 1 + usize::from(takes_value);
+            } else if assignment {
+                i += 1;
+            } else if plain > 0 {
+                (i, plain) = (i + 1, plain - 1);
+            } else {
+                break;
+            }
+        }
+        k = i;
+    }
+    seg.get(k).map(|_| k)
+}
+
+/// The programs a command runs (#1208): its program word unwrapped
+/// ([`unwrapped`]), the module `python3 -m` runs, and each command `find
+/// -exec` or `fd -x` runs; by their names.
+fn program_names(seg: &[&CommandWord]) -> Vec<String> {
+    let name = |k: usize| unescape(&seg[k].pattern).rsplit('/').next().unwrap_or_default().to_string();
+    let mut starts: Vec<usize> = seg.iter().position(|w| w.role == WordRole::Program).into_iter().collect();
+    starts.extend((0..seg.len()).filter(|&k| EXEC_WORDS.contains(&seg[k].word.as_str())).map(|k| k + 1));
+    let mut out = Vec::new();
+    for at in starts {
+        let Some(k) = unwrapped(seg, at) else { continue };
+        let n = name(k);
+        if n.starts_with("python") && seg.get(k + 1).is_some_and(|w| w.word == "-m") && k + 2 < seg.len() {
+            out.push(name(k + 2));
+        }
+        out.push(n);
+    }
+    out
+}
 
 /// Recursion and link-following flags, short and long (abbreviated too),
 /// as any walker spells them.
@@ -1898,23 +2013,20 @@ const WALK_FLAGS: (&str, &[&str]) = (
 );
 
 /// Whether a command of the line names its program at run time (`$Z`,
-/// `${Z}`, `$(…)`, a backtick, a glob; also after a wrapper such as `sudo`
-/// or `xargs`) and carries a recursion or link-following flag (#1208,
+/// `${Z}`, `$(…)`, a backtick, a glob, braces that expand; also after a
+/// wrapper such as `sudo` or `timeout 30`, unwrapped) and gives it a
+/// recursion or link-following flag (#1208,
 /// [`WALK_FLAGS`]): the walker it may be can't be known, so it asks. A
 /// program named at run time without such a flag (`$EDITOR notes.md`)
 /// doesn't.
 fn blind_program(words: &[CommandWord]) -> bool {
-    // `[` and `[[` are the test builtin, not a glob.
-    let blind = unknown_word;
     let mut from = 0;
     while from < words.len() {
         let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
-        let seg = &words[from..to];
-        let program = seg.iter().position(|w| w.role == WordRole::Program);
-        let wrapped = program.is_some_and(|p| WRAPPERS.contains(&unescape(&seg[p].pattern).rsplit('/').next().unwrap_or_default()));
-        let named_late = program.is_some_and(|p| blind(&seg[p]) || (wrapped && seg[p + 1..].iter().any(|w| w.role == WordRole::Argument && blind(w))));
-        let walks = seg.iter().any(walk_flag);
-        if named_late && walks {
+        let seg: Vec<&CommandWord> = words[from..to].iter().filter(|w| w.role != WordRole::Data).collect();
+        // The command it runs, wrappers unwrapped: its flags decide.
+        let run = seg.iter().position(|w| w.role == WordRole::Program).and_then(|p| unwrapped(&seg, p));
+        if run.is_some_and(|k| unknown_word(seg[k]) && seg[k + 1..].iter().any(|w| walk_flag(w))) {
             return true;
         }
         from = to;
@@ -2178,9 +2290,12 @@ fn following_segments(words: &[CommandWord], walking: &[bool]) -> Vec<Follow> {
             .and_then(|at| typed.get(at + 1))
             .copied()
             .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphabetic()));
-        let walks = walking.get(w.segment).copied().unwrap_or(false) || names.contains(&"du");
+        // The programs it runs decide, wrappers unwrapped (`timeout 5 zip`).
+        let programs = program_names(&seg.iter().map(|&j| &words[j]).collect::<Vec<_>>());
+        let runs = |p: &str| programs.iter().any(|n| n == p);
+        let walks = walking.get(w.segment).copied().unwrap_or(false) || runs("du");
         let mut follow = Follow::default();
-        for f in FOLLOWERS.iter().filter(|f| walks && names.contains(&f.program)) {
+        for f in FOLLOWERS.iter().filter(|f| walks && runs(f.program)) {
             let mut vague = false;
             let told = flags(f.program, f.on, false, &mut vague) || (f.program == "tar" && bundle.is_some_and(|b| b.contains(|c: char| f.on.0.contains(c))));
             let off = flags(f.program, f.off, true, &mut vague);
@@ -3734,11 +3849,9 @@ mod tests {
             "npx -c 'zip -r o.zip .'",
             "pnpm exec -c 'zip -r o.zip .'",
             "script -c 'zip -r o.zip .' /dev/null",
-            "script -q /dev/null zip -r o.zip .",
             "su -c 'zip -r o.zip .'",
             "sudo -s 'zip -r o.zip .'",
             "sudo sh -c 'zip -r o.zip .'",
-            "watch zip -r o.zip .",
             "nohup sh -c 'zip -r o.zip .'",
             "timeout 60 sh -c 'zip -r o.zip .'",
             "parallel 'zip -r {}.zip {}' ::: src",
@@ -3760,6 +3873,10 @@ mod tests {
             "$EDITOR notes.md",
             "\"$PAGER\" README.md",
             "env FOO=1 make test",
+            "env FOO=1 make",
+            "timeout 30 curl -H \"x: y\" \"$URL\"",
+            "nohup npm test &",
+            "sudo -u \"$U\" ls -la",
             "npx prettier --check src",
             "alias gs='git status'",
             "watch -n 1 date",
@@ -3773,6 +3890,43 @@ mod tests {
             "[ -h x ] || [ -R x ]",
         ] {
             assert_eq!(run(&reach, command), None, "{command}");
+        }
+    }
+
+    /// A wrapper runs its other words as a command (argv, #1208): it is
+    /// unwrapped, and the command it runs is read like any other. A walker
+    /// it runs is scanned; a program it names at run time asks only with a
+    /// recursion or link-following flag; a real code string asks as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_is_unwrapped_and_its_command_read_like_any_other() {
+        let (_d, linked, clean, _ws, _plain, _home) = linked_and_plain();
+        for command in [
+            "timeout 5 zip -r o.zip .",
+            "nohup zip -r o.zip . &",
+            "nice -n 5 tar -czhf o.tgz .",
+            "env FOO=1 cp -rL . out",
+            "sudo -u nobody zip -r o.zip .",
+            "watch -n 1 zip -r o.zip .",
+            "script -q /dev/null zip -r o.zip .",
+            "xargs -0 -n 1 rg -L token < /dev/null",
+            "time -p zip -r o.zip .",
+        ] {
+            let c = run(&linked, command).unwrap_or_else(|| panic!("{command} is scanned"));
+            assert!(c.grant.is_none() && (c.sensitive || c.reason.starts_with("follows links in ")), "{command}: {}", c.reason);
+        }
+        for command in ["timeout 5 zip -r o.zip .", "nohup zip -r o.zip . &", "sudo -u nobody zip -r o.zip .", "watch -n 1 zip -r o.zip ."] {
+            assert!(asks_for_a_link(&run(&linked, command).unwrap(), "~", "the folder holds ~/.ssh (SSH keys)"), "{command}");
+            assert_eq!(run(&clean, command), None, "{command}: a plain folder runs");
+        }
+        let named = "the program is named while the command runs, and the command recurses or follows links";
+        for command in ["timeout 5 \"$Z\" -r .", "env FOO=1 $Z -R .", "nice -n 5 ${Z} -a ."] {
+            assert!(run(&clean, command).is_some_and(|c| cut_short(&c, named)), "{command}");
+        }
+        let c = run(&clean, "timeout 5 sh -c 'z?p -r o .'").expect("a code string asks");
+        assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{}", c.reason);
+        for command in ["timeout 30 curl -H \"x: y\" \"$URL\"", "nohup npm test &", "env FOO=1 make", "timeout 30 \"$CMD\" --version"] {
+            assert_eq!(run(&clean, command), None, "{command}");
         }
     }
 
