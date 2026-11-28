@@ -4564,10 +4564,13 @@ impl ChatEngine {
     }
 
     /// Give the thread's Talk shell the workspace's port block (#1219), for
-    /// when it is next spawned.
-    fn set_shell_ports(&self, workspace_id: &str, thread_id: &str) {
+    /// when it is next spawned, and, in a mission that ships nothing, the
+    /// strict shell (`TalkShell::set_strict`) before its next command.
+    fn prepare_shell(&self, workspace_id: &str, thread_id: &str) {
         let ports = crate::workspace_ports::ensure(&self.db.lock(), workspace_id);
         self.talk_shell.set_spawn_env(thread_id, ports.map(|b| b.env()).unwrap_or_default());
+        let mission = self.db.lock().active_mission_for_workspace(workspace_id);
+        self.talk_shell.set_strict(thread_id, crate::permissions::mission_ships_nothing(&mission));
     }
 
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
@@ -4617,7 +4620,7 @@ impl ChatEngine {
         });
 
         let started = std::time::Instant::now();
-        self.set_shell_ports(&request.workspace_id, &request.thread_id);
+        self.prepare_shell(&request.workspace_id, &request.thread_id);
         let shell = Arc::clone(&self.talk_shell);
         let thread_id = request.thread_id.clone();
         let workspace_path = request.workspace_path.clone();
@@ -5913,7 +5916,7 @@ impl ChatEngine {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
-                    self.set_shell_ports(&request.workspace_id, &request.thread_id);
+                    self.prepare_shell(&request.workspace_id, &request.thread_id);
                     let shell = Arc::clone(&self.talk_shell);
                     let tid = request.thread_id.clone();
                     let wp = request.workspace_path.clone();
@@ -5954,6 +5957,9 @@ impl ChatEngine {
                             }
                             (format_command_output(&r.output, r.exit_code), r.ok)
                         }
+                        // A strict shell that didn't confirm runs nothing, and
+                        // no isolated shell runs it either (#1241).
+                        Ok(Err(AppError::Other(m))) if m == crate::talk_shell::STRICT_SHELL_UNCONFIRMED => (m, false),
                         // Shared shell unavailable (a live `$` process holds it, or
                         // a transient error). Run THIS command in an isolated shell
                         // so the agent isn't blocked — but say so explicitly, since

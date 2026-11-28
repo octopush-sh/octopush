@@ -841,38 +841,103 @@ fn venv_activate(path: &str) -> bool {
 /// (`!`), and a here-document (`<<`, checked as a pair).
 const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!'];
 
+/// Programs a [`plain_shape`] never runs: an alias or a function, which
+/// Talk's shell keeps, changes what a later plain word runs (`gp` for `git
+/// push`), and `unalias` is there only to touch them.
+const NOT_PLAIN_PROGRAMS: &[&str] = &["alias", "function", "unalias"];
+
 /// Whether `command` has a plain shape: none of [`NOT_PLAIN`] anywhere in
-/// its raw text, quoted or not, and no `<<`; and outside quotes no glob
-/// character (`*`, `?`, `[`) and no word starting with `~`. A whitelist on
-/// purpose, not a list of tricks: bash builds code from many shapes a check
-/// doesn't model (`{$,}{PWD:_}` makes `${PWD:_}` by brace expansion, whose
-/// arithmetic runs the command `$_` holds after `echo $'a[\x24(touch x)]'`),
-/// and a glob lets the files present pick the words (`git lfs pu?h` after
-/// `touch push`; `git diff *` next to a file named `--output=x`). Each new
-/// one was a bypass. In this shape no expansion, substitution or line join
-/// can happen, so what the check reads is what runs. Quoted globs are
-/// literal. Ask first's readers need the same shape (#1267): one function
-/// for both. Pure.
+/// its raw text, quoted or not, and no `<<`; outside quotes no glob
+/// character (`*`, `?`, `[`), no `(` or `)` and no word starting with `~`;
+/// quotes closed; and no command whose program is one of
+/// [`NOT_PLAIN_PROGRAMS`], however it is quoted (`'alias'`), past
+/// assignments and redirections. A whitelist on purpose, not a list of
+/// tricks: bash builds code from many shapes a check doesn't model
+/// (`{$,}{PWD:_}` makes `${PWD:_}` by brace expansion, whose arithmetic runs
+/// the command `$_` holds after `echo $'a[\x24(touch x)]'`), a glob lets the
+/// files present pick the words (`git lfs pu?h` after `touch push`; `git
+/// diff *` next to a file named `--output=x`), and a parenthesis opens a
+/// subshell or defines a function (`gp() ( git push ); gp`). Each new one
+/// was a bypass. In this shape no expansion, substitution, line join or new
+/// definition can happen, so what the check reads is what runs, in a shell
+/// Talk made strict (`talk_shell::apply_strict_shell`). Quoted globs and
+/// parentheses are literal. Ask first's readers need the same shape (#1267):
+/// one function for both. Pure.
 pub fn plain_shape(command: &str) -> bool {
     if command.contains(NOT_PLAIN) || command.contains("<<") {
         return false;
     }
     let mut quote = None;
-    let mut word_start = true;
-    for c in command.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                '*' | '?' | '[' => return false,
-                '~' if word_start => return false,
-                _ => {}
-            },
+    // The word being read, its quotes removed.
+    let mut word: Option<String> = None;
+    // Whether the next word is a command's program, or a redirection's target.
+    let mut program = true;
+    let mut target = false;
+    let mut prev = ' ';
+    let mut comment = false;
+    for c in command.chars().chain(['\n']) {
+        if comment && c != '\n' {
+            continue;
         }
-        word_start = quote.is_none() && (c.is_whitespace() || ";|&()<>".contains(c));
+        comment = false;
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if let Some(w) = word.as_mut() {
+                w.push(c);
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                if word.is_none() {
+                    word = Some(String::new());
+                }
+            }
+            '*' | '?' | '[' | '(' | ')' => return false,
+            '~' if word.is_none() => return false,
+            // To the end of the line, as the strict shell reads it
+            // (`interactive_comments`).
+            '#' if word.is_none() => comment = true,
+            c if c.is_whitespace() || ";|&<>".contains(c) => {
+                if let Some(w) = word.take() {
+                    // `2>x`: digits right before a redirection are its fd.
+                    let fd = "<>".contains(c) && w.bytes().all(|b| b.is_ascii_digit());
+                    if target {
+                        target = false;
+                    } else if program && !fd && !assignment(&w) {
+                        if NOT_PLAIN_PROGRAMS.contains(&w.as_str()) {
+                            return false;
+                        }
+                        program = false;
+                    }
+                }
+                match c {
+                    '<' | '>' => target = true,
+                    // `>&`, `>|`, `<&`: still the redirection.
+                    '&' | '|' if "<>".contains(prev) => {}
+                    ';' | '|' | '&' | '\n' => {
+                        program = true;
+                        target = false;
+                    }
+                    _ => {}
+                }
+            }
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+        prev = c;
     }
-    true
+    quote.is_none()
+}
+
+/// `NAME=value`: a word that sets a variable rather than naming a program.
+fn assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// The simple commands of `command` when it is plain: of [`plain_shape`];
@@ -2858,6 +2923,11 @@ mod tests {
             "source ../venv/bin/activate",
             ". .venv/bin/activate extra",
             "echo 'unclosed",
+            // An alias or a function Talk's shell would keep (#1241).
+            "gp() ( git push ); gp",
+            "alias gp='git push'",
+            "unalias -a",
+            "function gp",
         ];
         for command in bypasses {
             assert_eq!(decide_in(true, command), plain, "{command}");
@@ -2894,6 +2964,59 @@ mod tests {
         }
         // Delivering effects are still refused on top.
         assert_eq!(decide_in(true, "git push origin main"), Decision::Deny { message: ship_nothing_refusal("git push") });
+    }
+
+    /// Talk's shell keeps an alias or a function for every later command, so
+    /// a plain word could run something else (`gp` for `git push`): a
+    /// mission that ships nothing runs no `alias`, `function` or `unalias`,
+    /// however quoted and wherever it is the program, and no `(` or `)`
+    /// (#1241). As words they are literal, and so are quoted parentheses.
+    #[test]
+    fn a_ship_nothing_mission_defines_no_alias_or_function() {
+        let ro = HashSet::new();
+        let decide_in = |command: &str| {
+            let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing: true };
+            let input = json!({ "command": command });
+            decide(Mode::Edit, &ToolCall { name: "run_command", input: &input }, &ctx)
+        };
+        let plain = Decision::Deny { message: SHIP_NOTHING_PLAIN.to_string() };
+        for command in [
+            "gp() ( git push ); gp",
+            "gp ( ) ( git push )",
+            "(git status)",
+            "alias gp='git push'",
+            "alias",
+            "'alias' gp=x",
+            "al'ias' gp=x",
+            "\"function\" gp",
+            "unalias -a",
+            "npm test; alias gp=x",
+            "npm test && unalias gp",
+            "npm test\nalias gp=x",
+            "ls | alias",
+            "X=1 alias gp=x",
+            "2>/dev/null alias gp=x",
+            ">out.txt alias gp=x",
+            "ls 2>&1 >| out.txt; function gp",
+            ">&2 alias gp=x",
+            "npm test # done\nalias gp=x",
+        ] {
+            assert!(!plain_shape(command), "{command}");
+            assert_eq!(decide_in(command), plain, "{command}");
+        }
+        for command in [
+            "git commit -m \"fix (the) return path\"",
+            "echo 'gp() ( x )'",
+            "grep -rn alias src",
+            "git log --grep function",
+            "rg -n 'unalias' .",
+            "npm run alias",
+            "aliases=1 npm test",
+            "npm test # don't cache (yet)",
+        ] {
+            assert!(plain_shape(command), "{command}");
+            assert_eq!(decide_in(command), Decision::Allow, "{command}");
+        }
     }
 
     /// A redirect can take a request's body or method to another host:
@@ -3210,5 +3333,13 @@ mod tests {
         let attempts: Vec<&str> = run.lines().filter(|l| l.contains("run_attempt(")).collect();
         assert_eq!(attempts.len(), 3, "{attempts:?}");
         assert!(attempts.iter().all(|l| l.contains("&sink, &tool_gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
+        // The thread's shell runs strict in a mission that ships nothing,
+        // for the agent's commands and the `$` ones alike.
+        let at = engine.find("fn prepare_shell(").expect("the shell's preparation");
+        let prepare = &engine[at..at + engine[at..].find("\n    }\n").unwrap()];
+        assert!(prepare.contains("self.talk_shell.set_strict(thread_id, crate::permissions::mission_ships_nothing(&mission));"));
+        assert!(body.contains("self.prepare_shell(&request.workspace_id, &request.thread_id);"), "the agent's commands");
+        assert!(body.contains("Ok(Err(AppError::Other(m))) if m == crate::talk_shell::STRICT_SHELL_UNCONFIRMED => (m, false),"), "no fallback runs it");
+        assert_eq!(engine.matches("self.prepare_shell(&request.workspace_id, &request.thread_id);").count(), 2, "and `$` commands");
     }
 }

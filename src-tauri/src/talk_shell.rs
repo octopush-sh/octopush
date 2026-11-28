@@ -107,6 +107,8 @@ struct Session {
     cwd: String,
     /// Per-session random token mixed into the prompt marker.
     nonce: String,
+    /// Whether [`apply_strict_shell`] has run in it since it was attached.
+    strict: bool,
 }
 
 pub struct TalkShell {
@@ -115,6 +117,8 @@ pub struct TalkShell {
     /// Per thread, the variables its shell is spawned with besides PATH (the
     /// workspace's ports, #1219). A shell already running keeps its env.
     spawn_env: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// The threads whose shell runs strict ([`TalkShell::set_strict`]).
+    strict: Mutex<std::collections::HashSet<String>>,
 }
 
 impl TalkShell {
@@ -123,6 +127,21 @@ impl TalkShell {
             client: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             spawn_env: Mutex::new(HashMap::new()),
+            strict: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Run the thread's shell strict, or not, from its next command: in a
+    /// mission that ships nothing its commands run in a shell without the
+    /// profile's aliases and functions ([`apply_strict_shell`]), so a plain
+    /// word such as `gp` can't stand for `git push`. Turning it off leaves
+    /// a shell that already ran strict as it is.
+    pub fn set_strict(&self, thread_id: &str, strict: bool) {
+        let mut threads = self.strict.lock();
+        if strict {
+            threads.insert(thread_id.to_string());
+        } else {
+            threads.remove(thread_id);
         }
     }
 
@@ -174,10 +193,11 @@ impl TalkShell {
             map.get(thread_id).cloned()
         };
         let extra = self.spawn_env.lock().get(thread_id).cloned().unwrap_or_default();
+        let strict = self.strict.lock().contains(thread_id);
         let handle = match existing {
             Some(h) => h,
             None => {
-                let session = Self::ensure_session(&client, thread_id, workspace_path, &extra)?;
+                let session = Self::ensure_session(&client, thread_id, workspace_path, &extra, strict)?;
                 let h = Arc::new(Mutex::new(session));
                 let mut map = self.sessions.lock();
                 Arc::clone(map.entry(thread_id.to_string()).or_insert(h))
@@ -187,13 +207,22 @@ impl TalkShell {
         // Take the receiver out under the lock, then drop the lock so the drain
         // never blocks another thread. A concurrent run for THIS thread finds
         // `rx == None` and returns Busy.
-        let (rx, nonce, id, cwd) = {
+        let (rx, nonce, id, cwd, ran_strict) = {
             let mut session = handle.lock();
             let Some(rx) = session.rx.take() else {
                 return Ok(RunOutcome::Busy);
             };
-            (rx, session.nonce.clone(), session.id.clone(), session.cwd.clone())
+            (rx, session.nonce.clone(), session.id.clone(), session.cwd.clone(), session.strict)
         };
+
+        // A shell that was running when its mission came to ship nothing.
+        if strict && !ran_strict {
+            if !apply_strict_shell(&client, &id, &rx, &nonce) {
+                handle.lock().rx = Some(rx);
+                return Err(AppError::Other(STRICT_SHELL_UNCONFIRMED.into()));
+            }
+            handle.lock().strict = true;
+        }
 
         // Discard any stale bytes (the idle prompt left in the buffer) so the
         // next prompt marker we see is unambiguously THIS command's completion.
@@ -221,7 +250,7 @@ impl TalkShell {
             }
             Probe::Dead { output } => {
                 let _ = client.remove(&id);
-                match Self::ensure_session(&client, thread_id, &cwd, &extra) {
+                match Self::ensure_session(&client, thread_id, &cwd, &extra, strict) {
                     Ok(fresh) => *handle.lock() = fresh,
                     Err(e) => {
                         self.sessions.lock().remove(thread_id);
@@ -283,7 +312,7 @@ impl TalkShell {
                     _ => {
                         let body = join_nonempty(&[&partial, &note]);
                         let _ = client.remove(&id);
-                        match Self::ensure_session(&client, thread_id, &cwd, &extra) {
+                        match Self::ensure_session(&client, thread_id, &cwd, &extra, strict) {
                             Ok(fresh) => *handle.lock() = fresh,
                             Err(e) => {
                                 self.sessions.lock().remove(thread_id);
@@ -344,6 +373,7 @@ impl TalkShell {
         let client = self.client.lock().clone();
         let handle = self.sessions.lock().remove(thread_id);
         self.spawn_env.lock().remove(thread_id);
+        self.strict.lock().remove(thread_id);
         if let (Some(client), Some(handle)) = (client, handle) {
             let _ = client.remove(&handle.lock().id);
         }
@@ -352,11 +382,14 @@ impl TalkShell {
     /// Reattach to a surviving daemon PTY (so the shell persists across an
     /// Octopush restart) or spawn fresh; then (re-)install the prompt marker with
     /// a fresh nonce and wait until the shell confirms ready. Returns the cwd.
+    /// A `strict` shell runs [`apply_strict_shell`] on every attach, and no
+    /// command runs in it until the shell confirms it.
     fn ensure_session(
         client: &Arc<DaemonClient>,
         thread_id: &str,
         cwd: &str,
         extra: &[(String, String)],
+        strict: bool,
     ) -> AppResult<Session> {
         let id = format!("talk-{thread_id}");
         let reattaching = client
@@ -382,11 +415,20 @@ impl TalkShell {
                 if has_login_path {
                     apply_login_path(client, &id, &rx, &nonce, &path);
                 }
+                // On a reattach too: a command typed in the shell since, or
+                // an older build, may have left definitions in it.
+                if strict && !apply_strict_shell(client, &id, &rx, &nonce) {
+                    if !reattaching {
+                        let _ = client.remove(&id);
+                    }
+                    return Err(AppError::Other(STRICT_SHELL_UNCONFIRMED.into()));
+                }
                 Ok(Session {
                     id,
                     rx: Some(rx),
                     cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
                     nonce,
+                    strict,
                 })
             }
             // Reattached but never ready — the surviving shell is busy with a
@@ -443,6 +485,52 @@ fn apply_login_path(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEven
     if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. }) {
         tracing::warn!(id, "talk shell did not confirm the login PATH");
     }
+}
+
+/// Why a command didn't run in a strict shell that didn't confirm it.
+pub(crate) const STRICT_SHELL_UNCONFIRMED: &str = "Not run: this mission ships nothing, and this conversation's \
+    shell didn't confirm it dropped the aliases and functions from your shell profile, which can make a command \
+    run something other than what it names. A function marked readonly (`readonly -f`) can't be dropped.";
+
+/// What [`apply_strict_shell`] writes, a line at a time. bash expands a
+/// line's aliases as it reads it, so only the second line, read after
+/// `unalias -a` ran, uses reserved words an alias could replace (`while`,
+/// `case`); every command word is quoted (`\builtin`), which no alias
+/// matches. A profile's `builtin` or `unset` function goes first, in POSIX
+/// mode, where a special builtin is found before a function:
+/// `POSIXLY_CORRECT` turns it on, an assignment no function or alias can
+/// take, and comes off again unless the profile had it. Traps go too, since
+/// a `DEBUG` trap would call a function that is gone, and the command hash.
+/// `interactive_comments` is on, so a `#` starts a comment as the command
+/// check reads it. The `__octo_*` functions draw the prompt marker and
+/// stay. The second line fails when a function can't be dropped
+/// (`readonly -f`).
+const STRICT_SHELL_LINES: [&str; 2] = [
+    r#"__octo_px=${POSIXLY_CORRECT+y}; POSIXLY_CORRECT=y; \unset -f builtin unset; \builtin test -n "$__octo_px" || \builtin unset POSIXLY_CORRECT; \builtin unset __octo_px; \builtin unalias -a; \builtin shopt -u expand_aliases; \builtin shopt -s interactive_comments; \builtin trap - DEBUG RETURN ERR; \builtin hash -r"#,
+    r#"__octo_bad=0; while \builtin read -r _ _ __octo_f; do case $__octo_f in ''|__octo_*) ;; *) \builtin unset -f "$__octo_f" 2>/dev/null || __octo_bad=1;; esac; done <<< "$(\builtin declare -F)"; \builtin unset __octo_f; \builtin test "$__octo_bad" = 0"#,
+];
+
+/// Make the shell strict for a mission that ships nothing: no alias
+/// (`unalias -a`, and `shopt -u expand_aliases` so none expands later), no
+/// function from the profile (`unset -f` for each one `declare -F` lists),
+/// no trap and an empty command hash, so each word of a command runs the
+/// builtin or the program on the PATH it names, which is what the command
+/// check reads. PATH and the rest of the profile's environment stay. Written
+/// once the prompt is up, as the login PATH is ([`apply_login_path`]), on
+/// every attach. True only once the shell confirmed both lines; the caller
+/// runs no command until then.
+fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) -> bool {
+    for line in STRICT_SHELL_LINES {
+        drain_pending(rx);
+        if client.write(id, format!("{line}\n").as_bytes()).is_err() {
+            return false;
+        }
+        if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { exit_code: 0, .. }) {
+            tracing::warn!(id, "talk shell did not confirm the strict shell");
+            return false;
+        }
+    }
+    true
 }
 
 impl LiveRun {
@@ -1124,6 +1212,110 @@ mod e2e {
         assert_eq!(r.output, "40060");
 
         shell.close("ports");
+    }
+
+    /// A profile with the alias `gp` and the functions `gp` and `git`, read
+    /// by the daemon's `bash -l` from the test's HOME.
+    const PROFILE: &str = "alias gp='echo PROFILE_ALIAS'\nfunction gp { echo PROFILE_FUNCTION; }\nfunction git { echo PROFILE_FUNCTION; }\n";
+    /// What a strict shell prints for this: no alias, and no function but
+    /// the prompt marker's.
+    const DEFINITIONS: &str = "alias; declare -F | grep -v ' __octo_'; echo end";
+
+    /// In a mission that ships nothing (#1241), the profile's alias and
+    /// functions don't run: not in a new shell, and not in one that was
+    /// running when its mission came to ship nothing. A shell that isn't
+    /// strict, a Build or Fix mission's, keeps them as before.
+    #[test]
+    #[serial]
+    fn a_strict_shell_runs_no_alias_or_function_from_the_profile() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        fs::write(d._tmp.path().join(".bash_profile"), PROFILE).unwrap();
+        // Roomy: a busy CI runner can take seconds to bring a shell up.
+        let quick = Duration::from_secs(20);
+        with_login_shell_env(&[], || {
+            let shell = shell_on(&d.sock);
+            let r = done(shell.run("loose", "/tmp", "type -t gp git", quick, true).unwrap());
+            assert_eq!(r.output.lines().collect::<Vec<_>>(), ["alias", "function"], "the profile was read");
+            let r = done(shell.run("loose", "/tmp", "gp", quick, true).unwrap());
+            assert_eq!(r.output, "PROFILE_ALIAS", "not strict: as before");
+
+            shell.set_strict("strict", true);
+            for word in ["gp", "git"] {
+                let r = done(shell.run("strict", "/tmp", word, quick, true).unwrap());
+                assert!(!r.output.contains("PROFILE_"), "{word} ran the profile's: {:?}", r.output);
+            }
+            let r = done(shell.run("strict", "/tmp", DEFINITIONS, quick, true).unwrap());
+            assert_eq!(r.output, "end");
+
+            // A shell already running when it became strict.
+            shell.set_strict("loose", true);
+            let r = done(shell.run("loose", "/tmp", "gp; git; echo end", quick, true).unwrap());
+            assert!(!r.output.contains("PROFILE_") && r.output.ends_with("end"), "{:?}", r.output);
+            let r = done(shell.run("loose", "/tmp", DEFINITIONS, quick, true).unwrap());
+            assert_eq!(r.output, "end");
+            shell.close("strict");
+            shell.close("loose");
+        });
+    }
+
+    /// The strict shell runs on every attach, so definitions made in the
+    /// shell since (or by a shell an older build started) are gone after
+    /// a restart (#1241).
+    #[test]
+    #[serial]
+    fn the_strict_shell_runs_again_after_a_reattach() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        fs::write(d._tmp.path().join(".bash_profile"), PROFILE).unwrap();
+        let quick = Duration::from_secs(20);
+        let old = DaemonClient::connect_to(d.sock.to_str().unwrap()).unwrap();
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        old.spawn("talk-restrict", "/tmp", &env, Some("/bin/bash"), 40, 120).unwrap();
+        with_login_shell_env(&[], || {
+            {
+                let shell = shell_on(&d.sock);
+                shell.set_strict("restrict", true);
+                let r = done(shell.run("restrict", "/tmp", DEFINITIONS, quick, true).unwrap());
+                assert_eq!(r.output, "end", "the reattached shell ran strict");
+                // Defined again in the shell, as a `$` command could.
+                let again = "shopt -s expand_aliases; alias gp='echo PROFILE_ALIAS'; function git { echo PROFILE_FUNCTION; }";
+                done(shell.run("restrict", "/tmp", again, quick, true).unwrap());
+                let r = done(shell.run("restrict", "/tmp", DEFINITIONS, quick, true).unwrap());
+                assert_ne!(r.output, "end", "defined again: {:?}", r.output);
+                // `shell` drops here, as at an Octopush restart.
+            }
+            let shell = shell_on(&d.sock);
+            shell.set_strict("restrict", true);
+            let r = done(shell.run("restrict", "/tmp", DEFINITIONS, quick, true).unwrap());
+            assert_eq!(r.output, "end", "strict again after the reattach");
+            let r = done(shell.run("restrict", "/tmp", "gp; git; echo end", quick, true).unwrap());
+            assert!(!r.output.contains("PROFILE_") && r.output.ends_with("end"), "{:?}", r.output);
+            shell.close("restrict");
+        });
+    }
+
+    /// No command runs in a strict shell until it confirmed: a function the
+    /// profile made readonly can't be dropped, so nothing runs (#1241).
+    #[test]
+    #[serial]
+    fn a_strict_shell_that_cant_drop_a_function_runs_nothing() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        fs::write(d._tmp.path().join(".bash_profile"), format!("{PROFILE}readonly -f git\n")).unwrap();
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let quick = Duration::from_secs(20);
+        with_login_shell_env(&[], || {
+            let shell = shell_on(&d.sock);
+            shell.set_strict("stuck", true);
+            for _ in 0..2 {
+                let err = shell.run("stuck", &cwd, "touch ran", quick, true).err().expect("refused");
+                assert!(err.to_string().contains("didn't confirm it dropped the aliases and functions"), "{err}");
+            }
+            assert!(!dir.path().join("ran").exists(), "the command ran");
+            shell.close("stuck");
+        });
     }
 
     #[test]
