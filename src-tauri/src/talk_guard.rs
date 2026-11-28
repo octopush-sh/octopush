@@ -1190,9 +1190,14 @@ impl Reach {
         let walking = walking_segments(&words);
         let following = following_segments(&words, &walking);
         // Code run as a string, naming a walker that follows links, asks (#1208).
-        if code_names_walker(&words) {
-            let why = "eval, sh -c and source run code the check doesn't read as commands, and it names a walker that can follow links".to_string();
+        if code_names_walker(line, &words) {
+            let why = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one naming a walker that can follow links, which the check doesn't read".to_string();
             scan.cut.get_or_insert(LinkCut { shown: "code it runs from a string".to_string(), why });
+        }
+        // A program named at run time, told to recurse or follow links, asks (#1208).
+        if blind_program(&words) {
+            let why = "the program is named while the command runs, and the command recurses or follows links".to_string();
+            scan.cut.get_or_insert(LinkCut { shown: "a program the check can't name".to_string(), why });
         }
         // Where a walker that follows links stands is known only with no
         // `cd`, `pushd`, `popd` or subshell before it (#1208): `cd` isn't
@@ -1700,21 +1705,44 @@ fn moves_cwd(words: &[CommandWord]) -> bool {
     words.iter().any(|w| w.role != WordRole::Data && matches!(unescape(&w.pattern).rsplit('/').next(), Some("cd" | "pushd" | "popd")))
 }
 
+/// `line` with what quotes hold, and escaped characters, blanked out
+/// (#1208): what the shell reads as syntax.
+fn unquoted(line: &str) -> String {
+    let (mut quote, mut escaped) = (None::<char>, false);
+    line.chars()
+        .map(|c| match (quote, c) {
+            _ if escaped => {
+                escaped = false;
+                ' '
+            }
+            (Some('\''), '\'') | (Some('"'), '"') => {
+                quote = None;
+                ' '
+            }
+            (Some('\''), _) => ' ',
+            (_, '\\') => {
+                escaped = true;
+                ' '
+            }
+            (Some(_), _) => ' ',
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                ' '
+            }
+            _ => c,
+        })
+        .collect()
+}
+
 /// Whether `line` opens a subshell, `( … )`, or anything else that starts
 /// with a `(` outside quotes but `$(`, `<(`, `>(` and `((` (#1208): a
 /// heuristic that errs toward yes.
 fn subshell(line: &str) -> bool {
-    let (mut quote, mut escaped, mut prev) = (None::<char>, false, ' ');
-    for c in line.chars() {
-        match (quote, c) {
-            _ if escaped => escaped = false,
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (Some('\''), _) => {}
-            (_, '\\') => escaped = true,
-            (Some(_), _) => {}
-            (None, '\'' | '"') => quote = Some(c),
-            (None, '(') if !matches!(prev, '$' | '<' | '>' | '(') => return true,
-            _ => {}
+    let bare = unquoted(line);
+    let mut prev = ' ';
+    for c in bare.chars() {
+        if c == '(' && !matches!(prev, '$' | '<' | '>' | '(') {
+            return true;
         }
         prev = c;
     }
@@ -1724,16 +1752,63 @@ fn subshell(line: &str) -> bool {
 /// Shells that run a string, or their input, as commands.
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
+/// When a program runs a string as commands (#1208, [`RUNS_STRINGS`]).
+enum Takes {
+    /// Its arguments, whatever its flags (`eval`, `watch`, `alias`).
+    Always,
+    /// With one of these short flags or long ones (`sh -c`, `env -S`).
+    With(&'static str, &'static [&'static str]),
+}
+
+/// Every program the check knows to run a string, or its other arguments,
+/// as commands, in one place (#1208): the code-string rule
+/// ([`code_names_walker`]) reads all of them. `.` counts only as the
+/// command's program; a shell also when `xargs`, `find -exec` or `fd -x`
+/// runs it, or it reads its input; and a function definition (`NAME()`,
+/// `function NAME`) has its whole line read as its body.
+const RUNS_STRINGS: &[(&str, Takes)] = &[
+    ("eval", Takes::Always),
+    ("source", Takes::Always),
+    (".", Takes::Always),
+    ("alias", Takes::Always),
+    ("function", Takes::Always),
+    ("watch", Takes::Always),
+    ("script", Takes::Always),
+    ("parallel", Takes::Always),
+    ("sh", Takes::With("c", &[])),
+    ("bash", Takes::With("c", &[])),
+    ("zsh", Takes::With("c", &[])),
+    ("dash", Takes::With("c", &[])),
+    ("ksh", Takes::With("c", &[])),
+    ("fish", Takes::With("c", &["--command"])),
+    ("env", Takes::With("S", &["--split-string"])),
+    ("npm", Takes::With("c", &["--call"])),
+    ("npx", Takes::With("c", &["--call"])),
+    ("pnpm", Takes::With("c", &["--shell-mode"])),
+    ("su", Takes::With("c", &["--command"])),
+    ("sudo", Takes::With("si", &["--shell", "--login"])),
+];
+
 /// Whether a line runs code from a string that names a walker that can
-/// follow links (#1208, [`FOLLOWERS`]) as a word: after `eval`, `source`
-/// or `.`, or a shell given `-c`, run by `xargs`, `find -exec` or `fd -x`,
-/// or reading its input (then anywhere in the line). The check doesn't read
-/// such code as commands, so the line asks.
-fn code_names_walker(words: &[CommandWord]) -> bool {
+/// follow links (#1208, [`FOLLOWERS`]) as a word, which the check doesn't
+/// read as commands: the words after a program of [`RUNS_STRINGS`] that
+/// takes one (`eval 'zip -r o.zip .'`, `env -S '…'`, `npm exec -c '…'`,
+/// `alias q='…'`), a shell run by `xargs`, `find -exec` or `fd -x`, or any
+/// word of the line for a shell reading its input or a function
+/// definition.
+fn code_names_walker(line: &str, words: &[CommandWord]) -> bool {
+    static DEFINES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let defines = DEFINES.get_or_init(|| regex::Regex::new(r"(?:^|[\s;&|({])[A-Za-z_][A-Za-z0-9_.:-]*[ \t]*\([ \t]*\)").unwrap());
     let name = |w: &CommandWord| unescape(&w.pattern).rsplit('/').next().unwrap_or_default().to_string();
     let walker = |w: &CommandWord| {
         w.word.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|t| FOLLOWERS.iter().any(|f| f.program == t))
     };
+    // A function definition (`NAME()`, outside quotes, or `function NAME`):
+    // its body may span the line.
+    let function = defines.is_match(&unquoted(line)) || words.iter().any(|w| w.role == WordRole::Program && name(w) == "function");
+    if function && words.iter().any(&walker) {
+        return true;
+    }
     let mut from = 0;
     while from < words.len() {
         let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
@@ -1741,14 +1816,66 @@ fn code_names_walker(words: &[CommandWord]) -> bool {
         let names: Vec<String> = seg.iter().map(name).collect();
         let fed = names.iter().any(|n| matches!(n.as_str(), "xargs" | "find" | "fd"));
         for (k, w) in seg.iter().enumerate() {
+            if w.role == WordRole::Data {
+                continue;
+            }
             let n = names[k].as_str();
-            let runs_string = n == "eval" || (w.role == WordRole::Program && matches!(n, "source" | "."));
-            let shell = SHELLS.contains(&n) && w.role != WordRole::Data;
-            let given_c = shell && seg[k + 1..].iter().any(|o| short_flag(&o.word, "c"));
-            let reads_input = shell && w.role == WordRole::Program && (w.stdin || w.inline);
-            if ((runs_string || (shell && fed) || given_c) && seg[k + 1..].iter().any(&walker)) || (reads_input && words.iter().any(&walker)) {
+            let rest = &seg[k + 1..];
+            let Some((_, takes)) = RUNS_STRINGS.iter().find(|(p, _)| *p == n && (n != "." || w.role == WordRole::Program)) else { continue };
+            let shell = SHELLS.contains(&n);
+            let given = match takes {
+                Takes::Always => true,
+                Takes::With(short, long) => {
+                    rest.iter().any(|o| short_flag(&o.word, short) || long.iter().any(|l| long_option(&o.word, l, &[]).is_some()))
+                }
+            };
+            if (given || (shell && fed)) && rest.iter().any(&walker) {
                 return true;
             }
+            if shell && w.role == WordRole::Program && (w.stdin || w.inline) && words.iter().any(&walker) {
+                return true;
+            }
+        }
+        from = to;
+    }
+    false
+}
+
+/// Programs that run the next program they're given: a program named at
+/// run time after one of them is still named at run time.
+const WRAPPERS: &[&str] = &["sudo", "doas", "env", "nice", "nohup", "time", "timeout", "xargs", "command", "exec", "builtin", "caffeinate", "stdbuf"];
+
+/// Recursion and link-following flags, short and long (abbreviated too),
+/// as any walker spells them.
+const WALK_FLAGS: (&str, &[&str]) = (
+    "rRaLHh",
+    &[
+        "--recursive", "--recurse-paths", "--recurse-patterns", "--archive", "--dereference", "--dereference-recursive",
+        "--dereference-args", "--dereference-command-line", "--follow", "--copy-links", "--copy-unsafe-links", "--copy-dirlinks",
+    ],
+);
+
+/// Whether a command of the line names its program at run time (`$Z`,
+/// `${Z}`, `$(…)`, a backtick, a glob; also after a wrapper such as `sudo`
+/// or `xargs`) and carries a recursion or link-following flag (#1208,
+/// [`WALK_FLAGS`]): the walker it may be can't be known, so it asks. A
+/// program named at run time without such a flag (`$EDITOR notes.md`)
+/// doesn't.
+fn blind_program(words: &[CommandWord]) -> bool {
+    let blind = |w: &CommandWord| w.unmodeled || has_glob(&w.pattern);
+    let mut from = 0;
+    while from < words.len() {
+        let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
+        let seg = &words[from..to];
+        let program = seg.iter().position(|w| w.role == WordRole::Program);
+        let wrapped = program.is_some_and(|p| WRAPPERS.contains(&unescape(&seg[p].pattern).rsplit('/').next().unwrap_or_default()));
+        let named_late = program.is_some_and(|p| blind(&seg[p]) || (wrapped && seg[p + 1..].iter().any(|w| w.role == WordRole::Argument && blind(w))));
+        let walks = seg
+            .iter()
+            .filter(|w| w.role != WordRole::Data)
+            .any(|w| short_flag(&w.word, WALK_FLAGS.0) || WALK_FLAGS.1.iter().any(|l| long_option(&w.word, l, &[]).is_some()));
+        if named_late && walks {
+            return true;
         }
         from = to;
     }
@@ -3497,7 +3624,7 @@ mod tests {
     fn code_run_from_a_string_that_names_a_walker_asks() {
         let (_d, ws, home) = setup();
         let reach = Reach::new(&ws, None, Some(&home));
-        let why = "eval, sh -c and source run code the check doesn't read as commands, and it names a walker that can follow links";
+        let why = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one naming a walker that can follow links, which the check doesn't read";
         for command in [
             "eval 'zip -r o.zip .'",
             "eval zip -ry o.zip .",
@@ -3516,6 +3643,58 @@ mod tests {
             assert!(cut_short(&c, why) || (!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in ")), "{command}: {}", c.reason);
         }
         for command in ["bash -c 'npm test'", "source venv/bin/activate", "find . -exec sh -c 'echo {}' \\;", "eval \"$(ssh-agent -s)\"", "sh ./build.sh"] {
+            assert_eq!(run(&reach, command), None, "{command}");
+        }
+    }
+
+    /// Every program that runs a string as commands (#1208, [`RUNS_STRINGS`])
+    /// asks when the string names a walker that can follow links, aliases
+    /// and functions too; and a program named while the command runs asks
+    /// when the command recurses or follows links.
+    #[test]
+    fn strings_run_as_commands_and_programs_named_at_run_time_ask() {
+        let (_d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let code = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one naming a walker that can follow links, which the check doesn't read";
+        for command in [
+            "env -S 'zip -r o.zip .'",
+            "env --split-string='tar -czhf o.tgz .'",
+            "npm exec -c 'zip -r o.zip .'",
+            "npx -c 'zip -r o.zip .'",
+            "pnpm exec -c 'zip -r o.zip .'",
+            "script -c 'zip -r o.zip .' /dev/null",
+            "script -q /dev/null zip -ry o.zip .",
+            "su -c 'zip -r o.zip .'",
+            "sudo -s 'zip -ry o.zip .'",
+            "sudo sh -c 'zip -r o.zip .'",
+            "watch zip -ry o.zip .",
+            "nohup sh -c 'zip -r o.zip .'",
+            "timeout 60 sh -c 'zip -r o.zip .'",
+            "parallel 'zip -r {}.zip {}' ::: src",
+            "alias q='zip -r o.zip .'; q",
+            "alias q='zip -r o.zip .' && q",
+            "q() { zip -ry o.zip .; }; q",
+            "function q {\n  zip -ry o.zip .\n}\nq",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{command}: {}", c.reason);
+            assert!(c.reason.ends_with(code) || c.reason.contains("can't place"), "{command}: {}", c.reason);
+        }
+        let named = "the program is named while the command runs, and the command recurses or follows links";
+        for command in ["$Z -r o.zip .", "${Z} -r o.zip .", "$(which zip) -r o.zip .", "`which zip` -r o.zip .", "/usr/bin/zi? -r o.zip .", "sudo \"$Z\" -R o.zip .", "$T --deref -czf o.tgz ."] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, named), "{command}: {}", c.reason);
+        }
+        for command in [
+            "$EDITOR notes.md",
+            "\"$PAGER\" README.md",
+            "env FOO=1 make test",
+            "npx prettier --check src",
+            "alias gs='git status'",
+            "watch -n 1 date",
+            "npm run build",
+            "grep -n \"init()\" a.txt",
+        ] {
             assert_eq!(run(&reach, command), None, "{command}");
         }
     }
