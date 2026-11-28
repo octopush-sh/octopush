@@ -1870,10 +1870,12 @@ fn code_asks(code: &str, depth: usize) -> bool {
     follows || (words.iter().any(unknown_word) && words.iter().any(walk_flag)) || code_in(code, &words, depth)
 }
 
-/// A word the check can't know (#1208): an expansion it doesn't model, or a
-/// glob, but the test builtins `[` and `[[` as a program.
+/// A word the check can't know (#1208): an expansion it doesn't model, a
+/// glob (but the test builtins `[` and `[[` as a program), or braces that
+/// expand (`{zip,}`, `{a..b}`; a lone `{` or `}`, or `{}`, stays as written).
 fn unknown_word(w: &CommandWord) -> bool {
-    w.unmodeled || (has_glob(&w.pattern) && !(w.role == WordRole::Program && matches!(w.pattern.as_str(), "[" | "[[")))
+    let braces = || brace_expand(&w.pattern, MAX_BRACE_WORDS).is_none_or(|alts| alts.len() != 1 || alts[0] != w.pattern);
+    w.unmodeled || (has_glob(&w.pattern) && !(w.role == WordRole::Program && matches!(w.pattern.as_str(), "[" | "[["))) || braces()
 }
 
 /// Whether `w` is a recursion or link-following flag ([`WALK_FLAGS`]).
@@ -3667,6 +3669,7 @@ mod tests {
             "eval 'zip -r o.zip .'",
             "eval zip -r o.zip .",
             "eval '/usr/bin/z?p -r out .'",
+            "eval '{zip,} -r out .'",
             "sh -c \"$CMD -r .\"",
             "sh -c 'zip -r o.zip .'",
             "bash -lc \"tar -czhf o.tgz .\"",
@@ -3749,7 +3752,7 @@ mod tests {
             assert!(c.reason.ends_with(code) || c.reason.contains("can't place"), "{command}: {}", c.reason);
         }
         let named = "the program is named while the command runs, and the command recurses or follows links";
-        for command in ["$Z -r o.zip .", "${Z} -r o.zip .", "$(which zip) -r o.zip .", "`which zip` -r o.zip .", "/usr/bin/zi? -r o.zip .", "sudo \"$Z\" -R o.zip .", "$T --deref -czf o.tgz ."] {
+        for command in ["{zip,} -r out .", "{zi,}p -r out .", "$Z -r o.zip .", "${Z} -r o.zip .", "$(which zip) -r o.zip .", "`which zip` -r o.zip .", "/usr/bin/zi? -r o.zip .", "sudo \"$Z\" -R o.zip .", "$T --deref -czf o.tgz ."] {
             let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
             assert!(cut_short(&c, named), "{command}: {}", c.reason);
         }
@@ -3762,6 +3765,8 @@ mod tests {
             "watch -n 1 date",
             "npm run build",
             "grep -n \"init()\" a.txt",
+            "echo {a,b}",
+            "{ ls; }",
             "[ -r .env ]",
             "[[ -d x ]]",
             "[[ -L x ]] && echo link",
