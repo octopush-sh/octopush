@@ -1704,6 +1704,25 @@ mod workspace_tests {
     }
 
     #[test]
+    fn a_chat_digest_is_read_only_from_its_own_workspace() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        db.insert_workspace("other", "p", "other", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        db.insert_chat_message("ws", &t.id, "user", "the ask", None, None, None, None).unwrap();
+        db.insert_chat_message("ws", &t.id, "assistant", "the answer", None, None, None, None).unwrap();
+
+        let d = crate::commands::thread_digest_in(&db, "ws", &t.id).unwrap();
+        assert_eq!(d.asks, vec!["the ask".to_string()]);
+        assert_eq!(d.last_answer.as_deref(), Some("the answer"));
+        // Another workspace, or a conversation that is gone, is refused.
+        assert!(crate::commands::thread_digest_in(&db, "other", &t.id).is_err());
+        assert!(crate::commands::thread_digest_in(&db, "ws", "nope").is_err());
+        assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 2, "reading changes nothing");
+    }
+
+    #[test]
     fn shell_history_recall_dedups_and_orders_by_recency() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();

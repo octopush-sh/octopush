@@ -286,6 +286,7 @@ pub fn run() {
             commands::resize_shell,
             commands::list_shell_history,
             commands::list_chat_messages,
+            commands::chat_thread_digest,
             commands::cancel_chat,
             commands::list_running_threads,
             commands::list_chat_threads,
