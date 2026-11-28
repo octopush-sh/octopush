@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within, fireEvent } from "@testing-library/react";
+import { act, render, screen, within, fireEvent } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { WorkContextPanel } from "./WorkContextPanel";
 import { useIssuesStore } from "../stores/issuesStore";
@@ -12,12 +12,14 @@ vi.mock("../lib/ipc", () => ({
     listMyIssues: vi.fn(),
     getIssue: vi.fn(),
     openFileInSystem: vi.fn(),
+    getProjectIssueTracker: vi.fn(),
   },
 }));
 
 import { ipc } from "../lib/ipc";
 const listMyIssuesMock = vi.mocked(ipc.listMyIssues);
 const openFileInSystemMock = vi.mocked(ipc.openFileInSystem);
+const getProjectIssueTrackerMock = vi.mocked(ipc.getProjectIssueTracker);
 
 const issue: Issue = {
   key: "AB-1",
@@ -63,6 +65,9 @@ beforeEach(() => {
     detailLoadingByKey: {},
     epicIssuesByKey: {},
     epicLoadingByKey: {},
+    projectId: null,
+    tracker: null,
+    scope: null,
   });
   useWorkspaceStore.setState({ workspaces: [workspace] });
   useCompanionPrefs.setState({ workContextCollapsed: {} });
@@ -104,6 +109,34 @@ describe("WorkContextPanel ticket rows", () => {
     const row = await screen.findByTitle("AB-1 · alpha ticket");
     fireEvent.click(within(row).getByRole("button", { name: /open ab-1/i }));
     expect(openFileInSystemMock).toHaveBeenCalledWith("https://x/AB-1");
+  });
+
+  it("an Epiku project (no key, whole backlog) lists its stories, not just the count", async () => {
+    const story: Issue = { ...issue, key: "ST-1.1", summary: "sample story", url: "https://x/ST-1.1" };
+    useIssuesStore.setState({ issues: [story] });
+    listMyIssuesMock.mockResolvedValue([story]);
+    renderPanel({ projectKey: null, wholeBacklog: true });
+    expect(await screen.findByTitle("ST-1.1 · sample story")).toBeInTheDocument();
+  });
+
+  it("reloads the backlog when the tracker scope changes, Jira to Epiku (#1283)", async () => {
+    const story: Issue = { ...issue, key: "ST-1.1", summary: "sample story", url: "https://x/ST-1.1" };
+    useIssuesStore.setState({ scope: "jira", projectId: "p1", tracker: "jira" });
+    const { rerender } = renderPanel();
+    await screen.findByTitle("AB-1 · alpha ticket");
+    listMyIssuesMock.mockResolvedValue([story]);
+    getProjectIssueTrackerMock.mockResolvedValue({ choice: "epiku", epikuProject: null, active: "epiku" });
+    await act(() => useIssuesStore.getState().setProject("p1"));
+    rerender(<WorkContextPanel configured projectKey={null} wholeBacklog projectId="p1" activeKey={null} />);
+    expect(await screen.findByTitle("ST-1.1 · sample story")).toBeInTheDocument();
+    expect(listMyIssuesMock).toHaveBeenLastCalledWith("p1");
+  });
+
+  it("an empty Epiku backlog says so instead of showing nothing", async () => {
+    useIssuesStore.setState({ issues: [] });
+    listMyIssuesMock.mockResolvedValue([]);
+    renderPanel({ projectKey: null, wholeBacklog: true });
+    expect(await screen.findByText("Backlog clear ✓")).toBeInTheDocument();
   });
 });
 

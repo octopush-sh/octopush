@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Issue, ProjectIssueTracker } from "../lib/types";
+import type { EpikuConfigView, Issue, ProjectIssueTracker } from "../lib/types";
 
 const mockIpc = {
   listMyIssues: vi.fn<(projectId?: string | null) => Promise<Issue[]>>(),
   getProjectIssueTracker: vi.fn<(projectId: string) => Promise<ProjectIssueTracker>>(),
+  getEpikuConfig: vi.fn<() => Promise<EpikuConfigView | null>>(),
 };
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 
@@ -20,6 +21,7 @@ beforeEach(() => {
   useIssuesStore.setState({ issues: null, loading: false, error: null, projectId: null, tracker: null, scope: null, detailByKey: {} });
   mockIpc.listMyIssues.mockReset();
   mockIpc.getProjectIssueTracker.mockReset();
+  mockIpc.getEpikuConfig.mockReset().mockResolvedValue(null);
 });
 
 describe("issuesStore", () => {
@@ -49,6 +51,43 @@ describe("issuesStore", () => {
     mockIpc.listMyIssues.mockResolvedValue(ISSUES);
     await s.load();
     expect(mockIpc.listMyIssues).toHaveBeenCalledWith("p1");
+  });
+  it("starts a new scope when the project reads another Epiku project (#1283)", async () => {
+    mockIpc.getProjectIssueTracker.mockResolvedValue({ ...EPIKU, epikuProject: "sample-project" });
+    await useIssuesStore.getState().setProject("p1");
+    const story = { ...ISSUES[0], key: "ST-1.1" };
+    useIssuesStore.setState({ issues: [story], detailByKey: { "ST-1.1": story } });
+    mockIpc.getProjectIssueTracker.mockResolvedValue({ ...EPIKU, epikuProject: "other-sample-project" });
+    await useIssuesStore.getState().setProject("p1");
+    const s = useIssuesStore.getState();
+    expect(s.scope).toBe("epiku:p1:other-sample-project");
+    expect(s.issues).toBeNull();
+    expect(s.detailByKey).toEqual({});
+  });
+  it("starts a new scope when Settings' default Epiku project or connection changes (#1283)", async () => {
+    const connection: EpikuConfigView = { baseUrl: "https://epiku.example.com", project: "sample-project", hasToken: true };
+    const story = { ...ISSUES[0], key: "ST-1.1" };
+    mockIpc.getProjectIssueTracker.mockResolvedValue(EPIKU); // reads the default in Settings
+    mockIpc.getEpikuConfig.mockResolvedValue(connection);
+    await useIssuesStore.getState().setProject("p1");
+    expect(useIssuesStore.getState().scope).toBe("epiku:p1:sample-project@https://epiku.example.com");
+    useIssuesStore.setState({ issues: [story], detailByKey: { "ST-1.1": story } });
+
+    mockIpc.getEpikuConfig.mockResolvedValue({ ...connection, project: "other-sample-project" });
+    await useIssuesStore.getState().setProject("p1");
+    expect(useIssuesStore.getState().issues).toBeNull();
+    expect(useIssuesStore.getState().detailByKey).toEqual({});
+
+    useIssuesStore.setState({ issues: [story] });
+    mockIpc.getEpikuConfig.mockResolvedValue({ ...connection, project: "other-sample-project", baseUrl: "https://epiku-2.example.com" });
+    await useIssuesStore.getState().setProject("p1");
+    expect(useIssuesStore.getState().issues).toBeNull();
+  });
+  it("reads no Epiku connection for a Jira project", async () => {
+    mockIpc.getProjectIssueTracker.mockResolvedValue(JIRA);
+    await useIssuesStore.getState().setProject("p2");
+    expect(useIssuesStore.getState().scope).toBe("jira");
+    expect(mockIpc.getEpikuConfig).not.toHaveBeenCalled();
   });
   it("keeps the one Jira list across two Jira projects", async () => {
     useIssuesStore.setState({ issues: ISSUES, scope: "jira", projectId: "p1", tracker: "jira" });

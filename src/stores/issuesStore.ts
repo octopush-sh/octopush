@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
-import type { Issue, ProjectIssueTracker, TrackerKind } from "../lib/types";
+import type { EpikuConfigView, Issue, ProjectIssueTracker, TrackerKind } from "../lib/types";
 import { useParentIssuesStore } from "./parentIssuesStore";
 
 interface IssuesState {
@@ -13,8 +13,8 @@ interface IssuesState {
   /** The project the tracker calls are for (#1127), the tracker it reads
    *  (resolved by the backend) and the scope of the caches below: `jira`
    *  for every Jira project (one list serves them all), `epiku:<project>`
-   *  for an Epiku one. A scope change empties the caches, and an answer
-   *  for a scope the user has left never lands. */
+   *  for an Epiku one ({@link trackerScope}). A scope change empties the
+   *  caches, and an answer for a scope the user has left never lands. */
   projectId: string | null;
   tracker: TrackerKind | null;
   scope: string | null;
@@ -41,9 +41,29 @@ interface IssuesState {
   loadEpic: (epicKey: string) => Promise<void>;
 }
 
-/** The cache scope of a project's tracker. */
-export function trackerScope(projectId: string | null, tracker: TrackerKind | null): string | null {
-  return tracker === "epiku" ? `epiku:${projectId}` : tracker;
+/** The cache scope of a project's tracker. An Epiku scope adds the Epiku
+ *  project it reads, its own or the default in Settings, and the connection's
+ *  base URL (`epiku:<project>:<epiku project>@<base url>`), so choosing
+ *  another project or connection, per project or in Settings, is a new scope
+ *  and never shows the old one's stories (#1283). */
+export function trackerScope(
+  projectId: string | null,
+  tracker: TrackerKind | null,
+  epikuProject: string | null = null,
+  epikuBaseUrl: string | null = null,
+): string | null {
+  if (tracker !== "epiku") return tracker;
+  const scope = epikuProject ? `epiku:${projectId}:${epikuProject}` : `epiku:${projectId}`;
+  return epikuBaseUrl ? `${scope}@${epikuBaseUrl}` : scope;
+}
+
+/** Settings' Epiku connection, or null when it can't be read. */
+async function epikuConnection(): Promise<EpikuConfigView | null> {
+  try {
+    return (await ipc.getEpikuConfig()) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** Whether `key` is one of the loaded stories, or one `getIssue` read: what
@@ -97,9 +117,16 @@ export const useIssuesStore = create<IssuesState>((set, get) => ({
   setProject: async (projectId) => {
     const seq = ++projectSeq;
     const t = projectId ? await get().loadTracker(projectId) : null;
+    // Only an Epiku project reads the connection; Jira's scope needs none.
+    const connection = t?.active === "epiku" ? await epikuConnection() : null;
     if (seq !== projectSeq) return;
     const tracker = t?.active ?? null;
-    const scope = trackerScope(projectId, tracker);
+    const scope = trackerScope(
+      projectId,
+      tracker,
+      t?.epikuProject ?? connection?.project ?? null,
+      connection?.baseUrl ?? null,
+    );
     useParentIssuesStore.setState({ projectId, tracker });
     if (scope === get().scope) {
       set({ projectId, tracker });
