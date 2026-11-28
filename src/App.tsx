@@ -3620,13 +3620,15 @@ function App() {
           y={backlogTicketMenu.y}
           onCreateWorkspace={() => void startCreateForTicket(backlogTicketMenu.issue)}
           // Testing works on its own `test/<KEY>` branch, so a workspace the
-          // ticket already has is no reason to stop. Jira tickets only for
-          // now: Epiku stories join Test a ticket after #1127.
-          onTestTicket={
-            epikuTicketTarget(backlogTicketMenu.issue, activeTracker, activeProject)
-              ? undefined
-              : () => void continueCreateForTicket(backlogTicketMenu.issue.key, backlogTicketMenu.issue.summary, "test")
-          }
+          // ticket already has is no reason to stop. An Epiku story opens on
+          // the active project, whose backlog listed it; a Jira ticket on the
+          // project its key's prefix names.
+          onTestTicket={() => {
+            const { issue } = backlogTicketMenu;
+            const epiku = epikuTicketTarget(issue, activeTracker, activeProject, "test");
+            if (epiku) setCreatorForTicket(epiku);
+            else void continueCreateForTicket(issue.key, issue.summary, "test");
+          }}
           onClose={() => setBacklogTicketMenu(null)}
         />
         </ErrorBoundary>
