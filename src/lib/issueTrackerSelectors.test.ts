@@ -338,4 +338,16 @@ describe("Epiku paths of the workspace menu, the picker and Create workspace (#1
     expect(epikuTicketTarget(story, "jira", { id: "p1", path: "/tmp/p1" })).toBeNull();
     expect(epikuTicketTarget(story, "epiku", null)).toBeNull();
   });
+
+  it("opens Test this ticket for an Epiku story on the active project, on the test intent", () => {
+    const story = issue("ST-1.1");
+    expect(epikuTicketTarget(story, "epiku", { id: "p1", path: "/tmp/sample-project" }, "test")).toEqual({
+      projectId: "p1",
+      projectPath: "/tmp/sample-project",
+      initialTask: "summary ST-1.1",
+      linkIssueKeyOnCreate: "ST-1.1",
+      initialIntent: "test",
+    });
+    expect(epikuTicketTarget(story, "jira", { id: "p1", path: "/tmp/sample-project" }, "test")).toBeNull();
+  });
 });
