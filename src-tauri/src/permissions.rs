@@ -842,15 +842,37 @@ fn venv_activate(path: &str) -> bool {
 const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!'];
 
 /// Whether `command` has a plain shape: none of [`NOT_PLAIN`] anywhere in
-/// its raw text, quoted or not, and no `<<`. A whitelist on purpose, not a
-/// list of tricks: bash builds code from many shapes a check doesn't model
-/// (`{$,}{PWD:_}` makes `${PWD:_}` by brace expansion, whose arithmetic runs
-/// the command `$_` holds after `echo $'a[\x24(touch x)]'`), and each new one
-/// was a bypass. Without these characters no expansion, substitution or
-/// line join can happen, so what the check reads is what runs. Ask first's
-/// readers need the same shape (#1267): one function for both. Pure.
+/// its raw text, quoted or not, and no `<<`; and outside quotes no glob
+/// character (`*`, `?`, `[`) and no word starting with `~`. A whitelist on
+/// purpose, not a list of tricks: bash builds code from many shapes a check
+/// doesn't model (`{$,}{PWD:_}` makes `${PWD:_}` by brace expansion, whose
+/// arithmetic runs the command `$_` holds after `echo $'a[\x24(touch x)]'`),
+/// and a glob lets the files present pick the words (`git lfs pu?h` after
+/// `touch push`; `git diff *` next to a file named `--output=x`). Each new
+/// one was a bypass. In this shape no expansion, substitution or line join
+/// can happen, so what the check reads is what runs. Quoted globs are
+/// literal. Ask first's readers need the same shape (#1267): one function
+/// for both. Pure.
 pub fn plain_shape(command: &str) -> bool {
-    !command.contains(NOT_PLAIN) && !command.contains("<<")
+    if command.contains(NOT_PLAIN) || command.contains("<<") {
+        return false;
+    }
+    let mut quote = None;
+    let mut word_start = true;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '*' | '?' | '[' => return false,
+                '~' if word_start => return false,
+                _ => {}
+            },
+        }
+        word_start = quote.is_none() && (c.is_whitespace() || ";|&()<>".contains(c));
+    }
+    true
 }
 
 /// The simple commands of `command` when it is plain: of [`plain_shape`];
@@ -2784,6 +2806,15 @@ mod tests {
             "fc -s status=push",
             "{git,push,origin,HEAD}",
             "/usr/bin/gi? push",
+            // A glob in a later word becomes the real verb after `touch push`.
+            "git lfs pu?h origin main",
+            "docker image pu?h x",
+            "kubectl -n prod appl? -f d.yaml",
+            "git diff *",
+            "ls src/*.ts",
+            "[ -f package.json ] && npm ci",
+            "cd ~",
+            "cat ~/notes.txt",
             // Brace expansion builds `${PWD:_}`, whose arithmetic runs `$_`.
             "echo $'a[\\x24(touch x)]'; echo {$,}{PWD:_}",
             // No `$`, backtick, brace, backslash or `!`, even quoted.
@@ -2844,7 +2875,10 @@ mod tests {
             "cd app && npm ci && npm test",
             "git commit -m \"fix: keep the return path\"",
             "curl -X POST http://localhost:3000/api/x -H 'Content-Type: application/json' -d @body.json",
-            "ls src/*.ts",
+            "ls 'src/*.ts'",
+            "find . -name '*.ts' -type f",
+            "git diff HEAD~1 --stat",
+            "echo \"a?b\"",
             "npm run build > build.log 2>&1",
             "npm test >> logs/test.log",
             "cargo test 2>/dev/null",
