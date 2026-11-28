@@ -171,6 +171,11 @@ pub struct TerminalInfo {
     pub running: bool,
     pub cwd: String,
     pub started_at: i64, // Unix timestamp seconds
+    /// The shell's process, so a client can ask the OS where it sits and
+    /// whether a job holds its terminal without typing into it (#1231).
+    /// Absent when unknown; older clients ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// Streaming events pushed to an attached client.
