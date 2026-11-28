@@ -742,7 +742,11 @@ const SPEND_CAP_MARKERS: [&str; 6] = [
 /// about retrying it. A transient status marked `x-should-retry: false` is
 /// final (`Other`). A 429 with no `retry-after` whose body names a spend or
 /// usage limit is [`ProviderErrorKind::SpendCap`]: it keeps failing however
-/// long the backoff waits.
+/// long the backoff waits. A 500 whose body is a context-length error in a
+/// shape `context::budget::is_context_overflow` knows (LM Studio can answer
+/// a prompt too long for the loaded model so) is a
+/// [`ProviderErrorKind::BadRequest`]: the same request would be refused
+/// again, so it isn't retried as is, and the context guard shortens it.
 pub(crate) fn classify_status(status: u16, retry_after: Option<u64>, should_retry: Option<bool>, body: &str) -> ProviderErrorKind {
     let kind = ProviderErrorKind::from_http_status(status);
     if kind == ProviderErrorKind::RateLimit && retry_after.is_none() {
@@ -750,6 +754,9 @@ pub(crate) fn classify_status(status: u16, retry_after: Option<u64>, should_retr
         if SPEND_CAP_MARKERS.iter().any(|m| body.contains(m)) {
             return ProviderErrorKind::SpendCap;
         }
+    }
+    if status == 500 && crate::context::budget::is_context_overflow(body) {
+        return ProviderErrorKind::BadRequest;
     }
     if kind.is_transient() && should_retry == Some(false) {
         return ProviderErrorKind::Other;
