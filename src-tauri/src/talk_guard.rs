@@ -4,7 +4,9 @@
 //! ([`ToolCard`]) or `None`; the `ApprovalBroker` asks. A `run_command` that
 //! names a path outside the workspace or in a credentials location asks too
 //! (#1201, [`Reach::command_card`]): a net over the words of the command,
-//! not a sandbox, since a shell can build a path no check sees.
+//! not a sandbox, since a shell can build a path no check sees. A walker
+//! that follows links has the folders it walks scanned for links that lead
+//! to credentials first (#1208, [`Reach::links_hit`]).
 
 use crate::chat_engine::{CommandWord, WordRole};
 use crate::mcp::trust::TrustView;
@@ -561,6 +563,14 @@ pub struct Reach {
     /// The Git it asks, and how long it waits ([`git_hooks_dir`]).
     git: PathBuf,
     git_bound: std::time::Duration,
+    /// The turn's Stop (#1208): a link scan ends as soon as it is raised.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// How far a link scan reads ([`LINK_CAPS`]).
+    link_caps: LinkCaps,
+    /// What the link scan found per folder, during the current check only
+    /// (cleared as each starts, like `hooks`), so the rounds of
+    /// [`Reach::checked`] read a tree once.
+    link_scans: parking_lot::Mutex<HashMap<PathBuf, LinkScan>>,
 }
 
 /// Where Git runs a repository's hooks from, as Git said it during a check.
@@ -618,6 +628,9 @@ impl Reach {
             prefetching: std::sync::atomic::AtomicBool::new(false),
             git: PathBuf::from("git"),
             git_bound: std::time::Duration::from_millis(500),
+            cancel: None,
+            link_caps: LINK_CAPS,
+            link_scans: parking_lot::Mutex::default(),
         }
     }
 
@@ -626,6 +639,27 @@ impl Reach {
     fn with_git(mut self, git: PathBuf, bound: std::time::Duration) -> Self {
         (self.git, self.git_bound) = (git, bound);
         self
+    }
+
+    /// End a link scan as soon as `cancel`, the turn's Stop, is raised
+    /// (#1208). The scan is cut short then, so the command asks; the caller
+    /// denies a card raised after Stop without waiting
+    /// (`chat_engine::unless_stopped`).
+    pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Read at most `caps` in a link scan (tests).
+    #[cfg(test)]
+    fn with_link_caps(mut self, caps: LinkCaps) -> Self {
+        self.link_caps = caps;
+        self
+    }
+
+    /// Whether the turn's Stop was raised.
+    fn stopped(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Run the check `place` with every Git answer it needs asked first, on
@@ -637,6 +671,7 @@ impl Reach {
     pub async fn checked<T>(&self, place: impl Fn() -> T) -> T {
         use std::sync::atomic::Ordering::Relaxed;
         self.hooks.lock().clear();
+        self.link_scans.lock().clear();
         self.prefetching.store(true, Relaxed);
         let mut done = None;
         for _ in 0..3 {
@@ -661,10 +696,12 @@ impl Reach {
         out
     }
 
-    /// A new check starts: nothing Git said earlier counts (#1229).
+    /// A new check starts: nothing Git said earlier counts (#1229), nor
+    /// what an earlier link scan found (#1208).
     fn fresh(&self) {
         if !self.prefetching.load(std::sync::atomic::Ordering::Relaxed) {
             self.hooks.lock().clear();
+            self.link_scans.lock().clear();
         }
     }
 
@@ -794,14 +831,15 @@ impl Reach {
     /// The grant a flagged command's card may offer (#1229): [`Self::exact`]
     /// from `cwd` (else the workspace), when every path the command reaches
     /// may be covered by one: no credentials location, no place that runs
-    /// code, no folder around credentials, and within the check's caps.
+    /// code, no folder around credentials, and within the check's caps,
+    /// the link scan's too (#1208).
     pub fn command_grant(&self, command: &str, cwd: Option<&Path>) -> Option<Grant> {
         self.fresh();
         let start = cwd.unwrap_or(&self.workspace);
         let exact = self.exact(command, start)?;
         let mut scan = Scan { glob_names: MAX_GLOB_NAMES, ..Scan::default() };
         let first = self.scan(command, start, &mut scan);
-        (first.is_none() && !scan.over && !scan.ungrantable).then_some(exact)
+        (first.is_none() && !scan.over && !scan.ungrantable && scan.cut.is_none()).then_some(exact)
     }
 
     /// Whether one of the conversation's `grants` is the user's yes for this
@@ -831,12 +869,28 @@ impl Reach {
         }
     }
 
-    /// Scan every line `command` runs ([`Reach::command_card`]).
+    /// Scan every line `command` runs ([`Reach::command_card`]). A walker
+    /// that follows links knows where it stands only when no `cd`, `pushd`,
+    /// `popd` or subshell comes before it (#1208, [`moves_cwd`]); one in
+    /// another line of the command (a `$(…)`, a `bash -c` string) counts
+    /// wherever it is.
     fn scan(&self, command: &str, start: &Path, scan: &mut Scan) -> Option<Reached> {
-        match crate::chat_engine::each_command(command, |line| self.scan_line(line, start, scan)) {
-            Ok(found) => found,
-            Err(_) => self.scan_line(command, start, scan),
+        let mut lines = Vec::new();
+        let read = crate::chat_engine::each_command(command, |line| {
+            lines.push(line.to_string());
+            None::<()>
+        });
+        if read.is_err() {
+            lines = vec![command.to_string()];
         }
+        let moves: Vec<bool> = lines.iter().map(|l| moves_cwd(&crate::chat_engine::command_words(l)) || subshell(l)).collect();
+        for (k, line) in lines.iter().enumerate() {
+            let elsewhere = moves.iter().enumerate().any(|(j, &m)| j != k && m);
+            if let Some(hit) = self.scan_line(line, start, elsewhere, scan) {
+                return Some(hit);
+            }
+        }
+        None
     }
 
     /// The card a file tool's call must pass, or `None` when its target,
@@ -1065,6 +1119,12 @@ impl Reach {
     /// [`MAX_COMMAND_PATHS`] paths, [`MAX_COMMAND_WORDS`] words or
     /// [`MAX_GLOB_NAMES`] names a glob reads, the command asks. A net, not a
     /// sandbox: a path built at run time isn't followed.
+    ///
+    /// A walker that follows links ([`following_segments`]) has each folder
+    /// it gets scanned for links first (#1208, [`Reach::links_hit`]): one
+    /// that leads to or around a credentials location asks, Deny leading,
+    /// and a scan cut short by its caps ([`LINK_CAPS`]) or by Stop asks,
+    /// with no grant.
     pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, grants: &[Grant]) -> Option<ToolCard> {
         // A line continued with `\` is read as the shell joins it too
         // (#1231); the card still shows the command as written.
@@ -1083,8 +1143,8 @@ impl Reach {
         let first = self.scan(command, start, &mut scan);
         let ungrantable = scan.ungrantable;
         let kind = if first.as_ref().is_some_and(|r| r.config) { CardKind::Config } else { CardKind::Run };
-        let (reason, denial, sensitive, grant) = match (first, scan.over, scan.outside) {
-            (Some(r), ..) | (None, false, Some(r)) => (
+        let (reason, denial, sensitive, grant) = match (first, scan.over, scan.cut, scan.outside) {
+            (Some(r), ..) | (None, false, None, Some(r)) => (
                 r.reason(&format!("reaches {}", r.shown)),
                 format!(
                     "Command not run \u{2014} the user declined to let it reach {}, {}. \
@@ -1098,7 +1158,7 @@ impl Reach {
                     (None, _) => None,
                 },
             ),
-            (None, true, _) => (
+            (None, true, ..) => (
                 format!("names more paths than the check reads (over {MAX_COMMAND_PATHS}, or {MAX_COMMAND_WORDS} words)"),
                 "Command not run \u{2014} it names more paths than the check reads, and the user declined it. \
                  Split it into smaller commands, or ask the user how to proceed; do not retry it."
@@ -1106,16 +1166,44 @@ impl Reach {
                 false,
                 None,
             ),
-            (None, false, None) => return None,
+            // Where its links lead is unknown: it asks, and is never granted.
+            (None, false, Some(cut), _) => (
+                format!("follows links in {} \u{b7} {}", cut.shown, cut.why),
+                format!(
+                    "Command not run \u{2014} it follows links in {}, and the check couldn't see where they all lead ({}); \
+                     the user declined it. Run it on a smaller folder or without following links, or ask the user how \
+                     to proceed; do not retry it.",
+                    cut.shown, cut.why
+                ),
+                false,
+                None,
+            ),
+            (None, false, None, None) => return None,
         };
         Some(ToolCard { kind, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None, diff: None, bound: None })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
     /// it reaches, after noting in `scan` the first other path that asks.
-    fn scan_line(&self, line: &str, start: &Path, scan: &mut Scan) -> Option<Reached> {
+    fn scan_line(&self, line: &str, start: &Path, elsewhere: bool, scan: &mut Scan) -> Option<Reached> {
         let words = crate::chat_engine::command_words(line);
         let walking = walking_segments(&words);
+        let following = following_segments(&words, &walking);
+        // Code run as a string, naming a walker that follows links, asks (#1208).
+        if code_names_walker(line, &words) {
+            scan.cut.get_or_insert(LinkCut { shown: "code it runs from a string".to_string(), why: CODE_STRING_WHY.to_string() });
+        }
+        // A program named at run time, told to recurse or follow links, asks (#1208).
+        if blind_program(&words) {
+            let why = "the program is named while the command runs, and the command recurses or follows links".to_string();
+            scan.cut.get_or_insert(LinkCut { shown: "a program the check can't name".to_string(), why });
+        }
+        // Where a walker that follows links stands is known only with no
+        // `cd`, `pushd`, `popd` or subshell before it (#1208): `cd` isn't
+        // followed for it, since one can fail or end with its subshell.
+        let moved = elsewhere || subshell(line);
+        let first_move = words.iter().filter(|w| moves_cwd(std::slice::from_ref(w))).map(|w| w.segment).min();
+        let known = |segment: usize| !moved && first_move.is_none_or(|m| m >= segment);
         // A plain name costs one lookup, not a full resolve: missing, it is
         // no path the command reads; and it stays where the command stands
         // unless it is a link when that is in the workspace, the workspace
@@ -1140,6 +1228,10 @@ impl Reach {
                 return None;
             }
             if w.segment != segment {
+                // A walker that follows links may walk where it stands (#1208).
+                if let Some(hit) = self.here_hit(&following, &walking, segment, known(segment), cwd.as_ref(), scan) {
+                    return Some(hit);
+                }
                 segment = w.segment;
                 if cd.take().is_some() {
                     cwd = self.home.clone().map(&here);
@@ -1161,7 +1253,7 @@ impl Reach {
                 true => Lands { base: &c.logical, lexical: true, fast: false, careful: c.careful },
                 false => Lands { base: &c.real, lexical: false, fast: c.fast, careful: c.careful },
             });
-            let ctx = Ctx { role: w.role, walk: walking[w.segment], writes: w.writes };
+            let ctx = Ctx { role: w.role, walk: walking[w.segment], writes: w.writes, follow: following[w.segment].links, anchored: known(w.segment) };
             let (hit, leads) = self.scan_word(w, &text, lands, ctx, scan);
             if hit.is_some() {
                 return hit;
@@ -1180,13 +1272,53 @@ impl Reach {
                 }
             }
         }
-        None
+        if scan.over {
+            return None;
+        }
+        self.here_hit(&following, &walking, segment, known(segment), cwd.as_ref(), scan)
+    }
+
+    /// The end of segment `segment` (#1208): a walker that follows links
+    /// asks when which folders it walks can't be known (it reads their
+    /// names while it runs, or an abbreviated option may make it follow
+    /// links), and has the folder it stands in scanned as one it names when
+    /// it may walk there ([`Follow::here`]: `rg -L token` reads `.`, and a
+    /// searcher's first word may be its pattern). Where it stands unknown
+    /// (`known`: a `cd`, `pushd`, `popd` or subshell came first), it asks.
+    fn here_hit(&self, following: &[Follow], walking: &[bool], segment: usize, known: bool, cwd: Option<&Cwd>, scan: &mut Scan) -> Option<Reached> {
+        let follow = following.get(segment).copied().unwrap_or_default();
+        if !follow.links {
+            return None;
+        }
+        if follow.runtime {
+            let why = "it reads them while it runs, from its input, a list, xargs or find -exec".to_string();
+            scan.cut.get_or_insert(LinkCut { shown: "the names it is given".to_string(), why });
+        }
+        if follow.vague {
+            let why = "an abbreviated long option may stop it following links, or may not, and the check can't tell".to_string();
+            scan.cut.get_or_insert(LinkCut { shown: "the folders it walks".to_string(), why });
+        }
+        if !follow.here {
+            return None;
+        }
+        let Some(c) = cwd.filter(|_| known) else {
+            scan.cut.get_or_insert_with(unplaced_cwd);
+            return None;
+        };
+        let walk = walking.get(segment).copied().unwrap_or(false);
+        self.path_hit(&c.real, Ctx { role: WordRole::Argument, walk, writes: false, follow: true, anchored: true }, None, scan)
     }
 
     /// One word of a command: the sensitive hit if it has one, and where it
     /// leads when that is one path (where a `cd` goes).
     fn scan_word(&self, w: &CommandWord, text: &str, lands: Option<Lands>, ctx: Ctx, scan: &mut Scan) -> (Option<Reached>, Option<PathBuf>) {
+        // A walker that follows links, given a folder the check can't
+        // place, can't have it scanned: it asks (#1208).
+        let follows = ctx.follow && ctx.role == WordRole::Argument && !ctx.writes && !text.starts_with('-');
         if w.unmodeled {
+            if follows {
+                scan.cut.get_or_insert_with(|| LinkCut { shown: unescape(&w.pattern), why: "a folder the check can't place, built while the command runs".to_string() });
+            }
             return (named_credential(&w.pattern, &w.spliced), None);
         }
         // A program named without a `/` is found on the PATH; a flag is none.
@@ -1196,7 +1328,7 @@ impl Reach {
         // Code or prose in one word (`python3 -c "…"`, `eval "…"`, a commit
         // message): a credentials path in it still asks.
         let parts: Vec<&str> = text.split(|c: char| c.is_whitespace() || "()'\"`;=:|<>".contains(c)).filter(|p| !p.is_empty()).collect();
-        let data = Ctx { role: WordRole::Data, walk: false, writes: false };
+        let data = Ctx { role: WordRole::Data, walk: false, writes: false, follow: false, anchored: true };
         if parts.len() > 1 || parts.first().is_some_and(|p| *p != text) {
             for part in parts {
                 if let Some(hit) = self.data_path(part).and_then(|p| self.path_hit(&p, data, None, scan)) {
@@ -1212,6 +1344,7 @@ impl Reach {
         };
         let mut leads = Vec::new();
         for alt in &alternatives {
+            let mut ctx = ctx;
             let (base, rel, plain) = match alt.strip_prefix('~') {
                 Some(rest) if rest.is_empty() || rest.starts_with('/') => match self.home.as_deref() {
                     Some(home) => (home, rest.trim_start_matches('/'), None),
@@ -1220,20 +1353,34 @@ impl Reach {
                 // `~user`, `~+`, `~-`: where it leads isn't known here.
                 Some(_) => match named_credential(alt, alt) {
                     Some(hit) => return (Some(hit), None),
-                    None => continue,
+                    None => {
+                        if follows {
+                            scan.cut.get_or_insert_with(|| LinkCut { shown: unescape(alt), why: "a folder the check can't place".to_string() });
+                        }
+                        continue;
+                    }
                 },
                 None if alt.starts_with('/') => (Path::new("/"), alt.as_str(), None),
-                None => match &lands {
-                    Some(l) => {
-                        // `.git` is never plain: a worktree's is a file Git follows.
-                        let plain = !l.careful && !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt) && crate::name_fold::fold(&unescape(alt)) != ".git";
-                        (l.base, alt.as_str(), plain.then_some(l.fast))
+                None => {
+                    // A walker that follows links, from a folder not known
+                    // to it ([`Ctx::anchored`]), asks rather than scan a
+                    // folder it may not be in.
+                    if follows && !ctx.anchored {
+                        scan.cut.get_or_insert_with(unplaced_cwd);
+                        ctx.follow = false;
                     }
-                    None => match named_credential(alt, alt) {
-                        Some(hit) => return (Some(hit), None),
-                        None => continue,
-                    },
-                },
+                    match &lands {
+                        Some(l) => {
+                            // `.git` is never plain: a worktree's is a file Git follows.
+                            let plain = !l.careful && !alt.contains('/') && !matches!(alt.as_str(), "." | "..") && !has_glob(alt) && crate::name_fold::fold(&unescape(alt)) != ".git";
+                            (l.base, alt.as_str(), plain.then_some(l.fast))
+                        }
+                        None => match named_credential(alt, alt) {
+                            Some(hit) => return (Some(hit), None),
+                            None => continue,
+                        },
+                    }
+                }
             };
             // A pattern that could name a file that runs commands asks, even
             // before the file exists (#1245).
@@ -1292,6 +1439,13 @@ impl Reach {
             scan.over = true;
             return None;
         }
+        // A walker that follows links reads where each link in a folder it
+        // gets leads (#1208), a plain name's folder too.
+        if ctx.follow && ctx.role == WordRole::Argument && !ctx.writes {
+            if let Some(hit) = self.links_hit(path, scan) {
+                return Some(hit);
+            }
+        }
         if stays || is_device(path) {
             return None;
         }
@@ -1315,6 +1469,118 @@ impl Reach {
             scan.outside.get_or_insert(hit);
         }
         None
+    }
+
+    /// A folder a walker that follows links gets (#1208), scanned for links
+    /// once per check ([`Reach::scan_links`]): the hit for one that leads to
+    /// or around a credentials location. A scan cut short is noted in
+    /// `scan`, so the command asks. A folder inside one this command's scan
+    /// already read was read with it. A folder that is, holds or is in a
+    /// credentials location isn't read: the walk itself asks for it
+    /// ([`Reach::reached`]).
+    fn links_hit(&self, path: &Path, scan: &mut Scan) -> Option<Reached> {
+        if !std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+            return None;
+        }
+        let root = std::fs::canonicalize(path).ok().or_else(|| resolve(path))?;
+        if scan.link_roots.iter().any(|r| root.starts_with(r)) || self.secret_location(&root, true).is_some() {
+            return None;
+        }
+        scan.link_roots.push(root.clone());
+        let known = self.link_scans.lock().get(&root).cloned();
+        let found = match known {
+            Some(found) => found,
+            None => {
+                let found = self.scan_links(&root, scan);
+                self.link_scans.lock().insert(root, found.clone());
+                found
+            }
+        };
+        match found {
+            LinkScan::Clear => None,
+            LinkScan::Secret(hit) => Some(hit),
+            LinkScan::Cut(cut) => {
+                scan.cut.get_or_insert(cut);
+                None
+            }
+        }
+    }
+
+    /// Read the folder `root` for links without following any (#1208), and
+    /// resolve where each leads as any path the check reads is resolved
+    /// (`..` after a link from its target, a dangling one to where it
+    /// points; [`resolve`]). A link to or around a credentials location, as
+    /// named or where it resolves and as the volume compares names
+    /// ([`Reach::secret_location`]), is the find. A link to a folder outside
+    /// those read so far has that folder read too, since the walker goes on
+    /// there. Reads at most what is left of the command's [`LinkCaps`]
+    /// (entries in all, folder depth, time); past one, at a link too deep to
+    /// resolve, or once Stop is raised, the scan is cut.
+    fn scan_links(&self, root: &Path, scan: &mut Scan) -> LinkScan {
+        let caps = self.link_caps;
+        let deadline = *scan.link_deadline.get_or_insert_with(|| std::time::Instant::now() + caps.time);
+        let left = scan.link_entries.get_or_insert(caps.entries);
+        let cut = |why: String| LinkScan::Cut(LinkCut { shown: self.shown(root), why });
+        // The folders this scan reads whole: a link that lands in one is read there.
+        let mut read: HashSet<PathBuf> = HashSet::from([root.to_path_buf()]);
+        let mut stack = vec![(root.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > caps.depth {
+                return cut(format!("its folders nest deeper than the check reads (over {} levels)", caps.depth));
+            }
+            // A folder the walker can't read either holds nothing it reaches.
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries {
+                if self.stopped() {
+                    return cut("Stop ended the check".to_string());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return cut(format!("it takes longer to read than the check allows ({} s)", caps.time.as_secs()));
+                }
+                if *left == 0 {
+                    return cut(format!("it holds more than the check reads (over {} entries)", caps.entries));
+                }
+                *left -= 1;
+                // The entry's own type: a link is never followed here.
+                let Ok(entry) = entry else { continue };
+                let Ok(kind) = entry.file_type() else { continue };
+                let path = entry.path();
+                if kind.is_dir() {
+                    if !read.contains(&path) {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+                if !kind.is_symlink() {
+                    continue;
+                }
+                let Some(real) = std::fs::canonicalize(&path).ok().or_else(|| resolve(&path)) else {
+                    return cut(format!("{} goes through links too deep to follow", self.shown(&path)));
+                };
+                if real.ancestors().any(|a| read.contains(a)) {
+                    continue;
+                }
+                if let Some(why) = self.secret_location(&real, true) {
+                    let shown = format!("{} (a link to {})", self.shown(&path), self.shown(&real));
+                    return LinkScan::Secret(Reached {
+                        shown,
+                        real,
+                        place: "which the command follows",
+                        why: Some(why),
+                        sensitive: true,
+                        deep: false,
+                        folder: None,
+                        read: true,
+                        exec: false,
+                        config: false,
+                    });
+                }
+                if std::fs::metadata(&real).is_ok_and(|m| m.is_dir()) && read.insert(real.clone()) {
+                    stack.push((real, depth + 1));
+                }
+            }
+        }
+        LinkScan::Clear
     }
 
     /// Whether the conversation may be granted `dir` (#1201, #1229): never a
@@ -1372,12 +1638,17 @@ struct Lands<'a> {
 }
 
 /// How a path a command names is read: its word's role, whether its command
-/// reads whole folders, and whether it is written to.
+/// reads whole folders, whether it is written to, whether its command
+/// follows links into the folders it walks (#1208), and whether where it
+/// stands is known to that walker (no `cd`, `pushd`, `popd` or subshell
+/// before it).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Ctx {
     role: WordRole,
     walk: bool,
     writes: bool,
+    follow: bool,
+    anchored: bool,
 }
 
 /// What [`Reach::command_card`] has found so far across a command's lines.
@@ -1394,12 +1665,397 @@ struct Scan<'a> {
     over: bool,
     /// A path that asks may not be granted: no grant for the command.
     ungrantable: bool,
+    /// The first link scan cut short (#1208): the command asks.
+    cut: Option<LinkCut>,
+    /// The folders the command's link scans read, and what is left of
+    /// [`LinkCaps`] for the rest (set as the first scan starts).
+    link_roots: Vec<PathBuf>,
+    link_entries: Option<usize>,
+    link_deadline: Option<std::time::Instant>,
+}
+
+/// How far a command's link scans read in all (#1208) before it asks:
+/// entries, how deep folders nest under each folder scanned, and time.
+#[derive(Clone, Copy, Debug)]
+struct LinkCaps {
+    entries: usize,
+    depth: usize,
+    time: std::time::Duration,
+}
+
+/// Room for an ordinary workspace with its `node_modules`, and short
+/// enough that a check never holds a command long; a slow volume reaches
+/// the time cap first.
+const LINK_CAPS: LinkCaps = LinkCaps { entries: 100_000, depth: 64, time: std::time::Duration::from_secs(2) };
+
+/// The cut for a walker that follows links from where the command stands,
+/// when that isn't known to it (#1208): a `cd`, `pushd`, `popd` or subshell
+/// came before it.
+fn unplaced_cwd() -> LinkCut {
+    LinkCut {
+        shown: "a folder the check can't place".to_string(),
+        why: "a cd, pushd, popd or subshell before it may have moved it".to_string(),
+    }
+}
+
+/// Whether `words` hold a `cd`, `pushd` or `popd` (#1208), wherever: run
+/// by another command too (`builtin cd`).
+fn moves_cwd(words: &[CommandWord]) -> bool {
+    words.iter().any(|w| w.role != WordRole::Data && matches!(unescape(&w.pattern).rsplit('/').next(), Some("cd" | "pushd" | "popd")))
+}
+
+/// `line` with what quotes hold, and escaped characters, blanked out
+/// (#1208): what the shell reads as syntax.
+fn unquoted(line: &str) -> String {
+    let (mut quote, mut escaped) = (None::<char>, false);
+    line.chars()
+        .map(|c| match (quote, c) {
+            _ if escaped => {
+                escaped = false;
+                ' '
+            }
+            (Some('\''), '\'') | (Some('"'), '"') => {
+                quote = None;
+                ' '
+            }
+            (Some('\''), _) => ' ',
+            (_, '\\') => {
+                escaped = true;
+                ' '
+            }
+            (Some(_), _) => ' ',
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                ' '
+            }
+            _ => c,
+        })
+        .collect()
+}
+
+/// Whether `line` opens a subshell, `( … )`, or anything else that starts
+/// with a `(` outside quotes but `$(`, `<(`, `>(` and `((` (#1208): a
+/// heuristic that errs toward yes.
+fn subshell(line: &str) -> bool {
+    let bare = unquoted(line);
+    let mut prev = ' ';
+    for c in bare.chars() {
+        if c == '(' && !matches!(prev, '$' | '<' | '>' | '(') {
+            return true;
+        }
+        prev = c;
+    }
+    false
+}
+
+/// Shells that run a string, or their input, as commands.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+
+/// When a program runs a string as commands (#1208, [`RUNS_STRINGS`]).
+enum Takes {
+    /// Its arguments, whatever its flags (`eval`, `alias`).
+    Always,
+    /// With one of these short flags or long ones (`sh -c`, `env -S`).
+    With(&'static str, &'static [&'static str]),
+}
+
+/// Every program the check knows to run a string as commands, in one
+/// place (#1208): the code-string rule ([`code_names_walker`]) reads all of
+/// them. `.` counts only as the command's program; a shell also when it
+/// reads its input; and a function definition (`NAME()`, `function NAME`)
+/// has its whole line read as its body. A program that runs its other
+/// words as a command (`timeout 30 cmd`, `xargs cmd`, `watch cmd`) is a
+/// wrapper instead ([`WRAPPERS`]).
+const RUNS_STRINGS: &[(&str, Takes)] = &[
+    ("eval", Takes::Always),
+    ("source", Takes::Always),
+    (".", Takes::Always),
+    ("alias", Takes::Always),
+    ("function", Takes::Always),
+    ("script", Takes::With("c", &["--command"])),
+    ("parallel", Takes::Always),
+    ("sh", Takes::With("c", &[])),
+    ("bash", Takes::With("c", &[])),
+    ("zsh", Takes::With("c", &[])),
+    ("dash", Takes::With("c", &[])),
+    ("ksh", Takes::With("c", &[])),
+    ("fish", Takes::With("c", &["--command"])),
+    ("env", Takes::With("S", &["--split-string"])),
+    ("npm", Takes::With("c", &["--call"])),
+    ("npx", Takes::With("c", &["--call"])),
+    ("pnpm", Takes::With("c", &["--shell-mode"])),
+    ("su", Takes::With("c", &["--command"])),
+    ("sudo", Takes::With("si", &["--shell", "--login"])),
+];
+
+/// Why code run from a string asks (#1208, [`code_names_walker`]).
+const CODE_STRING_WHY: &str = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one that follows links, or names a word the check can't know beside a recursion or link-following flag";
+
+/// Whether a line runs code from a string (#1208, [`RUNS_STRINGS`]) that
+/// asks ([`code_asks`]): the words after a program that takes one
+/// (`eval 'zip -r o.zip .'`, after `-c` in `sh -c '…'`, after `-S` in
+/// `env -S '…'`, an alias's value), a shell run by `xargs`, `find -exec` or
+/// `fd -x`, and the rest of the line for a shell reading its input or a
+/// function definition (`NAME()`, outside quotes, or `function NAME`).
+fn code_names_walker(line: &str, words: &[CommandWord]) -> bool {
+    code_in(line, words, 0)
+}
+
+/// [`code_names_walker`] `depth` strings deep; past 4 it asks.
+fn code_in(line: &str, words: &[CommandWord], depth: usize) -> bool {
+    static DEFINES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let defines = DEFINES.get_or_init(|| regex::Regex::new(r"(?:^|[\s;&|({])[A-Za-z_][A-Za-z0-9_.:-]*[ \t]*\([ \t]*\)").unwrap());
+    let name = |w: &CommandWord| unescape(&w.pattern).rsplit('/').next().unwrap_or_default().to_string();
+    let asks = |code: String| depth >= 4 || code_asks(&code, depth + 1);
+    let joined = |ws: &[CommandWord]| ws.iter().map(|w| w.word.as_str()).collect::<Vec<_>>().join(" ");
+    // A function definition: its body may span the line, read as it is
+    // written there.
+    let function = defines.is_match(&unquoted(line)) || words.iter().any(|w| w.role == WordRole::Program && name(w) == "function");
+    if function && words_ask(words) {
+        return true;
+    }
+    let mut from = 0;
+    while from < words.len() {
+        let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
+        let seg = &words[from..to];
+        let names: Vec<String> = seg.iter().map(name).collect();
+        for (k, w) in seg.iter().enumerate() {
+            if w.role == WordRole::Data {
+                continue;
+            }
+            let n = names[k].as_str();
+            let rest = &seg[k + 1..];
+            let Some((_, takes)) = RUNS_STRINGS.iter().find(|(p, _)| *p == n && (n != "." || w.role == WordRole::Program)) else { continue };
+            let shell = SHELLS.contains(&n);
+            // The code it runs: its other words, or those after the flag
+            // that gives it (with what the flag holds after an `=`).
+            let code = match takes {
+                Takes::Always if n == "alias" => Some(rest.iter().map(|o| o.word.split_once('=').map_or(o.word.as_str(), |(_, v)| v)).collect::<Vec<_>>().join(" ")),
+                Takes::Always => Some(joined(rest)),
+                Takes::With(short, long) => {
+                    let at = rest.iter().position(|o| short_flag(&o.word, short) || long.iter().any(|l| long_option(&o.word, l, &[]).is_some()));
+                    match at {
+                        Some(f) => {
+                            let held = rest[f].word.split_once('=').filter(|_| rest[f].word.starts_with("--")).map_or("", |(_, v)| v);
+                            Some(format!("{held} {}", joined(&rest[f + 1..])))
+                        }
+                        None => None,
+                    }
+                }
+            };
+            if code.is_some_and(&asks) {
+                return true;
+            }
+            // A shell reading its input runs what the rest of the line
+            // gives it: each word written to it (`echo '…' | sh`) and each
+            // line of a here-document, read as a line of commands.
+            if shell && w.role == WordRole::Program && (w.stdin || w.inline) && asks(input_lines(words, from + k)) {
+                return true;
+            }
+        }
+        from = to;
+    }
+    false
+}
+
+/// Whether code a program runs from a string asks (#1208): read as
+/// commands, as the shell would (quotes and backslashes removed), it holds
+/// a walker that follows links ([`following_segments`]), or a word the
+/// check can't know (a `$`, a backtick, `$(…)`, a glob; not the test
+/// builtins `[` and `[[`) beside a recursion or link-following flag
+/// ([`WALK_FLAGS`]), or such code of its own.
+fn code_asks(code: &str, depth: usize) -> bool {
+    let words = crate::chat_engine::command_words(code);
+    words_ask(&words) || code_in(code, &words, depth)
+}
+
+/// [`code_asks`] for code already read into `words`, without its own
+/// strings.
+fn words_ask(words: &[CommandWord]) -> bool {
+    let walking = walking_segments(words);
+    let follows = following_segments(words, &walking).iter().any(|f| f.links);
+    follows || (words.iter().any(unknown_word) && words.iter().any(walk_flag))
+}
+
+/// What a shell reading its input (the word at `shell`) may run (#1208):
+/// each argument of the rest of the line on a line of its own, and each
+/// line of a here-document as written. Programs are left out.
+fn input_lines(words: &[CommandWord], shell: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut data: Option<(usize, String)> = None;
+    for w in words.iter().enumerate().filter(|&(k, w)| k != shell && w.role != WordRole::Program).map(|(_, w)| w) {
+        if w.role == WordRole::Data {
+            match &mut data {
+                Some((segment, line)) if *segment == w.segment => {
+                    line.push(' ');
+                    line.push_str(&w.word);
+                }
+                _ => {
+                    lines.extend(data.take().map(|(_, l)| l));
+                    data = Some((w.segment, w.word.clone()));
+                }
+            }
+        } else {
+            lines.extend(data.take().map(|(_, l)| l));
+            lines.push(w.word.clone());
+        }
+    }
+    lines.extend(data.map(|(_, l)| l));
+    lines.join("\n")
+}
+
+/// A word the check can't know (#1208): an expansion it doesn't model, a
+/// glob (but the test builtins `[` and `[[` as a program), or braces that
+/// expand (`{zip,}`, `{a..b}`; a lone `{` or `}`, or `{}`, stays as written).
+fn unknown_word(w: &CommandWord) -> bool {
+    let braces = || brace_expand(&w.pattern, MAX_BRACE_WORDS).is_none_or(|alts| alts.len() != 1 || alts[0] != w.pattern);
+    w.unmodeled || (has_glob(&w.pattern) && !(w.role == WordRole::Program && matches!(w.pattern.as_str(), "[" | "[["))) || braces()
+}
+
+/// Whether `w` is a recursion or link-following flag ([`WALK_FLAGS`]).
+fn walk_flag(w: &CommandWord) -> bool {
+    w.role != WordRole::Data && (short_flag(&w.word, WALK_FLAGS.0) || WALK_FLAGS.1.iter().any(|l| long_option(&w.word, l, &[]).is_some()))
+}
+
+/// Programs that run their other words as a command (argv, not a string;
+/// #1208), the short flags of theirs that take a value, and how many plain
+/// words come before the command (`timeout 30 cmd`, BSD's `script file
+/// cmd`). A wrapper is unwrapped ([`unwrapped`]): the command it runs is
+/// read like any other.
+const WRAPPERS: &[(&str, &str, usize)] = &[
+    ("sudo", "CDghpRrtTUu", 0),
+    ("doas", "uC", 0),
+    ("env", "uCPS", 0),
+    ("nice", "n", 0),
+    ("nohup", "", 0),
+    ("time", "fo", 0),
+    ("timeout", "sk", 1),
+    ("xargs", "IJLnPsdEaRS", 0),
+    ("command", "", 0),
+    ("exec", "a", 0),
+    ("builtin", "", 0),
+    ("caffeinate", "wt", 0),
+    ("stdbuf", "ioe", 0),
+    ("watch", "n", 0),
+    ("script", "cFt", 1),
+    // Reserved words before a command, read the same way.
+    ("{", "", 0),
+    ("!", "", 0),
+    ("if", "", 0),
+    ("then", "", 0),
+    ("else", "", 0),
+    ("elif", "", 0),
+    ("do", "", 0),
+    ("while", "", 0),
+    ("until", "", 0),
+];
+
+/// The index in `seg` of the command a word at `at` runs once its wrappers
+/// are unwrapped (#1208, [`WRAPPERS`]): past their flags (and the values
+/// of those that take one), `NAME=value` for `env`, and their plain words.
+/// `None` when nothing follows.
+fn unwrapped(seg: &[&CommandWord], at: usize) -> Option<usize> {
+    let mut k = at;
+    for _ in 0..8 {
+        let name = unescape(&seg.get(k)?.pattern).rsplit('/').next().unwrap_or_default().to_string();
+        let Some((_, values, plain)) = WRAPPERS.iter().find(|(p, ..)| *p == name) else { return Some(k) };
+        let (mut i, mut plain) = (k + 1, *plain);
+        while let Some(w) = seg.get(i) {
+            let t = w.word.as_str();
+            if t == "--" {
+                i += 1;
+                break;
+            }
+            let assignment = name == "env" && t.split_once('=').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+            if t.len() > 1 && t.starts_with('-') {
+                let takes_value = !t.starts_with("--") && t.chars().last().is_some_and(|c| values.contains(c));
+                i += 1 + usize::from(takes_value);
+            } else if assignment {
+                i += 1;
+            } else if plain > 0 {
+                (i, plain) = (i + 1, plain - 1);
+            } else {
+                break;
+            }
+        }
+        k = i;
+    }
+    seg.get(k).map(|_| k)
+}
+
+/// The programs a command runs (#1208): its program word unwrapped
+/// ([`unwrapped`]), the module `python3 -m` runs, and each command `find
+/// -exec` or `fd -x` runs; by their names.
+fn program_names(seg: &[&CommandWord]) -> Vec<String> {
+    let name = |k: usize| unescape(&seg[k].pattern).rsplit('/').next().unwrap_or_default().to_string();
+    let mut starts: Vec<usize> = seg.iter().position(|w| w.role == WordRole::Program).into_iter().collect();
+    starts.extend((0..seg.len()).filter(|&k| EXEC_WORDS.contains(&seg[k].word.as_str())).map(|k| k + 1));
+    let mut out = Vec::new();
+    for at in starts {
+        let Some(k) = unwrapped(seg, at) else { continue };
+        let n = name(k);
+        if n.starts_with("python") && seg.get(k + 1).is_some_and(|w| w.word == "-m") && k + 2 < seg.len() {
+            out.push(name(k + 2));
+        }
+        out.push(n);
+    }
+    out
+}
+
+/// Recursion and link-following flags, short and long (abbreviated too),
+/// as any walker spells them.
+const WALK_FLAGS: (&str, &[&str]) = (
+    "rRaLHh",
+    &[
+        "--recursive", "--recurse-paths", "--recurse-patterns", "--archive", "--dereference", "--dereference-recursive",
+        "--dereference-args", "--dereference-command-line", "--follow", "--copy-links", "--copy-unsafe-links", "--copy-dirlinks",
+    ],
+);
+
+/// Whether a command of the line names its program at run time (`$Z`,
+/// `${Z}`, `$(…)`, a backtick, a glob, braces that expand; also after a
+/// wrapper such as `sudo` or `timeout 30`, unwrapped) and gives it a
+/// recursion or link-following flag (#1208,
+/// [`WALK_FLAGS`]): the walker it may be can't be known, so it asks. A
+/// program named at run time without such a flag (`$EDITOR notes.md`)
+/// doesn't.
+fn blind_program(words: &[CommandWord]) -> bool {
+    let mut from = 0;
+    while from < words.len() {
+        let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
+        let seg: Vec<&CommandWord> = words[from..to].iter().filter(|w| w.role != WordRole::Data).collect();
+        // The command it runs, wrappers unwrapped: its flags decide.
+        let run = seg.iter().position(|w| w.role == WordRole::Program).and_then(|p| unwrapped(&seg, p));
+        if run.is_some_and(|k| unknown_word(seg[k]) && seg[k + 1..].iter().any(|w| walk_flag(w))) {
+            return true;
+        }
+        from = to;
+    }
+    false
+}
+
+/// What scanning a folder for links found (#1208, [`Reach::scan_links`]).
+#[derive(Clone)]
+enum LinkScan {
+    Clear,
+    /// A link that leads to or around a credentials location.
+    Secret(Reached),
+    /// The scan stopped short of the whole tree.
+    Cut(LinkCut),
+}
+
+/// A link scan cut short: the folder, as the card names it, and why.
+#[derive(Clone)]
+struct LinkCut {
+    shown: String,
+    why: String,
 }
 
 /// A path a tool call reaches that must ask ([`Reach::reached`]): where it
 /// leads, as the card names it, where that is, why it is sensitive, whether
 /// its links go too deep to follow, the folder a command's card may offer a
 /// grant for, and whether the command only reads it.
+#[derive(Clone)]
 struct Reached {
     real: PathBuf,
     shown: String,
@@ -1439,8 +2095,9 @@ pub(crate) fn sub_agent(label: Option<&str>, reason: String) -> String {
 /// that always do (`tar`, `ditto`, `cpio`, `pax`, `7z`, `rsync`, `rg`,
 /// `find`, `cat`, `python3 -m zipfile` or `tarfile`…), and those that do
 /// with their recursive flag (`cp -r`/`-R`/`-a`, `scp -r`, `grep -r`/`-R`,
-/// `diff -r`, `gzip -r`/`-R`, `zip -r`, `ls -R`). `cd ~`, `ls ~` and `du`,
-/// which reads only sizes, don't. Indexed by segment.
+/// `diff -r`, `gzip -r`/`-R`, `zip -r`, `ls -R`), long ones abbreviated too
+/// (`diff --recur`, #1208). `cd ~`, `ls ~` and `du`, which reads only
+/// sizes, don't. Indexed by segment.
 fn walking_segments(words: &[CommandWord]) -> Vec<bool> {
     const ALWAYS: &[&str] = &["tar", "ditto", "cpio", "pax", "7z", "rsync", "rg", "ag", "ack", "find", "fd", "cat", "tree", "zipfile", "tarfile"];
     /// A program, the short flags that make it recurse, its long ones.
@@ -1453,28 +2110,272 @@ fn walking_segments(words: &[CommandWord]) -> Vec<bool> {
         ("zgrep", "rR", &["--recursive"]),
         ("diff", "r", &["--recursive"]),
         ("gzip", "rR", &["--recursive"]),
-        ("zip", "rR", &["--recurse-paths"]),
+        ("zip", "rR", &["--recurse-paths", "--recurse-patterns"]),
         ("ls", "R", &["--recursive"]),
     ];
     let n = words.last().map_or(0, |w| w.segment + 1);
     let mut walks = vec![false; n];
-    let mut segment: Vec<String> = Vec::new();
+    // Each word unescaped, and as written (`--name=value` whole).
+    let mut segment: Vec<(String, &str)> = Vec::new();
     for (i, w) in words.iter().enumerate() {
         if w.role != WordRole::Data {
-            segment.push(unescape(&w.pattern));
+            segment.push((unescape(&w.pattern), w.word.as_str()));
         }
         if words.get(i + 1).is_some_and(|next| next.segment == w.segment) {
             continue;
         }
-        let names = || segment.iter().map(|t| t.rsplit('/').next().unwrap_or_default());
-        let flags = |short: &str, long: &[&str]| {
-            segment.iter().any(|t| long.contains(&t.as_str()) || (t.starts_with('-') && !t.starts_with("--") && t.contains(|c: char| short.contains(c))))
+        let names = || segment.iter().map(|(t, _)| t.rsplit('/').next().unwrap_or_default());
+        // A long flag abbreviated as getopt takes it counts (#1208).
+        let flags = |program: &str, short: &str, long: &[&str]| {
+            segment.iter().any(|(_, t)| short_flag(t, short) || long.iter().any(|l| long_option(t, l, full_long(program)).is_some()))
         };
         walks[w.segment] = names().any(|n| ALWAYS.contains(&n))
-            || RECURSIVE.iter().any(|&(program, short, long)| names().any(|n| n == program) && flags(short, long));
+            || RECURSIVE.iter().any(|&(program, short, long)| names().any(|n| n == program) && flags(program, short, long));
         segment.clear();
     }
     walks
+}
+
+/// Whether a command follows links into the folders it walks (#1208), and
+/// whether the check can know which folders those are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Follow {
+    links: bool,
+    /// Given no folder it reads `.`, or its first word may be its pattern
+    /// rather than a folder (`rg -L token`, `grep -R token`): where it
+    /// stands counts as a folder it names.
+    here: bool,
+    /// It reads the names it walks while it runs ([`at_run_time`]): which
+    /// folders it walks isn't known, so it asks.
+    runtime: bool,
+    /// An abbreviated long option may stop it following links, or may mean
+    /// another option ([`long_option`]): the check can't tell, so it asks.
+    vague: bool,
+}
+
+/// When a walker that follows links may walk the folder it stands in.
+#[derive(Clone, Copy)]
+enum Here {
+    Never,
+    Always,
+    /// With one of these short flags or long ones (`zip -R`).
+    With(&'static str, &'static [&'static str]),
+}
+
+/// A walker that follows links: whenever it walks unless `off` says not
+/// to (`always`), or when `on` tells it to. Each is short flags, then long
+/// ones, which count abbreviated too ([`long_option`]); an abbreviation of
+/// one in `off` asks, since it may mean another option.
+struct Follows {
+    program: &'static str,
+    always: bool,
+    on: (&'static str, &'static [&'static str]),
+    off: (&'static str, &'static [&'static str]),
+    here: Here,
+}
+
+const NO_FLAGS: (&str, &[&str]) = ("", &[]);
+
+/// The walkers of [`walking_segments`] that can follow links, and `du`.
+/// `cp -r` counts as `cp -RL`, a synonym for it in the BSD `cp` macOS ships.
+/// `-H` (links named on the command line) counts too where it means that,
+/// though the check already resolves those.
+const FOLLOWERS: &[Follows] = &[
+    Follows { program: "zip", always: true, on: NO_FLAGS, off: ("y", &["--symlinks"]), here: Here::With("R", &["--recurse-patterns"]) },
+    Follows { program: "scp", always: true, on: NO_FLAGS, off: NO_FLAGS, here: Here::Never },
+    Follows { program: "diff", always: true, on: NO_FLAGS, off: ("", &["--no-dereference"]), here: Here::Never },
+    Follows { program: "7z", always: true, on: NO_FLAGS, off: ("", &["-snl"]), here: Here::Never },
+    Follows { program: "zipfile", always: true, on: NO_FLAGS, off: NO_FLAGS, here: Here::Never },
+    Follows { program: "cp", always: false, on: ("rLH", &["--dereference"]), off: NO_FLAGS, here: Here::Never },
+    Follows {
+        program: "rsync",
+        always: false,
+        on: ("Lk", &["--copy-links", "--copy-unsafe-links", "--copy-dirlinks"]),
+        off: NO_FLAGS,
+        here: Here::Never,
+    },
+    Follows { program: "tar", always: false, on: ("hLH", &["--dereference"]), off: NO_FLAGS, here: Here::Never },
+    Follows { program: "gzip", always: false, on: ("f", &["--force"]), off: NO_FLAGS, here: Here::Never },
+    Follows { program: "pax", always: false, on: ("LH", &[]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "cpio", always: false, on: ("L", &["--dereference"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "find", always: false, on: ("LH", &["-follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "du", always: false, on: ("LH", &["--dereference", "--dereference-args"]), off: NO_FLAGS, here: Here::Always },
+    Follows {
+        program: "ls",
+        always: false,
+        on: ("LH", &["--dereference", "--dereference-command-line", "--dereference-command-line-symlink-to-dir"]),
+        off: NO_FLAGS,
+        here: Here::Always,
+    },
+    Follows { program: "tree", always: false, on: ("l", &[]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "grep", always: false, on: ("RS", &["--dereference-recursive"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "egrep", always: false, on: ("RS", &["--dereference-recursive"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "fgrep", always: false, on: ("RS", &["--dereference-recursive"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "zgrep", always: false, on: ("R", &[]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "rg", always: false, on: ("L", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "fd", always: false, on: ("L", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "ag", always: false, on: ("f", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "ack", always: false, on: ("", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+];
+
+/// Long options of a walker, in full, that start like one it follows links
+/// with or reads names from (`tar --file`, `rsync --include`): never read
+/// as an abbreviation of it.
+const FULL_LONG: &[(&str, &[&str])] = &[("tar", &["--file"]), ("rsync", &["--include"])];
+
+/// [`FULL_LONG`] for `program`.
+fn full_long(program: &str) -> &'static [&'static str] {
+    FULL_LONG.iter().find(|(p, _)| *p == program).map_or(&[][..], |(_, f)| *f)
+}
+
+/// How `typed` (a word as written, `--name=value` whole) names the long
+/// option `name`: `Some(false)` in full, `Some(true)` as an abbreviation
+/// getopt-style parsers take for it (`--de` for `--dereference`), and
+/// `None` otherwise, or when it is one of `full`, other options of the
+/// program written out. An abbreviation that could also mean another
+/// option counts too: the program refuses it or picks one, and counting it
+/// only makes the check scan or ask more.
+fn long_option(typed: &str, name: &str, full: &[&str]) -> Option<bool> {
+    let flag = typed.split_once('=').map_or(typed, |(f, _)| f);
+    if flag == name {
+        return Some(false);
+    }
+    (flag.len() > 2 && flag.starts_with("--") && name.starts_with(flag) && !full.contains(&flag)).then_some(true)
+}
+
+/// Which commands of a line follow links into the folders they walk
+/// (#1208, [`FOLLOWERS`]), given which walk ([`walking_segments`]; `du`
+/// always does): `zip -r` (not `-y`), `scp -r`, `diff -r`, `7z` and
+/// `python3 -m zipfile` whenever they walk; `cp -r`/`-L`/`-H`, `rsync -L`/
+/// `-k`/`--copy-links`/`--copy-unsafe-links`, `tar -h`/`-L`/`--dereference`
+/// (also in an old-style bundle, `tar czhf`), `gzip -rf`, `pax -L`,
+/// `cpio -L`, `find -L`/`-follow`, `du -L`, `ls -RL`, `tree -l`, `grep -R`
+/// (and BSD's `-S`), `rg -L`, `fd -L`, `ag -f` and `ack --follow` when told
+/// to; and whether the folders they walk can be known ([`Follow::runtime`],
+/// [`Follow::vague`]). Indexed by segment.
+fn following_segments(words: &[CommandWord], walking: &[bool]) -> Vec<Follow> {
+    let mut out = vec![Follow::default(); walking.len()];
+    let mut seg: Vec<usize> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if w.role != WordRole::Data {
+            seg.push(i);
+        }
+        if words.get(i + 1).is_some_and(|next| next.segment == w.segment) {
+            continue;
+        }
+        let texts: Vec<String> = seg.iter().map(|&j| unescape(&words[j].pattern)).collect();
+        let typed: Vec<&str> = seg.iter().map(|&j| words[j].word.as_str()).collect();
+        let names: Vec<&str> = texts.iter().map(|t| t.rsplit('/').next().unwrap_or_default()).collect();
+        // Whether the segment holds one of the flags. An abbreviation
+        // counts, except one that would stop following links (`off`): it
+        // may mean another option, so it is noted in `vague` instead.
+        let flags = |program: &str, (chars, long): (&str, &[&str]), off: bool, vague: &mut bool| {
+            let mut found = false;
+            for t in &typed {
+                found |= short_flag(t, chars);
+                for n in long {
+                    match long_option(t, n, full_long(program)) {
+                        Some(true) if off => *vague = true,
+                        Some(_) => found = true,
+                        None => {}
+                    }
+                }
+            }
+            found
+        };
+        // `tar czhf x.tgz .`: an old-style bundle of flags after the program.
+        let bundle = names
+            .iter()
+            .position(|n| *n == "tar")
+            .and_then(|at| typed.get(at + 1))
+            .copied()
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphabetic()));
+        // The programs it runs decide, wrappers unwrapped (`timeout 5 zip`);
+        // and, for a wrapper the check doesn't list (`pnpm exec zip`,
+        // `arch -arm64 zip`), any later word naming a walker, which then
+        // counts only with that walker's own flags below.
+        let programs = program_names(&seg.iter().map(|&j| &words[j]).collect::<Vec<_>>());
+        let runs = |p: &str| programs.iter().any(|n| n == p) || names.contains(&p);
+        let walks = walking.get(w.segment).copied().unwrap_or(false) || runs("du");
+        let mut follow = Follow::default();
+        for f in FOLLOWERS.iter().filter(|f| walks && runs(f.program)) {
+            let mut vague = false;
+            let told = flags(f.program, f.on, false, &mut vague) || (f.program == "tar" && bundle.is_some_and(|b| b.contains(|c: char| f.on.0.contains(c))));
+            let off = flags(f.program, f.off, true, &mut vague);
+            if (f.always && !off) || told || vague {
+                follow.links = true;
+                follow.vague |= vague;
+                follow.here |= match f.here {
+                    Here::Never => false,
+                    Here::Always => true,
+                    Here::With(chars, long) => typed.iter().any(|t| short_flag(t, chars) || long.iter().any(|l| long_option(t, l, &[]).is_some())),
+                };
+            }
+        }
+        if follow.links {
+            follow.runtime = at_run_time(words, &seg, &typed, &names, bundle);
+        }
+        if let Some(slot) = out.get_mut(w.segment) {
+            *slot = follow;
+        }
+        seg.clear();
+    }
+    out
+}
+
+/// Whether `typed` is a bundle of short flags holding one of `chars`.
+fn short_flag(typed: &str, chars: &str) -> bool {
+    typed.starts_with('-') && !typed.starts_with("--") && typed[1..].contains(|c: char| chars.contains(c))
+}
+
+/// The flags after `find` or `fd` that run another command on what they
+/// find, as `xargs` does on its input.
+const EXEC_WORDS: &[&str] = &["-exec", "-execdir", "-ok", "-okdir", "-x", "-X", "--exec", "--exec-batch"];
+
+/// Whether a segment that follows links reads the names it walks while it
+/// runs (#1208), so which folders it walks can't be known from its words:
+/// from its input (`zip -@`, `cpio`, `pax` with no operands, `tar -T -`,
+/// any pipe, redirect or here-document into it), from a list (`tar -T`/`-I`
+/// /`--files-from`, also in an old-style bundle, `rsync --files-from`/
+/// `--include-from`, `7z @list`/`-i@list`), or from `xargs`, `find -exec`
+/// or `fd -x` running the walker on names they produce (`{}`). `seg` holds
+/// the segment's word indices, `typed` and `names` its words as written and
+/// their program names.
+fn at_run_time(words: &[CommandWord], seg: &[usize], typed: &[&str], names: &[&str], bundle: Option<&str>) -> bool {
+    let has = |program: &str| names.contains(&program);
+    let input = seg.iter().any(|&j| words[j].stdin || words[j].inline);
+    let produced = typed.iter().any(|t| t.contains("{}")) || has("xargs") || has("parallel") || {
+        // A walker named after `find`'s or `fd`'s exec flag.
+        let at = typed.iter().position(|t| EXEC_WORDS.contains(t)).filter(|_| has("find") || has("fd"));
+        at.is_some_and(|at| names[at + 1..].iter().any(|n| FOLLOWERS.iter().any(|f| f.program == *n && *n != "find" && *n != "fd")))
+    };
+    let tar = has("tar")
+        && (typed.iter().any(|t| short_flag(t, "TI") || long_option(t, "--files-from", &["--file"]).is_some())
+            || bundle.is_some_and(|b| b.contains(['T', 'I'])));
+    let rsync = has("rsync") && typed.iter().any(|t| long_option(t, "--files-from", &[]).is_some() || long_option(t, "--include-from", &["--include"]).is_some());
+    let zip = has("zip") && typed.iter().any(|t| short_flag(t, "@"));
+    let seven = has("7z") && typed.iter().any(|t| t.starts_with('@') || (short_flag(t, "@") && t.starts_with("-i")));
+    input || produced || tar || rsync || zip || seven || has("cpio") || (has("pax") && pax_operands(typed, names) == 0)
+}
+
+/// How many folders or files `pax` is given (#1208): with none, it reads
+/// the names it writes from its input. Skips its flags and the values of
+/// those that take one (`-f archive`, `-s`, `-o`, `-x`, `-b`, `-B`, `-T`,
+/// `-U`, `-G`).
+fn pax_operands(typed: &[&str], names: &[&str]) -> usize {
+    let Some(at) = names.iter().position(|n| *n == "pax") else { return 0 };
+    let (mut count, mut value) = (0, false);
+    for t in &typed[at + 1..] {
+        if std::mem::take(&mut value) {
+            continue;
+        }
+        if t.starts_with('-') {
+            value = t.len() > 1 && t.ends_with(['f', 's', 'o', 'x', 'b', 'B', 'T', 'U', 'G']);
+            continue;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// The credentials location or file one of `texts` (spellings of a word)
@@ -2513,6 +3414,597 @@ mod tests {
         // and then. A real regression (a cap ignored, a path walked per
         // repeat) grows with the 50 000 words and 100 000 braces above, far
         // past 20 s, so this still catches it.
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    }
+
+    /// Whether `c` is the card for a link the command follows that leads to
+    /// or around a credentials location (#1208), Deny first, never granted.
+    fn asks_for_a_link(c: &ToolCard, to: &str, why: &str) -> bool {
+        c.kind == CardKind::Run
+            && c.sensitive
+            && c.grant.is_none()
+            && c.reason.contains(&format!("(a link to {to}) which the command follows"))
+            && c.reason.ends_with(why)
+            && c.denial.contains("do not retry")
+    }
+
+    /// A walker that follows links reads where each link in a folder it
+    /// walks leads (#1208): a workspace link to home with an archive of `.`
+    /// asks, Deny first, for every walker that follows links, by default or
+    /// when told to; the same walkers that don't follow them don't ask.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_link_to_home_asks_when_the_walker_follows_links() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink(&home, ws.join("home-link")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        for command in [
+            "zip -r out.zip .",
+            "sudo zip -qr out.zip .",
+            "tar -czhf out.tgz .",
+            "tar czhf out.tgz .",
+            "tar --dereference -czf out.tgz .",
+            "rsync -aL . out/",
+            "rsync -a --copy-unsafe-links . out/",
+            "cp -rL . out",
+            "cp -r . out",
+            "scp -r . backup-host:x",
+            "diff -r . out",
+            "7z a out.7z .",
+            "python3 -m zipfile -c out.zip .",
+            "gzip -rfc .",
+            "find -L . -name x",
+            "find . -follow -name x",
+            "du -L .",
+            "ls -RL",
+            "tree -l",
+            // A searcher's first word may be its pattern: where it stands counts.
+            "grep -R token",
+            "grep -R token src",
+            "rg -L token",
+            "rg --follow token src",
+            "fd -L x",
+            "ag -f token",
+            "ack --follow token",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+        }
+        // The same walkers, not following links: the link is archived as a link.
+        for command in [
+            "zip -ry out.zip .",
+            "zip -r --symlinks out.zip .",
+            "tar -czf out.tgz .",
+            "tar czf out.tgz .",
+            "rsync -a . out/",
+            "cp -R . out",
+            "cp -a . out",
+            "diff -r --no-dereference . out",
+            "find . -name x",
+            "du -sh .",
+            "ls -R",
+            "ls -L",
+            "grep -r token .",
+            "rg token",
+            "tree",
+        ] {
+            assert_eq!(run(&reach, command), None, "{command}");
+        }
+    }
+
+    /// A link into a credentials location asks too, spelled with `..` or in
+    /// another case, dangling or not; and a link to a folder outside has
+    /// that folder read, since the walker goes on there (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_credentials_or_through_a_folder_outside_asks() {
+        let (d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home));
+        std::os::unix::fs::symlink("../home/./.ssh", ws.join("keys")).unwrap();
+        let c = run(&reach, "zip -r out.zip .").expect("a link into ~/.ssh asks");
+        assert!(asks_for_a_link(&c, "~/.ssh", "~/.ssh holds SSH keys"), "{}", c.reason);
+        std::fs::remove_file(ws.join("keys")).unwrap();
+        // A case the volume folds (dangling where it doesn't), and a place not made yet.
+        for (target, to, why) in [(home.join(".SSH"), "~/.SSH", "~/.ssh holds SSH keys"), (home.join(".aws/credentials"), "~/.aws/credentials", "~/.aws holds AWS credentials")] {
+            std::os::unix::fs::symlink(&target, ws.join("k")).unwrap();
+            let c = run(&reach, "tar -czhf out.tgz .").unwrap_or_else(|| panic!("{to} asks"));
+            assert!(c.sensitive && c.reason.ends_with(why), "{}", c.reason);
+            std::fs::remove_file(ws.join("k")).unwrap();
+        }
+        // A link to a folder beside the workspace that links back home.
+        let shared = d.path().join("shared");
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+        std::fs::write(shared.join("lib/index.js"), "x").unwrap();
+        std::os::unix::fs::symlink(&shared, ws.join("linked")).unwrap();
+        assert_eq!(run(&reach, "zip -r out.zip ."), None, "a link to an ordinary folder outside doesn't ask");
+        std::os::unix::fs::symlink(&home, shared.join("lib/up")).unwrap();
+        let c = run(&reach, "zip -r out.zip .").expect("its link back home asks");
+        assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{}", c.reason);
+    }
+
+    /// A remembered read folder that holds a link back home (#1208): the
+    /// grant covers walking the folder, never where its link leads.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_a_granted_folder_back_home_asks_deny_first() {
+        let (_d, ws, home) = setup();
+        let granted = home.join("granted");
+        std::fs::create_dir_all(granted.join("docs")).unwrap();
+        std::fs::write(granted.join("docs/a.md"), "a").unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let grants = reads(std::slice::from_ref(&granted));
+        let commands = ["zip -r out.zip ~/granted", "rsync -aL ~/granted/ out/", "grep -R token ~/granted"];
+        // After a `cd`, where the walker stands isn't known to it: it asks.
+        assert!(reach.command_card(None, "cd ~/granted && zip -r out.zip .", None, &grants).is_some_and(|c| !c.sensitive && c.grant.is_none()));
+        for command in commands {
+            assert_eq!(reach.command_card(None, command, None, &grants), None, "{command}: the grant covers it");
+        }
+        std::os::unix::fs::symlink(&home, granted.join("docs/back")).unwrap();
+        for command in commands {
+            let c = reach.command_card(None, command, None, &grants).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+            // Neither the folder's grant nor one for the exact command answers it.
+            let exact = reach.exact(command, &ws).unwrap();
+            assert!(reach.command_card(None, command, None, &[grants.clone(), vec![exact]].concat()).is_some_and(|c| c.sensitive));
+            assert_eq!(reach.command_grant(command, None), None, "{command}: never offered");
+        }
+    }
+
+    /// A link scan past its caps (entries, depth, time) asks, with no grant
+    /// and none honoured; within them the command runs (#1208).
+    #[test]
+    fn a_link_scan_past_its_caps_asks_and_is_never_granted() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(ws.join("a/b/c/d/e")).unwrap();
+        for i in 0..30 {
+            std::fs::write(ws.join(format!("f{i}")), "x").unwrap();
+        }
+        let capped = |entries, depth, secs| {
+            Reach::new(&ws, None, Some(&home)).with_link_caps(LinkCaps { entries, depth, time: std::time::Duration::from_secs(secs) })
+        };
+        let command = "zip -r out.zip .";
+        for (reach, why) in [
+            (capped(20, 64, 60), "it holds more than the check reads (over 20 entries)"),
+            (capped(1000, 3, 60), "its folders nest deeper than the check reads (over 3 levels)"),
+            (capped(1000, 64, 0), "it takes longer to read than the check allows (0 s)"),
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{why}: asks"));
+            assert_eq!((c.kind, c.sensitive, c.grant.is_none()), (CardKind::Run, false, true), "{why}");
+            assert!(c.reason.starts_with("follows links in ") && c.reason.ends_with(why), "{}", c.reason);
+            assert!(c.denial.contains("without following links") && c.denial.contains("do not retry"), "{}", c.denial);
+            let exact = reach.exact(command, &ws).unwrap();
+            assert!(reach.command_card(None, command, None, &[exact]).is_some(), "{why}: a command grant doesn't answer it");
+            assert_eq!(reach.command_grant(command, None), None, "{why}: nor is one offered");
+            assert_eq!(run(&reach, "zip -ry out.zip ."), None, "{why}: a walker that doesn't follow links isn't scanned");
+        }
+        assert_eq!(run(&capped(1000, 64, 60), command), None, "within the caps it runs");
+    }
+
+    /// A workspace with a link to home, and a plain one beside it (#1208).
+    #[cfg(unix)]
+    fn linked_and_plain() -> (tempfile::TempDir, Reach, Reach, PathBuf, PathBuf, PathBuf) {
+        let (d, ws, home) = setup();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink(&home, ws.join("home-link")).unwrap();
+        let plain = d.path().join("plain");
+        std::fs::create_dir_all(plain.join("src")).unwrap();
+        std::fs::write(plain.join("src/a.txt"), "a").unwrap();
+        let plain = std::fs::canonicalize(plain).unwrap();
+        let (linked, clean) = (Reach::new(&ws, None, Some(&home)), Reach::new(&plain, None, Some(&home)));
+        (d, linked, clean, ws, plain, home)
+    }
+
+    /// Whether `c` is a link scan cut short (#1208): it asks, not Deny
+    /// first, with no grant, ending with `why`.
+    fn cut_short(c: &ToolCard, why: &str) -> bool {
+        c.kind == CardKind::Run && !c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in ") && c.reason.ends_with(why)
+    }
+
+    /// The cut for a walker that reads the names it walks while it runs.
+    const AT_RUN_TIME: &str = "it reads them while it runs, from its input, a list, xargs or find -exec";
+
+    /// A walker that follows links and reads the names it walks while it
+    /// runs (from its input, `xargs`, `find -exec` or a list) can't have
+    /// them scanned: it asks, however many commands feed it (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn names_given_at_run_time_ask() {
+        let (_d, linked, clean, _ws, _plain, home) = linked_and_plain();
+        let granted = home.join("g");
+        std::fs::create_dir_all(&granted).unwrap();
+        std::os::unix::fs::symlink(&home, granted.join("back")).unwrap();
+        let held = reads(std::slice::from_ref(&granted));
+        for command in [
+            "ls | zip -r -@ o.zip",
+            "find . | xargs tar -chf o.tar",
+            "find ~/g | sort | zip -r -@ o.zip",
+            "find ~/g | zip -r -@ o.zip",
+            "find . -exec zip -r o.zip {} +",
+            "find . -type d -execdir tar -chf o.tar {} \\;",
+            "fd -t d -x zip -r o.zip",
+            "find . | tar -chf o.tar -T -",
+            "xargs -a list cp -rL -t out",
+            "zip -r -@ o.zip < list",
+            "zip -r -@ o.zip <<'EOF'\nsrc\nEOF",
+            "find . -print0 | cpio -0 -oL > o.cpio",
+            "pax -wL -f o.pax",
+        ] {
+            for reach in [&linked, &clean] {
+                let c = reach.command_card(None, command, None, &held).unwrap_or_else(|| panic!("{command} asks"));
+                assert!(c.grant.is_none(), "{command}: never granted");
+            }
+            let c = clean.command_card(None, command, None, &held).unwrap();
+            assert!(cut_short(&c, AT_RUN_TIME), "{command}: {}", c.reason);
+        }
+        // Given its folders, a walker reads no names at run time.
+        for command in ["pax -wL -f o.pax src", "zip -r o.zip src", "find -L src -name x"] {
+            assert_eq!(run(&clean, command), None, "{command}");
+        }
+    }
+
+    /// A walker that follows links and reads the names it walks from a list
+    /// asks, wherever the list is and whatever it holds (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn a_walker_reading_names_from_a_list_asks_wherever_the_list_is() {
+        let (_d, _linked, clean, _ws, plain, home) = linked_and_plain();
+        // A list inside the folder that names a place outside it.
+        std::fs::write(plain.join("list"), "../home\n").unwrap();
+        let granted = home.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        for command in [
+            "tar -chf o.tar -T list",
+            "tar -chf o.tar -I list",
+            "tar -chf o.tar --files-from=src/list",
+            "tar -chf o.tar -T ../list",
+            "tar -chf o.tar --files-from=/tmp/list",
+            "tar -chf o.tar --files ../list",
+            "tar -chf o.tar -T~/granted/list",
+            "tar chfT o.tar list",
+            "rsync -aL --files-from=list . out/",
+            "rsync -aL --include-from ../list . out/",
+            "xargs --arg-file=../list tar -chf o.tar",
+            "7z a o.7z @list",
+            "7z a o.7z -i@../list",
+        ] {
+            let c = clean.command_card(None, command, None, &reads(std::slice::from_ref(&granted))).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, AT_RUN_TIME), "{command}: {}", c.reason);
+        }
+        let c = run(&clean, "tar -chf o.tar -T \"$LIST\"").expect("a list built at run time asks");
+        assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{}", c.reason);
+        // Options that aren't lists run.
+        for command in ["tar -czh --file=o.tgz .", "tar -czh --file o.tgz .", "rsync -aL --include=x . out/"] {
+            assert_eq!(run(&clean, command), None, "{command}");
+        }
+    }
+
+    /// Long options as getopt reads them (#1208): an abbreviation counts as
+    /// the option, recursing or following links; one that would stop it
+    /// following links may mean another option, so it asks.
+    #[cfg(unix)]
+    #[test]
+    fn abbreviated_long_options_count_and_one_that_stops_following_asks() {
+        let (_d, linked, clean, _ws, _plain, _home) = linked_and_plain();
+        for command in [
+            "tar --de -czf o.tgz .",
+            "tar --deref -czf o.tgz .",
+            "rsync -a --copy-l . out/",
+            "rsync -a --copy-unsafe . out/",
+            "rsync -a --copy-d . out/",
+            "cp -R --deref . out",
+            "du --dereference-a .",
+            "ls -R --deref",
+            "ls --recur --deref",
+            "grep -r --dereference-rec token .",
+            "grep --dereference-rec token .",
+            "rg --fol token",
+            "fd --fol x",
+            "ag --fol token",
+            "ack --fol token",
+            "gzip --recur --for .",
+            "zip --recurse-pa o.zip .",
+            "diff --recur -N e .",
+        ] {
+            let c = run(&linked, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+            assert_eq!(run(&clean, command), None, "{command}: a plain folder runs");
+        }
+        // A recursion flag abbreviated still reads home as a folder of credentials.
+        for command in ["grep --recur token ~", "cp --recur ~ ./backup", "diff --recur ~ ."] {
+            assert!(run(&clean, command).is_some_and(|c| c.sensitive), "{command}");
+        }
+        let why = "an abbreviated long option may stop it following links, or may not, and the check can't tell";
+        for command in ["zip -r --sym o.zip .", "diff -r --no-d . out"] {
+            let c = run(&clean, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, why), "{command}: {}", c.reason);
+        }
+        for command in ["tar -cz --file=o.tgz .", "tar -cz --file o.tgz .", "zip -r --symlinks o.zip .", "rg --files", "ls -R --directory"] {
+            assert_eq!(run(&linked, command), None, "{command}");
+        }
+    }
+
+    /// Where a walker that follows links stands is known only when no `cd`,
+    /// `pushd`, `popd` or subshell comes before it in the command (#1208):
+    /// a `cd` can fail or end with its subshell, so it isn't followed for a
+    /// walker. Otherwise a relative root, or one walking `.`, asks; so does
+    /// a folder built while the command runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_walker_that_follows_links_after_a_cd_asks() {
+        let (_d, linked, clean, _ws, plain, _home) = linked_and_plain();
+        let why = "a cd, pushd, popd or subshell before it may have moved it";
+        for reach in [&linked, &clean] {
+            for command in [
+                "(cd src); zip -r o.zip .",
+                "cd missing; zip -r o.zip .",
+                "cd src && cd .. && zip -r out.zip .",
+                "cd src && zip -r ../o.zip .",
+                "pushd src && zip -r ../o.zip .",
+                "cd \"$PWD\" && zip -r o.zip .",
+                "cd - && zip -r o.zip .",
+                "cd $(pwd) && tar -czhf o.tgz .",
+                "pushd src && popd && zip -r o.zip .",
+                "pushd +1 && zip -r o.zip .",
+                "cd - && rg -L token",
+                "cd {} && zip -r o.zip .",
+                "cd sr* && zip -r o.zip .",
+                "cd ~root && zip -r o.zip .",
+                "(zip -r o.zip .)",
+                "echo $(cd src) && zip -r o.zip .",
+            ] {
+                let c = run(reach, command).unwrap_or_else(|| panic!("{command} asks"));
+                assert!(cut_short(&c, why), "{command}: {}", c.reason);
+            }
+            let c = run(reach, "find . -type d -exec sh -c 'cd {} && zip -r o.zip .' \\;").expect("a walker in a string run by find asks");
+            assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{}", c.reason);
+            // A bare `pushd` swaps folders; the credentials check reads it as `cd`.
+            assert!(run(reach, "pushd && zip -r o.zip .").is_some_and(|c| c.grant.is_none()));
+            let c = run(reach, "zip -r o.zip \"$PWD\"").expect("a folder built at run time asks");
+            assert!(cut_short(&c, "a folder the check can't place, built while the command runs"), "{}", c.reason);
+            // Not following links, a cd after the walker, or only absolute roots, run.
+            for command in ["cd - && zip -ry o.zip .", "cd \"$PWD\" && ls", "zip -r o.zip src && cd src"] {
+                assert_eq!(run(reach, command), None, "{command}");
+            }
+        }
+        let p = plain.display();
+        assert_eq!(run(&clean, &format!("cd src && zip -r {p}/o.zip {p}/src")), None, "absolute roots are scanned after a cd");
+        assert!(run(&linked, &format!("cd /tmp && zip -r {p}/o.zip {}", linked.workspace.display())).is_some_and(|c| c.sensitive));
+    }
+
+    /// Code run from a string (`eval`, `sh -c`, `source`, a shell run by
+    /// `xargs` or `find -exec`, or reading its input) that names a walker
+    /// that can follow links asks: the check doesn't read it as commands
+    /// (#1208).
+    #[test]
+    fn code_run_from_a_string_that_names_a_walker_asks() {
+        let (_d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let why = CODE_STRING_WHY;
+        for command in [
+            "eval 'zip -r o.zip .'",
+            "eval zip -r o.zip .",
+            "eval '/usr/bin/z?p -r out .'",
+            "eval '{zip,} -r out .'",
+            "sh -c \"$CMD -r .\"",
+            "sh -c 'zip -r o.zip .'",
+            "bash -lc \"tar -czhf o.tgz .\"",
+            "zsh -c 'rg -L token'",
+            "ls | xargs sh -c 'zip -r o.zip \"$@\"' _",
+            "find . -exec sh -c 'zip -r o.zip .' \\;",
+            "echo 'zip -r o.zip .' | sh",
+            "bash <<'EOF'\nzip -r o.zip .\nEOF",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, why) || (!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in ")), "{command}: {}", c.reason);
+        }
+        // Quotes and backslashes are read as the shell reads them; a `$` or a
+        // backtick leaves the words unknown.
+        for command in [
+            "eval 'z\"i\"p -r out .'",
+            "eval 'z\\ip -r out .'",
+            "alias q='z\"i\"p -r out .'; q",
+            "alias q='cp -R\\L src out'; q",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, why), "{command}: {}", c.reason);
+        }
+        // Without a walker that follows links, or an unknown word beside a
+        // recursion or link-following flag, it runs; so does a script file
+        // (a stated limit).
+        for command in [
+            "bash -c 'npm test'",
+            "bash -c 'echo $X'",
+            "bash -c 'ls *.rs'",
+            "eval \"$(ssh-agent -s)\"",
+            "eval `cat cmd.txt`",
+            "eval zip -ry o.zip .",
+            "source venv/bin/activate",
+            "source ./zip-all.sh",
+            "ls | xargs bash zip-all.sh",
+            "find . -exec sh -c 'echo {}' \\;",
+            "sh ./build.sh",
+            "alias ll='ls -la'",
+        ] {
+            assert_eq!(run(&reach, command), None, "{command}");
+        }
+        // `$HOME` is home, which the path check asks about as an outside
+        // read (#1201), as for `echo ~`; the code-string rule adds nothing.
+        let c = run(&reach, "bash -c 'echo $HOME'").expect("home is outside the workspace");
+        assert_eq!((c.reason.as_str(), c.sensitive), ("reaches ~ outside the workspace", false));
+    }
+
+    /// Every program that runs a string as commands (#1208, [`RUNS_STRINGS`])
+    /// asks when the string names a walker that can follow links, aliases
+    /// and functions too; and a program named while the command runs asks
+    /// when the command recurses or follows links.
+    #[test]
+    fn strings_run_as_commands_and_programs_named_at_run_time_ask() {
+        let (_d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let code = CODE_STRING_WHY;
+        for command in [
+            "env -S 'zip -r o.zip .'",
+            "env --split-string='tar -czhf o.tgz .'",
+            "npm exec -c 'zip -r o.zip .'",
+            "npx -c 'zip -r o.zip .'",
+            "pnpm exec -c 'zip -r o.zip .'",
+            "script -c 'zip -r o.zip .' /dev/null",
+            "su -c 'zip -r o.zip .'",
+            "sudo -s 'zip -r o.zip .'",
+            "sudo sh -c 'zip -r o.zip .'",
+            "nohup sh -c 'zip -r o.zip .'",
+            "timeout 60 sh -c 'zip -r o.zip .'",
+            "parallel 'zip -r {}.zip {}' ::: src",
+            "alias q='zip -r o.zip .'; q",
+            "alias q='zip -r o.zip .' && q",
+            "q() { zip -r o.zip .; }; q",
+            "function q {\n  zip -r o.zip .\n}\nq",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{command}: {}", c.reason);
+            assert!(c.reason.ends_with(code) || c.reason.contains("can't place"), "{command}: {}", c.reason);
+        }
+        let named = "the program is named while the command runs, and the command recurses or follows links";
+        for command in ["{zip,} -r out .", "{zi,}p -r out .", "$Z -r o.zip .", "${Z} -r o.zip .", "$(which zip) -r o.zip .", "`which zip` -r o.zip .", "/usr/bin/zi? -r o.zip .", "sudo \"$Z\" -R o.zip .", "$T --deref -czf o.tgz ."] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, named), "{command}: {}", c.reason);
+        }
+        for command in [
+            "$EDITOR notes.md",
+            "\"$PAGER\" README.md",
+            "env FOO=1 make test",
+            "env FOO=1 make",
+            "timeout 30 curl -H \"x: y\" \"$URL\"",
+            "nohup npm test &",
+            "sudo -u \"$U\" ls -la",
+            "npx prettier --check src",
+            "alias gs='git status'",
+            "watch -n 1 date",
+            "npm run build",
+            "grep -n \"init()\" a.txt",
+            "echo {a,b}",
+            "{ ls; }",
+            "[ -r .env ]",
+            "[[ -d x ]]",
+            "[[ -L x ]] && echo link",
+            "[ -h x ] || [ -R x ]",
+        ] {
+            assert_eq!(run(&reach, command), None, "{command}");
+        }
+    }
+
+    /// A wrapper runs its other words as a command (argv, #1208): it is
+    /// unwrapped, and the command it runs is read like any other. A walker
+    /// it runs is scanned; a program it names at run time asks only with a
+    /// recursion or link-following flag; a real code string asks as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_is_unwrapped_and_its_command_read_like_any_other() {
+        let (_d, linked, clean, _ws, _plain, _home) = linked_and_plain();
+        for command in [
+            "timeout 5 zip -r o.zip .",
+            "nohup zip -r o.zip . &",
+            "nice -n 5 tar -czhf o.tgz .",
+            "env FOO=1 cp -rL . out",
+            "sudo -u nobody zip -r o.zip .",
+            "watch -n 1 zip -r o.zip .",
+            "script -q /dev/null zip -r o.zip .",
+            "xargs -0 -n 1 rg -L token < /dev/null",
+            "time -p zip -r o.zip .",
+        ] {
+            let c = run(&linked, command).unwrap_or_else(|| panic!("{command} is scanned"));
+            assert!(c.grant.is_none() && (c.sensitive || c.reason.starts_with("follows links in ")), "{command}: {}", c.reason);
+        }
+        for command in ["timeout 5 zip -r o.zip .", "nohup zip -r o.zip . &", "sudo -u nobody zip -r o.zip .", "watch -n 1 zip -r o.zip ."] {
+            assert!(asks_for_a_link(&run(&linked, command).unwrap(), "~", "the folder holds ~/.ssh (SSH keys)"), "{command}");
+            assert_eq!(run(&clean, command), None, "{command}: a plain folder runs");
+        }
+        let named = "the program is named while the command runs, and the command recurses or follows links";
+        for command in ["timeout 5 \"$Z\" -r .", "env FOO=1 $Z -R .", "nice -n 5 ${Z} -a ."] {
+            assert!(run(&clean, command).is_some_and(|c| cut_short(&c, named)), "{command}");
+        }
+        let c = run(&clean, "timeout 5 sh -c 'z?p -r o .'").expect("a code string asks");
+        assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{}", c.reason);
+        for command in ["timeout 30 curl -H \"x: y\" \"$URL\"", "nohup npm test &", "env FOO=1 make", "timeout 30 \"$CMD\" --version"] {
+            assert_eq!(run(&clean, command), None, "{command}");
+        }
+    }
+
+    /// A walker run by a program the check doesn't list as a wrapper
+    /// (`pnpm exec`, `arch -arm64`) still counts when a later word names it
+    /// and the command carries its flags (#1208); otherwise such a word
+    /// gets at most the bounded scan.
+    #[cfg(unix)]
+    #[test]
+    fn a_walker_run_through_an_unlisted_program_is_scanned() {
+        let (_d, linked, clean, _ws, _plain, _home) = linked_and_plain();
+        for command in ["pnpm exec zip -r o.zip .", "arch -arm64 zip -r o.zip .", "yarn exec tar -czhf o.tgz .", "bunx zip -r o.zip .", "chronic zip -r o.zip ."] {
+            let c = run(&linked, command).unwrap_or_else(|| panic!("{command} is scanned"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+            assert_eq!(run(&clean, command), None, "{command}: a plain folder runs");
+        }
+        // Without the walker's own flags, or on a plain tree, nothing asks.
+        for command in ["git grep -r foo", "git grep -R foo", "echo zip -r", "pnpm exec zip -ry o.zip ."] {
+            assert_eq!(run(&clean, command), None, "{command}");
+        }
+        for command in ["git grep -r foo", "echo zip -r", "pnpm exec zip -ry o.zip ."] {
+            assert_eq!(run(&linked, command), None, "{command}");
+        }
+    }
+
+    /// Stop ends a link scan at once (#1208): the command asks rather than
+    /// run unread, and the caller denies that card without waiting.
+    #[test]
+    fn stop_ends_the_link_scan_and_the_command_asks() {
+        let (_d, ws, home) = setup();
+        for i in 0..50 {
+            std::fs::write(ws.join(format!("f{i}")), "x").unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reach = Reach::new(&ws, None, Some(&home)).with_cancel(std::sync::Arc::clone(&stop));
+        assert_eq!(run(&reach, "zip -r out.zip ."), None, "before Stop it runs");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let c = run(&reach, "zip -r out.zip .").expect("a scan Stop cut short asks");
+        assert!(!c.sensitive && c.grant.is_none() && c.reason.ends_with("Stop ended the check"), "{}", c.reason);
+        assert_eq!(run(&reach, "zip -ry out.zip ."), None, "nothing to scan, nothing cut");
+    }
+
+    /// An ordinary workspace with a large `node_modules` (pnpm-style links
+    /// inside it, `.bin` links, a linked package beside it) is scanned
+    /// without a card, and quickly (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn an_ordinary_tree_with_a_large_node_modules_scans_fast_without_a_card() {
+        let (d, ws, home) = setup();
+        let shared = d.path().join("shared");
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+        std::fs::write(shared.join("lib/index.js"), "x").unwrap();
+        let modules = ws.join("node_modules");
+        std::fs::create_dir_all(modules.join(".bin")).unwrap();
+        for i in 0..1500 {
+            let inner = format!(".pnpm/pkg{i}@1.0.0/node_modules/pkg{i}");
+            std::fs::create_dir_all(modules.join(&inner).join("lib")).unwrap();
+            for f in ["package.json", "index.js", "README.md", "lib/a.js", "lib/b.js", "lib/c.js"] {
+                std::fs::write(modules.join(&inner).join(f), "x").unwrap();
+            }
+            std::os::unix::fs::symlink(&inner, modules.join(format!("pkg{i}"))).unwrap();
+            std::os::unix::fs::symlink(format!("../pkg{i}/index.js"), modules.join(format!(".bin/pkg{i}"))).unwrap();
+        }
+        std::os::unix::fs::symlink(&shared, modules.join("linked")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let started = std::time::Instant::now();
+        for command in ["zip -r out.zip .", "tar -czhf out.tgz .", "grep -R token", "find -L . -name x", "rg -L token node_modules"] {
+            assert_eq!(run(&reach, command), None, "{command}");
+        }
+        // About 18 000 entries and 3 000 links, five times over: tens of
+        // milliseconds on a quiet machine. Generous for the reason given in
+        // `the_command_check_is_bounded`: a debug build on a shared CI
+        // runner, with the other tests in parallel, runs several times
+        // slower. A scan that resolves every entry, or walks a tree once per
+        // link, grows far past this.
         assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     }
 

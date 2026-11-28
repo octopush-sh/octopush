@@ -21,7 +21,7 @@
 
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::chat_engine::{continuation_note, dangerous_command, guard_agent_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
+use crate::chat_engine::{continuation_note, dangerous_command, guard_agent_command, unless_stopped, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
 use crate::orchestrator::agentic::resume_messages_for_continuation;
 use crate::orchestrator::agentic::{run_agentic_loop_billed, user_messages, AgenticResult, BlockedTranscript, ExternalTools, LoopFailure, ToolGate};
 use crate::orchestrator::events::EventSink;
@@ -856,6 +856,9 @@ pub struct SubagentGate {
     /// The write the last `check` let through, checked again as it lands.
     pending_write: Mutex<Option<crate::talk_guard::WriteCheck>>,
     seq: AtomicU64,
+    /// The run's Stop (#1208): it ends a command check's link scan, and a
+    /// card raised after it is denied without waiting.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl SubagentGate {
@@ -875,7 +878,16 @@ impl SubagentGate {
             mode: None,
             pending_write: Mutex::new(None),
             seq: AtomicU64::new(1),
+            cancel: None,
         }
+    }
+
+    /// Let the run's Stop (`cancel`) end a command check's link scan and
+    /// deny a card raised after it (#1208).
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.reach = self.reach.with_cancel(Arc::clone(&cancel));
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Read the thread's mode from `source` at each call.
@@ -892,6 +904,9 @@ impl SubagentGate {
     /// project (`root`, from the database) run without a card.
     pub fn with_project_root(mut self, root: Option<std::path::PathBuf>) -> Self {
         self.reach = crate::talk_guard::Reach::of_workspace(Path::new(&self.workspace_path), root.as_deref());
+        if let Some(cancel) = &self.cancel {
+            self.reach = self.reach.with_cancel(Arc::clone(cancel));
+        }
         self
     }
 
@@ -989,7 +1004,9 @@ impl ToolGate for SubagentGate {
         let check = || self.reach.checked(&place);
         let card = check().await?;
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-        let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode);
+        let ask = |c: crate::talk_guard::ToolCard| {
+            unless_stopped(self.cancel.as_deref(), self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode))
+        };
         match crate::permissions::guard_ask_first(card, &check, refused, ask).await {
             crate::permissions::AskOutcome::Approved => None,
             crate::permissions::AskOutcome::Declined(why) | crate::permissions::AskOutcome::Refused(why) => Some(why),
@@ -1024,7 +1041,11 @@ impl ToolGate for SubagentGate {
             let check = || self.reach.checked(&place);
             if let Some(card) = check().await {
                 let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
-                let ask = |c: crate::talk_guard::ToolCard| self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode);
+                // A card raised as Stop lands (a link scan Stop cut short asks,
+                // #1208) is denied, never left waiting.
+                let ask = |c: crate::talk_guard::ToolCard| {
+                    unless_stopped(self.cancel.as_deref(), self.broker.await_card(&self.app, &self.workspace_id, &self.thread_id, &id, c, mode))
+                };
                 if let Some(denial) = crate::chat_engine::guard_card(card, &check, ask).await {
                     return Some(denial);
                 }
@@ -1061,11 +1082,8 @@ impl ToolGate for SubagentGate {
         };
         let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
         let grant = self.reach.checked(|| self.reach.command_grant(&shown, None)).await;
-        match self
-            .broker
-            .await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, grant, mode)
-            .await
-        {
+        let asked = self.broker.await_command(&self.app, &self.workspace_id, &self.thread_id, &id, &shown, &card_reason, grant, mode);
+        match unless_stopped(self.cancel.as_deref(), asked).await {
             ApprovalDecision::Deny => Some(denial),
             _ => None,
         }
@@ -1490,7 +1508,8 @@ pub async fn run_one_subagent(
     let approval_gate = SubagentGate::new(approvals, app.clone(), spec)
         .with_mode(Arc::clone(&mode))
         .with_mcp(mcp_tools, mode)
-        .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id));
+        .with_project_root(crate::talk_guard::project_root(&db, &spec.workspace_id))
+        .with_cancel(Arc::clone(cancel));
     let tool_gate = mode_gate(&db, spec, planned.sandbox_roots.as_deref(), mcp_tools, Some(Box::new(approval_gate)));
     let external = McpSubagentTools::granted(
         mcp,
