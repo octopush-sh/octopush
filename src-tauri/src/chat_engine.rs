@@ -2107,6 +2107,17 @@ impl ApprovalBroker {
     }
 }
 
+/// `ask`'s answer, or Deny without asking once `cancel` (the turn's Stop)
+/// is raised (#1208): Stop answers every card the turn has as Deny
+/// (`ApprovalBroker::deny_thread`), so one raised after it, such as the card
+/// of a check Stop cut short, would wait for an answer nobody gives.
+pub(crate) async fn unless_stopped(cancel: Option<&AtomicBool>, ask: impl std::future::Future<Output = ApprovalDecision>) -> ApprovalDecision {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return ApprovalDecision::Deny;
+    }
+    ask.await
+}
+
 /// Ask about `card` and, once it is approved, check the call again (#1147):
 /// it runs only if what it reaches is still what the card showed. A link
 /// that changed while the card waited asks again, about where it now leads;
@@ -5205,7 +5216,8 @@ impl ChatEngine {
         // Where the file tools may go without asking (#1147). A sandboxed
         // mission's own sandbox refuses a write outside the workspace.
         let main_checkout = crate::talk_guard::project_root(&self.db, &request.workspace_id);
-        let reach = crate::talk_guard::Reach::of_workspace(&workspace_path, main_checkout.as_deref());
+        // Stop ends a command check's link scan (#1208).
+        let reach = crate::talk_guard::Reach::of_workspace(&workspace_path, main_checkout.as_deref()).with_cancel(Arc::clone(&cancel));
         let writes_confined = sandbox_roots.is_some();
 
         let mut usage = TurnUsage::default();
@@ -5761,7 +5773,9 @@ impl ChatEngine {
                         let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));
                         let check = || reach.checked(&ask_place);
                         if let Some(card) = check().await {
-                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
+                            let ask = |c: ToolCard| {
+                                unless_stopped(Some(&*cancel), self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode))
+                            };
                             denied = guard_card(card, &check, ask).await;
                         }
                     }
@@ -5822,18 +5836,19 @@ impl ChatEngine {
                         };
                         let check = || reach.checked(&place);
                         if let Some(card) = check().await {
-                            let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
+                            // A card raised as Stop lands (a link scan Stop cut
+                            // short asks, #1208) is denied, never left waiting.
+                            let ask = |c: ToolCard| {
+                                unless_stopped(Some(&*cancel), self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode))
+                            };
                             denied = guard_card(card, &check, ask).await;
                         }
                     }
                     if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         // Its grant is bound to where it runs, and checks where it reaches (#1229).
                         let grant = reach.checked(|| reach.command_grant(command, shell_cwd().as_deref().map(Path::new))).await;
-                        match self
-                            .approvals
-                            .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, grant, mode)
-                            .await
-                        {
+                        let asked = self.approvals.await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, grant, mode);
+                        match unless_stopped(Some(&*cancel), asked).await {
                             ApprovalDecision::Deny => {
                                 denied = Some(format!(
                                     "Command not run — the user declined to approve it \
@@ -8305,6 +8320,24 @@ mod tests {
         for c in ["rm -rf $DIR", "echo \"$X\"", "rm $(cat l)", "rm `ls`", "diff <(a) <(b)", "ls !(x)", "rm a\rb", "", "cat <<EOF\n$X\nEOF"] {
             assert_eq!(command_key(c), None, "{c:?}");
         }
+    }
+
+    /// A card raised once Stop has landed (#1208) is denied without being
+    /// asked, so it can't wait for an answer Stop already gave.
+    #[tokio::test]
+    async fn a_card_raised_after_stop_is_denied_without_asking() {
+        let stop = AtomicBool::new(true);
+        let asked = AtomicBool::new(false);
+        let ask = || async {
+            asked.store(true, Ordering::Relaxed);
+            ApprovalDecision::Approve
+        };
+        assert!(unless_stopped(Some(&stop), ask()).await == ApprovalDecision::Deny);
+        assert!(!asked.load(Ordering::Relaxed), "nothing was asked");
+        stop.store(false, Ordering::Relaxed);
+        assert!(unless_stopped(Some(&stop), ask()).await == ApprovalDecision::Approve);
+        assert!(unless_stopped(None, ask()).await == ApprovalDecision::Approve);
+        assert!(asked.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

@@ -4,7 +4,9 @@
 //! ([`ToolCard`]) or `None`; the `ApprovalBroker` asks. A `run_command` that
 //! names a path outside the workspace or in a credentials location asks too
 //! (#1201, [`Reach::command_card`]): a net over the words of the command,
-//! not a sandbox, since a shell can build a path no check sees.
+//! not a sandbox, since a shell can build a path no check sees. A walker
+//! that follows links has the folders it walks scanned for links that lead
+//! to credentials first (#1208, [`Reach::links_hit`]).
 
 use crate::chat_engine::{CommandWord, WordRole};
 use crate::mcp::trust::TrustView;
@@ -556,6 +558,14 @@ pub struct Reach {
     /// The Git it asks, and how long it waits ([`git_hooks_dir`]).
     git: PathBuf,
     git_bound: std::time::Duration,
+    /// The turn's Stop (#1208): a link scan ends as soon as it is raised.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// How far a link scan reads ([`LINK_CAPS`]).
+    link_caps: LinkCaps,
+    /// What the link scan found per folder, during the current check only
+    /// (cleared as each starts, like `hooks`), so the rounds of
+    /// [`Reach::checked`] read a tree once.
+    link_scans: parking_lot::Mutex<HashMap<PathBuf, LinkScan>>,
 }
 
 /// Where Git runs a repository's hooks from, as Git said it during a check.
@@ -613,6 +623,9 @@ impl Reach {
             prefetching: std::sync::atomic::AtomicBool::new(false),
             git: PathBuf::from("git"),
             git_bound: std::time::Duration::from_millis(500),
+            cancel: None,
+            link_caps: LINK_CAPS,
+            link_scans: parking_lot::Mutex::default(),
         }
     }
 
@@ -621,6 +634,27 @@ impl Reach {
     fn with_git(mut self, git: PathBuf, bound: std::time::Duration) -> Self {
         (self.git, self.git_bound) = (git, bound);
         self
+    }
+
+    /// End a link scan as soon as `cancel`, the turn's Stop, is raised
+    /// (#1208). The scan is cut short then, so the command asks; the caller
+    /// denies a card raised after Stop without waiting
+    /// (`chat_engine::unless_stopped`).
+    pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Read at most `caps` in a link scan (tests).
+    #[cfg(test)]
+    fn with_link_caps(mut self, caps: LinkCaps) -> Self {
+        self.link_caps = caps;
+        self
+    }
+
+    /// Whether the turn's Stop was raised.
+    fn stopped(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Run the check `place` with every Git answer it needs asked first, on
@@ -632,6 +666,7 @@ impl Reach {
     pub async fn checked<T>(&self, place: impl Fn() -> T) -> T {
         use std::sync::atomic::Ordering::Relaxed;
         self.hooks.lock().clear();
+        self.link_scans.lock().clear();
         self.prefetching.store(true, Relaxed);
         let mut done = None;
         for _ in 0..3 {
@@ -656,10 +691,12 @@ impl Reach {
         out
     }
 
-    /// A new check starts: nothing Git said earlier counts (#1229).
+    /// A new check starts: nothing Git said earlier counts (#1229), nor
+    /// what an earlier link scan found (#1208).
     fn fresh(&self) {
         if !self.prefetching.load(std::sync::atomic::Ordering::Relaxed) {
             self.hooks.lock().clear();
+            self.link_scans.lock().clear();
         }
     }
 
@@ -789,14 +826,15 @@ impl Reach {
     /// The grant a flagged command's card may offer (#1229): [`Self::exact`]
     /// from `cwd` (else the workspace), when every path the command reaches
     /// may be covered by one: no credentials location, no place that runs
-    /// code, no folder around credentials, and within the check's caps.
+    /// code, no folder around credentials, and within the check's caps,
+    /// the link scan's too (#1208).
     pub fn command_grant(&self, command: &str, cwd: Option<&Path>) -> Option<Grant> {
         self.fresh();
         let start = cwd.unwrap_or(&self.workspace);
         let exact = self.exact(command, start)?;
         let mut scan = Scan { glob_names: MAX_GLOB_NAMES, ..Scan::default() };
         let first = self.scan(command, start, &mut scan);
-        (first.is_none() && !scan.over && !scan.ungrantable).then_some(exact)
+        (first.is_none() && !scan.over && !scan.ungrantable && scan.cut.is_none()).then_some(exact)
     }
 
     /// Whether one of the conversation's `grants` is the user's yes for this
@@ -1060,6 +1098,12 @@ impl Reach {
     /// [`MAX_COMMAND_PATHS`] paths, [`MAX_COMMAND_WORDS`] words or
     /// [`MAX_GLOB_NAMES`] names a glob reads, the command asks. A net, not a
     /// sandbox: a path built at run time isn't followed.
+    ///
+    /// A walker that follows links ([`following_segments`]) has each folder
+    /// it gets scanned for links first (#1208, [`Reach::links_hit`]): one
+    /// that leads to or around a credentials location asks, Deny leading,
+    /// and a scan cut short by its caps ([`LINK_CAPS`]) or by Stop asks,
+    /// with no grant.
     pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, grants: &[Grant]) -> Option<ToolCard> {
         self.fresh();
         let start = cwd.unwrap_or(&self.workspace);
@@ -1069,8 +1113,8 @@ impl Reach {
         let first = self.scan(command, start, &mut scan);
         let ungrantable = scan.ungrantable;
         let kind = if first.as_ref().is_some_and(|r| r.config) { CardKind::Config } else { CardKind::Run };
-        let (reason, denial, sensitive, grant) = match (first, scan.over, scan.outside) {
-            (Some(r), ..) | (None, false, Some(r)) => (
+        let (reason, denial, sensitive, grant) = match (first, scan.over, scan.cut, scan.outside) {
+            (Some(r), ..) | (None, false, None, Some(r)) => (
                 r.reason(&format!("reaches {}", r.shown)),
                 format!(
                     "Command not run \u{2014} the user declined to let it reach {}, {}. \
@@ -1084,7 +1128,7 @@ impl Reach {
                     (None, _) => None,
                 },
             ),
-            (None, true, _) => (
+            (None, true, ..) => (
                 format!("names more paths than the check reads (over {MAX_COMMAND_PATHS}, or {MAX_COMMAND_WORDS} words)"),
                 "Command not run \u{2014} it names more paths than the check reads, and the user declined it. \
                  Split it into smaller commands, or ask the user how to proceed; do not retry it."
@@ -1092,7 +1136,19 @@ impl Reach {
                 false,
                 None,
             ),
-            (None, false, None) => return None,
+            // Where its links lead is unknown: it asks, and is never granted.
+            (None, false, Some(cut), _) => (
+                format!("follows links in {} \u{b7} {}", cut.shown, cut.why),
+                format!(
+                    "Command not run \u{2014} it follows links in {}, and the check couldn't see where they all lead ({}); \
+                     the user declined it. Run it on a smaller folder or without following links, or ask the user how \
+                     to proceed; do not retry it.",
+                    cut.shown, cut.why
+                ),
+                false,
+                None,
+            ),
+            (None, false, None, None) => return None,
         };
         Some(ToolCard { kind, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None, diff: None })
     }
@@ -1102,6 +1158,7 @@ impl Reach {
     fn scan_line(&self, line: &str, start: &Path, scan: &mut Scan) -> Option<Reached> {
         let words = crate::chat_engine::command_words(line);
         let walking = walking_segments(&words);
+        let following = following_segments(&words, &walking);
         // A plain name costs one lookup, not a full resolve: missing, it is
         // no path the command reads; and it stays where the command stands
         // unless it is a link when that is in the workspace, the workspace
@@ -1126,6 +1183,10 @@ impl Reach {
                 return None;
             }
             if w.segment != segment {
+                // A walker that follows links may walk where it stands (#1208).
+                if let Some(hit) = self.here_hit(&following, &walking, segment, cwd.as_ref(), scan) {
+                    return Some(hit);
+                }
                 segment = w.segment;
                 if cd.take().is_some() {
                     cwd = self.home.clone().map(&here);
@@ -1147,7 +1208,7 @@ impl Reach {
                 true => Lands { base: &c.logical, lexical: true, fast: false, careful: c.careful },
                 false => Lands { base: &c.real, lexical: false, fast: c.fast, careful: c.careful },
             });
-            let ctx = Ctx { role: w.role, walk: walking[w.segment], writes: w.writes };
+            let ctx = Ctx { role: w.role, walk: walking[w.segment], writes: w.writes, follow: following[w.segment].links };
             let (hit, leads) = self.scan_word(w, &text, lands, ctx, scan);
             if hit.is_some() {
                 return hit;
@@ -1166,7 +1227,21 @@ impl Reach {
                 }
             }
         }
-        None
+        if scan.over {
+            return None;
+        }
+        self.here_hit(&following, &walking, segment, cwd.as_ref(), scan)
+    }
+
+    /// The folder segment `segment`'s command stands in, as one it names,
+    /// when it follows links and may walk there (#1208, [`Follow::here`]):
+    /// `rg -L token` reads `.`, and a searcher's first word may be its
+    /// pattern, not a folder. After a `cd` the check can't follow, nothing.
+    fn here_hit(&self, following: &[Follow], walking: &[bool], segment: usize, cwd: Option<&Cwd>, scan: &mut Scan) -> Option<Reached> {
+        let follow = following.get(segment).copied().unwrap_or_default();
+        let c = cwd.filter(|_| follow.links && follow.here)?;
+        let walk = walking.get(segment).copied().unwrap_or(false);
+        self.path_hit(&c.real, Ctx { role: WordRole::Argument, walk, writes: false, follow: true }, None, scan)
     }
 
     /// One word of a command: the sensitive hit if it has one, and where it
@@ -1182,7 +1257,7 @@ impl Reach {
         // Code or prose in one word (`python3 -c "…"`, `eval "…"`, a commit
         // message): a credentials path in it still asks.
         let parts: Vec<&str> = text.split(|c: char| c.is_whitespace() || "()'\"`;=:|<>".contains(c)).filter(|p| !p.is_empty()).collect();
-        let data = Ctx { role: WordRole::Data, walk: false, writes: false };
+        let data = Ctx { role: WordRole::Data, walk: false, writes: false, follow: false };
         if parts.len() > 1 || parts.first().is_some_and(|p| *p != text) {
             for part in parts {
                 if let Some(hit) = self.data_path(part).and_then(|p| self.path_hit(&p, data, None, scan)) {
@@ -1278,6 +1353,13 @@ impl Reach {
             scan.over = true;
             return None;
         }
+        // A walker that follows links reads where each link in a folder it
+        // gets leads (#1208), a plain name's folder too.
+        if ctx.follow && ctx.role == WordRole::Argument && !ctx.writes {
+            if let Some(hit) = self.links_hit(path, scan) {
+                return Some(hit);
+            }
+        }
         if stays || is_device(path) {
             return None;
         }
@@ -1301,6 +1383,118 @@ impl Reach {
             scan.outside.get_or_insert(hit);
         }
         None
+    }
+
+    /// A folder a walker that follows links gets (#1208), scanned for links
+    /// once per check ([`Reach::scan_links`]): the hit for one that leads to
+    /// or around a credentials location. A scan cut short is noted in
+    /// `scan`, so the command asks. A folder inside one this command's scan
+    /// already read was read with it. A folder that is, holds or is in a
+    /// credentials location isn't read: the walk itself asks for it
+    /// ([`Reach::reached`]).
+    fn links_hit(&self, path: &Path, scan: &mut Scan) -> Option<Reached> {
+        if !std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+            return None;
+        }
+        let root = std::fs::canonicalize(path).ok().or_else(|| resolve(path))?;
+        if scan.link_roots.iter().any(|r| root.starts_with(r)) || self.secret_location(&root, true).is_some() {
+            return None;
+        }
+        scan.link_roots.push(root.clone());
+        let known = self.link_scans.lock().get(&root).cloned();
+        let found = match known {
+            Some(found) => found,
+            None => {
+                let found = self.scan_links(&root, scan);
+                self.link_scans.lock().insert(root, found.clone());
+                found
+            }
+        };
+        match found {
+            LinkScan::Clear => None,
+            LinkScan::Secret(hit) => Some(hit),
+            LinkScan::Cut(cut) => {
+                scan.cut.get_or_insert(cut);
+                None
+            }
+        }
+    }
+
+    /// Read the folder `root` for links without following any (#1208), and
+    /// resolve where each leads as any path the check reads is resolved
+    /// (`..` after a link from its target, a dangling one to where it
+    /// points; [`resolve`]). A link to or around a credentials location, as
+    /// named or where it resolves and as the volume compares names
+    /// ([`Reach::secret_location`]), is the find. A link to a folder outside
+    /// those read so far has that folder read too, since the walker goes on
+    /// there. Reads at most what is left of the command's [`LinkCaps`]
+    /// (entries in all, folder depth, time); past one, at a link too deep to
+    /// resolve, or once Stop is raised, the scan is cut.
+    fn scan_links(&self, root: &Path, scan: &mut Scan) -> LinkScan {
+        let caps = self.link_caps;
+        let deadline = *scan.link_deadline.get_or_insert_with(|| std::time::Instant::now() + caps.time);
+        let left = scan.link_entries.get_or_insert(caps.entries);
+        let cut = |why: String| LinkScan::Cut(LinkCut { shown: self.shown(root), why });
+        // The folders this scan reads whole: a link that lands in one is read there.
+        let mut read: HashSet<PathBuf> = HashSet::from([root.to_path_buf()]);
+        let mut stack = vec![(root.to_path_buf(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > caps.depth {
+                return cut(format!("its folders nest deeper than the check reads (over {} levels)", caps.depth));
+            }
+            // A folder the walker can't read either holds nothing it reaches.
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries {
+                if self.stopped() {
+                    return cut("Stop ended the check".to_string());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return cut(format!("it takes longer to read than the check allows ({} s)", caps.time.as_secs()));
+                }
+                if *left == 0 {
+                    return cut(format!("it holds more than the check reads (over {} entries)", caps.entries));
+                }
+                *left -= 1;
+                // The entry's own type: a link is never followed here.
+                let Ok(entry) = entry else { continue };
+                let Ok(kind) = entry.file_type() else { continue };
+                let path = entry.path();
+                if kind.is_dir() {
+                    if !read.contains(&path) {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+                if !kind.is_symlink() {
+                    continue;
+                }
+                let Some(real) = std::fs::canonicalize(&path).ok().or_else(|| resolve(&path)) else {
+                    return cut(format!("{} goes through links too deep to follow", self.shown(&path)));
+                };
+                if real.ancestors().any(|a| read.contains(a)) {
+                    continue;
+                }
+                if let Some(why) = self.secret_location(&real, true) {
+                    let shown = format!("{} (a link to {})", self.shown(&path), self.shown(&real));
+                    return LinkScan::Secret(Reached {
+                        shown,
+                        real,
+                        place: "which the command follows",
+                        why: Some(why),
+                        sensitive: true,
+                        deep: false,
+                        folder: None,
+                        read: true,
+                        exec: false,
+                        config: false,
+                    });
+                }
+                if std::fs::metadata(&real).is_ok_and(|m| m.is_dir()) && read.insert(real.clone()) {
+                    stack.push((real, depth + 1));
+                }
+            }
+        }
+        LinkScan::Clear
     }
 
     /// Whether the conversation may be granted `dir` (#1201, #1229): never a
@@ -1358,12 +1552,14 @@ struct Lands<'a> {
 }
 
 /// How a path a command names is read: its word's role, whether its command
-/// reads whole folders, and whether it is written to.
+/// reads whole folders, whether it is written to, and whether its command
+/// follows links into the folders it walks (#1208).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Ctx {
     role: WordRole,
     walk: bool,
     writes: bool,
+    follow: bool,
 }
 
 /// What [`Reach::command_card`] has found so far across a command's lines.
@@ -1380,12 +1576,51 @@ struct Scan<'a> {
     over: bool,
     /// A path that asks may not be granted: no grant for the command.
     ungrantable: bool,
+    /// The first link scan cut short (#1208): the command asks.
+    cut: Option<LinkCut>,
+    /// The folders the command's link scans read, and what is left of
+    /// [`LinkCaps`] for the rest (set as the first scan starts).
+    link_roots: Vec<PathBuf>,
+    link_entries: Option<usize>,
+    link_deadline: Option<std::time::Instant>,
+}
+
+/// How far a command's link scans read in all (#1208) before it asks:
+/// entries, how deep folders nest under each folder scanned, and time.
+#[derive(Clone, Copy, Debug)]
+struct LinkCaps {
+    entries: usize,
+    depth: usize,
+    time: std::time::Duration,
+}
+
+/// Room for an ordinary workspace with its `node_modules`, and short
+/// enough that a check never holds a command long; a slow volume reaches
+/// the time cap first.
+const LINK_CAPS: LinkCaps = LinkCaps { entries: 100_000, depth: 64, time: std::time::Duration::from_secs(2) };
+
+/// What scanning a folder for links found (#1208, [`Reach::scan_links`]).
+#[derive(Clone)]
+enum LinkScan {
+    Clear,
+    /// A link that leads to or around a credentials location.
+    Secret(Reached),
+    /// The scan stopped short of the whole tree.
+    Cut(LinkCut),
+}
+
+/// A link scan cut short: the folder, as the card names it, and why.
+#[derive(Clone)]
+struct LinkCut {
+    shown: String,
+    why: String,
 }
 
 /// A path a tool call reaches that must ask ([`Reach::reached`]): where it
 /// leads, as the card names it, where that is, why it is sensitive, whether
 /// its links go too deep to follow, the folder a command's card may offer a
 /// grant for, and whether the command only reads it.
+#[derive(Clone)]
 struct Reached {
     real: PathBuf,
     shown: String,
@@ -1461,6 +1696,130 @@ fn walking_segments(words: &[CommandWord]) -> Vec<bool> {
         segment.clear();
     }
     walks
+}
+
+/// Whether a command follows links into the folders it walks (#1208), and
+/// whether it may walk the folder it stands in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Follow {
+    links: bool,
+    /// Given no folder it reads `.`, or its first word may be its pattern
+    /// rather than a folder (`rg -L token`, `grep -R token`): where it
+    /// stands counts as a folder it names.
+    here: bool,
+}
+
+/// When a walker that follows links may walk the folder it stands in.
+#[derive(Clone, Copy)]
+enum Here {
+    Never,
+    Always,
+    /// With one of these short flags (`zip -R`).
+    With(&'static str),
+}
+
+/// A walker that follows links: whenever it walks unless `off` says not
+/// to (`always`), or when `on` tells it to. Each is short flags, then long
+/// ones.
+struct Follows {
+    program: &'static str,
+    always: bool,
+    on: (&'static str, &'static [&'static str]),
+    off: (&'static str, &'static [&'static str]),
+    here: Here,
+}
+
+const NO_FLAGS: (&str, &[&str]) = ("", &[]);
+
+/// The walkers of [`walking_segments`] that can follow links, and `du`.
+/// `cp -r` counts as `cp -RL`, a synonym for it in the BSD `cp` macOS ships.
+/// `-H` (links named on the command line) counts too where it means that,
+/// though the check already resolves those.
+const FOLLOWERS: &[Follows] = &[
+    Follows { program: "zip", always: true, on: NO_FLAGS, off: ("y", &["--symlinks"]), here: Here::With("R") },
+    Follows { program: "scp", always: true, on: NO_FLAGS, off: NO_FLAGS, here: Here::Never },
+    Follows { program: "diff", always: true, on: NO_FLAGS, off: ("", &["--no-dereference"]), here: Here::Never },
+    Follows { program: "7z", always: true, on: NO_FLAGS, off: ("", &["-snl"]), here: Here::Never },
+    Follows { program: "zipfile", always: true, on: NO_FLAGS, off: NO_FLAGS, here: Here::Never },
+    Follows { program: "cp", always: false, on: ("rLH", &["--dereference"]), off: NO_FLAGS, here: Here::Never },
+    Follows {
+        program: "rsync",
+        always: false,
+        on: ("Lk", &["--copy-links", "--copy-unsafe-links", "--copy-dirlinks"]),
+        off: NO_FLAGS,
+        here: Here::Never,
+    },
+    Follows { program: "tar", always: false, on: ("hLH", &["--dereference"]), off: NO_FLAGS, here: Here::Never },
+    Follows { program: "gzip", always: false, on: ("f", &["--force"]), off: NO_FLAGS, here: Here::Never },
+    Follows { program: "pax", always: false, on: ("LH", &[]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "cpio", always: false, on: ("L", &["--dereference"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "find", always: false, on: ("LH", &["-follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "du", always: false, on: ("LH", &["--dereference", "--dereference-args"]), off: NO_FLAGS, here: Here::Always },
+    Follows {
+        program: "ls",
+        always: false,
+        on: ("LH", &["--dereference", "--dereference-command-line", "--dereference-command-line-symlink-to-dir"]),
+        off: NO_FLAGS,
+        here: Here::Always,
+    },
+    Follows { program: "tree", always: false, on: ("l", &[]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "grep", always: false, on: ("RS", &["--dereference-recursive"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "egrep", always: false, on: ("RS", &["--dereference-recursive"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "fgrep", always: false, on: ("RS", &["--dereference-recursive"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "zgrep", always: false, on: ("R", &[]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "rg", always: false, on: ("L", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "fd", always: false, on: ("L", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "ag", always: false, on: ("f", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+    Follows { program: "ack", always: false, on: ("", &["--follow"]), off: NO_FLAGS, here: Here::Always },
+];
+
+/// Which commands of a line follow links into the folders they walk
+/// (#1208, [`FOLLOWERS`]), given which walk ([`walking_segments`]; `du`
+/// always does): `zip -r` (not `-y`), `scp -r`, `diff -r`, `7z` and
+/// `python3 -m zipfile` whenever they walk; `cp -r`/`-L`/`-H`, `rsync -L`/
+/// `-k`/`--copy-links`/`--copy-unsafe-links`, `tar -h`/`-L`/`--dereference`
+/// (also in an old-style bundle, `tar czhf`), `gzip -rf`, `pax -L`,
+/// `cpio -L`, `find -L`/`-follow`, `du -L`, `ls -RL`, `tree -l`, `grep -R`
+/// (and BSD's `-S`), `rg -L`, `fd -L`, `ag -f` and `ack --follow` when told
+/// to. Indexed by segment.
+fn following_segments(words: &[CommandWord], walking: &[bool]) -> Vec<Follow> {
+    let mut out = vec![Follow::default(); walking.len()];
+    let mut segment: Vec<String> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if w.role != WordRole::Data {
+            segment.push(unescape(&w.pattern));
+        }
+        if words.get(i + 1).is_some_and(|next| next.segment == w.segment) {
+            continue;
+        }
+        let names: Vec<&str> = segment.iter().map(|t| t.rsplit('/').next().unwrap_or_default()).collect();
+        let short = |t: &str, chars: &str| t.starts_with('-') && !t.starts_with("--") && t[1..].contains(|c: char| chars.contains(c));
+        let flags = |chars: &str, long: &[&str]| segment.iter().any(|t| long.contains(&t.as_str()) || short(t.as_str(), chars));
+        // `tar czhf x.tgz .`: an old-style bundle of flags after the program.
+        let bundle = names
+            .iter()
+            .position(|n| *n == "tar")
+            .and_then(|at| segment.get(at + 1))
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphabetic()));
+        let walks = walking.get(w.segment).copied().unwrap_or(false) || names.contains(&"du");
+        let mut follow = Follow::default();
+        for f in FOLLOWERS.iter().filter(|f| walks && names.contains(&f.program)) {
+            let told = flags(f.on.0, f.on.1) || (f.program == "tar" && bundle.is_some_and(|b| b.contains(|c: char| f.on.0.contains(c))));
+            if (f.always && !flags(f.off.0, f.off.1)) || (!f.always && told) {
+                follow.links = true;
+                follow.here |= match f.here {
+                    Here::Never => false,
+                    Here::Always => true,
+                    Here::With(chars) => segment.iter().any(|t| short(t.as_str(), chars)),
+                };
+            }
+        }
+        if let Some(slot) = out.get_mut(w.segment) {
+            *slot = follow;
+        }
+        segment.clear();
+    }
+    out
 }
 
 /// The credentials location or file one of `texts` (spellings of a word)
@@ -2499,6 +2858,223 @@ mod tests {
         // and then. A real regression (a cap ignored, a path walked per
         // repeat) grows with the 50 000 words and 100 000 braces above, far
         // past 20 s, so this still catches it.
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    }
+
+    /// Whether `c` is the card for a link the command follows that leads to
+    /// or around a credentials location (#1208), Deny first, never granted.
+    fn asks_for_a_link(c: &ToolCard, to: &str, why: &str) -> bool {
+        c.kind == CardKind::Run
+            && c.sensitive
+            && c.grant.is_none()
+            && c.reason.contains(&format!("(a link to {to}) which the command follows"))
+            && c.reason.ends_with(why)
+            && c.denial.contains("do not retry")
+    }
+
+    /// A walker that follows links reads where each link in a folder it
+    /// walks leads (#1208): a workspace link to home with an archive of `.`
+    /// asks, Deny first, for every walker that follows links, by default or
+    /// when told to; the same walkers that don't follow them don't ask.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_link_to_home_asks_when_the_walker_follows_links() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink(&home, ws.join("home-link")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        for command in [
+            "zip -r out.zip .",
+            "sudo zip -qr out.zip .",
+            "cd src && cd .. && zip -r out.zip .",
+            "tar -czhf out.tgz .",
+            "tar czhf out.tgz .",
+            "tar --dereference -czf out.tgz .",
+            "rsync -aL . out/",
+            "rsync -a --copy-unsafe-links . out/",
+            "cp -rL . out",
+            "cp -r . out",
+            "scp -r . backup-host:x",
+            "diff -r . out",
+            "7z a out.7z .",
+            "python3 -m zipfile -c out.zip .",
+            "gzip -rfc .",
+            "find -L . -name x",
+            "find . -follow -name x",
+            "du -L .",
+            "ls -RL",
+            "tree -l",
+            // A searcher's first word may be its pattern: where it stands counts.
+            "grep -R token",
+            "grep -R token src",
+            "rg -L token",
+            "rg --follow token src",
+            "fd -L x",
+            "ag -f token",
+            "ack --follow token",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+        }
+        // The same walkers, not following links: the link is archived as a link.
+        for command in [
+            "zip -ry out.zip .",
+            "zip -r --symlinks out.zip .",
+            "tar -czf out.tgz .",
+            "tar czf out.tgz .",
+            "rsync -a . out/",
+            "cp -R . out",
+            "cp -a . out",
+            "diff -r --no-dereference . out",
+            "find . -name x",
+            "du -sh .",
+            "ls -R",
+            "ls -L",
+            "grep -r token .",
+            "rg token",
+            "tree",
+        ] {
+            assert_eq!(run(&reach, command), None, "{command}");
+        }
+    }
+
+    /// A link into a credentials location asks too, spelled with `..` or in
+    /// another case, dangling or not; and a link to a folder outside has
+    /// that folder read, since the walker goes on there (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_credentials_or_through_a_folder_outside_asks() {
+        let (d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home));
+        std::os::unix::fs::symlink("../home/./.ssh", ws.join("keys")).unwrap();
+        let c = run(&reach, "zip -r out.zip .").expect("a link into ~/.ssh asks");
+        assert!(asks_for_a_link(&c, "~/.ssh", "~/.ssh holds SSH keys"), "{}", c.reason);
+        std::fs::remove_file(ws.join("keys")).unwrap();
+        // A case the volume folds (dangling where it doesn't), and a place not made yet.
+        for (target, to, why) in [(home.join(".SSH"), "~/.SSH", "~/.ssh holds SSH keys"), (home.join(".aws/credentials"), "~/.aws/credentials", "~/.aws holds AWS credentials")] {
+            std::os::unix::fs::symlink(&target, ws.join("k")).unwrap();
+            let c = run(&reach, "tar -czhf out.tgz .").unwrap_or_else(|| panic!("{to} asks"));
+            assert!(c.sensitive && c.reason.ends_with(why), "{}", c.reason);
+            std::fs::remove_file(ws.join("k")).unwrap();
+        }
+        // A link to a folder beside the workspace that links back home.
+        let shared = d.path().join("shared");
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+        std::fs::write(shared.join("lib/index.js"), "x").unwrap();
+        std::os::unix::fs::symlink(&shared, ws.join("linked")).unwrap();
+        assert_eq!(run(&reach, "zip -r out.zip ."), None, "a link to an ordinary folder outside doesn't ask");
+        std::os::unix::fs::symlink(&home, shared.join("lib/up")).unwrap();
+        let c = run(&reach, "zip -r out.zip .").expect("its link back home asks");
+        assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{}", c.reason);
+    }
+
+    /// A remembered read folder that holds a link back home (#1208): the
+    /// grant covers walking the folder, never where its link leads.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_a_granted_folder_back_home_asks_deny_first() {
+        let (_d, ws, home) = setup();
+        let granted = home.join("granted");
+        std::fs::create_dir_all(granted.join("docs")).unwrap();
+        std::fs::write(granted.join("docs/a.md"), "a").unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let grants = reads(std::slice::from_ref(&granted));
+        let commands = ["zip -r out.zip ~/granted", "rsync -aL ~/granted/ out/", "grep -R token ~/granted", "cd ~/granted && zip -r out.zip ."];
+        for command in commands {
+            assert_eq!(reach.command_card(None, command, None, &grants), None, "{command}: the grant covers it");
+        }
+        std::os::unix::fs::symlink(&home, granted.join("docs/back")).unwrap();
+        for command in commands {
+            let c = reach.command_card(None, command, None, &grants).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+            // Neither the folder's grant nor one for the exact command answers it.
+            let exact = reach.exact(command, &ws).unwrap();
+            assert!(reach.command_card(None, command, None, &[grants.clone(), vec![exact]].concat()).is_some_and(|c| c.sensitive));
+            assert_eq!(reach.command_grant(command, None), None, "{command}: never offered");
+        }
+    }
+
+    /// A link scan past its caps (entries, depth, time) asks, with no grant
+    /// and none honoured; within them the command runs (#1208).
+    #[test]
+    fn a_link_scan_past_its_caps_asks_and_is_never_granted() {
+        let (_d, ws, home) = setup();
+        std::fs::create_dir_all(ws.join("a/b/c/d/e")).unwrap();
+        for i in 0..30 {
+            std::fs::write(ws.join(format!("f{i}")), "x").unwrap();
+        }
+        let capped = |entries, depth, secs| {
+            Reach::new(&ws, None, Some(&home)).with_link_caps(LinkCaps { entries, depth, time: std::time::Duration::from_secs(secs) })
+        };
+        let command = "zip -r out.zip .";
+        for (reach, why) in [
+            (capped(20, 64, 60), "it holds more than the check reads (over 20 entries)"),
+            (capped(1000, 3, 60), "its folders nest deeper than the check reads (over 3 levels)"),
+            (capped(1000, 64, 0), "it takes longer to read than the check allows (0 s)"),
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{why}: asks"));
+            assert_eq!((c.kind, c.sensitive, c.grant.is_none()), (CardKind::Run, false, true), "{why}");
+            assert!(c.reason.starts_with("follows links in ") && c.reason.ends_with(why), "{}", c.reason);
+            assert!(c.denial.contains("without following links") && c.denial.contains("do not retry"), "{}", c.denial);
+            let exact = reach.exact(command, &ws).unwrap();
+            assert!(reach.command_card(None, command, None, &[exact]).is_some(), "{why}: a command grant doesn't answer it");
+            assert_eq!(reach.command_grant(command, None), None, "{why}: nor is one offered");
+            assert_eq!(run(&reach, "zip -ry out.zip ."), None, "{why}: a walker that doesn't follow links isn't scanned");
+        }
+        assert_eq!(run(&capped(1000, 64, 60), command), None, "within the caps it runs");
+    }
+
+    /// Stop ends a link scan at once (#1208): the command asks rather than
+    /// run unread, and the caller denies that card without waiting.
+    #[test]
+    fn stop_ends_the_link_scan_and_the_command_asks() {
+        let (_d, ws, home) = setup();
+        for i in 0..50 {
+            std::fs::write(ws.join(format!("f{i}")), "x").unwrap();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reach = Reach::new(&ws, None, Some(&home)).with_cancel(std::sync::Arc::clone(&stop));
+        assert_eq!(run(&reach, "zip -r out.zip ."), None, "before Stop it runs");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let c = run(&reach, "zip -r out.zip .").expect("a scan Stop cut short asks");
+        assert!(!c.sensitive && c.grant.is_none() && c.reason.ends_with("Stop ended the check"), "{}", c.reason);
+        assert_eq!(run(&reach, "zip -ry out.zip ."), None, "nothing to scan, nothing cut");
+    }
+
+    /// An ordinary workspace with a large `node_modules` (pnpm-style links
+    /// inside it, `.bin` links, a linked package beside it) is scanned
+    /// without a card, and quickly (#1208).
+    #[cfg(unix)]
+    #[test]
+    fn an_ordinary_tree_with_a_large_node_modules_scans_fast_without_a_card() {
+        let (d, ws, home) = setup();
+        let shared = d.path().join("shared");
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+        std::fs::write(shared.join("lib/index.js"), "x").unwrap();
+        let modules = ws.join("node_modules");
+        std::fs::create_dir_all(modules.join(".bin")).unwrap();
+        for i in 0..1500 {
+            let inner = format!(".pnpm/pkg{i}@1.0.0/node_modules/pkg{i}");
+            std::fs::create_dir_all(modules.join(&inner).join("lib")).unwrap();
+            for f in ["package.json", "index.js", "README.md", "lib/a.js", "lib/b.js", "lib/c.js"] {
+                std::fs::write(modules.join(&inner).join(f), "x").unwrap();
+            }
+            std::os::unix::fs::symlink(&inner, modules.join(format!("pkg{i}"))).unwrap();
+            std::os::unix::fs::symlink(format!("../pkg{i}/index.js"), modules.join(format!(".bin/pkg{i}"))).unwrap();
+        }
+        std::os::unix::fs::symlink(&shared, modules.join("linked")).unwrap();
+        let reach = Reach::new(&ws, None, Some(&home));
+        let started = std::time::Instant::now();
+        for command in ["zip -r out.zip .", "tar -czhf out.tgz .", "grep -R token", "find -L . -name x", "rg -L token node_modules"] {
+            assert_eq!(run(&reach, command), None, "{command}");
+        }
+        // About 18 000 entries and 3 000 links, five times over: tens of
+        // milliseconds on a quiet machine. Generous for the reason given in
+        // `the_command_check_is_bounded`: a debug build on a shared CI
+        // runner, with the other tests in parallel, runs several times
+        // slower. A scan that resolves every entry, or walks a tree once per
+        // link, grows far past this.
         assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     }
 
