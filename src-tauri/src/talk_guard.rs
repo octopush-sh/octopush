@@ -1191,8 +1191,7 @@ impl Reach {
         let following = following_segments(&words, &walking);
         // Code run as a string, naming a walker that follows links, asks (#1208).
         if code_names_walker(line, &words) {
-            let why = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one naming a walker that can follow links, which the check doesn't read".to_string();
-            scan.cut.get_or_insert(LinkCut { shown: "code it runs from a string".to_string(), why });
+            scan.cut.get_or_insert(LinkCut { shown: "code it runs from a string".to_string(), why: CODE_STRING_WHY.to_string() });
         }
         // A program named at run time, told to recurse or follow links, asks (#1208).
         if blind_program(&words) {
@@ -1789,29 +1788,31 @@ const RUNS_STRINGS: &[(&str, Takes)] = &[
     ("sudo", Takes::With("si", &["--shell", "--login"])),
 ];
 
-/// Whether a line runs code from a string that names a walker that can
-/// follow links (#1208, [`FOLLOWERS`]) as a word, which the check doesn't
-/// read as commands: the words after a program of [`RUNS_STRINGS`] that
-/// takes one (`eval 'zip -r o.zip .'`, `env -S '…'`, `npm exec -c '…'`,
-/// `alias q='…'`), a shell run by `xargs`, `find -exec` or `fd -x`, or any
-/// word of the line for a shell reading its input or a function
-/// definition.
+/// Why code run from a string asks (#1208, [`code_names_walker`]).
+const CODE_STRING_WHY: &str = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one that follows links, or names a word the check can't know beside a recursion or link-following flag";
+
+/// Whether a line runs code from a string (#1208, [`RUNS_STRINGS`]) that
+/// asks ([`code_asks`]): the words after a program that takes one
+/// (`eval 'zip -r o.zip .'`, after `-c` in `sh -c '…'`, after `-S` in
+/// `env -S '…'`, an alias's value), a shell run by `xargs`, `find -exec` or
+/// `fd -x`, and the rest of the line for a shell reading its input or a
+/// function definition (`NAME()`, outside quotes, or `function NAME`).
 fn code_names_walker(line: &str, words: &[CommandWord]) -> bool {
+    code_in(line, words, 0)
+}
+
+/// [`code_names_walker`] `depth` strings deep; past 4 it asks.
+fn code_in(line: &str, words: &[CommandWord], depth: usize) -> bool {
     static DEFINES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let defines = DEFINES.get_or_init(|| regex::Regex::new(r"(?:^|[\s;&|({])[A-Za-z_][A-Za-z0-9_.:-]*[ \t]*\([ \t]*\)").unwrap());
     let name = |w: &CommandWord| unescape(&w.pattern).rsplit('/').next().unwrap_or_default().to_string();
-    // A word of the code, read as the program running it reads it, quotes
-    // and backslashes removed (`z"i"p` is `zip`): it names a walker, or
-    // holds a `$` or a backtick, so its words can't be known.
-    let walker = |w: &CommandWord| {
-        w.unmodeled
-            || w.word.contains(['$', '`'])
-            || shell_unquote(&w.word).split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|t| FOLLOWERS.iter().any(|f| f.program == t))
+    let asks = |code: String| depth >= 4 || code_asks(&code, depth + 1);
+    let joined = |ws: &[CommandWord], skip: Option<usize>| {
+        ws.iter().enumerate().filter(|(k, _)| Some(*k) != skip).map(|(_, w)| w.word.as_str()).collect::<Vec<_>>().join(" ")
     };
-    // A function definition (`NAME()`, outside quotes, or `function NAME`):
-    // its body may span the line.
+    // A function definition: its body may span the line.
     let function = defines.is_match(&unquoted(line)) || words.iter().any(|w| w.role == WordRole::Program && name(w) == "function");
-    if function && words.iter().any(&walker) {
+    if function && asks(joined(words, None)) {
         return true;
     }
     let mut from = 0;
@@ -1828,16 +1829,26 @@ fn code_names_walker(line: &str, words: &[CommandWord]) -> bool {
             let rest = &seg[k + 1..];
             let Some((_, takes)) = RUNS_STRINGS.iter().find(|(p, _)| *p == n && (n != "." || w.role == WordRole::Program)) else { continue };
             let shell = SHELLS.contains(&n);
-            let given = match takes {
-                Takes::Always => true,
+            // The code it runs: its other words, or those after the flag
+            // that gives it (with what the flag holds after an `=`).
+            let code = match takes {
+                Takes::Always if n == "alias" => Some(rest.iter().map(|o| o.word.split_once('=').map_or(o.word.as_str(), |(_, v)| v)).collect::<Vec<_>>().join(" ")),
+                Takes::Always => Some(joined(rest, None)),
                 Takes::With(short, long) => {
-                    rest.iter().any(|o| short_flag(&o.word, short) || long.iter().any(|l| long_option(&o.word, l, &[]).is_some()))
+                    let at = rest.iter().position(|o| short_flag(&o.word, short) || long.iter().any(|l| long_option(&o.word, l, &[]).is_some()));
+                    match at {
+                        Some(f) => {
+                            let held = rest[f].word.split_once('=').filter(|_| rest[f].word.starts_with("--")).map_or("", |(_, v)| v);
+                            Some(format!("{held} {}", joined(&rest[f + 1..], None)))
+                        }
+                        None => (shell && fed).then(|| joined(rest, None)),
+                    }
                 }
             };
-            if (given || (shell && fed)) && rest.iter().any(&walker) {
+            if code.is_some_and(&asks) {
                 return true;
             }
-            if shell && w.role == WordRole::Program && (w.stdin || w.inline) && words.iter().any(&walker) {
+            if shell && w.role == WordRole::Program && (w.stdin || w.inline) && asks(joined(words, Some(from + k))) {
                 return true;
             }
         }
@@ -1846,27 +1857,28 @@ fn code_names_walker(line: &str, words: &[CommandWord]) -> bool {
     false
 }
 
-/// `s` with quotes and backslashes removed as the shell reads it (#1208):
-/// the words a program that runs `s` as commands gets. Inside double quotes
-/// a backslash escapes only `"`, `\`, `$`, a backtick and a newline.
-fn shell_unquote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let (mut chars, mut quote) = (s.chars(), None::<char>);
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (Some('"'), '\\') => match chars.next() {
-                Some(n) if "\"\\$`\n".contains(n) => out.push(n),
-                Some(n) => out.extend(['\\', n]),
-                None => out.push('\\'),
-            },
-            (Some(_), c) => out.push(c),
-            (None, '\'' | '"') => quote = Some(c),
-            (None, '\\') => out.extend(chars.next()),
-            (None, c) => out.push(c),
-        }
-    }
-    out
+/// Whether code a program runs from a string asks (#1208): read as
+/// commands, as the shell would (quotes and backslashes removed), it holds
+/// a walker that follows links ([`following_segments`]), or a word the
+/// check can't know (a `$`, a backtick, `$(…)`, a glob; not the test
+/// builtins `[` and `[[`) beside a recursion or link-following flag
+/// ([`WALK_FLAGS`]), or such code of its own.
+fn code_asks(code: &str, depth: usize) -> bool {
+    let words = crate::chat_engine::command_words(code);
+    let walking = walking_segments(&words);
+    let follows = following_segments(&words, &walking).iter().any(|f| f.links);
+    follows || (words.iter().any(unknown_word) && words.iter().any(walk_flag)) || code_in(code, &words, depth)
+}
+
+/// A word the check can't know (#1208): an expansion it doesn't model, or a
+/// glob, but the test builtins `[` and `[[` as a program.
+fn unknown_word(w: &CommandWord) -> bool {
+    w.unmodeled || (has_glob(&w.pattern) && !(w.role == WordRole::Program && matches!(w.pattern.as_str(), "[" | "[[")))
+}
+
+/// Whether `w` is a recursion or link-following flag ([`WALK_FLAGS`]).
+fn walk_flag(w: &CommandWord) -> bool {
+    w.role != WordRole::Data && (short_flag(&w.word, WALK_FLAGS.0) || WALK_FLAGS.1.iter().any(|l| long_option(&w.word, l, &[]).is_some()))
 }
 
 /// Programs that run the next program they're given: a program named at
@@ -1891,7 +1903,7 @@ const WALK_FLAGS: (&str, &[&str]) = (
 /// doesn't.
 fn blind_program(words: &[CommandWord]) -> bool {
     // `[` and `[[` are the test builtin, not a glob.
-    let blind = |w: &CommandWord| w.unmodeled || (has_glob(&w.pattern) && !matches!(w.pattern.as_str(), "[" | "[["));
+    let blind = unknown_word;
     let mut from = 0;
     while from < words.len() {
         let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
@@ -1899,10 +1911,7 @@ fn blind_program(words: &[CommandWord]) -> bool {
         let program = seg.iter().position(|w| w.role == WordRole::Program);
         let wrapped = program.is_some_and(|p| WRAPPERS.contains(&unescape(&seg[p].pattern).rsplit('/').next().unwrap_or_default()));
         let named_late = program.is_some_and(|p| blind(&seg[p]) || (wrapped && seg[p + 1..].iter().any(|w| w.role == WordRole::Argument && blind(w))));
-        let walks = seg
-            .iter()
-            .filter(|w| w.role != WordRole::Data)
-            .any(|w| short_flag(&w.word, WALK_FLAGS.0) || WALK_FLAGS.1.iter().any(|l| long_option(&w.word, l, &[]).is_some()));
+        let walks = seg.iter().any(walk_flag);
         if named_late && walks {
             return true;
         }
@@ -3653,18 +3662,17 @@ mod tests {
     fn code_run_from_a_string_that_names_a_walker_asks() {
         let (_d, ws, home) = setup();
         let reach = Reach::new(&ws, None, Some(&home));
-        let why = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one naming a walker that can follow links, which the check doesn't read";
+        let why = CODE_STRING_WHY;
         for command in [
             "eval 'zip -r o.zip .'",
-            "eval zip -ry o.zip .",
+            "eval zip -r o.zip .",
+            "eval '/usr/bin/z?p -r out .'",
+            "sh -c \"$CMD -r .\"",
             "sh -c 'zip -r o.zip .'",
             "bash -lc \"tar -czhf o.tgz .\"",
             "zsh -c 'rg -L token'",
             "ls | xargs sh -c 'zip -r o.zip \"$@\"' _",
             "find . -exec sh -c 'zip -r o.zip .' \\;",
-            "ls | xargs bash zip-all.sh",
-            "source ./zip-all.sh",
-            ". ./zip-all.sh",
             "echo 'zip -r o.zip .' | sh",
             "bash <<'EOF'\nzip -r o.zip .\nEOF",
         ] {
@@ -3677,16 +3685,34 @@ mod tests {
             "eval 'z\"i\"p -r out .'",
             "eval 'z\\ip -r out .'",
             "alias q='z\"i\"p -r out .'; q",
-            "eval \"$(ssh-agent -s)\"",
-            "bash -c 'echo $HOME'",
-            "eval `cat cmd.txt`",
+            "alias q='cp -R\\L src out'; q",
         ] {
             let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
             assert!(cut_short(&c, why), "{command}: {}", c.reason);
         }
-        for command in ["bash -c 'npm test'", "source venv/bin/activate", "find . -exec sh -c 'echo {}' \\;", "sh ./build.sh"] {
+        // Without a walker that follows links, or an unknown word beside a
+        // recursion or link-following flag, it runs; so does a script file
+        // (a stated limit).
+        for command in [
+            "bash -c 'npm test'",
+            "bash -c 'echo $X'",
+            "bash -c 'ls *.rs'",
+            "eval \"$(ssh-agent -s)\"",
+            "eval `cat cmd.txt`",
+            "eval zip -ry o.zip .",
+            "source venv/bin/activate",
+            "source ./zip-all.sh",
+            "ls | xargs bash zip-all.sh",
+            "find . -exec sh -c 'echo {}' \\;",
+            "sh ./build.sh",
+            "alias ll='ls -la'",
+        ] {
             assert_eq!(run(&reach, command), None, "{command}");
         }
+        // `$HOME` is home, which the path check asks about as an outside
+        // read (#1201), as for `echo ~`; the code-string rule adds nothing.
+        let c = run(&reach, "bash -c 'echo $HOME'").expect("home is outside the workspace");
+        assert_eq!((c.reason.as_str(), c.sensitive), ("reaches ~ outside the workspace", false));
     }
 
     /// Every program that runs a string as commands (#1208, [`RUNS_STRINGS`])
@@ -3697,7 +3723,7 @@ mod tests {
     fn strings_run_as_commands_and_programs_named_at_run_time_ask() {
         let (_d, ws, home) = setup();
         let reach = Reach::new(&ws, None, Some(&home));
-        let code = "a program that runs a string as commands (eval, sh -c, env -S, an alias or function…) gets one naming a walker that can follow links, which the check doesn't read";
+        let code = CODE_STRING_WHY;
         for command in [
             "env -S 'zip -r o.zip .'",
             "env --split-string='tar -czhf o.tgz .'",
@@ -3705,18 +3731,18 @@ mod tests {
             "npx -c 'zip -r o.zip .'",
             "pnpm exec -c 'zip -r o.zip .'",
             "script -c 'zip -r o.zip .' /dev/null",
-            "script -q /dev/null zip -ry o.zip .",
+            "script -q /dev/null zip -r o.zip .",
             "su -c 'zip -r o.zip .'",
-            "sudo -s 'zip -ry o.zip .'",
+            "sudo -s 'zip -r o.zip .'",
             "sudo sh -c 'zip -r o.zip .'",
-            "watch zip -ry o.zip .",
+            "watch zip -r o.zip .",
             "nohup sh -c 'zip -r o.zip .'",
             "timeout 60 sh -c 'zip -r o.zip .'",
             "parallel 'zip -r {}.zip {}' ::: src",
             "alias q='zip -r o.zip .'; q",
             "alias q='zip -r o.zip .' && q",
-            "q() { zip -ry o.zip .; }; q",
-            "function q {\n  zip -ry o.zip .\n}\nq",
+            "q() { zip -r o.zip .; }; q",
+            "function q {\n  zip -r o.zip .\n}\nq",
         ] {
             let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
             assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{command}: {}", c.reason);
