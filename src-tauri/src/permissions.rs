@@ -1702,12 +1702,33 @@ const CONFIG_PREFIX: &str = "a HOME, PATH, XDG_*, GIT_*, SSH_*, GH_* or *_CONFIG
 /// program (`XDG_CONFIG_HOME=/tmp/x git status`), or after `env` or another
 /// wrapper (`env HOME=/tmp/x git status`).
 fn config_prefix(seg: &Segment) -> bool {
-    let named = |w: &str| w.split_once('=').is_some_and(|(n, _)| is_identifier(n) && config_variable(n));
-    if !seg.words.is_empty() && seg.assigns.iter().any(|a| named(a)) {
-        return true;
+    (!seg.words.is_empty() && seg.assigns.iter().any(|a| config_assignment(a))) || wrapped_config_prefix(&seg.words)
+}
+
+/// `NAME=value` for a [`config_variable`].
+fn config_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(n, _)| is_identifier(n) && config_variable(n))
+}
+
+/// Whether a wrapper (`env`, `then`, `nohup`…) sets a [`config_variable`]
+/// for the program it runs: one of its `NAME=value` words before that
+/// program, read through nested wrappers. `then export HOME=…` sets
+/// nothing for a program; it is lasting state ([`state_change`]).
+fn wrapped_config_prefix(words: &[(&str, bool)]) -> bool {
+    let Some(((first, _), rest)) = words.split_first() else { return false };
+    if !WRAPPERS.contains(&program(first).as_str()) {
+        return false;
     }
-    let Some(((first, _), rest)) = seg.words.split_first() else { return false };
-    WRAPPERS.contains(&program(first).as_str()) && rest.iter().any(|(w, _)| named(w))
+    for (i, (word, _)) in rest.iter().enumerate() {
+        if config_assignment(word) {
+            return true;
+        }
+        let assigns = word.split_once('=').is_some_and(|(n, _)| is_identifier(n));
+        if !word.starts_with('-') && !assigns {
+            return wrapped_config_prefix(&rest[i..]);
+        }
+    }
+    false
 }
 
 /// What a mission that ships nothing gets for `GIT_CONFIG_*` set on a line.
