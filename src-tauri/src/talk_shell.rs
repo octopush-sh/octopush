@@ -649,6 +649,36 @@ pub(crate) fn foreground_group(_pid: u32) -> Option<i32> {
     None
 }
 
+/// When `pid` started, as an opaque stamp from the OS (#1160): with the
+/// pid, it names one process, so a pid used again later never matches.
+/// `None` when the process is gone or the OS can't say.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_started(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: as in `process_cwd`.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let wrote = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+    (wrote == size).then(|| info.pbi_start_tvsec.wrapping_mul(1_000_000).wrapping_add(info.pbi_start_tvusec))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_started(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| stat_started(&stat))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn process_started(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// A `/proc/<pid>/stat` line's `starttime` (its 22nd field: clock ticks
+/// after boot). Pure.
+#[cfg(any(target_os = "linux", test))]
+fn stat_started(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// The group a job holds the terminal with, from a `/proc/<pid>/stat`
 /// line: its `tpgid`, when set and not the process's own `pgrp`. Pure.
 #[cfg(any(target_os = "linux", test))]
@@ -995,7 +1025,14 @@ impl LiveRun {
     /// Pump live output to `on_chunk` (raw, with ANSI — xterm draws it) until the
     /// process exits (the prompt marker prints), then restore the session and
     /// return the exit info. Blocking — run on a worker thread.
-    pub fn stream<F: FnMut(&str)>(self, mut on_chunk: F) -> LiveExit {
+    pub fn stream<F: FnMut(&str)>(self, on_chunk: F) -> LiveExit {
+        self.stream_ending(on_chunk, |_| {})
+    }
+
+    /// [`Self::stream`], calling `ending` with the exit code once the process
+    /// ended and before the shell takes another command (#1160): until then,
+    /// whatever holds the shell's terminal is this command.
+    pub fn stream_ending<F: FnMut(&str), G: FnOnce(i32)>(self, mut on_chunk: F, ending: G) -> LiveExit {
         let mut filter = StreamFilter::new(&self.nonce);
         let mut full = String::new();
         let mut push = |emit: &str, full: &mut String, on_chunk: &mut F| {
@@ -1016,6 +1053,7 @@ impl LiveRun {
         if let Some((code, cwd)) = init_done {
             exit.exit_code = code;
             exit.cwd = cwd;
+            ending(exit.exit_code);
             return self.finish(exit, full);
         }
 
@@ -1046,6 +1084,7 @@ impl LiveRun {
             }
         }
 
+        ending(exit.exit_code);
         self.finish(exit, full)
     }
 
@@ -1507,6 +1546,11 @@ mod tests {
         assert_eq!(stat_job_group("123 (bash) S 1 123 123 34816 123 4194560 0"), None);
         assert_eq!(stat_job_group("123 (bash) S 1 123 123 0 -1 4194560 0"), None);
         assert_eq!(stat_job_group("garbage"), None);
+        // When it started, which a pid used again never matches.
+        let stat = "123 (ba sh)) S 1 123 123 34816 456 4194560 0 0 0 0 10 2 0 0 20 0 1 0 987654 1000 10";
+        assert_eq!(stat_started(stat), Some(987_654));
+        assert_eq!(stat_started("123 (bash) S 1"), None);
+        assert_eq!(stat_started("garbage"), None);
         // Where the shell last said it sits, kept per thread.
         let dir = tempfile::TempDir::new().unwrap();
         let store = CwdStore(Some(dir.path().join("talk-cwd")));

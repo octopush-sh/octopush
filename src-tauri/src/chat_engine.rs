@@ -2811,6 +2811,20 @@ const RUN_COMMAND_TIMEOUT_SECS: u64 = 600;
 /// Upper bound a per-call `timeout_secs` override may request.
 const RUN_COMMAND_TIMEOUT_MAX: u64 = 3600;
 
+/// A conversation's posture as stored now (#1160): its mode in force, and
+/// its workspace's mission (ships nothing, runs sandboxed). A read that
+/// fails is the stricter answer.
+pub(crate) fn thread_posture(db: &Mutex<Db>, thread_id: &str) -> crate::talk_procs::Posture {
+    let state = crate::permissions::thread_mode_state(db, thread_id);
+    let db = db.lock();
+    let mission = db.chat_thread_workspace(thread_id).ok().flatten().map(|w| db.active_mission_for_workspace(&w)).unwrap_or(Ok(None));
+    let sandboxed = match &mission {
+        Ok(m) => m.as_ref().is_some_and(|m| crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, "").is_some()),
+        Err(_) => true,
+    };
+    crate::talk_procs::Posture { mode: state.effective, ships_nothing: crate::permissions::mission_ships_nothing(&mission), sandboxed }
+}
+
 /// A `run_command` call's wall-clock limit in seconds: its `timeout_secs`,
 /// else [`RUN_COMMAND_TIMEOUT_SECS`], within 1..=[`RUN_COMMAND_TIMEOUT_MAX`].
 fn run_command_timeout(input: &serde_json::Value) -> u64 {
@@ -4184,16 +4198,15 @@ impl ChatEngine {
     /// [`Self::enforce_procs`] at the conversation's posture as stored now:
     /// its mode, and its workspace's mission. For the mode switch.
     pub async fn enforce_thread_procs(&self, app: &AppHandle, thread_id: &str) {
-        let state = crate::permissions::thread_mode_state(&self.db, thread_id);
-        let (ships_nothing, sandboxed) = {
-            let db = self.db.lock();
-            let mission = db.chat_thread_workspace(thread_id).ok().flatten().map(|w| db.active_mission_for_workspace(&w)).unwrap_or(Ok(None));
-            let sandboxed = mission.as_ref().ok().and_then(|m| m.as_ref()).is_some_and(|m| {
-                crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, "").is_some()
-            });
-            (crate::permissions::mission_ships_nothing(&mission), sandboxed)
-        };
-        self.enforce_procs(app, thread_id, crate::talk_procs::Posture { mode: state.effective, ships_nothing, sandboxed }).await;
+        let now = thread_posture(&self.db, thread_id);
+        self.enforce_procs(app, thread_id, now).await;
+    }
+
+    /// Reads the conversation's posture as it is now, for a start or a
+    /// promotion that checks it again once its process exists (#1160).
+    fn posture_source(&self, thread_id: &str) -> crate::talk_procs::PostureSource {
+        let (db, thread) = (Arc::clone(&self.db), thread_id.to_string());
+        Arc::new(move || thread_posture(&db, &thread))
     }
 
     /// The conversations are gone, or their workspace is: stop their
@@ -4209,6 +4222,9 @@ impl ChatEngine {
     }
 
     /// `run_command { keep_running: true }`, once every check let it through.
+    /// The posture is read again, and `cancel` (Stop) checked, once its
+    /// process exists and before it runs.
+    #[allow(clippy::too_many_arguments)]
     async fn start_background(
         &self,
         app: &AppHandle,
@@ -4217,6 +4233,7 @@ impl ChatEngine {
         cwd: String,
         posture: crate::talk_procs::Posture,
         roots: Option<Vec<String>>,
+        cancel: &Arc<AtomicBool>,
     ) -> (String, bool) {
         self.wire_procs(app);
         let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
@@ -4231,6 +4248,8 @@ impl ChatEngine {
             cwd,
             env,
             posture,
+            posture_now: self.posture_source(&request.thread_id),
+            cancel: Some(Arc::clone(cancel)),
             sandbox_roots: roots,
         };
         let procs = Arc::clone(&self.procs);
@@ -4241,31 +4260,37 @@ impl ChatEngine {
         }
     }
 
-    /// Hand a command still running at its timeout to the live process
-    /// panel, as a long `$` command is (#1160): the panel streams it, and
-    /// the registry keeps its output for `read_output`.
-    fn promote_command(
+    /// Hand a command still running at its timeout to the registry (#1160),
+    /// so its output is kept for `read_output` and a stop can end it. With
+    /// `announce`, the live process panel streams it, as a long `$` command;
+    /// without, it is being stopped, and the panel never opens for it.
+    async fn promote_command(
         &self,
         app: &AppHandle,
         request: &ChatRequest,
         command: &str,
         live: crate::talk_shell::LiveRun,
         posture: crate::talk_procs::Posture,
-    ) -> crate::talk_procs::ProcView {
+        announce: bool,
+    ) -> Result<crate::talk_procs::ProcView, String> {
         self.wire_procs(app);
         let call_id = format!("shell-{}", SHELL_SEQ.fetch_add(1, Ordering::Relaxed));
-        let _ = app.emit("chat://shell-live-start", &ShellLiveStartEvent {
-            workspace_id: request.workspace_id.clone(),
-            thread_id: request.thread_id.clone(),
-            call_id: call_id.clone(),
-            command: command.to_string(),
-        });
+        if announce {
+            let _ = app.emit("chat://shell-live-start", &ShellLiveStartEvent {
+                workspace_id: request.workspace_id.clone(),
+                thread_id: request.thread_id.clone(),
+                call_id: call_id.clone(),
+                command: command.to_string(),
+            });
+        }
         // A Stop pressed before this process started isn't this process's.
         self.stopped_shells.lock().remove(&request.thread_id);
         let on_chunk = {
             let (app, thread_id, call_id) = (app.clone(), request.thread_id.clone(), call_id.clone());
             Box::new(move |chunk: &str| {
-                let _ = app.emit("chat://shell-output", &ShellOutputEvent { thread_id: thread_id.clone(), call_id: call_id.clone(), chunk: chunk.to_string() });
+                if announce {
+                    let _ = app.emit("chat://shell-output", &ShellOutputEvent { thread_id: thread_id.clone(), call_id: call_id.clone(), chunk: chunk.to_string() });
+                }
             })
         };
         let on_exit = {
@@ -4288,8 +4313,25 @@ impl ChatEngine {
             workspace_id: request.workspace_id.clone(),
             command: command.to_string(),
             posture,
+            posture_now: self.posture_source(&request.thread_id),
         };
-        self.procs.promote(spec, live, crate::talk_procs::LiveHooks { on_chunk, on_exit })
+        let procs = Arc::clone(&self.procs);
+        tokio::task::spawn_blocking(move || procs.promote(spec, live, crate::talk_procs::LiveHooks { on_chunk, on_exit }))
+            .await
+            .map_err(|e| format!("the promotion task failed: {e}"))
+    }
+
+    /// A command still running at its timeout that may not keep running
+    /// (#1160): stop it, and say why with what it printed.
+    async fn stop_at_timeout(&self, thread_id: &str, id: &str, timeout_secs: u64, why: &str) -> (String, bool) {
+        let (procs, thread, id) = (Arc::clone(&self.procs), thread_id.to_string(), id.to_string());
+        let output = tokio::task::spawn_blocking(move || {
+            let _ = procs.stop(&thread, &id);
+            procs.output(&thread, &id)
+        })
+        .await
+        .unwrap_or_default();
+        (crate::talk_procs::stopped_at_timeout(&output, timeout_secs, why), false)
     }
 
     /// `read_output` and `stop` (#1160), within this conversation only.
@@ -6415,7 +6457,7 @@ impl ChatEngine {
                     let shared = self.talk_shell.available() && exec_roots.is_none();
                     let cwd = shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten().unwrap_or_else(|| request.workspace_path.clone());
                     run_command_cwd = cwd.clone();
-                    self.start_background(&app, &request, &u.input, cwd, posture, exec_roots.clone()).await
+                    self.start_background(&app, &request, &u.input, cwd, posture, exec_roots.clone(), &cancel).await
                 } else if u.name == "run_command" && self.talk_shell.available() && exec_roots.is_none() {
                     // Unify with `$`-direct: the agent runs commands in the SAME
                     // persistent shell, so it shares the user's cwd/env. Capture
@@ -6474,11 +6516,47 @@ impl ChatEngine {
                         }
                         // Still running at its timeout: the live process panel
                         // takes it, and the model gets its id (#1160).
+                        // It keeps running only on a background start's terms:
+                        // the same policy for the same command with
+                        // `keep_running`. Ask first shows its card first (it
+                        // is tracked meanwhile, so its output isn't lost);
+                        // refused, or declined, it is stopped instead.
                         Ok(Ok(crate::talk_shell::RunOutcome::Live(live))) => {
                             run_command_cwd = live.cwd().to_string();
                             let partial = live.initial.clone();
-                            let view = self.promote_command(&app, &request, &shown, live, posture);
-                            (crate::talk_procs::promoted_result(&view, timeout, &partial), true)
+                            let keep = crate::talk_procs::kept_running(&shown);
+                            let ctx = crate::permissions::PolicyCtx {
+                                exec_roots: exec_roots.as_deref(),
+                                mcp_read_only: &mcp_read_only,
+                                delegate_writes: false,
+                                forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                                ships_nothing,
+                            };
+                            let kept = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: "run_command", input: &keep }, &ctx);
+                            let announce = !matches!(kept, crate::permissions::Decision::Deny { .. });
+                            match self.promote_command(&app, &request, &shown, live, posture, announce).await {
+                                Err(why) => (why, false),
+                                Ok(view) => {
+                                    let refusal = match kept {
+                                        crate::permissions::Decision::Allow => None,
+                                        crate::permissions::Decision::Deny { message } => Some(message),
+                                        crate::permissions::Decision::Ask { .. } => {
+                                            let card = crate::talk_procs::promotion_card(crate::permissions::ask_card(None, "run_command", &keep, &reach), timeout);
+                                            let ask = |c: ToolCard| {
+                                                unless_stopped(Some(&*cancel), self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode))
+                                            };
+                                            match ask(card).await {
+                                                ApprovalDecision::Deny => Some(crate::talk_procs::KEEP_DECLINED.to_string()),
+                                                _ => None,
+                                            }
+                                        }
+                                    };
+                                    match refusal {
+                                        None => (crate::talk_procs::promoted_result(&view, timeout, &partial), true),
+                                        Some(why) => self.stop_at_timeout(&request.thread_id, &view.id, timeout, &why).await,
+                                    }
+                                }
+                            }
                         }
                         // A strict shell that isn't proved clean runs nothing,
                         // and no isolated shell runs it either (#1241, #1231).
@@ -8925,10 +9003,31 @@ mod tests {
         assert!(gate[start..].contains("shared.then(|| self.talk_shell.cwd(&request.thread_id)).flatten().unwrap_or_else(|| request.workspace_path.clone());"));
         // It comes before the shared shell's branch, so it never runs there.
         assert!(start < at("} else if u.name == \"run_command\" && self.talk_shell.available() && exec_roots.is_none() {"));
-        // A command past its timeout is promoted, with its own timeout.
+        // A command past its timeout is promoted, with its own timeout, but
+        // kept running only on a background start's terms: the same policy
+        // for the command with `keep_running` (Plan only never, Ask first on
+        // its card, a ship-nothing mission's refusals), else stopped.
         assert!(gate.contains("shell.run_agent(&tid, &wp, &command, std::time::Duration::from_secs(timeout))"));
-        assert!(gate.contains("Ok(Ok(crate::talk_shell::RunOutcome::Live(live))) => {"));
+        let live = at("Ok(Ok(crate::talk_shell::RunOutcome::Live(live))) => {");
+        let arm = &gate[live..live + gate[live..].find("// A strict shell that isn't proved clean runs nothing,").unwrap()];
+        for step in [
+            "let keep = crate::talk_procs::kept_running(&shown);",
+            "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
+            "let kept = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: \"run_command\", input: &keep }, &ctx);",
+            "let announce = !matches!(kept, crate::permissions::Decision::Deny { .. });",
+            "crate::permissions::Decision::Deny { message } => Some(message),",
+            "crate::talk_procs::promotion_card(crate::permissions::ask_card(None, \"run_command\", &keep, &reach), timeout)",
+            "ApprovalDecision::Deny => Some(crate::talk_procs::KEEP_DECLINED.to_string()),",
+            "Some(why) => self.stop_at_timeout(&request.thread_id, &view.id, timeout, &why).await,",
+        ] {
+            assert!(arm.contains(step), "the promotion no longer has: {step}");
+        }
+        assert!(arm.find("let kept =").unwrap() < arm.find("self.promote_command(").unwrap());
         assert!(!gate.contains("run_capture("), "the agent's command is no longer interrupted at its timeout");
+        // A start reads the posture again, and checks Stop, before it runs.
+        let start = engine.find("async fn start_background(").unwrap();
+        let body = &engine[start..start + engine[start..].find("\n    }\n").unwrap()];
+        assert!(body.contains("posture_now: self.posture_source(&request.thread_id),") && body.contains("cancel: Some(Arc::clone(cancel)),"), "{body}");
         // A stricter posture stops what started before, every round.
         let loop_from = engine.find("// \u{2500}\u{2500}\u{2500} Agentic loop").unwrap();
         let round = &engine[loop_from..from];
