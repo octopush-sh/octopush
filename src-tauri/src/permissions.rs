@@ -276,16 +276,39 @@ pub fn reads_only(command: &str) -> bool {
 const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!'];
 
 /// Whether `command` has the plain shape Ask first lets run without a card:
-/// none of [`NOT_PLAIN`] anywhere in its raw text, quoted or not, and no
-/// `<<`. A whitelist on purpose, not a list of tricks: bash builds code from
-/// many shapes a reader check doesn't model (`{$,}{PWD:_}` makes `${PWD:_}`
-/// by brace expansion, whose arithmetic runs the command `$_` holds after
-/// `echo $'a[\x24(touch x)]'`; `$\⏎{` joins a line; `$((…))`, `${x:-…}`),
-/// and each new one was a bypass. Without these characters no expansion,
-/// substitution or line join can happen, so what the check reads is what
-/// runs. A command outside the shape only gets Ask first's card. Pure.
+/// none of [`NOT_PLAIN`] anywhere in its raw text, quoted or not; no `<<`;
+/// outside quotes no `*`, `?` or `[`, and no word that starts with `~`; and
+/// every quote closed. A whitelist on purpose, not a list of tricks: bash
+/// builds code from many shapes a reader check doesn't model (`{$,}{PWD:_}`
+/// makes `${PWD:_}` by brace expansion, whose arithmetic runs the command
+/// `$_` holds after `echo $'a[\x24(touch x)]'`; `$\⏎{` joins a line;
+/// `$((…))`, `${x:-…}`), and each new one was a bypass. A glob or a tilde
+/// expands into words the check never read, flags included: `git diff *`
+/// beside a file named `--output=x` writes `x`, and `git lfs pu?h` can match
+/// `push`. Quoted, a glob is literal. Without these no expansion,
+/// substitution, globbing or line join can happen, so what the check reads
+/// is what runs. A command outside the shape only gets Ask first's card.
+/// Pure.
 pub fn plain_shape(command: &str) -> bool {
-    !command.contains(NOT_PLAIN) && !command.contains("<<")
+    if command.contains(NOT_PLAIN) || command.contains("<<") {
+        return false;
+    }
+    let mut quote: Option<char> = None;
+    let mut word_start = true;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '*' | '?' | '[' => return false,
+                '~' if word_start => return false,
+                _ => {}
+            },
+        }
+        word_start = quote.is_none() && (c.is_whitespace() || ";|&()<>".contains(c));
+    }
+    quote.is_none()
 }
 
 /// Whether `command` runs `git` from outside `workspace` (#1231): `cwd` is
@@ -1112,7 +1135,7 @@ mod tests {
             "git status", "git status --porcelain", "git diff HEAD~1", "git log --oneline -5", "git show HEAD:a.rs",
             "git blame a.rs", "git ls-files", "git rev-parse HEAD",
             "cat a.rs | grep fn | head -3", "ls && git status; pwd", "grep x a.rs 2>/dev/null", "ls >/dev/null 2>&1",
-            "cat < a.rs", "grep -c fn a.rs || echo none", "grep -n foo src/*.rs",
+            "cat < a.rs", "grep -c fn a.rs || echo none", "grep -n 'foo*' a.rs",
         ];
         for command in runs {
             assert!(reads_only(command), "{command} should run without a card");
@@ -1212,10 +1235,18 @@ mod tests {
             "echo hi!",
             "grep 'a\\.b' a.rs",
             "cat <<EOF",
+            // A glob or a tilde expands into words the check never read.
+            "git diff *",
+            "git lfs pu?h",
+            "grep -n foo src/*.rs",
+            "ls [ab].rs",
+            "cat ~/.bashrc",
+            "ls ~",
+            "echo 'open",
         ] {
             assert!(!plain_shape(command) && !reads_only(command), "{command} should ask");
         }
-        for command in ["grep -n foo src/*.rs", "cat a.rs | head -3", "git log --oneline -5", "ls -la src > /dev/null 2>&1"] {
+        for command in ["grep -n 'foo*' a.rs", "cat 'a*b' \"c?d\" '[x]' '~'", "git diff HEAD~1", "cat a.rs | head -3", "ls -la src > /dev/null 2>&1"] {
             assert!(plain_shape(command) && reads_only(command), "{command} should run without a card");
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1225,6 +1256,14 @@ mod tests {
             .current_dir(dir.path())
             .status();
         assert!(ran.is_ok_and(|s| s.success()) && dir.path().join("x").exists(), "bash runs it: the case the shape asks for");
+        // A glob expands into a flag: beside a file named `--output=x`, `git
+        // diff *` writes `x`.
+        let repo = tempfile::tempdir().unwrap();
+        let sh = |script: &str| std::process::Command::new("/bin/bash").arg("-c").arg(script).current_dir(repo.path()).output();
+        if sh("git init -q . && : > a && : > ./--output=x").is_ok_and(|o| o.status.success()) {
+            let _ = sh("git diff *");
+            assert!(repo.path().join("x").exists(), "git diff * wrote through a file named like a flag");
+        }
     }
 
     /// A git reader skips the card only where it starts inside the
