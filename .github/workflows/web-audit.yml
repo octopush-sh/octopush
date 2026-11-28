@@ -18,8 +18,10 @@
 # gone — before anything else runs. The audit (whose Chromium runs the site's
 # JavaScript) runs as octo-sandbox too, from scripts and a browser installed
 # root-owned in /opt/pw before the checkout; only regular, size-capped result
-# files come back out. A separate job on a fresh runner mints an issues-only
-# token and files the findings.
+# files come back out. Node is frozen-node.sh's root-owned copy, and after each
+# sandboxed step `frozen-node.sh verify` proves nothing the runner executes next
+# has changed. A separate job on a fresh runner mints an issues-only token and
+# files the findings.
 # 00:49 Bogotá, after the app audit.
 name: web-audit
 
@@ -55,9 +57,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
+      - name: Node 22, root-owned and read-only (frozen-node.sh, instead of setup-node)
+        run: bash scripts/routines/frozen-node.sh freeze
 
       - name: Trusted scripts and Chromium, root-owned (before the site is checked out)
         # /opt/pw: read-only for everyone else. The sandbox runs the audit from
@@ -117,12 +118,18 @@ jobs:
           OCTO_CHECK_PROFILE: web-audit
         run: |
           set -euo pipefail
+          # The build needs no history: the site's checkout keeps no .git.
+          rm -rf "$GITHUB_WORKSPACE/site/.git"
           OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/site" bash "$RUNNER_TEMP/scripts/routines/agent-sandbox-setup.sh"
           octo-check site   # install (no scripts) + build, in one sandboxed call
 
-      - name: Nothing of the site's code is still running
+      - name: Nothing of the site's code is still running, and nothing it could reach has changed
         if: always()
+        # Not resolved through PATH: this step checks PATH.
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
+          job_path="$PATH"
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
           sudo pkill -KILL -u octo-sandbox || true
           sudo find "$GITHUB_WORKSPACE/site" -type l -user octo-sandbox -delete || true
           chmod -R o-w "$GITHUB_WORKSPACE/site" || true
@@ -130,6 +137,7 @@ jobs:
           if pgrep -u octo-sandbox >/dev/null; then
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
           fi
+          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" verify
 
       - name: Audit as octo-sandbox (Chromium over the static dist/, every page, three window sizes)
         id: audit
@@ -149,14 +157,18 @@ jobs:
           # 0 = clean, 1 = findings (filed by the next job); anything else is the audit failing.
           [ "$rc" -le 1 ] || exit "$rc"
 
-      - name: Nothing of the audit is still running
+      - name: Nothing of the audit is still running, and nothing it could reach has changed
         if: always()
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
+          job_path="$PATH"
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
           sudo pkill -KILL -u octo-sandbox || true
           sleep 1
           if pgrep -u octo-sandbox >/dev/null; then
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
           fi
+          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" verify
 
       - name: Take the results out of the sandbox (regular files only, size-capped)
         if: always() && steps.audit.outputs.rc != ''

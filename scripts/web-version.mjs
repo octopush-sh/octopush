@@ -6,8 +6,6 @@
 // octopush-web and opens the PR; the PM or the owner merges it (VISION §8).
 //
 //   node scripts/web-version.mjs <web-checkout> <new-version>   (reads releases with gh)
-//   node scripts/web-version.mjs body <new-version> <pr-number> (the PR body; inputs in
-//     GATE_LOG / GATE_RC / CREW_LOG / CREW_RC / CREW_CHANGED / CREW_SHA_BEFORE / CREW_SHA_AFTER / RUN_URL)
 //
 // No agent is involved: the entries are the release notes' user-facing
 // sections (Features, Improvements, Fixes), reformatted to the changelog's
@@ -127,92 +125,9 @@ export function apply(webDir, version, releases) {
   return { from, versions };
 }
 
-// The PR body promote.yml writes after it regenerated the crew pricing and ran
-// the website's consistency gate as octo-sandbox (#1178). Their output is the
-// website's own code talking, so it is quoted in a fenced block only, capped.
-
-const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
-const logLines = (log) => String(log ?? "").replace(ANSI, "").split("\n").map((l) => l.trimEnd());
-const fenced = (lines) => ["````text", ...lines.slice(0, 40).map((l) => l.slice(0, 400)), ...(lines.length > 40 ? [`… ${lines.length - 40} more lines in the run log`] : []), "````"];
-
-/**
- * The gate's verdict from its log and exit code ("" or undefined: it never
- * ran): { state: passed | failed | missing, summary, failed, tail }. `failed`
- * holds its ✗ lines; `tail` is the end of the log when it failed without one
- * (npm ci or the script itself broke).
- */
-export function gateResult(log, rc) {
-  const lines = logLines(log);
-  const summary = lines.map((l) => l.trim()).find((l) => /^\d+ passed · \d+ failed/.test(l)) ?? null;
-  const failed = lines.map((l) => l.trim()).filter((l) => l.startsWith("✗"));
-  if (rc === undefined || rc === null || String(rc) === "") return { state: "missing", summary: null, failed: [], tail: [] };
-  if (String(rc) === "0") return { state: "passed", summary, failed: [], tail: [] };
-  return { state: "failed", summary, failed, tail: failed.length ? [] : lines.filter((l) => l.trim()).slice(-25) };
-}
-
-/**
- * The release PR's body. `gate` is gateResult(); `crew` is { rc, log,
- * changed, shaBefore, shaAfter } from build-crew-pricing.mjs (rc "" when it
- * never ran).
- */
-export function releasePrBody({ version, pr, gate, crew = {}, runUrl = "" }) {
-  const v = `v${version}`;
-  const run = runUrl ? ` ([run](${runUrl}))` : "";
-  const local = (cmd) => `\`OCTOPUSH_APP_DIR=../octopush OCTOPUSH_STABLE_VERSION=${version} ${cmd}\` (with the app checked out at \`${v}\`)`;
-  const out = [];
-  if (gate.state === "failed") {
-    out.push("> [!CAUTION]", `> **The consistency gate failed** with the app at \`${v}\`. Fix the failing checks below on this branch before merging.`, "");
-  } else if (gate.state === "missing") {
-    out.push("> [!WARNING]", `> **The consistency gate did not run**${run}. Run ${local("npm run consistency")} before merging.`, "");
-  }
-  const merge = gate.state === "passed" ? `Reply \`merge web#${pr}\` in the digest to publish it.` : `Once the gate passes, reply \`merge web#${pr}\` in the digest to publish it.`;
-  out.push(`${v} was promoted to stable, so the landing's \`VERSION\` and the changelog follow it, and \`src/data/crew-pricing.json\` is regenerated from the app at that tag. The entries are written from the release notes by \`scripts/web-version.mjs\` in the app repo, run by promote.yml. ${merge}`, "");
-
-  out.push("### Crew pricing", "");
-  const crewRc = crew.rc === undefined || crew.rc === null ? "" : String(crew.rc);
-  if (crewRc === "0") {
-    out.push(crew.changed
-      ? `\`node scripts/build-crew-pricing.mjs\` regenerated \`src/data/crew-pricing.json\` from the app at \`${v}\`; this PR carries the change.`
-      : `\`node scripts/build-crew-pricing.mjs\` regenerated \`src/data/crew-pricing.json\` from the app at \`${v}\`: no change.`);
-    const wrote = logLines(crew.log).find((l) => l.startsWith("wrote "));
-    if (wrote) out.push("", ...fenced([wrote]));
-    if (crew.shaBefore && crew.shaAfter && crew.shaBefore !== crew.shaAfter) {
-      out.push("", "> [!IMPORTANT]", `> \`estimator.sourceSha256\` changed: the app's \`estimate_run_cost\` / \`estimate_run\` / \`range\` / \`pick_reference_model\` changed at \`${v}\`. Re-read them and update the mirror in \`src/lib/crewEstimate.ts\` (and its tests) on this branch before merging. The gate compares the JSON, not that mirror.`);
-    }
-  } else if (crewRc === "") {
-    out.push(`**Not regenerated**: the step did not run${run}. Run ${local("node scripts/build-crew-pricing.mjs")} and commit the result here.`);
-  } else {
-    out.push(`**Could not be regenerated** from the app at \`${v}\` (exit ${crewRc}); the file is unchanged. If the app's pricing code changed shape, fix the reader in \`scripts/lib/crew-pricing.mjs\`.`, "", ...fenced(logLines(crew.log).filter((l) => l.trim())));
-  }
-
-  out.push("", "### Consistency gate", "");
-  const how = `\`npm run consistency\` with \`OCTOPUSH_APP_DIR\` set to the app checked out at \`${v}\`, \`OCTOPUSH_STABLE_VERSION=${version}\` and \`OCTOPUSH_STRICT_RELEASE=1\`, run by promote.yml as an unprivileged user without a token${run}`;
-  if (gate.state === "passed") {
-    out.push(`**Passed**: ${how}.${gate.summary ? ` ${gate.summary}.` : ""}`);
-  } else if (gate.state === "failed") {
-    out.push(`**Failed**: ${how}.${gate.summary ? ` ${gate.summary}.` : ""}`, "", ...fenced(gate.failed.length ? gate.failed : gate.tail));
-  } else {
-    out.push(`**Did not run**${run}: the sandboxed step failed before the gate. Run ${local("npm run consistency")}.`);
-  }
-  return `${out.join("\n")}\n`;
-}
-
-function body(version, pr, env = process.env) {
-  if (!SEMVER.test(version ?? "") || !/^\d+$/.test(pr ?? "")) { console.error("usage: web-version.mjs body <X.Y.Z> <pr-number>"); return 64; }
-  const file = (p) => { try { return p ? readFileSync(p, "utf8") : ""; } catch { return ""; } };
-  process.stdout.write(releasePrBody({
-    version, pr,
-    gate: gateResult(file(env.GATE_LOG), env.GATE_RC),
-    crew: { rc: env.CREW_RC, log: file(env.CREW_LOG), changed: env.CREW_CHANGED === "1", shaBefore: env.CREW_SHA_BEFORE, shaAfter: env.CREW_SHA_AFTER },
-    runUrl: env.RUN_URL,
-  }));
-  return 0;
-}
-
 function main() {
-  if (process.argv[2] === "body") return body(process.argv[3], process.argv[4]);
   const [webDir, version] = process.argv.slice(2);
-  if (!webDir || !SEMVER.test(version ?? "")) { console.error("usage: web-version.mjs <web-checkout> <X.Y.Z> | body <X.Y.Z> <pr-number>"); return 64; }
+  if (!webDir || !SEMVER.test(version ?? "")) { console.error("usage: web-version.mjs <web-checkout> <X.Y.Z>"); return 64; }
   const repo = process.env.OCTOPUSH_APP_REPO || "octopush-sh/octopush";
   // Only the fields used: the full objects (assets included) outgrow any buffer.
   const out = execFileSync("gh", ["api", "--paginate", `repos/${repo}/releases?per_page=100`, "--jq", ".[] | select(.draft | not) | {tag_name, body, published_at, prerelease}"],

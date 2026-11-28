@@ -1054,51 +1054,241 @@ test("workflows: website code runs only as octo-sandbox, and the App key only ou
   assert.match(build, /pgrep -u octo-sandbox/);
 });
 
-test("workflows: promote's website PR regenerates the crew pricing and runs the gate against the promoted tag, as octo-sandbox (#1178)", async () => {
+/** A step's `run: |` block from a workflow job, dedented (the step is found by its `- name:` or `id:`). */
+function runBlock(job, key) {
+  const lines = job.split("\n");
+  let i = lines.findIndex((l) => l.trim() === `- name: ${key}` || l.trim() === `id: ${key}` || l.trim().startsWith(`- name: ${key}`));
+  assert.ok(i >= 0, `step ${key}`);
+  for (; i < lines.length && !/^\s+run: \|$/.test(lines[i]); i++);
+  const indent = lines[i].indexOf("run:") + 2;
+  const body = [];
+  for (i++; i < lines.length && (lines[i].trim() === "" || lines[i].startsWith(" ".repeat(indent))); i++) body.push(lines[i].slice(indent));
+  return body.join("\n");
+}
+const promoteJob = async (name) => {
   const { readFileSync } = await import("node:fs");
   const wf = readFileSync(new URL("../../.github/workflows/promote.yml", import.meta.url), "utf8");
-  const job = wf.slice(wf.indexOf("\n  web-version:\n"), wf.indexOf("\n  homebrew-tap:\n"));
-  const live = job.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
-  /** One step, from its `- name:` line to the next step. */
-  const step = (name) => { const i = live.indexOf(`- name: ${name}`); assert.ok(i > 0, name); const j = live.indexOf("\n      - ", i + 1); return live.slice(i, j < 0 ? undefined : j); };
-  // After the tap (the gate reads its cask), whatever the tap's result, never after a failed promotion.
-  assert.match(live, /\n    needs: \[promote, homebrew-tap\]\n    if: \$\{\{ !cancelled\(\) && needs\.promote\.result == 'success' \}\}\n/);
-  assert.match(live, /\n    permissions:\n      contents: read /, "no wider permissions");
-  // The app at the promoted tag, in its own directory, without credentials.
-  assert.match(live, /uses: actions\/checkout@v7\n        with:\n          ref: refs\/tags\/v\$\{\{ github\.event\.inputs\.version \}\}\n          path: app-stable\n          persist-credentials: false\n/);
+  const at = wf.indexOf(`\n  ${name}:\n`);
+  assert.ok(at > 0, name);
+  const next = wf.slice(at + 1).search(/\n  [a-z-]+:\n/);
+  return { wf, job: wf.slice(at, next < 0 ? undefined : at + 1 + next) };
+};
+const live = (text) => text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+
+test("workflows: promote's website PR — web-gate runs the website's code without a write token, web-version runs none (#1178)", async () => {
+  const { wf, job: gateJob } = await promoteJob("web-gate");
+  const { job: prJob } = await promoteJob("web-version");
+  const a = live(gateJob), b = live(prJob);
+  const step = (text, key) => { const i = text.indexOf(`- name: ${key}`); assert.ok(i > 0, key); const j = text.indexOf("\n      - ", i + 1); return text.slice(i, j < 0 ? undefined : j); };
   for (const [, action, ref] of wf.matchAll(/uses: (\S+)@(\S+)/g)) {
-    assert.equal(ref, { "actions/checkout": "v7", "actions/setup-node": "v7", "actions/create-github-app-token": "v3" }[action], `${action} pinned like the rest of the file`);
+    assert.equal(ref, { "actions/checkout": "v7", "actions/setup-node": "v7", "actions/create-github-app-token": "v3", "actions/upload-artifact": "v7", "actions/download-artifact": "v8" }[action], `${action} pinned like the rest of the repo`);
   }
-  const gate = step("Crew pricing and the consistency gate");
+  // web-gate: after the tap (the gate reads its cask), read-only, the app at the promoted tag.
+  assert.match(a, /\n    needs: \[promote, homebrew-tap\]\n    if: \$\{\{ !cancelled\(\) && needs\.promote\.result == 'success' \}\}\n/);
+  assert.match(a, /\n    permissions:\n      contents: read /);
+  assert.match(a, /uses: actions\/checkout@v7\n        with:\n          ref: refs\/tags\/v\$\{\{ github\.event\.inputs\.version \}\}\n          path: app-stable\n          persist-credentials: false\n/);
+  assert.doesNotMatch(a, /uses: actions\/setup-node|permission-contents: write|permission-pull-requests|webapi|git [^\n]*push/, "no shared Node, no write token, nothing published");
+  assert.equal((a.match(/create-github-app-token@/g) ?? []).length, 1);
+  assert.match(a, /permission-contents: read\n/);
+  // Order: freeze Node, read token, clone + bump, revoke (proved dead), sandbox, survivors + verify, patch, upload.
+  const at = (s) => { const i = a.indexOf(s); assert.ok(i > 0, s); return i; };
+  const order = ["frozen-node.sh freeze", "id: read-token", "id: bump", "- name: Revoke the read token and prove it dead", "agent-sandbox-setup.sh", "id: sandbox-gone", "- name: The patch and the gate's verdict", "actions/upload-artifact@v7"].map(at);
+  assert.deepEqual([...order].sort((x, y) => x - y), order, "steps in order");
+  for (let i = a.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = a.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) assert.ok(i < at("agent-sandbox-setup.sh"), "the App key only before the sandbox");
+  assert.match(step(a, "Revoke the read token"), /if: always\(\) && steps\.read-token\.outputs\.token != ''[\s\S]*if \[ "\$code" = 401 \]/);
+  const gate = step(a, "Crew pricing and the consistency gate");
   assert.doesNotMatch(gate, /TOKEN|secrets\.|github\.token/, "no token in the sandbox step");
-  assert.match(gate, /OCTO_CHECK_PROFILE=web OCTOPUSH_CHECKOUT="\$gate" bash scripts\/routines\/agent-sandbox-setup\.sh/);
-  assert.match(gate, /rm -rf "\$gate\/\.git"/, "the sandbox never gets the .git that is pushed");
+  assert.match(gate, /rm -rf "\$gate\/\.git"/);
+  assert.match(gate, /\[ "\$node_dir" = \/opt\/octo-node\/bin \]/, "the sandbox runs the frozen Node");
   assert.match(gate, /timeout --kill-after=15 "\$secs" sudo -n -u octo-sandbox \/usr\/bin\/env -i \\\n/);
   assert.match(gate, /OCTOPUSH_APP_DIR="\$app" OCTOPUSH_STABLE_VERSION="\$VERSION" OCTOPUSH_STRICT_RELEASE=1/);
-  assert.match(gate, /GIT_CONFIG_KEY_0=safe\.directory GIT_CONFIG_VALUE_0="\$app"/, "git reads the runner's checkout as another user");
+  assert.match(gate, /GIT_CONFIG_KEY_0=safe\.directory GIT_CONFIG_VALUE_0="\$app"/);
   assert.match(gate, /sandbox 120 node scripts\/build-crew-pricing\.mjs 2>&1 \| tee "\$RUNNER_TEMP\/crew\.log" \|\| crew=\$\?/);
-  assert.match(gate, /sandbox 600 bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent consistency' 2>&1 \| tee "\$RUNNER_TEMP\/gate\.log" \|\| rc=\$\?/, "a failed gate is recorded, not fatal");
-  // The website's code runs nowhere else in the job.
-  for (const re of [/build-crew-pricing/g, /npm ci/g, /npm run/g]) assert.equal((live.match(re) ?? []).length, 1, `${re} only inside the sandbox`);
-  // The App key only before the sandbox exists; nothing is pushed unless every sandbox process is gone.
-  const setupAt = live.indexOf("agent-sandbox-setup.sh");
-  for (let i = live.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = live.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) assert.ok(i < setupAt, "the App key appears only before the sandbox");
-  const gone = step("Nothing of the website's code is still running");
-  assert.match(gone, /if: always\(\)/);
+  assert.match(gate, /sandbox 600 bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent consistency' 2>&1 \| tee "\$RUNNER_TEMP\/gate\.log" \|\| rc=\$\?/);
+  assert.ok(gate.indexOf("raw.githubusercontent.com") < gate.indexOf("agent-sandbox-setup.sh"), "the runner's own network wait comes before any website code");
+  for (const re of [/build-crew-pricing\.mjs 2>&1/g, /npm ci/g, /npm run/g]) assert.equal((a.match(re) ?? []).length, 1, `${re} only inside the sandbox`);
+  const gone = step(a, "Nothing of the website's code is still running");
+  assert.match(gone, /shell: \/usr\/bin\/bash --noprofile --norc -eo pipefail \{0\}/, "the checking step isn't found through PATH");
   assert.match(gone, /pgrep -u octo-sandbox[^\n]*\n[^\n]*exit 1/);
-  const pr = step("Open the web version PR");
-  assert.match(pr, /if: \$\{\{ !cancelled\(\) && steps\.bump\.outcome == 'success' && steps\.sandbox-gone\.outcome == 'success' \}\}/);
-  assert.ok(live.indexOf("- name: Web token") < live.indexOf("id: bump") && live.indexOf("id: bump") < setupAt && setupAt < live.indexOf("id: sandbox-gone") && live.indexOf("id: sandbox-gone") < live.indexOf("- name: Open the web version PR"));
-  // Only the regenerated JSON comes back: a plain file at exactly its path.
-  assert.match(pr, /src="\$\(realpath -e "\$gate\/\$crew_json" 2>\/dev\/null \|\| true\)"\n\s+if \[ "\$src" = "\$gate\/\$crew_json" \] && \[ -f "\$src" \] && \[ "\$\(stat -c %s "\$src"\)" -lt 2000000 \]/);
-  assert.match(pr, /withtoken git -C "\$web" -c core\.hooksPath=\/dev\/null push /);
-  assert.match(pr, /node scripts\/web-version\.mjs body "\$VERSION" "\$new" > "\$RUNNER_TEMP\/pr-body\.md"/);
-  assert.match(pr, /webapi -X PATCH "repos\/\$WEB\/pulls\/\$new" -F body=@"\$RUNNER_TEMP\/pr-body\.md"/);
-  // Tokens reach git through the environment only, and expressions reach scripts only through env:.
-  assert.doesNotMatch(live, /x-access-token:\$\{\{|https:\/\/[^\s"]*@github\.com/);
-  const runs = [...live.matchAll(/\n(\s+)run: \|\n((?:\1  [^\n]*\n|[ \t]*\n)*)/g)];
-  assert.ok(runs.length >= 4, "run blocks found");
-  for (const m of runs) assert.doesNotMatch(m[2], /\$\{\{/, "an expression inside a run: block");
+  assert.match(gone, /PATH="\$job_path" \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" verify "\$GITHUB_WORKSPACE\/app-stable\/\.git"/);
+  const patch = step(a, "The patch and the gate's verdict");
+  assert.match(patch, /steps\.sandbox-gone\.outcome == 'success'/);
+  assert.match(patch, /src="\$\(realpath -e "\$gate\/\$crew_json" 2>\/dev\/null \|\| true\)"\n\s+if \[ "\$src" = "\$gate\/\$crew_json" \] && \[ -f "\$src" \] && \[ "\$\(stat -c %s "\$src"\)" -lt 2000000 \]/);
+  assert.doesNotMatch(patch, /\bnode\b|npm|scripts\//, "nothing but git and coreutils after the sandbox");
+  assert.match(a, /retention-days: 1\n/);
+  // web-version: a fresh runner, no checkout, no node, no code of either repo; the token only after the check.
+  assert.match(b, /\n    needs: \[promote, web-gate\]\n    if: \$\{\{ !cancelled\(\) && needs\.promote\.result == 'success' \}\}\n/);
+  assert.doesNotMatch(b, /uses: actions\/(checkout|setup-node)/, "web-version checks nothing out");
+  assert.doesNotMatch(b, /^\s*(?:[A-Z_]+=\S*\s+|env\s+[^\n]*?\s)*(?:node|npm|npx|bash\s+\S*scripts\/\S*|\S*scripts\/\S+)(?:\s|$)/m, "web-version runs no code from either repo, and no node");
+  assert.ok(b.indexOf("actions/download-artifact@v8") < b.indexOf("- name: Check the patch and the verdict") && b.indexOf("- name: Check the patch and the verdict") < b.indexOf("OCTOPUSH_APP_PRIVATE_KEY"), "the patch is checked before any token exists");
+  assert.doesNotMatch(b, /--force|push -f|\+HEAD:|\+refs\//, "never a forced push");
+  assert.match(b, /-F body=@"\$RUNNER_TEMP\/pr-body\.md"/);
+  // Tokens reach git through the environment only; expressions reach scripts only through env:.
+  for (const text of [a, b]) {
+    assert.doesNotMatch(text, /x-access-token:\$\{\{|https:\/\/[^\s"]*@github\.com/);
+    const runs = [...text.matchAll(/\n(\s+)run: \|\n((?:\1  [^\n]*\n|[ \t]*\n)*)/g)];
+    assert.ok(runs.length >= 2);
+    for (const m of runs) assert.doesNotMatch(m[2], /\$\{\{/, "an expression inside a run: block");
+  }
+});
+
+test("promote web-version: checks web-gate's patch, applies it with git, never forces, leaves a branch with someone's commits alone", async () => {
+  const { spawnSync, execFileSync } = await import("node:child_process");
+  const { mkdirSync, readFileSync, existsSync, appendFileSync, chmodSync, symlinkSync, rmSync } = await import("node:fs");
+  const { job } = await promoteJob("web-version");
+  const check = runBlock(job, "Check the patch and the verdict (before any token exists)");
+  const open = runBlock(job, "Open the web version PR");
+  const VERSION = "0.4.153";
+  const root = mkdtempSync(join(tmpdir(), "webv-pr-"));
+  const env0 = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  const git = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env: env0 }).trim();
+  // octopush-web, as far as this job is concerned.
+  const bare = join(root, "web.git");
+  git(root, "init", "-q", "--bare", bare);
+  git(bare, "config", "uploadpack.allowAnySHA1InWant", "true");
+  git(bare, "symbolic-ref", "HEAD", "refs/heads/main");
+  const seed = join(root, "seed");
+  mkdirSync(join(seed, "src/data"), { recursive: true });
+  mkdirSync(join(seed, "src/content/docs/docs"), { recursive: true });
+  writeFileSync(join(seed, "src/data/release.ts"), "// the landing's version\nexport const VERSION = '0.4.152';\nexport const PRICE_FREE = 0;\n");
+  writeFileSync(join(seed, "src/content/docs/docs/changelog.md"), "---\ntitle: Changelog\n---\n\n## v0.4.152\n\nOld.\n");
+  writeFileSync(join(seed, "src/data/crew-pricing.json"), JSON.stringify({ version: "0.4.152", source: { tag: "v0.4.152" }, estimator: { sourceSha256: "a".repeat(64) } }, null, 2) + "\n");
+  writeFileSync(join(seed, "vercel.json"), "{}\n");
+  git(seed, "init", "-q", "-b", "main"); git(seed, "add", "-A"); git(seed, "commit", "-qm", "web");
+  git(seed, "push", "-q", bare, "main:refs/heads/main");
+  const base = git(seed, "rev-parse", "HEAD");
+  // What web-gate hands over: the patch on main, and the verdict.
+  const artifact = (gateRc = "0", failed = "") => {
+    const work = join(root, `bump-${Math.random().toString(36).slice(2)}`);
+    git(root, "clone", "-q", bare, work);
+    writeFileSync(join(work, "src/data/release.ts"), readFileSync(join(work, "src/data/release.ts"), "utf8").replace("0.4.152", VERSION));
+    const log = readFileSync(join(work, "src/content/docs/docs/changelog.md"), "utf8");
+    writeFileSync(join(work, "src/content/docs/docs/changelog.md"), log.replace("## v0.4.152", `## v${VERSION}\n\nNew.\n\n## v0.4.152`));
+    writeFileSync(join(work, "src/data/crew-pricing.json"), JSON.stringify({ version: VERSION, source: { tag: `v${VERSION}` }, estimator: { sourceSha256: "b".repeat(64) } }, null, 2) + "\n");
+    const dir = join(root, `in-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(dir);
+    writeFileSync(join(dir, "base"), `${base}\n`);
+    writeFileSync(join(dir, "release.patch"), git(work, "diff") + "\n");
+    writeFileSync(join(dir, "result"), `crew=0\ngate=${gateRc}\n`);
+    writeFileSync(join(dir, "crew.txt"), `wrote src/data/crew-pricing.json from octopush v${VERSION}\n`);
+    writeFileSync(join(dir, "gate-summary.txt"), gateRc === "0" ? "40 passed · 0 failed · 1 skipped\n" : "39 passed · 1 failed · 1 skipped\n");
+    writeFileSync(join(dir, "gate-failed.txt"), failed);
+    return dir;
+  };
+  // A stub gh: compare from the bare repo, one PR, the body kept.
+  const bin = join(root, "bin"); mkdirSync(bin);
+  const state = join(root, "gh"); mkdirSync(state);
+  writeFileSync(join(bin, "gh"), `#!/usr/bin/env bash
+echo "gh $*" >> "${state}/calls"
+a="$*"
+case "$a" in
+  *"/compare/main..."*) b="\${a##*compare/main...}"; b="\${b%% *}"
+    git -C "${bare}" log --format='%H%x09%ae%x09%ce%x09%s' "main..$b" | jq -R -s 'split("\\n") | map(select(length > 0) | split("\\t") | {sha: .[0], commit: {author: {email: .[1]}, committer: {email: .[2]}, message: .[3]}}) | {ahead_by: length, commits: .}' ;;
+  *"-X POST repos/octopush-sh/octopush-web/pulls "*) echo 7 > "${state}/pr"; echo 7 ;;
+  *"pulls?state=open&head="*) cat "${state}/pr" 2>/dev/null; true ;;
+  *"-X PATCH repos/octopush-sh/octopush-web/pulls/7 -F body=@"*) f="\${a##*body=@}"; cp "\${f%% *}" "${state}/body" ;;
+  *) : ;;
+esac
+`);
+  chmodSync(join(bin, "gh"), 0o755);
+  const gitconfig = join(root, "gitconfig");
+  writeFileSync(gitconfig, `[url "file://${bare}"]\n\tinsteadOf = https://github.com/octopush-sh/octopush-web.git\n[protocol "file"]\n\tallow = always\n`);
+  const run = (script, dir) => {
+    const temp = mkdtempSync(join(root, "runner-"));
+    mkdirSync(join(temp, "in"));
+    execFileSync("bash", ["-c", 'cp -a "$0/." "$1/"', dir, join(temp, "in")]);
+    const summary = join(temp, "summary");
+    const r = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
+      encoding: "utf8",
+      env: { PATH: `${bin}:${process.env.PATH}`, HOME: root, GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: "1", RUNNER_TEMP: temp, GITHUB_STEP_SUMMARY: summary,
+        GITHUB_SERVER_URL: "https://github.com", GITHUB_REPOSITORY: "octopush-sh/octopush", GITHUB_RUN_ID: "9", VERSION, WEB: "octopush-sh/octopush-web", WEB_TOKEN: "t0ken" },
+    });
+    return { code: r.status, out: r.stdout + r.stderr, summary: existsSync(summary) ? readFileSync(summary, "utf8") : "" };
+  };
+  const both = (dir) => { const c = run(check, dir); return c.code ? c : run(open, dir); };
+  const head = () => spawnSync("git", ["-C", bare, "rev-parse", "-q", "--verify", `refs/heads/release/v${VERSION}`], { encoding: "utf8" }).stdout.trim();
+  const body = () => readFileSync(join(state, "body"), "utf8");
+
+  // A first run creates the branch from main with one commit of the bot's, and the PR.
+  const good = artifact();
+  let r = both(good);
+  assert.equal(r.code, 0, r.out);
+  const first = head();
+  assert.ok(first);
+  assert.equal(git(bare, "rev-parse", `${first}^`), base);
+  assert.equal(git(bare, "log", "-1", "--format=%an <%ae>|%s", first), `github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>|release: landing v${VERSION}, its changelog entries and the crew pricing`);
+  assert.match(git(bare, "show", `${first}:src/data/release.ts`), new RegExp(`VERSION = '${VERSION.replace(/\./g, "\\.")}'`));
+  assert.match(body(), /^v0\.4\.153 was promoted to stable/);
+  assert.match(body(), /\*\*Passed\*\*: .* 40 passed · 0 failed · 1 skipped\./);
+  assert.match(body(), /> \[!IMPORTANT\]\n> `estimator\.sourceSha256` changed/);
+  assert.match(r.summary, /\*\*passed\*\*/);
+  // A re-run with the same patch moves nothing (no forced push) and refreshes the body.
+  rmSync(join(state, "body"));
+  r = both(artifact());
+  assert.equal(r.code, 0, r.out);
+  assert.equal(head(), first);
+  assert.match(r.out, /already carries these changes/);
+  assert.ok(existsSync(join(state, "body")));
+  // A failed gate still opens the PR, marked, its text fenced past every backtick run, colours and controls gone.
+  r = both(artifact("1", "\x1b[31m✗\x1b[0m the landing shows a retired glyph ````\n```\n@octopush-sh/everyone [x](https://example.invalid)\x07\n"));
+  assert.equal(r.code, 0, r.out);
+  assert.match(body(), /^> \[!CAUTION\]\n> \*\*The consistency gate failed\*\*/);
+  assert.match(body(), /\*\*Failed\*\*: .* 39 passed · 1 failed · 1 skipped\.\n\n`````text\n✗ the landing shows a retired glyph ````\n```\n@octopush-sh\/everyone \[x\]\(https:\/\/example\.invalid\)\n`````\n/);
+  assert.doesNotMatch(body(), /\x1b|\x07/);
+  // Someone's fix on the branch: left alone, said so, nothing pushed, the PR untouched.
+  const fix = join(root, "fix");
+  git(root, "clone", "-q", "-b", `release/v${VERSION}`, bare, fix);
+  appendFileSync(join(fix, "src/content/docs/docs/changelog.md"), "A fix.\n");
+  execFileSync("git", ["-C", fix, "-c", "user.name=PM", "-c", "user.email=pm@example.com", "commit", "-qam", "Fix the changelog"]);
+  git(fix, "push", "-q", "origin", `release/v${VERSION}`);
+  const fixed = head();
+  rmSync(join(state, "body"));
+  r = both(artifact());
+  assert.equal(r.code, 0, r.out);
+  assert.equal(head(), fixed, "the fix survives");
+  assert.match(r.summary, /has commits this job didn't make \([0-9a-f]{12}\): left alone, nothing pushed/);
+  assert.ok(!existsSync(join(state, "body")), "the PR is left alone too");
+  // Patches that are not what web-gate writes are refused before any token exists, or before anything is pushed.
+  const refused = [
+    ["an extra file", (d) => writeFileSync(join(d, "run-me.sh"), "x")],
+    ["a link", (d) => { rmSync(join(d, "crew.txt")); symlinkSync("/etc/passwd", join(d, "crew.txt")); }],
+    ["a result with a command", (d) => writeFileSync(join(d, "result"), "crew=0\ngate=0; true\n")],
+    ["another file", (d) => appendFileSync(join(d, "release.patch"), "diff --git a/vercel.json b/vercel.json\n--- a/vercel.json\n+++ b/vercel.json\n@@ -1 +1 @@\n-{}\n+{ }\n")],
+    ["a new file", (d) => appendFileSync(join(d, "release.patch"), "diff --git a/api/x.ts b/api/x.ts\nnew file mode 100644\n--- /dev/null\n+++ b/api/x.ts\n@@ -0,0 +1 @@\n+x\n")],
+    ["a mode change on an allowed path", (d) => writeFileSync(join(d, "release.patch"), readFileSync(join(d, "release.patch"), "utf8").replace(/^(diff --git a\/src\/data\/release\.ts b\/src\/data\/release\.ts\n)index ([0-9a-f]+)\.\.([0-9a-f]+) 100644$/m, "$1old mode 100644\nnew mode 100755\nindex $2..$3"))],
+    ["another version in release.ts", (d) => writeFileSync(join(d, "release.patch"), readFileSync(join(d, "release.patch"), "utf8").replace(`+export const VERSION = '${VERSION}';`, "+export const VERSION = '9.9.9';"))],
+    ["another version's crew pricing", (d) => writeFileSync(join(d, "release.patch"), readFileSync(join(d, "release.patch"), "utf8").replace(`+  "version": "${VERSION}"`, '+  "version": "9.9.9"'))],
+  ];
+  for (const [what, tamper] of refused) {
+    const d = artifact();
+    tamper(d);
+    r = both(d);
+    assert.notEqual(r.code, 0, what);
+    assert.match(r.out, /::error::web-gate's patch is refused/, what);
+    assert.equal(head(), fixed, `${what}: nothing pushed`);
+  }
+});
+
+test("workflows: web-audit's audit job runs the frozen Node and verifies after each sandboxed step", async () => {
+  const { readFileSync } = await import("node:fs");
+  const wf = readFileSync(new URL("../../.github/workflows/web-audit.yml", import.meta.url), "utf8");
+  const job = wf.slice(wf.indexOf("\n  audit:\n"), wf.indexOf("\n  file:\n"));
+  assert.doesNotMatch(job, /uses: actions\/setup-node/, "no shared Node on the audit job's PATH");
+  const freeze = job.indexOf("bash scripts/routines/frozen-node.sh freeze");
+  assert.ok(freeze > 0 && freeze < job.indexOf("Web token (check out"), "Node is frozen before anything else");
+  assert.ok(job.indexOf('rm -rf "$GITHUB_WORKSPACE/site/.git"') < job.indexOf("agent-sandbox-setup.sh"), "no .git of the site left for the sandbox");
+  const verifies = [...job.matchAll(/shell: \/usr\/bin\/bash --noprofile --norc -e \{0\}\n\s+run: \|\n\s+job_path="\$PATH"\n\s+PATH=\/usr\/sbin:\/usr\/bin:\/sbin:\/bin\n[\s\S]*?PATH="\$job_path" \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" verify\n/g)];
+  assert.equal(verifies.length, 2, "both survivor steps verify, not through PATH");
+  assert.ok(job.indexOf("frozen-node.sh\" verify", job.lastIndexOf("pgrep -u octo-sandbox")) < job.indexOf("Take the results out"), "verified before the results are taken out");
+});
+
+test("frozen-node.sh refuses to run outside GitHub Actions", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const f = new URL("./frozen-node.sh", import.meta.url).pathname;
+  for (const cmd of ["freeze", "verify"]) {
+    assert.equal(spawnSync("bash", [f, cmd], { encoding: "utf8", env: { PATH: process.env.PATH } }).status, 64, cmd);
+    assert.equal(spawnSync("bash", [f, cmd], { encoding: "utf8", env: { PATH: process.env.PATH, GITHUB_ACTIONS: "true" } }).status, 64, `${cmd} without RUNNER_TEMP`);
+  }
 });
 
 test("octo-check web: install, site, routes; build and all fail on a dist that shadows /download, /api or /update", async () => {
