@@ -1336,6 +1336,31 @@ mod e2e {
         });
     }
 
+    /// A reattached shell's directory isn't known until it reports it, so no
+    /// grant, bound to a folder, matches it before then (#1231): the shell
+    /// may sit anywhere after a restart.
+    #[test]
+    #[serial]
+    fn a_reattached_shells_unknown_directory_matches_no_grant() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        use crate::talk_guard::{Grant, GrantKind};
+        let d = boot();
+        let old = DaemonClient::connect_to(d.sock.to_str().unwrap()).unwrap();
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        old.spawn("talk-oldcwd", "/tmp", &env, Some("/bin/bash"), 40, 120).unwrap();
+        let grant = Grant { kind: GrantKind::Command, value: "ls".into(), shown: "ls".into() };
+        with_login_shell_env(&[], || {
+            let shell = shell_on(&d.sock);
+            assert_eq!(shell.cwd("oldcwd"), None, "reattached: where it sits isn't read yet");
+            assert!(crate::chat_engine::grants_where(true, shell.cwd("oldcwd").as_deref(), vec![grant.clone()]).is_empty());
+            done(shell.run("oldcwd", "/tmp", "true", Duration::from_secs(20), true).unwrap());
+            assert!(shell.cwd("oldcwd").is_some(), "known once it has run");
+            assert_eq!(crate::chat_engine::grants_where(true, shell.cwd("oldcwd").as_deref(), vec![grant.clone()]), vec![grant.clone()]);
+            assert_eq!(crate::chat_engine::grants_where(false, None, vec![grant.clone()]).len(), 1, "off the shared shell, it starts at the root");
+            shell.close("oldcwd");
+        });
+    }
+
     /// A dir holding `octo-1087-tool`, an executable found only through it.
     fn login_bin() -> TempDir {
         use std::os::unix::fs::PermissionsExt;

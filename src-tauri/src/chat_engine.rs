@@ -1758,6 +1758,19 @@ impl Offer {
     }
 }
 
+/// The grants a command may match where it starts (#1231): none in a shared
+/// shell (`shared`) whose directory isn't known yet (`cwd` `None`: a shell
+/// reattached after a restart, before it reports where it is), which may sit
+/// anywhere. A grant is bound to its folder; an unknown one never matches,
+/// and the card asks. Pure.
+pub(crate) fn grants_where(shared: bool, cwd: Option<&str>, grants: Vec<Grant>) -> Vec<Grant> {
+    if shared && cwd.is_none() {
+        Vec::new()
+    } else {
+        grants
+    }
+}
+
 /// What an answer counts as in `mode` (#1231): in Ask first a "don't ask
 /// again" or an MCP trust answer is one approval and keeps nothing. The
 /// conversation's narrow grants (#1229) stand. Pure.
@@ -5866,11 +5879,10 @@ impl ChatEngine {
                     // yes (#1229): Ask first doesn't hold it. MCP trust and the
                     // thread's "don't ask again" never are, and Plan only
                     // refused these calls above.
-                    let ask_cwd = (u.name == "run_command" && self.talk_shell.available() && exec_roots.is_none())
-                        .then(|| self.talk_shell.cwd(&request.thread_id))
-                        .flatten();
+                    let in_shell = u.name == "run_command" && self.talk_shell.available() && exec_roots.is_none();
+                    let ask_cwd = in_shell.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
                     let granted = || {
-                        let grants = self.approvals.grants(&request.thread_id, mode);
+                        let grants = grants_where(in_shell, ask_cwd.as_deref(), self.approvals.grants(&request.thread_id, mode));
                         reach.granted(&u.name, &u.input, ask_cwd.as_deref().map(Path::new), writes_confined, &grants)
                     };
                     if !reach.checked(&granted).await {
@@ -5940,7 +5952,7 @@ impl ChatEngine {
                     if denied.is_none() {
                         let place = || {
                             let cwd = shell_cwd();
-                            let grants = self.approvals.grants(&request.thread_id, mode);
+                            let grants = grants_where(shared, cwd.as_deref(), self.approvals.grants(&request.thread_id, mode));
                             reach.command_card(None, command, cwd.as_deref().map(Path::new), &grants)
                         };
                         let check = || reach.checked(&place);
@@ -5951,7 +5963,13 @@ impl ChatEngine {
                     }
                     if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         // Its grant is bound to where it runs, and checks where it reaches (#1229).
-                        let grant = reach.checked(|| reach.command_grant(command, shell_cwd().as_deref().map(Path::new))).await;
+                        // None from a shared shell whose directory isn't known.
+                        let cwd = shell_cwd();
+                        let known = !shared || cwd.is_some();
+                        let grant = match known {
+                            true => reach.checked(|| reach.command_grant(command, cwd.as_deref().map(Path::new))).await,
+                            false => None,
+                        };
                         match self
                             .approvals
                             .await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, grant, mode)
