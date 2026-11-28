@@ -1970,7 +1970,7 @@ test("octo-check epiku: Epiku's own gates, no network, no store, and no argument
   for (const a of [["tests/estado.test.ts"], ["tests"], ["tests/estado.test.ts", "tests"], []]) {
     const r = oc("test", ...a);
     assert.doesNotMatch(r.stderr, refused, JSON.stringify(a));
-    assert.ok(r.stdout.includes(["RAN -n -u octo-sandbox /usr/bin/env -i"].join("")) && r.stdout.trimEnd().endsWith(["npx vitest run", ...a].join(" ")), "existing paths go through, as the sandbox user, with an empty environment");
+    assert.ok(r.stdout.includes(["RAN -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i"].join("")) && r.stdout.trimEnd().endsWith(["npx vitest run", ...a].join(" ")), "existing paths go through, as the sandbox user inside its cgroup, with an empty environment");
   }
   assert.match(src, /all\) cmd=\(bash -c 'npm run --silent typecheck && npx vitest run && npm run --silent test:py && npm run --silent check:agents'\)/);
   assert.match(src, /\/usr\/bin\/env -i \\\n/, "the checks' environment is built from nothing");

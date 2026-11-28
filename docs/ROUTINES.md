@@ -218,10 +218,16 @@ trusted:
   `web-build`, `epiku-build`), Node and the Claude Code CLI are a root-owned, read-only copy made
   by `scripts/routines/frozen-node.sh freeze` before the agent's branch or repo arrives (the
   CLI is installed into it there, with no token in the step), and everything on `PATH`, the
-  runner, the actions' code and `~/.config` is closed to other users. After the agent,
-  `frozen-node.sh end` ends the sandbox user: every process at once (`kill -1` as that user, until
-  none is left, or the step fails), its crontab removed, the account locked. Only then does it
-  close the checkout's top directory and remove any `.git` there. Every later step, and the last
+  runner, the actions' code and `~/.config` is closed to other users. Code runs as `octo-sandbox`
+  only through `octo-sandbox-exec` (`scripts/routines/sandbox-exec.sh`, installed root-owned by
+  `agent-sandbox-setup.sh`), which puts it in one cgroup v2 per job that nothing in it can leave,
+  with no way to gain privileges; without cgroup v2 the setup refuses. After the agent,
+  `frozen-node.sh end` writes the cgroup's `cgroup.kill` first, which ends every member at once,
+  forks in flight included. It fails the step unless the cgroup is empty and no process of the
+  user runs anywhere, then locks the account. Only then does it close the checkout's top
+  directory and remove any `.git` there. `publish-build.mjs` reads the agent's files only as
+  regular files, without following links (`readRegular`), and refuses FIFOs and devices. CI's
+  `sandbox-end` job proves `end` on the runner image against a process that keeps forking. Every later step, and the last
   one before the actions' post steps, starts with `frozen-node.sh guard` (`end`, then the checks): the frozen
   copy is unchanged, nothing the runner executes is writable by or belongs to that user, the moved
   `.git` has no hook or command-running config, and the step's environment sets no `GIT_*`,

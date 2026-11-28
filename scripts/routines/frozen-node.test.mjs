@@ -6,7 +6,7 @@
 // text and run the parts of frozen-node.sh that need no sudo.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync } from "node:fs";
+import { readFileSync, mkdtempSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -166,20 +166,81 @@ test("frozen-node.sh guard and end: a job that never created the sandbox user pa
   }
 });
 
-test("frozen-node.sh end: every process at once, the account locked, the checkout closed before its .git goes", () => {
+test("frozen-node.sh end: the sandbox's cgroup killed first, always; then empty, nothing of the user's outside it, the account locked; then the checkout closed before its .git goes", () => {
   const src = readFileSync(new URL("./frozen-node.sh", import.meta.url), "utf8");
   const fn = src.slice(src.indexOf("end_sandbox() {"), src.indexOf("\n}\n", src.indexOf("end_sandbox() {")));
+  assert.match(src, /\nCG=\/sys\/fs\/cgroup\/octo-sandbox\n/);
+  assert.match(fn, /^end_sandbox\(\) \{\n\s+\[\[ -e "\$CG\/cgroup\.kill" && -e "\$CG\/cgroup\.events" \]\] \|\| die /, "no cgroup: fail closed, never fall back to the process table");
+  const kill = fn.indexOf('echo 1 | sudo tee "$CG/cgroup.kill" >/dev/null');
+  assert.ok(kill > 0, "cgroup.kill");
+  for (const later of ["alive", "ps ", "pgrep", "populated 0"]) assert.ok(fn.indexOf(later) < 0 || fn.indexOf(later) > kill, `nothing looks before the kill: ${later}`);
+  assert.match(fn, /for _ in \$\(seq 1 50\); do\n\s+echo 1 \| sudo tee "\$CG\/cgroup\.kill" >\/dev\/null\n\s+if grep -qx 'populated 0' "\$CG\/cgroup\.events"; then empty=1; break; fi\n/, "killed again until the cgroup is empty, a bounded number of times");
+  assert.match(fn, /\[\[ -n "\$empty" \]\] \|\| die /);
   const lock = fn.indexOf('sudo usermod --lock --expiredate 1 --shell /usr/sbin/nologin "$SANDBOX_USER"');
-  const kill = fn.indexOf(`sudo setpriv --reuid="$uid" --regid="$gid" --clear-groups /usr/bin/bash -c 'kill -KILL -1'`);
-  assert.ok(fn.indexOf("crontab -r -u") >= 0 && lock > 0 && kill > lock, "crontab gone and the account locked, then kill(-1) as that user");
-  assert.match(fn, /for _ in \$\(seq 1 50\); do\n\s+alive \|\| return 0\n/, "until no process can run, a bounded number of times");
-  assert.match(fn, /! alive \|\| die "\$SANDBOX_USER processes survived"/);
+  assert.ok(lock > kill && fn.indexOf("crontab -r -u") > kill);
+  assert.match(fn, /if alive; then\n[^\n]*kill -KILL -1[^\n]*\n\s+die "a process of \$SANDBOX_USER ran outside the sandbox's cgroup"/, "one outside the cgroup is killed and fails the job");
   assert.match(src, /alive\(\) \{ ps -u "\$SANDBOX_USER" -o stat= 2>\/dev\/null \| grep -qv '\^Z'; \}/, "a zombie runs nothing");
   assert.doesNotMatch(live(src), /\bpkill\b/, "never pkill, which walks /proc and a forking process can outrun");
   const end = src.slice(src.indexOf('if [[ "$1" == end ]]; then'), src.indexOf("\nfi\n", src.indexOf('if [[ "$1" == end ]]; then')));
   assert.ok(end.indexOf("end_sandbox") < end.indexOf('sudo chmod o-w "$c"') && end.indexOf('sudo chmod o-w "$c"') < end.indexOf('sudo rm -rf -- "$c/.git"'), "ended, then closed, then removed");
   assert.match(end, /\(\(planted == 0\)\) \|\| die /, "a removed .git fails the step");
   assert.match(src.slice(src.indexOf("\n  guard)\n")), /^\n  guard\)\n    end_sandbox\n    check\n/);
+});
+
+test("the sandbox's cgroup: made (or refused) by agent-sandbox-setup.sh, entered by octo-sandbox-exec, the only way code runs as octo-sandbox", () => {
+  const setup = readFileSync(new URL("./agent-sandbox-setup.sh", import.meta.url), "utf8");
+  assert.match(setup, /\[\[ "\$\(stat -fc %T \/sys\/fs\/cgroup 2>\/dev\/null\)" == cgroup2fs \]\] \\\n\s+\|\| \{ echo "::error::[^"]*not cgroup v2[^"]*" >&2; exit 1; \}/, "no cgroup v2: refuse");
+  assert.match(setup, /\|\| \{ echo "::error::[^"]*no cgroup\.kill[^"]*" >&2; exit 1; \}/);
+  assert.match(setup, /sudo install -o root -g root -m 755 "\$HERE\/sandbox-exec\.sh" \/usr\/local\/sbin\/octo-sandbox-exec\n/);
+  assert.ok(setup.indexOf("/usr/local/sbin/octo-sandbox-exec\n") < setup.indexOf("as_sandbox()"), "installed before the network proof runs anything as the sandbox");
+  const exec = readFileSync(new URL("./sandbox-exec.sh", import.meta.url), "utf8");
+  assert.match(exec, /\nCG=\/sys\/fs\/cgroup\/octo-sandbox\n/);
+  assert.match(exec, /\necho "\$\$" > "\$CG\/cgroup\.procs"\nexec setpriv --reuid="\$\(id -u "\$SANDBOX_USER"\)" --regid="\$\(id -g "\$SANDBOX_USER"\)" --clear-groups --no-new-privs -- "\$@"\n$/, "into the cgroup, then the user, with no new privileges");
+  assert.match(exec, /if \[\[ "\$\{1:-\}" == --kill \]\]; then\n\s+for _ in \$\(seq 1 100\); do\n\s+echo 1 > "\$CG\/cgroup\.kill"\n/, "--kill kills first");
+  // Nothing starts a sandbox process any other way.
+  const check = readFileSync(new URL("./agent-check.sh", import.meta.url), "utf8");
+  assert.match(check, /\/usr\/bin\/sudo -n \/usr\/local\/sbin\/octo-sandbox-exec \/usr\/bin\/env -i \\\n/);
+  assert.match(check, /\/usr\/bin\/sudo -n \/usr\/local\/sbin\/octo-sandbox-exec --kill 2>\/dev\/null\n/);
+  const files = [
+    ...readdirSync(new URL("./", import.meta.url)).filter((f) => f.endsWith(".sh")).map((f) => readFileSync(new URL(`./${f}`, import.meta.url), "utf8")),
+    ...BUILDERS.map((b) => wf(b.file)),
+  ];
+  for (const text of files) assert.doesNotMatch(live(text), /\bsudo (-n )?-u (octo-sandbox|"\$SANDBOX_USER")|pkill -KILL -u/, "no sudo -u to the sandbox user, no pkill");
+});
+
+test("frozen-node.sh end, on this runner: a sandbox that keeps forking does not survive it (the CI job sandbox-end)", () => {
+  const ci = live(wf("ci.yml"));
+  const at = ci.indexOf("\n  sandbox-end:\n");
+  const next = ci.slice(at + 1).search(/\n  [a-z-]+:\n/);
+  const job = ci.slice(at, next < 0 ? undefined : at + 1 + next);
+  assert.ok(ci.includes("\n  sandbox-end:\n"), "the self-check job");
+  assert.match(job, /permissions:\n      contents: read\n/);
+  assert.doesNotMatch(job, /secrets\.|github\.token|TOKEN/);
+  assert.match(job, /while :; do \(sleep 0 &\); done/, "the fork loop");
+  assert.match(job, /rc=0; \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" end "\$c" \|\| rc=\$\?/);
+  assert.match(job, /ps -u octo-sandbox -o stat= \| grep -qv '\^Z'/);
+  assert.match(job, /grep -qx 'populated 0' \/sys\/fs\/cgroup\/octo-sandbox\/cgroup\.events/);
+});
+
+test("publish-build reads the agent's files without following links: readRegular", async () => {
+  const { readRegular } = await import("./publish-build.mjs");
+  const { symlinkSync, mkdirSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "regular-"));
+  const file = join(dir, "f.txt");
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(file, "text\n");
+  symlinkSync(file, join(dir, "link"));
+  mkdirSync(join(dir, "d"));
+  assert.equal(spawnSync("mkfifo", [join(dir, "fifo")]).status, 0);
+  assert.equal(readRegular(file), "text\n");
+  assert.equal(readRegular(join(dir, "link")), null, "a link, even to a regular file");
+  assert.equal(readRegular(join(dir, "fifo")), null, "a FIFO, without blocking");
+  assert.equal(readRegular(join(dir, "d")), null);
+  assert.equal(readRegular(join(dir, "missing")), null);
+  const src = readFileSync(new URL("./publish-build.mjs", import.meta.url), "utf8");
+  assert.match(src, /const text = outDir \? readRegular\(file\) : null;/, "result.json: a real directory and a regular file");
+  assert.match(src, /const contents = paths\.map\(readRegular\)\.filter\(\(t\) => t !== null\);/);
+  assert.match(src, /return paths\.filter\(\(p\) => hasConflictMarkers\(readRegular\(p\) \?\? ""\)\);/);
 });
 
 test("frozen-node.sh: what verify refuses (the checks themselves, read from the script)", () => {
