@@ -2197,7 +2197,7 @@ mod tests {
         }
         // Plan only refuses them before any card: it reads `readOnlyHint` alone.
         let read_only: HashSet<String> = ["mcp__s__read_y".to_string()].into();
-        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false, ships_nothing: false };
         let input = json!({});
         for name in ["mcp__s__get_x", "mcp__s__post_x"] {
             let decision = crate::permissions::decide(Mode::Plan, &crate::permissions::ToolCall { name, input: &input }, &ctx);

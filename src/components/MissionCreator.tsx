@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronLeft, ChevronRight, Hammer, Wrench, Eye, FlaskConical, Gauge, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, ClipboardCheck, Hammer, Wrench, Eye, FlaskConical, Gauge, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
@@ -18,6 +18,10 @@ import { copyToClipboard } from "../lib/clipboard";
 import { pushToast } from "./Toasts";
 import { SETUP_FIELD_ROWS, conductorSourceLine, wantsConductorPrefill } from "../lib/conductorSetup";
 import { type ShareRow, sameSpec, setupInstallWarning, shareRows, specFromRows } from "../lib/shareWithMissions";
+import { ticketBranch } from "../lib/ticketBranch";
+import { testBrief } from "../lib/testBrief";
+import { useChatStore } from "../stores/chatStore";
+import { tourId } from "../lib/tour/ids";
 
 interface Props {
   projectId: string;
@@ -34,19 +38,21 @@ interface Props {
   /** A mission group of this project the new mission joins (the creator was
    *  opened from that group's "+" in the rail). */
   groupId?: string | null;
+  /** The intent the creator opens on (the backlog's "Test this ticket"). */
+  initialIntent?: Intent;
 }
 
 type Step = 1 | 2 | 3;
 /** Code intents (build/fix) write to a worktree; non-code intents (review/probe)
  *  are read-only-by-construction — their agents read the checkout but can't
  *  modify it (a `readonly` git-isolation enforced by the seatbelt sandbox). */
-type Intent = "build" | "fix" | "review" | "probe" | "perf";
+export type Intent = "build" | "fix" | "review" | "probe" | "perf" | "test";
 /** Intents that don't write code — the wizard forces `readonly` git isolation
  *  and hides the writer isolation controls for them. `perf` is a specialized
  *  read-only probe (chase a regression). */
 const READONLY_INTENTS: Intent[] = ["review", "probe", "perf"];
 /** Card order for keyboard navigation. */
-const INTENT_ORDER: Intent[] = ["build", "fix", "review", "probe", "perf"];
+const INTENT_ORDER: Intent[] = ["build", "fix", "review", "probe", "perf", "test"];
 /** The manual git-isolation choices. `pr` is derived (picking a PR), never a
  *  Listbox option — one state, two entry points. */
 type GitIsolation = "worktree" | "ephemeral";
@@ -91,11 +97,12 @@ const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: strin
   review: { icon: Eye, title: "Review the work", desc: "Read the code, judge it — never touch it." },
   probe: { icon: FlaskConical, title: "Probe a question", desc: "Investigate, read-only. No changes." },
   perf: { icon: Gauge, title: "Chase a regression", desc: "Profile & find what got slow. Read-only." },
+  test: { icon: ClipboardCheck, title: "Test a ticket", desc: "Build it, run it, ship nothing." },
 };
 
-export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate, projectJiraKey, groupId }: Props) {
+export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate, projectJiraKey, groupId, initialIntent }: Props) {
   const [step, setStep] = useState<Step>(1);
-  const [intent, setIntent] = useState<Intent>("build");
+  const [intent, setIntent] = useState<Intent>(initialIntent ?? "build");
   const [task, setTask] = useState(initialTask ?? "");
   // Step 3 prefills with the project's last-used setup script (saved back on
   // successful create — a remembered template, not a live binding).
@@ -206,6 +213,14 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
       .catch(() => {});
   }, [projectPath]);
 
+  // Testing a ticket starts from the ticket's own branch when one exists (a
+  // new branch is cut from it, so it never moves); otherwise the default.
+  const testBase = intent === "test" && linkIssueKeyOnCreate ? ticketBranch(branches, remoteBranches, linkIssueKeyOnCreate) : null;
+  useEffect(() => {
+    // Only when the ticket's branch resolves, never over a PR's head.
+    if (testBase && !fromPr) setBase(testBase);
+  }, [testBase]);
+
   // Escape cancels the whole creator — but only when no inner layer claimed
   // the key first. The BaseBranchPicker's menu chrome calls preventDefault()
   // on its Escape; without the defaultPrevented guard, dismissing the branch
@@ -231,7 +246,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     if (step !== 1) return;
     function onKey(e: KeyboardEvent) {
       const idx = INTENT_ORDER.indexOf(intent);
-      if (/^[1-5]$/.test(e.key)) {
+      if (/^[1-6]$/.test(e.key)) {
         const picked = INTENT_ORDER[parseInt(e.key, 10) - 1];
         if (picked) { setIntent(picked); setStep(2); }
       } else if (e.key === "ArrowLeft") {
@@ -254,9 +269,12 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   // four words of the task, never over the cap — a long branch becomes a long
   // worktree path, which Claude Code's transcripts cannot follow. Two tasks
   // sharing their first words get `-2`, `-3`: never another mission's branch.
-  const branch =
-    branchOverride ??
-    uniqueBranch(branchFromTask(task, linkIssueKeyOnCreate, projectJiraKey) || "new-mission", (b) => branches.includes(b));
+  // Testing a ticket works on `test/<KEY>`, never the ticket's own branch.
+  const suggested =
+    intent === "test" && linkIssueKeyOnCreate
+      ? `test/${linkIssueKeyOnCreate}`
+      : branchFromTask(task, linkIssueKeyOnCreate, projectJiraKey) || "new-mission";
+  const branch = branchOverride ?? uniqueBranch(suggested, (b) => branches.includes(b));
   const workspaceName = branch;
   const taskValid = task.trim().length > 0;
   const branchCollides = branches.includes(branch);
@@ -272,12 +290,15 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     setError(null);
     // Picking a PR overrides the manual isolation choice — one effective value.
     // Review/probe missions are read-only-by-construction — always `readonly`,
-    // never a writer isolation (enforced in UI and backend).
+    // never a writer isolation (enforced in UI and backend). Testing a ticket
+    // is always a throwaway checkout, a PR's head included.
     const gitIso: string = READONLY_INTENTS.includes(intent)
       ? "readonly"
-      : fromPr
-        ? "pr"
-        : gitIsolation;
+      : intent === "test"
+        ? "ephemeral"
+        : fromPr
+          ? "pr"
+          : gitIsolation;
     // The share list is a project setting the backend applies while it makes
     // the worktree, so it is saved first; a failed save stops here.
     const shareSpec = specFromRows(shareList);
@@ -355,6 +376,14 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
         setError(`Workspace was created but linking the Jira ticket failed: ${String(e)}. You can link it later via right-click on the workspace.`);
         setCreating(false);
         return;
+      }
+      // Testing a ticket opens on its brief, in the composer, unsent.
+      if (intent === "test") {
+        const brief = await ipc
+          .getIssue(linkIssueKeyOnCreate)
+          .then((issue) => testBrief(issue))
+          .catch(() => testBrief({ key: linkIssueKeyOnCreate, summary: task.trim() }, true));
+        useChatStore.getState().seedComposer(newWs.id, brief);
       }
     }
     setCreating(false);
@@ -436,6 +465,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
               {(Object.keys(INTENT_META) as Intent[]).map((key, i) => (
                 <IntentCard
                   key={key}
+                  tour={key === "test" ? tourId("mission-intent-test") : undefined}
                   index={i}
                   meta={INTENT_META[key]}
                   shortcut={String(i + 1)}
@@ -455,7 +485,7 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
               </button>
               <div className="ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
                 <kbd className="rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] tracking-normal text-octo-mute">Enter</kbd>
-                <span className="ml-1">to continue · 1 / 2 to choose</span>
+                <span className="ml-1">to continue · 1–6 to choose</span>
               </div>
             </div>
           </>
@@ -566,7 +596,14 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                       <div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
                         Git state
                       </div>
-                      {fromPr ? (
+                      {intent === "test" ? (
+                        <div
+                          data-tour="mission-ships-nothing"
+                          className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage"
+                        >
+                          <span className="text-octo-brass">Runs locally, ships nothing.</span> This workspace is thrown away when the mission is done. Talk&apos;s agents can build, run and edit config here. Octopush refuses the git pushes, pull requests, publishes, image pushes and cluster changes their commands ask for. Talk runs plain commands only here, in a shell without your profile&apos;s aliases and functions: no shell expansions, nested shells or wrappers like sudo, env or xargs. ssh, scp, rsync, deploy CLIs, a script it runs and a program that does its own networking aren&apos;t caught until the process-level barrier arrives. Crews don&apos;t run in this mission.
+                        </div>
+                      ) : fromPr ? (
                         <div className="max-w-[420px] rounded-md border border-octo-hairline bg-octo-panel px-3 py-2 text-[12px] leading-[1.5] text-octo-sage">
                           Starting from <span className="text-octo-brass">PR #{fromPr.number}</span> — this mission uses the pull request&apos;s head as its checkout.
                         </div>
@@ -784,12 +821,14 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
 }
 
 function IntentCard({
+  tour,
   index,
   meta,
   shortcut,
   selected,
   onSelect,
 }: {
+  tour?: string;
   index: number;
   meta: { icon: LucideIcon; title: string; desc: string };
   shortcut: string;
@@ -800,6 +839,7 @@ function IntentCard({
   return (
     <button
       type="button"
+      data-tour={tour}
       onClick={onSelect}
       aria-pressed={selected}
       style={{ animationDelay: `calc(${index} * var(--stagger-step))` }}

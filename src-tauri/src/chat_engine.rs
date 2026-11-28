@@ -880,6 +880,11 @@ pub(crate) struct CommandWord {
     /// The word with quotes removed and nothing dropped (`--method=POST`
     /// whole), for checks that read flags (`permissions::remote_effect`).
     pub word: String,
+    /// Its command reads its input from a pipe or a `<` redirection
+    /// (`permissions`' ship-nothing check).
+    pub stdin: bool,
+    /// Its command reads its input from a here-document or a here-string.
+    pub inline: bool,
 }
 
 /// The words of one command line as the path check reads them (#1201): a
@@ -960,6 +965,10 @@ struct Lexer {
     heredocs: Vec<(String, bool)>,
     /// Lexing a here-document's body: every word is `Data`.
     data: bool,
+    /// The current command reads its input from a pipe or `<` ([`CommandWord::stdin`]).
+    stdin: bool,
+    /// The current command reads its input from a here-document or a here-string.
+    inline: bool,
     /// Every word (`w`), operator (`o`), here-document delimiter (`d`) and
     /// body (`h`) in order, as [`command_key`] compares them.
     shape: Vec<String>,
@@ -1008,6 +1017,8 @@ impl Lexer {
                     self.i += if c == '|' && matches!(next, Some('|' | '&')) { 2 } else { 1 };
                     self.op("", from);
                     self.next_segment();
+                    // `|` and `|&` feed the next command; `||` doesn't.
+                    self.stdin = c == '|' && next != Some('|');
                 }
                 '&' if next == Some('>') => {
                     self.finish();
@@ -1072,6 +1083,26 @@ impl Lexer {
         self.segment += 1;
         self.started = false;
         self.target = None;
+        self.stdin = false;
+        self.inline = false;
+    }
+
+    /// The current command reads its input from a pipe or a file
+    /// (`inline`: a here-document or a here-string), its words already
+    /// read included (`bash < script.sh`).
+    fn feeds(&mut self, inline: bool) {
+        // Marked once per command: the words after it take the flag as they're read.
+        if (inline && self.inline) || (!inline && self.stdin) {
+            return;
+        }
+        let segment = self.segment;
+        let mark = |w: &mut CommandWord| if inline { w.inline = true } else { w.stdin = true };
+        self.out.iter_mut().rev().take_while(|w| w.segment == segment).for_each(mark);
+        if inline {
+            self.inline = true;
+        } else {
+            self.stdin = true;
+        }
     }
 
     fn finish(&mut self) {
@@ -1111,6 +1142,8 @@ impl Lexer {
             writes: target == Some(true),
             redirect: target.is_some(),
             word: crate::talk_guard::unescape(&w.pattern),
+            stdin: self.stdin,
+            inline: self.inline,
         });
     }
 
@@ -1131,6 +1164,7 @@ impl Lexer {
                 return;
             }
             ('<', Some('<')) => {
+                self.feeds(true);
                 self.i += 1;
                 if self.peek() == Some('<') {
                     self.i += 1;
@@ -1147,6 +1181,9 @@ impl Lexer {
             _ => {}
         }
         let writes = c == '>' || self.s.get(self.i - 1) == Some(&'>');
+        if c == '<' {
+            self.feeds(false);
+        }
         if self.peek() == Some('&') {
             self.i += 1;
             // `>&2`, `<&-`: an fd, not a word.
@@ -4559,10 +4596,13 @@ impl ChatEngine {
     }
 
     /// Give the thread's Talk shell the workspace's port block (#1219), for
-    /// when it is next spawned.
-    fn set_shell_ports(&self, workspace_id: &str, thread_id: &str) {
+    /// when it is next spawned, and, in a mission that ships nothing, the
+    /// strict shell (`TalkShell::set_strict`) before its next command.
+    fn prepare_shell(&self, workspace_id: &str, thread_id: &str) {
         let ports = crate::workspace_ports::ensure(&self.db.lock(), workspace_id);
         self.talk_shell.set_spawn_env(thread_id, ports.map(|b| b.env()).unwrap_or_default());
+        let mission = self.db.lock().active_mission_for_workspace(workspace_id);
+        self.talk_shell.set_strict(thread_id, crate::permissions::mission_ships_nothing(&mission));
     }
 
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
@@ -4612,7 +4652,7 @@ impl ChatEngine {
         });
 
         let started = std::time::Instant::now();
-        self.set_shell_ports(&request.workspace_id, &request.thread_id);
+        self.prepare_shell(&request.workspace_id, &request.thread_id);
         let shell = Arc::clone(&self.talk_shell);
         let thread_id = request.thread_id.clone();
         let workspace_path = request.workspace_path.clone();
@@ -4908,19 +4948,14 @@ impl ChatEngine {
         // write_file is confined. A `readonly` mission (review/probe) is
         // read-only-by-construction → Some(vec![]) (temp-only, no workspace
         // writes); a `sandbox` mission → Some(vec![workspace]). Resolved once/turn.
-        let sandbox_roots: Option<Vec<String>> = self
-            .db
-            .lock()
-            .active_mission_for_workspace(&request.workspace_id)
-            .ok()
-            .flatten()
-            .and_then(|m| {
-                crate::orchestrator::sandbox::sandbox_write_roots(
-                    &m.git_isolation,
-                    &m.exec_isolation,
-                    &request.workspace_path,
-                )
-            });
+        let mission = self.db.lock().active_mission_for_workspace(&request.workspace_id);
+        // A mission that ships nothing (#1238) refuses pushes and remote
+        // changes in every mode. A mission that can't be read is treated as
+        // one: the posture never loosens on an error.
+        let ships_nothing = crate::permissions::mission_ships_nothing(&mission);
+        let sandbox_roots: Option<Vec<String>> = mission.ok().flatten().and_then(|m| {
+            crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, &request.workspace_path)
+        });
 
         // Register a fresh cancellation flag for this turn, keyed by thread,
         // or refuse: a turn already runs there. The guard removes it from the
@@ -5514,6 +5549,7 @@ impl ChatEngine {
                     mcp_read_only: &mcp_read_only,
                     delegate_writes: crate::chat_agents::delegate_writes(definition),
                     forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                    ships_nothing,
                 };
                 let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
                 match crate::permissions::decide(mode, &call, &ctx) {
@@ -5914,7 +5950,7 @@ impl ChatEngine {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
-                    self.set_shell_ports(&request.workspace_id, &request.thread_id);
+                    self.prepare_shell(&request.workspace_id, &request.thread_id);
                     let shell = Arc::clone(&self.talk_shell);
                     let tid = request.thread_id.clone();
                     let wp = request.workspace_path.clone();
@@ -5955,6 +5991,9 @@ impl ChatEngine {
                             }
                             (format_command_output(&r.output, r.exit_code), r.ok)
                         }
+                        // A strict shell that isn't proved clean runs nothing,
+                        // and no isolated shell runs it either (#1241).
+                        Ok(Err(AppError::Other(m))) if m.starts_with(crate::talk_shell::STRICT_SHELL_REFUSED) => (m, false),
                         // Shared shell unavailable (a live `$` process holds it, or
                         // a transient error). Run THIS command in an isolated shell
                         // so the agent isn't blocked — but say so explicitly, since
@@ -8369,7 +8408,7 @@ mod tests {
         assert!(offered.grant.as_ref().is_some_and(|g| g.kind == GrantKind::Write), "{offered:?}");
         broker.settle_card("t-old", ApprovalDecision::Grant, &offered);
         let read_only = std::collections::HashSet::new();
-        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false, ships_nothing: false };
         let decision = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: "write_file", input: &input }, &ctx);
         let grants = broker.grants("t-old", mode);
         let ask_first = matches!(decision, crate::permissions::Decision::Ask { .. }) && !reach.granted("write_file", &input, None, false, &grants);
@@ -8423,7 +8462,7 @@ mod tests {
             ] {
                 let input = serde_json::json!({ "path": path, "content": content });
                 let read_only = std::collections::HashSet::new();
-                let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+                let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false, ships_nothing: false };
                 let decision = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: "write_file", input: &input }, &ctx);
                 assert_eq!(matches!(decision, Decision::Ask { .. }), mode == Mode::Ask, "{mode:?}");
                 assert!(!w.reach.granted("write_file", &input, None, false, &w.grants), "{mode:?}: the grant isn't a yes for {path:?}");

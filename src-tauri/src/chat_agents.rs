@@ -1612,7 +1612,8 @@ pub fn mode_spec(db: &Mutex<Db>, spec: &SubagentSpec) -> SubagentSpec {
 /// call is decided in the thread's mode, read at the call, then what the
 /// mode allows goes to `inner` (its approval gate). `mission_roots`, the
 /// mission's own, say whether a read-only mission forces Plan only. Its
-/// read-only MCP tools are the ones their server marks so.
+/// read-only MCP tools are the ones their server marks so. A workspace whose
+/// mission ships nothing binds the sub-agent to that posture too.
 pub fn mode_gate(
     db: &Arc<Mutex<Db>>,
     spec: &SubagentSpec,
@@ -1620,10 +1621,12 @@ pub fn mode_gate(
     mcp_tools: &[crate::mcp::McpToolInfo],
     inner: Option<Box<dyn ToolGate>>,
 ) -> crate::permissions::ModeGate {
+    let mission = db.lock().active_mission_for_workspace(&spec.workspace_id);
     crate::permissions::ModeGate::new(
         crate::permissions::thread_mode_source(Arc::clone(db), spec.thread_id.clone(), spec.sandbox_roots.clone()),
         spec.sandbox_roots.clone(),
         crate::permissions::forced(mission_roots),
+        crate::permissions::mission_ships_nothing(&mission),
         mcp_tools.iter().filter(|t| t.read_only).map(|t| t.namespaced.clone()).collect(),
         inner,
     )
@@ -3275,7 +3278,7 @@ mod tests {
         let (none, sandboxed): (std::collections::HashSet<String>, &[String]) = (Default::default(), &[]);
         assert!(!delegate_writes(None) && delegate_writes(Some(&def("implementer", Some(vec!["edit_file"]), None))));
         assert!(!delegate_writes(Some(&def("explorer", Some(vec!["read_file", "grep"]), None))));
-        let ctx = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &none, delegate_writes: delegate_writes(None), forced: false };
+        let ctx = PolicyCtx { exec_roots: Some(sandboxed), mcp_read_only: &none, delegate_writes: delegate_writes(None), forced: false, ships_nothing: false };
         let untyped = serde_json::json!({"prompt": "look around"});
         assert_eq!(decide(Mode::Plan, &ToolCall { name: "Agent", input: &untyped }, &ctx), Decision::Allow);
 
