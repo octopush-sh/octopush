@@ -294,12 +294,14 @@ jobs:
           OCTO_CHECK_PROFILE=web OCTOPUSH_CHECKOUT="$gate" bash scripts/routines/agent-sandbox-setup.sh
           node_dir="$(dirname "$(readlink -f "$(command -v node)")")"
           [ "$node_dir" = /opt/octo-node/bin ] || { echo "::error::node is not the frozen one ($node_dir)"; exit 1; }
+          # octo-sandbox-exec: as octo-sandbox, inside the sandbox's cgroup (which
+          # `end` kills at once), with no way to gain privileges.
           # An empty environment: no token; the app at the promoted tag (git
           # refuses a repository another user owns unless it is a
           # safe.directory); the gate as strict as a local run.
           sandbox() {
             local secs="$1"; shift
-            timeout --kill-after=15 "$secs" sudo -n -u octo-sandbox /usr/bin/env -i \
+            timeout --kill-after=15 "$secs" sudo -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i \
               PATH="$node_dir:/usr/local/bin:/usr/bin:/bin" HOME=/tmp/octo-sandbox-home \
               CI=true LANG=C.UTF-8 ASTRO_TELEMETRY_DISABLED=1 NPM_CONFIG_UPDATE_NOTIFIER=false \
               OCTOPUSH_APP_DIR="$app" OCTOPUSH_STABLE_VERSION="$VERSION" OCTOPUSH_STRICT_RELEASE=1 \
@@ -354,12 +356,16 @@ jobs:
           # A gate step that failed before it finished reported nothing.
           if [ "$GATE_STEP" != success ]; then CREW_RC=""; GATE_RC=""; fi
           if [ "$CREW_RC" = 0 ]; then
-            # Only the regenerated JSON comes out of the (dead) sandbox: a regular
-            # file at exactly that path, no link on the way, under 2 MB, a JSON object.
-            src="$(realpath -e "$gate/$crew_json" 2>/dev/null || true)"
-            if [ "$src" = "$gate/$crew_json" ] && [ -f "$src" ] && [ "$(stat -c %s "$src")" -lt 2000000 ] \
-              && jq -e 'type == "object"' "$src" >/dev/null 2>&1; then
-              cp "$src" "$web/$crew_json"
+            # Only the regenerated JSON comes out of the (ended) sandbox: no link
+            # anywhere on its path, a regular file under 2 MB, read without
+            # following a link (dd iflag=nofollow) into the runner's clone, and a
+            # JSON object there.
+            f="$gate/$crew_json" ok=1
+            for p in "$gate" "$gate/src" "$gate/src/data"; do [ -d "$p" ] && [ ! -L "$p" ] || ok=""; done
+            if [ -n "$ok" ] && [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %s "$f")" -lt 2000000 ] \
+              && dd if="$f" of="$web/$crew_json" iflag=nofollow,nonblock status=none 2>/dev/null \
+              && jq -e 'type == "object"' "$web/$crew_json" >/dev/null 2>&1; then
+              :
             else
               echo "::error::the regenerated $crew_json is not a plain JSON file at its path — not taking it"; exit 1
             fi

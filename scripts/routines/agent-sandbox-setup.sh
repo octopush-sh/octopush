@@ -1,7 +1,9 @@
 #!/bin/bash
 # Prepare a GitHub Actions runner for a builder agent (run once per job, as the
 # runner user, before the agent starts). See agent-check.sh.
-#   - creates the unprivileged `octo-sandbox` user (no shared group);
+#   - creates the unprivileged `octo-sandbox` user (no shared group), and the
+#     cgroup every one of its processes runs in (octo-sandbox-exec), so that
+#     frozen-node.sh end can kill them all at once;
 #   - opens ONLY the checkout to it (it runs the type checker and tests there);
 #   - leaves the directories above the checkout traversable but not listable,
 #     and locks the runner's temp dir (step scripts, env files) to the runner.
@@ -19,6 +21,20 @@ PROFILE="${OCTO_CHECK_PROFILE:-app}"
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] || { echo "agent-sandbox-setup: GitHub Actions only" >&2; exit 64; }
 
 id -u "$SANDBOX_USER" >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$SANDBOX_USER"
+
+# The sandbox's cgroup (cgroup v2, root-owned: nothing in it can leave), and the
+# one way to run code as the sandbox user, inside it. Without either, refuse:
+# a sandbox that can't be ended at once is not one.
+CG=/sys/fs/cgroup/octo-sandbox
+[[ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" == cgroup2fs ]] \
+  || { echo "::error::agent-sandbox-setup: /sys/fs/cgroup is not cgroup v2; refusing to run code as $SANDBOX_USER without a cgroup to end it in" >&2; exit 1; }
+[[ -x /usr/bin/setpriv ]] || { echo "::error::agent-sandbox-setup: no /usr/bin/setpriv" >&2; exit 1; }
+sudo mkdir -p "$CG"
+sudo chown root:root "$CG"
+sudo chmod 755 "$CG"
+[[ -e "$CG/cgroup.kill" && -e "$CG/cgroup.events" ]] \
+  || { echo "::error::agent-sandbox-setup: $CG has no cgroup.kill (Linux 5.14 or later needed); refusing to run code as $SANDBOX_USER" >&2; exit 1; }
+sudo install -o root -g root -m 755 "$HERE/sandbox-exec.sh" /usr/local/sbin/octo-sandbox-exec
 sudo install -d -o "$SANDBOX_USER" -m 700 "/tmp/$SANDBOX_USER-home"
 
 # The checkout: read/write for others (the sandbox), so tests can write caches.
@@ -51,7 +67,9 @@ if [[ "${OCTO_SANDBOX_NETWORK:-open}" == none ]]; then
   for sock in /run/systemd/resolve/io.systemd.Resolve /run/systemd/resolve/io.systemd.Resolve.Monitor /run/dbus/system_bus_socket /var/run/nscd/socket; do
     if [[ -e "$sock" ]]; then sudo setfacl -m "u:$SANDBOX_USER:---" "$sock"; fi
   done
-  as_sandbox() { sudo -n -u "$SANDBOX_USER" /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/timeout 8 "$@" >/dev/null 2>&1; }
+  as_sandbox() { sudo -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/timeout 8 "$@" >/dev/null 2>&1; }
+  # The proof below is that commands fail: first, that one can succeed at all.
+  as_sandbox /usr/bin/true || { echo "::error::nothing runs as $SANDBOX_USER, so its lack of network would prove nothing" >&2; exit 1; }
   open=""
   if as_sandbox /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'; then open="$open tcp"; fi
   if as_sandbox /bin/bash -c 'exec 3<>/dev/tcp/2606:4700:4700::1111/443'; then open="$open tcp6"; fi

@@ -130,7 +130,8 @@ jobs:
         run: |
           job_path="$PATH"
           PATH=/usr/sbin:/usr/bin:/sbin:/bin
-          sudo pkill -KILL -u octo-sandbox || true
+          # The whole sandbox cgroup at once (the audit runs in it next).
+          sudo -n /usr/local/sbin/octo-sandbox-exec --kill
           sudo find "$GITHUB_WORKSPACE/site" -type l -user octo-sandbox -delete || true
           chmod -R o-w "$GITHUB_WORKSPACE/site" || true
           sleep 1
@@ -148,7 +149,7 @@ jobs:
         run: |
           set +e
           node_dir="$(dirname "$(readlink -f "$(command -v node)")")"
-          timeout --kill-after=30 1800 sudo -n -u octo-sandbox /usr/bin/env -i \
+          timeout --kill-after=30 1800 sudo -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i \
             PATH="$node_dir:/usr/bin:/bin" HOME=/tmp/octo-sandbox-home LANG=C.UTF-8 \
             NODE_PATH=/opt/pw/node_modules PLAYWRIGHT_BROWSERS_PATH=/opt/pw/browsers \
             "$node_dir/node" /opt/pw/scripts/web-audit/audit.mjs --site "$GITHUB_WORKSPACE/site" --out /tmp/octo-sandbox-home/out
@@ -176,21 +177,25 @@ jobs:
 
       - name: Take the results out of the sandbox (regular files only, size-capped)
         if: always() && steps.audit.outputs.rc != ''
-        # Nothing of the sandbox runs any more, so nothing can swap a file for a
-        # link between the check and the copy. find -P never follows links,
-        # starting point included; only findings.json and shots/*.png, by name.
+        # Nothing of the sandbox runs any more (the step above ended its cgroup),
+        # and nothing here follows a link: not on the way (the home, out, shots),
+        # not in find -P, not when reading (dd iflag=nofollow, as root). Only
+        # findings.json and shots/*.png, by name.
         run: |
           set -euo pipefail
-          src=/tmp/octo-sandbox-home/out dst="$RUNNER_TEMP/web-audit"
+          home=/tmp/octo-sandbox-home src=/tmp/octo-sandbox-home/out dst="$RUNNER_TEMP/web-audit"
           mkdir -p "$dst/shots"
-          if ! sudo test -d "$src" || sudo test -L "$src"; then echo "::warning::the audit left no output directory"; exit 0; fi
+          for d in "$home" "$src"; do
+            if ! sudo test -d "$d" || sudo test -L "$d"; then echo "::warning::the audit left no output directory"; exit 0; fi
+          done
+          if sudo test -L "$src/shots"; then echo "::error::the audit's shots directory is a link"; exit 1; fi
           sudo find -P "$src" -maxdepth 2 -type f -size -20M -print0 | while IFS= read -r -d '' f; do
             rel="${f#"$src"/}"
             [[ "$rel" =~ ^(findings\.json|shots/[A-Za-z0-9._-]+\.png)$ ]] || continue
             # The repo is private but this repo's artifacts are public: no
             # screenshots of the legal pages (they are the owner's to publish).
             [[ "$rel" =~ ^shots/(privacy|terms|refunds)-- ]] && continue
-            sudo cat -- "$f" > "$dst/$rel"
+            sudo dd if="$f" iflag=nofollow,nonblock status=none > "$dst/$rel"
           done
           [ -f "$dst/findings.json" ] || echo "::warning::the audit left no findings.json"
 

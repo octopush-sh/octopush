@@ -1040,10 +1040,13 @@ test("workflows: website code runs only as octo-sandbox, and the App key only ou
   assert.match(job, /Revoke the read token and prove it dead\n\s*if: always\(\)/);
   assert.match(job, /pgrep -u octo-sandbox/);
   // The audit itself (the site's JavaScript runs in Chromium) runs as octo-sandbox too, from root-owned /opt/pw.
-  assert.match(job, /timeout --kill-after=\d+ \d+ sudo -n -u octo-sandbox \/usr\/bin\/env -i \\\n[^\n]*\n[^\n]*\n\s*"\$node_dir\/node" \/opt\/pw\/scripts\/web-audit\/audit\.mjs/);
+  assert.match(job, /timeout --kill-after=\d+ \d+ sudo -n \/usr\/local\/sbin\/octo-sandbox-exec \/usr\/bin\/env -i \\\n[^\n]*\n[^\n]*\n\s*"\$node_dir\/node" \/opt\/pw\/scripts\/web-audit\/audit\.mjs/, "as octo-sandbox, inside its cgroup");
   assert.equal((job.match(/web-audit\/audit\.mjs/g) ?? []).length, 1, "audit.mjs runs only that once, as the sandbox");
   assert.match(job, /sudo chown -R root:root \/opt\/pw/);
   assert.match(job, /find -P "\$src" -maxdepth 2 -type f -size -20M/, "only regular, size-capped files leave the sandbox");
+  assert.match(job, /sudo dd if="\$f" iflag=nofollow,nonblock status=none > "\$dst\/\$rel"/, "read as root without following a link");
+  assert.doesNotMatch(job, /sudo cat\b/);
+  assert.match(job, /if sudo test -L "\$src\/shots"; then /);
   assert.equal((job.match(/pgrep -u octo-sandbox/g) ?? []).length, 2, "a survivor check after the build and after the audit");
   keyOutside(job, job.indexOf("agent-sandbox-setup.sh"), job.lastIndexOf("pgrep -u octo-sandbox"));
   assert.ok(job.indexOf("Trusted copy of the scripts") < job.indexOf("Check out octopush-web"), "trusted scripts are copied before the site arrives");
@@ -1112,7 +1115,7 @@ test("workflows: promote's website PR — web-gate runs the website's code after
   assert.doesNotMatch(gate, /TOKEN|secrets\.|github\.token/, "no token in the sandbox step");
   assert.match(gate, /rm -rf "\$gate\/\.git"/);
   assert.match(gate, /\[ "\$node_dir" = \/opt\/octo-node\/bin \]/, "the sandbox runs the frozen Node");
-  assert.match(gate, /timeout --kill-after=15 "\$secs" sudo -n -u octo-sandbox \/usr\/bin\/env -i \\\n/);
+  assert.match(gate, /timeout --kill-after=15 "\$secs" sudo -n \/usr\/local\/sbin\/octo-sandbox-exec \/usr\/bin\/env -i \\\n/, "as octo-sandbox, inside its cgroup");
   assert.match(gate, /OCTOPUSH_APP_DIR="\$app" OCTOPUSH_STABLE_VERSION="\$VERSION" OCTOPUSH_STRICT_RELEASE=1/);
   assert.match(gate, /GIT_CONFIG_KEY_0=safe\.directory GIT_CONFIG_VALUE_0="\$app"/);
   // Their output stays on the runner: the public log gets the gate's check lines and count only.
@@ -1141,7 +1144,10 @@ test("workflows: promote's website PR — web-gate runs the website's code after
   assert.equal((patch.match(/gate\.log/g) ?? []).length, 1, "the gate's log is read once, through the check-name filter");
   const result = patch.slice(patch.indexOf("          {\n"), patch.indexOf('} > "$out/result.txt"'));
   assert.deepEqual(result.split("\n").map((l) => l.trim()).filter((l) => /^echo /.test(l)), ['echo "base=$(git -C "$web" rev-parse HEAD)"', 'echo "crew=$(word "$CREW_RC")"', 'echo "gate=$(word "$GATE_RC")"'], "the result: base, crew, gate, and failed= lines");
-  assert.match(patch, /src="\$\(realpath -e "\$gate\/\$crew_json" 2>\/dev\/null \|\| true\)"\n\s+if \[ "\$src" = "\$gate\/\$crew_json" \] && \[ -f "\$src" \] && \[ "\$\(stat -c %s "\$src"\)" -lt 2000000 \]/);
+  // The crew JSON leaves the (ended) sandbox with no link on its path, read without following one.
+  assert.match(patch, /for p in "\$gate" "\$gate\/src" "\$gate\/src\/data"; do \[ -d "\$p" \] && \[ ! -L "\$p" \] \|\| ok=""; done\n/);
+  assert.match(patch, /if \[ -n "\$ok" \] && \[ -f "\$f" \] && \[ ! -L "\$f" \] && \[ "\$\(stat -c %s "\$f"\)" -lt 2000000 \] \\\n\s+&& dd if="\$f" of="\$web\/\$crew_json" iflag=nofollow,nonblock status=none/);
+  assert.doesNotMatch(patch, /\bcp\b|realpath -e/, "no copy that follows a link");
   assert.doesNotMatch(patch.replace(/\/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" guard [^\n]*/, ""), /\bnode\b|npm|scripts\//, "nothing but git and coreutils after the sandbox (and the runner-only guard)");
   assert.match(a, /retention-days: 1\n/);
   // web-version: a fresh runner, no checkout, no node, no code of either repo; the token only after the check.
@@ -2249,7 +2255,7 @@ test("octo-check epiku: Epiku's own gates, no network, no store, and no argument
   for (const a of [["tests/estado.test.ts"], ["tests"], ["tests/estado.test.ts", "tests"], []]) {
     const r = oc("test", ...a);
     assert.doesNotMatch(r.stderr, refused, JSON.stringify(a));
-    assert.ok(r.stdout.includes(["RAN -n -u octo-sandbox /usr/bin/env -i"].join("")) && r.stdout.trimEnd().endsWith(["npx vitest run", ...a].join(" ")), "existing paths go through, as the sandbox user, with an empty environment");
+    assert.ok(r.stdout.includes(["RAN -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i"].join("")) && r.stdout.trimEnd().endsWith(["npx vitest run", ...a].join(" ")), "existing paths go through, as the sandbox user inside its cgroup, with an empty environment");
   }
   assert.match(src, /all\) cmd=\(bash -c 'npm run --silent typecheck && npx vitest run && npm run --silent test:py && npm run --silent check:agents'\)/);
   assert.match(src, /\/usr\/bin\/env -i \\\n/, "the checks' environment is built from nothing");

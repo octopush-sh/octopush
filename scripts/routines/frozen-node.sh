@@ -18,11 +18,13 @@
 #                            of its own, or if the step's environment carries a
 #                            variable that makes bash, node, git or the loader
 #                            run other code
-#   frozen-node.sh end [checkout…]  the sandbox is over: kill every process of the
-#                            sandbox user at once (kill -1 as that user, until
-#                            none is left; exit 1 if one survives), remove its
-#                            crontab and lock the account, so nothing can start
-#                            as it again. Then, for each checkout it could write
+#   frozen-node.sh end [checkout…]  the sandbox is over: kill every process in the
+#                            sandbox's cgroup at once (cgroup.kill: forks in
+#                            flight included, never gated on a look at the
+#                            process table), then exit 1 unless the cgroup is
+#                            empty and no process of the sandbox user runs
+#                            anywhere; remove its crontab and lock the account,
+#                            so nothing can start as it again. Then, for each checkout it could write
 #                            (whose own .git was moved out before the sandbox):
 #                            close its top directory to other users, remove any
 #                            .git there (actions/checkout's post step would run
@@ -74,24 +76,28 @@ if [[ "$1" == guard || "$1" == end ]] && ! id -u "$SANDBOX_USER" >/dev/null 2>&1
   exit 0
 fi
 
-# Every process of the sandbox user, killed at once: kill(-1) as that user
-# reaches all of them in one pass, so one that keeps forking can't outrun it
-# (pkill walks /proc and can). Its crontab goes, and the account is locked and
-# expired, so nothing starts as it again; repeated until none is left.
-# (A zombie runs nothing: only processes that can still run count.)
+# The sandbox's cgroup (agent-sandbox-setup.sh): every process octo-sandbox-exec
+# starts is in it and can't leave it, so cgroup.kill ends them all at once.
+CG=/sys/fs/cgroup/octo-sandbox
+# A process of the sandbox user that can still run (a zombie runs nothing).
 alive() { ps -u "$SANDBOX_USER" -o stat= 2>/dev/null | grep -qv '^Z'; }
 end_sandbox() {
-  local uid gid
-  uid="$(id -u "$SANDBOX_USER")" gid="$(id -g "$SANDBOX_USER")"
-  sudo crontab -r -u "$SANDBOX_USER" >/dev/null 2>&1 || true
-  sudo usermod --lock --expiredate 1 --shell /usr/sbin/nologin "$SANDBOX_USER" >/dev/null 2>&1 || die "could not lock $SANDBOX_USER"
+  [[ -e "$CG/cgroup.kill" && -e "$CG/cgroup.events" ]] || die "no sandbox cgroup at $CG: $SANDBOX_USER can't be ended at once (agent-sandbox-setup.sh makes it)"
+  # First, always: the whole cgroup, then until it reports itself empty.
+  local empty=""
   for _ in $(seq 1 50); do
-    alive || return 0
-    # bash's own kill: kill(-1) spares only its caller.
-    sudo setpriv --reuid="$uid" --regid="$gid" --clear-groups /usr/bin/bash -c 'kill -KILL -1' >/dev/null 2>&1 || true
+    echo 1 | sudo tee "$CG/cgroup.kill" >/dev/null
+    if grep -qx 'populated 0' "$CG/cgroup.events"; then empty=1; break; fi
     sleep 0.1
   done
-  ! alive || die "$SANDBOX_USER processes survived"
+  [[ -n "$empty" ]] || die "the sandbox's cgroup is still populated after cgroup.kill"
+  sudo crontab -r -u "$SANDBOX_USER" >/dev/null 2>&1 || true
+  sudo usermod --lock --expiredate 1 --shell /usr/sbin/nologin "$SANDBOX_USER" >/dev/null 2>&1 || die "could not lock $SANDBOX_USER"
+  # Nothing of the user's may run outside the cgroup: kill it too, and fail.
+  if alive; then
+    sudo setpriv --reuid="$(id -u "$SANDBOX_USER")" --regid="$(id -g "$SANDBOX_USER")" --clear-groups /usr/bin/bash -c 'kill -KILL -1' >/dev/null 2>&1 || true
+    die "a process of $SANDBOX_USER ran outside the sandbox's cgroup"
+  fi
 }
 
 if [[ "$1" == end ]]; then
