@@ -688,23 +688,87 @@ pub(crate) fn codex_home_dir(base: &Path, scope: &str, write_roots: &[String], t
     mission_cache_root(base, scope, write_roots, tenant)
 }
 
-/// `s` as an SBPL regex that matches it case-insensitively, the way a
-/// case-insensitive APFS volume compares names: each ASCII letter as every
-/// single character that folds to it (`name_fold::letter_forms`: both
-/// cases, and for `k` and `s` the Kelvin sign and the long s), a class when
-/// that's just the two cases. Anything else is escaped. Pure.
+/// `s` as an SBPL regex that matches every name the way a case-insensitive
+/// APFS volume compares names (`name_fold::fold`, #1270): each spelling is
+/// a run of the characters `name_fold::forms_at` gives, so a letter is also
+/// its other case, `k` and `s` the Kelvin sign and the long s, and `ff`,
+/// `fi`, `fl`, `ffi`, `ffl`, `st` and `ss` their ligatures. What still isn't
+/// ASCII once folded (a mark, a letter of another script) can't be spelled
+/// out: it, the ASCII letters on either side of it (a composed character or
+/// a ligature can take them in) and the character before it (a mark's
+/// base) match any run of characters but `/`, so the regex denies the whole
+/// family of names. Pure.
 fn ci_regex(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if !c.is_ascii_alphabetic() {
-                return regex_escape(&c.to_string());
-            }
-            match crate::name_fold::letter_forms(c).as_slice() {
-                [lower, upper] => format!("[{lower}{upper}]"),
-                forms => format!("({})", forms.iter().map(char::to_string).collect::<Vec<_>>().join("|")),
-            }
-        })
-        .collect()
+    let folded: Vec<char> = crate::name_fold::fold(s).chars().collect();
+    let mut family = vec![false; folded.len()];
+    for i in (0..folded.len()).filter(|&i| !folded[i].is_ascii()) {
+        family[i] = true;
+        let mut j = i;
+        while j > 0 && folded[j - 1].is_ascii_alphabetic() {
+            j -= 1;
+            family[j] = true;
+        }
+        if j == i && j > 0 && folded[j - 1] != '/' {
+            family[j - 1] = true;
+        }
+        let mut k = i + 1;
+        while k < folded.len() && folded[k].is_ascii_alphabetic() {
+            family[k] = true;
+            k += 1;
+        }
+    }
+    let mut out = String::new();
+    let mut start = 0;
+    while start < folded.len() {
+        let end = (start..folded.len()).find(|&i| family[i] != family[start]).unwrap_or(folded.len());
+        if family[start] {
+            out.push_str("[^/]+");
+        } else {
+            out.push_str(&ascii_ci_regex(&folded[start..end].iter().collect::<String>()));
+        }
+        start = end;
+    }
+    out
+}
+
+/// [`ci_regex`] of the ASCII `s`: cut into the shortest stretches no
+/// ligature crosses, each written as the alternation of its spellings.
+fn ascii_ci_regex(s: &str) -> String {
+    let folded = crate::name_fold::fold(s);
+    let longest = |i: usize| crate::name_fold::forms_at(&folded[i..]).iter().map(|(n, _)| *n).max().unwrap_or(1);
+    let mut out = String::new();
+    let mut start = 0;
+    while start < folded.len() {
+        let (mut i, mut end) = (start, start + 1);
+        while i < end {
+            end = end.max(i + longest(i));
+            i += 1;
+        }
+        match spellings(&folded[start..end]).as_slice() {
+            [one] => out.push_str(one),
+            many => out.push_str(&format!("({})", many.join("|"))),
+        }
+        start = end;
+    }
+    out
+}
+
+/// Every spelling of the folded ASCII `stretch` as regexes, one per way to
+/// cut it into the characters `name_fold::forms_at` gives.
+fn spellings(stretch: &str) -> Vec<String> {
+    if stretch.is_empty() {
+        return vec![String::new()];
+    }
+    let mut v = Vec::new();
+    for (n, forms) in crate::name_fold::forms_at(stretch) {
+        let head = match forms.as_slice() {
+            [one] => regex_escape(&one.to_string()),
+            _ if forms.iter().all(char::is_ascii_alphabetic) => format!("[{}]", forms.iter().collect::<String>()),
+            _ => format!("({})", forms.iter().map(|c| regex_escape(&c.to_string())).collect::<Vec<_>>().join("|")),
+        };
+        v.extend(spellings(&stretch[n..]).into_iter().map(|tail| format!("{head}{tail}")));
+    }
+    v
 }
 
 /// The deny regexes for the Codex home `base` (as given): every file of
@@ -743,11 +807,12 @@ fn codex_home_rules(home: &str, user_homes: &[String]) -> WriteRules {
     rules
 }
 
-/// Whether `name` (one entry of a stage's Codex home, lower-cased) is one the
-/// profile denies, other than Octopush's own copies: those go before each
-/// launch (`purge_denied_entries`). Pure.
+/// Whether `name` (one entry of a stage's Codex home, read through
+/// `name_fold::fold` as the volume compares it) is one the profile denies,
+/// other than Octopush's own copies: those go before each launch
+/// (`purge_denied_entries`). Pure.
 fn is_denied_top_level(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
+    let n = crate::name_fold::fold(name);
     if n == CODEX_CONFIG_FILE || n == CODEX_AUTH_FILE {
         return false;
     }
@@ -4439,6 +4504,11 @@ mod tests {
             assert!(codex_denies(&rules, &format!("{b}/\u{17F}kills/x/SKILL.md")));
             assert!(codex_denies(&rules, &format!("{b}/s\u{212A}ills/x/SKILL.md")));
             assert!(codex_denies(&rules, &format!("{b}/.tmp/plugin\u{17F}/p")));
+            // So do the ligatures (#1270).
+            assert!(codex_denies(&rules, &format!("{b}/in\u{FB05}ructions.md")));
+            assert!(codex_denies(&rules, &format!("{b}/cloud-con\u{FB01}g-bundle-cache.json")));
+            assert!(codex_denies(&rules, &format!("{b}/managed-con\u{FB01}g-acme.json")));
+            assert!(codex_denies(&rules, &format!("{b}/memories_exten\u{17F}ions/m.md")));
         }
         // `.tmp` is pinned in the stage's own home, not its contents.
         assert!(codex_denies(&rules, "/c/h/.tmp") && codex_denies(&rules, "/c/h/.TMP"));
@@ -4467,6 +4537,84 @@ mod tests {
         for kept in ["config.toml", "CONFIG.toml", "auth.json", "sessions", "log", ".tmp", "tmp", "state_5.sqlite", "history.jsonl", "version.json", "installation_id"] {
             assert!(!is_denied_top_level(kept), "{kept}");
         }
+        // Read the way the volume compares names (#1270).
+        for denied in ["in\u{FB06}ructions.md", "managed-con\u{FB01}g-acme.json", "x.TOM\u{212A}.toml", "\u{17F}kills", "Secret\u{17F}"] {
+            assert!(is_denied_top_level(denied), "{denied}");
+        }
+        assert!(!is_denied_top_level("con\u{FB01}g.toml"), "Octopush's own copy, as the volume sees it");
+    }
+
+    /// Whether the anchored `ci_regex` of `name` matches `path`.
+    fn ci_matches(name: &str, path: &str) -> bool {
+        regex::Regex::new(&format!("^{}$", ci_regex(name))).unwrap().is_match(path)
+    }
+
+    /// The characters outside ASCII that fold to ASCII on the volume.
+    const FOLDING_TO_ASCII: [char; 11] = [
+        '\u{DF}', '\u{17F}', '\u{1E9E}', '\u{212A}', '\u{FB00}', '\u{FB01}', '\u{FB02}', '\u{FB03}', '\u{FB04}',
+        '\u{FB05}', '\u{FB06}',
+    ];
+
+    #[test]
+    fn ci_regex_matches_every_ligature_of_the_latin_block() {
+        for c in '\u{FB00}'..='\u{FB06}' {
+            let letters = crate::name_fold::fold(&c.to_string());
+            let name = format!("x{letters}y.json");
+            for spelling in [name.clone(), name.to_ascii_uppercase(), format!("x{c}y.json"), format!("X{c}Y.JSON")] {
+                assert!(ci_matches(&name, &spelling), "U+{:04X}: {spelling}", c as u32);
+            }
+            assert!(!ci_matches(&name, &format!("x{c}{c}y.json")), "U+{:04X}", c as u32);
+            assert!(!ci_matches(&name, "xy.json"), "U+{:04X}", c as u32);
+        }
+        // Ligatures that overlap, and the sharp s.
+        let words: [(&str, &[&str]); 3] = [
+            ("offline", &["o\u{FB00}line", "of\u{FB02}ine", "o\u{FB04}ine", "OFFLINE"]),
+            ("official", &["o\u{FB03}cial", "of\u{FB01}cial", "o\u{FB00}icial"]),
+            ("mistress", &["mi\u{FB05}re\u{DF}", "MI\u{FB06}RE\u{1E9E}", "mi\u{17F}tre\u{17F}\u{17F}"]),
+        ];
+        for (name, spellings) in words {
+            for s in spellings {
+                assert!(ci_matches(name, s), "{name}: {s}");
+            }
+        }
+        assert!(!ci_matches("offline", "o\u{FB00}\u{FB02}ine"));
+        assert_eq!(ci_regex("st"), "((S|s|\u{17F})[Tt]|(\u{FB05}|\u{FB06}))");
+        assert_eq!(ci_regex(".env"), "\\.[Ee][Nn][Vv]");
+    }
+
+    #[test]
+    fn ci_regex_denies_every_ligature_spelling_of_a_protected_name() {
+        for name in CODEX_HOME_DENIED_FILES.iter().chain(CODEX_HOME_DENIED_DIRS) {
+            let folded = crate::name_fold::fold(name);
+            for c in FOLDING_TO_ASCII {
+                let letters = crate::name_fold::fold(&c.to_string());
+                for (i, _) in folded.match_indices(letters.as_str()) {
+                    let spelling = format!("{}{c}{}", &name[..i], &name[i + letters.len()..]);
+                    assert!(ci_matches(name, &spelling), "{name}: {spelling}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ci_regex_matches_what_name_fold_matches() {
+        assert!(ci_matches(".mcp.json", ".mcp.j\u{17F}on"));
+        assert!(ci_matches("tasks.json", "tas\u{212A}s.json"));
+        assert!(ci_matches("workflows", "work\u{FB02}ows"));
+        assert!(ci_matches("claude.md", "CLAUDE.MD"));
+        assert!(ci_matches("STRASSE", "Stra\u{DF}e"));
+        // A name written with a ligature matches its plain spelling too.
+        assert!(ci_matches("work\u{FB02}ows", "WORKFLOWS"));
+        // What can't be spelled out denies the whole family: every spelling
+        // of the name, and never across a `/`.
+        for s in ["Caf\u{E9}.md", "Cafe\u{301}.md", "CAF\u{C9}.MD", "cafe\u{301}.md"] {
+            assert!(ci_matches("Caf\u{E9}.md", s), "{s}");
+            assert!(ci_matches("Cafe\u{301}.md", s), "{s}");
+        }
+        assert!(!ci_matches("Caf\u{E9}.md", "x/Caf\u{E9}.md"));
+        assert!(!ci_matches("Caf\u{E9}.md", "Caf\u{E9}.txt"));
+        assert!(ci_matches("\u{C5}ngstr\u{F6}m", "A\u{30A}ngstro\u{308}m"));
+        assert!(ci_matches("\u{C5}ngstr\u{F6}m", "\u{C5}NGSTR\u{D6}M"));
     }
 
     #[test]
@@ -4857,8 +5005,10 @@ mod tests {
                 format!("echo x > '{u}/anything-new'"),
             ];
             // Everything Codex reads back, as written and in other cases (the
-            // volume is case-insensitive), plus the Kelvin sign and long s.
+            // volume is case-insensitive), plus the Kelvin sign and long s, and
+            // ligatures (#1270).
             let plants = [
+                "in\u{FB06}ructions.md", "cloud-con\u{FB01}g-bundle-cache.json", "managed-con\u{FB01}g-acme.json",
                 "AGENTS.md", "AGENTS.MD", "agents.md", "AGENTS.override.md", "instructions.md", ".env", ".ENV",
                 "hooks.json", "Hooks.json", "models_cache.json", "MODELS_CACHE.JSON", "cloud-config-bundle-cache.json",
                 "managed-config-acme.json", "Managed-Config-acme.JSON", "managed_config.toml", "requirements.toml",
