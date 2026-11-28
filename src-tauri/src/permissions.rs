@@ -2013,16 +2013,72 @@ const GIT_VALUED_SHIP: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--na
 /// the repository to other machines (`daemon`, `instaweb`, `http-push`);
 /// and git running a command of its own (`rebase --exec`, `submodule
 /// foreach`, `bisect run`, `filter-branch`), where git's own folder comes
-/// first on PATH, ahead of the shims. Then only git's own commands run
-/// ([`GIT_COMMANDS`]): anything else is an alias, which could stand for
-/// `push`, or a program outside git.
+/// first on PATH, ahead of the shims; a tool the config names (`difftool`,
+/// `mergetool`); `upload-pack` run directly (its pack-objects hook); a
+/// background job outside the workspace (`maintenance start`/`register`);
+/// and another program in place of git's own on the other side
+/// (`--upload-pack`, `--receive-pack`, `archive --exec`, `clone -u`). Every
+/// setting given for the command (`-c`, `--config-env`, `clone -c`/
+/// `--config`) must be a display or identity one ([`git_setting_allowed`]):
+/// any other can run a program (`diff.external`, `core.fsmonitor`,
+/// `core.hooksPath`…), which finds git's own folder, with the real git,
+/// first on its PATH. Then only git's own commands run ([`GIT_COMMANDS`]):
+/// anything else is an alias, which could stand for `push`, or a program
+/// outside git.
 fn git_ships(args: &[&str]) -> Option<&'static str> {
     const RUNS: &str = "git running a command of its own (rebase --exec, submodule foreach, bisect run, filter-branch)";
+    const SETTING: &str = "a git setting other than a display or identity one, which can run a program";
     let ops = operands(args, GIT_VALUED_SHIP);
     let op = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
     let after = |sub: &str| args.iter().position(|a| a.eq_ignore_ascii_case(sub)).map_or(&[][..], |at| &args[at + 1..]);
+    if !git_global_settings(args).iter().all(|(setting, from_env)| git_setting_allowed(setting, *from_env)) {
+        return Some(SETTING);
+    }
+    let other_side = |a: &&str| ["--upload-pack", "--receive-pack"].iter().any(|f| a.starts_with(f));
+    if args.iter().any(other_side) {
+        return Some("another program in place of git's own on the other side (--upload-pack, --receive-pack)");
+    }
+    if args.iter().any(|a| a.starts_with("--exec-path=")) {
+        return Some("another folder for git's own programs (--exec-path)");
+    }
+    // `--ext-diff` and the abbreviations git may take for it.
+    if args.iter().any(|a| a.len() >= "--ext-".len() && "--ext-diff".starts_with(a)) {
+        return Some("an external diff program (--ext-diff)");
+    }
+    // A help page opens the viewer the config names (`man.<tool>.cmd`,
+    // `browser.<tool>.cmd`); `-h` prints a command's usage instead.
+    const HELP: &str = "git's help viewer, which the config can name (-h prints a command's usage)";
+    const HELP_LISTS: &[&str] = &[
+        "-a", "--all", "-g", "--guides", "-c", "--config", "--user-interfaces", "--developer-interfaces",
+        "--config-for-completion", "--config-sections-for-completion",
+    ];
+    if args.contains(&"--help") && !ops.is_empty() {
+        return Some(HELP);
+    }
+    let template = |sub: &str| after(sub).iter().any(|a| a.starts_with("--template"));
     let refused = match (op(0).as_deref(), op(1).as_deref()) {
         (None, _) => return None,
+        (Some("help"), Some(_)) if !after("help").iter().any(|a| HELP_LISTS.contains(a)) => Some(HELP),
+        (Some("gui" | "citool" | "web--browse"), _) => Some("a git tool that runs programs the config names (gui, citool, web--browse)"),
+        (Some("init"), _) if template("init") => Some("a template folder, whose config and hooks a new repository takes (--template)"),
+        (Some("clone"), _) => {
+            let rest = after("clone");
+            let uploads = rest.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('u'));
+            let settings = clone_settings(rest);
+            if uploads {
+                Some("another program in place of git's own on the other side (clone -u)")
+            } else if template("clone") {
+                Some("a template folder, whose config and hooks a new repository takes (--template)")
+            } else {
+                (!settings.iter().all(|s| git_setting_allowed(s, false))).then_some(SETTING)
+            }
+        }
+        (Some("archive"), _) if after("archive").iter().any(|a| a.starts_with("--exec")) => {
+            Some("another program in place of git's own on the other side (archive --exec)")
+        }
+        (Some("difftool" | "mergetool"), _) => Some("git running a tool the config names (difftool, mergetool)"),
+        (Some("upload-pack" | "upload-archive" | "upload-archive--writer"), _) => Some("git's upload-pack run directly"),
+        (Some("maintenance"), Some("start" | "register")) => Some("a background job outside the workspace (git maintenance start)"),
         (Some("request-pull"), _) => Some("git request-pull"),
         (Some("imap-send"), _) => Some("git imap-send"),
         (Some("svn"), Some("dcommit" | "set-tree")) => Some("git svn dcommit"),
@@ -2047,6 +2103,72 @@ fn git_ships(args: &[&str]) -> Option<&'static str> {
     // isn't (`git Status` runs `alias.status`).
     let command = ops.first().copied().unwrap_or_default();
     (!GIT_COMMANDS.contains(&command)).then_some("a git alias, or a command that isn't one of git's own")
+}
+
+/// The settings git's global options give a command, before its
+/// subcommand: each `-c name=value` and `--config-env name=VAR` (`true`
+/// when the value comes from the environment). `-c` after the subcommand
+/// is that command's own (`git switch -c topic`).
+pub(crate) fn git_global_settings<'a>(args: &[&'a str]) -> Vec<(&'a str, bool)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        match a {
+            "-c" => {
+                out.extend(args.get(i + 1).map(|s| (*s, false)));
+                i += 2;
+            }
+            "--config-env" => {
+                out.extend(args.get(i + 1).map(|s| (*s, true)));
+                i += 2;
+            }
+            _ if a.starts_with("--config-env=") => {
+                out.push((&a["--config-env=".len()..], true));
+                i += 1;
+            }
+            _ if GIT_VALUED_SHIP.contains(&a) => i += 2,
+            _ if a.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// The settings `git clone` writes into the new repository and uses for
+/// the clone itself: `-c name=value`, `--config name=value`,
+/// `--config=name=value`.
+fn clone_settings<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for (i, &a) in args.iter().enumerate() {
+        match a {
+            "-c" | "--config" => out.extend(args.get(i + 1).copied()),
+            _ => out.extend(a.strip_prefix("--config=")),
+        }
+    }
+    out
+}
+
+/// Whether a mission that ships nothing lets a command give git `setting`
+/// (`name=value`, or `name=VAR` from the environment): only a display or
+/// identity one, which runs nothing: `color.*`, `core.quotePath`,
+/// `diff.noprefix`, `diff.renames`, `log.*`'s display options, `user.name`,
+/// `user.email`, `advice.*`, and `pager.<cmd>` set to `false` or `cat`
+/// (written out, not from the environment).
+pub(crate) fn git_setting_allowed(setting: &str, from_env: bool) -> bool {
+    const LOG_DISPLAY: &[&str] = &[
+        "log.date", "log.decorate", "log.abbrevcommit", "log.follow", "log.graphcolors", "log.mailmap", "log.showroot",
+        "log.excludedecoration", "log.initialdecorationset", "log.diffmerges",
+    ];
+    let (name, value) = setting.split_once('=').unwrap_or((setting, "true"));
+    let key = name.to_ascii_lowercase();
+    if key.starts_with("pager.") {
+        return !from_env && matches!(value.to_ascii_lowercase().as_str(), "false" | "cat");
+    }
+    key.starts_with("color.")
+        || key.starts_with("advice.")
+        || LOG_DISPLAY.contains(&key.as_str())
+        || matches!(key.as_str(), "core.quotepath" | "diff.noprefix" | "diff.renames" | "user.name" | "user.email")
 }
 
 /// The `gh` and `glab` subcommands a mission that ships nothing runs: the
@@ -4329,6 +4451,83 @@ mod tests {
             assert_eq!(remote_effect_local(command), None, "{command}");
         }
         for command in ["git p origin main", "git credential fill", "git rebase -x 'make' main"] {
+            assert_eq!(remote_effect(command), None, "Plan only is unchanged: {command}");
+        }
+    }
+
+    /// In a mission that ships nothing git takes only display and identity
+    /// settings from `-c` and `--config-env` (review of #1287 at
+    /// `7a175724`): a key that names a program (`diff.external`,
+    /// `core.fsmonitor`, `core.pager`, `core.hooksPath`) is refused, as are
+    /// the other ways a call names a program for git to run: another
+    /// upload-pack, an archive `--exec`, `difftool`/`mergetool`, a template
+    /// folder, `--ext-diff`, `--exec-path=`, the help viewer and the GUI
+    /// tools. Plan only reads them as before.
+    #[test]
+    fn a_ship_nothing_mission_takes_only_display_git_settings() {
+        for command in [
+            "git -c diff.external=./x diff",
+            "git -c core.fsmonitor=./x status",
+            "git -c core.hooksPath=hooks commit -m a",
+            "git -c core.pager=./x log",
+            "git -c core.sshCommand=./x fetch origin",
+            "git -c gpg.program=./x commit -S -m a",
+            "git -c filter.f.clean=./x add a",
+            "git -c pager.log=less log",
+            "git --config-env=core.pager=EVIL log",
+            "git --config-env core.fsmonitor=EVIL status",
+            "git --config-env=pager.log=PAGER log",
+            "git -C sub -c Core.FSMonitor=./x status",
+            "git clone -c core.fsmonitor=./x https://example.com/r.git",
+            "git clone --config core.sshCommand=./x https://example.com/r.git",
+            "git clone --config=diff.external=./x https://example.com/r.git",
+            "git clone -u ./x https://example.com/r.git",
+            "git clone --template=./t https://example.com/r.git",
+            "git init --template=./t",
+            "git fetch --upload-pack=./x origin",
+            "git ls-remote --upload-pack ./x origin",
+            "git archive --exec=./x --remote=origin HEAD",
+            "git difftool",
+            "git mergetool",
+            "git upload-pack .",
+            "git maintenance start",
+            "git log -p --ext-diff",
+            "git diff --ext-diff",
+            "git diff --ext-d",
+            "git --exec-path=./x status",
+            "git help log",
+            "git help -w log",
+            "git log --help",
+            "git --help log",
+            "git gui",
+            "git web--browse index.html",
+        ] {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        for command in [
+            "git -c color.ui=always log",
+            "git -c user.name=t -c user.email=t@example.com commit -m a",
+            "git -c pager.log=false log",
+            "git -c pager.diff=cat diff",
+            "git -c core.quotePath=false status",
+            "git -c log.date=iso log",
+            "git -c advice.detachedHead=false switch --detach HEAD",
+            "git -c diff.renames=true -c diff.noprefix=true diff",
+            "git switch -c topic",
+            "git checkout -b topic",
+            "git --exec-path",
+            "git --help",
+            "git help -a",
+            "git help --config",
+            "git log -h",
+            "git diff --no-ext-diff",
+            "git log --extended-regexp --grep=x",
+            "git init",
+            "git fetch origin",
+        ] {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+        for command in ["git -c core.fsmonitor=./x status", "git help log", "git diff --ext-diff"] {
             assert_eq!(remote_effect(command), None, "Plan only is unchanged: {command}");
         }
     }
