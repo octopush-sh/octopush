@@ -140,8 +140,11 @@ jobs:
         shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
           c="$GITHUB_WORKSPACE/sandbox-check"
-          rc=0; /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$c" || rc=$?
-          [ "$rc" = 1 ] || { echo "::error::end should have failed on the planted .git (exit $rc)"; exit 1; }
+          # Its error here is the expected one: kept off the run's annotations.
+          rc=0; /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$c" 2> "$RUNNER_TEMP/end.err" || rc=$?
+          [ "$rc" = 1 ] && grep -q "had a .git of the sandbox's: removed" "$RUNNER_TEMP/end.err" \
+            || { echo "::error::end should have failed on the planted .git (exit $rc)"; sed 's/^::/:/' "$RUNNER_TEMP/end.err"; exit 1; }
+          echo "end refused the planted .git, as expected"
           sleep 2
           if ps -u octo-sandbox -o stat= | grep -qv '^Z'; then echo "::error::a process of octo-sandbox survived end"; ps -u octo-sandbox -o pid=,stat=,args=; exit 1; fi
           grep -qx 'populated 0' /sys/fs/cgroup/octo-sandbox/cgroup.events || { echo "::error::the sandbox's cgroup is not empty"; exit 1; }
