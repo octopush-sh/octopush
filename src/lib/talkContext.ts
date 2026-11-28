@@ -7,7 +7,12 @@
  * - `@session:<slug>` — the last lines a Run session printed (`@session`
  *   alone when the workspace has exactly one session);
  * - `@diff` / `@diff:<path>` — the workspace's uncommitted diff (staged and
- *   not staged), or one (existing) file's.
+ *   not staged), or one (existing) file's;
+ * - `@chat:<slug>` — another conversation of the workspace: its summary row,
+ *   or its asks and last answer (#1162).
+ *
+ * `@` followed by an identifier also offers its definitions
+ * (`lib/talkSymbols.ts`); choosing one inserts its `@path#Lx-y`.
  *
  * Every expansion shares the 64k cap whole-file mentions already use. The
  * composer shows each resolved token as a removable chip with its token
@@ -33,16 +38,27 @@ export interface SessionRef {
   slug: string;
 }
 
+export interface ChatRef {
+  /** The thread's id. */
+  id: string;
+  title: string;
+  /** The token after `@chat:` — the title, kebab-cased, unique. */
+  slug: string;
+}
+
 export type ContextRef =
   | { kind: "file"; token: string; path: string; range: { start: number; end: number } | null }
   | { kind: "folder"; token: string; path: string }
   | { kind: "session"; token: string; session: SessionRef }
-  | { kind: "diff"; token: string; path: string | null };
+  | { kind: "diff"; token: string; path: string | null }
+  | { kind: "chat"; token: string; chat: ChatRef };
 
 export interface ContextCatalog {
   files: Set<string>;
   dirs: Set<string>;
   sessions: SessionRef[];
+  /** The workspace's other conversations (never the one being typed in). */
+  chats?: ChatRef[];
 }
 
 /** Every ancestor folder of the catalog's files (no trailing slash). */
@@ -70,6 +86,21 @@ export function sessionRefs(terminals: { id: string; label: string }[]): Session
     seen.set(base, n);
     return { id: t.id, label: t.label, slug: n === 1 ? base : `${base}-${n}` };
   });
+}
+
+/** The workspace's conversations `@chat:` can name: every one but `current`
+ *  (the one the message goes to), each with a unique slug from its title. */
+export function chatRefs(threads: { id: string; title: string }[], current: string | null): ChatRef[] {
+  const seen = new Map<string, number>();
+  return threads
+    .filter((t) => t.id !== current)
+    .map((t) => {
+      const base =
+        t.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "conversation";
+      const n = (seen.get(base) ?? 0) + 1;
+      seen.set(base, n);
+      return { id: t.id, title: t.title, slug: n === 1 ? base : `${base}-${n}` };
+    });
 }
 
 /** `path#L10-40` → the path and range; `#L10` is one line; a reversed range
@@ -111,6 +142,10 @@ function resolveToken(token: string, cat: ContextCatalog): ContextRef | null {
   if (token.startsWith("session:")) {
     const s = cat.sessions.find((x) => x.slug === token.slice(8));
     if (s) return { kind: "session", token, session: s };
+  }
+  if (token.startsWith("chat:")) {
+    const c = cat.chats?.find((x) => x.slug === token.slice(5));
+    if (c) return { kind: "chat", token, chat: c };
   }
   return null;
 }
@@ -155,16 +190,25 @@ export function removeContextToken(text: string, token: string): string {
   return text.replace(re, "$1");
 }
 
+/** Most conversations the popover lists beside files for a query that isn't
+ *  `chat:` (whose title holds the query). */
+export const CHAT_ROWS_BESIDE_FILES = 3;
+
 /** The popover's rows for the `@query` being typed: `diff` and sessions when
- *  the query reads as one (or is empty), folders and files otherwise. */
+ *  the query reads as one (or is empty), folders and files otherwise. The
+ *  workspace's other conversations come under `chat:` (or a query that
+ *  starts it); a query of two characters or more also lists, after the
+ *  files, the conversations whose title holds it. */
 export function contextMentionItems(
   query: string,
   files: string[],
   dirs: Set<string>,
   sessions: SessionRef[],
+  chats: ChatRef[] = [],
   limit = 8,
 ): string[] {
   const q = query.toLowerCase();
+  const chatToken = (c: ChatRef) => `chat:${c.slug}`;
   if (q.startsWith("session:")) {
     const s = q.slice(8);
     return sessions.filter((x) => x.slug.includes(s)).slice(0, limit).map((x) => `session:${x.slug}`);
@@ -172,12 +216,43 @@ export function contextMentionItems(
   if (q.startsWith("diff:")) {
     return rankFiles(files, query.slice(5), limit).map((p) => `diff:${p}`);
   }
+  if (q.startsWith("chat:")) {
+    const s = q.slice(5);
+    return chats
+      .filter((c) => c.slug.includes(s) || c.title.toLowerCase().includes(s))
+      .slice(0, limit)
+      .map(chatToken);
+  }
   const special: string[] = [];
   if ("diff".startsWith(q)) special.push("diff");
   if (q && "session".startsWith(q)) special.push(...sessions.map((x) => `session:${x.slug}`));
   else if (!q && sessions[0]) special.push(`session:${sessions[0].slug}`);
+  const named = q && "chat".startsWith(q);
+  if (named) special.push(...chats.slice(0, limit).map(chatToken));
+  else if (!q && chats[0]) special.push(chatToken(chats[0]));
+  const titled =
+    !named && q.length >= 2
+      ? chats.filter((c) => c.title.toLowerCase().includes(q)).slice(0, CHAT_ROWS_BESIDE_FILES).map(chatToken)
+      : [];
   const paths = rankFiles([...[...dirs].map((d) => `${d}/`), ...files], query, limit);
-  return [...special, ...paths].slice(0, limit);
+  return [...[...special, ...paths].slice(0, limit - titled.length), ...titled];
+}
+
+/** Which of the popover's groups a row sits in. */
+export type MentionGroup = "context" | "chats" | "symbols";
+
+/** The popover's rows in the order shown, one run per group: what `@` names
+ *  in the workspace (files, folders, sessions, the diff), then its
+ *  conversations, then the definitions of the identifier typed (as their
+ *  `path#Lx-y` tokens). A definition already listed as a row is shown once. */
+export function groupMentionRows(items: string[], symbols: string[] = []): { token: string; group: MentionGroup }[] {
+  const ctx = items.filter((t) => !t.startsWith("chat:"));
+  const chats = items.filter((t) => t.startsWith("chat:"));
+  return [
+    ...ctx.map((token) => ({ token, group: "context" as const })),
+    ...chats.map((token) => ({ token, group: "chats" as const })),
+    ...symbols.filter((t) => !items.includes(t)).map((token) => ({ token, group: "symbols" as const })),
+  ];
 }
 
 /** Lines `start..end` (1-based, clamped to the file) of `content`. */
@@ -467,7 +542,22 @@ export function chipLabel(ref: ContextRef): string {
       return ref.session.label;
     case "diff":
       return ref.path ? `diff · ${base(ref.path)}` : "diff";
+    case "chat":
+      return ref.chat.title;
   }
+}
+
+/** A conversation's block body (#1162): its summary row when it has one,
+ *  then the asks and the last answer after it. */
+export function formatChatDigest(d: { summary: string | null; asks: string[]; lastAnswer: string | null }): string {
+  const parts: string[] = [];
+  if (d.summary) parts.push(`## Summary\n${d.summary}`);
+  if (d.asks.length > 0) {
+    const head = d.summary ? "## Asks since" : "## Asks";
+    parts.push(`${head}\n${d.asks.map((a, i) => `${i + 1}. ${a.replace(/\n/g, "\n   ")}`).join("\n")}`);
+  }
+  if (d.lastAnswer) parts.push(`## Last answer\n${d.lastAnswer}`);
+  return parts.join("\n\n");
 }
 
 /** The same chars/4 heuristic the composer's estimate uses. */

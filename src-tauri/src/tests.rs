@@ -1704,6 +1704,25 @@ mod workspace_tests {
     }
 
     #[test]
+    fn a_chat_digest_is_read_only_from_its_own_workspace() {
+        let db = test_db();
+        db.insert_project("p", "P", "/tmp/p").unwrap();
+        db.insert_workspace("ws", "p", "ws", "", "main", None, "", None).unwrap();
+        db.insert_workspace("other", "p", "other", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("ws", "T").unwrap();
+        db.insert_chat_message("ws", &t.id, "user", "the ask", None, None, None, None).unwrap();
+        db.insert_chat_message("ws", &t.id, "assistant", "the answer", None, None, None, None).unwrap();
+
+        let d = crate::commands::thread_digest_in(&db, "ws", &t.id).unwrap();
+        assert_eq!(d.asks, vec!["the ask".to_string()]);
+        assert_eq!(d.last_answer.as_deref(), Some("the answer"));
+        // Another workspace, or a conversation that is gone, is refused.
+        assert!(crate::commands::thread_digest_in(&db, "other", &t.id).is_err());
+        assert!(crate::commands::thread_digest_in(&db, "ws", "nope").is_err());
+        assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 2, "reading changes nothing");
+    }
+
+    #[test]
     fn shell_history_recall_dedups_and_orders_by_recency() {
         let db = test_db();
         db.insert_project("p", "P", "/tmp/p").unwrap();
@@ -3520,6 +3539,7 @@ mod agentic_loop_tests {
                         id: "t1".into(),
                         name: "list_files".into(),
                         input: serde_json::json!({ "path": "." }),
+                        input_error: None,
                     }],
                     stop_reason: LlmStopReason::ToolUse,
                     input_tokens: 100,
@@ -6621,8 +6641,8 @@ mod orchestrator_tests {
                         raw: vec![],
                         text: "I need to ask".into(),
                         tool_uses: vec![
-                            LlmToolUse { id: "ask-9".into(), name: "ask_director".into(), input: serde_json::json!({}) },
-                            LlmToolUse { id: "read-1".into(), name: "read_file".into(), input: serde_json::json!({"path":"a"}) },
+                            LlmToolUse { id: "ask-9".into(), name: "ask_director".into(), input: serde_json::json!({}), input_error: None },
+                            LlmToolUse { id: "read-1".into(), name: "read_file".into(), input: serde_json::json!({"path":"a"}), input_error: None },
                         ],
                     },
                 },
@@ -14052,7 +14072,7 @@ mod live_tests {
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             resp("inspecting the change",
                  vec![LlmToolUse { id: "t1".into(), name: "read_file".into(),
-                       input: serde_json::json!({"path": "a.rs"}) }],
+                       input: serde_json::json!({"path": "a.rs"}), input_error: None }],
                  LlmStopReason::ToolUse),
             resp("looks good", vec![], LlmStopReason::EndTurn),
         ])) };
@@ -14161,7 +14181,7 @@ mod live_tests {
     async fn agentic_loop_retries_a_truncated_round_with_its_signed_thinking_first() {
         let dir = tempfile::tempdir().unwrap();
         let call = LlmToolUse { id: "t1".into(), name: "write_file".into(),
-            input: json!({ "path": "a.rs", "content": "fn main() {" }) };
+            input: json!({ "path": "a.rs", "content": "fn main() {" }), input_error: None };
         let mut cut = resp("Writing it.", vec![call.clone()], LlmStopReason::MaxTokens);
         cut.raw_content = vec![
             json!({ "type": "thinking", "thinking": "plan", "signature": "sig-1" }),
@@ -14214,7 +14234,7 @@ mod live_tests {
         // produces a real final answer instead of throwing the work away.
         let tool_turn = || resp("still digging",
             vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
-                  input: serde_json::json!({"path": "a.rs"}) }],
+                  input: serde_json::json!({"path": "a.rs"}), input_error: None }],
             LlmStopReason::ToolUse);
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             tool_turn(), tool_turn(),
@@ -14258,7 +14278,7 @@ mod live_tests {
         std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
         let tool_turn = || resp("still digging",
             vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
-                  input: serde_json::json!({"path": "a.rs"}) }],
+                  input: serde_json::json!({"path": "a.rs"}), input_error: None }],
             LlmStopReason::ToolUse);
         // The forced close returns empty text → the stage stays unfinished.
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
@@ -14323,7 +14343,7 @@ mod live_tests {
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             resp("narration",
                  vec![LlmToolUse { id: "v".into(), name: "submit_verdict".into(),
-                     input: json!({"verdict": "changes_requested", "findings": "BLOCKING: null deref in foo()"}) }],
+                     input: json!({"verdict": "changes_requested", "findings": "BLOCKING: null deref in foo()"}), input_error: None }],
                  LlmStopReason::ToolUse),
         ])) };
         let rec = Recorder { events: Mutex::new(vec![]) };
@@ -14346,11 +14366,11 @@ mod live_tests {
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             resp("",
                  vec![LlmToolUse { id: "v1".into(), name: "submit_verdict".into(),
-                     input: json!({"verdict": "approved", "findings": "fine"}) }],
+                     input: json!({"verdict": "approved", "findings": "fine"}), input_error: None }],
                  LlmStopReason::ToolUse),
             resp("",
                  vec![LlmToolUse { id: "v2".into(), name: "submit_verdict".into(),
-                     input: json!({"verdict": "PASS", "findings": "fine"}) }],
+                     input: json!({"verdict": "PASS", "findings": "fine"}), input_error: None }],
                  LlmStopReason::ToolUse),
         ])) };
         let rec = Recorder { events: Mutex::new(vec![]) };
@@ -14363,6 +14383,48 @@ mod live_tests {
         assert!(out.finished);
         assert_eq!(out.verdict, Some(crate::orchestrator::types::ReviewVerdict::Pass),
             "case-tolerant retry lands the verdict");
+    }
+
+    #[tokio::test]
+    async fn openai_invalid_arguments_reported_not_executed() {
+        use crate::providers::{LlmContent, LlmToolResult};
+        let dir = tempfile::tempdir().unwrap();
+        // A local model's write_file call cut mid-string, as Chat Completions
+        // returns it; then a valid call; then the answer.
+        let cut = crate::providers::openai_compat::parse_response(json!({
+            "choices": [{ "message": { "content": null, "tool_calls": [{
+                "id": "bad", "type": "function",
+                "function": { "name": "write_file", "arguments": "{\"path\":\"a.txt\",\"content\":\"hel" }
+            }]}, "finish_reason": "tool_calls" }]
+        }));
+        assert!(cut.tool_uses[0].input_error.is_some());
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            resp("", cut.tool_uses, LlmStopReason::ToolUse),
+            resp("", vec![LlmToolUse { id: "good".into(), name: "write_file".into(),
+                     input: json!({"path": "b.txt", "content": "hi"}), input_error: None }],
+                 LlmStopReason::ToolUse),
+            resp("written", vec![], LlmStopReason::EndTurn),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "m",
+                                   "sys", crate::orchestrator::agentic::user_messages("write it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, true, None, &[], None,
+                                   None,).await.unwrap();
+        assert!(out.finished);
+        assert!(!dir.path().join("a.txt").exists(), "the invalid call never ran");
+        assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap(), "hi", "the retry did");
+        assert!(out.tool_calls[0].result.starts_with("The arguments were not valid JSON: "), "{}", out.tool_calls[0].result);
+        // The model read the parse error, as an error result for its call.
+        let results: Vec<&LlmToolResult> = out.transcript.iter()
+            .filter_map(|m| match &m.content { LlmContent::ToolResults(r) => Some(r), _ => None })
+            .flatten()
+            .collect();
+        let bad = results.iter().find(|r| r.tool_use_id == "bad").expect("a result for the invalid call");
+        assert!(bad.is_error);
+        assert!(bad.content.contains("not valid JSON") && bad.content.contains("{\"path\":\"a.txt\",\"content\":\"hel"), "{}", bad.content);
+        assert!(!results.iter().find(|r| r.tool_use_id == "good").unwrap().is_error);
     }
 
     #[test]
@@ -14456,7 +14518,7 @@ mod live_tests {
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             resp("consulting",
                  vec![LlmToolUse { id: "q".into(), name: "ask_stage".into(),
-                     input: json!({"step": 9, "question": "why?"}) }],
+                     input: json!({"step": 9, "question": "why?"}), input_error: None }],
                  LlmStopReason::ToolUse),
             resp("done anyway", vec![], LlmStopReason::EndTurn),
         ])) };
@@ -14493,7 +14555,7 @@ mod live_tests {
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             resp("digging",
                  vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
-                       input: serde_json::json!({"path": "a.rs"}) }],
+                       input: serde_json::json!({"path": "a.rs"}), input_error: None }],
                  LlmStopReason::ToolUse),
             resp("stopping here: summary of partial work", vec![], LlmStopReason::EndTurn),
         ])) };
@@ -14531,7 +14593,7 @@ mod live_tests {
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             sized(resp("reading",
                        vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
-                             input: serde_json::json!({"path": "a.rs"}) }],
+                             input: serde_json::json!({"path": "a.rs"}), input_error: None }],
                        LlmStopReason::ToolUse), 10_000, 30_000, 1_000),
             sized(resp("done", vec![], LlmStopReason::EndTurn), 20_000, 120_000, 2_000),
         ])) };
@@ -14861,9 +14923,9 @@ mod live_tests {
                         input: json!({"summary":"which datastore?","questions":[
                             {"question":"Postgres or SQLite?","whyBlocked":"schema differs","recommendedDefault":"Postgres"},
                             {"question":"Which auth?","whyBlocked":"affects the schema","recommendedDefault":"OAuth"}
-                        ]}) },
+                        ]}), input_error: None },
                     LlmToolUse { id: "r".into(), name: "read_file".into(),
-                        input: json!({"path":"a.rs"}) },
+                        input: json!({"path":"a.rs"}), input_error: None },
                  ],
                  LlmStopReason::ToolUse),
         ])) };
@@ -14900,7 +14962,7 @@ mod live_tests {
         let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
             resp("blocked",
                  vec![LlmToolUse { id: "ask".into(), name: "ask_director".into(),
-                       input: json!({"summary":"need a decision"}) }],
+                       input: json!({"summary":"need a decision"}), input_error: None }],
                  LlmStopReason::ToolUse),
         ])) };
         let rec = Recorder { events: Mutex::new(vec![]) };
@@ -14930,7 +14992,7 @@ mod live_tests {
                            {"question":"DB?","why_blocked":"schema differs","recommended_default":"Postgres"},
                            {"question":"Auth?","why_blocked":"affects schema","recommended_default":"OAuth"},
                            {"question":"Region?"}
-                       ]}) }],
+                       ]}), input_error: None }],
                  LlmStopReason::ToolUse),
         ])) };
         let rec = Recorder { events: Mutex::new(vec![]) };
@@ -14958,7 +15020,7 @@ mod live_tests {
         let u = LlmToolUse { id: "a".into(), name: "ask_director".into(),
             input: json!({"summary":"which datastore?","questions":[
                 {"whyBlocked":"schema differs","recommendedDefault":"Postgres"}
-            ]}) };
+            ]}), input_error: None };
         let ask = parse_ask_director(&u);
         assert_eq!(ask.questions.len(), 1);
         assert!(!ask.questions[0].question.trim().is_empty(), "no blank <label>");
@@ -14970,7 +15032,7 @@ mod live_tests {
     fn parse_ask_director_drops_a_fully_empty_question_and_synthesizes_from_summary() {
         use crate::orchestrator::agentic::parse_ask_director;
         let u = LlmToolUse { id: "a".into(), name: "ask_director".into(),
-            input: json!({"summary":"pick a database","questions":[{}]}) };
+            input: json!({"summary":"pick a database","questions":[{}]}), input_error: None };
         let ask = parse_ask_director(&u);
         assert_eq!(ask.questions.len(), 1, "the empty question is dropped, one synthesized from summary");
         assert_eq!(ask.questions[0].question, "pick a database");
@@ -14979,7 +15041,7 @@ mod live_tests {
     #[test]
     fn parse_ask_director_all_empty_input_yields_one_fallback_question() {
         use crate::orchestrator::agentic::parse_ask_director;
-        let u = LlmToolUse { id: "a".into(), name: "ask_director".into(), input: json!({}) };
+        let u = LlmToolUse { id: "a".into(), name: "ask_director".into(), input: json!({}), input_error: None };
         let ask = parse_ask_director(&u);
         assert_eq!(ask.questions.len(), 1);
         assert!(!ask.questions[0].question.trim().is_empty());

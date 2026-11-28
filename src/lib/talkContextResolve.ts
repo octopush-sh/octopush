@@ -24,11 +24,13 @@ import {
   diffForFile,
   diffScanInputs,
   fenced,
+  formatChatDigest,
   formatFolderListing,
   joinDiffs,
   quoteToken,
   stripAnsi,
   tailLines,
+  type ChatRef,
   type ContextRef,
   type SessionRef,
 } from "./talkContext";
@@ -58,6 +60,9 @@ export interface ResolvedBlock {
  *  one message read the diff once. */
 export interface ResolveShare {
   diff?: Promise<[string, string]>;
+  /** The workspace the message is sent in: `@chat:` reads only its own
+   *  conversations, and the backend refuses any other. */
+  workspaceId?: string;
 }
 
 function note(ref: ContextRef, why: string): string {
@@ -149,6 +154,17 @@ export async function resolveContextBlock(
         // `id_rsa` in the diff is flagged as it would be in a commit.
         return { ref, text: fenced(heading, body, "diff"), scan: diffScanInputs(body) };
       }
+      case "chat": {
+        if (!share.workspaceId) return missing("not in this workspace");
+        const digest = await ipc.chatThreadDigest(share.workspaceId, ref.chat.id);
+        const body = capText(formatChatDigest(digest) || "(nothing asked yet)");
+        const from = digest.summary ? "summary" : "asks and last answer";
+        return {
+          ref,
+          text: fenced(`Conversation "${ref.chat.title}" · ${from}`, body),
+          scan: [{ label: `@${ref.token}`, text: body }],
+        };
+      }
     }
   } catch (e) {
     return missing(notAFileReason(e) ?? "unreadable");
@@ -160,8 +176,9 @@ export function resolveContextBlocks(
   refs: ContextRef[],
   workspacePath: string,
   files: string[],
+  workspaceId?: string,
 ): Promise<ResolvedBlock[]> {
-  const share: ResolveShare = {};
+  const share: ResolveShare = { workspaceId };
   return Promise.all(refs.map((r) => resolveContextBlock(r, workspacePath, files, share)));
 }
 
@@ -259,11 +276,17 @@ export function joinBlocks(blocks: ResolvedBlock[], leaveOut?: Set<number>, unch
 /** A resend with no composer to ask in (Edit & resend, #1150): the draft's
  *  `@` tokens resolved fresh, as at send. A block the guard flags, or
  *  couldn't check, is left out, and its chip says so. */
-export async function expandDraft(text: string, workspacePath: string, sessions: SessionRef[]): Promise<SentMessage> {
+export async function expandDraft(
+  text: string,
+  workspacePath: string,
+  sessions: SessionRef[],
+  chats: ChatRef[] = [],
+  workspaceId?: string,
+): Promise<SentMessage> {
   const files = await ipc.listWorkspaceFiles(workspacePath).catch(() => [] as string[]);
-  const refs = capRefs(extractContextRefs(text, { files: new Set(files), dirs: dirsOf(files), sessions })).kept;
+  const refs = capRefs(extractContextRefs(text, { files: new Set(files), dirs: dirsOf(files), sessions, chats })).kept;
   if (refs.length === 0) return { content: text, context: [] };
-  const blocks = await resolveContextBlocks(refs, workspacePath, files);
+  const blocks = await resolveContextBlocks(refs, workspacePath, files, workspaceId);
   const verdict = await scanContextBlocks(blocks);
   return withContext(text, blocks, verdict?.flagged, verdict?.unchecked);
 }
