@@ -5433,6 +5433,13 @@ impl ChatEngine {
                 sandbox_roots.as_deref(),
             );
             let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
+            // Ask first and Plan only want the shared shell strict, without
+            // the profile's aliases and functions (#1231); it is made so
+            // before its next command.
+            self.talk_shell.set_strict(
+                &request.thread_id,
+                matches!(mode, crate::permissions::Mode::Ask | crate::permissions::Mode::Plan),
+            );
 
             let response = loop {
                 let llm_req = director_request(&request, &system_prompt, &messages, &tools);
@@ -5854,7 +5861,16 @@ impl ChatEngine {
                 // (#1165; inside the workspace only, so it never tells whether a
                 // file exists outside), the mission sandbox's, an edit that
                 // doesn't apply (#1231).
-                let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();
+                // A reader runs in the shared shell without a card only once
+                // that shell is sure to be strict (#1231): an alias or a profile
+                // function could turn `ls` or `git` into a writer.
+                let loose_shell = mode == crate::permissions::Mode::Ask
+                    && !mode_denied
+                    && u.name == "run_command"
+                    && self.talk_shell.available()
+                    && exec_roots.is_none()
+                    && !self.talk_shell.strict_wanted(&request.thread_id);
+                let held = (mode_asks.contains(&u.id) || git_outside || loose_shell) && skill_refusal.is_none();
                 let inside = || reach.outside_card(None, &u.name, &u.input, false, &[]).is_none();
                 let seen = self.thread_file_seen(&request.thread_id);
                 let refused = || {
