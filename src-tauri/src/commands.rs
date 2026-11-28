@@ -1895,6 +1895,39 @@ pub async fn list_chat_messages(
     state.db.lock().list_chat_messages(&thread_id)
 }
 
+/// What `@chat:<slug>` attaches of another conversation (#1162): its summary
+/// row, or its asks and last answer. Read-only, and only for a conversation
+/// of `workspace_id`: one from another workspace is refused.
+#[tauri::command]
+pub async fn chat_thread_digest(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    thread_id: String,
+) -> AppResult<crate::chat_history::ThreadDigest> {
+    thread_digest_in(&state.db.lock(), &workspace_id, &thread_id)
+}
+
+pub(crate) fn thread_digest_in(
+    db: &crate::db::Db,
+    workspace_id: &str,
+    thread_id: &str,
+) -> AppResult<crate::chat_history::ThreadDigest> {
+    if db.chat_thread_workspace(thread_id)?.as_deref() != Some(workspace_id) {
+        return Err(AppError::Other("that conversation isn't in this workspace".into()));
+    }
+    let messages = db.list_chat_messages(thread_id)?;
+    let rows: Vec<crate::chat_history::HistoryRow<'_>> = messages
+        .iter()
+        .map(|m| crate::chat_history::HistoryRow {
+            id: m.id,
+            role: m.role.as_str(),
+            content: m.content.as_str(),
+            context: m.context_blocks.as_deref(),
+        })
+        .collect();
+    Ok(crate::chat_history::thread_digest(&rows))
+}
+
 /// The workspace's conversations with a director turn running now, so a
 /// reloaded view shows them as running (and offers Stop) again.
 #[tauri::command]
@@ -2333,6 +2366,46 @@ pub async fn list_mcp_server_status(
     workspace_path: String,
 ) -> AppResult<Vec<crate::mcp::scope::McpServerStatus>> {
     Ok(state.chat.mcp.status(std::path::Path::new(&workspace_path)))
+}
+
+/// The servers a worktree's own `.claude/mcp.json` defines and where each
+/// stands (#1245): approved, waiting for approval, changed since, or
+/// clashing with a Settings server. Spawns nothing.
+#[tauri::command]
+pub async fn list_project_mcp_servers(
+    state: State<'_, AppState>,
+    workspace_path: String,
+) -> AppResult<Vec<crate::mcp::approval::ProjectServer>> {
+    let mcp = Arc::clone(&state.chat.mcp);
+    let listed = tokio::task::spawn_blocking(move || mcp.project_servers(std::path::Path::new(&workspace_path))).await;
+    listed.map_err(|e| AppError::Other(e.to_string()))
+}
+
+/// Every approved project server, for Settings › Integrations.
+#[tauri::command]
+pub async fn list_project_mcp_approvals(state: State<'_, AppState>) -> AppResult<Vec<crate::db::ProjectMcpApproval>> {
+    state.db.lock().list_project_mcp_approvals()
+}
+
+/// Revoke a project server's approval (by its project, or a worktree of
+/// it) and stop the server, so it waits for approval again.
+#[tauri::command]
+pub async fn revoke_project_mcp_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server: String,
+    project_id: Option<String>,
+    workspace_path: Option<String>,
+) -> AppResult<bool> {
+    let project = match (project_id, workspace_path) {
+        (Some(p), _) => Some(p),
+        (None, Some(w)) => state.db.lock().project_id_for_worktree(&w)?,
+        (None, None) => None,
+    };
+    let project = project.ok_or_else(|| AppError::Other("No project to revoke the server in.".into()))?;
+    let had = crate::mcp::approval::revoke(&state.db, &state.chat.mcp, &project, &server).map_err(AppError::Other)?;
+    let _ = app.emit(crate::mcp::scope::CONFIG_CHANGED_EVENT, ());
+    Ok(had)
 }
 
 /// The Settings › Integrations servers only (`~/.claude/mcp.json`), with
@@ -9029,6 +9102,7 @@ mod ai_complete_tests {
                 id: "tu_1".into(),
                 name: super::AI_RESULT_TOOL.into(),
                 input: serde_json::json!({ "summary": "ok", "findings": [] }),
+                input_error: None,
             }],
             stop_reason: LlmStopReason::ToolUse,
             input_tokens: 1,

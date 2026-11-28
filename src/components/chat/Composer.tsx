@@ -10,14 +10,17 @@ import { findActiveMention, applyMention } from "../../lib/mentions";
 import {
   blockTokens,
   capRefs,
+  chatRefs,
   contextMentionItems,
   dirsOf,
   extractContextRefs,
+  groupMentionRows,
   quoteToken,
   removeContextToken,
   sessionRefs,
   type ContextCatalog,
 } from "../../lib/talkContext";
+import { findSymbolRows, isSymbolQuery, type SymbolRow } from "../../lib/talkSymbols";
 import {
   resolveContextBlocks,
   scanContextBlocks,
@@ -33,7 +36,7 @@ import { PermissionModeControl } from "./PermissionModeControl";
 import { usePermissionModeStore } from "../../stores/permissionModeStore";
 import { isModeChord } from "../../lib/permissionModes";
 import { isModalOpen } from "../ModalShell";
-import { MentionPopover } from "./MentionPopover";
+import { MentionPopover, type MentionRowLabel } from "./MentionPopover";
 import { SlashMenu, matchingSkipped } from "./SlashMenu";
 import { ComposerEstimate } from "./ComposerEstimate";
 import { CommandHistoryPopover } from "./CommandHistoryPopover";
@@ -51,6 +54,8 @@ interface Props {
   workspaceId: string;
   workspacePath: string;
 }
+
+const NO_SYMBOLS: SymbolRow[] = [];
 
 /**
  * The TALK composer — a single bounded box with the textarea and a quiet
@@ -292,9 +297,14 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [sessionsKey],
   );
+  // The workspace's other conversations `@chat:` can name (#1162): this
+  // workspace's only, never the one the message goes to.
+  const threads = useChatStore((s) => s.getThreads(workspaceId));
+  const activeThread = useChatStore((s) => s.getActiveThread(workspaceId));
+  const chats = useMemo(() => chatRefs(threads, activeThread), [threads, activeThread]);
   const catalog: ContextCatalog = useMemo(
-    () => ({ files: new Set(files), dirs: dirsOf(files), sessions }),
-    [files, sessions],
+    () => ({ files: new Set(files), dirs: dirsOf(files), sessions, chats }),
+    [files, sessions, chats],
   );
   // A message attaches at most MAX_MENTIONS blocks; the rest stay prose and
   // the chips say so (#1046).
@@ -330,7 +340,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     const t = setTimeout(() => {
       const gen = estimateGenRef.current;
       for (const r of missing) inFlightRef.current.add(r.token);
-      void resolveContextBlocks(missing, workspacePath, files).then((blocks) => {
+      void resolveContextBlocks(missing, workspacePath, files, workspaceId).then((blocks) => {
         if (gen !== estimateGenRef.current) return;
         for (const r of missing) inFlightRef.current.delete(r.token);
         const live = blocks.filter((b) => liveTokensRef.current.has(b.ref.token));
@@ -350,7 +360,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       });
     }, 250);
     return () => clearTimeout(t);
-  }, [contextRefs, tokensByToken, workspacePath, files]);
+  }, [contextRefs, tokensByToken, workspacePath, workspaceId, files]);
   /** Forget every estimate, and any still in flight (send, workspace switch). */
   function resetEstimates() {
     estimateGenRef.current++;
@@ -385,6 +395,42 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     textareaRef.current?.focus();
   }
 
+  // `@` followed by an identifier also offers its definitions (#1162),
+  // searched once the query rests; each inserts its `@path#Lx-y`.
+  const [symbols, setSymbols] = useState<{ query: string; rows: SymbolRow[] } | null>(null);
+  const symbolQuery = mention && isSymbolQuery(mention.query) ? mention.query : null;
+  useEffect(() => {
+    if (!symbolQuery) return;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      findSymbolRows(workspacePath, symbolQuery, catalog.files)
+        .then((rows) => {
+          if (!cancelled) setSymbols({ query: symbolQuery, rows });
+        })
+        .catch(() => {});
+    }, 200);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [symbolQuery, workspacePath, catalog.files]);
+  const symbolRows = symbols && symbols.query === symbolQuery ? symbols.rows : NO_SYMBOLS;
+  // The popover's rows in the order shown and keyed through: context, then
+  // conversations, then definitions.
+  const mentionRows = useMemo(
+    () => groupMentionRows(mentionItems, symbolRows.map((r) => r.token)),
+    [mentionItems, symbolRows],
+  );
+  const mentionTokens = useMemo(() => mentionRows.map((r) => r.token), [mentionRows]);
+  const mentionLabels = useMemo(() => {
+    const out: Record<string, MentionRowLabel> = {};
+    for (const c of chats) out[`chat:${c.slug}`] = { name: c.title, detail: `chat:${c.slug}` };
+    for (const r of symbolRows) {
+      out[r.token] = { name: r.name, detail: `${r.file}:${r.start === r.end ? r.start : `${r.start}–${r.end}`}` };
+    }
+    return out;
+  }, [chats, symbolRows]);
+
   function closeMention() {
     setMention(null);
     setMentionItems([]);
@@ -399,7 +445,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       closeMention();
       return;
     }
-    const items = contextMentionItems(m.query, files, catalog.dirs, catalog.sessions);
+    const items = contextMentionItems(m.query, files, catalog.dirs, catalog.sessions, catalog.chats);
     closeSlash();
     closeCmdHist();
     setMention({ ...m, caret });
@@ -637,7 +683,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     let held = false;
     void (async () => {
       try {
-        const blocks = await resolveContextBlocks(refs, workspacePath, files);
+        const blocks = await resolveContextBlocks(refs, workspacePath, files, workspaceId);
         const verdict = await scanContextBlocks(blocks);
         if (verdict) {
           // Answered after a workspace switch: nothing is sent, and the
@@ -757,20 +803,20 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     }
 
     // ── Mention popover takes precedence over history/send while open ──
-    if (mention && mentionItems.length > 0) {
+    if (mention && mentionTokens.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setMentionIndex((i) => (i + 1) % mentionItems.length);
+        setMentionIndex((i) => (i + 1) % mentionTokens.length);
         return;
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        setMentionIndex((i) => (i - 1 + mentionItems.length) % mentionItems.length);
+        setMentionIndex((i) => (i - 1 + mentionTokens.length) % mentionTokens.length);
         return;
       }
       if (e.key === "Enter" || e.key === "Tab") {
         e.preventDefault();
-        selectMention(mentionItems[mentionIndex]);
+        selectMention(mentionTokens[Math.min(mentionIndex, mentionTokens.length - 1)]);
         return;
       }
       if (e.key === "Escape") {
@@ -831,7 +877,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   // readers announce the highlighted @file / skill / recent-command row.
   const activePopover = mention ? "mention" : slashOpen ? "slash" : cmdHistOpen ? "cmdhist" : null;
   const activeDescendant =
-    activePopover === "mention" && mentionItems.length
+    activePopover === "mention" && mentionTokens.length
       ? `mention-opt-${mentionIndex}`
       : activePopover === "slash" && slashItems.length
         ? `slash-opt-${slashIndex}`
@@ -874,7 +920,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         {mention && (
           <MentionPopover
             heading="Add context"
-            items={mentionItems}
+            items={mentionTokens}
+            groups={mentionRows.map((r) => r.group)}
+            labels={mentionLabels}
             activeIndex={mentionIndex}
             onSelect={selectMention}
             onHover={setMentionIndex}
@@ -1068,7 +1116,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 function ComposerHelp({ onClose }: { onClose: () => void }) {
   const rows: { key: string; desc: string }[] = [
     { key: "@ file", desc: "Reference a file — its contents ride along with the message" },
-    { key: "@ more", desc: "path#L10-40 lines · folder/ listing · session:name output · diff" },
+    { key: "@ more", desc: "path#L10-40 lines · folder/ listing · session:name output · diff · chat:name conversation · a name's definition" },
     { key: "/ skill", desc: "Invoke a skill with this message — several allowed, none sticks" },
     { key: "$ cmd", desc: "Run a command in the shared shell (also /run cmd)" },
     { key: "\\$ …", desc: "Send a literal $… to the agent instead of running it" },

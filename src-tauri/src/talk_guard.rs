@@ -27,6 +27,12 @@ pub enum CardKind {
     /// A command naming a path outside the workspace or in a credentials
     /// location (#1201).
     Run,
+    /// A file tool or a command that would change a workspace file that
+    /// makes Octopush or Claude Code run commands ([`RUNS_CODE`], #1245).
+    Config,
+    /// A server of the project's own `.claude/mcp.json` that waits for the
+    /// user's approval before it starts (#1245).
+    Server,
     /// A file change Ask first holds (#1231), with its diff.
     Edit,
     /// A command Ask first holds (#1231): one that doesn't only read.
@@ -174,6 +180,33 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// comment body, a file) as its length, and at most [`MCP_ARGS_MAX`] in all.
 const MCP_ARG_SHOWN: usize = 160;
 const MCP_ARGS_MAX: usize = 400;
+
+/// Files in a workspace that make Octopush or Claude Code run commands: the
+/// project's MCP servers and Claude Code's project settings (its hooks).
+/// Changing one always asks, Deny first, wherever the call comes from.
+pub const RUNS_CODE: &[&str] = &[".claude/mcp.json", ".claude/settings.json", ".claude/settings.local.json"];
+
+/// The card that asks before a project's own MCP server starts: its exact
+/// command, arguments and env names (`approval::ProjectServer::shown`).
+pub fn server_card(server: &crate::mcp::approval::ProjectServer) -> ToolCard {
+    let changed = server.state == crate::mcp::approval::ProjectServerState::Changed;
+    let reason = if changed {
+        "this project's .claude/mcp.json changed this server since you approved it"
+    } else {
+        "this project's .claude/mcp.json defines this server"
+    };
+    ToolCard {
+        kind: CardKind::Server,
+        shown: server.shown(),
+        reason: reason.to_string(),
+        denial: String::new(),
+        sensitive: true,
+        grant: None,
+        trust: None,
+        diff: None,
+        bound: None,
+    }
+}
 
 /// The card for an MCP tool its server does not mark read-only (or marks
 /// `destructive`). `label` names the sub-agent that asks.
@@ -832,8 +865,21 @@ impl Reach {
             "edit_file" => (CardKind::Write, "edits a file", "edit", path("")),
             _ => return None,
         };
+        let joined = self.workspace.join(&raw);
+        // A sandbox lets a write in the workspace through, so this asks there too.
+        if matches!(name, "write_file" | "edit_file") {
+            if let Some(r) = self.config_file(&joined, false, true) {
+                let denial = format!(
+                    "Tool call not made \u{2014} the user declined to let it change {}, which can make Octopush or \
+                     Claude Code run commands. Ask the user to make this change; do not retry it.",
+                    r.shown
+                );
+                let reason = sub_agent(label, format!("changes {} \u{b7} it can make Octopush or Claude Code run commands", r.shown));
+                return Some(ToolCard { kind: CardKind::Config, shown: r.shown, reason, denial, sensitive: true, grant: None, trust: None, diff: None, bound: None });
+            }
+        }
         let writes = matches!(name, "write_file" | "edit_file");
-        let r = self.reached(&self.workspace.join(&raw), kind == CardKind::Read, name == "grep", writes)?;
+        let r = self.reached(&joined, kind == CardKind::Read, name == "grep", writes)?;
         if kind == CardKind::Write && writes_confined && !r.exec {
             return None;
         }
@@ -928,7 +974,66 @@ impl Reach {
             .or(by_name.map(str::to_string))
             .or(exec.map(|e| format!("it runs code: {e}")))
             .or(too_deep.then(|| "its links go too deep to follow".to_string()));
-        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, folder: None, read, exec: exec.is_some() })
+        Some(Reached { shown: self.shown(&real), real, place, why, sensitive, deep: too_deep, folder: None, read, exec: exec.is_some(), config: false })
+    }
+
+    /// Where `path` leads when that is one of the workspace's [`RUNS_CODE`]
+    /// files, or (`folder`, for a command, which may write into it) the
+    /// `.claude` folder that holds them. Compared without case, since the
+    /// volume is case-insensitive. Only a name that could be one, or (with
+    /// `links`, when the caller hasn't already seen it isn't one) a link, is
+    /// resolved.
+    fn config_file(&self, path: &Path, folder: bool, links: bool) -> Option<Reached> {
+        let root = self.root.as_deref()?;
+        let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let maybe = matches!(name.as_str(), "mcp.json" | "settings.json" | "settings.local.json" | ".claude")
+            || (links && path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()));
+        if !maybe {
+            return None;
+        }
+        let real = resolve(path).unwrap_or_else(|| lexical(path));
+        let rel = real.strip_prefix(root).ok()?;
+        let is = |f: &str| under(rel, Path::new(f)) && rel.components().count() == Path::new(f).components().count();
+        if !(RUNS_CODE.iter().any(|f| is(f)) || (folder && is(".claude"))) {
+            return None;
+        }
+        Some(Reached {
+            shown: self.shown(&real),
+            real,
+            place: "in the workspace",
+            why: Some("it can make Octopush or Claude Code run commands".to_string()),
+            sensitive: true,
+            deep: false,
+            folder: None,
+            read: false,
+            exec: false,
+            config: true,
+        })
+    }
+
+    /// [`Reach::config_file`] for a glob `pattern` from `base`: the first of
+    /// the workspace's [`RUNS_CODE`] files, or their `.claude` folder, that it
+    /// could match, whether or not it exists yet. Component by component as
+    /// bash matches (a `*` never matches a leading `.`), without case.
+    fn glob_config_file(&self, base: &Path, pattern: &str) -> Option<Reached> {
+        let root = self.root.as_deref()?;
+        let parts: Vec<&str> = pattern.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        let matches = |name: &str, part: &str| {
+            if !has_glob(part) {
+                return unescape(part).eq_ignore_ascii_case(name);
+            }
+            let glob = globset::GlobBuilder::new(part).backslash_escape(true).case_insensitive(true).build();
+            (part.starts_with('.') || !name.starts_with('.')) && glob.is_ok_and(|g| g.compile_matcher().is_match(name))
+        };
+        let candidates = RUNS_CODE.iter().copied().chain([".claude"]);
+        let hit = candidates.map(|f| root.join(f)).find(|target| {
+            let Ok(rest) = target.strip_prefix(base) else { return false };
+            let names: Vec<String> = rest.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            names.len() == parts.len() && names.iter().zip(&parts).all(|(n, p)| matches(n, p))
+        })?;
+        let mut r = self.config_file(&hit, true, false)?;
+        r.shown = format!("{} (a pattern that can match {})", unescape(pattern), r.shown);
+        Some(r)
     }
 
     /// The card an agent's `run_command` must pass (#1201), or `None`. Every
@@ -977,6 +1082,7 @@ impl Reach {
         let mut scan = Scan { grants, granted, glob_names: MAX_GLOB_NAMES, ..Scan::default() };
         let first = self.scan(command, start, &mut scan);
         let ungrantable = scan.ungrantable;
+        let kind = if first.as_ref().is_some_and(|r| r.config) { CardKind::Config } else { CardKind::Run };
         let (reason, denial, sensitive, grant) = match (first, scan.over, scan.outside) {
             (Some(r), ..) | (None, false, Some(r)) => (
                 r.reason(&format!("reaches {}", r.shown)),
@@ -1002,7 +1108,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-        Some(ToolCard { kind: CardKind::Run, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None, diff: None, bound: None })
+        Some(ToolCard { kind, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None, diff: None, bound: None })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location
@@ -1129,6 +1235,13 @@ impl Reach {
                     },
                 },
             };
+            // A pattern that could name a file that runs commands asks, even
+            // before the file exists (#1245).
+            if has_glob(rel) {
+                if let Some(hit) = self.glob_config_file(base, rel) {
+                    return (Some(hit), None);
+                }
+            }
             let paths = if has_glob(rel) {
                 match glob_paths(base, rel, &mut scan.glob_names) {
                     Some(paths) => paths,
@@ -1169,6 +1282,11 @@ impl Reach {
         }
         // A missing name written to is a file the command creates: it counts.
         let stays = plain.is_some_and(|fast| path.symlink_metadata().map_or(fast || !ctx.writes, |m| fast && !m.file_type().is_symlink()));
+        // Read or written: the check can't tell which a program does. A name
+        // that stays put was already seen not to be a link.
+        if let Some(hit) = self.config_file(path, true, !stays) {
+            return Some(hit);
+        }
         scan.resolved += usize::from(!stays);
         if scan.seen.len() > MAX_COMMAND_WORDS || scan.resolved > MAX_COMMAND_PATHS {
             scan.over = true;
@@ -1293,6 +1411,9 @@ struct Reached {
     read: bool,
     /// A place that runs code ([`Reach::runs_code`]).
     exec: bool,
+    /// One of the workspace's [`RUNS_CODE`] files (or their folder), which
+    /// always asks on a Config card (#1245).
+    config: bool,
 }
 
 impl Reached {
@@ -1389,6 +1510,7 @@ fn named_credential(pattern: &str, spliced: &str) -> Option<Reached> {
         folder: None,
         read: false,
         exec: false,
+        config: false,
     })
 }
 
@@ -1804,6 +1926,51 @@ mod tests {
         assert_eq!(card(&at_home, "read_file", "notes.txt"), None);
     }
 
+    #[test]
+    fn a_change_to_a_file_that_runs_commands_always_asks_deny_first() {
+        // #1245: the project's MCP servers and Claude Code's project settings.
+        let (_d, ws, home) = setup();
+        let reach = Reach::new(&ws, None, Some(&home));
+        for path in [".claude/mcp.json", ".claude/settings.json", ".claude/settings.local.json", "./.Claude/MCP.json"] {
+            for tool in ["write_file", "edit_file"] {
+                let c = card(&reach, tool, path).unwrap_or_else(|| panic!("{tool} {path}"));
+                assert_eq!((c.kind, c.sensitive), (CardKind::Config, true), "{tool} {path}");
+                assert!(c.reason.ends_with("it can make Octopush or Claude Code run commands"), "{}", c.reason);
+                assert!(c.denial.contains("do not retry"), "{}", c.denial);
+            }
+            // A sandbox lets a write in the workspace through: it asks there too.
+            let sandboxed = reach.outside_card(None, "write_file", &json!({"path": path, "content": "{}"}), true, &[]);
+            assert_eq!(sandboxed.map(|c| c.kind), Some(CardKind::Config), "{path}");
+            assert_eq!(card(&reach, "read_file", path), None, "reading it doesn't ask");
+        }
+        assert_eq!(card(&reach, "write_file", ".claude/agents/x.md"), None, "only the files that run commands");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(ws.join(".claude")).unwrap();
+            std::os::unix::fs::symlink(ws.join(".claude/mcp.json"), ws.join("cfg")).unwrap();
+            assert_eq!(card(&reach, "write_file", "cfg").map(|c| c.kind), Some(CardKind::Config), "through a link");
+        }
+        // A command that names one, or their folder, asks whether it reads or writes.
+        for command in [
+            "echo '{}' > .claude/mcp.json",
+            "cat .claude/settings.json",
+            "cp evil.json .claude/settings.local.json",
+            "rm -rf .claude",
+        ] {
+            let c = reach.command_card(None, command, None, &[]).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!((c.kind, c.sensitive), (CardKind::Config, true), "{command}");
+        }
+        assert_eq!(reach.command_card(None, "cat a.txt", None, &[]), None);
+        // A pattern that could match one asks too, before the file exists.
+        for command in ["echo x > .cl*/mcp.json", "cp evil.json .claude/settings*.json", "tee .[c]laude/MCP.JSON", "rm -r .c?aude"] {
+            let c = reach.command_card(None, command, None, &[]).unwrap_or_else(|| panic!("{command}"));
+            assert_eq!((c.kind, c.sensitive), (CardKind::Config, true), "{command}");
+        }
+        for command in ["cat *.txt", "ls .claude/agents/*.md"] {
+            assert_eq!(reach.command_card(None, command, None, &[]).map(|c| c.kind), None, "{command}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_linked_credentials_folder_still_counts() {
@@ -1924,8 +2091,10 @@ mod tests {
         // A composed and a decomposed spelling are the same path.
         assert!(same_path(&out.join("Caf\u{E9}/x"), &out.join("Cafe\u{301}/X")));
         assert!(!same_path(&out.join("Cafe\u{301}/x"), &out.join("cafe/x")));
-        // The workspace's own: as before.
-        for rel in [".claude/settings.json", ".github/workflows/ci.yml", "CLAUDE.md"] {
+        // The workspace's own: as before, except a file that runs commands,
+        // which asks on its Config card (#1245).
+        assert_eq!(write(ws.join(".claude/settings.json"), &[]).map(|c| c.kind), Some(CardKind::Config));
+        for rel in [".github/workflows/ci.yml", "CLAUDE.md"] {
             assert_eq!(write(ws.join(rel), &[]), None, "{rel} in the workspace");
         }
     }
@@ -2338,8 +2507,12 @@ mod tests {
         // More nested commands than the caps: read flat, so a path still counts.
         assert_eq!(run(&reach, &"echo $(date) ".repeat(65)), None);
         assert!(run(&reach, &"echo $(cat ~/.ssh/id_ed25519) ".repeat(65)).is_some_and(|c| c.sensitive));
-        // A blow-up past the caps takes minutes; a loaded CI runner takes a
-        // few seconds for all of it (5s failed there at 5.2s to 7.5s).
+        // A guard against super-linear blowups, not a benchmark: the debug
+        // build on a shared CI runner, with the other tests in parallel, runs
+        // this 3–4× slower than a quiet machine, and 5 s failed there now
+        // and then. A real regression (a cap ignored, a path walked per
+        // repeat) grows with the 50 000 words and 100 000 braces above, far
+        // past 20 s, so this still catches it.
         assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     }
 

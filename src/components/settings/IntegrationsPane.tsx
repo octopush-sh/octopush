@@ -10,6 +10,7 @@ import { copyToClipboard } from "../../lib/clipboard";
 import { PaneHeader, SectionLabel } from "./shared";
 import { IssueTrackingSection } from "./IssueTrackingSection";
 import { McpServersSection } from "./McpServersSection";
+import { ProjectMcpApprovals } from "./ProjectMcpApprovals";
 
 export function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void }) {
   return (
@@ -28,6 +29,7 @@ export function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void
 
       {/* ── MCP servers Octopush connects to (chat tools) ── */}
       <McpServersSection />
+      <ProjectMcpApprovals />
     </>
   );
 }

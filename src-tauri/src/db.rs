@@ -1412,6 +1412,21 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN group_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN group_id TEXT")?;
 
+        // ── A project's own MCP servers (#1245): what the user approved, per
+        // project, bound to a hash of the server's `.claude/mcp.json` entry.
+        // Deleted with the project.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS mcp_project_approvals (
+                project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                server      TEXT NOT NULL,
+                hash        TEXT NOT NULL,
+                approved_at TEXT NOT NULL,
+                PRIMARY KEY (project_id, server)
+            );
+            "#,
+        )?;
+
         // ── Starts after (#960): a mission that waits on another mission of
         // the same project. `after_workspace_id` names the prerequisite (no
         // foreign key: deleting or archiving it clears the link in
@@ -4151,6 +4166,65 @@ impl Db {
                 updated_at: r.get(5)?,
                 pinned: r.get::<_, i64>(6)? != 0,
             })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The project a worktree belongs to: a workspace's, or a project opened
+    /// at that path.
+    pub fn project_id_for_worktree(&self, path: &str) -> AppResult<Option<String>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT project_id FROM workspaces WHERE worktree_path = ?1
+                 UNION ALL SELECT id FROM projects WHERE path = ?1 LIMIT 1",
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// The entry hash the user approved for a project's MCP server (#1245).
+    pub fn project_mcp_approval(&self, project_id: &str, server: &str) -> AppResult<Option<String>> {
+        let hash: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT hash FROM mcp_project_approvals WHERE project_id = ?1 AND server = ?2",
+                params![project_id, server],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hash)
+    }
+
+    /// Approve a project's MCP server with the entry hash `hash`, replacing
+    /// an approval of another entry.
+    pub fn approve_project_mcp_server(&self, project_id: &str, server: &str, hash: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO mcp_project_approvals (project_id, server, hash, approved_at) VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, server, hash, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget an approval; whether there was one.
+    pub fn revoke_project_mcp_server(&self, project_id: &str, server: &str) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM mcp_project_approvals WHERE project_id = ?1 AND server = ?2",
+            params![project_id, server],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Every approval, for Settings: project id and name, server, when.
+    pub fn list_project_mcp_approvals(&self) -> AppResult<Vec<ProjectMcpApproval>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.project_id, p.name, a.server, a.approved_at FROM mcp_project_approvals a
+             JOIN projects p ON p.id = a.project_id ORDER BY p.name, a.server",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ProjectMcpApproval { project_id: r.get(0)?, project_name: r.get(1)?, server: r.get(2)?, approved_at: r.get(3)? })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -9609,6 +9683,16 @@ pub struct PipelineStageRow {
     pub escalate_effort: Option<crate::providers::Effort>,
     /// The MCP servers an API stage may use; empty ⇒ none (#1134).
     pub mcp_servers: Vec<String>,
+}
+
+/// One approved project MCP server (#1245), as Settings lists it.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMcpApproval {
+    pub project_id: String,
+    pub project_name: String,
+    pub server: String,
+    pub approved_at: String,
 }
 
 /// A row for the canonical `spend_events` ledger.

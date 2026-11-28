@@ -423,15 +423,21 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         }
         _ => (format!("calls {name}, which can change files"), None, None),
     };
+    let reason = match runs_code {
+        true => format!("{reason} \u{b7} it can make Octopush or Claude Code run commands"),
+        false => reason,
+    };
     let shown = if path.is_empty() { name.to_string() } else { path };
     card(CardKind::Edit, shown, format!("{reason} (Ask first)"), ASK_DECLINED_CHANGE, diff, bound)
 }
 
 /// Whether Ask first's card reads the file `name` changes at `path` to show
 /// its diff: inside the workspace, and not named like an env file or a key.
+/// A workspace file that runs commands (`talk_guard::RUNS_CODE`) keeps its
+/// preview: its own Config card asks after this one (#1245).
 fn previewed(reach: &Reach, name: &str, input: &Value, path: &str) -> bool {
     let marked = crate::secret_scan::is_env_file(path) || crate::secret_scan::is_sensitive_name(path);
-    !marked && reach.outside_card(None, name, input, false, &[]).is_none()
+    !marked && reach.outside_card(None, name, input, false, &[]).is_none_or(|c| c.kind == CardKind::Config)
 }
 
 /// What an Ask first approval binds to (#1231): the SHA-256 of the file at
@@ -1356,6 +1362,21 @@ mod tests {
             let c = ask_card(None, "write_file", &json!({ "path": path, "content": "x" }), &reach);
             assert_eq!((c.kind, c.shown.as_str(), c.diff.as_deref()), (CardKind::Edit, path, None), "{path}");
         }
+        // A file that runs commands keeps its diff, and its Config card still
+        // asks after this one (#1245).
+        std::fs::create_dir_all(ws.path().join(".claude")).unwrap();
+        std::fs::write(ws.path().join(".claude/mcp.json"), "{}\n").unwrap();
+        let mcp = json!({ "path": ".claude/mcp.json", "content": "{\"mcpServers\":{}}\n" });
+        let c = ask_card(None, "write_file", &mcp, &reach);
+        assert_eq!(c.kind, CardKind::Edit);
+        assert_eq!(c.reason, "writes a file \u{b7} it can make Octopush or Claude Code run commands (Ask first)");
+        assert_eq!(c.diff.as_deref(), Some("@@ -1,1 +1,1 @@\n-{}\n+{\"mcpServers\":{}}"));
+        assert_eq!(reach.outside_card(None, "write_file", &mcp, false, &[]).map(|g| g.kind), Some(CardKind::Config));
+        let settings = ask_card(None, "write_file", &json!({ "path": ".claude/settings.json", "content": "{}\n" }), &reach);
+        assert_eq!(settings.diff.as_deref(), Some("@@ -0,0 +1,1 @@\n+{}"), "a new one previews too");
+        // Claude Code's local settings may hold credentials: no preview, as before.
+        let local = ask_card(None, "write_file", &json!({ "path": ".claude/settings.local.json", "content": "{}\n" }), &reach);
+        assert_eq!(local.diff, None);
         // A command's card shows the command; a sub-agent's names it.
         let run = ask_card(Some("Fix the tests"), "run_command", &json!({ "command": "npm test" }), &reach);
         assert_eq!((run.kind, run.shown.as_str()), (CardKind::Exec, "npm test"));
@@ -1892,9 +1913,11 @@ mod tests {
             "match crate::permissions::decide(mode, &call, &ctx) {",
             "let git_outside = mode == crate::permissions::Mode::Ask && !mode_denied && u.name == \"run_command\" && {",
             "crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))",
-            "let held = (mode_asks.contains(&u.id) || git_outside || loose_shell) && skill_refusal.is_none();",
-            "&& !self.talk_shell.strict_wanted(&request.thread_id);",
-            "matches!(mode, crate::permissions::Mode::Ask | crate::permissions::Mode::Plan),",
+            "let held = (mode_asks.contains(&u.id) || git_outside || loose_shell.is_some()) && skill_refusal.is_none();",
+            "crate::talk_shell::Strictness::Verified => None,",
+            "let entered = self.talk_shell.set_strict(&request.thread_id, strict_mode);",
+            "tokio::task::spawn_blocking(move || shell.restart_strict(&tid, &wp, label)).await;",
+            "true => shell.run_capture_read_only(&tid, &wp, &command, std::time::Duration::from_secs(600)),",
             "if held && pre_refused.is_none() {",
             "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
             "if !reach.checked(&granted).await {",

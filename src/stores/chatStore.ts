@@ -199,8 +199,10 @@ export interface PendingApproval {
 }
 
 /** `edit` and `exec` are Ask first's cards (#1231): a file change (or
- *  another tool that may write) and a command that doesn't only read. */
-export type ApprovalKind = "mcp" | "read" | "write" | "run" | "edit" | "exec";
+ *  another tool that may write) and a command that doesn't only read.
+ *  `config`: a change to a workspace file that runs commands; `server`: a
+ *  project's own MCP server waiting for approval (#1245). */
+export type ApprovalKind = "mcp" | "read" | "write" | "run" | "edit" | "exec" | "config" | "server";
 
 /** The card fields a request carries beyond its command and reason. */
 function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command" | "reason">) {

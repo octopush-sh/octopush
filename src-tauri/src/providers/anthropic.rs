@@ -607,7 +607,7 @@ pub fn parse_response(response: Value) -> LlmResponse {
                     let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let input = block.get("input").cloned().unwrap_or(json!({}));
-                    tool_uses.push(LlmToolUse { id, name, input });
+                    tool_uses.push(LlmToolUse { id, name, input, input_error: None });
                 }
                 _ => {}
             }

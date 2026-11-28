@@ -126,8 +126,21 @@ struct Session {
     cwd: String,
     /// Per-session random token mixed into the prompt marker.
     nonce: String,
-    /// [`apply_strict_shell`] ran in it: no alias or profile function left.
-    strict: bool,
+    /// Whether Ask first may give its commands a read-only verdict (#1231).
+    strict: Strictness,
+}
+
+/// Whether a Talk shell is fit for Ask first's read-only verdicts (#1231).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Strictness {
+    /// Not started fresh and cleaned, or something not read-only ran in it
+    /// since: what its words run is unknown.
+    Unchecked,
+    /// Started fresh ([`TalkShell::restart_strict`]), cleaned
+    /// ([`apply_strict_shell`]), and its report said nothing was left.
+    Verified,
+    /// Started fresh and cleaned, but the cleanup didn't hold: why.
+    Failed(String),
 }
 
 pub struct TalkShell {
@@ -151,29 +164,78 @@ impl TalkShell {
         }
     }
 
-    /// Whether the thread's shell must be strict (#1231): Ask first and Plan
-    /// only want it, read at each round. A shell made strict stays so until
-    /// it restarts, whatever the mode is set to after.
-    pub fn set_strict(&self, thread_id: &str, want: bool) {
+    /// Whether the thread is in Ask first or Plan only (#1231), read at each
+    /// round. `true` when it just entered them (or this process just started),
+    /// when its shell is to start fresh ([`Self::restart_strict`]).
+    pub fn set_strict(&self, thread_id: &str, want: bool) -> bool {
         let mut strict = self.strict.lock();
         if want {
-            strict.insert(thread_id.to_string());
+            strict.insert(thread_id.to_string())
         } else {
             strict.remove(thread_id);
+            false
         }
     }
 
-    /// Whether the thread's next command is sure to run in a strict shell:
-    /// it is wanted, and [`Self::run`] makes the shell strict before it runs
-    /// anything or runs nothing. Until then no command reads as read-only.
-    pub fn strict_wanted(&self, thread_id: &str) -> bool {
-        self.strict.lock().contains(thread_id)
+    /// Whether the thread's shell is in use by this process yet.
+    pub fn has_session(&self, thread_id: &str) -> bool {
+        self.sessions.lock().contains_key(thread_id)
     }
 
-    /// Whether the thread's shell has been made strict.
-    #[cfg(test)]
-    pub fn is_strict(&self, thread_id: &str) -> bool {
-        self.sessions.lock().get(thread_id).is_some_and(|h| h.lock().strict)
+    /// Whether the thread's shell may host a read-only verdict now.
+    pub fn strictness(&self, thread_id: &str) -> Strictness {
+        self.sessions.lock().get(thread_id).map_or(Strictness::Unchecked, |h| h.lock().strict.clone())
+    }
+
+    /// Restart, don't clean (#1231): kill the thread's shell, whatever state
+    /// earlier commands left in it, start a fresh `bash -l` in the same
+    /// directory when it is known (else `workspace_path`), say so in the
+    /// terminal ("Shell restarted for <mode>"), then run
+    /// [`apply_strict_shell`] on that fresh shell. A shell busy with a live
+    /// process isn't killed: it stays unchecked.
+    pub fn restart_strict(&self, thread_id: &str, workspace_path: &str, mode: &str) -> Strictness {
+        let Some(client) = self.client.lock().clone() else {
+            return Strictness::Failed("the terminal daemon is unavailable".into());
+        };
+        let old = self.sessions.lock().get(thread_id).cloned();
+        if let Some(old) = &old {
+            if old.lock().rx.is_none() {
+                return Strictness::Failed("the shell is busy with a running process".into());
+            }
+        }
+        let cwd = old.map(|h| h.lock().cwd.clone()).filter(|c| !c.is_empty()).unwrap_or_else(|| workspace_path.to_string());
+        self.sessions.lock().remove(thread_id);
+        let id = format!("talk-{thread_id}");
+        let _ = client.remove(&id);
+        // Never attach to the old one again: wait until it is gone.
+        let gone = || !client.list_terminals().unwrap_or_default().iter().any(|t| t.id == id && t.running);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !gone() {
+            if Instant::now() > deadline {
+                return Strictness::Failed("the old shell didn't stop".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let extra = self.spawn_env.lock().get(thread_id).cloned().unwrap_or_default();
+        let mut session = match Self::ensure_session(&client, thread_id, &cwd, &extra) {
+            Ok(session) => session,
+            Err(e) => return Strictness::Failed(format!("the shell didn't start again: {e}")),
+        };
+        if let Some(rx) = session.rx.take() {
+            drain_pending(&rx);
+            let note = format!("\\builtin printf '%s\\n' 'Shell restarted for {mode}'\n");
+            if client.write(&session.id, note.as_bytes()).is_ok() {
+                let _ = probe(&rx, Duration::from_secs(5), &session.nonce);
+            }
+            session.strict = match apply_strict_shell(&client, &session.id, &rx, &session.nonce) {
+                Ok(()) => Strictness::Verified,
+                Err(why) => Strictness::Failed(why),
+            };
+            session.rx = Some(rx);
+        }
+        let state = session.strict.clone();
+        self.sessions.lock().insert(thread_id.to_string(), Arc::new(Mutex::new(session)));
+        state
     }
 
     /// Set the variables the thread's shell starts with the next time it is
@@ -213,6 +275,21 @@ impl TalkShell {
         timeout: Duration,
         promote: bool,
     ) -> AppResult<RunOutcome> {
+        self.run_as(thread_id, workspace_path, command, timeout, promote, false)
+    }
+
+    /// [`Self::run`]. `keeps_strict`: the command had Ask first's read-only
+    /// verdict in a verified shell, so it leaves it verified; anything else
+    /// leaves it [`Strictness::Unchecked`] (#1231).
+    fn run_as(
+        &self,
+        thread_id: &str,
+        workspace_path: &str,
+        command: &str,
+        timeout: Duration,
+        promote: bool,
+        keeps_strict: bool,
+    ) -> AppResult<RunOutcome> {
         let client = self
             .client
             .lock()
@@ -245,18 +322,10 @@ impl TalkShell {
             (rx, session.nonce.clone(), session.id.clone(), session.cwd.clone())
         };
 
-        // Ask first and Plan only (#1231): the shell is made strict before it
-        // runs anything, on start, on reattach and after a switch into them;
-        // if it can't be, nothing runs.
-        if self.strict_wanted(thread_id) && !handle.lock().strict {
-            if !apply_strict_shell(&client, &id, &rx, &nonce) {
-                handle.lock().rx = Some(rx);
-                return Err(AppError::Other(
-                    "Talk couldn't clear this shell's aliases and functions for the conversation's mode, so nothing ran."
-                        .into(),
-                ));
-            }
-            handle.lock().strict = true;
+        // What a command other than a verified read-only one leaves in the
+        // shell is unknown (#1231): an alias, a function, a trap.
+        if !keeps_strict || handle.lock().strict != Strictness::Verified {
+            handle.lock().strict = Strictness::Unchecked;
         }
 
         // Discard any stale bytes (the idle prompt left in the buffer) so the
@@ -382,6 +451,21 @@ impl TalkShell {
         }
     }
 
+    /// [`Self::run_capture`] for a command with Ask first's read-only verdict
+    /// in a verified shell, which stays verified (#1231).
+    pub fn run_capture_read_only(
+        &self,
+        thread_id: &str,
+        workspace_path: &str,
+        command: &str,
+        timeout: Duration,
+    ) -> AppResult<CaptureOutcome> {
+        match self.run_as(thread_id, workspace_path, command, timeout, false, true)? {
+            RunOutcome::Done(r) => Ok(CaptureOutcome::Done(r)),
+            RunOutcome::Busy | RunOutcome::Live(_) => Ok(CaptureOutcome::Busy),
+        }
+    }
+
     /// Send SIGINT (Ctrl-C) to a thread's live process.
     pub fn interrupt(&self, thread_id: &str) {
         if let Some(client) = self.client.lock().clone() {
@@ -454,7 +538,7 @@ impl TalkShell {
                     rx: Some(rx),
                     cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
                     nonce,
-                    strict: false,
+                    strict: Strictness::Unchecked,
                 })
             }
             // Reattached but never ready — the surviving shell is busy with a
@@ -539,30 +623,76 @@ fn apply_git_hardening(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermE
     }
 }
 
-/// The line that makes a Talk shell strict ([`apply_strict_shell`]): no
-/// alias, alias expansion off, and every function unset but Octopush's own
-/// prompt functions (`__octo_*`). Each builtin is named as `\builtin` so an
-/// alias of its name can't stand in.
-const STRICT_SHELL_LINE: &str = "__octo_strict() { \\builtin unalias -a; \\builtin shopt -u expand_aliases; \\builtin local f; \
-    while \\builtin read -r _ _ f; do case \"$f\" in __octo_*) ;; *) \\builtin unset -f \"$f\" ;; esac; done < <(\\builtin declare -F); }; \
-    __octo_strict; \\builtin unset -f __octo_strict\n";
+/// The two lines that make a Talk shell strict ([`apply_strict_shell`]),
+/// with `nonce` in the new prompt marker and `tag` on the report. Pure.
+///
+/// The first runs with the profile's aliases still on, so each word it runs
+/// is a `\`-named builtin, and in POSIX mode (`POSIXLY_CORRECT`), where a
+/// special builtin (`trap`, `unset`) is found before a function of its name:
+/// it drops the DEBUG, RETURN, ERR and EXIT traps, the functions that could
+/// stand in for the builtins it uses next, every alias, alias expansion,
+/// `PROMPT_COMMAND`, `PS0` and `command_not_found_handle`, and leaves an
+/// empty prompt. The second, read once aliases are gone, unsets every
+/// function `declare -F` lists (Octopush's own prompt functions too), sets
+/// a prompt marker that needs no function (`printf` in `PS1`), and prints
+/// one report line: the aliases, functions and traps left, and whether
+/// `PROMPT_COMMAND` is set.
+fn strict_shell_lines(nonce: &str, tag: &str) -> String {
+    let first = "POSIXLY_CORRECT=1; \\trap - DEBUG RETURN ERR EXIT; \
+        \\unset -f unset builtin command declare read printf trap shopt unalias alias set enable eval exec source local; \
+        \\unset POSIXLY_CORRECT; \\builtin unalias -a; \\builtin shopt -u expand_aliases; \
+        \\builtin unset PROMPT_COMMAND PS0 command_not_found_handle; PS1=''";
+    let count = |var: &str, of: &str| {
+        format!("{var}=0; while \\builtin read -r _; do {var}=$(({var}+1)); done < <(\\builtin {of}); ")
+    };
+    let second = format!(
+        "while \\builtin read -r _ _ __octo_f; do \\builtin unset -f \"$__octo_f\"; done < <(\\builtin declare -F); \
+         \\builtin set +H; \\builtin unset CDPATH __octo_f; __OCTORS=$(\\builtin printf '\\036'); \
+         {}{}{}\\builtin printf 'OCTO_STRICT_%s:%d:%d:%d:%s\\n' {tag} \"$__octo_a\" \"$__octo_n\" \"$__octo_t\" \"${{PROMPT_COMMAND+set}}\"; \
+         \\builtin unset __octo_a __octo_n __octo_t; \
+         PS1='$(printf \"%s%sOCTO_DONE_%s:%d:%s%s%s\" \"$__OCTORS\" \"$__OCTORS\" {nonce} \"$?\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\")'",
+        count("__octo_a", "alias"),
+        count("__octo_n", "declare -F"),
+        count("__octo_t", "trap -p"),
+    );
+    format!("{first}\n{second}\n")
+}
 
-/// Make the shell strict for Ask first and Plan only (#1231), as git's
-/// hardening is given (see [`apply_git_hardening`]): `bash -l` loads the
-/// user's profile, whose aliases and functions can turn a word the reader
-/// check counts as read-only (`ls`, `git`) into a writer. Runs `unalias -a`,
-/// `shopt -u expand_aliases` and `unset -f` for each function `declare -F`
-/// lists. `true` once the shell confirms it.
-fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) -> bool {
+/// Whether the cleanup held, from the shell's report line tagged `tag` in
+/// `output` ([`strict_shell_lines`]): `Ok` only when it reports no alias, no
+/// function, no trap and no `PROMPT_COMMAND`. Pure.
+fn strict_report(output: &str, tag: &str) -> Result<(), String> {
+    let re = regex::Regex::new(&format!(r"OCTO_STRICT_{}:(\d+):(\d+):(\d+):(\S*)", regex::escape(tag))).expect("valid report regex");
+    let Some(c) = re.captures(output) else {
+        return Err("the shell sent no report after its cleanup".into());
+    };
+    let (aliases, functions, traps, prompt) = (&c[1], &c[2], &c[3], &c[4]);
+    if (aliases, functions, traps, prompt) == ("0", "0", "0", "") {
+        return Ok(());
+    }
+    let pc = if prompt.is_empty() { "" } else { ", and PROMPT_COMMAND is still set" };
+    Err(format!("after its cleanup the shell still has {aliases} alias(es), {functions} function(s) and {traps} trap(s){pc}"))
+}
+
+/// Make a fresh Talk shell strict for Ask first and Plan only (#1231), as
+/// git's hardening is given (see [`apply_git_hardening`]), then prove it:
+/// `bash -l` loads the user's profile, whose aliases, functions, traps and
+/// `PROMPT_COMMAND` can turn a word the reader check counts as read-only
+/// (`ls`, `git`) into a writer. Runs [`strict_shell_lines`] and accepts the
+/// shell only when its report says nothing is left ([`strict_report`]);
+/// the reason otherwise. Only ever run on a shell just started
+/// ([`TalkShell::restart_strict`]): state an earlier command made could
+/// defeat any cleanup.
+fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) -> Result<(), String> {
     drain_pending(rx);
-    if client.write(id, STRICT_SHELL_LINE.as_bytes()).is_err() {
-        return false;
+    let tag = gen_nonce();
+    if client.write(id, strict_shell_lines(nonce, &tag).as_bytes()).is_err() {
+        return Err("the shell couldn't be written to".into());
     }
-    let done = matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. });
-    if !done {
-        tracing::warn!(id, "talk shell did not confirm it was made strict");
+    match probe(rx, Duration::from_secs(10), nonce) {
+        Probe::Done { output, .. } => strict_report(&output, &tag),
+        _ => Err("the shell didn't come back after its cleanup".into()),
     }
-    done
 }
 
 impl LiveRun {
@@ -917,15 +1047,31 @@ mod tests {
     #[test]
     fn a_strict_shell_is_wanted_in_ask_first_and_plan_only_and_drops_aliases_and_functions() {
         let shell = TalkShell::new();
-        assert!(!shell.strict_wanted("t"), "Edit freely: the profile stands");
-        shell.set_strict("t", true);
-        assert!(shell.strict_wanted("t") && !shell.strict_wanted("other"));
-        shell.set_strict("t", false);
-        assert!(!shell.strict_wanted("t"));
-        for part in ["\\builtin unalias -a", "\\builtin shopt -u expand_aliases", "\\builtin declare -F", "\\builtin unset -f \"$f\"", "__octo_*) ;;"] {
-            assert!(STRICT_SHELL_LINE.contains(part), "{part}");
+        assert_eq!(shell.strictness("t"), Strictness::Unchecked, "no shell yet: no read-only verdict");
+        assert!(shell.set_strict("t", true), "entering: the shell starts fresh");
+        assert!(!shell.set_strict("t", true), "staying: it doesn't");
+        assert!(!shell.set_strict("t", false));
+        assert!(shell.set_strict("t", true), "back again: fresh again");
+        let lines = strict_shell_lines("N0NCE", "T4G");
+        let (first, second) = lines.split_once('\n').unwrap();
+        for part in ["POSIXLY_CORRECT=1; \\trap - DEBUG RETURN ERR EXIT;", "\\unset -f unset builtin", "\\builtin unalias -a", "\\builtin shopt -u expand_aliases", "\\builtin unset PROMPT_COMMAND PS0 command_not_found_handle", "PS1=''"] {
+            assert!(first.contains(part), "{part}");
         }
-        assert!(STRICT_SHELL_LINE.ends_with("\\builtin unset -f __octo_strict\n"));
+        for part in ["\\builtin unset -f \"$__octo_f\"", "< <(\\builtin declare -F)", "< <(\\builtin alias)", "< <(\\builtin trap -p)", "OCTO_STRICT_%s", " T4G ", "${PROMPT_COMMAND+set}", " N0NCE "] {
+            assert!(second.contains(part), "{part}");
+        }
+        assert!(!lines.contains("OCTO_DONE_N0NCE"), "the marker is never in the shell's source");
+    }
+
+    /// The shell counts as strict only when its report says nothing is left.
+    #[test]
+    fn a_strict_report_must_say_zero_for_everything() {
+        assert_eq!(strict_report("noise\nOCTO_STRICT_t1:0:0:0:\n", "t1"), Ok(()));
+        let failed = strict_report("OCTO_STRICT_t1:0:1:0:\n", "t1").unwrap_err();
+        assert_eq!(failed, "after its cleanup the shell still has 0 alias(es), 1 function(s) and 0 trap(s)");
+        assert!(strict_report("OCTO_STRICT_t1:0:0:1:set\n", "t1").unwrap_err().ends_with("and 1 trap(s), and PROMPT_COMMAND is still set"));
+        assert_eq!(strict_report("OCTO_STRICT_other:0:0:0:\n", "t1"), Err("the shell sent no report after its cleanup".into()), "another tag isn't the report");
+        assert!(strict_report("", "t1").is_err());
     }
 
     #[test]
@@ -1447,35 +1593,88 @@ mod e2e {
         });
     }
 
-    /// In Ask first and Plan only the shell drops the profile's aliases and
-    /// functions before it runs anything (#1231), so an aliased `ls` or a
-    /// function named `git` can't write behind a read-only verdict. A switch
-    /// into those modes applies it at the next command.
+    /// Ask first, then Edit freely, where the agent defines `ls`, then Ask
+    /// first again: the shell starts fresh and is cleaned, so `ls` is the
+    /// real one and writes nothing (#1231). What the agent left (a DEBUG
+    /// trap, a `PROMPT_COMMAND`) is gone with the old shell.
     #[test]
     #[serial]
-    fn a_strict_shell_runs_the_real_ls_and_git() {
+    fn a_strict_shell_survives_an_ls_defined_in_edit_freely() {
         use crate::orchestrator::cli_runner::with_login_shell_env;
-        let _d = boot();
+        let d = boot();
         let dir = tempfile::tempdir().unwrap();
         let at = dir.path().to_string_lossy().into_owned();
         let quick = Duration::from_secs(20);
         with_login_shell_env(&[], || {
-            let shell = shell_on(&_d.sock);
-            // Edit freely: the profile's alias and function stand.
-            let plant = format!("cd '{at}' && alias ls='touch by-alias' && git() {{ touch by-function; }}");
-            done(shell.run("strict", &at, &plant, quick, false).unwrap());
-            assert!(!shell.is_strict("strict"));
-            // Switched into Ask first: made strict before the next command.
-            shell.set_strict("strict", true);
-            let r = cap(shell.run_capture("strict", &at, "ls >/dev/null; git status >/dev/null 2>&1; type -t ls git; true", quick).unwrap());
-            assert!(shell.is_strict("strict"));
-            assert!(!dir.path().join("by-alias").exists() && !dir.path().join("by-function").exists(), "{}", r.output);
-            assert_eq!(r.output.lines().collect::<Vec<_>>(), ["file", "file"], "the real programs");
-            // Back to Edit freely: the aliases stay gone until the shell restarts.
-            shell.set_strict("strict", false);
-            let r = cap(shell.run_capture("strict", &at, "type -t ls", quick).unwrap());
-            assert_eq!(r.output.trim(), "file");
-            shell.close("strict");
+            let shell = shell_on(&d.sock);
+            assert!(shell.set_strict("rt", true));
+            assert_eq!(shell.restart_strict("rt", &at, "Ask first"), Strictness::Verified);
+            // Edit freely: the agent defines `ls`, a DEBUG trap and a PROMPT_COMMAND.
+            assert!(!shell.set_strict("rt", false));
+            let plant = format!("cd '{at}' && ls(){{ touch x;}} && trap 'touch dbg' DEBUG && PROMPT_COMMAND=\"$PROMPT_COMMAND; touch pc\"");
+            done(shell.run("rt", &at, &plant, quick, false).unwrap());
+            assert_eq!(shell.strictness("rt"), Strictness::Unchecked);
+            for f in ["dbg", "pc"] {
+                let _ = std::fs::remove_file(dir.path().join(f));
+            }
+            // Back to Ask first: a fresh shell, in the same folder.
+            assert!(shell.set_strict("rt", true));
+            assert_eq!(shell.restart_strict("rt", &at, "Ask first"), Strictness::Verified);
+            let r = cap(shell.run_capture_read_only("rt", &at, "ls; type -t ls; pwd", quick).unwrap());
+            for f in ["x", "dbg", "pc"] {
+                assert!(!dir.path().join(f).exists(), "{f}: {}", r.output);
+            }
+            assert!(r.output.contains("file"), "{}", r.output);
+            assert!(r.output.trim_end().ends_with(dir.path().canonicalize().unwrap().to_str().unwrap()) || r.output.trim_end().ends_with(at.as_str()), "{}", r.output);
+            assert_eq!(shell.strictness("rt"), Strictness::Verified, "a read-only command keeps it");
+            done(shell.run("rt", &at, "true", quick, false).unwrap());
+            assert_eq!(shell.strictness("rt"), Strictness::Unchecked, "anything else doesn't");
+            shell.close("rt");
+        });
+    }
+
+    /// The cleanup itself drops a profile's DEBUG trap, `PROMPT_COMMAND`,
+    /// aliases and functions, a hijacked `builtin` included, and reports it;
+    /// what it can't drop (a readonly function) fails the report.
+    #[test]
+    #[serial]
+    fn the_cleanup_drops_traps_and_prompt_command_and_reports_what_it_cant() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().to_string_lossy().into_owned();
+        let quick = Duration::from_secs(20);
+        let clean = |shell: &TalkShell, thread: &str| {
+            let handle = shell.sessions.lock().get(thread).cloned().unwrap();
+            let client = shell.client.lock().clone().unwrap();
+            let (id, nonce, rx) = {
+                let mut s = handle.lock();
+                (s.id.clone(), s.nonce.clone(), s.rx.take().unwrap())
+            };
+            let result = apply_strict_shell(&client, &id, &rx, &nonce);
+            handle.lock().rx = Some(rx);
+            result
+        };
+        with_login_shell_env(&[], || {
+            let shell = shell_on(&d.sock);
+            let plant = format!(
+                "cd '{at}' && alias ls='touch by-alias' && builtin(){{ :;}} && trap 'touch dbg' DEBUG && PROMPT_COMMAND=\"$PROMPT_COMMAND; touch pc\""
+            );
+            done(shell.run("cl", &at, &plant, quick, false).unwrap());
+            assert_eq!(clean(&shell, "cl"), Ok(()));
+            for f in ["dbg", "pc"] {
+                let _ = std::fs::remove_file(dir.path().join(f));
+            }
+            let r = done(shell.run("cl", &at, "ls >/dev/null; trap -p; echo \"pc=${PROMPT_COMMAND+set}\"", quick, false).unwrap());
+            assert_eq!(r.output.trim(), "pc=", "{}", r.output);
+            for f in ["by-alias", "dbg", "pc"] {
+                assert!(!dir.path().join(f).exists(), "{f}");
+            }
+            // A failed report: a readonly function can't be unset.
+            done(shell.run("cl", &at, "f(){ :;}; readonly -f f", quick, false).unwrap());
+            let failed = clean(&shell, "cl").unwrap_err();
+            assert!(failed.contains("1 function(s)"), "{failed}");
+            shell.close("cl");
         });
     }
 
