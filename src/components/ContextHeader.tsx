@@ -8,8 +8,8 @@ import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
 import { issueTypeToken } from "../lib/issueTrackerSelectors";
-import { detectTrackerKey } from "../lib/detectIssueKey";
-import { useIssuesStore, useKnownStory } from "../stores/issuesStore";
+import { detectIssueKeys, detectTrackerKey } from "../lib/detectIssueKey";
+import { isKnownStory as isKnownStoryIn, useIssuesStore, useKnownStory } from "../stores/issuesStore";
 import { copyToClipboard } from "../lib/clipboard";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { HeaderSandbox } from "./HeaderSandbox";
@@ -171,6 +171,24 @@ export function ContextHeader({
   const resolvedKey = manualKey ?? detectedKey;
   const activeKey = resolvedKey && issueTrackerConfigured ? resolvedKey : null;
   const activeIssue = useActiveIssue(activeKey);
+
+  // Under Epiku a branch's dotted id counts once the tracker confirms it. The
+  // open backlog may not be loaded (Companion collapsed) and never holds a
+  // done story, so ask `getIssue` for the ids it doesn't hold (#1283); the
+  // read lands in `detailByKey`, and a token that isn't a story links nothing.
+  const scope = useIssuesStore((s) => s.scope);
+  const loadDetail = useIssuesStore((s) => s.loadDetail);
+  const storyIds =
+    tracker === "epiku" && issueTrackerConfigured && !manualKey
+      ? detectIssueKeys(branch).filter((key) => key.includes(".")).join(" ")
+      : "";
+  useEffect(() => {
+    if (!storyIds) return;
+    const caches = useIssuesStore.getState();
+    for (const key of storyIds.split(" ")) {
+      if (!isKnownStoryIn(caches, key)) void loadDetail(key);
+    }
+  }, [storyIds, scope, loadDetail]);
 
   const parents = useParentIssuesStore((s) => s.parents);
   const loadAncestors = useParentIssuesStore((s) => s.loadAncestors);

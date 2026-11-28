@@ -1,4 +1,4 @@
-import type { Issue } from "../lib/types";
+import type { Issue, TrackerKind } from "../lib/types";
 import { InlineTicketPicker } from "./InlineTicketPicker";
 import { ModalShell } from "./ModalShell";
 
@@ -6,12 +6,14 @@ interface Props {
   candidates: Issue[];
   projectKey: string | null;
   projectId?: string | null;
+  /** The project's tracker, for the picker's copy (#1283). */
+  tracker?: TrackerKind | null;
   title: string;
   onPick: (key: string) => void;
   onClose: () => void;
 }
 
-export function JiraTicketPickerModal({ candidates, projectKey, projectId = null, title, onPick, onClose }: Props) {
+export function JiraTicketPickerModal({ candidates, projectKey, projectId = null, tracker = null, title, onPick, onClose }: Props) {
   return (
     <ModalShell onClose={onClose} ariaLabel={title}>
       <div className="flex max-h-[80vh] w-[560px] flex-col rounded-md border border-octo-hairline bg-octo-panel">
@@ -34,6 +36,7 @@ export function JiraTicketPickerModal({ candidates, projectKey, projectId = null
             candidates={candidates}
             projectKey={projectKey}
             projectId={projectId}
+            tracker={tracker}
             onPick={onPick}
             onCancel={onClose}
           />

@@ -117,11 +117,14 @@ export function WorkContextPanel({
     else setLocalCollapsed(!collapsed);
   }
 
-  // Initial my-issues load.
+  // Initial my-issues load, and again on a tracker scope change (#1283): a
+  // new scope (another tracker, or another Epiku project, after a project
+  // switch or a save in Issue tracking) empties the list.
+  const scope = useIssuesStore((s) => s.scope);
   useEffect(() => {
     if (configured) void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configured]);
+  }, [configured, scope]);
 
   const epicKey = useMemo(
     () => resolveEpicKey(activeIssue, parents),
@@ -301,7 +304,10 @@ export function WorkContextPanel({
           {!configured && (
             <p className="mt-2 text-[12px] text-octo-mute">Connect Jira in Settings →</p>
           )}
-          {configured && projectKey != null && (
+          {/* An Epiku project passes no key (its list is the project's
+              already, `wholeBacklog`), so the key alone can't gate the rows:
+              that hid every story while the pill still counted them. */}
+          {configured && (projectKey != null || wholeBacklog) && (
             <>
               {activePill === "mine" && error && (
                 <p className="mt-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute">

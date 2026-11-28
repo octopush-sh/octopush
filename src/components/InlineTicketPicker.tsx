@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Issue, StatusCategory } from "../lib/types";
+import type { Issue, StatusCategory, TrackerKind } from "../lib/types";
 import { ipc } from "../lib/ipc";
 import { isIssueKey } from "../lib/detectIssueKey";
+import { pickerListCopy } from "../lib/issueTrackerSelectors";
 
 const STATUS_DOT: Record<StatusCategory, string> = {
   todo: "text-octo-mute",
@@ -15,11 +16,15 @@ interface Props {
   projectKey: string | null;
   /** The project whose tracker verifies a typed key (#1127). */
   projectId?: string | null;
+  /** The project's tracker: Epiku's list is the project's open stories, not
+   *  the user's assigned tickets (#1283). */
+  tracker?: TrackerKind | null;
   onPick: (key: string) => void;
   onCancel: () => void;
 }
 
-export function InlineTicketPicker({ candidates, projectKey, projectId = null, onPick, onCancel }: Props) {
+export function InlineTicketPicker({ candidates, projectKey, projectId = null, tracker = null, onPick, onCancel }: Props) {
+  const copy = pickerListCopy(tracker);
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<"project" | "all">(projectKey ? "project" : "all");
   const [highlight, setHighlight] = useState(0);
@@ -175,7 +180,7 @@ export function InlineTicketPicker({ candidates, projectKey, projectId = null, o
               />
               <span className="font-mono text-[11px] text-octo-brass">{query}</span>
               <span className="flex-1 truncate text-[12px] text-octo-sage">
-                (not assigned to you — verified on link)
+                ({copy.notListed} — verified on link)
               </span>
               <span className="font-mono text-[9px] uppercase tracking-[0.15em] text-octo-brass">USE →</span>
             </button>
@@ -184,7 +189,7 @@ export function InlineTicketPicker({ candidates, projectKey, projectId = null, o
 
         {results.length === 0 && !showFallback && (
           <p className="px-1 py-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute">
-            No matches in your assigned tickets.
+            {copy.noMatches}
           </p>
         )}
       </div>
