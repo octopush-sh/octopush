@@ -45,6 +45,7 @@ mod session;
 pub mod session_recap;
 pub mod secret_scan;
 pub mod settings;
+pub mod ship_barrier;
 pub mod skills;
 mod state;
 pub mod sync;
@@ -811,6 +812,16 @@ fn restore_active_sessions(app: tauri::AppHandle, state: &AppState) {
         }
         let mut env = std::collections::HashMap::new();
         guard.apply_env(&mut env);
+        // A workspace whose mission ships nothing (#1238): behind the
+        // process barrier, or not restored.
+        match crate::ship_barrier::terminal_env_for_root(&state.db, &session.project_root) {
+            Ok(barrier) => env.extend(barrier),
+            Err(why) => {
+                tracing::warn!(session = %session.name, %why, "the session's process barrier couldn't be set up");
+                let _ = state.db.lock().update_status(&session.id, SessionStatus::Error);
+                continue;
+            }
+        }
 
         let db_for_hook = std::sync::Arc::clone(&state.db);
         let scanner_hook: crate::pty_manager::OutputHook = Box::new(move |sid, seq, bytes| {

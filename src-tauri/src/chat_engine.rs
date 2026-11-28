@@ -3187,15 +3187,17 @@ fn open_without_links(dir: &Path, name: &std::ffi::OsStr, _check: Option<&crate:
 /// Talk's `run_command` with `input` in `workspace` under `roots`, on a
 /// blocking thread, so the turn's runtime thread stays free; `cancel` (Stop)
 /// kills it mid-run. The output comes back as kept (`run_command_kept`): the
-/// turn cuts the copy its row and the model read.
+/// turn cuts the copy its row and the model read. In a mission that ships
+/// nothing it starts behind the process barrier (`ship_barrier`).
 pub(crate) async fn run_confined(
     workspace: &Path,
     input: &serde_json::Value,
     roots: Option<Vec<String>>,
     cancel: &std::sync::Arc<AtomicBool>,
+    ships_nothing: bool,
 ) -> (String, bool) {
     let (wp, input, flag) = (workspace.to_path_buf(), input.clone(), std::sync::Arc::clone(cancel));
-    tokio::task::spawn_blocking(move || run_command_kept(&wp, &input, roots.as_deref(), Some(&flag)))
+    tokio::task::spawn_blocking(move || run_command_kept(&wp, &input, roots.as_deref(), Some(&flag), ships_nothing))
         .await
         .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
 }
@@ -3210,9 +3212,10 @@ pub(crate) async fn run_builtin(
     roots: Option<Vec<String>>,
     cancel: &std::sync::Arc<AtomicBool>,
     check: Option<crate::talk_guard::WriteCheck>,
+    ships_nothing: bool,
 ) -> (String, bool) {
     let (wp, name, input, flag) = (workspace.to_path_buf(), name.to_string(), input.clone(), std::sync::Arc::clone(cancel));
-    tokio::task::spawn_blocking(move || execute_tool_checked(&wp, &name, &input, roots.as_deref(), Some(&flag), check.as_ref()))
+    tokio::task::spawn_blocking(move || execute_tool_checked(&wp, &name, &input, roots.as_deref(), Some(&flag), check.as_ref(), ships_nothing))
         .await
         .unwrap_or_else(|e| (format!("tool execution task failed: {e}"), false))
 }
@@ -3227,11 +3230,12 @@ async fn run_fallback_shell(
     input: &serde_json::Value,
     reason: &str,
     cancel: &std::sync::Arc<AtomicBool>,
+    ships_nothing: bool,
 ) -> (String, bool) {
     if cancel.load(Ordering::Relaxed) {
         return (format!("(stopped before an isolated shell ran it — {reason})"), false);
     }
-    let (out, ok) = run_confined(workspace, input, None, cancel).await;
+    let (out, ok) = run_confined(workspace, input, None, cancel, ships_nothing).await;
     (format!("(ran in an isolated shell at the workspace root — {reason})\n{out}"), ok)
 }
 
@@ -3440,12 +3444,16 @@ pub(crate) fn execute_tool(
 /// Run `run_command`'s `input` and return its output as captured: up to
 /// `chat_history::COMMAND_CAPTURE_BYTES`, stdout and stderr in arrival order,
 /// then its exit and sandbox notes (all within `COMMAND_KEEP_BYTES`). Under `sandbox_roots` it runs under
-/// seatbelt, fail-closed; `cancel` kills its process group.
+/// seatbelt, fail-closed; `cancel` kills its process group. In a mission
+/// that `ships_nothing` it starts behind the process barrier
+/// (`ship_barrier::Barrier::apply`: the PATH shims first, the push rewrite,
+/// the token scrub), fail-closed too.
 fn run_command_kept(
     workspace_path: &Path,
     input: &serde_json::Value,
     sandbox_roots: Option<&[String]>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ships_nothing: bool,
 ) -> (String, bool) {
     let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
     // Only Talk's director keeps a command running (#1160): every loop that
@@ -3489,6 +3497,14 @@ fn run_command_kept(
     };
     // Git uses a bare repository only when named (#1231).
     command.envs(crate::talk_shell::git_hardening_env());
+    if ships_nothing {
+        // After the hardening, whose `GIT_CONFIG_*` entries the barrier's
+        // follow.
+        match crate::ship_barrier::Barrier::for_workspace(workspace_path) {
+            Ok(barrier) => barrier.apply(&mut command, &path),
+            Err(e) => return (crate::ship_barrier::unavailable(&e), false),
+        }
+    }
     command.current_dir(workspace_path);
     let (out, ok) = wait_command_bounded(command, timeout_secs, cancel);
     (with_read_only_note(out, ok, sandbox_roots), ok)
@@ -3508,11 +3524,13 @@ pub(crate) fn execute_tool_cancellable(
     sandbox_roots: Option<&[String]>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> (String, bool) {
-    execute_tool_checked(workspace_path, name, input, sandbox_roots, cancel, None)
+    execute_tool_checked(workspace_path, name, input, sandbox_roots, cancel, None, false)
 }
 
 /// [`execute_tool_cancellable`] with what a Talk write was checked against
-/// (#1229): `write_file` and `edit_file` check it again where they land.
+/// (#1229): `write_file` and `edit_file` check it again where they land. A
+/// `run_command` in a mission that `ships_nothing` starts behind the
+/// process barrier ([`run_command_kept`]).
 pub(crate) fn execute_tool_checked(
     workspace_path: &Path,
     name: &str,
@@ -3520,12 +3538,13 @@ pub(crate) fn execute_tool_checked(
     sandbox_roots: Option<&[String]>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     check: Option<&crate::talk_guard::WriteCheck>,
+    ships_nothing: bool,
 ) -> (String, bool) {
     match name {
         // Sub-agents and stages read the head and tail; Talk keeps the
         // whole output for recall (`run_command_kept`).
         "run_command" => {
-            let (out, ok) = run_command_kept(workspace_path, input, sandbox_roots, cancel);
+            let (out, ok) = run_command_kept(workspace_path, input, sandbox_roots, cancel, ships_nothing);
             (crate::chat_history::command_excerpt(&out, crate::chat_history::COMMAND_SHOWN_BYTES, !ok, ""), ok)
         }
         "read_file" => {
@@ -6574,7 +6593,7 @@ impl ChatEngine {
                                 Ok(Err(e)) => e.to_string(),
                                 _ => "the shared shell task failed".to_string(),
                             };
-                            let ran = run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await;
+                            let ran = run_fallback_shell(&workspace_path, &u.input, &reason, &cancel, ships_nothing).await;
                             interrupted = cancel.load(Ordering::Relaxed);
                             ran
                         }
@@ -6582,7 +6601,7 @@ impl ChatEngine {
                 } else if u.name == "run_command" {
                     // On the sandbox (Plan only, a sandboxed mission) or without
                     // the shared shell: off the runtime thread, and Stop kills it.
-                    let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
+                    let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel, ships_nothing).await;
                     interrupted = cancel.load(Ordering::Relaxed);
                     (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
                 } else if let Some(refusal) = match pre_refused.take() {
@@ -6600,7 +6619,7 @@ impl ChatEngine {
                     // walk Stop ended reads as stopped.
                     // Taken first: the lock never lives across the await.
                     let landing = write_check.lock().take();
-                    let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await;
+                    let ran = run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing, ships_nothing).await;
                     interrupted = !ran.1 && cancel.load(Ordering::Relaxed);
                     self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1).await;
                     ran
@@ -7400,13 +7419,39 @@ mod continuation_tests {
         assert!(!first.contains("truncated"), "nothing of it was cut");
     }
 
+    /// A command in a mission that ships nothing starts behind the process
+    /// barrier (#1275): the shims first on the PATH it always gets, the push
+    /// rewrite after git's hardening, and a push refused by the shim. A Build
+    /// or Fix mission's command gets exactly the PATH and git configuration
+    /// it had.
+    #[test]
+    fn a_ship_nothing_command_starts_behind_the_process_barrier() {
+        let ws = tempfile::tempdir().unwrap();
+        let path = crate::orchestrator::cli_runner::resolved_cli_path();
+        let probe = serde_json::json!({ "command": "printf '%s|%s|%s' \"$PATH\" \"$GIT_CONFIG_COUNT\" \"${GIT_ASKPASS-unset}\"" });
+        let hardening = crate::talk_shell::git_hardening_env()[0].1.clone();
+        let (out, ok) = run_command_kept(ws.path(), &probe, None, None, false);
+        assert!(ok && out == format!("{path}|{hardening}|{}", std::env::var("GIT_ASKPASS").unwrap_or_else(|_| "unset".into())), "{out}");
+        let barrier = crate::ship_barrier::Barrier::for_workspace(ws.path()).unwrap();
+        let (out, ok) = run_command_kept(ws.path(), &probe, None, None, true);
+        let fields: Vec<&str> = out.split('|').collect();
+        assert!(ok && fields[0] == barrier.path(&path), "{out}");
+        assert!(fields[1].parse::<usize>().unwrap() > hardening.parse::<usize>().unwrap(), "{out}");
+        assert_eq!(fields[2], barrier.askpass().display().to_string(), "{out}");
+        let push = serde_json::json!({ "command": "git push origin main" });
+        let (out, ok) = run_command_kept(ws.path(), &push, None, None, true);
+        assert!(!ok && out.contains("Octopush refused `git`"), "{out}");
+        let (out, _) = run_command_kept(ws.path(), &push, None, None, false);
+        assert!(!out.contains("Octopush refused"), "a Build or Fix mission's push isn't the barrier's: {out}");
+    }
+
     #[test]
     fn output_over_the_keep_cap_recalls_its_end() {
         use crate::chat_history::{command_excerpt, COMMAND_CAPTURE_BYTES, COMMAND_KEEP_BYTES};
         // A real capture over 4 MB keeps its last line with room to spare.
         let ws = tempfile::tempdir().unwrap();
         let input = serde_json::json!({"command": "head -c 4500000 /dev/zero | tr '\\0' x; echo; echo 'error: LAST LINE'; exit 3"});
-        let (out, ok) = run_command_kept(ws.path(), &input, None, None);
+        let (out, ok) = run_command_kept(ws.path(), &input, None, None, false);
         assert!(!ok && out.len() <= COMMAND_CAPTURE_BYTES + 100, "{}", out.len());
         assert!(out.ends_with("error: LAST LINE\n"), "{:?}", &out[out.len().saturating_sub(80)..]);
         // The shared shell's capture, its exit code and the isolated-shell
@@ -8249,7 +8294,7 @@ mod tests {
         let body = &engine[from..to];
         let at = |s: &str| body.find(s).unwrap_or_else(|| panic!("the director's loop no longer has: {s}"));
         let check = at("self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await");
-        let run = at("run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await");
+        let run = at("run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing, ships_nothing).await");
         let note = at("self.note_file_seen(&request.thread_id, &workspace_path, &u.name, &u.input, ran.1).await");
         assert!(check < at("write_refused = true;") && check < run && run < note, "{body}");
         assert!(body.contains("&& !mode_denied && !write_refused"), "a refused write is recorded as an edit");
@@ -8342,7 +8387,7 @@ mod tests {
         // Talk: the whole output comes back, and the row and the model keep the tail.
         let cancel = Arc::new(AtomicBool::new(false));
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let (full, ok) = rt.block_on(run_confined(dir.path(), &input, None, &cancel));
+        let (full, ok) = rt.block_on(run_confined(dir.path(), &input, None, &cancel, false));
         assert!(!ok && full.starts_with("1\n") && full.contains("\n100000\n") && full.ends_with("assertion failed: LAST\n"));
         let (row, kept) = cut_command_output("run_command", full.clone(), true);
         assert_eq!(kept.as_deref(), Some(full.as_str()), "kept for recall");
@@ -8414,7 +8459,7 @@ mod tests {
         let roots = vec![ws.path().to_string_lossy().into_owned()];
         let cancel = Arc::new(AtomicBool::new(false));
         let input = serde_json::json!({ "command": "echo MARK_PRE; sleep 30", "timeout_secs": 3600 });
-        let (out, ok, after) = stopped_after_300ms(&cancel, run_confined(ws.path(), &input, Some(roots.clone()), &cancel));
+        let (out, ok, after) = stopped_after_300ms(&cancel, run_confined(ws.path(), &input, Some(roots.clone()), &cancel, false));
         let _ = crate::orchestrator::sandbox::remove_workspace_build_caches(&roots[0]);
         assert!(!ok, "{out}");
         assert!(after < std::time::Duration::from_secs(1), "Stop took {after:?} to end the command: {out}");
@@ -8426,7 +8471,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let input = serde_json::json!({ "command": "sleep 30" });
-        let (out, ok, after) = stopped_after_300ms(&cancel, run_fallback_shell(ws.path(), &input, "busy", &cancel));
+        let (out, ok, after) = stopped_after_300ms(&cancel, run_fallback_shell(ws.path(), &input, "busy", &cancel, false));
         assert!(!ok, "{out}");
         assert!(after < std::time::Duration::from_secs(1), "Stop took {after:?} to end the command: {out}");
         assert!(out.starts_with("(ran in an isolated shell at the workspace root — busy)"), "{out}");
@@ -8434,7 +8479,7 @@ mod tests {
         // Once Stop landed, the fallback never starts the command.
         let input = serde_json::json!({ "command": "touch ran.txt" });
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let (out, ok) = rt.block_on(run_fallback_shell(ws.path(), &input, "busy", &cancel));
+        let (out, ok) = rt.block_on(run_fallback_shell(ws.path(), &input, "busy", &cancel, false));
         assert!(!ok && out.contains("stopped before"), "{out}");
         assert!(!ws.path().join("ran.txt").exists(), "the command ran after Stop");
     }
@@ -8449,7 +8494,7 @@ mod tests {
             ("grep", serde_json::json!({ "pattern": "needle" })),
             ("glob", serde_json::json!({ "pattern": "*.txt" })),
         ] {
-            let (out, ok) = rt.block_on(run_builtin(dir.path(), name, &input, None, &cancel, None));
+            let (out, ok) = rt.block_on(run_builtin(dir.path(), name, &input, None, &cancel, None, false));
             assert!(!ok && out.starts_with("Search stopped"), "{name}: {out}");
         }
         // Without a stop they run as before.
@@ -8827,13 +8872,13 @@ mod tests {
         // Then a subfolder becomes a link to where login items run from.
         std::fs::remove_dir(home.join("out/sub")).unwrap();
         std::os::unix::fs::symlink(home.join("Library/LaunchAgents"), home.join("out/sub")).unwrap();
-        let (msg, ok) = execute_tool_checked(&ws, "write_file", &input, None, None, Some(&check));
+        let (msg, ok) = execute_tool_checked(&ws, "write_file", &input, None, None, Some(&check), false);
         assert!(!ok && msg.contains("changed after it was checked"), "{msg}");
         assert!(!home.join("Library/LaunchAgents/x.plist").exists());
         // As checked, it lands.
         std::fs::remove_file(home.join("out/sub")).unwrap();
         std::fs::create_dir_all(home.join("out/sub")).unwrap();
-        assert!(execute_tool_checked(&ws, "write_file", &input, None, None, Some(&check)).1);
+        assert!(execute_tool_checked(&ws, "write_file", &input, None, None, Some(&check), false).1);
         assert_eq!(std::fs::read_to_string(home.join("out/sub/x.plist")).unwrap(), "c");
     }
 
@@ -9116,7 +9161,7 @@ mod tests {
         let w = granted_write_in(crate::permissions::Mode::Edit);
         assert!(matches!(w.decision, crate::permissions::Decision::Allow) && !w.ask_first && !w.outside);
         let check = w.reach.write_check("write_file", &w.input, false, &w.grants, false);
-        let (msg, ok) = execute_tool_checked(&w.root.join("ws"), "write_file", &w.input, None, None, check.as_ref());
+        let (msg, ok) = execute_tool_checked(&w.root.join("ws"), "write_file", &w.input, None, None, check.as_ref(), false);
         assert!(ok, "{msg}");
         assert_eq!(std::fs::read_to_string(w.root.join("home/out/x.txt")).unwrap(), "c");
     }

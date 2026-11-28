@@ -3179,7 +3179,11 @@ fn stage_context_env(dialect: CliDialect, model: &str, cli_version: Option<&str>
 /// ([`CliDialect::stage_quiet_env`]), a gateway model's context window
 /// ([`stage_context_env`]) and a gateway-named Claude model's full prompt
 /// ([`stage_system_prompt_env`]). The ONE place a stage's env is set — fresh and
-/// `--resume` runs, in-process and detached, all spawn through it.
+/// `--resume` runs, in-process and detached, all spawn through it. In a
+/// mission that ships nothing, `barrier` is its process barrier and the PATH
+/// the stage gets: the shims go first on it, the push rewrite follows the
+/// `GIT_CONFIG_*` entries the stage inherits, and the tokens are removed
+/// (`ship_barrier::Barrier::apply_tokio`). `None` leaves the env as it was.
 pub(crate) fn apply_stage_env(
     command: &mut tokio::process::Command,
     dialect: CliDialect,
@@ -3187,7 +3191,11 @@ pub(crate) fn apply_stage_env(
     effort: Option<crate::providers::Effort>,
     quiet: bool,
     cli_version: Option<&str>,
+    barrier: Option<(&crate::ship_barrier::Barrier, &str)>,
 ) {
+    if let Some((barrier, path)) = barrier {
+        barrier.apply_tokio(command, path, stage_env_value("GIT_CONFIG_COUNT").as_deref());
+    }
     for (k, v) in dialect.stage_env() {
         command.env(k, v);
     }
@@ -3832,6 +3840,19 @@ impl CliRunner {
                 }
             };
 
+        // A mission that ships nothing (#1238): the stage starts behind the
+        // process barrier, or not at all.
+        let barrier = if ctx.ships_nothing {
+            let ws = ctx.workspace_path.clone();
+            match tokio::task::spawn_blocking(move || crate::ship_barrier::Barrier::for_workspace(&ws)).await {
+                Ok(Ok(barrier)) => Some(barrier),
+                Ok(Err(e)) => return Ok(failed_stage(&format!("The process barrier couldn't be set up — refusing to run the stage without it: {e}"))),
+                Err(e) => return Ok(failed_stage(&format!("The process barrier couldn't be set up — refusing to run the stage without it: {e}"))),
+            }
+        } else {
+            None
+        };
+
         let mut command = tokio::process::Command::new(&program);
         command
             .args(&exec_args)
@@ -3846,6 +3867,9 @@ impl CliRunner {
         for (k, v) in sandbox_env {
             command.env(k, v);
         }
+        // Before the stage's own env, which puts the barrier's shims ahead
+        // of it.
+        command.env("PATH", &path_env);
         apply_stage_env(
             &mut command,
             dialect,
@@ -3853,12 +3877,12 @@ impl CliRunner {
             effort,
             ctx.quiet_claude_code,
             cli_version.as_ref().and_then(|v| v.version.as_deref()),
+            barrier.as_ref().map(|b| (b, path_env.as_str())),
         );
         for (k, v) in drop_deferred_env(dialect, resuming, stage.drop_deferred_call) {
             command.env(k, v);
         }
         command
-            .env("PATH", &path_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

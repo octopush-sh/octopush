@@ -6979,7 +6979,7 @@ mod orchestrator_tests {
         ) -> crate::error::AppResult<StageOutcome> {
             use crate::orchestrator::cli_runner::{apply_stage_env, dialect_for_model, QUIET_TRAFFIC_ENV};
             let mut command = tokio::process::Command::new("claude");
-            apply_stage_env(&mut command, dialect_for_model(&stage.agent_model), &stage.agent_model, stage.effort, ctx.quiet_claude_code, None);
+            apply_stage_env(&mut command, dialect_for_model(&stage.agent_model), &stage.agent_model, stage.effort, ctx.quiet_claude_code, None, None);
             let var = command
                 .as_std()
                 .get_envs()

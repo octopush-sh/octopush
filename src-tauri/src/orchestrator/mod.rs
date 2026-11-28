@@ -1261,6 +1261,9 @@ impl Orchestrator {
             // mission (review/probe) is read-only-by-construction: the sandbox is
             // forced on with temp-only write roots regardless of its exec choice.
             let mission = self.db.lock().active_mission_for_workspace(&run.workspace_id)?;
+            // A mission that ships nothing (#1238): its CLI stages start
+            // behind the process barrier.
+            let ships_nothing = mission.as_ref().is_some_and(|m| crate::mission::ships_nothing(&m.intent, &m.git_isolation));
             let git_isolation = mission
                 .as_ref()
                 .map(|m| m.git_isolation.clone())
@@ -1330,6 +1333,7 @@ impl Orchestrator {
                 quiet_claude_code: crate::settings::quiet_claude_code(),
                 mcp,
                 skill_shell_off,
+                ships_nothing,
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

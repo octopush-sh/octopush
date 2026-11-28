@@ -861,7 +861,14 @@ impl TalkProcs {
         let (argv, sandbox_env) = argv_for(&spec)?;
         let launcher = self.store.lock().clone().ensure_launcher().map_err(|e| format!("Not started: the launcher couldn't be written ({e})."))?;
         let launcher = launcher.to_string_lossy().into_owned();
-        let env = launch_env(&spec.env, &argv, sandbox_env);
+        let mut env = launch_env(&spec.env, &argv, sandbox_env);
+        // A mission that ships nothing starts it behind the process barrier
+        // (#1275), as its foreground commands, fail-closed.
+        if spec.posture.ships_nothing {
+            let barrier = crate::ship_barrier::Barrier::for_workspace(std::path::Path::new(&spec.workspace_path))
+                .map_err(|e| crate::ship_barrier::unavailable(&e))?;
+            barrier.daemon_env(&mut env);
+        }
 
         let gate = self.gate.lock();
         let taken: Vec<String> = client.list_terminals().map(|ts| ts.into_iter().filter(|t| t.running).map(|t| t.id).collect()).unwrap_or_default();
@@ -1935,6 +1942,31 @@ mod e2e {
         assert!(!listed[0].running);
         procs.close_thread("t-a");
         assert!(procs.list("t-a").is_empty());
+    }
+
+    /// In a mission that ships nothing a background command starts behind
+    /// the process barrier (#1275): the shims first on its PATH, no token,
+    /// and a push refused by the git shim.
+    #[test]
+    #[serial]
+    fn a_ship_nothing_background_command_starts_behind_the_barrier() {
+        let d = boot();
+        let procs = procs_on(&d);
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let ships = Posture { mode: Mode::Edit, ships_nothing: true, sandboxed: false };
+        let command = "printf 'first=%s token=%s\\n' \"${PATH%%:*}\" \"${GITHUB_TOKEN:-none}\"; git push origin main; echo \"push=$?\"; sleep 30";
+        let mut s = spec("t-s", command, &cwd);
+        s.posture = ships;
+        s.posture_now = Arc::new(move || ships);
+        s.env.push(("GITHUB_TOKEN".to_string(), "ghp_example".to_string()));
+        procs.start(s).unwrap();
+        let out = read_until(&procs, "t-s", "proc-1", None, "push=");
+        let barrier = crate::ship_barrier::Barrier::for_workspace(std::path::Path::new(&cwd)).unwrap();
+        assert!(out.contains(&format!("first={} token=none", barrier.bin().display())), "{out}");
+        assert!(out.contains("Octopush refused `git`") && out.contains("push=1"), "{out}");
+        procs.stop("t-s", "proc-1").unwrap();
+        procs.close_thread("t-s");
     }
 
     /// A command that ends at once says so in its start, with its exit code.

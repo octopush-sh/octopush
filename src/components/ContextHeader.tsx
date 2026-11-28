@@ -263,7 +263,7 @@ export function ContextHeader({
           {shipsNothing(missionIntent, missionGitIsolation) && (
             <span
               data-tour="context-ships-nothing"
-              title="Runs locally, ships nothing: the git pushes, pull requests and publishes an agent's commands ask for are refused (ssh, scp, rsync and deploy CLIs aren't checked yet)"
+              title="Runs locally, ships nothing: the pushes, pull requests, publishes and deploys an agent's commands ask for are refused, and git, gh and the publish and deploy tools a script finds on PATH are checked too. A program that opens its own connection isn't."
               className="octo-pop-in flex flex-none items-center"
             >
               <PackageX size={10} aria-hidden />

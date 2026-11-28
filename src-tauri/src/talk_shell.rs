@@ -45,12 +45,19 @@ pub(crate) fn git_hardening_env() -> Vec<(String, String)> {
 
 /// [`git_hardening_env`] after `count` entries already set. Pure.
 pub(crate) fn git_hardening_after(count: Option<&str>) -> Vec<(String, String)> {
+    git_config_after(count, &[("safe.bareRepository", "explicit")])
+}
+
+/// `pairs` as `GIT_CONFIG_*` variables after `count` entries already set:
+/// the new count, then each key and value. Pure.
+pub(crate) fn git_config_after(count: Option<&str>, pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     let n = count.and_then(|c| c.trim().parse::<usize>().ok()).unwrap_or(0);
-    vec![
-        ("GIT_CONFIG_COUNT".to_string(), (n + 1).to_string()),
-        (format!("GIT_CONFIG_KEY_{n}"), "safe.bareRepository".to_string()),
-        (format!("GIT_CONFIG_VALUE_{n}"), "explicit".to_string()),
-    ]
+    let mut env = vec![("GIT_CONFIG_COUNT".to_string(), (n + pairs.len()).to_string())];
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        env.push((format!("GIT_CONFIG_KEY_{}", n + i), key.to_string()));
+        env.push((format!("GIT_CONFIG_VALUE_{}", n + i), value.to_string()));
+    }
+    env
 }
 
 /// Cap on a `$` command's captured output (bytes), so it can't bloat the DB
@@ -132,6 +139,17 @@ struct Session {
     /// and no command has run in it since while its thread wasn't strict
     /// (#1231).
     strict: bool,
+    /// Whether it was spawned behind its mission's process barrier and
+    /// proved it holds it (`ship_barrier`, #1275).
+    barrier: bool,
+}
+
+impl Session {
+    /// Whether it can run a command for a thread strict for `why`: strict,
+    /// and behind the barrier when its mission ships nothing.
+    fn holds(&self, why: StrictFor) -> bool {
+        self.strict && (why != StrictFor::ShipsNothing || self.barrier)
+    }
 }
 
 pub struct TalkShell {
@@ -264,11 +282,21 @@ impl TalkShell {
         };
         let extra = self.spawn_env.lock().get(thread_id).cloned().unwrap_or_default();
         let strict = self.strict.lock().get(thread_id).copied();
+        // In a mission that ships nothing the shell starts behind the
+        // process barrier (#1275), checked (and put back where it changed)
+        // before every command; no command runs without it.
+        let barrier = match strict {
+            Some(StrictFor::ShipsNothing) => Some(
+                crate::ship_barrier::Barrier::for_workspace(std::path::Path::new(workspace_path))
+                    .map_err(|e| AppError::Other(format!("{STRICT_SHELL_REFUSED} couldn't be put behind the process barrier ({e}).")))?,
+            ),
+            _ => None,
+        };
         let handle = match existing {
             Some(h) => h,
             None => {
                 let recorded = self.cwd_store.lock().read(thread_id);
-                let session = Self::ensure_session(&client, thread_id, workspace_path, &extra, strict, recorded)?;
+                let session = Self::ensure_session(&client, thread_id, workspace_path, &extra, strict, recorded, barrier.as_ref())?;
                 let h = Arc::new(Mutex::new(session));
                 let mut map = self.sessions.lock();
                 Arc::clone(map.entry(thread_id.to_string()).or_insert(h))
@@ -280,8 +308,17 @@ impl TalkShell {
         // never cleaned in place: what ran in it can outlast any cleanup (a
         // function named `unset`, an `ls` defined in Edit freely). A fresh
         // `bash -l` takes its place, where it was, is made strict before
-        // this command, and the terminal says so.
-        if let Some(why) = strict.filter(|_| !handle.lock().strict) {
+        // this command, and the terminal says so. So does one spawned
+        // without the process barrier its mission now needs, and one behind
+        // the barrier whose thread is no longer strict.
+        let replace = {
+            let session = handle.lock();
+            match strict {
+                Some(why) => !session.holds(why),
+                None => session.barrier,
+            }
+        };
+        if replace {
             let (id, cwd) = {
                 let mut session = handle.lock();
                 if session.rx.take().is_none() {
@@ -291,9 +328,9 @@ impl TalkShell {
             };
             let _ = client.remove(&id);
             let start = if std::path::Path::new(&cwd).is_dir() { cwd.as_str() } else { workspace_path };
-            match Self::ensure_session(&client, thread_id, start, &extra, Some(why), None) {
+            match Self::ensure_session(&client, thread_id, start, &extra, strict, None, barrier.as_ref()) {
                 Ok(fresh) => {
-                    if let Some(rx) = fresh.rx.as_ref() {
+                    if let (Some(why), Some(rx)) = (strict, fresh.rx.as_ref()) {
                         note_restart(&client, &fresh.id, rx, &fresh.nonce, why);
                     }
                     *handle.lock() = fresh;
@@ -348,7 +385,7 @@ impl TalkShell {
             }
             Probe::Dead { output } => {
                 let _ = client.remove(&id);
-                match Self::ensure_session(&client, thread_id, &cwd, &extra, strict, None) {
+                match Self::ensure_session(&client, thread_id, &cwd, &extra, strict, None, barrier.as_ref()) {
                     Ok(fresh) => *handle.lock() = fresh,
                     Err(e) => {
                         self.sessions.lock().remove(thread_id);
@@ -412,7 +449,7 @@ impl TalkShell {
                     _ => {
                         let body = join_nonempty(&[&partial, &note]);
                         let _ = client.remove(&id);
-                        match Self::ensure_session(&client, thread_id, &cwd, &extra, strict, None) {
+                        match Self::ensure_session(&client, thread_id, &cwd, &extra, strict, None, barrier.as_ref()) {
                             Ok(fresh) => *handle.lock() = fresh,
                             Err(e) => {
                                 self.sessions.lock().remove(thread_id);
@@ -492,7 +529,10 @@ impl TalkShell {
     /// its prompt last reported, when the OS can't say), and a job from
     /// before the restart that holds its terminal keeps it alive. A strict
     /// shell runs [`apply_strict_shell`] before anything else, and no
-    /// command runs in it unless that proved it clean.
+    /// command runs in it unless that proved it clean. With a `barrier` (a
+    /// mission that ships nothing) it is spawned behind it, and the cleanup
+    /// puts it back after the profile and proves it holds.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_session(
         client: &Arc<DaemonClient>,
         thread_id: &str,
@@ -500,6 +540,7 @@ impl TalkShell {
         extra: &[(String, String)],
         strict: Option<StrictFor>,
         recorded: Option<String>,
+        barrier: Option<&crate::ship_barrier::Barrier>,
     ) -> AppResult<Session> {
         let id = format!("talk-{thread_id}");
         let live = client.list_terminals().unwrap_or_default().into_iter().find(|t| t.id == id && t.running);
@@ -523,7 +564,7 @@ impl TalkShell {
         // `/usr/bin` ahead of Homebrew: leave `bash -l`'s PATH alone then.
         let has_login_path = crate::orchestrator::cli_runner::login_env_path().is_some();
         if !reattaching {
-            Self::spawn_bash(client, &id, &cwd, &spawn_env(&path, extra))?;
+            Self::spawn_bash(client, &id, &cwd, &spawn_env(&path, extra), barrier)?;
         }
         let nonce = gen_nonce();
         let rx = client.attach(&id, 0)?;
@@ -534,7 +575,7 @@ impl TalkShell {
                     apply_login_path(client, &id, &rx, &nonce, &path);
                 }
                 if let Some(reason) = strict {
-                    if let Err(why) = apply_strict_shell(client, &id, &rx, &nonce) {
+                    if let Err(why) = apply_strict_shell(client, &id, &rx, &nonce, barrier) {
                         let _ = client.remove(&id);
                         return Err(AppError::Other(format!("{} {why}.", reason.refused())));
                     }
@@ -552,6 +593,7 @@ impl TalkShell {
                     cwd: ready_cwd.unwrap_or_else(|| cwd.clone()),
                     nonce,
                     strict: strict.is_some(),
+                    barrier: strict.is_some() && barrier.is_some(),
                 })
             }
             // Reattached but never ready — the surviving shell is busy with a
@@ -564,9 +606,30 @@ impl TalkShell {
         }
     }
 
-    fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str, env: &HashMap<String, String>) -> AppResult<()> {
+    /// Spawn the thread's `bash -l` with `env` and git's hardening; behind
+    /// `barrier`, with its variables too ([`crate::ship_barrier::Barrier::env`])
+    /// and each token it scrubs set empty, since the daemon only sets
+    /// variables. The profile runs after this, so the strict cleanup puts the
+    /// barrier back once it has ([`apply_strict_shell`]).
+    fn spawn_bash(
+        client: &Arc<DaemonClient>,
+        id: &str,
+        cwd: &str,
+        env: &HashMap<String, String>,
+        barrier: Option<&crate::ship_barrier::Barrier>,
+    ) -> AppResult<()> {
         let mut env = env.clone();
-        env.extend(git_hardening_env());
+        match barrier {
+            Some(barrier) => {
+                let path = env.get("PATH").cloned().unwrap_or_default();
+                let count = std::env::var("GIT_CONFIG_COUNT").ok();
+                env.extend(barrier.env(&path, count.as_deref()));
+                for name in crate::ship_barrier::SCRUBBED {
+                    env.insert(name.to_string(), String::new());
+                }
+            }
+            None => env.extend(git_hardening_env()),
+        }
         client.spawn(id, cwd, &env, Some(TALK_BASH), 40, 120)?;
         Ok(())
     }
@@ -992,25 +1055,49 @@ impl StrictReport {
 /// prompt is up, as the login PATH is ([`apply_login_path`]). `Ok` only
 /// when the report came back with everything at zero; otherwise why, for
 /// the caller's refusal. No command may run in the shell until it is `Ok`.
-fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) -> Result<(), String> {
+///
+/// With a `barrier` (a mission that ships nothing, #1275), the clean shell
+/// is then put behind it, after everything the profile did
+/// ([`crate::ship_barrier::Barrier::shell_lines`]: the shims first on PATH,
+/// the tokens unset, the askpass refuser, the push rewrite), and reports
+/// again, tagged with the same nonce, whether it holds it
+/// ([`crate::ship_barrier::Barrier::report_line`]). `Ok` only when it does.
+fn apply_strict_shell(
+    client: &Arc<DaemonClient>,
+    id: &str,
+    rx: &Receiver<TermEvent>,
+    nonce: &str,
+    barrier: Option<&crate::ship_barrier::Barrier>,
+) -> Result<(), String> {
     let no_answer = || "didn't answer the cleanup that makes it strict".to_string();
-    for line in STRICT_SHELL_LINES {
+    let run_line = |line: &str| -> Result<String, String> {
         drain_pending(rx);
         client.write(id, format!("{line}\n").as_bytes()).map_err(|_| no_answer())?;
-        if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. }) {
-            return Err(no_answer());
+        match probe(rx, Duration::from_secs(5), nonce) {
+            Probe::Done { output, .. } => Ok(output),
+            _ => Err(no_answer()),
         }
-    }
-    drain_pending(rx);
-    client.write(id, format!("{}\n", strict_report_line(nonce)).as_bytes()).map_err(|_| no_answer())?;
-    let Probe::Done { output, .. } = probe(rx, Duration::from_secs(5), nonce) else {
-        return Err(no_answer());
     };
+    for line in STRICT_SHELL_LINES {
+        run_line(line)?;
+    }
+    let output = run_line(&strict_report_line(nonce))?;
     let report = StrictReport::read(&output, nonce).ok_or_else(|| "didn't report what it holds after the cleanup that makes it strict".to_string())?;
-    match report.left() {
+    if let Some(why) = report.left() {
+        tracing::warn!(id, ?report, "talk shell isn't strict after its cleanup");
+        return Err(why);
+    }
+    let Some(barrier) = barrier else { return Ok(()) };
+    for line in barrier.shell_lines() {
+        run_line(&line)?;
+    }
+    let output = run_line(&barrier.report_line(nonce))?;
+    let held = crate::ship_barrier::BarrierReport::read(&output, nonce)
+        .ok_or_else(|| "didn't report whether it holds the process barrier".to_string())?;
+    match held.missing() {
         None => Ok(()),
         Some(why) => {
-            tracing::warn!(id, ?report, "talk shell isn't strict after its cleanup");
+            tracing::warn!(id, ?held, "talk shell doesn't hold the process barrier");
             Err(why)
         }
     }
@@ -1957,6 +2044,64 @@ mod e2e {
             assert!(!dir.path().join("ran").exists(), "the command ran");
             shell.close("stuck");
         });
+    }
+
+    /// A mission that ships nothing puts its shell behind the process
+    /// barrier once the profile ran (#1275): the shims first on PATH, no
+    /// token from the daemon's environment or the profile, the askpass
+    /// refuser, and a push refused by the shim. A shell strict for Ask
+    /// first, as a Build or Fix mission's conversation can be, gets none of
+    /// it, and neither does one in Edit freely.
+    #[test]
+    #[serial]
+    fn a_ship_nothing_shell_starts_behind_the_process_barrier() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join(".octopush");
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("pty-server.sock");
+        let mut child = Command::new(find_daemon_bin())
+            .env("HOME", tmp.path())
+            .env("OCTOPUSH_PTY_AUTO_EXIT_SECS", "20")
+            .env("GITHUB_TOKEN", "ghp_from_the_daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn daemon");
+        assert!(wait_for_socket(&sock), "daemon socket did not appear");
+        fs::write(tmp.path().join(".bash_profile"), "export NPM_TOKEN=npm_from_the_profile\nexport PATH=/usr/bin:/bin:$PATH\n").unwrap();
+        let ws = TempDir::new().unwrap();
+        let wsp = ws.path().to_str().unwrap().to_string();
+        let quick = Duration::from_secs(20);
+        let probe = "printf '%s|%s|%s|%s' \"${GITHUB_TOKEN-unset}\" \"${NPM_TOKEN-unset}\" \"${PATH%%:*}\" \"${GIT_ASKPASS-unset}\"";
+        with_login_shell_env(&[], || {
+            let shell = shell_on(&sock);
+            shell.set_strict_for("ship", Some(StrictFor::ShipsNothing));
+            let barrier = crate::ship_barrier::Barrier::for_workspace(ws.path()).unwrap();
+            let r = done(shell.run("ship", &wsp, probe, quick, true).unwrap());
+            assert_eq!(r.output, format!("unset|unset|{}|{}", barrier.bin().display(), barrier.askpass().display()));
+            let r = done(shell.run("ship", &wsp, "git push origin main", quick, true).unwrap());
+            assert!(r.exit_code != 0 && r.output.contains("Octopush refused `git`"), "{:?}", r.output);
+            let r = done(shell.run("ship", &wsp, "git --version", quick, true).unwrap());
+            assert!(r.exit_code == 0 && r.output.starts_with("git version"), "{:?}", r.output);
+
+            for (thread, why) in [("ask", StrictFor::of(false, crate::permissions::Mode::Ask)), ("edit", None)] {
+                shell.set_strict_for(thread, why);
+                let r = done(shell.run(thread, &wsp, probe, quick, true).unwrap());
+                assert!(r.output.starts_with("ghp_from_the_daemon|npm_from_the_profile|/usr/bin|"), "{thread}: {:?}", r.output);
+                assert!(!r.output.contains(&barrier.askpass().display().to_string()), "{thread}: {:?}", r.output);
+            }
+            // The Ask first shell, whose mission comes to ship nothing, is
+            // replaced by one behind the barrier.
+            shell.set_strict_for("ask", Some(StrictFor::ShipsNothing));
+            let r = done(shell.run("ask", &wsp, probe, quick, true).unwrap());
+            assert!(r.output.ends_with(&format!("unset|unset|{}|{}", barrier.bin().display(), barrier.askpass().display())), "{:?}", r.output);
+            for thread in ["ship", "ask", "edit"] {
+                shell.close(thread);
+            }
+        });
+        child.kill().ok();
     }
 
     #[test]

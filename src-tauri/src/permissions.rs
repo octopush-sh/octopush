@@ -979,13 +979,35 @@ fn remote_command(words: &[&str], scope: Scope) -> Option<&'static str> {
     if WRAPPERS.contains(&name.as_str()) {
         // A wrapper's own flags and values (`sudo -u x`, `timeout 10`) come
         // first; `env` and `eval` are read as the commands they run.
-        let at = rest.iter().position(|&w| matches!(program(w).as_str(), "eval" | "env") || remote_rule(&program(w)).is_some())?;
+        let known = |w: &str| remote_rule(w).is_some() || (scope.ship_nothing && ship_known(w));
+        let at = rest.iter().position(|&w| matches!(program(w).as_str(), "eval" | "env") || known(&program(w)))?;
         return remote_command(&rest[at..], scope);
     }
-    if scope.ship_nothing && name == "git" {
-        // What both modes refuse names itself first (`-c alias.p=push`).
-        if let Some(what) = git_remote(rest).or_else(|| git_rebinds(rest)) {
-            return Some(what);
+    if scope.ship_nothing {
+        if name == "git" {
+            // What both modes refuse names itself first (`-c alias.p=push`).
+            if let Some(what) = git_remote_with(rest, GIT_VALUED_SHIP).or_else(|| git_rebinds(rest)).or_else(|| git_ships(rest)) {
+                return Some(what);
+            }
+        }
+        // The hosted git CLIs run their reads only (#1275).
+        match name.as_str() {
+            "gh" | "glab" => return gh_ships(&name, rest),
+            "hub" => return hub_ships(rest),
+            _ => {}
+        }
+        // A package runner starts a program by name (`npx vercel deploy`):
+        // it is read as that program.
+        if let Some(at) = runner_target(&name, rest) {
+            let target = package_program(rest[at]);
+            if remote_rule(&target).is_some() || ship_known(&target) {
+                let mut words = vec![target.as_str()];
+                words.extend_from_slice(&rest[at + 1..]);
+                return remote_command(&words, scope);
+            }
+        }
+        if let Some(effect) = ship_effect(&name, rest) {
+            return effect;
         }
     }
     let what = remote_rule(&name)?(rest)?;
@@ -1669,6 +1691,9 @@ pub fn ship_nothing_shell_refusal(command: &str) -> Option<String> {
             if let Some(feature) = refused_feature(seg) {
                 return Some(ship_nothing_feature_refusal(feature));
             }
+            if config_prefix(seg) {
+                return Some(ship_nothing_feature_refusal(CONFIG_PREFIX));
+            }
             if hidden_command(&seg.words, false) {
                 return Some(SHIP_NOTHING_HIDDEN.to_string());
             }
@@ -1679,6 +1704,53 @@ pub fn ship_nothing_shell_refusal(command: &str) -> Option<String> {
     .flatten()
 }
 
+/// A variable that tells a program which configuration, credentials or
+/// programs to use (#1275): `HOME`, `PATH`, `XDG_*`, `GIT_*`, `SSH_*`,
+/// `GH_*` and any `*_CONFIG*`. Set for one command, it lets git, called by
+/// name, read a config the agent wrote (an alias to `push`, a longer
+/// `pushInsteadOf`, a credential helper).
+fn config_variable(name: &str) -> bool {
+    matches!(name, "HOME" | "PATH")
+        || ["XDG_", "GIT_", "SSH_", "GH_"].iter().any(|p| name.starts_with(p))
+        || name.contains("_CONFIG")
+}
+
+/// What a mission that ships nothing refuses as a one-command prefix.
+const CONFIG_PREFIX: &str = "a HOME, PATH, XDG_*, GIT_*, SSH_*, GH_* or *_CONFIG* variable set for the command";
+
+/// Whether a command sets a [`config_variable`] for itself: before its
+/// program (`XDG_CONFIG_HOME=/tmp/x git status`), or after `env` or another
+/// wrapper (`env HOME=/tmp/x git status`).
+fn config_prefix(seg: &Segment) -> bool {
+    (!seg.words.is_empty() && seg.assigns.iter().any(|a| config_assignment(a))) || wrapped_config_prefix(&seg.words)
+}
+
+/// `NAME=value` for a [`config_variable`].
+fn config_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(n, _)| is_identifier(n) && config_variable(n))
+}
+
+/// Whether a wrapper (`env`, `then`, `nohup`…) sets a [`config_variable`]
+/// for the program it runs: one of its `NAME=value` words before that
+/// program, read through nested wrappers. `then export HOME=…` sets
+/// nothing for a program; it is lasting state ([`state_change`]).
+fn wrapped_config_prefix(words: &[(&str, bool)]) -> bool {
+    let Some(((first, _), rest)) = words.split_first() else { return false };
+    if !WRAPPERS.contains(&program(first).as_str()) {
+        return false;
+    }
+    for (i, (word, _)) in rest.iter().enumerate() {
+        if config_assignment(word) {
+            return true;
+        }
+        let assigns = word.split_once('=').is_some_and(|(n, _)| is_identifier(n));
+        if !word.starts_with('-') && !assigns {
+            return wrapped_config_prefix(&rest[i..]);
+        }
+    }
+    false
+}
+
 /// What a mission that ships nothing gets for `GIT_CONFIG_*` set on a line.
 const GIT_CONFIG_ENV: &str = "git configuration set through GIT_CONFIG_* variables";
 /// What a mission that ships nothing gets for a git config change that can redirect.
@@ -1686,10 +1758,17 @@ const GIT_CONFIG_REDIRECT: &str = "git configuration that can send a push or a r
 
 /// Git keys that can send a push or a request somewhere else, or run
 /// something in its place: aliases, includes, URL rewrites, `http.*`, the
-/// ssh command.
+/// ssh command, a credential helper (`credential.*`, which the barrier
+/// empties), and a remote's own push URL (`remote.<name>.pushurl`), which
+/// git never rewrites with the process barrier's `pushInsteadOf`
+/// (`ship_barrier`). Read with or without its `=value`.
 fn redirecting_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
-    ["alias", "include", "url.", "http", "core.sshcommand"].iter().any(|p| k.starts_with(p))
+    let k = k.split('=').next().unwrap_or_default();
+    // `credential.*` would hand the keychain back to git, past the
+    // barrier's empty `credential.helper`.
+    ["alias", "include", "url.", "http", "core.sshcommand", "credential"].iter().any(|p| k.starts_with(p))
+        || (k.starts_with("remote.") && k.ends_with(".pushurl"))
 }
 
 /// In a mission that ships nothing: a git command that sets a redirecting
@@ -1908,13 +1987,18 @@ fn is_read_method(m: &str) -> bool {
 }
 
 fn git_remote(args: &[&str]) -> Option<&'static str> {
+    git_remote_with(args, GIT_VALUED)
+}
+
+/// [`git_remote`], reading `valued` as git's global options that take a value.
+fn git_remote_with(args: &[&str], valued: &[&str]) -> Option<&'static str> {
     // An alias set on the command line can run any of these (`-c alias.p=push`).
     let alias = args.windows(2).any(|w| matches!(w[0], "-c" | "--config-env") && w[1].to_ascii_lowercase().starts_with("alias."))
         || args.iter().any(|a| a.to_ascii_lowercase().starts_with("--config-env=alias."));
     if alias {
         return Some("a git alias set on the command line");
     }
-    let ops = operands(args, GIT_VALUED);
+    let ops = operands(args, valued);
     let op = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
     match (op(0).as_deref(), op(1).as_deref()) {
         (Some("push"), _) => Some("git push"),
@@ -1933,6 +2017,535 @@ fn git_remote(args: &[&str]) -> Option<&'static str> {
 
 /// Git's global options that take a value.
 const GIT_VALUED: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"];
+
+/// [`GIT_VALUED`] and the newer global options that take a value too
+/// (`git --attr-source HEAD push`), for a mission that ships nothing only,
+/// so Plan only reads git as before.
+const GIT_VALUED_SHIP: &[&str] = &["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source", "--super-prefix"];
+
+/// What a mission that ships nothing refuses of git beyond the push family
+/// [`git_remote`] refuses in both modes: a pull request mailed or written
+/// for upstream (`request-pull`, `imap-send`), a commit sent to another
+/// version control system (`svn dcommit`/`set-tree`, `p4 submit`,
+/// `cvsexportcommit`), a remote's own push URL (`git remote set-url
+/// --push`), which the process barrier's push rewrite doesn't reach; the
+/// credential store (`git credential fill` prints a saved token); serving
+/// the repository to other machines (`daemon`, `instaweb`, `http-push`);
+/// and git running a command of its own (`rebase --exec`, `submodule
+/// foreach`, `bisect run`, `filter-branch`), where git's own folder comes
+/// first on PATH, ahead of the shims; a tool the config names (`difftool`,
+/// `mergetool`); `upload-pack` run directly (its pack-objects hook); a
+/// background job outside the workspace (`maintenance start`/`register`);
+/// and another program in place of git's own on the other side
+/// (`--upload-pack`, `--receive-pack`, `archive --exec`, `clone -u`). Every
+/// setting given for the command (`-c`, `--config-env`, `clone -c`/
+/// `--config`) must be a display or identity one ([`git_setting_allowed`]):
+/// any other can run a program (`diff.external`, `core.fsmonitor`,
+/// `core.hooksPath`…), which finds git's own folder, with the real git,
+/// first on its PATH. Then only git's own commands run ([`GIT_COMMANDS`]):
+/// anything else is an alias, which could stand for `push`, or a program
+/// outside git.
+fn git_ships(args: &[&str]) -> Option<&'static str> {
+    const RUNS: &str = "git running a command of its own (rebase --exec, submodule foreach, bisect run, filter-branch)";
+    const SETTING: &str = "a git setting other than a display or identity one, which can run a program";
+    let ops = operands(args, GIT_VALUED_SHIP);
+    let op = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
+    let after = |sub: &str| args.iter().position(|a| a.eq_ignore_ascii_case(sub)).map_or(&[][..], |at| &args[at + 1..]);
+    if !git_global_settings(args).iter().all(|(setting, from_env)| git_setting_allowed(setting, *from_env)) {
+        return Some(SETTING);
+    }
+    let other_side = |a: &&str| ["--upload-pack", "--receive-pack"].iter().any(|f| a.starts_with(f));
+    if args.iter().any(other_side) {
+        return Some("another program in place of git's own on the other side (--upload-pack, --receive-pack)");
+    }
+    if args.iter().any(|a| a.starts_with("--exec-path=")) {
+        return Some("another folder for git's own programs (--exec-path)");
+    }
+    // `--ext-diff` and the abbreviations git may take for it.
+    if args.iter().any(|a| a.len() >= "--ext-".len() && "--ext-diff".starts_with(a)) {
+        return Some("an external diff program (--ext-diff)");
+    }
+    // A help page opens the viewer the config names (`man.<tool>.cmd`,
+    // `browser.<tool>.cmd`); `-h` prints a command's usage instead.
+    const HELP: &str = "git's help viewer, which the config can name (-h prints a command's usage)";
+    const HELP_LISTS: &[&str] = &[
+        "-a", "--all", "-g", "--guides", "-c", "--config", "--user-interfaces", "--developer-interfaces",
+        "--config-for-completion", "--config-sections-for-completion",
+    ];
+    if args.contains(&"--help") && !ops.is_empty() {
+        return Some(HELP);
+    }
+    let template = |sub: &str| after(sub).iter().any(|a| a.starts_with("--template"));
+    let refused = match (op(0).as_deref(), op(1).as_deref()) {
+        (None, _) => return None,
+        (Some("help"), Some(_)) if !after("help").iter().any(|a| HELP_LISTS.contains(a)) => Some(HELP),
+        (Some("gui" | "citool" | "web--browse"), _) => Some("a git tool that runs programs the config names (gui, citool, web--browse)"),
+        (Some("init"), _) if template("init") => Some("a template folder, whose config and hooks a new repository takes (--template)"),
+        (Some("clone"), _) => {
+            let rest = after("clone");
+            let uploads = rest.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('u'));
+            let settings = clone_settings(rest);
+            if uploads {
+                Some("another program in place of git's own on the other side (clone -u)")
+            } else if template("clone") {
+                Some("a template folder, whose config and hooks a new repository takes (--template)")
+            } else {
+                (!settings.iter().all(|s| git_setting_allowed(s, false))).then_some(SETTING)
+            }
+        }
+        (Some("archive"), _) if after("archive").iter().any(|a| a.starts_with("--exec")) => {
+            Some("another program in place of git's own on the other side (archive --exec)")
+        }
+        (Some("difftool" | "mergetool"), _) => Some("git running a tool the config names (difftool, mergetool)"),
+        (Some("upload-pack" | "upload-archive" | "upload-archive--writer"), _) => Some("git's upload-pack run directly"),
+        (Some("maintenance"), Some("start" | "register")) => Some("a background job outside the workspace (git maintenance start)"),
+        (Some("request-pull"), _) => Some("git request-pull"),
+        (Some("imap-send"), _) => Some("git imap-send"),
+        (Some("svn"), Some("dcommit" | "set-tree")) => Some("git svn dcommit"),
+        (Some("p4"), Some("submit")) => Some("git p4 submit"),
+        (Some("cvsexportcommit"), _) => Some("git cvsexportcommit"),
+        (Some("remote"), Some("set-url")) if args.contains(&"--push") => Some(GIT_CONFIG_REDIRECT),
+        (Some(c), _) if c.starts_with("credential") => Some("git's credential store"),
+        (Some("daemon" | "instaweb" | "http-push" | "http-backend" | "receive-pack" | "shell"), _) => {
+            Some("git serving or sending the repository to another machine")
+        }
+        (Some("rebase"), _) => {
+            let exec = after("rebase").iter().any(|a| *a == "-x" || a.starts_with("--exec") || (a.starts_with('-') && !a.starts_with("--") && a.contains('x')));
+            exec.then_some(RUNS)
+        }
+        (Some("submodule"), Some("foreach")) | (Some("bisect"), Some("run")) | (Some("filter-branch"), _) => Some(RUNS),
+        _ => None,
+    };
+    if refused.is_some() {
+        return refused;
+    }
+    // As written: git's commands are case-sensitive, while an alias's name
+    // isn't (`git Status` runs `alias.status`).
+    let command = ops.first().copied().unwrap_or_default();
+    (!GIT_COMMANDS.contains(&command)).then_some("a git alias, or a command that isn't one of git's own")
+}
+
+/// The settings git's global options give a command, before its
+/// subcommand: each `-c name=value` and `--config-env name=VAR` (`true`
+/// when the value comes from the environment). `-c` after the subcommand
+/// is that command's own (`git switch -c topic`).
+pub(crate) fn git_global_settings<'a>(args: &[&'a str]) -> Vec<(&'a str, bool)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        match a {
+            "-c" => {
+                out.extend(args.get(i + 1).map(|s| (*s, false)));
+                i += 2;
+            }
+            "--config-env" => {
+                out.extend(args.get(i + 1).map(|s| (*s, true)));
+                i += 2;
+            }
+            _ if a.starts_with("--config-env=") => {
+                out.push((&a["--config-env=".len()..], true));
+                i += 1;
+            }
+            _ if GIT_VALUED_SHIP.contains(&a) => i += 2,
+            _ if a.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// The settings `git clone` writes into the new repository and uses for
+/// the clone itself: `-c name=value`, `--config name=value`,
+/// `--config=name=value`.
+fn clone_settings<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for (i, &a) in args.iter().enumerate() {
+        match a {
+            "-c" | "--config" => out.extend(args.get(i + 1).copied()),
+            _ => out.extend(a.strip_prefix("--config=")),
+        }
+    }
+    out
+}
+
+/// Whether a mission that ships nothing lets a command give git `setting`
+/// (`name=value`, or `name=VAR` from the environment): only a display or
+/// identity one, which runs nothing: `color.*`, `core.quotePath`,
+/// `diff.noprefix`, `diff.renames`, `log.*`'s display options, `user.name`,
+/// `user.email`, `advice.*`, and `pager.<cmd>` set to `false` or `cat`
+/// (written out, not from the environment).
+pub(crate) fn git_setting_allowed(setting: &str, from_env: bool) -> bool {
+    const LOG_DISPLAY: &[&str] = &[
+        "log.date", "log.decorate", "log.abbrevcommit", "log.follow", "log.graphcolors", "log.mailmap", "log.showroot",
+        "log.excludedecoration", "log.initialdecorationset", "log.diffmerges",
+    ];
+    let (name, value) = setting.split_once('=').unwrap_or((setting, "true"));
+    let key = name.to_ascii_lowercase();
+    if key.starts_with("pager.") {
+        return !from_env && matches!(value.to_ascii_lowercase().as_str(), "false" | "cat");
+    }
+    key.starts_with("color.")
+        || key.starts_with("advice.")
+        || LOG_DISPLAY.contains(&key.as_str())
+        || matches!(key.as_str(), "core.quotepath" | "diff.noprefix" | "diff.renames" | "user.name" | "user.email")
+}
+
+/// The `gh` and `glab` subcommands a mission that ships nothing runs: the
+/// ones that only read (`view`, `list`, `status`, `diff`, `checks`, as in
+/// `gh pr view 12` or `gh status`), a version or help call, and `api` with
+/// GET and no field. Anything else is refused, an alias included (`gh co`),
+/// so a subcommand the check doesn't know can't change the host
+/// (`gh pr update-branch`). [`gh_remote`] and [`glab_remote`] name the
+/// writes they know.
+fn gh_ships(program: &str, args: &[&str]) -> Option<&'static str> {
+    const READS: &[&str] = &["view", "list", "status", "diff", "checks"];
+    let known = if program == "glab" { glab_remote(args) } else { gh_remote(args) };
+    if known.is_some() {
+        return known;
+    }
+    if info_only(args) {
+        return None;
+    }
+    let ops = operands(args, &["-R", "--repo", "-g", "--group"]);
+    let word = |i: usize| ops.get(i).map(|s| s.to_ascii_lowercase());
+    let reads = match (word(0).as_deref(), word(1).as_deref()) {
+        (Some("api"), _) => gh_api_reads(args),
+        (Some("status"), _) => true,
+        (Some(_), Some(verb)) => READS.contains(&verb),
+        _ => false,
+    };
+    (!reads).then_some(if program == "glab" {
+        "a glab command other than a read (view, list, status, diff, or api with GET)"
+    } else {
+        "a gh command other than a read (view, list, status, diff, checks, or api with GET)"
+    })
+}
+
+/// Whether a `gh api` or `glab api` call only reads: no method but GET (or
+/// HEAD), no field or input (`-f`, `-F`, `--field`, `--raw-field`,
+/// `--input`), and not the GraphQL endpoint, which takes a POST.
+fn gh_api_reads(args: &[&str]) -> bool {
+    let mut method_ok = true;
+    for (i, a) in args.iter().enumerate() {
+        let method = match *a {
+            "-X" | "--method" => Some(args.get(i + 1).copied().unwrap_or("")),
+            _ => a.strip_prefix("--method=").or_else(|| a.strip_prefix("-X").filter(|m| !m.is_empty())),
+        };
+        if method.is_some_and(|m| !is_read_method(m)) {
+            method_ok = false;
+        }
+    }
+    let fields = args.iter().any(|a| ["-f", "-F", "--field", "--raw-field", "--input"].iter().any(|f| a.starts_with(f)));
+    let graphql = args.iter().any(|a| a.eq_ignore_ascii_case("graphql"));
+    method_ok && !fields && !graphql
+}
+
+/// `hub` in a mission that ships nothing: a git command is read as git
+/// ([`git_remote_with`], [`git_ships`]); anything else as `gh`
+/// ([`gh_ships`]).
+fn hub_ships(args: &[&str]) -> Option<&'static str> {
+    if let Some(what) = hub_remote(args) {
+        return Some(what);
+    }
+    let ops = operands(args, GIT_VALUED_SHIP);
+    match ops.first() {
+        Some(op) if GIT_COMMANDS.contains(op) => git_remote_with(args, GIT_VALUED_SHIP).or_else(|| git_rebinds(args)).or_else(|| git_ships(args)),
+        _ => gh_ships("gh", args),
+    }
+}
+
+/// Git's own commands (`git --list-cmds=main`, git 2.43, and Git LFS),
+/// which no alias can replace: git runs one of these before it looks for an
+/// alias.
+const GIT_COMMANDS: &[&str] = &[
+    "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch", "bugreport", "bundle", "cat-file",
+    "check-attr", "check-ignore", "check-mailmap", "check-ref-format", "checkout", "checkout--worker", "checkout-index",
+    "cherry", "cherry-pick", "clean", "clone", "column", "commit", "commit-graph", "commit-tree", "config",
+    "count-objects", "describe", "diagnose", "diff", "diff-files", "diff-index", "diff-tree", "difftool",
+    "difftool--helper", "fast-export", "fast-import", "fetch", "fetch-pack", "fmt-merge-msg", "for-each-ref",
+    "for-each-repo", "format-patch", "fsck", "fsck-objects", "fsmonitor--daemon", "gc", "get-tar-commit-id", "grep",
+    "hash-object", "help", "hook", "http-fetch", "index-pack", "init", "init-db", "interpret-trailers", "log",
+    "ls-files", "ls-remote", "ls-tree", "mailinfo", "mailsplit", "maintenance", "merge", "merge-base", "merge-file",
+    "merge-index", "merge-octopus", "merge-one-file", "merge-ours", "merge-recursive", "merge-recursive-ours",
+    "merge-recursive-theirs", "merge-resolve", "merge-subtree", "merge-tree", "mergetool", "mktag", "mktree",
+    "multi-pack-index", "mv", "name-rev", "notes", "pack-objects", "pack-redundant", "pack-refs", "patch-id",
+    "pickaxe", "prune", "prune-packed", "pull", "quiltimport", "range-diff", "read-tree", "rebase", "reflog", "remote",
+    "remote-ext", "remote-fd", "remote-ftp", "remote-ftps", "remote-http", "remote-https", "repack", "replace",
+    "rerere", "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "sh-i18n--envsubst", "shortlog", "show",
+    "show-branch", "show-index", "show-ref", "sparse-checkout", "stage", "stash", "status", "stripspace", "submodule",
+    "submodule--helper", "subtree", "switch", "symbolic-ref", "tag", "unpack-file", "unpack-objects", "update-index",
+    "update-ref", "update-server-info", "upload-archive", "upload-archive--writer", "upload-pack", "var",
+    "verify-commit", "verify-pack", "verify-tag", "version", "web--browse", "whatchanged", "worktree", "write-tree",
+    "lfs", "svn", "p4",
+];
+
+/// Where a package runner names the program it starts, in `args`: `npx
+/// vercel`, `pnpx`, `bunx`, `npm exec`/`npm x`, `pnpm exec`/`pnpm dlx`,
+/// `yarn dlx`/`yarn exec`, `bun x`, and `yarn <bin>`, which runs a
+/// package's program by its name. A runner's own flags come first.
+fn runner_target(runner: &str, args: &[&str]) -> Option<usize> {
+    const VALUED: &[&str] = &["-p", "--package", "-c", "--call", "-w", "--workspace", "--filter", "--dir", "-C", "--cwd"];
+    // The positions of the words that aren't flags or a flag's value.
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if VALUED.contains(&args[i]) {
+            i += 2;
+            continue;
+        }
+        if !args[i].starts_with('-') {
+            words.push(i);
+        }
+        i += 1;
+    }
+    let sub = words.first().map(|&i| args[i].to_ascii_lowercase());
+    let runs = match runner {
+        "npx" | "pnpx" | "bunx" => return words.first().copied(),
+        "npm" => matches!(sub.as_deref(), Some("exec" | "x")),
+        "pnpm" | "yarn" => matches!(sub.as_deref(), Some("exec" | "dlx")),
+        "bun" => sub.as_deref() == Some("x"),
+        _ => return None,
+    };
+    if runs {
+        words.get(1).copied()
+    } else if matches!(runner, "yarn" | "pnpm") {
+        // `yarn vercel deploy` runs the package's `vercel`.
+        words.first().copied()
+    } else {
+        None
+    }
+}
+
+/// The program a runner's package word starts: the name without its scope
+/// or version (`vercel@latest`, `@scope/tool@2`), or the program a package
+/// installs under another name (`netlify-cli` installs `netlify`).
+fn package_program(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    let name = match lower.strip_prefix('@') {
+        Some(scoped) => {
+            let full = scoped.split('@').next().unwrap_or(scoped);
+            match full {
+                "railway/cli" => return "railway".to_string(),
+                _ => full.rsplit('/').next().unwrap_or(full).to_string(),
+            }
+        }
+        None => lower.split('@').next().unwrap_or(&lower).to_string(),
+    };
+    match name.as_str() {
+        "netlify-cli" => "netlify".to_string(),
+        "firebase-tools" => "firebase".to_string(),
+        "aws-cdk" => "cdk".to_string(),
+        _ => program(&name),
+    }
+}
+
+/// Hosted deploy CLIs, and the subcommands of each that stay on this Mac or
+/// only read. Any other call is refused, a bare one included (`vercel` and
+/// `surge` deploy when run alone), and so is one that names a delivering
+/// verb anywhere ([`DELIVERING_VERBS`]), so a flag's value the check reads
+/// as the subcommand can't hide one.
+const HOSTED_CLIS: &[(&str, &[&str])] = &[
+    ("vercel", VERCEL_LOCAL),
+    ("now", VERCEL_LOCAL),
+    ("netlify", NETLIFY_LOCAL),
+    ("ntl", NETLIFY_LOCAL),
+    ("fly", FLY_LOCAL),
+    ("flyctl", FLY_LOCAL),
+    ("heroku", HEROKU_LOCAL),
+    ("firebase", FIREBASE_LOCAL),
+    ("wrangler", WRANGLER_LOCAL),
+    ("railway", RAILWAY_LOCAL),
+    ("surge", SURGE_LOCAL),
+    ("pulumi", PULUMI_LOCAL),
+    ("serverless", SERVERLESS_LOCAL),
+    ("sls", SERVERLESS_LOCAL),
+    ("cdk", CDK_LOCAL),
+    ("eb", EB_LOCAL),
+];
+const VERCEL_LOCAL: &[&str] = &["dev", "build", "help", "whoami", "ls", "list", "inspect", "logs", "pull"];
+const NETLIFY_LOCAL: &[&str] = &[
+    "dev", "serve", "build", "status", "help", "logs", "functions:serve", "functions:list", "functions:build", "sites:list",
+    "env:list", "env:get",
+];
+const FLY_LOCAL: &[&str] = &["status", "logs", "version", "help", "doctor", "releases"];
+const HEROKU_LOCAL: &[&str] = &[
+    "local", "local:start", "local:run", "logs", "help", "version", "whoami", "auth:whoami", "apps", "apps:info", "config",
+    "config:get", "ps", "releases", "releases:info", "addons", "status", "domains",
+];
+const FIREBASE_LOCAL: &[&str] = &["emulators:start", "emulators:exec", "serve", "help", "projects:list", "apps:list", "login:list"];
+const WRANGLER_LOCAL: &[&str] = &["dev", "whoami", "help", "types", "tail", "pages"];
+const RAILWAY_LOCAL: &[&str] = &["status", "logs", "whoami", "list", "help"];
+const SURGE_LOCAL: &[&str] = &["list", "whoami", "help"];
+const PULUMI_LOCAL: &[&str] = &["preview", "whoami", "about", "version", "help", "logs"];
+const SERVERLESS_LOCAL: &[&str] = &["offline", "package", "print", "info", "logs", "help"];
+const CDK_LOCAL: &[&str] = &["synth", "diff", "list", "ls", "doctor", "docs", "help"];
+const EB_LOCAL: &[&str] = &["status", "health", "logs", "list", "printenv", "local", "help"];
+
+/// Cloud CLIs (`aws`, `gcloud`, `gsutil`, `bq`, `az`, `doctl`): a call runs
+/// only when it reads, naming a read verb ([`CLOUD_READS`]) and no
+/// delivering one ([`DELIVERING_VERBS`]).
+const CLOUD_CLIS: &[&str] = &["aws", "gcloud", "gsutil", "bq", "az", "doctl"];
+const CLOUD_READS: &[&str] = &["list", "ls", "describe", "show", "get", "info", "help", "version", "whoami", "logs", "read", "status", "tail", "inspect"];
+/// Prefixes of the cloud CLIs' read operations (`aws ec2 describe-instances`).
+const CLOUD_READ_PREFIXES: &[&str] = &["describe-", "list-", "get-", "show-"];
+
+/// Verbs that deliver or change something on a hosted service. Words a
+/// read names too (`gcloud run services list`, `gcloud secrets list`,
+/// `serverless offline start`) aren't here: a call runs only from a local
+/// subcommand or a read verb anyway.
+const DELIVERING_VERBS: &[&str] = &[
+    "deploy", "publish", "release", "promote", "rollback", "redeploy", "up", "push", "apply", "destroy", "delete", "remove",
+    "rm", "create", "put", "set", "unset", "add", "scale", "upload", "invoke", "import", "update", "patch", "cancel", "kill",
+    "suspend", "detach", "attach", "enable", "disable", "migrate", "move", "mv", "cp", "submit", "transfer", "approve",
+    "merge", "purge", "reset", "reboot", "terminate", "resize", "install", "uninstall", "ssh", "console", "proxy", "tunnel",
+];
+
+/// Flags that only print, which any of these CLIs takes alone.
+const INFO_FLAGS: &[&str] = &["--version", "-v", "-V", "--help", "-h", "help", "version"];
+
+/// Programs only a mission that ships nothing reads ([`ship_effect`]).
+const SHIP_ONLY: &[&str] = &["ssh", "scp", "sftp", "rsync", "autossh", "cloudflared", "ngrok", "lt", "localtunnel", "bore", "zrok", "tailscale"];
+
+/// Whether [`ship_effect`] knows `program`.
+fn ship_known(program: &str) -> bool {
+    SHIP_ONLY.contains(&program) || CLOUD_CLIS.contains(&program) || HOSTED_CLIS.iter().any(|(p, _)| *p == program)
+}
+
+/// Whether the ship-nothing check has a rule for `program`, so a PATH shim
+/// for it refuses what it should (`ship_barrier::SHIMMED`).
+pub fn shim_knows(program: &str) -> bool {
+    remote_rule(program).is_some() || ship_known(program)
+}
+
+/// Whether `args` only ask for a version or help.
+fn info_only(args: &[&str]) -> bool {
+    !args.is_empty() && args.iter().all(|a| INFO_FLAGS.contains(&a.to_ascii_lowercase().as_str()))
+}
+
+/// Whether any of `args` is a delivering verb ([`DELIVERING_VERBS`]).
+fn names_delivery(args: &[&str]) -> bool {
+    args.iter().any(|a| DELIVERING_VERBS.contains(&a.to_ascii_lowercase().as_str()))
+}
+
+/// Whether a scp, sftp or rsync operand names another machine: a URL
+/// (`rsync://`, `scp://`, `sftp://`, `ssh://`), or a colon before any slash
+/// (`host:path`, `user@host:path`, `host::module`, `[::1]:path`), as those
+/// tools read it. `./a:b` is a local path.
+fn names_remote(operand: &str) -> bool {
+    let lower = operand.to_ascii_lowercase();
+    if ["rsync://", "scp://", "sftp://", "ssh://"].iter().any(|s| lower.starts_with(s)) {
+        return true;
+    }
+    operand.split_once(':').is_some_and(|(before, _)| !before.contains('/'))
+}
+
+/// What a program only a mission that ships nothing reads would change
+/// elsewhere: `None` when the check doesn't know the program, `Some(None)`
+/// when this call stays on this Mac. Remote shells and copies (`ssh`, `scp`,
+/// `sftp`, `rsync` to or from another machine), tunnels that make this Mac
+/// reachable (`ssh` itself, `autossh`, `cloudflared`, `ngrok`, localtunnel,
+/// `bore`, `zrok`, `tailscale funnel`/`serve`/`file`), hosted deploy CLIs
+/// ([`HOSTED_CLIS`]) and cloud CLIs ([`CLOUD_CLIS`]). A word that only asks
+/// for a version or help runs. Every operand counts, flag values included,
+/// so a value the check misreads can only refuse more.
+fn ship_effect(program: &str, args: &[&str]) -> Option<Option<&'static str>> {
+    const SSH: &str = "ssh to another machine, or a tunnel through it";
+    const COPY: &str = "a copy to or from another machine (scp, sftp, rsync)";
+    const TUNNEL: &str = "a tunnel that makes this Mac reachable from elsewhere";
+    const HOSTED: &str = "a hosted deploy CLI command that deploys or changes something there";
+    const CLOUD: &str = "a cloud CLI command that changes something there, or that the check can't read as a read";
+    let ops: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+    if let Some((_, local)) = HOSTED_CLIS.iter().find(|(p, _)| *p == program) {
+        let stays = info_only(args)
+            || (ops.first().is_some_and(|op| local.contains(&op.to_ascii_lowercase().as_str())) && !names_delivery(&ops));
+        return Some((!stays).then_some(HOSTED));
+    }
+    if CLOUD_CLIS.contains(&program) {
+        let reads = ops.iter().any(|o| {
+            let o = o.to_ascii_lowercase();
+            CLOUD_READS.contains(&o.as_str()) || CLOUD_READ_PREFIXES.iter().any(|p| o.starts_with(p))
+        });
+        let stays = info_only(args) || (reads && !names_delivery(&ops));
+        return Some((!stays).then_some(CLOUD));
+    }
+    let effect = match program {
+        // `-V` prints the version, `-G` the configuration, `-Q` what it
+        // supports: none of them connects. Git fetching over ssh runs.
+        "ssh" => {
+            let prints = args.iter().any(|a| matches!(*a, "-V" | "-G") || a.starts_with("-Q"));
+            (!prints && !git_fetch_over_ssh(args)).then_some(SSH)
+        }
+        "scp" | "rsync" => ops.iter().any(|o| names_remote(o)).then_some(COPY),
+        "sftp" => Some(COPY),
+        "autossh" | "lt" | "localtunnel" => Some(TUNNEL),
+        "cloudflared" | "ngrok" | "bore" | "zrok" => (!info_only(args)).then_some(TUNNEL),
+        "tailscale" => ops.first().is_some_and(|o| matches!(o.to_ascii_lowercase().as_str(), "funnel" | "serve" | "file")).then_some(TUNNEL),
+        _ => return None,
+    };
+    Some(effect)
+}
+
+/// Whether an ssh call is git fetching (`git fetch`, `clone`, `ls-remote`,
+/// `archive --remote`): its remote command, the last word, has exactly the
+/// shape git sends ([`git_fetch_command`]), and every word before the host
+/// is one git passes (protocol v2's `-o SendEnv=GIT_PROTOCOL`, a port, an
+/// address family). A push runs `git-receive-pack`, which isn't one, so a
+/// git that finds `ssh` on PATH can't push over ssh through the ssh shim;
+/// nor can a call that forwards a port or runs anything else there.
+fn git_fetch_over_ssh(args: &[&str]) -> bool {
+    let Some((command, rest)) = args.split_last() else { return false };
+    if !git_fetch_command(command) {
+        return false;
+    }
+    let Some((host, flags)) = rest.split_last() else { return false };
+    if host.starts_with('-') {
+        return false;
+    }
+    let port = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let mut i = 0;
+    while i < flags.len() {
+        match flags[i] {
+            "-o" if flags.get(i + 1) == Some(&"SendEnv=GIT_PROTOCOL") => i += 2,
+            "-p" if flags.get(i + 1).is_some_and(|p| port(p)) => i += 2,
+            "-oSendEnv=GIT_PROTOCOL" | "-4" | "-6" | "-T" => i += 1,
+            f if f.strip_prefix("-p").is_some_and(port) => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether `command`, an ssh remote command, is exactly what git sends to
+/// fetch: `git-upload-pack` or `git-upload-archive` (or the `git
+/// upload-pack` spelling), one space, and one single-quoted path with no
+/// quote inside and nothing after it. Nothing a remote shell would read as
+/// more (`;`, `&`, `|`, a newline, a backtick, `$`, a redirection, a
+/// parenthesis or a backslash) is anywhere in it.
+fn git_fetch_command(command: &str) -> bool {
+    if command.chars().any(|c| matches!(c, ';' | '&' | '|' | '\n' | '\r' | '`' | '$' | '<' | '>' | '(' | ')' | '\\')) {
+        return false;
+    }
+    let path = ["git-upload-pack ", "git upload-pack ", "git-upload-archive ", "git upload-archive "]
+        .iter()
+        .find_map(|program| command.strip_prefix(program));
+    let Some(quoted) = path.and_then(|p| p.strip_prefix('\'')).and_then(|p| p.strip_suffix('\'')) else {
+        return false;
+    };
+    !quoted.is_empty() && !quoted.contains('\'')
+}
+
+/// In a mission that ships nothing, what a PATH shim's call would change
+/// elsewhere (`ship_barrier`): `program` run with `args`, read by the same
+/// walk as an agent's command ([`remote_effect_local`]) but on the words as
+/// the program got them, with no shell in between to parse. No request to
+/// loopback counts as local here: the shim can't see the environment that
+/// would route it.
+pub fn shim_refusal(program: &str, args: &[&str]) -> Option<&'static str> {
+    let mut words = vec![program];
+    words.extend_from_slice(args);
+    remote_command(&words, Scope { ship_nothing: true, loopback_ok: false })
+}
 
 /// `gh` verbs that change GitHub, in groups other than the local ones.
 const GH_WRITES: &[&str] = &[
@@ -2281,6 +2894,10 @@ impl ToolGate for ModeGate {
 
     fn write_check(&self, name: &str, input: &Value) -> Option<crate::talk_guard::WriteCheck> {
         self.inner.as_ref().and_then(|g| g.write_check(name, input))
+    }
+
+    fn ships_nothing(&self) -> bool {
+        self.ships_nothing
     }
 }
 
@@ -3274,7 +3891,6 @@ mod tests {
         for command in [
             "export PORT=3000",
             "NODE_ENV=test npm test",
-            "HOME=/tmp npm test",
             "unset FOO",
             "alias",
             "exec",
@@ -3636,6 +4252,439 @@ mod tests {
         // A mission that can't be read counts as one that ships nothing.
         assert!(mission_ships_nothing(&Err(crate::error::AppError::Other("locked".into()))));
         assert!(!mission_ships_nothing(&Ok(None)));
+        // The loop's commands start behind the process barrier only in the
+        // posture (#1275).
+        assert!(gate.ships_nothing() && !open.ships_nothing());
+    }
+
+    /// The classifier gaps slice 2 closes (#1275), in a mission that ships
+    /// nothing: remote shells and copies, tunnels, hosted deploy and cloud
+    /// CLIs, a package runner's program, and git's other ways to deliver.
+    /// Plan only, and so a Build or Fix mission, reads them as before.
+    #[test]
+    fn a_ship_nothing_mission_refuses_remote_shells_tunnels_and_deploy_clis() {
+        let refused = [
+            "ssh deploy@example.com 'systemctl restart app'",
+            "ssh example.com",
+            "ssh -L 8080:localhost:80 example.com",
+            "ssh -R 9000:localhost:3000 example.com",
+            "ssh -D 1080 example.com",
+            "ssh -o SendEnv=GIT_PROTOCOL git@example.com \"git-receive-pack 'org/repo.git'\"",
+            "ssh -L 8080:localhost:80 git@example.com \"git-upload-pack 'org/repo.git'\"",
+            "scp dist/app.tgz deploy@example.com:/srv/",
+            "scp -P 2222 example.com:/etc/hosts .",
+            "sftp deploy@example.com",
+            "rsync -avz dist/ deploy@example.com:/srv/www/",
+            "rsync -a rsync://example.com/module/ ./out",
+            "rsync -a example.com::module ./out",
+            "autossh -M 0 -R 9000:localhost:3000 example.com",
+            "cloudflared tunnel run",
+            "cloudflared tunnel --url http://localhost:3000",
+            "ngrok http 3000",
+            "lt --port 3000",
+            "bore local 3000 --to bore.pub",
+            "tailscale funnel 3000",
+            "vercel",
+            "vercel --prod",
+            "vercel deploy --prebuilt",
+            "vercel env add SECRET production",
+            "netlify deploy --prod",
+            "netlify env:set KEY value",
+            "fly deploy",
+            "flyctl secrets set KEY=value",
+            "heroku config:set KEY=value",
+            "heroku run bash",
+            "firebase deploy --only hosting",
+            "wrangler deploy",
+            "wrangler pages deploy dist",
+            "railway up",
+            "surge ./dist example.surge.sh",
+            "pulumi up --yes",
+            "cdk deploy",
+            "serverless deploy",
+            "eb deploy",
+            "aws s3 cp dist s3://bucket/ --recursive",
+            "aws s3 sync . s3://bucket",
+            "aws lambda update-function-code --function-name f --zip-file fileb://f.zip",
+            "gcloud run deploy service --source .",
+            "gcloud app deploy",
+            "gsutil cp a.txt gs://bucket/",
+            "az webapp up",
+            "doctl apps create --spec app.yaml",
+            "npx vercel deploy",
+            "npx vercel@latest --prod",
+            "npm exec -- netlify-cli deploy",
+            "pnpm dlx wrangler deploy",
+            "yarn firebase deploy",
+            "bunx surge ./dist",
+            "git request-pull v1.0 https://example.com/repo.git main",
+            "git imap-send",
+            "git svn dcommit",
+            "git p4 submit",
+            "git cvsexportcommit -w /tmp/cvs HEAD",
+            "git remote set-url --push origin git@example.com:org/repo.git",
+            "git config remote.origin.pushurl git@example.com:org/repo.git",
+            "git -c remote.origin.pushurl=git@example.com:org/repo.git fetch",
+            "git --attr-source HEAD push origin main",
+        ];
+        for command in refused {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        let local = [
+            "ssh -V",
+            "ssh -G example.com",
+            "ssh -o SendEnv=GIT_PROTOCOL git@example.com \"git-upload-pack 'org/repo.git'\"",
+            "ssh -p 2222 git@example.com \"git-upload-pack 'org/repo.git'\"",
+            "scp a.txt b.txt",
+            "rsync -a src/ dst/",
+            "rsync -a ./a:b dst/",
+            "cloudflared --version",
+            "ngrok version",
+            "tailscale status",
+            "vercel dev",
+            "vercel build",
+            "vercel --version",
+            "netlify dev",
+            "netlify build",
+            "fly logs",
+            "heroku local web",
+            "heroku logs --tail",
+            "firebase emulators:start --only functions",
+            "wrangler dev",
+            "wrangler pages dev dist",
+            "pulumi preview",
+            "cdk synth",
+            "serverless offline start",
+            "aws sts get-caller-identity",
+            "aws s3 ls s3://bucket",
+            "aws ec2 describe-instances",
+            "gcloud run services list",
+            "gcloud config list",
+            "az account show",
+            "npx vercel dev",
+            "npx eslint .",
+            "yarn build",
+            "yarn wrangler dev",
+            "git remote add upstream https://example.com/repo.git",
+            "git remote -v",
+            "git fetch origin",
+        ];
+        for command in local {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+        // Plan only reads none of these programs: the posture alone adds them.
+        for command in ["ssh example.com", "vercel deploy", "aws s3 cp a s3://b/", "npx vercel deploy", "git request-pull v1 x", "git remote set-url --push origin x"] {
+            assert_eq!(remote_effect(command), None, "{command}");
+        }
+        // The director's refusal in Edit freely, and none for a mission
+        // that delivers.
+        let ro = HashSet::new();
+        let decide_in = |ships_nothing: bool, command: &str| {
+            let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing };
+            let input = json!({ "command": command });
+            decide(Mode::Edit, &ToolCall { name: "run_command", input: &input }, &ctx)
+        };
+        for command in ["ssh example.com", "vercel deploy", "rsync -a dist/ example.com:/srv/"] {
+            assert!(matches!(decide_in(true, command), Decision::Deny { .. }), "{command}");
+            assert_eq!(decide_in(false, command), Decision::Allow, "{command}");
+        }
+    }
+
+    /// A PATH shim's call is read by the same rules, on the words as the
+    /// program got them (#1275).
+    #[test]
+    fn a_shim_call_is_read_by_the_ship_nothing_rules() {
+        let refused: &[(&str, &[&str])] = &[
+            ("git", &["push", "origin", "main"]),
+            ("git", &["push", "--mirror", "origin"]),
+            ("git", &["-c", "remote.origin.pushurl=/tmp/r.git", "push", "origin", "main"]),
+            ("git", &["--attr-source", "HEAD", "push"]),
+            ("git", &["-C", "sub", "push"]),
+            ("git", &["send-email", "0001.patch"]),
+            ("git", &["request-pull", "v1", "origin"]),
+            ("git", &["remote", "set-url", "--push", "origin", "x"]),
+            ("gh", &["pr", "create", "--fill"]),
+            ("glab", &["mr", "create"]),
+            ("npm", &["publish"]),
+            ("cargo", &["publish"]),
+            ("twine", &["upload", "dist/*"]),
+            ("docker", &["push", "example/app"]),
+            ("vercel", &["--prod"]),
+            ("netlify", &["deploy"]),
+            ("fly", &["deploy"]),
+            ("heroku", &["releases:rollback"]),
+            ("firebase", &["deploy"]),
+            ("ssh", &["git@example.com", "git-receive-pack 'org/repo.git'"]),
+            ("ssh", &["-R", "9000:localhost:3000", "example.com"]),
+            // Anything but git's exact fetch command (review of #1287).
+            ("ssh", &["git@example.com", "git-upload-pack 'org/repo.git'; touch /tmp/x"]),
+            ("ssh", &["git@example.com", "git-upload-pack 'org/repo.git' && rm -rf ~"]),
+            ("ssh", &["git@example.com", "git-upload-pack 'org/repo.git' | sh"]),
+            ("ssh", &["git@example.com", "git-upload-pack 'org/repo.git'\ntouch /tmp/x"]),
+            ("ssh", &["git@example.com", "git-upload-pack '`id`'"]),
+            ("ssh", &["git@example.com", "git-upload-pack '$(id)'"]),
+            ("ssh", &["git@example.com", "git-upload-pack org/repo.git"]),
+            ("ssh", &["git@example.com", "git-upload-pack 'org/repo.git' extra"]),
+            ("ssh", &["git@example.com", "git-upload-pack 'a'\\''b'"]),
+            ("ssh", &["git@example.com", " git-upload-pack 'org/repo.git'"]),
+            ("ssh", &["git@example.com", "git-upload-pack"]),
+            ("rsync", &["-a", "dist/", "example.com:/srv/"]),
+            ("npx", &["vercel", "deploy"]),
+            // Only git's own commands, and gh's reads (review of #1287).
+            ("git", &["p", "origin", "main"]),
+            ("git", &["Status"]),
+            ("git", &["credential", "fill"]),
+            ("git", &["-c", "credential.helper=store", "fetch"]),
+            ("gh", &["alias", "set", "co", "pr checkout"]),
+            ("gh", &["co", "12"]),
+            ("gh", &["pr", "update-branch", "12"]),
+        ];
+        for (program, args) in refused {
+            assert!(shim_refusal(program, args).is_some(), "{program} {args:?}");
+        }
+        let runs: &[(&str, &[&str])] = &[
+            ("git", &["status"]),
+            ("git", &["commit", "-m", "push"]),
+            ("git", &["log", "--grep", "push"]),
+            ("git", &["fetch", "origin"]),
+            ("git", &["-c", "user.name=t", "commit", "-m", "x"]),
+            ("gh", &["pr", "view", "12"]),
+            ("npm", &["test"]),
+            ("npm", &["install"]),
+            ("cargo", &["build"]),
+            ("vercel", &["dev"]),
+            ("ssh", &["-o", "SendEnv=GIT_PROTOCOL", "git@example.com", "git-upload-pack 'org/repo.git'"]),
+            ("ssh", &["git@example.com", "git upload-pack 'org/repo.git'"]),
+            ("ssh", &["-p", "2222", "git@example.com", "git-upload-archive '/srv/repo with space.git'"]),
+            ("ssh", &["-G", "example.com"]),
+            ("rsync", &["-a", "src/", "dst/"]),
+        ];
+        for (program, args) in runs {
+            assert_eq!(shim_refusal(program, args), None, "{program} {args:?}");
+        }
+    }
+
+    /// In a mission that ships nothing, a command can't name another config
+    /// for itself (review of #1287): git, called by name, would read the
+    /// agent's own (an alias to `push`, a longer `pushInsteadOf`, a
+    /// credential helper). Other one-command variables still pass.
+    #[test]
+    fn a_ship_nothing_mission_refuses_a_config_prefix() {
+        let refused = Some(ship_nothing_feature_refusal(CONFIG_PREFIX));
+        for command in [
+            "XDG_CONFIG_HOME=/tmp/x git p origin main",
+            "XDG_CONFIG_HOME=./cfg git status",
+            "HOME=/tmp/x git status",
+            "HOME=/tmp npm test",
+            "PATH=./bin:/usr/bin git status",
+            "GIT_CONFIG_GLOBAL=./cfg git status",
+            "GIT_SSH_COMMAND=./ssh git fetch",
+            "SSH_AUTH_SOCK=/tmp/agent git fetch",
+            "GH_CONFIG_DIR=./gh gh pr view 1",
+            "NPM_CONFIG_USERCONFIG=./npmrc npm test",
+            "env HOME=/tmp/x git status",
+            "npm test && XDG_CONFIG_HOME=./cfg git log",
+        ] {
+            assert_eq!(ship_nothing_shell_refusal(command), refused, "{command}");
+            let ro = HashSet::new();
+            let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing: true };
+            let input = json!({ "command": command });
+            assert!(matches!(decide(Mode::Edit, &ToolCall { name: "run_command", input: &input }, &ctx), Decision::Deny { .. }), "{command}");
+        }
+        for command in ["NODE_ENV=test npm test", "PORT=3000 npm start", "CI=1 npm test", "RUST_LOG=debug cargo test"] {
+            assert_eq!(ship_nothing_shell_refusal(command), None, "{command}");
+        }
+        let text = ship_nothing_feature_refusal(CONFIG_PREFIX);
+        assert!(text.contains("HOME, PATH, XDG_*") && text.contains("ships nothing"), "{text}");
+    }
+
+    /// In a mission that ships nothing git runs its own commands only, and
+    /// never one that hands out a credential, serves the repository or runs
+    /// a command of its own (review of #1287). Plan only reads git as before.
+    #[test]
+    fn a_ship_nothing_mission_runs_only_gits_own_commands() {
+        for command in [
+            "git p origin main",
+            "git Status",
+            "git co main",
+            "git credential fill",
+            "git credential-store get",
+            "git daemon --export-all",
+            "git instaweb",
+            "git http-push https://example.com/repo.git main",
+            "git rebase -x 'git push' main",
+            "git rebase --exec='make test' main",
+            "git rebase -ix make main",
+            "git submodule foreach 'git push'",
+            "git bisect run ./check.sh",
+            "git filter-branch --tree-filter true HEAD",
+            "git -c credential.helper=store fetch",
+            "git config credential.helper store",
+        ] {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        for command in [
+            "git",
+            "git --version",
+            "git status",
+            "git -C sub status",
+            "git log --oneline -5",
+            "git lfs pull",
+            "git subtree split -P lib",
+            "git rebase -i main",
+            "git rebase main",
+            "git submodule update --init",
+            "git bisect start",
+            "git worktree list",
+            "git stash push -m wip",
+        ] {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+        for command in ["git p origin main", "git credential fill", "git rebase -x 'make' main"] {
+            assert_eq!(remote_effect(command), None, "Plan only is unchanged: {command}");
+        }
+    }
+
+    /// In a mission that ships nothing git takes only display and identity
+    /// settings from `-c` and `--config-env` (review of #1287 at
+    /// `7a175724`): a key that names a program (`diff.external`,
+    /// `core.fsmonitor`, `core.pager`, `core.hooksPath`) is refused, as are
+    /// the other ways a call names a program for git to run: another
+    /// upload-pack, an archive `--exec`, `difftool`/`mergetool`, a template
+    /// folder, `--ext-diff`, `--exec-path=`, the help viewer and the GUI
+    /// tools. Plan only reads them as before.
+    #[test]
+    fn a_ship_nothing_mission_takes_only_display_git_settings() {
+        for command in [
+            "git -c diff.external=./x diff",
+            "git -c core.fsmonitor=./x status",
+            "git -c core.hooksPath=hooks commit -m a",
+            "git -c core.pager=./x log",
+            "git -c core.sshCommand=./x fetch origin",
+            "git -c gpg.program=./x commit -S -m a",
+            "git -c filter.f.clean=./x add a",
+            "git -c pager.log=less log",
+            "git --config-env=core.pager=EVIL log",
+            "git --config-env core.fsmonitor=EVIL status",
+            "git --config-env=pager.log=PAGER log",
+            "git -C sub -c Core.FSMonitor=./x status",
+            "git clone -c core.fsmonitor=./x https://example.com/r.git",
+            "git clone --config core.sshCommand=./x https://example.com/r.git",
+            "git clone --config=diff.external=./x https://example.com/r.git",
+            "git clone -u ./x https://example.com/r.git",
+            "git clone --template=./t https://example.com/r.git",
+            "git init --template=./t",
+            "git fetch --upload-pack=./x origin",
+            "git ls-remote --upload-pack ./x origin",
+            "git archive --exec=./x --remote=origin HEAD",
+            "git difftool",
+            "git mergetool",
+            "git upload-pack .",
+            "git maintenance start",
+            "git log -p --ext-diff",
+            "git diff --ext-diff",
+            "git diff --ext-d",
+            "git --exec-path=./x status",
+            "git help log",
+            "git help -w log",
+            "git log --help",
+            "git --help log",
+            "git gui",
+            "git web--browse index.html",
+        ] {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        for command in [
+            "git -c color.ui=always log",
+            "git -c user.name=t -c user.email=t@example.com commit -m a",
+            "git -c pager.log=false log",
+            "git -c pager.diff=cat diff",
+            "git -c core.quotePath=false status",
+            "git -c log.date=iso log",
+            "git -c advice.detachedHead=false switch --detach HEAD",
+            "git -c diff.renames=true -c diff.noprefix=true diff",
+            "git switch -c topic",
+            "git checkout -b topic",
+            "git --exec-path",
+            "git --help",
+            "git help -a",
+            "git help --config",
+            "git log -h",
+            "git diff --no-ext-diff",
+            "git log --extended-regexp --grep=x",
+            "git init",
+            "git fetch origin",
+        ] {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+        for command in ["git -c core.fsmonitor=./x status", "git help log", "git diff --ext-diff"] {
+            assert_eq!(remote_effect(command), None, "Plan only is unchanged: {command}");
+        }
+    }
+
+    /// In a mission that ships nothing `gh` and `glab` run their reads only
+    /// (review of #1287): an alias, `gh pr update-branch` and any other
+    /// subcommand the check doesn't know are refused. Plan only reads them
+    /// as before.
+    #[test]
+    fn a_ship_nothing_mission_runs_only_gh_reads() {
+        for command in [
+            "gh alias set co 'pr checkout'",
+            "gh co 12",
+            "gh pr update-branch 12",
+            "gh pr checkout 12",
+            "gh auth token",
+            "gh api -X PATCH repos/o/r",
+            "gh api -XPOST repos/o/r/issues",
+            "gh api --method=DELETE repos/o/r",
+            "gh api -X GET repos/o/r/issues -f state=open",
+            "gh api repos/o/r/issues -F title=x",
+            "gh api graphql -f query=x",
+            "gh",
+            "glab mr merge 3",
+            "glab mr checkout 3",
+            "hub pull-request -m x",
+            "hub co 12",
+        ] {
+            assert!(remote_effect_local(command).is_some(), "{command}");
+        }
+        for command in [
+            "gh pr view 12",
+            "gh pr list --state open",
+            "gh pr diff 12",
+            "gh pr checks 12",
+            "gh run view 99 --log",
+            "gh status",
+            "gh auth status",
+            "gh api repos/o/r/pulls",
+            "gh api -X GET repos/o/r",
+            "gh --version",
+            "glab mr view 3",
+            "glab ci status",
+            "hub status",
+        ] {
+            assert_eq!(remote_effect_local(command), None, "{command}");
+        }
+        for command in ["gh pr update-branch 12", "gh co 12", "gh auth token"] {
+            assert_eq!(remote_effect(command), None, "Plan only is unchanged: {command}");
+        }
+    }
+
+    /// Every command the hosts run for a mission that ships nothing starts
+    /// behind the process barrier (#1275): the director's, through the
+    /// confined runner; a sub-agent's, through its gate. Read in the
+    /// source, as above.
+    #[test]
+    fn the_hosts_start_commands_behind_the_barrier() {
+        let agentic = include_str!("orchestrator/agentic.rs");
+        assert!(agentic.contains("let ships_nothing = gate.is_some_and(|g| g.ships_nothing());"));
+        assert!(agentic.contains("check.as_ref(), ships_nothing);"));
+        let engine = include_str!("chat_engine.rs");
+        assert!(engine.contains("match crate::ship_barrier::Barrier::for_workspace(workspace_path) {"));
+        assert!(engine.contains("run_command_kept(workspace_path, input, sandbox_roots, cancel, ships_nothing);"));
+        let cli = include_str!("orchestrator/cli_runner.rs");
+        assert!(cli.contains("let barrier = if ctx.ships_nothing {"));
+        assert!(cli.contains("barrier.as_ref().map(|b| (b, path_env.as_str())),"));
     }
 
     #[test]
@@ -3793,7 +4842,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             });
-            crate::chat_engine::run_confined(ws.path(), &json!({ "command": "sleep 30" }), None, &cancel).await
+            crate::chat_engine::run_confined(ws.path(), &json!({ "command": "sleep 30" }), None, &cancel, false).await
         });
         assert!(!ok, "{out}");
         assert!(started.elapsed() < std::time::Duration::from_secs(15), "Stop didn't reach the command: {out}");
@@ -3826,10 +4875,10 @@ mod tests {
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
             "let mut was_denied = denied.is_some() || mode_denied;",
             "self.talk_shell.available() && exec_roots.is_none()",
-            "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await",
+            "run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel, ships_nothing).await",
             "name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref()))",
-            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing).await",
-            "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel).await",
+            "run_builtin(&workspace_path, &u.name, &u.input, exec_roots.clone(), &cancel, landing, ships_nothing).await",
+            "run_fallback_shell(&workspace_path, &u.input, &reason, &cancel, ships_nothing).await",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),\n                    ships_nothing,\n",
         ] {
             assert!(body.contains(call), "the director's loop no longer has: {call}");
