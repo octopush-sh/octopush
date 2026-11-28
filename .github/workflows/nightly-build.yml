@@ -5,7 +5,11 @@
 # the oldest `ready` issue — and has a Claude agent build it. The agent runs with no GitHub
 # credential: its checks run as a separate user, the checkout's .git is moved out
 # of its reach, and the publishing step runs a copy of scripts/routines taken
-# before it started. Runs every two hours (at :07, Bogotá even hours); an
+# before it started. Agent and dependency code run without access to
+# credentials: Node and the Claude Code CLI are a root-owned, read-only copy
+# (scripts/routines/frozen-node.sh), and before each step that runs after the
+# agent, `frozen-node.sh guard` proves the sandbox user gone and nothing the
+# runner executes changed or open to it. Runs every two hours (at :07, Bogotá even hours); an
 # empty queue costs a minute and no agent.
 name: nightly-build
 
@@ -85,6 +89,15 @@ jobs:
         # releasing the claim) comes from main, never from the agent's work.
         run: cp -R scripts/routines "$RUNNER_TEMP/routines"
 
+      - name: Node 22 and the Claude Code CLI, root-owned and read-only (before any agent branch)
+        if: steps.pick.outputs.kind != ''
+        # The sandbox's checks can write the runner's shared tool cache, so the
+        # agent and every later step run this copy instead: the CLI is installed
+        # into it here, with no token in this step, then the whole tree becomes
+        # root-owned and read-only and comes first on PATH. What the runner
+        # executes from here on is closed to other users (frozen-node.sh).
+        run: OCTO_NODE_GLOBALS="@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" bash "$RUNNER_TEMP/routines/frozen-node.sh" freeze
+
       - name: Context and brief
         if: steps.pick.outputs.kind != ''
         env:
@@ -157,7 +170,9 @@ jobs:
           # The branch's dependencies, without lifecycle scripts (manifests and
           # lockfile are human-only, but nothing from the branch runs here).
           npm ci --no-audit --no-fund --ignore-scripts
-          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          for c in node npm npx claude; do
+            [ "$(command -v "$c")" = "/opt/octo-node/bin/$c" ] || { echo "::error::$c is not the frozen copy"; exit 1; }
+          done
           # Out of the agent's (and the sandbox's) reach from here on.
           mv .git "$RUNNER_TEMP/repo.git"
           OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE" bash "$RUNNER_TEMP/routines/agent-sandbox-setup.sh"
@@ -170,16 +185,29 @@ jobs:
         run: node "$RUNNER_TEMP/routines/agent.mjs" builder "$RUNNER_TEMP/prompt.md"
 
       - name: Stop the sandbox and freeze the checkout
+        id: sandbox-gone
         if: always() && steps.pick.outputs.kind != ''
         # Nothing the checks started may keep changing files while they're
-        # scanned and committed.
+        # scanned and committed. The checkout's .git is in the runner's temp
+        # dir: one here now was made by the sandbox, and actions/checkout's post
+        # step would run git in it. Not resolved through PATH: guard checks PATH.
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
+          job_path="$PATH"
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
           sudo pkill -KILL -u octo-sandbox || true
           sudo find "$GITHUB_WORKSPACE" -type l -user octo-sandbox -delete || true
+          planted=""
+          if [ -d "$RUNNER_TEMP/repo.git" ] && { [ -e "$GITHUB_WORKSPACE/.git" ] || [ -L "$GITHUB_WORKSPACE/.git" ]; }; then
+            sudo rm -rf "$GITHUB_WORKSPACE/.git"; planted=1
+          fi
           chmod -R o-w "$GITHUB_WORKSPACE" || true
+          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines" "$RUNNER_TEMP/repo.git"
+          if [ -n "$planted" ]; then echo "::error::the checkout had a .git of the sandbox's (removed): not publishing"; exit 1; fi
 
       - name: Publish
-        if: steps.pick.outputs.kind != '' && !cancelled()
+        if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         env:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_GIT_DIR: ${{ runner.temp }}/repo.git
@@ -191,12 +219,24 @@ jobs:
           KIND: ${{ steps.pick.outputs.kind }}
           NUM: ${{ steps.pick.outputs.num }}
           BRANCH: ${{ steps.pick.outputs.branch }}
-        run: node "$RUNNER_TEMP/routines/publish-build.mjs" "$KIND" "$NUM" "$BRANCH"
+        run: |
+          /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines" "$RUNNER_TEMP/repo.git"
+          node "$RUNNER_TEMP/routines/publish-build.mjs" "$KIND" "$NUM" "$BRANCH"
 
       - name: Release the claim
         if: always() && steps.pick.outputs.kind != ''
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         env:
           GH_TOKEN: ${{ github.token }}
           KIND: ${{ steps.pick.outputs.kind }}
           NUM: ${{ steps.pick.outputs.num }}
-        run: node "$RUNNER_TEMP/routines/jobs.mjs" release "$KIND" "$NUM" || true
+        run: |
+          /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines"
+          node "$RUNNER_TEMP/routines/jobs.mjs" release "$KIND" "$NUM" || true
+
+      - name: Nothing the post steps run has changed
+        # The actions' post steps (setup-node's cache, checkout's clean-up) run
+        # after this one, on the runner's own Node and git.
+        if: always() && steps.pick.outputs.kind != ''
+        shell: /usr/bin/bash --noprofile --norc -e {0}
+        run: /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines"

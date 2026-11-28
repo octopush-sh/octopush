@@ -15,7 +15,11 @@
 # repo: one to pick, claim and check out (revoked before the agent starts), a
 # fresh one to publish after it has finished. GITHUB_TOKEN covers the app repo
 # (claims and comments on `area:web` issues). No token is ever in the agent's
-# environment (agent.mjs rebuilds it). Website PRs never auto-merge: the owner
+# environment (agent.mjs rebuilds it). Agent and dependency code run without
+# access to credentials: Node and the Claude Code CLI are a root-owned,
+# read-only copy (scripts/routines/frozen-node.sh), and before each step that
+# runs after the agent, `frozen-node.sh guard` proves the sandbox user gone and
+# nothing the runner executes changed or open to it. Website PRs never auto-merge: the owner
 # answers `merge web#N` in the digest. Every two hours at :37, between the app
 # builder (:07) and the reviewers.
 name: web-build
@@ -112,6 +116,15 @@ jobs:
           NUM: ${{ steps.pick.outputs.num }}
         run: node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$WEB_REPO" claim "$KIND" "$NUM"
 
+      - name: Node 22 and the Claude Code CLI, root-owned and read-only (before the website arrives)
+        if: steps.pick.outputs.kind != ''
+        # The sandbox's checks can write the runner's shared tool cache, so the
+        # agent and every later step run this copy of setup-node's Node instead:
+        # the CLI is installed into it here, with no token in this step, then the
+        # whole tree becomes root-owned and read-only and comes first on PATH.
+        # What the runner executes from here on is closed to other users.
+        run: OCTO_NODE_GLOBALS="@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" bash "$RUNNER_TEMP/routines/frozen-node.sh" freeze
+
       - name: Check out octopush-web
         if: steps.pick.outputs.kind != ''
         uses: actions/checkout@v7
@@ -170,7 +183,9 @@ jobs:
           set -euo pipefail
           # The web repo's dependencies, without lifecycle scripts.
           (cd web && npm ci --no-audit --no-fund --ignore-scripts)
-          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          for c in node npm npx claude; do
+            [ "$(command -v "$c")" = "/opt/octo-node/bin/$c" ] || { echo "::error::$c is not the frozen copy"; exit 1; }
+          done
           # Out of the agent's (and the sandbox's) reach from here on.
           mv web/.git "$RUNNER_TEMP/web.git"
           OCTO_CHECK_PROFILE=web OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/web" bash "$RUNNER_TEMP/routines/agent-sandbox-setup.sh"
@@ -185,8 +200,17 @@ jobs:
 
       - name: Stop the sandbox and freeze the checkout
         if: always() && steps.pick.outputs.kind != ''
+        # The checkout's own .git is in the runner's temp dir: one there now is
+        # the sandbox's, and actions/checkout's post step would run git in it.
+        # Removed here, whatever else fails; the next step refuses to go on.
+        # Not resolved through PATH: nothing on it is checked yet.
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
           sudo pkill -KILL -u octo-sandbox || true
+          if [ -d "$RUNNER_TEMP/web.git" ] && { [ -e "$GITHUB_WORKSPACE/web/.git" ] || [ -L "$GITHUB_WORKSPACE/web/.git" ]; }; then
+            sudo rm -rf "$GITHUB_WORKSPACE/web/.git"; : > "$RUNNER_TEMP/planted-git"
+          fi
           sudo find "$GITHUB_WORKSPACE/web" -type l -user octo-sandbox -delete || true
           chmod -R o-w "$GITHUB_WORKSPACE/web" || true
 
@@ -197,12 +221,20 @@ jobs:
         # sudo, which can't read the runner's processes. The App's private key is
         # used again only after this step (the publish token, and the token
         # action's post steps) — refuse if any sandbox process survived.
+        # Also refused: a checkout that had a .git again (the step above removed
+        # it), and anything the runner executes from here that changed or is
+        # open to the sandbox (frozen-node.sh).
         if: always() && steps.pick.outputs.kind != ''
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
+          job_path="$PATH"
+          PATH=/usr/sbin:/usr/bin:/sbin:/bin
           sleep 1
           if pgrep -u octo-sandbox >/dev/null; then
             echo "::error::octo-sandbox processes survived the kill — not minting the publish token"; exit 1
           fi
+          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines" "$RUNNER_TEMP/web.git"
+          if [ -e "$RUNNER_TEMP/planted-git" ]; then echo "::error::the website's checkout had a .git of the sandbox's (removed): not publishing"; exit 1; fi
 
       - name: Web token (publish)
         id: pub-token
@@ -220,6 +252,7 @@ jobs:
       - name: Publish
         if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
         working-directory: web
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         env:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_WEB_TOKEN: ${{ steps.pub-token.outputs.token }}
@@ -232,6 +265,7 @@ jobs:
           BRANCH: ${{ steps.pick.outputs.branch }}
         run: |
           set -euo pipefail
+          /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines" "$RUNNER_TEMP/web.git"
           # Commits are the App's bot's (its noreply address needs the bot's user id).
           id="$(gh api "users/$OCTOPUSH_APP_BOT_LOGIN" --jq .id 2>/dev/null || true)"
           if [[ "$id" =~ ^[0-9]+$ ]]; then
@@ -241,10 +275,20 @@ jobs:
 
       - name: Release the claim
         if: always() && steps.pick.outputs.kind != ''
+        shell: /usr/bin/bash --noprofile --norc -e {0}
         env:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_WEB_TOKEN: ${{ steps.pub-token.outputs.token }}
           OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
           KIND: ${{ steps.pick.outputs.kind }}
           NUM: ${{ steps.pick.outputs.num }}
-        run: node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$WEB_REPO" release "$KIND" "$NUM" || true
+        run: |
+          /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines"
+          node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$WEB_REPO" release "$KIND" "$NUM" || true
+
+      - name: Nothing the post steps run has changed
+        # The actions' post steps (the publish token's revocation, checkout's
+        # clean-up) run after this one, on the runner's own Node and git.
+        if: always() && steps.pick.outputs.kind != ''
+        shell: /usr/bin/bash --noprofile --norc -e {0}
+        run: /usr/bin/bash "$RUNNER_TEMP/routines/frozen-node.sh" guard "$RUNNER_TEMP/routines"

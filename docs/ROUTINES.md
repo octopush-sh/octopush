@@ -214,6 +214,19 @@ trusted:
 - **The builder runs code only through `octo-check`** (typecheck, tests, changeset check) — a
   root-owned copy of `scripts/routines/agent-check.sh` that runs the checks as a separate user with
   an empty environment, so code the agent writes can't reach the token.
+- **Nothing the sandbox can write runs as the runner.** In the three builders (`nightly-build`,
+  `web-build`, `epiku-build`), Node and the Claude Code CLI are a root-owned, read-only copy made
+  by `scripts/routines/frozen-node.sh freeze` before the agent's branch or repo arrives (the
+  CLI is installed into it there, with no token in the step), and everything on `PATH`, the
+  runner, the actions' code and `~/.config` is closed to other users. After the agent, the sandbox
+  is stopped with system tools only, and every later step, and the last one before the actions'
+  post steps, starts with `frozen-node.sh guard`: the sandbox user's processes and crontab are gone, the frozen
+  copy is unchanged, nothing the runner executes is writable by or belongs to that user, the moved
+  `.git` has no hook or command-running config, and the step's environment sets no `GIT_*`,
+  `NODE_OPTIONS`, `BASH_ENV` or loader variable; otherwise the step fails and nothing is
+  published. Those steps run on `/usr/bin/bash`, not a shell found through `PATH`. A `.git` the
+  sandbox made in the checkout (whose own `.git` was moved out) is removed before
+  `actions/checkout`'s post step could run git in it, and the build is not published.
 - **Agents only write files.** Fixed steps then validate them, scan everything for the token, and
   do the GitHub writes with the workflow's token — from a copy of `scripts/routines` taken from
   `main` before any agent branch is checked out, with the checkout's `.git` moved out of the
