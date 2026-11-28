@@ -3362,7 +3362,7 @@ mod tests {
         let prepare = &engine[at..at + engine[at..].find("\n    }\n").unwrap()];
         assert!(prepare.contains("self.talk_shell.set_strict(thread_id, crate::permissions::mission_ships_nothing(&mission));"));
         assert!(body.contains("self.prepare_shell(&request.workspace_id, &request.thread_id);"), "the agent's commands");
-        assert!(body.contains("Ok(Err(AppError::Other(m))) if m == crate::talk_shell::STRICT_SHELL_UNCONFIRMED => (m, false),"), "no fallback runs it");
+        assert!(body.contains("Ok(Err(AppError::Other(m))) if m.starts_with(crate::talk_shell::STRICT_SHELL_REFUSED) => (m, false),"), "no fallback runs it");
         assert_eq!(engine.matches("self.prepare_shell(&request.workspace_id, &request.thread_id);").count(), 2, "and `$` commands");
     }
 }

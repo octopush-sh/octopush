@@ -5991,9 +5991,9 @@ impl ChatEngine {
                             }
                             (format_command_output(&r.output, r.exit_code), r.ok)
                         }
-                        // A strict shell that didn't confirm runs nothing, and
-                        // no isolated shell runs it either (#1241).
-                        Ok(Err(AppError::Other(m))) if m == crate::talk_shell::STRICT_SHELL_UNCONFIRMED => (m, false),
+                        // A strict shell that isn't proved clean runs nothing,
+                        // and no isolated shell runs it either (#1241).
+                        Ok(Err(AppError::Other(m))) if m.starts_with(crate::talk_shell::STRICT_SHELL_REFUSED) => (m, false),
                         // Shared shell unavailable (a live `$` process holds it, or
                         // a transient error). Run THIS command in an isolated shell
                         // so the agent isn't blocked — but say so explicitly, since

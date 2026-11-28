@@ -204,25 +204,39 @@ impl TalkShell {
             }
         };
 
+        // A shell that ran before its mission came to ship nothing is never
+        // cleaned in place: what ran in it can outlast any cleanup (a
+        // function named `unset`). A fresh `bash -l` takes its place, where
+        // it was, and is made strict before this command.
+        if strict && !handle.lock().strict {
+            let (id, cwd) = {
+                let mut session = handle.lock();
+                if session.rx.take().is_none() {
+                    return Ok(RunOutcome::Busy);
+                }
+                (session.id.clone(), session.cwd.clone())
+            };
+            let _ = client.remove(&id);
+            let start = if std::path::Path::new(&cwd).is_dir() { cwd.as_str() } else { workspace_path };
+            match Self::ensure_session(&client, thread_id, start, &extra, true) {
+                Ok(fresh) => *handle.lock() = fresh,
+                Err(e) => {
+                    self.sessions.lock().remove(thread_id);
+                    return Err(e);
+                }
+            }
+        }
+
         // Take the receiver out under the lock, then drop the lock so the drain
         // never blocks another thread. A concurrent run for THIS thread finds
         // `rx == None` and returns Busy.
-        let (rx, nonce, id, cwd, ran_strict) = {
+        let (rx, nonce, id, cwd) = {
             let mut session = handle.lock();
             let Some(rx) = session.rx.take() else {
                 return Ok(RunOutcome::Busy);
             };
-            (rx, session.nonce.clone(), session.id.clone(), session.cwd.clone(), session.strict)
+            (rx, session.nonce.clone(), session.id.clone(), session.cwd.clone())
         };
-
-        // A shell that was running when its mission came to ship nothing.
-        if strict && !ran_strict {
-            if !apply_strict_shell(&client, &id, &rx, &nonce) {
-                handle.lock().rx = Some(rx);
-                return Err(AppError::Other(STRICT_SHELL_UNCONFIRMED.into()));
-            }
-            handle.lock().strict = true;
-        }
 
         // Discard any stale bytes (the idle prompt left in the buffer) so the
         // next prompt marker we see is unambiguously THIS command's completion.
@@ -382,8 +396,11 @@ impl TalkShell {
     /// Reattach to a surviving daemon PTY (so the shell persists across an
     /// Octopush restart) or spawn fresh; then (re-)install the prompt marker with
     /// a fresh nonce and wait until the shell confirms ready. Returns the cwd.
-    /// A `strict` shell runs [`apply_strict_shell`] on every attach, and no
-    /// command runs in it until the shell confirms it.
+    /// A `strict` shell is never reattached: the surviving one may have run
+    /// before its mission came to ship nothing, so it is replaced by a fresh
+    /// `bash -l` where it was. A strict shell runs [`apply_strict_shell`]
+    /// before anything else, and no command runs in it unless that proved
+    /// it clean.
     fn ensure_session(
         client: &Arc<DaemonClient>,
         thread_id: &str,
@@ -392,11 +409,27 @@ impl TalkShell {
         strict: bool,
     ) -> AppResult<Session> {
         let id = format!("talk-{thread_id}");
-        let reattaching = client
+        let mut reattaching = client
             .list_terminals()
             .unwrap_or_default()
             .iter()
             .any(|t| t.id == id && t.running);
+        let mut cwd = cwd.to_string();
+        if reattaching && strict {
+            // Where it was, read from its prompt, then gone.
+            let rx = client.attach(&id, 0)?;
+            match init_and_wait_ready(client, &id, &rx, &gen_nonce()) {
+                Ok(was) => {
+                    if let Some(was) = was.filter(|c| std::path::Path::new(c).is_dir()) {
+                        cwd = was;
+                    }
+                }
+                Err(_) => return Err(AppError::Other(SHELL_BUSY.into())),
+            }
+            drop(rx);
+            client.remove(&id)?;
+            reattaching = false;
+        }
 
         // The PATH CLI stages spawn with, and no other login-shell variable.
         let path = crate::orchestrator::cli_runner::resolved_cli_path();
@@ -405,7 +438,7 @@ impl TalkShell {
         // `/usr/bin` ahead of Homebrew: leave `bash -l`'s PATH alone then.
         let has_login_path = crate::orchestrator::cli_runner::login_env_path().is_some();
         if !reattaching {
-            Self::spawn_bash(client, &id, cwd, &spawn_env(&path, extra))?;
+            Self::spawn_bash(client, &id, &cwd, &spawn_env(&path, extra))?;
         }
         let nonce = gen_nonce();
         let rx = client.attach(&id, 0)?;
@@ -415,29 +448,23 @@ impl TalkShell {
                 if has_login_path {
                     apply_login_path(client, &id, &rx, &nonce, &path);
                 }
-                // On a reattach too: a command typed in the shell since, or
-                // an older build, may have left definitions in it.
-                if strict && !apply_strict_shell(client, &id, &rx, &nonce) {
-                    if !reattaching {
+                if strict {
+                    if let Err(why) = apply_strict_shell(client, &id, &rx, &nonce) {
                         let _ = client.remove(&id);
+                        return Err(AppError::Other(format!("{STRICT_SHELL_REFUSED} {why}.")));
                     }
-                    return Err(AppError::Other(STRICT_SHELL_UNCONFIRMED.into()));
                 }
                 Ok(Session {
                     id,
                     rx: Some(rx),
-                    cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
+                    cwd: ready_cwd.unwrap_or_else(|| cwd.clone()),
                     nonce,
                     strict,
                 })
             }
             // Reattached but never ready — the surviving shell is busy with a
             // process from before the restart. Do NOT kill it; surface an error.
-            Err(_) if reattaching => Err(AppError::Other(
-                "This conversation's shell is busy with a process still running from before \
-                 the restart. Wait for it to finish, or delete the conversation to stop it."
-                    .into(),
-            )),
+            Err(_) if reattaching => Err(AppError::Other(SHELL_BUSY.into())),
             Err(e) => {
                 let _ = client.remove(&id);
                 Err(e)
@@ -450,6 +477,10 @@ impl TalkShell {
         Ok(())
     }
 }
+
+/// Why a reattached shell runs nothing: it never came back to its prompt.
+const SHELL_BUSY: &str = "This conversation's shell is busy with a process still running from before \
+    the restart. Wait for it to finish, or delete the conversation to stop it.";
 
 /// A Talk shell's spawn env: `path` as PATH, plus the thread's `extra`
 /// variables (which never replace PATH).
@@ -487,50 +518,126 @@ fn apply_login_path(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEven
     }
 }
 
-/// Why a command didn't run in a strict shell that didn't confirm it.
-pub(crate) const STRICT_SHELL_UNCONFIRMED: &str = "Not run: this mission ships nothing, and this conversation's \
-    shell didn't confirm it dropped the aliases and functions from your shell profile, which can make a command \
-    run something other than what it names. A function marked readonly (`readonly -f`) can't be dropped.";
+/// How a command refused by a strict shell's caller starts; the reason
+/// [`apply_strict_shell`] gave follows.
+pub(crate) const STRICT_SHELL_REFUSED: &str = "Not run: this mission ships nothing, and this conversation's shell";
 
-/// What [`apply_strict_shell`] writes, a line at a time. bash expands a
-/// line's aliases as it reads it, so only the second line, read after
-/// `unalias -a` ran, uses reserved words an alias could replace (`while`,
+/// What [`apply_strict_shell`] writes before its report, a line at a time.
+/// bash expands a line's aliases as it reads it, so only lines read after
+/// `unalias -a` ran use reserved words an alias could replace (`while`,
 /// `case`); every command word is quoted (`\builtin`), which no alias
 /// matches. A profile's `builtin` or `unset` function goes first, in POSIX
 /// mode, where a special builtin is found before a function:
 /// `POSIXLY_CORRECT` turns it on, an assignment no function or alias can
-/// take, and comes off again unless the profile had it. Traps go too, since
-/// a `DEBUG` trap would call a function that is gone, and the command hash.
-/// `interactive_comments` is on, so a `#` starts a comment as the command
-/// check reads it. The `__octo_*` functions draw the prompt marker and
-/// stay. The second line fails when a function can't be dropped
-/// (`readonly -f`).
+/// take, and comes off again unless the profile had it. Then every
+/// function but the `__octo_*` ones that draw the prompt marker, every
+/// trap with an action, `PROMPT_COMMAND`, `PS0`, `command_not_found_handle`
+/// and `CDPATH`, and the command hash. `PROMPT_COMMAND`, `PS0` and `CDPATH`
+/// stay unset and `PS1` stays the marker, as readonly variables, so nothing
+/// run later can set them; a virtual environment's activation leaves the
+/// prompt alone (`VIRTUAL_ENV_DISABLE_PROMPT`). `interactive_comments` is
+/// on, so a `#` starts a comment as the command check reads it.
 const STRICT_SHELL_LINES: [&str; 2] = [
-    r#"__octo_px=${POSIXLY_CORRECT+y}; POSIXLY_CORRECT=y; \unset -f builtin unset; \builtin test -n "$__octo_px" || \builtin unset POSIXLY_CORRECT; \builtin unset __octo_px; \builtin unalias -a; \builtin shopt -u expand_aliases; \builtin shopt -s interactive_comments; \builtin trap - DEBUG RETURN ERR; \builtin hash -r"#,
-    r#"__octo_bad=0; while \builtin read -r _ _ __octo_f; do case $__octo_f in ''|__octo_*) ;; *) \builtin unset -f "$__octo_f" 2>/dev/null || __octo_bad=1;; esac; done <<< "$(\builtin declare -F)"; \builtin unset __octo_f; \builtin test "$__octo_bad" = 0"#,
+    r#"__octo_px=${POSIXLY_CORRECT+y}; POSIXLY_CORRECT=y; \unset -f builtin unset; \builtin test -n "$__octo_px" || \builtin unset POSIXLY_CORRECT; \builtin unset __octo_px; \builtin unalias -a; \builtin shopt -u expand_aliases; \builtin shopt -s interactive_comments; \builtin trap - DEBUG RETURN ERR EXIT; \builtin unset PROMPT_COMMAND PS0 command_not_found_handle CDPATH; \builtin hash -r"#,
+    r#"while \builtin read -r _ _ __octo_f; do case $__octo_f in ''|__octo_*) ;; *) \builtin unset -f "$__octo_f";; esac; done <<< "$(\builtin declare -F)"; while \builtin read -r __octo_f; do case $__octo_f in ''|"trap -- - "*|"trap -- '' "*) ;; *) \builtin trap - "${__octo_f##* }";; esac; done <<< "$(\builtin trap -p)"; \builtin unset __octo_f; \builtin readonly PROMPT_COMMAND PS0 PS1 CDPATH; \builtin export VIRTUAL_ENV_DISABLE_PROMPT=1"#,
 ];
 
-/// Make the shell strict for a mission that ships nothing: no alias
-/// (`unalias -a`, and `shopt -u expand_aliases` so none expands later), no
-/// function from the profile (`unset -f` for each one `declare -F` lists),
-/// no trap and an empty command hash, so each word of a command runs the
-/// builtin or the program on the PATH it names, which is what the command
-/// check reads. PATH and the rest of the profile's environment stay. Written
-/// once the prompt is up, as the login PATH is ([`apply_login_path`]), on
-/// every attach. True only once the shell confirmed both lines; the caller
-/// runs no command until then.
-fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) -> bool {
+/// The line that reports what a strict shell still holds, tagged with
+/// `nonce`: its aliases, its functions but the `__octo_*` ones, its traps
+/// with an action, and whether `PROMPT_COMMAND` holds anything to run
+/// (`1`; any element of an array counts, the readonly, unset one the
+/// cleanup leaves doesn't). The RS bytes come from a variable, so the tag
+/// is whole only in the shell's output.
+fn strict_report_line(nonce: &str) -> String {
+    format!(
+        r#"__octo_count() {{ __octo_k=0; while \builtin read -r __octo_f; do case $__octo_f in ''|*' __octo_'*|"trap -- - "*|"trap -- '' "*) ;; *) __octo_k=$((__octo_k+1));; esac; done <<< "$1"; \builtin printf %s "$__octo_k"; }}; __octo_pc=0; case ${{PROMPT_COMMAND[*]-}} in '') ;; *) __octo_pc=1;; esac; \builtin printf '%s%sOCTO_STRICT_{nonce}:%s:%s:%s:%s%s%s\n' "$__OCTORS" "$__OCTORS" "$(__octo_count "$(\builtin alias)")" "$(__octo_count "$(\builtin declare -F)")" "$(__octo_count "$(\builtin trap -p)")" "$__octo_pc" "$__OCTORS" "$__OCTORS"; \builtin unset -f __octo_count; \builtin unset __octo_k __octo_f __octo_pc"#
+    )
+}
+
+/// What a strict shell reported it still holds ([`strict_report_line`]).
+#[derive(Debug, PartialEq)]
+struct StrictReport {
+    aliases: u32,
+    functions: u32,
+    traps: u32,
+    prompt_command: bool,
+}
+
+impl StrictReport {
+    /// The report tagged with `nonce` in `output`, if there is one. Pure.
+    fn read(output: &str, nonce: &str) -> Option<Self> {
+        let re = regex::Regex::new(&format!(r"\x1e\x1eOCTO_STRICT_{}:(\d+):(\d+):(\d+):([01])\x1e\x1e", regex::escape(nonce))).ok()?;
+        let caps = re.captures(output)?;
+        Some(Self {
+            aliases: caps[1].parse().ok()?,
+            functions: caps[2].parse().ok()?,
+            traps: caps[3].parse().ok()?,
+            prompt_command: &caps[4] == "1",
+        })
+    }
+
+    /// What is left, as the end of a refusal (`None` when nothing is).
+    /// Pure.
+    fn left(&self) -> Option<String> {
+        let count = |n: u32, one: &str, many: &str| match n {
+            0 => None,
+            1 => Some(format!("1 {one}")),
+            n => Some(format!("{n} {many}")),
+        };
+        let parts: Vec<String> = [
+            count(self.aliases, "alias", "aliases"),
+            count(self.functions, "function", "functions"),
+            count(self.traps, "trap", "traps"),
+            self.prompt_command.then(|| "PROMPT_COMMAND".to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let held = match parts.as_slice() {
+            [] => return None,
+            [one] => one.clone(),
+            [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        };
+        Some(format!(
+            "still holds {held} after the cleanup that makes it strict; a function or variable marked readonly can't be removed"
+        ))
+    }
+}
+
+/// Make the shell strict: no alias (`unalias -a`, and `shopt -u
+/// expand_aliases` so none expands later), no function (`unset -f` for
+/// each one `declare -F` lists, the prompt marker's `__octo_*` aside), no
+/// trap, no `PROMPT_COMMAND`, `PS0` or `command_not_found_handle`, and an
+/// empty command hash ([`STRICT_SHELL_LINES`]), so each word of a command
+/// runs the builtin or the program on the PATH it names, which is what the
+/// command check reads. PATH and the rest of the profile's environment
+/// stay. Then the shell reports what it still holds, on one line tagged
+/// with `nonce` ([`strict_report_line`]). Run on a fresh shell, once its
+/// prompt is up, as the login PATH is ([`apply_login_path`]). `Ok` only
+/// when the report came back with everything at zero; otherwise why, for
+/// the caller's refusal. No command may run in the shell until it is `Ok`.
+fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) -> Result<(), String> {
+    let no_answer = || "didn't answer the cleanup that makes it strict".to_string();
     for line in STRICT_SHELL_LINES {
         drain_pending(rx);
-        if client.write(id, format!("{line}\n").as_bytes()).is_err() {
-            return false;
-        }
-        if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { exit_code: 0, .. }) {
-            tracing::warn!(id, "talk shell did not confirm the strict shell");
-            return false;
+        client.write(id, format!("{line}\n").as_bytes()).map_err(|_| no_answer())?;
+        if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. }) {
+            return Err(no_answer());
         }
     }
-    true
+    drain_pending(rx);
+    client.write(id, format!("{}\n", strict_report_line(nonce)).as_bytes()).map_err(|_| no_answer())?;
+    let Probe::Done { output, .. } = probe(rx, Duration::from_secs(5), nonce) else {
+        return Err(no_answer());
+    };
+    let report = StrictReport::read(&output, nonce).ok_or_else(|| "didn't report what it holds after the cleanup that makes it strict".to_string())?;
+    match report.left() {
+        None => Ok(()),
+        Some(why) => {
+            tracing::warn!(id, ?report, "talk shell isn't strict after its cleanup");
+            Err(why)
+        }
+    }
 }
 
 impl LiveRun {
@@ -770,6 +877,10 @@ fn init_and_wait_ready(
     //   So `echo "$PS1"` / `set` / `declare` reproduce only the literal
     //   `$(__octo_ps)`, NOT the marker (a command printing the env can't forge a
     //   false completion).
+    // - The exit code is `$?` as the marker is drawn (bash keeps it across
+    //   PROMPT_COMMAND), so the marker itself needs no PROMPT_COMMAND: a
+    //   strict shell has none (`apply_strict_shell`), and PS1 is readonly
+    //   there instead.
     // - PROMPT_COMMAND re-asserts PS1 each prompt, so a command that overwrites
     //   PS1 (venv/conda activate, a sourced script) can't break detection. It
     //   re-asserts `set +H` too (below), so a command or sourced script that
@@ -790,10 +901,10 @@ fn init_and_wait_ready(
     init.push_str(SHELL_INPUT_AS_WRITTEN);
     init.push_str("__OCTORS=$(printf '\\036')\n");
     init.push_str(&format!(
-        "__octo_ps() {{ printf '%s%sOCTO_DONE_{nonce}:%d:%s%s%s' \"$__OCTORS\" \"$__OCTORS\" \"$__octo_oc\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
+        "__octo_ps() {{ printf '%s%sOCTO_DONE_{nonce}:%d:%s%s%s' \"$__OCTORS\" \"$__OCTORS\" \"$?\" \"$PWD\" \"$__OCTORS\" \"$__OCTORS\"; }}\n"
     ));
     init.push_str("__octo_setps() { PS1='$(__octo_ps)'; }\n");
-    init.push_str("__octo_oc=0; PROMPT_COMMAND='__octo_oc=$?; set +H; unset CDPATH; __octo_setps'\n");
+    init.push_str("PROMPT_COMMAND='set +H; unset CDPATH; __octo_setps'\n");
     init.push_str("__octo_setps\n");
     client.write(id, init.as_bytes())?;
 
@@ -886,7 +997,7 @@ mod tests {
     fn the_shell_runs_without_cdpath() {
         assert!(SHELL_INPUT_AS_WRITTEN.starts_with("set +H; unset CDPATH;"), "{SHELL_INPUT_AS_WRITTEN}");
         // Split, so this test's own text isn't what it finds.
-        let line = ["init.push_str(\"__octo_oc=0; PROMPT_COMMAND='", "__octo_oc=$?; set +H; unset CDPATH; __octo_setps'"].concat();
+        let line = ["init.push_str(\"PROMPT_COMMAND='", "set +H; unset CDPATH; __octo_setps'"].concat();
         assert!(include_str!("talk_shell.rs").contains(&line), "every prompt clears it again");
     }
 
@@ -1020,6 +1131,35 @@ mod tests {
         let tail = &capped[capped.find("omitted]").unwrap()..];
         assert!(tail.len() > MAX_OUTPUT_BYTES / 2, "a failure keeps more of the end");
         assert_eq!(cap_output(out.clone(), crate::chat_history::COMMAND_CAPTURE_BYTES, true), out, "the agent's capture keeps it whole");
+    }
+
+    /// The strict shell's report: read only with its nonce and RS bytes,
+    /// and a refusal that names what is left (#1241).
+    #[test]
+    fn the_strict_report_names_what_is_left() {
+        let line = |a: u32, f: u32, t: u32, p: u32| format!("noise\n{RS}{RS}OCTO_STRICT_{N}:{a}:{f}:{t}:{p}{RS}{RS}");
+        let clean = StrictReport { aliases: 0, functions: 0, traps: 0, prompt_command: false };
+        assert_eq!(StrictReport::read(&line(0, 0, 0, 0), N), Some(clean));
+        assert_eq!(StrictReport::read(&line(0, 0, 0, 0), N).unwrap().left(), None);
+        assert_eq!(StrictReport::read(&line(0, 0, 0, 0), "other"), None, "another nonce");
+        assert_eq!(StrictReport::read(&format!("OCTO_STRICT_{N}:0:0:0:0"), N), None, "the typed line, without RS bytes");
+        let left = |a, f, t, p| StrictReport::read(&line(a, f, t, p), N).unwrap().left().unwrap();
+        assert!(left(0, 1, 0, 0).starts_with("still holds 1 function after"), "{}", left(0, 1, 0, 0));
+        assert!(left(2, 1, 3, 1).starts_with("still holds 2 aliases, 1 function, 3 traps and PROMPT_COMMAND after"), "{}", left(2, 1, 3, 1));
+        assert!(left(0, 0, 0, 1).contains("readonly can't be removed"));
+        // Every cleanup the review asked for is in the lines.
+        let lines = STRICT_SHELL_LINES.concat();
+        for part in [
+            r"\builtin unalias -a",
+            r"\builtin shopt -u expand_aliases",
+            r#"\builtin unset -f "$__octo_f""#,
+            r"\builtin trap - DEBUG RETURN ERR EXIT",
+            r"\builtin unset PROMPT_COMMAND PS0 command_not_found_handle CDPATH",
+            r"\builtin readonly PROMPT_COMMAND PS0 PS1 CDPATH",
+        ] {
+            assert!(lines.contains(part), "{part}");
+        }
+        assert!(strict_report_line(N).contains(&format!("OCTO_STRICT_{N}:%s:%s:%s:%s")));
     }
 
     #[test]
@@ -1217,14 +1357,15 @@ mod e2e {
     /// A profile with the alias `gp` and the functions `gp` and `git`, read
     /// by the daemon's `bash -l` from the test's HOME.
     const PROFILE: &str = "alias gp='echo PROFILE_ALIAS'\nfunction gp { echo PROFILE_FUNCTION; }\nfunction git { echo PROFILE_FUNCTION; }\n";
-    /// What a strict shell prints for this: no alias, and no function but
-    /// the prompt marker's.
-    const DEFINITIONS: &str = "alias; declare -F | grep -v ' __octo_'; echo end";
+    /// What a strict shell prints for this: no alias, no function but the
+    /// prompt marker's, no trap, no `PROMPT_COMMAND`.
+    const DEFINITIONS: &str = "alias; declare -F | grep -v ' __octo_'; trap -p; echo \"${PROMPT_COMMAND-}end\"";
 
     /// In a mission that ships nothing (#1241), the profile's alias and
     /// functions don't run: not in a new shell, and not in one that was
-    /// running when its mission came to ship nothing. A shell that isn't
-    /// strict, a Build or Fix mission's, keeps them as before.
+    /// running when its mission came to ship nothing, which is replaced by
+    /// a fresh `bash -l` in the same directory. A shell that isn't strict,
+    /// a Build or Fix mission's, keeps them as before.
     #[test]
     #[serial]
     fn a_strict_shell_runs_no_alias_or_function_from_the_profile() {
@@ -1247,11 +1388,15 @@ mod e2e {
             }
             let r = done(shell.run("strict", "/tmp", DEFINITIONS, quick, true).unwrap());
             assert_eq!(r.output, "end");
+            let r = done(shell.run("strict", "/tmp", "false", quick, true).unwrap());
+            assert_eq!(r.exit_code, 1, "the marker reads the exit code without PROMPT_COMMAND");
 
-            // A shell already running when it became strict.
+            // A shell already running when it became strict: a fresh one,
+            // where it was.
+            done(shell.run("loose", "/tmp", "cd /usr && export OCTO_T5=old", quick, true).unwrap());
             shell.set_strict("loose", true);
-            let r = done(shell.run("loose", "/tmp", "gp; git; echo end", quick, true).unwrap());
-            assert!(!r.output.contains("PROFILE_") && r.output.ends_with("end"), "{:?}", r.output);
+            let r = done(shell.run("loose", "/tmp", "gp; git; echo \"${OCTO_T5-fresh}\"; pwd", quick, true).unwrap());
+            assert!(!r.output.contains("PROFILE_") && r.output.ends_with("fresh\n/usr"), "{:?}", r.output);
             let r = done(shell.run("loose", "/tmp", DEFINITIONS, quick, true).unwrap());
             assert_eq!(r.output, "end");
             shell.close("strict");
@@ -1259,9 +1404,11 @@ mod e2e {
         });
     }
 
-    /// The strict shell runs on every attach, so definitions made in the
-    /// shell since (or by a shell an older build started) are gone after
-    /// a restart (#1241).
+    /// A strict shell is never reattached (#1241): what ran in it before
+    /// its mission came to ship nothing can outlast a cleanup (functions
+    /// named `unset` and `builtin`, a `DEBUG` trap, `PROMPT_COMMAND`), so
+    /// a fresh `bash -l` takes its place in the same directory, and is made
+    /// strict, after every restart.
     #[test]
     #[serial]
     fn the_strict_shell_runs_again_after_a_reattach() {
@@ -1269,40 +1416,48 @@ mod e2e {
         let d = boot();
         fs::write(d._tmp.path().join(".bash_profile"), PROFILE).unwrap();
         let quick = Duration::from_secs(20);
-        let old = DaemonClient::connect_to(d.sock.to_str().unwrap()).unwrap();
-        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        old.spawn("talk-restrict", "/tmp", &env, Some("/bin/bash"), 40, 120).unwrap();
         with_login_shell_env(&[], || {
+            {
+                // A Build mission's shell, where the agent ran anything.
+                let shell = shell_on(&d.sock);
+                let before = "unset() { :; }; builtin() { :; }; trap 'echo TRAPPED' DEBUG; \
+                              PROMPT_COMMAND='echo PC'; export OCTO_T6=old; cd /usr";
+                done(shell.run("restrict", "/tmp", before, quick, true).unwrap());
+                // `shell` drops here, as at an Octopush restart.
+            }
             {
                 let shell = shell_on(&d.sock);
                 shell.set_strict("restrict", true);
                 let r = done(shell.run("restrict", "/tmp", DEFINITIONS, quick, true).unwrap());
-                assert_eq!(r.output, "end", "the reattached shell ran strict");
+                assert_eq!(r.output, "end", "the reattached shell was replaced and made strict");
+                let r = done(shell.run("restrict", "/tmp", "echo \"${OCTO_T6-fresh}\"; pwd; type -t unset builtin", quick, true).unwrap());
+                assert_eq!(r.output.lines().collect::<Vec<_>>(), ["fresh", "/usr", "builtin", "builtin"]);
                 // Defined again in the shell, as a `$` command could.
                 let again = "shopt -s expand_aliases; alias gp='echo PROFILE_ALIAS'; function git { echo PROFILE_FUNCTION; }";
                 done(shell.run("restrict", "/tmp", again, quick, true).unwrap());
                 let r = done(shell.run("restrict", "/tmp", DEFINITIONS, quick, true).unwrap());
                 assert_ne!(r.output, "end", "defined again: {:?}", r.output);
-                // `shell` drops here, as at an Octopush restart.
             }
             let shell = shell_on(&d.sock);
             shell.set_strict("restrict", true);
             let r = done(shell.run("restrict", "/tmp", DEFINITIONS, quick, true).unwrap());
             assert_eq!(r.output, "end", "strict again after the reattach");
-            let r = done(shell.run("restrict", "/tmp", "gp; git; echo end", quick, true).unwrap());
-            assert!(!r.output.contains("PROFILE_") && r.output.ends_with("end"), "{:?}", r.output);
+            let r = done(shell.run("restrict", "/tmp", "gp; git; pwd", quick, true).unwrap());
+            assert!(!r.output.contains("PROFILE_") && r.output.ends_with("/usr"), "{:?}", r.output);
             shell.close("restrict");
         });
     }
 
-    /// No command runs in a strict shell until it confirmed: a function the
-    /// profile made readonly can't be dropped, so nothing runs (#1241).
+    /// No command runs in a strict shell its report doesn't prove clean: a
+    /// function or a `PROMPT_COMMAND` the profile made readonly can't be
+    /// removed, so nothing runs, and the refusal says what is left (#1241).
     #[test]
     #[serial]
     fn a_strict_shell_that_cant_drop_a_function_runs_nothing() {
         use crate::orchestrator::cli_runner::with_login_shell_env;
         let d = boot();
-        fs::write(d._tmp.path().join(".bash_profile"), format!("{PROFILE}readonly -f git\n")).unwrap();
+        let profile = format!("{PROFILE}readonly -f git\nPROMPT_COMMAND=true\nreadonly PROMPT_COMMAND\n");
+        fs::write(d._tmp.path().join(".bash_profile"), profile).unwrap();
         let dir = TempDir::new().unwrap();
         let cwd = dir.path().to_str().unwrap().to_string();
         let quick = Duration::from_secs(20);
@@ -1311,7 +1466,8 @@ mod e2e {
             shell.set_strict("stuck", true);
             for _ in 0..2 {
                 let err = shell.run("stuck", &cwd, "touch ran", quick, true).err().expect("refused");
-                assert!(err.to_string().contains("didn't confirm it dropped the aliases and functions"), "{err}");
+                let err = err.to_string();
+                assert!(err.contains(STRICT_SHELL_REFUSED) && err.contains("still holds 1 function and PROMPT_COMMAND"), "{err}");
             }
             assert!(!dir.path().join("ran").exists(), "the command ran");
             shell.close("stuck");
