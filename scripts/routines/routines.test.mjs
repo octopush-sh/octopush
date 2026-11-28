@@ -1075,7 +1075,7 @@ const promoteJob = async (name) => {
 };
 const live = (text) => text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
 
-test("workflows: promote's website PR — web-gate runs the website's code without a write token, web-version runs none (#1178)", async () => {
+test("workflows: promote's website PR — web-gate runs the website's code after its only token is revoked, web-version runs none (#1178)", async () => {
   const { wf, job: gateJob } = await promoteJob("web-gate");
   const { job: prJob } = await promoteJob("web-version");
   const a = live(gateJob), b = live(prJob);
@@ -1088,14 +1088,26 @@ test("workflows: promote's website PR — web-gate runs the website's code witho
   assert.match(a, /\n    permissions:\n      contents: read /);
   assert.match(a, /uses: actions\/checkout@v7\n        with:\n          ref: refs\/tags\/v\$\{\{ github\.event\.inputs\.version \}\}\n          path: app-stable\n          persist-credentials: false\n/);
   assert.doesNotMatch(a, /uses: actions\/setup-node|permission-contents: write|permission-pull-requests|webapi|git [^\n]*push/, "no shared Node, no write token, nothing published");
+  // One token: the first step, contents read on octopush-web only, the App key only in its `with:`.
   assert.equal((a.match(/create-github-app-token@/g) ?? []).length, 1);
-  assert.match(a, /permission-contents: read\n/);
-  // Order: freeze Node, read token, clone + bump, revoke (proved dead), sandbox, survivors + verify, patch, upload.
+  assert.match(a, /\n    steps:\n      - name: [^\n]*\n        id: read-token\n        uses: actions\/create-github-app-token@v3\n        with:\n          app-id: \$\{\{ secrets\.OCTOPUSH_APP_ID \}\}\n          private-key: \$\{\{ secrets\.OCTOPUSH_APP_PRIVATE_KEY \}\}\n          owner: octopush-sh\n          repositories: octopush-web\n          skip-token-revoke: true[^\n]*\n          permission-contents: read\n\n/, "the token is the job's first step, read-only, octopush-web alone");
+  assert.equal((a.match(/OCTOPUSH_APP_PRIVATE_KEY/g) ?? []).length, 1, "the App key in that one step's with:");
+  assert.doesNotMatch(a, /\n\s+[A-Z_]+: \$\{\{ secrets\./, "no secret in any env:");
+  // Order: token, clone, revoke (proved dead), then this repo, freeze, bump, sandbox, survivors + verify, patch (guarded), upload.
   const at = (s) => { const i = a.indexOf(s); assert.ok(i > 0, s); return i; };
-  const order = ["frozen-node.sh freeze", "id: read-token", "id: bump", "- name: Revoke the read token and prove it dead", "agent-sandbox-setup.sh", "id: sandbox-gone", "- name: The patch and the gate's verdict", "actions/upload-artifact@v7"].map(at);
+  const order = ["id: read-token", "id: clone", "id: revoke", "uses: actions/checkout@v7", "frozen-node.sh freeze", "id: bump", "agent-sandbox-setup.sh", "id: sandbox-gone", "- name: The patch and the result", "actions/upload-artifact@v7"].map(at);
   assert.deepEqual([...order].sort((x, y) => x - y), order, "steps in order");
-  for (let i = a.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = a.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) assert.ok(i < at("agent-sandbox-setup.sh"), "the App key only before the sandbox");
-  assert.match(step(a, "Revoke the read token"), /if: always\(\) && steps\.read-token\.outputs\.token != ''[\s\S]*if \[ "\$code" = 401 \]/);
+  for (const s of ["WEB_TOKEN", "steps.read-token.outputs.token"]) for (let i = a.indexOf(s); i >= 0; i = a.indexOf(s, i + 1)) assert.ok(i < at("uses: actions/checkout@v7"), `${s} only in the trusted phase`);
+  const clone = step(a, "Clone octopush-web");
+  assert.match(clone, /GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=http\.https:\/\/github\.com\/\.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic \$auth" \\\n\s+GIT_CONFIG_KEY_1=credential\.helper GIT_CONFIG_VALUE_1="" \\\n/, "the token through the environment only, no credential helper");
+  assert.match(clone, /\[ "\$\(git -C "\$web" remote get-url origin\)" = "https:\/\/github\.com\/\$WEB\.git" \]/);
+  assert.match(clone, /config --local --name-only --get-regexp '\^\(http\\\.\.\*\|credential\\\.\.\*\|url\\\.\.\*/);
+  assert.match(clone, /grep -rqF -e "\$WEB_TOKEN" -e "\$auth" --exclude-dir=objects "\$web\/\.git"/);
+  const revoke = step(a, "Revoke the read token");
+  assert.match(revoke, /if: always\(\) && steps\.read-token\.outputs\.token != ''[\s\S]*gh api -X DELETE installation\/token[\s\S]*if \[ "\$code" = 401 \][\s\S]*exit 1\n?$/, "revoked, proved dead, or the job fails");
+  assert.doesNotMatch(step(a, "Bump the website's version"), /WEB_TOKEN|read-token/);
+  assert.equal((revoke.match(/exit 0/g) ?? []).length, 1, "the one way out is a 401");
+  assert.match(revoke, /if \[ "\$code" = 401 \]; then [^\n]*exit 0; fi\n/);
   const gate = step(a, "Crew pricing and the consistency gate");
   assert.doesNotMatch(gate, /TOKEN|secrets\.|github\.token/, "no token in the sandbox step");
   assert.match(gate, /rm -rf "\$gate\/\.git"/);
@@ -1103,24 +1115,33 @@ test("workflows: promote's website PR — web-gate runs the website's code witho
   assert.match(gate, /timeout --kill-after=15 "\$secs" sudo -n -u octo-sandbox \/usr\/bin\/env -i \\\n/);
   assert.match(gate, /OCTOPUSH_APP_DIR="\$app" OCTOPUSH_STABLE_VERSION="\$VERSION" OCTOPUSH_STRICT_RELEASE=1/);
   assert.match(gate, /GIT_CONFIG_KEY_0=safe\.directory GIT_CONFIG_VALUE_0="\$app"/);
-  assert.match(gate, /sandbox 120 node scripts\/build-crew-pricing\.mjs 2>&1 \| tee "\$RUNNER_TEMP\/crew\.log" \|\| crew=\$\?/);
-  assert.match(gate, /sandbox 600 bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent consistency' 2>&1 \| tee "\$RUNNER_TEMP\/gate\.log" \|\| rc=\$\?/);
+  // Their output stays on the runner: the public log gets the gate's check lines and count only.
+  assert.match(gate, /sandbox 120 node scripts\/build-crew-pricing\.mjs > "\$RUNNER_TEMP\/crew\.log" 2>&1 \|\| crew=\$\?/);
+  assert.match(gate, /sandbox 600 bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent consistency' > "\$RUNNER_TEMP\/gate\.log" 2>&1 \|\| rc=\$\?/);
+  assert.match(gate, /\{ grep -E '\^\(✓\|✗\|▸\) \|\^\[0-9\]\+ passed · \[0-9\]\+ failed' \|\| true; \}/);
+  assert.doesNotMatch(gate, /\btee\b/, "nothing of the website's output is copied to the log as is");
   assert.ok(gate.indexOf("raw.githubusercontent.com") < gate.indexOf("agent-sandbox-setup.sh"), "the runner's own network wait comes before any website code");
-  for (const re of [/build-crew-pricing\.mjs 2>&1/g, /npm ci/g, /npm run/g]) assert.equal((a.match(re) ?? []).length, 1, `${re} only inside the sandbox`);
+  for (const re of [/build-crew-pricing\.mjs > /g, /npm ci/g, /npm run/g]) assert.equal((a.match(re) ?? []).length, 1, `${re} only inside the sandbox`);
   const gone = step(a, "Nothing of the website's code is still running");
   assert.match(gone, /shell: \/usr\/bin\/bash --noprofile --norc -eo pipefail \{0\}/, "the checking step isn't found through PATH");
   assert.match(gone, /pgrep -u octo-sandbox[^\n]*\n[^\n]*exit 1/);
-  assert.match(gone, /PATH="\$job_path" \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" verify "\$GITHUB_WORKSPACE\/app-stable\/\.git"/);
-  const patch = step(a, "The patch and the gate's verdict");
+  assert.match(gone, /PATH="\$job_path" \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" verify "\$GITHUB_WORKSPACE\/app-stable\/\.git" "\$RUNNER_TEMP\/web\/\.git"/);
+  const patch = step(a, "The patch and the result");
   assert.match(patch, /steps\.sandbox-gone\.outcome == 'success'/);
+  assert.match(patch, /shell: \/usr\/bin\/bash --noprofile --norc -eo pipefail \{0\}\n[\s\S]*run: \|\n\s+\/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" guard /, "guarded first, not found through PATH");
+  assert.match(patch, /\| \{ grep '\^✗ ' \|\| true; \} \| sed 's\/\^✗ \/\/' \| cut -b 1-300 \| iconv -f UTF-8 -t UTF-8 -c \| head -n 40 \| sed 's\/\^\/failed=\/'/, "the result holds failing check names, not raw output");
+  assert.doesNotMatch(patch, /crew\.txt|crew\.log|gate-failed|gate-summary|tail -n|\bcat\b/);
+  assert.equal((patch.match(/gate\.log/g) ?? []).length, 1, "the gate's log is read once, through the check-name filter");
+  const result = patch.slice(patch.indexOf("          {\n"), patch.indexOf('} > "$out/result.txt"'));
+  assert.deepEqual(result.split("\n").map((l) => l.trim()).filter((l) => /^echo /.test(l)), ['echo "base=$(git -C "$web" rev-parse HEAD)"', 'echo "crew=$(word "$CREW_RC")"', 'echo "gate=$(word "$GATE_RC")"'], "the result: base, crew, gate, and failed= lines");
   assert.match(patch, /src="\$\(realpath -e "\$gate\/\$crew_json" 2>\/dev\/null \|\| true\)"\n\s+if \[ "\$src" = "\$gate\/\$crew_json" \] && \[ -f "\$src" \] && \[ "\$\(stat -c %s "\$src"\)" -lt 2000000 \]/);
-  assert.doesNotMatch(patch, /\bnode\b|npm|scripts\//, "nothing but git and coreutils after the sandbox");
+  assert.doesNotMatch(patch.replace(/\/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" guard [^\n]*/, ""), /\bnode\b|npm|scripts\//, "nothing but git and coreutils after the sandbox (and the runner-only guard)");
   assert.match(a, /retention-days: 1\n/);
   // web-version: a fresh runner, no checkout, no node, no code of either repo; the token only after the check.
   assert.match(b, /\n    needs: \[promote, web-gate\]\n    if: \$\{\{ !cancelled\(\) && needs\.promote\.result == 'success' \}\}\n/);
   assert.doesNotMatch(b, /uses: actions\/(checkout|setup-node)/, "web-version checks nothing out");
   assert.doesNotMatch(b, /^\s*(?:[A-Z_]+=\S*\s+|env\s+[^\n]*?\s)*(?:node|npm|npx|bash\s+\S*scripts\/\S*|\S*scripts\/\S+)(?:\s|$)/m, "web-version runs no code from either repo, and no node");
-  assert.ok(b.indexOf("actions/download-artifact@v8") < b.indexOf("- name: Check the patch and the verdict") && b.indexOf("- name: Check the patch and the verdict") < b.indexOf("OCTOPUSH_APP_PRIVATE_KEY"), "the patch is checked before any token exists");
+  assert.ok(b.indexOf("actions/download-artifact@v8") < b.indexOf("- name: Check the patch and the result") && b.indexOf("- name: Check the patch and the result") < b.indexOf("OCTOPUSH_APP_PRIVATE_KEY"), "the patch is checked before any token exists");
   assert.doesNotMatch(b, /--force|push -f|\+HEAD:|\+refs\//, "never a forced push");
   assert.match(b, /-F body=@"\$RUNNER_TEMP\/pr-body\.md"/);
   // Tokens reach git through the environment only; expressions reach scripts only through env:.
@@ -1136,7 +1157,7 @@ test("promote web-version: checks web-gate's patch, applies it with git, never f
   const { spawnSync, execFileSync } = await import("node:child_process");
   const { mkdirSync, readFileSync, existsSync, appendFileSync, chmodSync, symlinkSync, rmSync } = await import("node:fs");
   const { job } = await promoteJob("web-version");
-  const check = runBlock(job, "Check the patch and the verdict (before any token exists)");
+  const check = runBlock(job, "Check the patch and the result (before any token exists)");
   const open = runBlock(job, "Open the web version PR");
   const VERSION = "0.4.153";
   const root = mkdtempSync(join(tmpdir(), "webv-pr-"));
@@ -1157,8 +1178,8 @@ test("promote web-version: checks web-gate's patch, applies it with git, never f
   git(seed, "init", "-q", "-b", "main"); git(seed, "add", "-A"); git(seed, "commit", "-qm", "web");
   git(seed, "push", "-q", bare, "main:refs/heads/main");
   const base = git(seed, "rev-parse", "HEAD");
-  // What web-gate hands over: the patch on main, and the verdict.
-  const artifact = (gateRc = "0", failed = "") => {
+  // What web-gate hands over: the patch on main, and the result (the base, pass/fail/none, failing checks by name).
+  const artifact = (gate = "pass", failed = []) => {
     const work = join(root, `bump-${Math.random().toString(36).slice(2)}`);
     git(root, "clone", "-q", bare, work);
     writeFileSync(join(work, "src/data/release.ts"), readFileSync(join(work, "src/data/release.ts"), "utf8").replace("0.4.152", VERSION));
@@ -1167,12 +1188,8 @@ test("promote web-version: checks web-gate's patch, applies it with git, never f
     writeFileSync(join(work, "src/data/crew-pricing.json"), JSON.stringify({ version: VERSION, source: { tag: `v${VERSION}` }, estimator: { sourceSha256: "b".repeat(64) } }, null, 2) + "\n");
     const dir = join(root, `in-${Math.random().toString(36).slice(2)}`);
     mkdirSync(dir);
-    writeFileSync(join(dir, "base"), `${base}\n`);
     writeFileSync(join(dir, "release.patch"), git(work, "diff") + "\n");
-    writeFileSync(join(dir, "result"), `crew=0\ngate=${gateRc}\n`);
-    writeFileSync(join(dir, "crew.txt"), `wrote src/data/crew-pricing.json from octopush v${VERSION}\n`);
-    writeFileSync(join(dir, "gate-summary.txt"), gateRc === "0" ? "40 passed · 0 failed · 1 skipped\n" : "39 passed · 1 failed · 1 skipped\n");
-    writeFileSync(join(dir, "gate-failed.txt"), failed);
+    writeFileSync(join(dir, "result.txt"), [`base=${base}`, "crew=pass", `gate=${gate}`, ...failed.map((f) => `failed=${f}`)].join("\n") + "\n");
     return dir;
   };
   // A stub gh: compare from the bare repo, one PR, the body kept.
@@ -1219,7 +1236,8 @@ esac
   assert.equal(git(bare, "log", "-1", "--format=%an <%ae>|%s", first), `github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>|release: landing v${VERSION}, its changelog entries and the crew pricing`);
   assert.match(git(bare, "show", `${first}:src/data/release.ts`), new RegExp(`VERSION = '${VERSION.replace(/\./g, "\\.")}'`));
   assert.match(body(), /^v0\.4\.153 was promoted to stable/);
-  assert.match(body(), /\*\*Passed\*\*: .* 40 passed · 0 failed · 1 skipped\./);
+  assert.match(body(), /\*\*Passed\*\*: `npm run consistency` with .* as another user, after the job's read token was revoked \(\[run\]/);
+  assert.match(body(), /regenerated `src\/data\/crew-pricing\.json` from the app at `v0\.4\.153`; this PR carries the change\./);
   assert.match(body(), /> \[!IMPORTANT\]\n> `estimator\.sourceSha256` changed/);
   assert.match(r.summary, /\*\*passed\*\*/);
   // A re-run with the same patch moves nothing (no forced push) and refreshes the body.
@@ -1229,12 +1247,16 @@ esac
   assert.equal(head(), first);
   assert.match(r.out, /already carries these changes/);
   assert.ok(existsSync(join(state, "body")));
-  // A failed gate still opens the PR, marked, its text fenced past every backtick run, colours and controls gone.
-  r = both(artifact("1", "\x1b[31m✗\x1b[0m the landing shows a retired glyph ````\n```\n@octopush-sh/everyone [x](https://example.invalid)\x07\n"));
+  // A failed gate still opens the PR, marked, the failing checks' names fenced past every backtick run.
+  r = both(artifact("fail", ["the landing shows a retired glyph ````", "```", "@octopush-sh/everyone [x](https://example.invalid)"]));
   assert.equal(r.code, 0, r.out);
   assert.match(body(), /^> \[!CAUTION\]\n> \*\*The consistency gate failed\*\*/);
-  assert.match(body(), /\*\*Failed\*\*: .* 39 passed · 1 failed · 1 skipped\.\n\n`````text\n✗ the landing shows a retired glyph ````\n```\n@octopush-sh\/everyone \[x\]\(https:\/\/example\.invalid\)\n`````\n/);
-  assert.doesNotMatch(body(), /\x1b|\x07/);
+  assert.match(body(), /\*\*Failed\*\*: .*\. The failing checks:\n\n`````text\nthe landing shows a retired glyph ````\n```\n@octopush-sh\/everyone \[x\]\(https:\/\/example\.invalid\)\n`````\n/);
+  // Failed before any check reported: no output of the website's code, only how to reproduce it.
+  r = both(artifact("fail"));
+  assert.equal(r.code, 0, r.out);
+  assert.match(body(), /\*\*Failed\*\* before it reported a check \(its install, or the gate itself\)/);
+  assert.doesNotMatch(body(), /```text/);
   // Someone's fix on the branch: left alone, said so, nothing pushed, the PR untouched.
   const fix = join(root, "fix");
   git(root, "clone", "-q", "-b", `release/v${VERSION}`, bare, fix);
@@ -1251,8 +1273,13 @@ esac
   // Patches that are not what web-gate writes are refused before any token exists, or before anything is pushed.
   const refused = [
     ["an extra file", (d) => writeFileSync(join(d, "run-me.sh"), "x")],
-    ["a link", (d) => { rmSync(join(d, "crew.txt")); symlinkSync("/etc/passwd", join(d, "crew.txt")); }],
-    ["a result with a command", (d) => writeFileSync(join(d, "result"), "crew=0\ngate=0; true\n")],
+    ["a link", (d) => { rmSync(join(d, "result.txt")); symlinkSync("/etc/passwd", join(d, "result.txt")); }],
+    ["a result with a command", (d) => writeFileSync(join(d, "result.txt"), readFileSync(join(d, "result.txt"), "utf8").replace("gate=pass", "gate=pass; true"))],
+    ["raw output in the result", (d) => appendFileSync(join(d, "result.txt"), "npm error code E404\n")],
+    ["failing checks on a passing gate", (d) => appendFileSync(join(d, "result.txt"), "failed=nothing failed\n")],
+    ["a control character in a check name", (d) => writeFileSync(join(d, "result.txt"), readFileSync(join(d, "result.txt"), "utf8").replace("gate=pass", "gate=fail") + "failed=\x1b[31mred\n")],
+    ["another base", (d) => writeFileSync(join(d, "result.txt"), readFileSync(join(d, "result.txt"), "utf8").replace(/^base=[0-9a-f]{40}/, "base=main"))],
+    ["the old output files", (d) => writeFileSync(join(d, "gate-failed.txt"), "x\n")],
     ["another file", (d) => appendFileSync(join(d, "release.patch"), "diff --git a/vercel.json b/vercel.json\n--- a/vercel.json\n+++ b/vercel.json\n@@ -1 +1 @@\n-{}\n+{ }\n")],
     ["a new file", (d) => appendFileSync(join(d, "release.patch"), "diff --git a/api/x.ts b/api/x.ts\nnew file mode 100644\n--- /dev/null\n+++ b/api/x.ts\n@@ -0,0 +1 @@\n+x\n")],
     ["a mode change on an allowed path", (d) => writeFileSync(join(d, "release.patch"), readFileSync(join(d, "release.patch"), "utf8").replace(/^(diff --git a\/src\/data\/release\.ts b\/src\/data\/release\.ts\n)index ([0-9a-f]+)\.\.([0-9a-f]+) 100644$/m, "$1old mode 100644\nnew mode 100755\nindex $2..$3"))],

@@ -264,8 +264,10 @@ trusted:
   key is used only before the sandbox exists and after a step has killed every sandbox process and
   checked that none survived. The release PR is split the same way: `promote.yml`'s `web-gate`
   job runs the website's `build-crew-pricing.mjs`, `npm ci` and consistency gate as
-  `octo-sandbox` (inline, on a copy of the checkout without its `.git`), holds no write token, and
-  hands only a patch and the gate's verdict to `web-version`. That job, on a fresh runner, runs
+  `octo-sandbox` (inline, on a copy of the checkout without its `.git`) only after its one token
+  (contents read, minted in its first step) has cloned the site, left nothing in the clone and been
+  revoked, and hands only a patch and a result file (pass or fail, the failing checks' names) to
+  `web-version`. That job, on a fresh runner, runs
   no code from either repo, checks the patch, applies it with git and opens the PR. Jobs that
   run code as `octo-sandbox` (`web-gate`, `web-audit`'s `audit`) take Node from
   `scripts/routines/frozen-node.sh`, a root-owned, read-only copy, instead of `setup-node`, and

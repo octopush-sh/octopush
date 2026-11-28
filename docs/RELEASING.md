@@ -87,14 +87,19 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
     `scripts/build-crew-pricing.mjs`, reading the app checked out at `v<version>`.
     It then runs the website's `npm ci` and `npm run consistency` against that tag
     (`OCTOPUSH_APP_DIR`, `OCTOPUSH_STABLE_VERSION=<version>`, `OCTOPUSH_STRICT_RELEASE=1`).
-    It holds no write token, and the website's code runs there as `octo-sandbox`
-    (see [`ROUTINES.md`](ROUTINES.md) → the website lane). Only a patch of those three
-    files and the gate's verdict leave the job.
+    Its first step mints its only token (contents read, octopush-web alone); the job
+    clones with it, keeps no credential in the clone and revokes it, proved dead, or
+    fails. Only then does the website's code run, as `octo-sandbox` (see
+    [`ROUTINES.md`](ROUTINES.md) → the website lane). Only a patch of those three
+    files and a result file (pass or fail, and the failing checks' names) leave the
+    job. Its log is public, like every log of this repo's Actions: it shows the
+    version and pricing checks only (the gate's check lines and count), whose subjects
+    are public on the site; the website's files and install output stay on the runner.
   - `web-version`, on a fresh runner that runs no code from either repo, checks the
     patch: only the `VERSION` line, lines added to the changelog, and a
     `crew-pricing.json` for this version. It applies the patch with git and opens or
-    refreshes the PR, with the verdict in its body: passed, or failed with the
-    failing checks and marked at the top so a person fixes them on the branch before
+    refreshes the PR, with the result in its body: passed, or failed with the
+    failing checks' names and marked at the top so a person fixes them on the branch before
     merging. A failed gate still opens the PR. It never force-pushes: if the branch
     already has commits the job didn't make, it leaves the branch alone and says so
     in the job summary.

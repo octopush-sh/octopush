@@ -144,17 +144,24 @@ jobs:
     # changelog (scripts/web-version.mjs), regenerate src/data/crew-pricing.json
     # with the website's scripts/build-crew-pricing.mjs from the app at the
     # promoted tag, and run the website's consistency gate against that tag.
-    # Only a patch of those three files and the gate's verdict leave this job;
-    # `web-version` checks them on a fresh runner and opens the PR. No agent
-    # runs here. A failure never undoes the promotion above.
+    # Only a patch of those three files and a result file (pass or fail, and
+    # the names of failing checks) leave this job; `web-version` checks them on
+    # a fresh runner and opens the PR. No agent runs here. A failure never
+    # undoes the promotion above.
     #
-    # This job holds no write token. octopush-web is private, so it mints a
-    # read-only token to clone it, and revokes it (proved dead) before any of
-    # the website's code runs. That code (its dependencies, the crew pricing
-    # script, the gate) runs as octo-sandbox (agent-sandbox-setup.sh: another
-    # uid, no sudo, an empty environment), on a copy of the checkout without
-    # its .git, with the Node of frozen-node.sh; `frozen-node.sh verify` proves
-    # nothing the runner executes afterwards has changed before the job goes on.
+    # Trusted phase first, as the runner, before anything untrusted exists:
+    # octopush-web is private, so the job mints a token that can only read it,
+    # clones with it, keeps nothing of it in the clone, and revokes it (proved
+    # dead; the job fails otherwise). The App key is used in that one step.
+    # Then the website's code (its dependencies, the crew pricing script, the
+    # gate) runs as octo-sandbox (agent-sandbox-setup.sh: another uid, no sudo,
+    # an empty environment), on a copy of the clone without its .git, with the
+    # Node of frozen-node.sh; `frozen-node.sh verify` and `guard` prove nothing
+    # the runner executes afterwards has changed before the job goes on.
+    #
+    # This repo's Actions logs are public: this job's log shows the version and
+    # pricing checks only (the gate's check lines and its count), never the
+    # website's files or its install output, which stay on the runner.
     #
     # After homebrew-tap, whatever its result: the gate checks the tap's cask
     # against VERSION, so running alongside it would race the cask's push.
@@ -168,6 +175,67 @@ jobs:
       VERSION: ${{ github.event.inputs.version }}
       WEB: octopush-sh/octopush-web
     steps:
+      - name: Web token (contents read, octopush-web only; revoked before anything else runs)
+        id: read-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true   # revoked explicitly below
+          permission-contents: read
+
+      - name: Clone octopush-web, keeping no credential in the clone
+        id: clone
+        env:
+          WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          web="$RUNNER_TEMP/web"
+          # The token reaches git through the environment, never argv or a
+          # config file; no credential helper may store it.
+          auth="$(printf 'x-access-token:%s' "$WEB_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            GIT_CONFIG_KEY_1=credential.helper GIT_CONFIG_VALUE_1="" \
+            git -c core.hooksPath=/dev/null clone --quiet --depth 1 --no-tags "https://github.com/$WEB.git" "$web"
+          # Nothing of the token stays: the plain remote URL, no extraheader,
+          # credential or URL rewrite, and neither form of it in any git file.
+          [ "$(git -C "$web" remote get-url origin)" = "https://github.com/$WEB.git" ] || { echo "::error::the clone's remote is not the plain URL"; exit 1; }
+          if git -C "$web" config --local --name-only --get-regexp '^(http\..*|credential\..*|url\..*|include\..*|includeif\..*)$' >/dev/null; then
+            echo "::error::the clone kept credential configuration"; exit 1
+          fi
+          if grep -rqF -e "$WEB_TOKEN" -e "$auth" --exclude-dir=objects "$web/.git"; then
+            echo "::error::the token is in the clone's git files"; exit 1
+          fi
+          echo "octopush-web at $(git -C "$web" rev-parse HEAD)"
+
+      - name: Revoke the read token and prove it dead (the job fails otherwise)
+        id: revoke
+        if: always() && steps.read-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: |
+          set -uo pipefail
+          revoked=""
+          for _ in 1 2 3; do
+            if gh api -X DELETE installation/token >/dev/null 2>&1; then revoked=1; break; fi
+            sleep 3
+          done
+          # Dead means GitHub answers 401 (revocation takes a few seconds to
+          # propagate). 200 = still live; anything else proves nothing, so keep
+          # looking; give up closed.
+          for _ in $(seq 1 12); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/octopush-sh/octopush-web) || code=000
+            if [ "$code" = 401 ]; then echo "read token revoked${revoked:+ (DELETE /installation/token)}"; exit 0; fi
+            echo "check $code — token not yet proven dead"
+            sleep 5
+          done
+          echo "::error::the read token was not revoked (${revoked:+the API took the revocation but }no 401 a minute later) — stopping before any of the website's code runs"; exit 1
+
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -180,54 +248,16 @@ jobs:
           persist-credentials: false
 
       - name: Node 22, root-owned and read-only (frozen-node.sh, instead of setup-node)
-        run: bash scripts/routines/frozen-node.sh freeze "$GITHUB_WORKSPACE/app-stable/.git"
+        run: bash scripts/routines/frozen-node.sh freeze "$GITHUB_WORKSPACE/app-stable/.git" "$RUNNER_TEMP/web/.git"
 
-      - name: Web token (read-only; revoked before any of the website's code runs)
-        id: read-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
-          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
-          owner: octopush-sh
-          repositories: octopush-web
-          skip-token-revoke: true   # revoked explicitly below
-          permission-contents: read
-
-      - name: Check out octopush-web and bump its version
+      - name: Bump the website's version and changelog (the app's script, on the clone's files)
         id: bump
         env:
           GH_TOKEN: ${{ github.token }}
-          WEB_TOKEN: ${{ steps.read-token.outputs.token }}
         run: |
           set -euo pipefail
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
-          web="$RUNNER_TEMP/web"
-          # The token reaches git through the environment, never argv; only git gets it.
-          auth="$(printf 'x-access-token:%s' "$WEB_TOKEN" | base64 -w0)"
-          echo "::add-mask::$auth"
-          withtoken() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" "$@"; }
-          withtoken git clone --quiet --depth 1 "https://github.com/$WEB.git" "$web"
-          env -u WEB_TOKEN node scripts/web-version.mjs "$web" "$VERSION"
-
-      - name: Revoke the read token and prove it dead
-        if: always() && steps.read-token.outputs.token != ''
-        env:
-          GH_TOKEN: ${{ steps.read-token.outputs.token }}
-        run: |
-          set -uo pipefail
-          gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning::the revoke call failed; checking whether the token is dead anyway"
-          # Dead means GitHub answers 401 (revocation takes a few seconds to
-          # propagate). 200 = still live; anything else proves nothing, so keep
-          # looking; give up closed.
-          for _ in $(seq 1 12); do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/octopush-sh/octopush-web) || code=000
-            if [ "$code" = 401 ]; then echo "read token revoked"; exit 0; fi
-            echo "check $code — token not yet proven dead"
-            sleep 5
-          done
-          echo "::error::the read token was not proven dead (401) a minute after revoking it — not running the website's code"; exit 1
+          node scripts/web-version.mjs "$RUNNER_TEMP/web" "$VERSION"
 
       - name: Crew pricing and the consistency gate, as octo-sandbox (no token in this step)
         id: gate
@@ -276,11 +306,17 @@ jobs:
               GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$app" \
               bash -c 'cd "$1" && shift && exec "$@"' _ "$gate" "$@"
           }
+          # Their output stays on the runner (this log is public): only the
+          # gate's check lines and its count are printed, colours and controls gone.
+          checks() { sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1" | tr -d '\000-\010\013-\037\177' | { grep -E '^(✓|✗|▸) |^[0-9]+ passed · [0-9]+ failed' || true; } | cut -b 1-300; }
           crew=0
-          sandbox 120 node scripts/build-crew-pricing.mjs 2>&1 | tee "$RUNNER_TEMP/crew.log" || crew=$?
+          sandbox 120 node scripts/build-crew-pricing.mjs > "$RUNNER_TEMP/crew.log" 2>&1 || crew=$?
+          echo "crew pricing: exit $crew"
           echo "crew=$crew" >> "$GITHUB_OUTPUT"
           rc=0
-          sandbox 600 bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent consistency' 2>&1 | tee "$RUNNER_TEMP/gate.log" || rc=$?
+          sandbox 600 bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent consistency' > "$RUNNER_TEMP/gate.log" 2>&1 || rc=$?
+          checks "$RUNNER_TEMP/gate.log"
+          echo "consistency gate: exit $rc"
           echo "gate=$rc" >> "$GITHUB_OUTPUT"
 
       - name: Nothing of the website's code is still running, and nothing it could reach has changed
@@ -296,16 +332,18 @@ jobs:
           if pgrep -u octo-sandbox >/dev/null 2>&1; then
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
           fi
-          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" verify "$GITHUB_WORKSPACE/app-stable/.git"
+          PATH="$job_path" /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" verify "$GITHUB_WORKSPACE/app-stable/.git" "$RUNNER_TEMP/web/.git"
 
-      - name: The patch and the gate's verdict (all that leaves this job)
+      - name: The patch and the result (all that leaves this job)
         if: ${{ !cancelled() && steps.bump.outcome == 'success' && steps.sandbox-gone.outcome == 'success' }}
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
         env:
           GATE_STEP: ${{ steps.gate.outcome }}
           CREW_RC: ${{ steps.gate.outputs.crew }}
           GATE_RC: ${{ steps.gate.outputs.gate }}
         run: |
-          set -euo pipefail
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" guard "$GITHUB_WORKSPACE/app-stable/.git" "$RUNNER_TEMP/web/.git"
+          set -u
           web="$RUNNER_TEMP/web"
           gate="$(realpath "$GITHUB_WORKSPACE")/web-gate"
           out="$RUNNER_TEMP/web-release"
@@ -324,20 +362,21 @@ jobs:
               echo "::error::the regenerated $crew_json is not a plain JSON file at its path — not taking it"; exit 1
             fi
           fi
-          git -C "$web" rev-parse HEAD > "$out/base"
-          git -C "$web" -c core.hooksPath=/dev/null diff --no-ext-diff --no-color > "$out/release.patch"
-          printf 'crew=%s\ngate=%s\n' "$CREW_RC" "$GATE_RC" > "$out/result"
-          plain() { if [ -f "$1" ]; then sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1" | tr -d '\000-\010\013-\037\177'; fi; }
-          plain "$RUNNER_TEMP/crew.log" | { grep -v '^[[:space:]]*$' || true; } | head -n 40 > "$out/crew.txt"
-          plain "$RUNNER_TEMP/gate.log" | { grep -E '^[0-9]+ passed · [0-9]+ failed' || true; } | head -n 1 > "$out/gate-summary.txt"
-          plain "$RUNNER_TEMP/gate.log" | { grep '^✗' || true; } | head -n 40 > "$out/gate-failed.txt"
-          # Failed without a failing check (npm ci, or the gate itself broke): the end of its log.
-          if [ -n "$GATE_RC" ] && [ "$GATE_RC" != 0 ] && [ ! -s "$out/gate-failed.txt" ]; then
-            plain "$RUNNER_TEMP/gate.log" | { grep -v '^[[:space:]]*$' || true; } | tail -n 25 > "$out/gate-failed.txt"
-          fi
+          git -C "$web" -c core.hooksPath=/dev/null diff --no-ext-diff --no-textconv --no-color > "$out/release.patch"
+          word() { case "$1" in 0) echo pass ;; "") echo none ;; *) echo fail ;; esac; }
+          # pass or fail, and the failing checks by name: no other output of the website's code.
+          {
+            echo "base=$(git -C "$web" rev-parse HEAD)"
+            echo "crew=$(word "$CREW_RC")"
+            echo "gate=$(word "$GATE_RC")"
+            if [ -n "$GATE_RC" ] && [ "$GATE_RC" != 0 ]; then
+              sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUNNER_TEMP/gate.log" | tr -d '\000-\010\013-\037\177' \
+                | { grep '^✗ ' || true; } | sed 's/^✗ //' | cut -b 1-300 | iconv -f UTF-8 -t UTF-8 -c | head -n 40 | sed 's/^/failed=/'
+            fi
+          } > "$out/result.txt"
           echo "patch: $(wc -l < "$out/release.patch") lines; crew=${CREW_RC:-none} gate=${GATE_RC:-none}"
 
-      - name: Hand the patch and the verdict to web-version
+      - name: Hand the patch and the result to web-version
         if: ${{ !cancelled() && steps.bump.outcome == 'success' && steps.sandbox-gone.outcome == 'success' }}
         uses: actions/upload-artifact@v7
         with:
@@ -349,7 +388,7 @@ jobs:
   web-version:
     # Open the octopush-web release PR from web-gate's patch (#1178), on a
     # fresh runner that runs no code from either repository and no node of its
-    # own: it checks the patch and the verdict before any token exists (only
+    # own: it checks the patch and the result before any token exists (only
     # release.ts's VERSION, lines added to the changelog and a crew-pricing.json
     # for this version), applies the patch with git and opens or refreshes the
     # PR, with the gate's verdict in its body. A failed gate still opens the
@@ -373,26 +412,36 @@ jobs:
           name: web-release
           path: ${{ runner.temp }}/in
 
-      - name: Check the patch and the verdict (before any token exists)
+      - name: Check the patch and the result (before any token exists)
         run: |
           set -euo pipefail
           in="$RUNNER_TEMP/in"
           die() { echo "::error::web-gate's patch is refused: $*"; exit 1; }
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "bad version"
-          # base and result always; the others may be empty, and an empty file may not travel.
+          # result.txt always; the patch may be empty, and an empty file may not travel.
           (cd "$in" && find . -mindepth 1 -printf '%P\n') | while IFS= read -r f; do
-            case "$f" in base|result|release.patch|crew.txt|gate-failed.txt|gate-summary.txt) ;; *) die "unexpected file: $f" ;; esac
+            case "$f" in result.txt|release.patch) ;; *) die "unexpected file: $f" ;; esac
           done
-          for f in release.patch crew.txt gate-failed.txt gate-summary.txt; do [ -e "$in/$f" ] || : > "$in/$f"; done
-          for f in base result release.patch crew.txt gate-failed.txt gate-summary.txt; do
+          [ -e "$in/release.patch" ] || : > "$in/release.patch"
+          for f in result.txt release.patch; do
             [ -f "$in/$f" ] && [ ! -L "$in/$f" ] || die "$f is missing or not a regular file"
             max=65536; [ "$f" = release.patch ] && max=1048576
             [ "$(stat -c %s "$in/$f")" -le "$max" ] || die "$f is over $max bytes"
             iconv -f UTF-8 -t UTF-8 "$in/$f" >/dev/null 2>&1 || die "$f is not UTF-8 text"
           done
-          [[ "$(cat "$in/base")" =~ ^[0-9a-f]{40}$ ]] || die "base is not a commit id"
-          re=$'^crew=([0-9]{0,3})\ngate=([0-9]{0,3})$'
-          [[ "$(cat "$in/result")" =~ $re ]] || die "the result is not crew=<n> and gate=<n>"
+          # The result: the base commit, pass/fail/none for each, and the
+          # failing checks by name (only when the gate failed), nothing else.
+          n=0 gate=""
+          while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n + 1))
+            case "$n" in
+              1) [[ "$line" =~ ^base=[0-9a-f]{40}$ ]] ;;
+              2) [[ "$line" =~ ^crew=(pass|fail|none)$ ]] ;;
+              3) [[ "$line" =~ ^gate=(pass|fail|none)$ ]] && gate="${line#gate=}" ;;
+              *) [[ "$gate" == fail && "$n" -le 43 && "$line" =~ ^failed=[^[:cntrl:]]{1,300}$ ]] ;;
+            esac || die "the result is not base=, crew=, gate= and failed= lines (line $n)"
+          done < "$in/result.txt"
+          [ "$n" -ge 3 ] || die "the result is not base=, crew=, gate= and failed= lines"
           # File contents only, and only the three files web-gate writes.
           if LC_ALL=C grep -Eq '^(old mode|new mode|deleted file mode|new file mode|rename from|rename to|copy from|copy to|similarity index|dissimilarity index|GIT binary patch|Binary files )' "$in/release.patch"; then
             die "it does more than change file contents"
@@ -407,7 +456,7 @@ jobs:
               esac
             done < "$RUNNER_TEMP/numstat"
           fi
-          echo "web-gate's patch and verdict are what web-gate writes"
+          echo "web-gate's patch and result are what web-gate writes"
 
       - name: Web token
         id: token
@@ -443,15 +492,17 @@ jobs:
           webapi() { GH_TOKEN="$WEB_TOKEN" gh api "$@"; }
           commit() { git -C "$web" -c core.hooksPath=/dev/null -c user.name="$bot" -c user.email="$bot_email" commit --quiet --no-verify -m "$message"; }
           push() { withtoken git -C "$web" -c core.hooksPath=/dev/null push --quiet origin "HEAD:refs/heads/$branch"; }
-          re=$'^crew=([0-9]{0,3})\ngate=([0-9]{0,3})$'
-          [[ "$(cat "$in/result")" =~ $re ]]
-          crew_rc="${BASH_REMATCH[1]}" gate_rc="${BASH_REMATCH[2]}"
-          case "$gate_rc" in 0) verdict=passed ;; "") verdict="did not run" ;; *) verdict=FAILED ;; esac
+          base="$(sed -n '1s/^base=//p' "$in/result.txt")"
+          crew="$(sed -n '2s/^crew=//p' "$in/result.txt")"
+          gate="$(sed -n '3s/^gate=//p' "$in/result.txt")"
+          [[ "$base" =~ ^[0-9a-f]{40}$ && "$crew" =~ ^(pass|fail|none)$ && "$gate" =~ ^(pass|fail|none)$ ]]
+          sed -n '4,$s/^failed=//p' "$in/result.txt" > "$RUNNER_TEMP/failed.txt"
+          case "$gate" in pass) verdict=passed ;; none) verdict="did not run" ;; *) verdict=FAILED ;; esac
 
           # The patch, on the commit web-gate bumped, then checked for what it must be.
           git init --quiet "$web"
           git -C "$web" remote add origin "https://github.com/$WEB.git"
-          withtoken git -C "$web" fetch --quiet --depth 1 origin "$(cat "$in/base")"
+          withtoken git -C "$web" fetch --quiet --depth 1 origin "$base"
           git -C "$web" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
           sha_before="$(jq -r '.estimator.sourceSha256 // empty' "$web/$crew_json" 2>/dev/null || true)"
           if [ -s "$in/release.patch" ]; then git -C "$web" apply --index "$in/release.patch"; fi
@@ -509,8 +560,8 @@ jobs:
                 new="$(webapi -X POST "repos/$WEB/pulls" -f title="release: landing v$VERSION + changelog" \
                   -f head="$branch" -f base=main -f body="(filled in below)" --jq .number)"
               fi
-              # web-gate's text is data: it goes into the body only inside code fences
-              # longer than any backtick run in it, cleaned and capped.
+              # web-gate's check names are data: they go into the body only inside a
+              # code fence longer than any backtick run in them, cleaned and capped.
               quote() {
                 local t n f
                 t="$(mktemp)"
@@ -519,11 +570,9 @@ jobs:
                 f="$(printf '%*s' "$(( n < 3 ? 3 : n + 1 ))" '' | tr ' ' '`')"
                 printf '%stext\n' "$f"; cat "$t"; printf '%s\n' "$f"
               }
-              summary="$(head -n 1 "$in/gate-summary.txt")"
-              [[ "$summary" =~ ^[0-9]+\ passed\ ·\ [0-9]+\ failed\ ·\ [0-9]+\ skipped(\ ·\ [0-9]+\ warnings)?$ ]] || summary=""
               run="([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))"
               local_cmd="\`OCTOPUSH_APP_DIR=../octopush OCTOPUSH_STABLE_VERSION=$VERSION"
-              how="\`npm run consistency\` with \`OCTOPUSH_APP_DIR\` set to the app checked out at \`v$VERSION\`, \`OCTOPUSH_STABLE_VERSION=$VERSION\` and \`OCTOPUSH_STRICT_RELEASE=1\`, run by promote.yml in a job without write credentials $run"
+              how="\`npm run consistency\` with \`OCTOPUSH_APP_DIR\` set to the app checked out at \`v$VERSION\`, \`OCTOPUSH_STABLE_VERSION=$VERSION\` and \`OCTOPUSH_STRICT_RELEASE=1\`, run by promote.yml as another user, after the job's read token was revoked $run"
               {
                 case "$verdict" in
                   FAILED) printf '> [!CAUTION]\n> **The consistency gate failed** with the app at `v%s`. Fix the failing checks below on this branch before merging.\n\n' "$VERSION" ;;
@@ -532,26 +581,28 @@ jobs:
                 if [ "$verdict" = passed ]; then merge="Reply \`merge web#$new\` in the digest to publish it."; else merge="Once the gate passes, reply \`merge web#$new\` in the digest to publish it."; fi
                 printf 'v%s was promoted to stable, so the landing'"'"'s `VERSION` and the changelog follow it, and `src/data/crew-pricing.json` is regenerated from the app at that tag. The entries are written from the release notes by `scripts/web-version.mjs` in the app repo, run by promote.yml. %s\n\n' "$VERSION" "$merge"
                 printf '### Crew pricing\n\n'
-                case "$crew_rc" in
-                  0)
+                case "$crew" in
+                  pass)
                     if [ "$crew_changed" = 1 ]; then
-                      printf '`node scripts/build-crew-pricing.mjs` regenerated `src/data/crew-pricing.json` from the app at `v%s`; this PR carries the change.\n\n' "$VERSION"
+                      printf '`node scripts/build-crew-pricing.mjs` regenerated `src/data/crew-pricing.json` from the app at `v%s`; this PR carries the change.\n' "$VERSION"
                     else
-                      printf '`node scripts/build-crew-pricing.mjs` regenerated `src/data/crew-pricing.json` from the app at `v%s`: no change.\n\n' "$VERSION"
+                      printf '`node scripts/build-crew-pricing.mjs` regenerated `src/data/crew-pricing.json` from the app at `v%s`: no change.\n' "$VERSION"
                     fi
-                    quote "$in/crew.txt"
                     if [ -n "$sha_before" ] && [ -n "$sha_after" ] && [ "$sha_before" != "$sha_after" ]; then
                       printf '\n> [!IMPORTANT]\n> `estimator.sourceSha256` changed: the app'"'"'s `estimate_run_cost` / `estimate_run` / `range` / `pick_reference_model` changed at `v%s`. Re-read them and update the mirror in `src/lib/crewEstimate.ts` (and its tests) on this branch before merging. The gate compares the JSON, not that mirror.\n' "$VERSION"
                     fi ;;
-                  "") printf '**Not regenerated**: the step did not run %s. Run %s node scripts/build-crew-pricing.mjs` (with the app checked out at `v%s`) and commit the result here.\n' "$run" "$local_cmd" "$VERSION" ;;
-                  *)
-                    printf '**Could not be regenerated** from the app at `v%s` (exit %s); the file is unchanged. If the app'"'"'s pricing code changed shape, fix the reader in `scripts/lib/crew-pricing.mjs`.\n\n' "$VERSION" "$crew_rc"
-                    quote "$in/crew.txt" ;;
+                  none) printf '**Not regenerated**: the step did not run %s. Run %s node scripts/build-crew-pricing.mjs` (with the app checked out at `v%s`) and commit the result here.\n' "$run" "$local_cmd" "$VERSION" ;;
+                  *) printf '**Could not be regenerated** from the app at `v%s`; the file is unchanged. Run %s node scripts/build-crew-pricing.mjs` locally to see why; if the app'"'"'s pricing code changed shape, fix the reader in `scripts/lib/crew-pricing.mjs`.\n' "$VERSION" "$local_cmd" ;;
                 esac
                 printf '\n### Consistency gate\n\n'
                 case "$verdict" in
-                  passed) printf '**Passed**: %s.%s\n' "$how" "${summary:+ $summary.}" ;;
-                  FAILED) printf '**Failed**: %s.%s\n\n' "$how" "${summary:+ $summary.}"; quote "$in/gate-failed.txt" ;;
+                  passed) printf '**Passed**: %s.\n' "$how" ;;
+                  FAILED)
+                    if [ -s "$RUNNER_TEMP/failed.txt" ]; then
+                      printf '**Failed**: %s. The failing checks:\n\n' "$how"; quote "$RUNNER_TEMP/failed.txt"
+                    else
+                      printf '**Failed** before it reported a check (its install, or the gate itself): %s. Run %s npm run consistency` (with the app checked out at `v%s`) to see why.\n' "$how" "$local_cmd" "$VERSION"
+                    fi ;;
                   *) printf '**Did not run** %s: the sandboxed step failed before the gate. Run %s npm run consistency` (with the app checked out at `v%s`).\n' "$run" "$local_cmd" "$VERSION" ;;
                 esac
               } > "$RUNNER_TEMP/pr-body.md"
