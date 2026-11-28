@@ -229,6 +229,29 @@ impl TalkShell {
         timeout: Duration,
         promote: bool,
     ) -> AppResult<RunOutcome> {
+        let keep = if promote { MAX_OUTPUT_BYTES } else { crate::chat_history::COMMAND_CAPTURE_BYTES };
+        self.run_kept(thread_id, workspace_path, command, timeout, promote, keep)
+    }
+
+    /// The agent's command in the thread's shell (#1160): captured as
+    /// [`Self::run_capture`] captures it (up to
+    /// `chat_history::COMMAND_CAPTURE_BYTES`), but a command still running at
+    /// `timeout` is promoted to a live process ([`RunOutcome::Live`]), as a
+    /// long `$` command is, instead of being interrupted.
+    pub fn run_agent(&self, thread_id: &str, workspace_path: &str, command: &str, timeout: Duration) -> AppResult<RunOutcome> {
+        self.run_kept(thread_id, workspace_path, command, timeout, true, crate::chat_history::COMMAND_CAPTURE_BYTES)
+    }
+
+    /// [`Self::run`], keeping up to `keep` bytes of a finished command's output.
+    fn run_kept(
+        &self,
+        thread_id: &str,
+        workspace_path: &str,
+        command: &str,
+        timeout: Duration,
+        promote: bool,
+        keep: usize,
+    ) -> AppResult<RunOutcome> {
         let client = self
             .client
             .lock()
@@ -302,7 +325,6 @@ impl TalkShell {
         // Discard any stale bytes (the idle prompt left in the buffer) so the
         // next prompt marker we see is unambiguously THIS command's completion.
         drain_pending(&rx);
-        let keep = if promote { MAX_OUTPUT_BYTES } else { crate::chat_history::COMMAND_CAPTURE_BYTES };
         if let Err(e) = client.write(&id, format!("{command}\n").as_bytes()) {
             handle.lock().rx = Some(rx);
             return Err(e);
@@ -600,6 +622,41 @@ fn process_busy(pid: u32) -> bool {
     let Ok(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else { return false };
     let wrote = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
     wrote == size && info.e_tpgid != 0 && info.e_tpgid != info.pbi_pgid
+}
+
+/// The process group a job holds `pid`'s terminal with, when one does
+/// (#1160): the group to signal to stop a command running in a shell,
+/// without typing into the shell. `None` while the shell is at its prompt,
+/// or when the OS can't say.
+#[cfg(target_os = "macos")]
+pub(crate) fn foreground_group(pid: u32) -> Option<i32> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: as in `process_cwd`.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    let wrote = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+    let held = wrote == size && info.e_tpgid != 0 && info.e_tpgid != info.pbi_pgid;
+    held.then(|| i32::try_from(info.e_tpgid).ok()).flatten()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn foreground_group(pid: u32) -> Option<i32> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| stat_job_group(&stat))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn foreground_group(_pid: u32) -> Option<i32> {
+    None
+}
+
+/// The group a job holds the terminal with, from a `/proc/<pid>/stat`
+/// line: its `tpgid`, when set and not the process's own `pgrp`. Pure.
+#[cfg(any(target_os = "linux", test))]
+fn stat_job_group(stat: &str) -> Option<i32> {
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let pgrp: i64 = fields.get(2)?.parse().ok()?;
+    let tpgid: i64 = fields.get(5)?.parse().ok()?;
+    (tpgid > 0 && tpgid != pgrp).then(|| i32::try_from(tpgid).ok()).flatten()
 }
 
 #[cfg(target_os = "linux")]
@@ -930,6 +987,11 @@ fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEv
 }
 
 impl LiveRun {
+    /// Where the command started: the shell's directory as it last reported it.
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
     /// Pump live output to `on_chunk` (raw, with ANSI — xterm draws it) until the
     /// process exits (the prompt marker prints), then restore the session and
     /// return the exit info. Blocking — run on a worker thread.
@@ -1233,7 +1295,7 @@ fn ansi_re() -> &'static regex::Regex {
 }
 
 /// Strip ANSI escapes, normalize PTY CRLFs, and trim — for the captured result.
-fn clean_output(s: &str) -> String {
+pub(crate) fn clean_output(s: &str) -> String {
     let no_ansi = ansi_re().replace_all(s, "");
     no_ansi.replace("\r\n", "\n").replace('\r', "").trim().to_string()
 }
@@ -1440,6 +1502,11 @@ mod tests {
         assert_eq!(stat_busy("123 (ba sh)) S 1 123 123 34816 456 4194560 0"), Some(true));
         assert_eq!(stat_busy("123 (bash) S 1 123 123 0 -1 4194560 0"), Some(false));
         assert_eq!(stat_busy("garbage"), None);
+        // The group to signal to stop it (#1160).
+        assert_eq!(stat_job_group("123 (ba sh)) S 1 123 123 34816 456 4194560 0"), Some(456));
+        assert_eq!(stat_job_group("123 (bash) S 1 123 123 34816 123 4194560 0"), None);
+        assert_eq!(stat_job_group("123 (bash) S 1 123 123 0 -1 4194560 0"), None);
+        assert_eq!(stat_job_group("garbage"), None);
         // Where the shell last said it sits, kept per thread.
         let dir = tempfile::TempDir::new().unwrap();
         let store = CwdStore(Some(dir.path().join("talk-cwd")));
@@ -1680,6 +1747,34 @@ mod e2e {
         assert_eq!(r.output, "shared", "env lost after a timeout interrupt");
 
         shell.close("u");
+    }
+
+    /// The agent's command still running at its timeout is promoted to a
+    /// live process instead of being interrupted (#1160): the shell is busy
+    /// while it runs and takes the next command once it ends.
+    #[test]
+    #[serial]
+    fn an_agent_command_past_its_timeout_is_promoted() {
+        let d = boot();
+        let shell = shell_on(&d.sock);
+        let quick = Duration::from_secs(5);
+        let r = done(shell.run_agent("pr", "/tmp", "echo quick", quick).unwrap());
+        assert_eq!(r.output, "quick");
+        let live = match shell.run_agent("pr", "/tmp", "echo promoted-start; sleep 1; echo promoted-done", Duration::from_millis(300)).unwrap() {
+            RunOutcome::Live(l) => l,
+            _ => panic!("expected the command to be promoted"),
+        };
+        assert!(live.cwd().ends_with("tmp"), "{}", live.cwd());
+        assert!(matches!(shell.run_agent("pr", "/tmp", "echo x", quick).unwrap(), RunOutcome::Busy));
+        let chunks = Arc::new(StdMutex::new(String::new()));
+        let c2 = Arc::clone(&chunks);
+        let exit = live.stream(move |s| c2.lock().unwrap().push_str(s));
+        assert_eq!(exit.exit_code, 0);
+        let streamed = chunks.lock().unwrap().clone();
+        assert!(streamed.contains("promoted-start") && streamed.contains("promoted-done"), "{streamed:?}");
+        let r = done(shell.run_agent("pr", "/tmp", "echo back", quick).unwrap());
+        assert_eq!(r.output, "back");
+        shell.close("pr");
     }
 
     /// The workspace's port block (#1219) is in the thread's shell, for `$`
