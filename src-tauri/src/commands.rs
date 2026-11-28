@@ -1270,6 +1270,13 @@ fn archive_workspace_internal(state: &AppState, workspace_id: &str) -> AppResult
         }
     }
     state.db.lock().archive_workspace(workspace_id)?;
+    // Its conversations' background processes stop (#1160), off this thread.
+    let procs = std::sync::Arc::clone(&state.chat.procs);
+    std::thread::spawn(move || {
+        for thread in threads {
+            procs.close_thread(&thread);
+        }
+    });
     Ok(())
 }
 
@@ -1592,6 +1599,8 @@ pub async fn delete_workspace(
     // longer come, and keep counting on the Dock badge.
     let threads = state.db.lock().chat_thread_ids(&workspace_id).unwrap_or_default();
     state.chat.cancel_workspace(&workspace_id, &threads);
+    // Their background processes stop with it (#1160).
+    state.chat.close_procs(&threads).await;
     let project_path = expand_tilde(&project_path);
     let is_main = worktree_path
         .as_deref()
@@ -1677,9 +1686,18 @@ pub async fn archive_workspace(
     let _ = &branch;
     let project_path = expand_tilde(&project_path);
     let running = |t: &[String]| state.chat.any_running(t);
-    archive_workspace_at(&state.db, running, &workspace_id, &project_path, worktree_path.as_deref(), None)
-        .await
-        .map(|_| ())
+    let archived = archive_workspace_at(&state.db, running, &workspace_id, &project_path, worktree_path.as_deref(), None).await;
+    if matches!(archived, Ok(None)) {
+        close_workspace_procs(&state, &workspace_id).await;
+    }
+    archived.map(|_| ())
+}
+
+/// An archived workspace's worktree is gone: its conversations' background
+/// processes stop (#1160).
+async fn close_workspace_procs(state: &AppState, workspace_id: &str) {
+    let threads = state.db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
+    state.chat.close_procs(&threads).await;
 }
 
 /// The archive itself, shared with `archive_merged_workspaces`, which passes
@@ -2005,8 +2023,10 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
     // card (as Deny), which would otherwise wait for an answer that can no
     // longer come once the conversation is gone.
     state.chat.cancel(&thread_id);
-    // Tear down the thread's TALK shell (kills the daemon PTY + releases the
-    // session entry) so deleting conversations doesn't leak bash processes.
+    // Its background processes stop first (#1160), then the thread's TALK
+    // shell goes (kills the daemon PTY + releases the session entry) so
+    // deleting conversations doesn't leak bash processes.
+    state.chat.close_procs(std::slice::from_ref(&thread_id)).await;
     state.chat.talk_shell.close(&thread_id);
     // Its checkpoints go with it (#958).
     let worktree = state.db.lock().chat_thread_worktree(&thread_id).ok().flatten();
@@ -2505,13 +2525,42 @@ pub async fn get_thread_permission_mode(state: State<'_, AppState>, thread_id: S
 
 /// Set a Talk conversation's permission mode, `plan`, `ask` or `edit`; a
 /// turn that is running takes it from its next round, and notes the switch.
+///
+/// Entering Ask first or Plan only stops the agent's background processes
+/// that started in a looser mode (#1160): one never outlives a stricter
+/// mode without being approved again.
 #[tauri::command]
-pub async fn set_thread_permission_mode(state: State<'_, AppState>, thread_id: String, mode: String) -> AppResult<String> {
+pub async fn set_thread_permission_mode(app: AppHandle, state: State<'_, AppState>, thread_id: String, mode: String) -> AppResult<String> {
     let Some(mode) = crate::permissions::Mode::settable(&mode) else {
         return Err(AppError::Other(format!("Unknown permission mode `{mode}`: use `plan`, `ask` or `edit`.")));
     };
     state.db.lock().set_thread_permission_mode(&thread_id, mode)?;
+    state.chat.enforce_thread_procs(&app, &thread_id).await;
     Ok(mode.as_str().to_string())
+}
+
+/// A Talk conversation's background processes (#1160), oldest first: what
+/// the agent started with `keep_running`, and commands promoted at their
+/// timeout. Updates arrive as `chat://background-processes`.
+#[tauri::command]
+pub async fn list_background_processes(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<Vec<crate::talk_procs::ProcView>> {
+    Ok(state.chat.list_procs(&app, &thread_id).await)
+}
+
+/// Stop one of a conversation's background processes, with its process
+/// group, from the live process panel (#1160).
+#[tauri::command]
+pub async fn stop_background_process(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    id: String,
+) -> AppResult<crate::talk_procs::ProcView> {
+    state.chat.stop_proc(&app, &thread_id, &id).await
 }
 
 /// The grants a Talk conversation holds (#1229), oldest first: the folders
@@ -7616,6 +7665,7 @@ pub async fn archive_merged_workspaces(
                 let archived = archive_workspace_at(&state.db, running, &id, &project_path, Some(&wt), Some(named)).await;
                 match archived {
                     Ok(None) => {
+                        close_workspace_procs(&state, &id).await;
                         out.archived.push(id);
                         continue;
                     }

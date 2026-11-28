@@ -30,6 +30,24 @@ export type UpdateDownloadEvent =
  *  folder with its commands, write in a folder with the file tools, or run
  *  one exact command. `value` is the folder, or the command's key; `shown`
  *  is how the Companion names it. */
+/** A Talk conversation's background process (#1160): one the agent started
+ *  with `run_command { keep_running: true }`, or a command promoted to the
+ *  live process panel at its timeout. */
+export interface BackgroundProcess {
+  /** `proc-<n>`, unique in its conversation. */
+  id: string;
+  kind: "background" | "promoted";
+  command: string;
+  cwd: string;
+  /** Unix seconds. */
+  startedAt: number;
+  running: boolean;
+  exitCode: number | null;
+  stopped: boolean;
+  /** Gone after a restart: Octopush's terminal service no longer had it. */
+  lost: boolean;
+}
+
 export interface TalkGrant {
   kind: "read" | "write" | "command";
   value: string;
@@ -1149,6 +1167,12 @@ export const ipc = {
   /** Resize a thread's PTY so a full-screen TUI fits the live panel. */
   resizeShell: (threadId: string, rows: number, cols: number) =>
     invoke<void>("resize_shell", { threadId, rows, cols }),
+  /** A conversation's background processes (#1160), oldest first. */
+  listBackgroundProcesses: (threadId: string) =>
+    invoke<BackgroundProcess[]>("list_background_processes", { threadId }),
+  /** Stop one of them, with its process group. */
+  stopBackgroundProcess: (threadId: string, id: string) =>
+    invoke<BackgroundProcess>("stop_background_process", { threadId, id }),
   /** Most-recently-used `$`-direct commands for a workspace (recall palette). */
   listShellHistory: (workspaceId: string, limit?: number) =>
     invoke<string[]>("list_shell_history", { workspaceId, limit }),
