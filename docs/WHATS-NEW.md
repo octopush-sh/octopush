@@ -119,6 +119,7 @@ Current anchors:
 | `run-pane-caption` · `run-open-beside` | Run canvas: the first pane's caption (a lone pane has one too) · its `⋯` "Session actions" button, whose menu holds "Open beside…" (tours from before the session line, which pointed at the rail flyout's Open beside, land here) | `run/RunPanes.tsx` |
 | `run-pane-divider` · `run-empty-seat` | Run canvas, only with two or more panes: the first (main) divider · the empty seat (only while there is one) | `run/RunPanes.tsx` |
 | `run-pane-waiting` | Run canvas: the first pane's caption suffix "· waiting on permission" / "· waiting on your input" (only while Claude Code's hooks say that session waits on you) | `run/PaneWaiting.tsx` via `run/RunPanes.tsx` |
+| `talk-process-row` | Talk live process panel: a background process the agent started, one row each with its id, command and Stop (only while one runs; a tour finds the first) | `chat/LiveProcessPanel.tsx` |
 | `talk-seat-toggle` | Talk canvas: the `SquareTerminal` icon that opens or closes the terminal seat beside the conversation | `chat/TalkSeat.tsx` |
 | `talk-seat-leave` | Talk canvas, while the terminal seat is open: the minus on its caption, "Leave the view · the session keeps running" | `chat/TalkSeat.tsx` |
 | `talk-turn-actions` · `talk-turn-rewind` · `talk-turn-fork` | Talk, on a message you sent (revealed on hover or focus, and while a tour points at it): its row of actions · "Rewind files to here" (only when that turn took a checkpoint) · "Fork from here" | `chat/ChatCanvas.tsx` |

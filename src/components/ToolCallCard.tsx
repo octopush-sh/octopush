@@ -31,6 +31,8 @@ export const TOOL_LABELS: Record<string, string> = {
   Task: "AGENT",
   recall_tool_output: "RECALL",
   Skill: "SKILL",
+  read_output: "OUTPUT",
+  stop: "STOP",
 };
 
 /** The card header label for a tool name (e.g. `write_file` → `WRITE`,
@@ -55,8 +57,14 @@ export function summarizeTool(
   switch (toolName) {
     case "run_command": {
       const cmd = String(toolInput?.command ?? "");
-      return cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
+      const shown = cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
+      // Started to keep running in the background (#1160).
+      return toolInput?.keep_running === true ? `${shown} · in the background` : shown;
     }
+    case "read_output":
+    case "stop":
+      // A background process of the conversation, by its id (#1160).
+      return String(toolInput?.id ?? "");
     case "Agent":
     case "Task": {
       // A sub-agent card reads as `description · role`; the prompt itself is

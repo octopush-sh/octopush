@@ -107,7 +107,9 @@ pub fn classify(name: &str) -> Class {
         | crate::skills::SKILL_TOOL_NAME
         | ASK_DIRECTOR_TOOL
         | SUBMIT_VERDICT_TOOL
-        | ASK_STAGE_TOOL => Class::Meta,
+        | ASK_STAGE_TOOL
+        | crate::talk_procs::READ_OUTPUT_TOOL
+        | crate::talk_procs::STOP_TOOL => Class::Meta,
         n if crate::chat_agents::is_agent_tool(n) => Class::Delegate,
         n if crate::mcp::is_mcp_tool(n) => Class::Net,
         _ => Class::Write,
@@ -161,6 +163,8 @@ pub enum Refused {
     Delegate,
     /// A command that changes something elsewhere, and what ([`remote_effect`]).
     Remote(&'static str),
+    /// A command that would keep running in the background (#1160).
+    Background,
 }
 
 /// The fixed result Plan only gives a call it refuses, saying why Plan only
@@ -194,6 +198,10 @@ pub fn plan_refusal(refused: Refused, forced: bool) -> String {
         Refused::Remote(what) => format!(
             "Not run: {why}, which allows reading and fetching but no command that changes something elsewhere \
              ({what}). Leave the step in your plan."
+        ),
+        Refused::Background => format!(
+            "Not started: {why}, which starts no background process. Run a command that finishes, or leave the \
+             server or watcher in your plan."
         ),
     }
 }
@@ -244,11 +252,12 @@ pub const ASK_DECLINED_COMMAND: &str = "Not run: the user declined this command 
 ///
 /// - **Plan only:** reads and the loop's own tools run. Writes are refused.
 ///   A command runs only under the read-only sandbox, and not when it
-///   changes something elsewhere ([`remote_effect`]). An MCP tool runs only
-///   when its server marks it read-only, and a sub-agent unless it names a
-///   type that writes.
+///   changes something elsewhere ([`remote_effect`]) or would keep running
+///   in the background (#1160). An MCP tool runs only when its server marks
+///   it read-only, and a sub-agent unless it names a type that writes.
 /// - **Ask first:** writes ask, and so does a command unless every command
-///   in it only reads ([`reads_only`]). The host asks on [`ask_card`].
+///   in it only reads ([`reads_only`]); one that would keep running in the
+///   background always asks. The host asks on [`ask_card`].
 /// - **Edit freely:** everything runs, as before modes existed.
 ///
 /// In a mission that ships nothing, a command that changes something
@@ -285,9 +294,11 @@ pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
             _ => {}
         }
     }
+    let background = matches!(classify(call.name), Class::Exec) && crate::talk_procs::keeps_running(call.input);
     match (mode, classify(call.name)) {
         (Mode::Edit, _) | (_, Class::Read | Class::Meta) => Decision::Allow,
         (Mode::Plan, Class::Write) => refuse(Refused::Write),
+        (Mode::Plan, Class::Exec) if background => refuse(Refused::Background),
         (Mode::Plan, Class::Exec) => match remote_effect(&field("command")) {
             Some(what) => refuse(Refused::Remote(what)),
             None if matches!(ctx.exec_roots, Some([])) => Decision::Allow,
@@ -298,11 +309,16 @@ pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
         (Mode::Plan, Class::Delegate) if !ctx.delegate_writes => Decision::Allow,
         (Mode::Plan, Class::Delegate) => refuse(Refused::Delegate),
         (Mode::Ask, Class::Write) => Decision::Ask { reason: "changes a file".into(), preview: field("path") },
+        (Mode::Ask, Class::Exec) if background => Decision::Ask { reason: BACKGROUND_REASON.into(), preview: field("command") },
         (Mode::Ask, Class::Exec) if reads_only(&field("command")) => Decision::Allow,
         (Mode::Ask, Class::Exec) => Decision::Ask { reason: "runs a command".into(), preview: field("command") },
         (Mode::Ask, Class::Net | Class::Delegate) => Decision::Allow,
     }
 }
+
+/// Why Ask first holds a command that would keep running (#1160): a reader
+/// such as `tail -f` asks too, since it outlives the turn.
+pub const BACKGROUND_REASON: &str = "starts a command that keeps running in the background";
 
 /// Programs Ask first runs without a card: they only read, whatever their
 /// flags. A short list on purpose; anything else asks.
@@ -414,7 +430,11 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         bound,
     };
     if name == "run_command" {
-        return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None, None);
+        let reason = match crate::talk_procs::keeps_running(input) {
+            true => format!("{BACKGROUND_REASON} (Ask first)"),
+            false => "runs a command (Ask first)".to_string(),
+        };
+        return card(CardKind::Exec, field("command"), reason, ASK_DECLINED_COMMAND, None, None);
     }
     let path = field("path");
     // A file in the workspace that runs commands (`talk_guard::RUNS_CODE`)
@@ -3529,6 +3549,76 @@ mod tests {
             assert_eq!(remote_effect(command), None, "{command}");
         }
         assert!(remote_effect(&"$(".repeat(6)).is_some(), "past the nesting it reads, it refuses");
+    }
+
+    /// A command started to keep running (#1160) meets the policy exactly
+    /// as the same command run in the foreground: the control-character
+    /// refusal and a ship-nothing mission's refusals, word for word. Then
+    /// Plan only refuses every background start, Ask first asks for every
+    /// one (a reader such as `tail -f` too), and Edit freely runs it, as it
+    /// runs any command. `read_output` and `stop` run in every mode.
+    #[test]
+    fn a_background_start_meets_the_policy_as_a_foreground_command_does() {
+        let ro: HashSet<String> = HashSet::new();
+        let sandboxed: &[String] = &[];
+        let decide_in = |mode: Mode, ships_nothing: bool, input: &Value| {
+            let roots = (mode == Mode::Plan).then_some(sandboxed);
+            let ctx = PolicyCtx { exec_roots: roots, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing };
+            decide(mode, &ToolCall { name: "run_command", input }, &ctx)
+        };
+        let fg = |c: &str| json!({ "command": c });
+        let bg = |c: &str| json!({ "command": c, "keep_running": true });
+        // Refused before any mode decides, in every mode: the same refusal.
+        for mode in [Mode::Plan, Mode::Ask, Mode::Edit] {
+            for ships_nothing in [false, true] {
+                let foreground = decide_in(mode, ships_nothing, &fg("npm run dev\rgit push"));
+                assert!(matches!(foreground, Decision::Deny { .. }), "{foreground:?}");
+                assert_eq!(decide_in(mode, ships_nothing, &bg("npm run dev\rgit push")), foreground, "{mode:?}");
+            }
+            for command in ["git push origin main", "npm publish", "bash -c 'npm run dev'", "npm run dev $(cat cmd)", "alias gp='git push'"] {
+                let foreground = decide_in(mode, true, &fg(command));
+                assert!(matches!(foreground, Decision::Deny { .. }), "{command}: {foreground:?}");
+                assert_eq!(decide_in(mode, true, &bg(command)), foreground, "{command} in {mode:?}");
+            }
+        }
+        let background = deny(Refused::Background);
+        for command in ["npm run dev", "tail -f log.txt"] {
+            assert_eq!(decide_in(Mode::Plan, false, &bg(command)), background, "{command}");
+            assert_eq!(decide_in(Mode::Plan, true, &bg(command)), background, "{command}");
+            assert_eq!(
+                decide_in(Mode::Ask, false, &bg(command)),
+                Decision::Ask { reason: BACKGROUND_REASON.into(), preview: command.into() },
+                "{command}"
+            );
+            assert_eq!(decide_in(Mode::Edit, false, &bg(command)), Decision::Allow, "{command}");
+            assert_eq!(decide_in(Mode::Edit, true, &bg(command)), Decision::Allow, "a local server ships nothing");
+        }
+        // In the foreground, the reader runs without a card and Plan only runs it.
+        assert_eq!(decide_in(Mode::Ask, false, &fg("tail -f log.txt")), Decision::Allow);
+        assert_eq!(decide_in(Mode::Plan, false, &fg("tail -f log.txt")), Decision::Allow);
+        assert!(plan_refusal(Refused::Background, false).starts_with("Not started: this conversation is in Plan only mode, which starts no background process."));
+        assert!(plan_refusal(Refused::Background, true).contains("mission is read-only"));
+        // A string isn't the flag: it runs in the foreground.
+        assert_eq!(decide_in(Mode::Plan, false, &json!({ "command": "npm test", "keep_running": "yes" })), Decision::Allow);
+        for tool in ["read_output", "stop"] {
+            assert_eq!(classify(tool), Class::Meta, "{tool}");
+            for mode in [Mode::Plan, Mode::Ask, Mode::Edit] {
+                let ctx = PolicyCtx { exec_roots: None, mcp_read_only: &ro, delegate_writes: false, forced: false, ships_nothing: true };
+                assert_eq!(decide(mode, &ToolCall { name: tool, input: &json!({ "id": "proc-1" }) }, &ctx), Decision::Allow, "{tool} in {mode:?}");
+            }
+        }
+    }
+
+    /// Ask first's card for a background start says it keeps running (#1160).
+    #[test]
+    fn ask_firsts_card_names_a_background_start() {
+        let (_ws, _home, reach) = workspace_reach(&[]);
+        let card = ask_card(None, "run_command", &json!({ "command": "npm run dev", "keep_running": true }), &reach);
+        assert_eq!((card.kind, card.shown.as_str()), (CardKind::Exec, "npm run dev"));
+        assert_eq!(card.reason, "starts a command that keeps running in the background (Ask first)");
+        assert_eq!(card.denial, ASK_DECLINED_COMMAND);
+        let sub = ask_card(Some("Run the app"), "run_command", &json!({ "command": "npm run dev", "keep_running": true }), &reach);
+        assert_eq!(sub.reason, "Sub-agent \u{201c}Run the app\u{201d}: starts a command that keeps running in the background (Ask first)");
     }
 
     /// A mission that ships nothing (#1239): in every mode, a command that

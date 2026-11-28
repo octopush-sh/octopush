@@ -52,6 +52,7 @@ pub mod sync;
 pub mod talk_checkpoints;
 pub mod talk_guard;
 pub mod permissions;
+pub mod talk_procs;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_ports;
@@ -282,6 +283,8 @@ pub fn run() {
             commands::truncate_chat_after,
             commands::run_shell_command,
             commands::stop_shell_command,
+            commands::list_background_processes,
+            commands::stop_background_process,
             commands::respond_approval,
             commands::send_shell_input,
             commands::resize_shell,
