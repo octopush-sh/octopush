@@ -126,4 +126,15 @@ describe("InlineTicketPicker", () => {
       expect(onPick).toHaveBeenCalledWith("CLPNSNS-555");
     });
   });
+
+  it("speaks of an Epiku project's open stories, not of assigned tickets (#1283)", () => {
+    const stories = [issue("ST-1.1", "Sample story")];
+    render(<InlineTicketPicker candidates={stories} projectKey={null} projectId="p1" tracker="epiku" onPick={vi.fn()} onCancel={vi.fn()} />);
+    const input = screen.getByPlaceholderText(/search by key/i);
+    fireEvent.change(input, { target: { value: "nothing like it" } });
+    expect(screen.getByText("No matches in the project's open stories.")).toBeInTheDocument();
+    fireEvent.change(input, { target: { value: "ST-1.2" } });
+    expect(screen.getByText("(not in the open stories — verified on link)")).toBeInTheDocument();
+    expect(screen.queryByText(/assigned/)).not.toBeInTheDocument();
+  });
 });

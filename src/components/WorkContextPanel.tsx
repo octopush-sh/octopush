@@ -117,11 +117,14 @@ export function WorkContextPanel({
     else setLocalCollapsed(!collapsed);
   }
 
-  // Initial my-issues load.
+  // Initial my-issues load, and again on a tracker scope change (#1283): a
+  // new scope (another tracker, or another Epiku project, after a project
+  // switch or a save in Issue tracking) empties the list.
+  const scope = useIssuesStore((s) => s.scope);
   useEffect(() => {
     if (configured) void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configured]);
+  }, [configured, scope]);
 
   const epicKey = useMemo(
     () => resolveEpicKey(activeIssue, parents),

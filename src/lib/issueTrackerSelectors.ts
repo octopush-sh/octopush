@@ -43,11 +43,31 @@ export function pickerCandidates(
   list: { scope: string | null; projectId: string | null },
   picker: { projectId: string | null; tracker: TrackerKind | null },
 ): Issue[] {
+  // An Epiku scope may also name the Epiku project it reads (`trackerScope`),
+  // so match it by the project the list is for.
   const same =
     picker.tracker === "epiku"
-      ? picker.projectId !== null && list.scope === `epiku:${picker.projectId}`
+      ? picker.projectId !== null && list.projectId === picker.projectId && !!list.scope?.startsWith("epiku:")
       : picker.tracker === "jira" && list.scope === "jira";
   return same ? issues ?? [] : [];
+}
+
+/** How the ticket picker speaks of the list it searches (#1283): Jira's is
+ *  the user's assigned tickets; Epiku's is the project's open stories, which
+ *  aren't assigned to anyone. */
+export function pickerListCopy(tracker: TrackerKind | null): { notListed: string; noMatches: string } {
+  return tracker === "epiku"
+    ? { notListed: "not in the open stories", noMatches: "No matches in the project's open stories." }
+    : { notListed: "not assigned to you", noMatches: "No matches in your assigned tickets." };
+}
+
+/** What the new-mission wizard opens on for a ticket. */
+export interface TicketWizardTarget {
+  projectId: string;
+  projectPath: string;
+  initialTask: string;
+  linkIssueKeyOnCreate: string;
+  initialIntent?: "test";
 }
 
 /** "Create workspace" or "Test this ticket" (`initialIntent: "test"`) on an
@@ -58,10 +78,40 @@ export function epikuTicketTarget(
   activeTracker: TrackerKind | null,
   activeProject: Pick<ProjectInfo, "id" | "path"> | null,
   initialIntent?: "test",
-): { projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string; initialIntent?: "test" } | null {
+): TicketWizardTarget | null {
   if (activeTracker !== "epiku" || !activeProject) return null;
   const target = { projectId: activeProject.id, projectPath: activeProject.path, initialTask: issue.summary, linkIssueKeyOnCreate: issue.key };
   return initialIntent ? { ...target, initialIntent } : target;
+}
+
+/** Where creating a workspace for a ticket goes once nothing stops it, the
+ *  existing-workspace alert's Continue included (#1283): an Epiku story to
+ *  its `epiku` target ({@link epikuTicketTarget}); a Jira ticket to the one
+ *  project its key's prefix names, a choice of several, or none. */
+export function ticketCreateRoute(
+  ticket: Pick<Issue, "key" | "summary">,
+  epiku: TicketWizardTarget | null,
+  projects: ProjectInfo[],
+  initialIntent?: "test",
+):
+  | { kind: "wizard"; target: TicketWizardTarget }
+  | { kind: "pick"; candidates: ProjectInfo[] }
+  | { kind: "unlinked"; prefix: string } {
+  if (epiku) return { kind: "wizard", target: epiku };
+  const prefix = ticket.key.split("-")[0];
+  const candidates = projects.filter((p) => p.jiraProjectKey === prefix);
+  if (candidates.length === 0) return { kind: "unlinked", prefix };
+  if (candidates.length > 1) return { kind: "pick", candidates };
+  return {
+    kind: "wizard",
+    target: {
+      projectId: candidates[0].id,
+      projectPath: candidates[0].path,
+      initialTask: ticket.summary,
+      linkIssueKeyOnCreate: ticket.key,
+      initialIntent,
+    },
+  };
 }
 
 // Order maps the spec's "inProgress → todo → unknown → done" rule.

@@ -31,8 +31,9 @@ export function isIssueKey(text: string): boolean {
 
 /** The ticket a branch names for a project's tracker (#1127). Under Epiku,
  *  the first dotted story id (`ST-2.3`) that `isKnownStory` confirms: one of
- *  the project's loaded stories, or one `getIssue` read. A dotted token that
- *  isn't a story (`UTF-8.1`, `NODE-20.11`) links nothing and fetches nothing.
+ *  the project's loaded stories, or one `getIssue` read (the header asks for
+ *  a branch's dotted ids, #1283). A dotted token that isn't a story
+ *  (`UTF-8.1`, `NODE-20.11`) links nothing.
  *  Otherwise a key of the project's Jira key ({@link detectIssueKeyForProject}). */
 export function detectTrackerKey(
   branch: string,
