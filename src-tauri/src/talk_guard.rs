@@ -2290,9 +2290,12 @@ fn following_segments(words: &[CommandWord], walking: &[bool]) -> Vec<Follow> {
             .and_then(|at| typed.get(at + 1))
             .copied()
             .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphabetic()));
-        // The programs it runs decide, wrappers unwrapped (`timeout 5 zip`).
+        // The programs it runs decide, wrappers unwrapped (`timeout 5 zip`);
+        // and, for a wrapper the check doesn't list (`pnpm exec zip`,
+        // `arch -arm64 zip`), any later word naming a walker, which then
+        // counts only with that walker's own flags below.
         let programs = program_names(&seg.iter().map(|&j| &words[j]).collect::<Vec<_>>());
-        let runs = |p: &str| programs.iter().any(|n| n == p);
+        let runs = |p: &str| programs.iter().any(|n| n == p) || names.contains(&p);
         let walks = walking.get(w.segment).copied().unwrap_or(false) || runs("du");
         let mut follow = Follow::default();
         for f in FOLLOWERS.iter().filter(|f| walks && runs(f.program)) {
@@ -3927,6 +3930,28 @@ mod tests {
         assert!(!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in "), "{}", c.reason);
         for command in ["timeout 30 curl -H \"x: y\" \"$URL\"", "nohup npm test &", "env FOO=1 make", "timeout 30 \"$CMD\" --version"] {
             assert_eq!(run(&clean, command), None, "{command}");
+        }
+    }
+
+    /// A walker run by a program the check doesn't list as a wrapper
+    /// (`pnpm exec`, `arch -arm64`) still counts when a later word names it
+    /// and the command carries its flags (#1208); otherwise such a word
+    /// gets at most the bounded scan.
+    #[cfg(unix)]
+    #[test]
+    fn a_walker_run_through_an_unlisted_program_is_scanned() {
+        let (_d, linked, clean, _ws, _plain, _home) = linked_and_plain();
+        for command in ["pnpm exec zip -r o.zip .", "arch -arm64 zip -r o.zip .", "yarn exec tar -czhf o.tgz .", "bunx zip -r o.zip .", "chronic zip -r o.zip ."] {
+            let c = run(&linked, command).unwrap_or_else(|| panic!("{command} is scanned"));
+            assert!(asks_for_a_link(&c, "~", "the folder holds ~/.ssh (SSH keys)"), "{command}: {}", c.reason);
+            assert_eq!(run(&clean, command), None, "{command}: a plain folder runs");
+        }
+        // Without the walker's own flags, or on a plain tree, nothing asks.
+        for command in ["git grep -r foo", "git grep -R foo", "echo zip -r", "pnpm exec zip -ry o.zip ."] {
+            assert_eq!(run(&clean, command), None, "{command}");
+        }
+        for command in ["git grep -r foo", "echo zip -r", "pnpm exec zip -ry o.zip ."] {
+            assert_eq!(run(&linked, command), None, "{command}");
         }
     }
 
