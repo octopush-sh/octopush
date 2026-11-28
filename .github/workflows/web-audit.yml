@@ -159,11 +159,15 @@ jobs:
 
       - name: Nothing of the audit is still running, and nothing it could reach has changed
         if: always()
+        # The sandbox's last use: `end` kills every process of the sandbox user
+        # at once, locks the account, closes the site's checkout and removes a
+        # .git there (the build removed the site's own), which actions/checkout's
+        # post step would run git in.
         shell: /usr/bin/bash --noprofile --norc -e {0}
         run: |
           job_path="$PATH"
           PATH=/usr/sbin:/usr/bin:/sbin:/bin
-          sudo pkill -KILL -u octo-sandbox || true
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/site"
           sleep 1
           if pgrep -u octo-sandbox >/dev/null; then
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
@@ -198,6 +202,14 @@ jobs:
           path: ${{ runner.temp }}/web-audit
           retention-days: 3
           if-no-files-found: ignore
+
+      - name: The sandbox user is ended, and the site's checkout has no .git for checkout's post step
+        if: always()
+        shell: /usr/bin/bash --noprofile --norc -e {0}
+        run: |
+          # Without the frozen Node's script, freeze never finished and no sandbox ran.
+          [ -f "$RUNNER_TEMP/frozen-node.sh" ] || exit 0
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/site"
 
   file:
     needs: audit

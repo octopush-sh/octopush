@@ -1126,6 +1126,13 @@ test("workflows: promote's website PR — web-gate runs the website's code after
   assert.match(gone, /shell: \/usr\/bin\/bash --noprofile --norc -eo pipefail \{0\}/, "the checking step isn't found through PATH");
   assert.match(gone, /pgrep -u octo-sandbox[^\n]*\n[^\n]*exit 1/);
   assert.match(gone, /PATH="\$job_path" \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" verify "\$GITHUB_WORKSPACE\/app-stable\/\.git" "\$RUNNER_TEMP\/web\/\.git"/);
+  const END = '/usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/web-gate"';
+  assert.ok(gone.includes(END) && gone.indexOf(END) < gone.indexOf("pgrep -u octo-sandbox"), "the sandbox user is ended (kill -1 as it, then locked) before anything is checked");
+  assert.doesNotMatch(live(gateJob), /\bpkill\b/, "never pkill, which a forking process can outrun");
+  // The job's last step ends it again, always, before the actions' post steps.
+  const lastStep = a.slice(a.lastIndexOf("\n      - name: "));
+  assert.match(lastStep, /\n        if: always\(\) && steps\.bump\.outcome == 'success'\n        shell: \/usr\/bin\/bash --noprofile --norc -eo pipefail \{0\}\n/);
+  assert.ok(lastStep.includes(END) && lastStep.indexOf(END) < lastStep.indexOf('frozen-node.sh" guard'));
   const patch = step(a, "The patch and the result");
   assert.match(patch, /steps\.sandbox-gone\.outcome == 'success'/);
   assert.match(patch, /shell: \/usr\/bin\/bash --noprofile --norc -eo pipefail \{0\}\n[\s\S]*run: \|\n\s+\/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" guard /, "guarded first, not found through PATH");
@@ -1307,6 +1314,14 @@ test("workflows: web-audit's audit job runs the frozen Node and verifies after e
   const verifies = [...job.matchAll(/shell: \/usr\/bin\/bash --noprofile --norc -e \{0\}\n\s+run: \|\n\s+job_path="\$PATH"\n\s+PATH=\/usr\/sbin:\/usr\/bin:\/sbin:\/bin\n[\s\S]*?PATH="\$job_path" \/usr\/bin\/bash "\$RUNNER_TEMP\/frozen-node\.sh" verify\n/g)];
   assert.equal(verifies.length, 2, "both survivor steps verify, not through PATH");
   assert.ok(job.indexOf("frozen-node.sh\" verify", job.lastIndexOf("pgrep -u octo-sandbox")) < job.indexOf("Take the results out"), "verified before the results are taken out");
+  // After the audit (the sandbox's last use) and again as the job's last step: the sandbox user
+  // ended and locked, the site's checkout closed and without a .git for checkout's post step.
+  const END = '/usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/site"';
+  const afterAudit = job.slice(job.indexOf("- name: Nothing of the audit is still running"), job.indexOf("- name: Take the results out"));
+  assert.ok(afterAudit.includes(END) && afterAudit.indexOf(END) < afterAudit.indexOf("pgrep -u octo-sandbox"));
+  const lastStep = job.slice(job.lastIndexOf("\n      - name: "));
+  assert.match(lastStep, /\n        if: always\(\)\n        shell: \/usr\/bin\/bash --noprofile --norc -e \{0\}\n/);
+  assert.ok(lastStep.includes(END));
 });
 
 test("frozen-node.sh refuses to run outside GitHub Actions", async () => {

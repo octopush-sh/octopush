@@ -322,12 +322,14 @@ jobs:
       - name: Nothing of the website's code is still running, and nothing it could reach has changed
         id: sandbox-gone
         if: always() && steps.bump.outcome == 'success'
-        # Not resolved through PATH: this step checks PATH.
+        # Not resolved through PATH: this step checks PATH. `end` kills every
+        # process of the sandbox user at once, locks the account, closes the
+        # copy it worked in and fails if a .git appeared there.
         shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
         run: |
           job_path="$PATH"
           PATH=/usr/sbin:/usr/bin:/sbin:/bin
-          sudo pkill -KILL -u octo-sandbox 2>/dev/null || true
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/web-gate"
           sleep 1
           if pgrep -u octo-sandbox >/dev/null 2>&1; then
             echo "::error::octo-sandbox processes survived the kill — stopping"; exit 1
@@ -384,6 +386,15 @@ jobs:
           path: ${{ runner.temp }}/web-release
           retention-days: 1
           if-no-files-found: error
+
+      - name: The sandbox user is ended, and nothing the post steps run has changed
+        # The actions' post steps (checkout's clean-up, the token action's) run
+        # after this one, on the runner's own Node and git.
+        if: always() && steps.bump.outcome == 'success'
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
+        run: |
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$GITHUB_WORKSPACE/web-gate"
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" guard "$GITHUB_WORKSPACE/app-stable/.git" "$RUNNER_TEMP/web/.git"
 
   web-version:
     # Open the octopush-web release PR from web-gate's patch (#1178), on a
