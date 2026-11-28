@@ -384,12 +384,20 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
     }
     let path = field("path");
     let marked = crate::secret_scan::is_env_file(&path) || crate::secret_scan::is_sensitive_name(&path);
+    // A file in the workspace that runs commands (`talk_guard::RUNS_CODE`)
+    // keeps its preview: its own Config card asks after this one (#1245).
+    let guard = matches!(name, "write_file" | "edit_file").then(|| reach.outside_card(None, name, input, false, &[])).flatten();
+    let runs_code = guard.as_ref().is_some_and(|c| c.kind == CardKind::Config);
     let (reason, diff) = match name {
-        "write_file" | "edit_file" if marked || reach.outside_card(None, name, input, false, &[]).is_some() => {
+        "write_file" | "edit_file" if marked || (guard.is_some() && !runs_code) => {
             ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None)
         }
         "write_file" | "edit_file" => change_preview(reach.workspace(), name, input, &path),
         _ => (format!("calls {name}, which can change files"), None),
+    };
+    let reason = match runs_code {
+        true => format!("{reason} \u{b7} it can make Octopush or Claude Code run commands"),
+        false => reason,
     };
     let shown = if path.is_empty() { name.to_string() } else { path };
     card(CardKind::Edit, shown, format!("{reason} (Ask first)"), ASK_DECLINED_CHANGE, diff)
@@ -2223,6 +2231,21 @@ mod tests {
             let c = ask_card(None, "write_file", &json!({ "path": path, "content": "x" }), &reach);
             assert_eq!((c.kind, c.shown.as_str(), c.diff.as_deref()), (CardKind::Edit, path, None), "{path}");
         }
+        // A file that runs commands keeps its diff, and its Config card still
+        // asks after this one (#1245).
+        std::fs::create_dir_all(ws.path().join(".claude")).unwrap();
+        std::fs::write(ws.path().join(".claude/mcp.json"), "{}\n").unwrap();
+        let mcp = json!({ "path": ".claude/mcp.json", "content": "{\"mcpServers\":{}}\n" });
+        let c = ask_card(None, "write_file", &mcp, &reach);
+        assert_eq!(c.kind, CardKind::Edit);
+        assert_eq!(c.reason, "writes a file \u{b7} it can make Octopush or Claude Code run commands (Ask first)");
+        assert_eq!(c.diff.as_deref(), Some("@@ -1,1 +1,1 @@\n-{}\n+{\"mcpServers\":{}}"));
+        assert_eq!(reach.outside_card(None, "write_file", &mcp, false, &[]).map(|g| g.kind), Some(CardKind::Config));
+        let settings = ask_card(None, "write_file", &json!({ "path": ".claude/settings.json", "content": "{}\n" }), &reach);
+        assert_eq!(settings.diff.as_deref(), Some("@@ -0,0 +1,1 @@\n+{}"), "a new one previews too");
+        // Claude Code's local settings may hold credentials: no preview, as before.
+        let local = ask_card(None, "write_file", &json!({ "path": ".claude/settings.local.json", "content": "{}\n" }), &reach);
+        assert_eq!(local.diff, None);
         // A command's card shows the command; a sub-agent's names it.
         let run = ask_card(Some("Fix the tests"), "run_command", &json!({ "command": "npm test" }), &reach);
         assert_eq!((run.kind, run.shown.as_str()), (CardKind::Exec, "npm test"));

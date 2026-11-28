@@ -43,6 +43,8 @@ pub mod secrets;
 pub use failure::{classify_failure, classify_failure_with, McpFailure};
 // Per-conversation server scope and the registry's status read (Companion).
 pub mod scope;
+// A project's own servers start only once approved, bound to content (#1245).
+pub mod approval;
 // What the user trusts to run without a card in Edit freely (#1243).
 pub mod trust;
 
@@ -107,8 +109,11 @@ pub fn sort_tools(tools: &mut [McpToolInfo]) {
 
 /// The configured servers in name order, so servers start (and fail) in
 /// the same order every time.
-pub(crate) fn sorted_server_configs(worktree: &Path) -> Vec<(String, McpServerConfig)> {
-    let mut cfgs: Vec<(String, McpServerConfig)> = load_server_configs(worktree).into_iter().collect();
+pub(crate) fn sorted_server_configs(
+    worktree: &Path,
+    approvals: &dyn approval::ProjectApprovals,
+) -> Vec<(String, McpServerConfig)> {
+    let mut cfgs: Vec<(String, McpServerConfig)> = load_server_configs(worktree, approvals).into_iter().collect();
     cfgs.sort_by(|a, b| a.0.cmp(&b.0));
     cfgs
 }
@@ -238,22 +243,33 @@ fn save_config_at(path: &Path, servers: &HashMap<String, McpServerConfig>) -> Re
     std::fs::write(path, pretty).map_err(|e| e.to_string())
 }
 
-/// Load configured servers for a worktree (project overrides user on name clash).
+/// The servers Octopush may start for a worktree: the Settings servers, and
+/// each server of the worktree's own `.claude/mcp.json` the user approved
+/// in its project with exactly this entry (`approval::project_servers`). A
+/// project entry never replaces a Settings server of the same name, and one
+/// waiting for approval, or changed since, isn't here.
 /// A remote entry's bridge is rebuilt from its `remote` choices
 /// (`remote::with_bridges`), as Settings' Test and Reconnect do, so a
 /// hand-edited `remote` block runs the same in Talk. A project entry can't
 /// name Keychain items: its `secret_env` is dropped after the rebuild (which
 /// would list a token's), so a repo's file never gets the user's secrets
 /// into a command it chose.
-pub fn load_server_configs(worktree: &Path) -> HashMap<String, McpServerConfig> {
-    let mut merged: HashMap<String, McpServerConfig> = HashMap::new();
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(c) = std::fs::read_to_string(home.join(".claude/mcp.json")) {
-            merged.extend(parse_mcp_config(&c));
-        }
-    }
-    let project = project_config(worktree);
-    let from_project: Vec<String> = project.keys().cloned().collect();
+pub fn load_server_configs(worktree: &Path, approvals: &dyn approval::ProjectApprovals) -> HashMap<String, McpServerConfig> {
+    merge_servers(load_user_config(), worktree, approvals)
+}
+
+/// [`load_server_configs`] over the Settings servers `merged`.
+fn merge_servers(
+    mut merged: HashMap<String, McpServerConfig>,
+    worktree: &Path,
+    approvals: &dyn approval::ProjectApprovals,
+) -> HashMap<String, McpServerConfig> {
+    let project: Vec<(String, McpServerConfig)> = approval::project_servers(worktree, &merged, approvals)
+        .into_iter()
+        .filter(|(s, _)| s.state == approval::ProjectServerState::Approved)
+        .map(|(s, cfg)| (s.name, cfg))
+        .collect();
+    let from_project: Vec<String> = project.iter().map(|(n, _)| n.clone()).collect();
     merged.extend(project);
     let mut merged = remote::with_bridges(merged);
     for name in &from_project {
@@ -476,6 +492,11 @@ static SECRET_HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::n
 static SECRET_ENV_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)TOKEN|KEY|SECRET|PASSWORD|PASSWD|AUTH|BEARER|CREDENTIAL|PRIVATE").unwrap()
 });
+
+/// Whether an env name reads as a credential's (`SECRET_ENV_NAME`).
+pub(crate) fn secret_env_name(key: &str) -> bool {
+    SECRET_ENV_NAME.is_match(key)
+}
 
 /// A value that looks like base64 rather than a word: a digit or `+/=`, or
 /// a capital after its first character beside a lower-case letter.
@@ -949,6 +970,9 @@ pub struct McpRegistry {
     resets: Mutex<HashMap<String, u64>>,
     /// Where an entry's `secret_env` values are read at spawn.
     secrets: Arc<dyn secrets::SecretStore>,
+    /// Which of a project's own servers the user approved (#1245). Read
+    /// without holding any of the locks above.
+    approvals: Arc<dyn approval::ProjectApprovals>,
 }
 
 /// How long one MCP `tools/call` may take on the wire before the caller
@@ -993,7 +1017,7 @@ pub async fn call_bounded_from(
     let target = CallTarget::default();
     let t = Arc::clone(&target);
     let work = tokio::task::spawn_blocking(move || match &configs {
-        CallConfigs::Worktree(worktree) => reg.call_on(&load_server_configs(worktree), &name, &input, Some(&t)),
+        CallConfigs::Worktree(worktree) => reg.call_on(&reg.configs(worktree), &name, &input, Some(&t)),
         CallConfigs::Pinned(pinned) => reg.call_on(pinned, &name, &input, Some(&t)),
     });
     match tokio::time::timeout(bound, work).await {
@@ -1033,7 +1057,38 @@ impl McpRegistry {
             failed: Mutex::new(HashMap::new()),
             resets: Mutex::new(HashMap::new()),
             secrets: store,
+            approvals: Arc::new(approval::NoApprovals),
         }
+    }
+
+    /// Start a project's own servers once the user approved them, as
+    /// `approvals` records (#1245). Without it, none ever starts.
+    pub fn with_approvals(mut self, approvals: Arc<dyn approval::ProjectApprovals>) -> Self {
+        self.approvals = approvals;
+        self
+    }
+
+    /// Tests of the registry itself: every project server counts as approved.
+    #[cfg(test)]
+    pub fn trusting_projects() -> Self {
+        Self::new().with_approvals(Arc::new(approval::TrustAll))
+    }
+
+    /// The servers this registry may start for `worktree`
+    /// ([`load_server_configs`] with its approvals).
+    pub fn configs(&self, worktree: &Path) -> HashMap<String, McpServerConfig> {
+        load_server_configs(worktree, &*self.approvals)
+    }
+
+    /// [`Self::configs`] in name order.
+    pub(crate) fn sorted_configs(&self, worktree: &Path) -> Vec<(String, McpServerConfig)> {
+        sorted_server_configs(worktree, &*self.approvals)
+    }
+
+    /// The worktree's own servers and where each stands (approved, waiting,
+    /// changed since approved, or clashing with a Settings server).
+    pub fn project_servers(&self, worktree: &Path) -> Vec<approval::ProjectServer> {
+        approval::project_servers(worktree, &load_user_config(), &*self.approvals).into_iter().map(|(s, _)| s).collect()
     }
 
     fn reset_count(&self, name: &str) -> u64 {
@@ -1392,7 +1447,7 @@ impl McpRegistry {
     /// (never fatal).
     pub fn list_tools(&self, worktree: &Path) -> Vec<McpToolInfo> {
         let mut out = Vec::new();
-        for (name, cfg) in sorted_server_configs(worktree) {
+        for (name, cfg) in self.sorted_configs(worktree) {
             match self.ensure(&name, &cfg) {
                 Ok((conn, _)) => out.extend(conn.lock().tools.clone()),
                 Err(e) => {
@@ -1409,7 +1464,7 @@ impl McpRegistry {
     /// payloads as short placeholders: `content::render_call_result`). A tool
     /// that reports its own failure (`isError`) is a result like any other.
     pub fn call(&self, worktree: &Path, namespaced: &str, input: &Value) -> Result<String, McpCallError> {
-        self.call_on(&load_server_configs(worktree), namespaced, input, None).map(|out| out.text)
+        self.call_on(&self.configs(worktree), namespaced, input, None).map(|out| out.text)
     }
 
     /// [`Self::call`] with the server's config looked up in `cfgs`,
@@ -1589,7 +1644,7 @@ done
             ),
         )
         .unwrap();
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         let out = reg
             .call(dir.path(), "mcp__fix__echo", &serde_json::json!({"x": 1}))
             .expect("tools/call should succeed");
@@ -1712,6 +1767,55 @@ done
         (dir, log, servers)
     }
 
+    /// #1245: a committed project server starts only once approved in its
+    /// project, with exactly this entry; a change or a revoke stops it from
+    /// starting, and a Settings server of the same name keeps its entry.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_server_starts_only_while_its_entry_is_approved() {
+        use approval::ProjectServerState::{Approved, Changed, Waiting};
+        let (dir, log, mut servers) = echo_worktree("hello");
+        let wt = dir.path().to_string_lossy().into_owned();
+        let db = Arc::new(Mutex::new(crate::db::Db::open(&dir.path().join("app.db")).unwrap()));
+        db.lock().insert_project("p1", "Sample", &wt).unwrap();
+        let reg = McpRegistry::new().with_approvals(Arc::new(approval::DbApprovals(Arc::clone(&db))));
+        let state = || reg.project_servers(dir.path())[0].state;
+
+        assert!(reg.list_tools(dir.path()).is_empty(), "a committed server waits for approval");
+        assert!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).is_err());
+        assert!(reg.status(dir.path()).is_empty());
+        assert_eq!((state(), log_lines(&log, "start")), (Waiting, 0), "never started");
+
+        let hash = reg.project_servers(dir.path())[0].hash.clone();
+        assert!(approval::approve(&db, &reg, dir.path(), "fix", "another entry").is_err(), "only what the card showed");
+        approval::approve(&db, &reg, dir.path(), "fix", &hash).unwrap();
+        assert_eq!(state(), Approved);
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "hello");
+        assert_eq!(log_lines(&log, "start"), 1);
+
+        // A changed entry asks again: nothing starts, and calls are refused.
+        servers.get_mut("fix").unwrap().env.insert("ECHO_TEXT".into(), "changed".into());
+        write_servers(dir.path(), &servers);
+        assert_eq!(state(), Changed);
+        assert!(reg.list_tools(dir.path()).is_empty());
+        assert!(matches!(reg.call(dir.path(), "mcp__fix__echo", &json!({})), Err(McpCallError::NotConfigured { .. })));
+
+        // Approved again, then revoked: it stops and doesn't start again.
+        let hash = reg.project_servers(dir.path())[0].hash.clone();
+        approval::approve(&db, &reg, dir.path(), "fix", &hash).unwrap();
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "changed");
+        assert!(approval::revoke(&db, &reg, "p1", "fix").unwrap());
+        assert_eq!(state(), Waiting);
+        assert!(reg.list_tools(dir.path()).is_empty());
+        assert!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).is_err());
+        assert_eq!(log_lines(&log, "start"), 2, "revoked, it never starts again");
+
+        // A Settings server of the same name keeps its entry, approved or not.
+        let user = HashMap::from([("fix".to_string(), McpServerConfig { command: "from-settings".into(), ..Default::default() })]);
+        let merged = merge_servers(user, dir.path(), &approval::TrustAll);
+        assert_eq!(merged["fix"].command, "from-settings");
+    }
+
     #[cfg(unix)]
     fn reaped(child: &ChildHandle) -> bool {
         matches!(child.lock().try_wait(), Ok(Some(_)))
@@ -1721,7 +1825,7 @@ done
     #[test]
     fn saving_a_changed_config_stops_the_old_server_and_the_next_use_starts_the_new_one() {
         let (dir, log, before) = echo_worktree("old");
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "old");
         let old_child = Arc::clone(&reg.conns.lock()["fix"].child);
 
@@ -1753,7 +1857,7 @@ done
     #[test]
     fn a_save_stops_a_call_in_flight_without_blocking_and_the_next_call_respawns() {
         let (dir, log) = hanging_worktree();
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
         assert_eq!(reg.list_tools(dir.path()).len(), 1);
         let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
         let worker = std::thread::spawn(move || r2.call(&wt, "mcp__hang__slow", &json!({})));
@@ -1775,7 +1879,7 @@ done
     #[test]
     fn a_reset_during_a_handshake_neither_caches_nor_remembers_a_failure() {
         let (dir, log) = fixture_worktree(MUTE_FIXTURE);
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
         let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
         let worker = std::thread::spawn(move || r2.list_tools(&wt).len());
         wait_for(&log, "start", 1);
@@ -1792,7 +1896,7 @@ done
     #[test]
     fn a_killed_server_fails_its_call_and_the_next_call_respawns() {
         let (dir, log, _) = echo_worktree("pong");
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
         // The process dies behind the registry's back.
         let child = Arc::clone(&reg.conns.lock()["fix"].child);
@@ -1824,7 +1928,7 @@ done
     #[test]
     fn a_tool_level_error_keeps_the_connection() {
         let (dir, log, _) = echo_worktree("pong");
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         // The tool failed and said so: a result, from a healthy server.
         assert_eq!(reg.call(dir.path(), "mcp__fix__refuse", &json!({})).unwrap(), "no such issue");
         let conn = Arc::clone(&reg.conns.lock()["fix"].conn);
@@ -1841,7 +1945,7 @@ done
     #[test]
     fn reconnect_restarts_a_live_server_and_forgets_a_failure() {
         let (dir, log, _) = echo_worktree("pong");
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
         let child = Arc::clone(&reg.conns.lock()["fix"].child);
         reg.reset_server("fix");
@@ -1866,7 +1970,7 @@ done
     #[test]
     fn a_hand_edited_config_is_used_without_a_save() {
         let (dir, log, _) = echo_worktree("old");
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "old");
         // The file changes outside Settings: the cached process was started
         // with the old entry, so it isn't reused.
@@ -2055,11 +2159,12 @@ done
         assert!(!dump.exists());
         assert_eq!(classify_failure(&err).summary, "The value for MY_TOKEN isn't in the Keychain.");
 
-        // The same entry in a repo's `.claude/mcp.json` gets nothing from
-        // the Keychain: Talk starts it with the file's empty value.
+        // The same entry in a repo's `.claude/mcp.json`, even approved, gets
+        // nothing from the Keychain: Talk starts it with the file's empty value.
         write_servers(dir.path(), &HashMap::from([("example".to_string(), cfg.clone())]));
         let store = Arc::new(secrets::MemoryStore::with(&[("example/MY_TOKEN", "tok-2")]));
-        let reg = McpRegistry::with_secrets(Arc::clone(&store) as Arc<dyn secrets::SecretStore>);
+        let reg = McpRegistry::with_secrets(Arc::clone(&store) as Arc<dyn secrets::SecretStore>)
+            .with_approvals(Arc::new(approval::TrustAll));
         assert!(reg.call(dir.path(), "mcp__example__x", &json!({})).is_err());
         assert_eq!(std::fs::read_to_string(&dump).unwrap(), "");
         assert!(store.reads.lock().is_empty(), "the Keychain wasn't even read");
@@ -2111,7 +2216,7 @@ done
     #[test]
     fn a_save_whose_secret_changed_restarts_the_server_whose_entry_reads_the_same() {
         let (dir, _log, servers) = echo_worktree("pong");
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
         let child = Arc::clone(&reg.conns.lock()["fix"].child);
         // Same entry, nothing touched: it keeps running.
@@ -2132,7 +2237,7 @@ done
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
         std::fs::write(dir.path().join(".claude/mcp.json"), content).unwrap();
-        let cfgs = load_server_configs(dir.path());
+        let cfgs = load_server_configs(dir.path(), &approval::TrustAll);
         assert!(cfgs["example"].secret_env.is_empty());
         // Not even the token name the rebuilt bridge would list.
         assert!(cfgs["example-remote"].secret_env.is_empty(), "{:?}", cfgs["example-remote"].secret_env);
@@ -2152,7 +2257,7 @@ done
         let claude = dir.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
         std::fs::write(claude.join("mcp.json"), json!({ "mcpServers": { "example-remote": stale } }).to_string()).unwrap();
-        let cfgs = load_server_configs(dir.path());
+        let cfgs = load_server_configs(dir.path(), &approval::TrustAll);
         assert_eq!(
             cfgs["example-remote"].args,
             vec!["-y", "mcp-remote@^0.16", "https://mcp.example.com/mcp", "--transport", "sse-only"],
@@ -2216,7 +2321,7 @@ done
     #[test]
     fn abort_server_unblocks_a_hung_call_and_the_next_call_respawns() {
         let (dir, log) = hanging_worktree();
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
         let tools = reg.list_tools(dir.path());
         assert_eq!(tools.len(), 1);
         assert!(tools[0].read_only, "readOnlyHint is parsed");
@@ -2224,7 +2329,7 @@ done
         let target = CallTarget::default();
         let (r2, wt, t2) = (Arc::clone(&reg), dir.path().to_path_buf(), Arc::clone(&target));
         let worker =
-            std::thread::spawn(move || r2.call_on(&load_server_configs(&wt), "mcp__hang__slow", &json!({}), Some(&t2)));
+            std::thread::spawn(move || r2.call_on(&r2.configs(&wt), "mcp__hang__slow", &json!({}), Some(&t2)));
         wait_for(&log, "call", 1);
         assert!(!worker.is_finished(), "the call is blocked on the server");
         let started = std::time::Instant::now();
@@ -2241,7 +2346,7 @@ done
     #[test]
     fn abort_reaches_a_server_stuck_in_its_handshake() {
         let (dir, log) = fixture_worktree(MUTE_FIXTURE);
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
         let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
         let worker = std::thread::spawn(move || r2.list_tools(&wt).len());
         wait_for(&log, "start", 1);
@@ -2263,7 +2368,7 @@ done
     #[tokio::test]
     async fn call_bounded_times_out_stops_the_server_and_says_so() {
         let (dir, log) = hanging_worktree();
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
         let err = call_bounded(
             Arc::clone(&reg),
             dir.path().to_path_buf(),
@@ -2289,7 +2394,7 @@ done
     #[test]
     fn concurrent_first_callers_spawn_a_server_once() {
         let (dir, log) = hanging_worktree();
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let (r, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
@@ -2306,7 +2411,7 @@ done
     #[tokio::test(flavor = "multi_thread")]
     async fn a_timeout_stops_the_process_its_call_was_on_not_a_newer_one() {
         let (dir, log) = hanging_worktree();
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
         let call = tokio::spawn(call_bounded(
             Arc::clone(&reg),
             dir.path().to_path_buf(),
@@ -2340,7 +2445,7 @@ done
     #[test]
     fn a_start_that_completes_after_a_reset_is_discarded() {
         let (dir, log, servers) = echo_worktree("pong");
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         let cfg = &servers["fix"];
         let resets = reg.reset_count("fix");
         // The handshake finished, and the reset lands before it is cached.
@@ -2385,7 +2490,7 @@ done
         const NOISY_FAILURE: &str =
             "#!/usr/bin/env bash\necho start >> \"$SPAWN_LOG\"\nread -r line\necho 'auth failed: token=abcdef123456'\nexit 1\n";
         let (dir, _log) = fixture_worktree(NOISY_FAILURE);
-        let reg = McpRegistry::new();
+        let reg = McpRegistry::trusting_projects();
         let first = reg.call(dir.path(), "mcp__hang__x", &json!({})).unwrap_err().to_string();
         assert!(first.contains("Server output:\nauth failed: token=[redacted]"), "{first}");
         assert!(!first.contains("abcdef123456"), "{first}");
@@ -2526,7 +2631,7 @@ done
         let err = McpRegistry::test_connect("fix", &cfg).unwrap_err();
         assert!(err.contains("using [redacted]") && !err.contains("sample-value-123"), "{err}");
         write_servers(dir.path(), &HashMap::from([("fix".to_string(), cfg)]));
-        let err = McpRegistry::new().call(dir.path(), "mcp__fix__x", &json!({})).unwrap_err().to_string();
+        let err = McpRegistry::trusting_projects().call(dir.path(), "mcp__fix__x", &json!({})).unwrap_err().to_string();
         assert!(!err.contains("sample-value-123"), "{err}");
     }
 

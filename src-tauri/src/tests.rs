@@ -30890,7 +30890,7 @@ mod talk_mcp_scope_tests {
         let db = parking_lot::Mutex::new(db);
         let wt = two_servers();
         let wp = wt.path().to_string_lossy().into_owned();
-        let reg = Arc::new(McpRegistry::new());
+        let reg = Arc::new(McpRegistry::trusting_projects());
 
         let off = thread_mcp_off(&db, &t);
         assert_eq!(off.iter().cloned().collect::<Vec<_>>(), vec!["docs-server".to_string()]);

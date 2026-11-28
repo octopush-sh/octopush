@@ -193,7 +193,9 @@ export interface PendingApproval {
   trustTool?: string;
 }
 
-export type ApprovalKind = "mcp" | "read" | "write" | "run";
+/** `config`: a change to a workspace file that runs commands; `server`: a
+ *  project's own MCP server waiting for approval (#1245). */
+export type ApprovalKind = "mcp" | "read" | "write" | "run" | "config" | "server";
 
 /** The card fields a request carries beyond its command and reason. */
 function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command" | "reason">) {
