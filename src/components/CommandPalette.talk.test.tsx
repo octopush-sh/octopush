@@ -28,7 +28,13 @@ afterAll(() => {
   Element.prototype.scrollIntoView = originalScrollIntoView;
 });
 
-function open(talk?: { onNew: () => void; onSwitch: () => void; onCopy?: () => void; onFocusApproval?: () => void }) {
+function open(talk?: {
+  onNew: () => void;
+  onSwitch: () => void;
+  onCopy?: () => void;
+  onFocusApproval?: () => void;
+  mode?: { current: "plan" | "ask" | "edit"; onSet: (mode: "plan" | "ask" | "edit") => void };
+}) {
   const onClose = vi.fn();
   const view = render(
     <CommandPalette open onClose={onClose} onNewSession={vi.fn()} onToggleTokens={vi.fn()} talk={talk} />,
@@ -73,6 +79,21 @@ describe("CommandPalette Talk group", () => {
     unmount();
     open({ onNew: vi.fn(), onSwitch: vi.fn() });
     expect(screen.queryByText("Focus the waiting approval card")).toBeNull();
+  });
+
+  it("offers the two other permission modes, the next one with ⌘⌥P (#1231)", () => {
+    const onSet = vi.fn();
+    const { onClose, unmount } = open({ onNew: vi.fn(), onSwitch: vi.fn(), mode: { current: "edit", onSet } });
+    const items = Array.from(document.querySelectorAll('[data-tour="palette-talk"] [cmdk-item]'))
+      .map((item) => item.textContent)
+      .filter((text) => text?.includes("Permission mode"));
+    expect(items).toEqual(["◐Permission mode: Plan only⌘⌥P", "◐Permission mode: Ask first"]);
+    fireEvent.click(screen.getByText("Permission mode: Ask first"));
+    expect(onClose).toHaveBeenCalled();
+    expect(onSet).toHaveBeenCalledWith("ask");
+    unmount();
+    open({ onNew: vi.fn(), onSwitch: vi.fn() });
+    expect(screen.queryByText(/Permission mode/)).toBeNull();
   });
 
   it("drops Copy with no conversation, and the group with no workspace", () => {
