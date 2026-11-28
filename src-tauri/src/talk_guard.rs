@@ -1800,8 +1800,13 @@ fn code_names_walker(line: &str, words: &[CommandWord]) -> bool {
     static DEFINES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let defines = DEFINES.get_or_init(|| regex::Regex::new(r"(?:^|[\s;&|({])[A-Za-z_][A-Za-z0-9_.:-]*[ \t]*\([ \t]*\)").unwrap());
     let name = |w: &CommandWord| unescape(&w.pattern).rsplit('/').next().unwrap_or_default().to_string();
+    // A word of the code, read as the program running it reads it, quotes
+    // and backslashes removed (`z"i"p` is `zip`): it names a walker, or
+    // holds a `$` or a backtick, so its words can't be known.
     let walker = |w: &CommandWord| {
-        w.word.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|t| FOLLOWERS.iter().any(|f| f.program == t))
+        w.unmodeled
+            || w.word.contains(['$', '`'])
+            || shell_unquote(&w.word).split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|t| FOLLOWERS.iter().any(|f| f.program == t))
     };
     // A function definition (`NAME()`, outside quotes, or `function NAME`):
     // its body may span the line.
@@ -1841,6 +1846,29 @@ fn code_names_walker(line: &str, words: &[CommandWord]) -> bool {
     false
 }
 
+/// `s` with quotes and backslashes removed as the shell reads it (#1208):
+/// the words a program that runs `s` as commands gets. Inside double quotes
+/// a backslash escapes only `"`, `\`, `$`, a backtick and a newline.
+fn shell_unquote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let (mut chars, mut quote) = (s.chars(), None::<char>);
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('"'), '\\') => match chars.next() {
+                Some(n) if "\"\\$`\n".contains(n) => out.push(n),
+                Some(n) => out.extend(['\\', n]),
+                None => out.push('\\'),
+            },
+            (Some(_), c) => out.push(c),
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '\\') => out.extend(chars.next()),
+            (None, c) => out.push(c),
+        }
+    }
+    out
+}
+
 /// Programs that run the next program they're given: a program named at
 /// run time after one of them is still named at run time.
 const WRAPPERS: &[&str] = &["sudo", "doas", "env", "nice", "nohup", "time", "timeout", "xargs", "command", "exec", "builtin", "caffeinate", "stdbuf"];
@@ -1862,7 +1890,8 @@ const WALK_FLAGS: (&str, &[&str]) = (
 /// program named at run time without such a flag (`$EDITOR notes.md`)
 /// doesn't.
 fn blind_program(words: &[CommandWord]) -> bool {
-    let blind = |w: &CommandWord| w.unmodeled || has_glob(&w.pattern);
+    // `[` and `[[` are the test builtin, not a glob.
+    let blind = |w: &CommandWord| w.unmodeled || (has_glob(&w.pattern) && !matches!(w.pattern.as_str(), "[" | "[["));
     let mut from = 0;
     while from < words.len() {
         let to = (from..words.len()).find(|&k| words[k].segment != words[from].segment).unwrap_or(words.len());
@@ -3642,7 +3671,20 @@ mod tests {
             let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
             assert!(cut_short(&c, why) || (!c.sensitive && c.grant.is_none() && c.reason.starts_with("follows links in ")), "{command}: {}", c.reason);
         }
-        for command in ["bash -c 'npm test'", "source venv/bin/activate", "find . -exec sh -c 'echo {}' \\;", "eval \"$(ssh-agent -s)\"", "sh ./build.sh"] {
+        // Quotes and backslashes are read as the shell reads them; a `$` or a
+        // backtick leaves the words unknown.
+        for command in [
+            "eval 'z\"i\"p -r out .'",
+            "eval 'z\\ip -r out .'",
+            "alias q='z\"i\"p -r out .'; q",
+            "eval \"$(ssh-agent -s)\"",
+            "bash -c 'echo $HOME'",
+            "eval `cat cmd.txt`",
+        ] {
+            let c = run(&reach, command).unwrap_or_else(|| panic!("{command} asks"));
+            assert!(cut_short(&c, why), "{command}: {}", c.reason);
+        }
+        for command in ["bash -c 'npm test'", "source venv/bin/activate", "find . -exec sh -c 'echo {}' \\;", "sh ./build.sh"] {
             assert_eq!(run(&reach, command), None, "{command}");
         }
     }
@@ -3694,6 +3736,10 @@ mod tests {
             "watch -n 1 date",
             "npm run build",
             "grep -n \"init()\" a.txt",
+            "[ -r .env ]",
+            "[[ -d x ]]",
+            "[[ -L x ]] && echo link",
+            "[ -h x ] || [ -R x ]",
         ] {
             assert_eq!(run(&reach, command), None, "{command}");
         }
