@@ -2493,7 +2493,13 @@ mod tests {
         // More nested commands than the caps: read flat, so a path still counts.
         assert_eq!(run(&reach, &"echo $(date) ".repeat(65)), None);
         assert!(run(&reach, &"echo $(cat ~/.ssh/id_ed25519) ".repeat(65)).is_some_and(|c| c.sensitive));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // A guard against super-linear blowups, not a benchmark: the debug
+        // build on a shared CI runner, with the other tests in parallel, runs
+        // this 3–4× slower than a quiet machine, and 5 s failed there now
+        // and then. A real regression (a cap ignored, a path walked per
+        // repeat) grows with the 50 000 words and 100 000 braces above, far
+        // past 20 s, so this still catches it.
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     }
 
     /// A file tool's write outside offers its folder (#1229); once granted,

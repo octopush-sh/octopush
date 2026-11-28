@@ -1,9 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
+  CHAT_ROWS_BESIDE_FILES,
   CONTEXT_CAP,
   FOLDER_MAX_ENTRIES,
   MAX_MENTIONS,
   capRefs,
+  chatRefs,
+  formatChatDigest,
+  groupMentionRows,
   capTail,
   capText,
   fenced,
@@ -137,6 +141,91 @@ describe("talkContext — popover rows", () => {
   it("ranks files after `diff:` and ranks a folder by its own name", () => {
     expect(contextMentionItems("diff:b.ts", files, cat.dirs, sessions)).toEqual(["diff:src/lib/b.ts"]);
     expect(contextMentionItems("lib", files, cat.dirs, sessions)[0]).toBe("src/lib/");
+  });
+
+  const chats = chatRefs(
+    [
+      { id: "c0", title: "This one" },
+      { id: "c1", title: "Auth refactor" },
+      { id: "c2", title: "Fix the lib build" },
+      { id: "c3", title: "Auth refactor" },
+    ],
+    "c0",
+  );
+
+  it("names every conversation but the current one, by a unique slug", () => {
+    expect(chats.map((c) => [c.id, c.slug])).toEqual([
+      ["c1", "auth-refactor"],
+      ["c2", "fix-the-lib-build"],
+      ["c3", "auth-refactor-2"],
+    ]);
+    expect(chatRefs([{ id: "x", title: "???" }], null)[0].slug).toBe("conversation");
+  });
+
+  it("lists conversations under `chat` and filters them by slug or title after `chat:`", () => {
+    expect(contextMentionItems("ch", files, cat.dirs, sessions, chats)).toEqual([
+      "chat:auth-refactor",
+      "chat:fix-the-lib-build",
+      "chat:auth-refactor-2",
+    ]);
+    expect(contextMentionItems("chat:auth", files, cat.dirs, sessions, chats)).toEqual([
+      "chat:auth-refactor",
+      "chat:auth-refactor-2",
+    ]);
+    expect(contextMentionItems("chat:the lib", files, cat.dirs, sessions, chats)).toEqual(["chat:fix-the-lib-build"]);
+    // An empty query offers the newest one beside diff and a session.
+    expect(contextMentionItems("", files, cat.dirs, sessions, chats).slice(0, 3)).toEqual([
+      "diff",
+      "session:npm-run-dev",
+      "chat:auth-refactor",
+    ]);
+  });
+
+  it("ranks files first and conversations whose title holds the query after them", () => {
+    const items = contextMentionItems("lib", files, cat.dirs, sessions, chats);
+    expect(items[0]).toBe("src/lib/");
+    expect(items[items.length - 1]).toBe("chat:fix-the-lib-build");
+    // A one-letter query lists no conversation by title.
+    expect(contextMentionItems("l", files, cat.dirs, sessions, chats).some((t) => t.startsWith("chat:"))).toBe(false);
+    // Conversations take at most their share of the rows.
+    const many = chatRefs(Array.from({ length: 9 }, (_, i) => ({ id: `m${i}`, title: `lib talk ${i}` })), null);
+    const capped = contextMentionItems("lib", files, cat.dirs, sessions, many);
+    expect(capped.filter((t) => t.startsWith("chat:"))).toHaveLength(CHAT_ROWS_BESIDE_FILES);
+    expect(capped.length).toBeLessThanOrEqual(8);
+  });
+
+  it("groups the rows: context, then conversations, then definitions, each once", () => {
+    const rows = groupMentionRows(["chat:auth-refactor", "src/a.ts", "diff"], ["src/a.ts#L3-9", "src/a.ts"]);
+    expect(rows).toEqual([
+      { token: "src/a.ts", group: "context" },
+      { token: "diff", group: "context" },
+      { token: "chat:auth-refactor", group: "chats" },
+      { token: "src/a.ts#L3-9", group: "symbols" },
+    ]);
+  });
+
+  it("resolves @chat: only for a conversation in the catalog, chipped by its title", () => {
+    const withChats: ContextCatalog = { ...cat, chats };
+    const refs = extractContextRefs("see @chat:auth-refactor-2, @chat:this-one and @chat:nope", withChats);
+    expect(refs).toMatchObject([{ kind: "chat", token: "chat:auth-refactor-2", chat: { id: "c3" } }]);
+    expect(chipLabel(refs[0])).toBe("Auth refactor");
+    expect(extractContextRefs("@chat:auth-refactor", cat)).toEqual([]);
+  });
+});
+
+describe("talkContext — conversation blocks", () => {
+  it("is the asks and the last answer when the thread has no summary", () => {
+    expect(formatChatDigest({ summary: null, asks: ["fix login", "and\nthe tests"], lastAnswer: "Done." })).toBe(
+      "## Asks\n1. fix login\n2. and\n   the tests\n\n## Last answer\nDone.",
+    );
+  });
+
+  it("starts from the summary row when there is one", () => {
+    expect(formatChatDigest({ summary: "We chose JWT.", asks: [], lastAnswer: null })).toBe("## Summary\nWe chose JWT.");
+    expect(formatChatDigest({ summary: "S", asks: ["later"], lastAnswer: "A" })).toBe(
+      "## Summary\nS\n\n## Asks since\n1. later\n\n## Last answer\nA",
+    );
+    expect(formatChatDigest({ summary: null, asks: [], lastAnswer: null })).toBe("");
   });
 });
 

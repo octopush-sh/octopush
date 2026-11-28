@@ -470,7 +470,7 @@ mod tests {
     fn round(ids: &[&str], chars: &[usize], thinking: bool) -> Vec<LlmMessage> {
         let tool_uses: Vec<LlmToolUse> = ids
             .iter()
-            .map(|id| LlmToolUse { id: id.to_string(), name: "read_file".into(), input: json!({ "path": "a.rs" }) })
+            .map(|id| LlmToolUse { id: id.to_string(), name: "read_file".into(), input: json!({ "path": "a.rs" }), input_error: None })
             .collect();
         let mut raw = Vec::new();
         if thinking {

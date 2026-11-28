@@ -1895,6 +1895,39 @@ pub async fn list_chat_messages(
     state.db.lock().list_chat_messages(&thread_id)
 }
 
+/// What `@chat:<slug>` attaches of another conversation (#1162): its summary
+/// row, or its asks and last answer. Read-only, and only for a conversation
+/// of `workspace_id`: one from another workspace is refused.
+#[tauri::command]
+pub async fn chat_thread_digest(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    thread_id: String,
+) -> AppResult<crate::chat_history::ThreadDigest> {
+    thread_digest_in(&state.db.lock(), &workspace_id, &thread_id)
+}
+
+pub(crate) fn thread_digest_in(
+    db: &crate::db::Db,
+    workspace_id: &str,
+    thread_id: &str,
+) -> AppResult<crate::chat_history::ThreadDigest> {
+    if db.chat_thread_workspace(thread_id)?.as_deref() != Some(workspace_id) {
+        return Err(AppError::Other("that conversation isn't in this workspace".into()));
+    }
+    let messages = db.list_chat_messages(thread_id)?;
+    let rows: Vec<crate::chat_history::HistoryRow<'_>> = messages
+        .iter()
+        .map(|m| crate::chat_history::HistoryRow {
+            id: m.id,
+            role: m.role.as_str(),
+            content: m.content.as_str(),
+            context: m.context_blocks.as_deref(),
+        })
+        .collect();
+    Ok(crate::chat_history::thread_digest(&rows))
+}
+
 /// The workspace's conversations with a director turn running now, so a
 /// reloaded view shows them as running (and offers Stop) again.
 #[tauri::command]
@@ -9027,6 +9060,7 @@ mod ai_complete_tests {
                 id: "tu_1".into(),
                 name: super::AI_RESULT_TOOL.into(),
                 input: serde_json::json!({ "summary": "ok", "findings": [] }),
+                input_error: None,
             }],
             stop_reason: LlmStopReason::ToolUse,
             input_tokens: 1,
