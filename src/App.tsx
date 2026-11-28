@@ -144,7 +144,7 @@ import { archivableMissions, archiveMergedBody, runStatesByWs } from "./lib/rail
 import { archiveMergedMissions } from "./lib/archiveMerged";
 import { prefillFixChecks } from "./lib/fixChecks";
 import { isKnownStory, useIssuesStore } from "./stores/issuesStore";
-import { epikuTicketTarget, pickerCandidates, ticketNoun } from "./lib/issueTrackerSelectors";
+import { epikuTicketTarget, pickerCandidates, ticketCreateRoute, ticketNoun, type TicketWizardTarget } from "./lib/issueTrackerSelectors";
 import { detectIssueKey, detectTrackerKey } from "./lib/detectIssueKey";
 import { DIFF_ARRIVAL_WAIT_MS, revealDiffTargetWhenReady, stripDiffPrefix } from "./lib/diffJump";
 
@@ -542,7 +542,7 @@ function App() {
 
   // ── Backlog ticket → create workspace orchestration ──
   const [backlogTicketMenu, setBacklogTicketMenu] = useState<{ issue: Issue; x: number; y: number } | null>(null);
-  const [existingWsAlert, setExistingWsAlert] = useState<{ ticketKey: string; summary: string; existingName: string } | null>(null);
+  const [existingWsAlert, setExistingWsAlert] = useState<{ ticketKey: string; summary: string; existingName: string; epiku: TicketWizardTarget | null } | null>(null);
   const [projectPickerForTicket, setProjectPickerForTicket] = useState<{ ticketKey: string; summary: string; candidates: ProjectInfo[]; initialIntent?: "test" } | null>(null);
   const [creatorForTicket, setCreatorForTicket] = useState<{ projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string; initialIntent?: "test" } | null>(null);
 
@@ -2353,28 +2353,26 @@ function App() {
   );
 
   // ── Backlog ticket → create workspace orchestration ──
-  async function continueCreateForTicket(ticketKey: string, summary: string, initialIntent?: "test") {
-    const prefix = ticketKey.split("-")[0];
-    const candidates = recentProjects.filter((p) => p.jiraProjectKey === prefix);
-    if (candidates.length === 0) {
+  async function continueCreateForTicket(
+    ticketKey: string,
+    summary: string,
+    initialIntent?: "test",
+    epiku: TicketWizardTarget | null = null,
+  ) {
+    const route = ticketCreateRoute({ key: ticketKey, summary }, epiku, recentProjects, initialIntent);
+    if (route.kind === "unlinked") {
       pushToast({
         level: "error",
         title: "No project linked",
-        body: `No Octopush Project is linked to "${prefix}". Right-click a project to set its Jira key.`,
+        body: `No Octopush Project is linked to "${route.prefix}". Right-click a project to set its Jira key.`,
       });
       return;
     }
-    if (candidates.length === 1) {
-      setCreatorForTicket({
-        projectId: candidates[0].id,
-        projectPath: candidates[0].path,
-        initialTask: summary,
-        linkIssueKeyOnCreate: ticketKey,
-        initialIntent,
-      });
+    if (route.kind === "wizard") {
+      setCreatorForTicket(route.target);
       return;
     }
-    setProjectPickerForTicket({ ticketKey, summary, candidates, initialIntent });
+    setProjectPickerForTicket({ ticketKey, summary, candidates: route.candidates, initialIntent });
   }
 
   async function startCreateForTicket(issue: Issue) {
@@ -2384,16 +2382,13 @@ function App() {
     const existing = allWorkspaces.find(
       (w) => w.linkedIssueKey === issue.key || detectIssueKey(w.branch ?? "") === issue.key
     );
+    // An Epiku story belongs to the active project, whose backlog listed it;
+    // the alert keeps that target for its Continue.
     if (existing) {
-      setExistingWsAlert({ ticketKey: issue.key, summary: issue.summary, existingName: existing.name });
+      setExistingWsAlert({ ticketKey: issue.key, summary: issue.summary, existingName: existing.name, epiku });
       return;
     }
-    // An Epiku story belongs to the active project, whose backlog listed it.
-    if (epiku) {
-      setCreatorForTicket(epiku);
-      return;
-    }
-    await continueCreateForTicket(issue.key, issue.summary);
+    await continueCreateForTicket(issue.key, issue.summary, undefined, epiku);
   }
 
   // ── Render: pre-project views ──
@@ -3575,6 +3570,7 @@ function App() {
             })}
             projectKey={pickerProjectKey}
             projectId={pickerProject?.id ?? null}
+            tracker={pickerTracker}
             title={jiraTicketPickerOpen.mode === "link" ? `Link ${noun}` : `Change ${noun}`}
             onPick={async (key) => {
               await ipc.updateWorkspaceLink(jiraTicketPickerOpen.workspaceId, key);
@@ -3652,9 +3648,9 @@ function App() {
           ticketKey={existingWsAlert.ticketKey}
           workspaceName={existingWsAlert.existingName}
           onContinue={() => {
-            const { ticketKey, summary } = existingWsAlert;
+            const { ticketKey, summary, epiku } = existingWsAlert;
             setExistingWsAlert(null);
-            void continueCreateForTicket(ticketKey, summary);
+            void continueCreateForTicket(ticketKey, summary, undefined, epiku);
           }}
           onCancel={() => setExistingWsAlert(null)}
         />

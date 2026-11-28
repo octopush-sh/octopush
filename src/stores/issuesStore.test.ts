@@ -50,6 +50,18 @@ describe("issuesStore", () => {
     await s.load();
     expect(mockIpc.listMyIssues).toHaveBeenCalledWith("p1");
   });
+  it("starts a new scope when the project reads another Epiku project (#1283)", async () => {
+    mockIpc.getProjectIssueTracker.mockResolvedValue({ ...EPIKU, epikuProject: "sample-project" });
+    await useIssuesStore.getState().setProject("p1");
+    const story = { ...ISSUES[0], key: "ST-1.1" };
+    useIssuesStore.setState({ issues: [story], detailByKey: { "ST-1.1": story } });
+    mockIpc.getProjectIssueTracker.mockResolvedValue({ ...EPIKU, epikuProject: "other-sample-project" });
+    await useIssuesStore.getState().setProject("p1");
+    const s = useIssuesStore.getState();
+    expect(s.scope).toBe("epiku:p1:other-sample-project");
+    expect(s.issues).toBeNull();
+    expect(s.detailByKey).toEqual({});
+  });
   it("keeps the one Jira list across two Jira projects", async () => {
     useIssuesStore.setState({ issues: ISSUES, scope: "jira", projectId: "p1", tracker: "jira" });
     mockIpc.getProjectIssueTracker.mockResolvedValue(JIRA);

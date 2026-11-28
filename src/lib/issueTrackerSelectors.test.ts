@@ -6,6 +6,7 @@ import {
   ticketNoun,
   pickerCandidates,
   epikuTicketTarget,
+  ticketCreateRoute,
   selectElsewhereCount,
   selectBlocking,
   selectBlockedBy,
@@ -337,6 +338,23 @@ describe("Epiku paths of the workspace menu, the picker and Create workspace (#1
     });
     expect(epikuTicketTarget(story, "jira", { id: "p1", path: "/tmp/p1" })).toBeNull();
     expect(epikuTicketTarget(story, "epiku", null)).toBeNull();
+  });
+
+  it("continues an Epiku story past the existing-workspace alert to its project, not a Jira key (#1283)", () => {
+    const story = issue("ST-1.1");
+    const sample = proj({ id: "p1", path: "/tmp/sample-project" });
+    const target = epikuTicketTarget(story, "epiku", sample);
+    expect(ticketCreateRoute(story, target, [sample])).toEqual({ kind: "wizard", target });
+    // Jira keeps its prefix lookup: one project, a choice of several, or none.
+    const jira = proj({ id: "p2", path: "/tmp/sample-jira", jiraProjectKey: "PROJ" });
+    const twin = proj({ id: "p3", path: "/tmp/sample-jira-2", jiraProjectKey: "PROJ" });
+    const ticket = issue("PROJ-1");
+    expect(ticketCreateRoute(ticket, null, [sample, jira])).toEqual({
+      kind: "wizard",
+      target: { projectId: "p2", projectPath: "/tmp/sample-jira", initialTask: "summary PROJ-1", linkIssueKeyOnCreate: "PROJ-1", initialIntent: undefined },
+    });
+    expect(ticketCreateRoute(ticket, null, [jira, twin])).toEqual({ kind: "pick", candidates: [jira, twin] });
+    expect(ticketCreateRoute(ticket, null, [sample])).toEqual({ kind: "unlinked", prefix: "PROJ" });
   });
 
   it("opens Test this ticket for an Epiku story on the active project, on the test intent", () => {

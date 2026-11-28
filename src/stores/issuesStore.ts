@@ -13,8 +13,8 @@ interface IssuesState {
   /** The project the tracker calls are for (#1127), the tracker it reads
    *  (resolved by the backend) and the scope of the caches below: `jira`
    *  for every Jira project (one list serves them all), `epiku:<project>`
-   *  for an Epiku one. A scope change empties the caches, and an answer
-   *  for a scope the user has left never lands. */
+   *  for an Epiku one ({@link trackerScope}). A scope change empties the
+   *  caches, and an answer for a scope the user has left never lands. */
   projectId: string | null;
   tracker: TrackerKind | null;
   scope: string | null;
@@ -41,9 +41,16 @@ interface IssuesState {
   loadEpic: (epicKey: string) => Promise<void>;
 }
 
-/** The cache scope of a project's tracker. */
-export function trackerScope(projectId: string | null, tracker: TrackerKind | null): string | null {
-  return tracker === "epiku" ? `epiku:${projectId}` : tracker;
+/** The cache scope of a project's tracker. An Epiku project that reads its
+ *  own Epiku project adds it (`epiku:<project>:<epiku project>`), so choosing
+ *  another one is a new scope and never shows the old one's stories (#1283). */
+export function trackerScope(
+  projectId: string | null,
+  tracker: TrackerKind | null,
+  epikuProject: string | null = null,
+): string | null {
+  if (tracker !== "epiku") return tracker;
+  return epikuProject ? `epiku:${projectId}:${epikuProject}` : `epiku:${projectId}`;
 }
 
 /** Whether `key` is one of the loaded stories, or one `getIssue` read: what
@@ -99,7 +106,7 @@ export const useIssuesStore = create<IssuesState>((set, get) => ({
     const t = projectId ? await get().loadTracker(projectId) : null;
     if (seq !== projectSeq) return;
     const tracker = t?.active ?? null;
-    const scope = trackerScope(projectId, tracker);
+    const scope = trackerScope(projectId, tracker, t?.epikuProject ?? null);
     useParentIssuesStore.setState({ projectId, tracker });
     if (scope === get().scope) {
       set({ projectId, tracker });

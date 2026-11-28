@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { MissionCreator } from "./MissionCreator";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
+import { useIssuesStore } from "../stores/issuesStore";
 import * as ipcModule from "../lib/ipc";
 import type { Workspace } from "../lib/types";
 
@@ -234,6 +235,22 @@ describe("MissionCreator", () => {
       expect(vi.mocked(ipcModule.ipc.updateWorkspaceLink)).toHaveBeenCalledWith("ws-new-1", "PROJ-99");
     });
     expect(onCreated).toHaveBeenCalled();
+  });
+
+  it("names an Epiku story, not a Jira ticket, when linking it fails (#1283)", async () => {
+    useIssuesStore.setState({ trackerByProject: { "proj-1": { choice: "epiku", epikuProject: null, active: "epiku" } } });
+    vi.mocked(ipcModule.ipc.updateWorkspaceLink).mockRejectedValueOnce(new Error("offline"));
+    vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
+    const onCreated = vi.fn();
+    render(
+      <MissionCreator projectId="proj-1" projectPath="/home/user/sample-project" onCreated={onCreated} onCancel={vi.fn()} initialTask="Sample story" linkIssueKeyOnCreate="ST-1.1" />,
+    );
+    await gotoTask();
+    await beginMission();
+    expect(await screen.findByText(/linking the Epiku story failed/)).toBeInTheDocument();
+    expect(screen.queryByText(/Jira ticket/)).not.toBeInTheDocument();
+    expect(onCreated).not.toHaveBeenCalled();
+    useIssuesStore.setState({ trackerByProject: {} });
   });
 
   it("does NOT call ipc.updateWorkspaceLink when linkIssueKeyOnCreate is not set", async () => {

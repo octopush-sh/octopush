@@ -13,6 +13,8 @@ import { moveMissionToGroup } from "../lib/groupActions";
 import { useMissionsStore } from "../stores/missionsStore";
 import { BRANCH_NAME_MAX, branchFromTask, shortenSlug, uniqueBranch, worktreeSlugMax } from "../lib/branchName";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
+import { useIssuesStore } from "../stores/issuesStore";
+import { ticketNoun } from "../lib/issueTrackerSelectors";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { pushToast } from "./Toasts";
@@ -370,10 +372,12 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
         await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate);
         await useWorkspaceStore.getState().load(newWs.projectId);
       } catch (e) {
-        // Workspace was created OK but the Jira link did not persist. Keep the
+        // Workspace was created OK but the ticket link did not persist. Keep the
         // creator open with a clear, actionable message — the user can dismiss
-        // and link the ticket later via the workspace's right-click menu.
-        setError(`Workspace was created but linking the Jira ticket failed: ${String(e)}. You can link it later via right-click on the workspace.`);
+        // and link the ticket later via the workspace's right-click menu. The
+        // ticket is named after the project's tracker (#1283).
+        const noun = ticketNoun(useIssuesStore.getState().trackerByProject[projectId]?.active ?? null);
+        setError(`Workspace was created but linking the ${noun} failed: ${String(e)}. You can link it later via right-click on the workspace.`);
         setCreating(false);
         return;
       }
