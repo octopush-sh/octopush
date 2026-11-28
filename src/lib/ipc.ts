@@ -1052,6 +1052,14 @@ export const ipc = {
     contextBlocks?: string;
   }) => invoke<void>("send_chat_message", { request }),
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
+  /** What `@chat:` attaches of another conversation (#1162): its summary
+   *  row, or its asks (typed text only) and last answer. Refused for a
+   *  conversation outside `workspaceId`. */
+  chatThreadDigest: (workspaceId: string, threadId: string) =>
+    invoke<{ summary: string | null; asks: string[]; lastAnswer: string | null }>("chat_thread_digest", {
+      workspaceId,
+      threadId,
+    }),
   /** What the thread has cost so far, from the ledger (Companion). */
   getThreadCost: (threadId: string) => invoke<ThreadCost>("get_thread_cost", { threadId }),
   /** What the Claude Code session in a Run terminal has used (context size,

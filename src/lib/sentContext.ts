@@ -24,7 +24,7 @@ export interface SentContextBlock {
   notIncluded?: string;
 }
 
-const KINDS = new Set(["file", "folder", "session", "diff"]);
+const KINDS = new Set(["file", "folder", "session", "diff", "chat"]);
 
 function isBlock(b: unknown): b is SentContextBlock {
   const o = (b ?? {}) as Record<string, unknown>;
