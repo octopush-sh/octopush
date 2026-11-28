@@ -543,8 +543,8 @@ function App() {
   // ── Backlog ticket → create workspace orchestration ──
   const [backlogTicketMenu, setBacklogTicketMenu] = useState<{ issue: Issue; x: number; y: number } | null>(null);
   const [existingWsAlert, setExistingWsAlert] = useState<{ ticketKey: string; summary: string; existingName: string } | null>(null);
-  const [projectPickerForTicket, setProjectPickerForTicket] = useState<{ ticketKey: string; summary: string; candidates: ProjectInfo[] } | null>(null);
-  const [creatorForTicket, setCreatorForTicket] = useState<{ projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string } | null>(null);
+  const [projectPickerForTicket, setProjectPickerForTicket] = useState<{ ticketKey: string; summary: string; candidates: ProjectInfo[]; initialIntent?: "test" } | null>(null);
+  const [creatorForTicket, setCreatorForTicket] = useState<{ projectId: string; projectPath: string; initialTask: string; linkIssueKeyOnCreate: string; initialIntent?: "test" } | null>(null);
 
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
@@ -2353,7 +2353,7 @@ function App() {
   );
 
   // ── Backlog ticket → create workspace orchestration ──
-  async function continueCreateForTicket(ticketKey: string, summary: string) {
+  async function continueCreateForTicket(ticketKey: string, summary: string, initialIntent?: "test") {
     const prefix = ticketKey.split("-")[0];
     const candidates = recentProjects.filter((p) => p.jiraProjectKey === prefix);
     if (candidates.length === 0) {
@@ -2370,10 +2370,11 @@ function App() {
         projectPath: candidates[0].path,
         initialTask: summary,
         linkIssueKeyOnCreate: ticketKey,
+        initialIntent,
       });
       return;
     }
-    setProjectPickerForTicket({ ticketKey, summary, candidates });
+    setProjectPickerForTicket({ ticketKey, summary, candidates, initialIntent });
   }
 
   async function startCreateForTicket(issue: Issue) {
@@ -3629,6 +3630,14 @@ function App() {
           x={backlogTicketMenu.x}
           y={backlogTicketMenu.y}
           onCreateWorkspace={() => void startCreateForTicket(backlogTicketMenu.issue)}
+          // Testing works on its own `test/<KEY>` branch, so a workspace the
+          // ticket already has is no reason to stop. Jira tickets only for
+          // now: Epiku stories join Test a ticket after #1127.
+          onTestTicket={
+            epikuTicketTarget(backlogTicketMenu.issue, activeTracker, activeProject)
+              ? undefined
+              : () => void continueCreateForTicket(backlogTicketMenu.issue.key, backlogTicketMenu.issue.summary, "test")
+          }
           onClose={() => setBacklogTicketMenu(null)}
         />
         </ErrorBoundary>
@@ -3665,6 +3674,7 @@ function App() {
               projectPath: picked.path,
               initialTask: projectPickerForTicket.summary,
               linkIssueKeyOnCreate: projectPickerForTicket.ticketKey,
+              initialIntent: projectPickerForTicket.initialIntent,
             });
           }}
           onClose={() => setProjectPickerForTicket(null)}
@@ -3689,6 +3699,7 @@ function App() {
               projectJiraKey={targetProject.jiraProjectKey}
               initialTask={creatorForTicket.initialTask}
               linkIssueKeyOnCreate={creatorForTicket.linkIssueKeyOnCreate}
+              initialIntent={creatorForTicket.initialIntent}
               onCreated={() => setCreatorForTicket(null)}
               onCancel={() => setCreatorForTicket(null)}
             />

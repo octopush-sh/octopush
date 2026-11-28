@@ -1,4 +1,4 @@
-import { Hammer, Wrench, Eye, FlaskConical, PenTool, Gauge, Cog } from "lucide-react";
+import { Hammer, Wrench, Eye, FlaskConical, PenTool, Gauge, Cog, ClipboardCheck } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 /** Mission-intent glyphs. `build`/`fix` ship in M1; the rest arrive with later
@@ -12,4 +12,11 @@ export const INTENT_ICON: Record<string, LucideIcon> = {
   design: PenTool,
   perf: Gauge,
   ops: Cog,
+  test: ClipboardCheck,
 };
+
+/** Whether a mission ships nothing: Octopush refuses the pushes, pull requests
+ *  and publishes its agents ask for. Mirrors `mission::ships_nothing`. */
+export function shipsNothing(intent: string | null, gitIsolation: string | null): boolean {
+  return !!intent && !!gitIsolation && !["build", "fix", "design", "ops"].includes(intent) && gitIsolation !== "readonly";
+}

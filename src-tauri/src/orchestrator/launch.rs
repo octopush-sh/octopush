@@ -29,6 +29,9 @@ pub async fn launch_run(
     run_id: &str,
     budget_usd: Option<f64>,
 ) -> AppResult<()> {
+    // The drive refuses too (`Orchestrator::drive_inner`); this says so
+    // before the run is handed to a worker.
+    refuse_in_ship_nothing(db, run_id)?;
     if orch.has_concurrent_run(run_id).await? {
         return Err(AppError::Other(
             "another run in this workspace is already executing".into(),
@@ -94,5 +97,23 @@ pub async fn launch_run(
         }
     }
     Arc::clone(orch).start_run(run_id.to_string());
+    Ok(())
+}
+
+/// What a crew in a mission that ships nothing gets (#1239).
+pub const CREW_SHIPS_NOTHING: &str = "Crews don't run in a mission that ships nothing. Test it in Talk.";
+
+/// A crew's stages don't yet carry the ship-nothing posture that binds Talk,
+/// so none starts in a workspace whose active mission ships nothing. Asked
+/// where every crew drive starts (`Orchestrator::drive_inner`: Begin, a
+/// Routine, a re-run, a checkpoint decision, the detached worker) and by
+/// `launch_run`. A mission that can't be read refuses too: the posture never
+/// loosens on an error.
+pub(crate) fn refuse_in_ship_nothing(db: &Mutex<Db>, run_id: &str) -> AppResult<()> {
+    let db = db.lock();
+    let Some(run) = db.get_run(run_id)? else { return Ok(()) };
+    if crate::permissions::mission_ships_nothing(&db.active_mission_for_workspace(&run.workspace_id)) {
+        return Err(AppError::Other(CREW_SHIPS_NOTHING.into()));
+    }
     Ok(())
 }

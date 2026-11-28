@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { CircleCheck, CircleDashed, CircleX, Copy, EthernetPort, GitBranch, Hammer, Wrench } from "lucide-react";
+import { CircleCheck, CircleDashed, CircleX, Copy, EthernetPort, GitBranch, Hammer, PackageX, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { INTENT_ICON } from "../lib/missionIntent";
+import { INTENT_ICON, shipsNothing } from "../lib/missionIntent";
 import { checksTitle } from "../lib/prChecks";
 import type { ChecksState, GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
@@ -123,7 +123,9 @@ interface Props {
   missionId?: string | null;
   /** The active mission's Execution axis: `sandbox` or `none`. */
   missionExecIsolation?: string | null;
-  /** The active mission's Git axis: `readonly` forces the sandbox on. */
+  /** The active mission's Git axis: `readonly` forces the sandbox on. With
+   *  the intent, it says whether the mission ships nothing, which adds a mute
+   *  PackageX glyph to the eyebrow. */
   missionGitIsolation?: string | null;
 }
 
@@ -239,6 +241,16 @@ export function ContextHeader({
           )}
 
           <HeaderSandbox missionId={missionId} execIsolation={missionExecIsolation} gitIsolation={missionGitIsolation} />
+
+          {shipsNothing(missionIntent, missionGitIsolation) && (
+            <span
+              data-tour="context-ships-nothing"
+              title="Runs locally, ships nothing: the git pushes, pull requests and publishes an agent's commands ask for are refused (ssh, scp, rsync and deploy CLIs aren't checked yet)"
+              className="octo-pop-in flex flex-none items-center"
+            >
+              <PackageX size={10} aria-hidden />
+            </span>
+          )}
 
           {activeIssue && (
             <>

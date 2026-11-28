@@ -18,13 +18,16 @@ vi.mock("../lib/ipc", () => ({
     listBranches: vi.fn(),
     listPrs: vi.fn(),
     ensurePrBranch: vi.fn(),
+    getIssue: vi.fn(),
   },
 }));
 
-const { mockPushToast, mockMoveToGroup } = vi.hoisted(() => ({
+const { mockPushToast, mockMoveToGroup, mockSeedComposer } = vi.hoisted(() => ({
   mockPushToast: vi.fn(),
   mockMoveToGroup: vi.fn().mockResolvedValue(true),
+  mockSeedComposer: vi.fn(),
 }));
+vi.mock("../stores/chatStore", () => ({ useChatStore: { getState: () => ({ seedComposer: mockSeedComposer }) } }));
 vi.mock("./Toasts", () => ({ pushToast: mockPushToast }));
 vi.mock("../lib/groupActions", () => ({ moveMissionToGroup: mockMoveToGroup }));
 
@@ -357,6 +360,78 @@ describe("MissionCreator", () => {
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(mockCreate.mock.calls[0][7]).toBe("perf");
       expect(mockCreate.mock.calls[0][8]).toBe("readonly");
+    });
+  });
+
+  describe("Test a ticket", () => {
+    const ticket = { key: "ENG-42", summary: "Sign-in keeps the return path", url: "https://tracker.example.com/browse/ENG-42" };
+
+    function openOnTest(onCreated = vi.fn()) {
+      render(
+        <MissionCreator
+          projectId="proj-1"
+          projectPath="/home/user/proj"
+          onCreated={onCreated}
+          onCancel={vi.fn()}
+          initialTask={ticket.summary}
+          linkIssueKeyOnCreate="ENG-42"
+          initialIntent="test"
+        />,
+      );
+    }
+
+    beforeEach(() => {
+      vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({ local: ["main", "feat/ENG-4-x"], remote: ["origin/ENG-42-sign-in"] });
+      vi.mocked(ipcModule.ipc.getIssue).mockResolvedValue({ ...ticket, description: "Open /login?next=/billing and sign in." } as never);
+    });
+
+    it("is card 6 and opens on `test`, from the ticket's branch onto `test/<KEY>`, sending `ephemeral`", async () => {
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = vi.fn();
+      openOnTest(onCreated);
+      const card = screen.getByText("Test a ticket").closest("button")!;
+      expect(card).toHaveAttribute("data-tour", "mission-intent-test");
+      expect(card).toHaveAttribute("aria-pressed", "true");
+      expect(card.textContent).toContain("6");
+      await gotoTask();
+      await screen.findByTitle(/^Base branch: origin\/ENG-42-sign-in/);
+      expect(screen.getByLabelText("Branch name")).toHaveValue("test/ENG-42");
+      fireEvent.click(screen.getByRole("button", { name: "Isolation" }));
+      expect(await screen.findByText(/Runs locally, ships nothing\./)).toBeInTheDocument();
+      await beginMission();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      const call = mockCreate.mock.calls[0];
+      expect([call[4], call[5], call[7], call[8]]).toEqual(["test/ENG-42", "origin/ENG-42-sign-in", "test", "ephemeral"]);
+      // The brief waits in the composer, unsent.
+      expect(mockSeedComposer).toHaveBeenCalledWith(mockWorkspace.id, expect.stringContaining("Open /login?next=/billing and sign in."));
+    });
+
+    it("sends `ephemeral` from a pull request too, based on its head", async () => {
+      vi.mocked(ipcModule.ipc.listPrs).mockResolvedValue([{ number: 42, title: "Keep the return path", headRefName: "feat/return-path", author: null }]);
+      vi.mocked(ipcModule.ipc.ensurePrBranch).mockResolvedValue(undefined);
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      const onCreated = vi.fn();
+      openOnTest(onCreated);
+      await gotoTask();
+      await screen.findByTitle(/^Base branch: origin\/ENG-42-sign-in/);
+      fireEvent.click(screen.getByTitle("Start from a pull request"));
+      fireEvent.click(await screen.findByRole("menuitem", { name: /#42/ }));
+      await screen.findByText(/from PR #42/);
+      await beginMission();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect([mockCreate.mock.calls[0][5], mockCreate.mock.calls[0][8]]).toEqual(["feat/return-path", "ephemeral"]);
+    });
+
+    it("seeds a brief that says the ticket couldn't be read when get_issue fails", async () => {
+      vi.mocked(ipcModule.ipc.getIssue).mockRejectedValue(new Error("no tracker"));
+      const onCreated = vi.fn();
+      openOnTest(onCreated);
+      await gotoTask();
+      await beginMission();
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(mockSeedComposer).toHaveBeenCalledWith(mockWorkspace.id, expect.stringContaining("couldn't be read"));
     });
   });
 

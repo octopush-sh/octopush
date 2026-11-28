@@ -1000,6 +1000,11 @@ pub(crate) struct CommandWord {
     /// The word with quotes removed and nothing dropped (`--method=POST`
     /// whole), for checks that read flags (`permissions::remote_effect`).
     pub word: String,
+    /// Its command reads its input from a pipe or a `<` redirection
+    /// (`permissions`' ship-nothing check).
+    pub stdin: bool,
+    /// Its command reads its input from a here-document or a here-string.
+    pub inline: bool,
 }
 
 /// The words of one command line as the path check reads them (#1201): a
@@ -1080,6 +1085,10 @@ struct Lexer {
     heredocs: Vec<(String, bool)>,
     /// Lexing a here-document's body: every word is `Data`.
     data: bool,
+    /// The current command reads its input from a pipe or `<` ([`CommandWord::stdin`]).
+    stdin: bool,
+    /// The current command reads its input from a here-document or a here-string.
+    inline: bool,
     /// Every word (`w`), operator (`o`), here-document delimiter (`d`) and
     /// body (`h`) in order, as [`command_key`] compares them.
     shape: Vec<String>,
@@ -1128,6 +1137,8 @@ impl Lexer {
                     self.i += if c == '|' && matches!(next, Some('|' | '&')) { 2 } else { 1 };
                     self.op("", from);
                     self.next_segment();
+                    // `|` and `|&` feed the next command; `||` doesn't.
+                    self.stdin = c == '|' && next != Some('|');
                 }
                 '&' if next == Some('>') => {
                     self.finish();
@@ -1192,6 +1203,26 @@ impl Lexer {
         self.segment += 1;
         self.started = false;
         self.target = None;
+        self.stdin = false;
+        self.inline = false;
+    }
+
+    /// The current command reads its input from a pipe or a file
+    /// (`inline`: a here-document or a here-string), its words already
+    /// read included (`bash < script.sh`).
+    fn feeds(&mut self, inline: bool) {
+        // Marked once per command: the words after it take the flag as they're read.
+        if (inline && self.inline) || (!inline && self.stdin) {
+            return;
+        }
+        let segment = self.segment;
+        let mark = |w: &mut CommandWord| if inline { w.inline = true } else { w.stdin = true };
+        self.out.iter_mut().rev().take_while(|w| w.segment == segment).for_each(mark);
+        if inline {
+            self.inline = true;
+        } else {
+            self.stdin = true;
+        }
     }
 
     fn finish(&mut self) {
@@ -1231,6 +1262,8 @@ impl Lexer {
             writes: target == Some(true),
             redirect: target.is_some(),
             word: crate::talk_guard::unescape(&w.pattern),
+            stdin: self.stdin,
+            inline: self.inline,
         });
     }
 
@@ -1251,6 +1284,7 @@ impl Lexer {
                 return;
             }
             ('<', Some('<')) => {
+                self.feeds(true);
                 self.i += 1;
                 if self.peek() == Some('<') {
                     self.i += 1;
@@ -1267,6 +1301,9 @@ impl Lexer {
             _ => {}
         }
         let writes = c == '>' || self.s.get(self.i - 1) == Some(&'>');
+        if c == '<' {
+            self.feeds(false);
+        }
         if self.peek() == Some('&') {
             self.i += 1;
             // `>&2`, `<&-`: an fd, not a word.
@@ -4730,10 +4767,18 @@ impl ChatEngine {
     }
 
     /// Give the thread's Talk shell the workspace's port block (#1219), for
-    /// when it is next spawned.
-    fn set_shell_ports(&self, workspace_id: &str, thread_id: &str) {
+    /// when it is next spawned, and the strict shell (`TalkShell::set_strict_for`)
+    /// before its next command in a mission that ships nothing, and in Ask
+    /// first and Plan only (#1231), where a reader the command check lets
+    /// through must run the reader. A shell that ran a command while its
+    /// thread wasn't strict starts fresh then.
+    fn prepare_shell(&self, workspace_id: &str, thread_id: &str) {
         let ports = crate::workspace_ports::ensure(&self.db.lock(), workspace_id);
         self.talk_shell.set_spawn_env(thread_id, ports.map(|b| b.env()).unwrap_or_default());
+        let mission = self.db.lock().active_mission_for_workspace(workspace_id);
+        let (_, mode) = crate::permissions::thread_modes(&self.db, thread_id);
+        let why = crate::talk_shell::StrictFor::of(crate::permissions::mission_ships_nothing(&mission), mode);
+        self.talk_shell.set_strict_for(thread_id, why);
     }
 
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
@@ -4783,7 +4828,7 @@ impl ChatEngine {
         });
 
         let started = std::time::Instant::now();
-        self.set_shell_ports(&request.workspace_id, &request.thread_id);
+        self.prepare_shell(&request.workspace_id, &request.thread_id);
         let shell = Arc::clone(&self.talk_shell);
         let thread_id = request.thread_id.clone();
         let workspace_path = request.workspace_path.clone();
@@ -5079,19 +5124,14 @@ impl ChatEngine {
         // write_file is confined. A `readonly` mission (review/probe) is
         // read-only-by-construction → Some(vec![]) (temp-only, no workspace
         // writes); a `sandbox` mission → Some(vec![workspace]). Resolved once/turn.
-        let sandbox_roots: Option<Vec<String>> = self
-            .db
-            .lock()
-            .active_mission_for_workspace(&request.workspace_id)
-            .ok()
-            .flatten()
-            .and_then(|m| {
-                crate::orchestrator::sandbox::sandbox_write_roots(
-                    &m.git_isolation,
-                    &m.exec_isolation,
-                    &request.workspace_path,
-                )
-            });
+        let mission = self.db.lock().active_mission_for_workspace(&request.workspace_id);
+        // A mission that ships nothing (#1238) refuses pushes and remote
+        // changes in every mode. A mission that can't be read is treated as
+        // one: the posture never loosens on an error.
+        let ships_nothing = crate::permissions::mission_ships_nothing(&mission);
+        let sandbox_roots: Option<Vec<String>> = mission.ok().flatten().and_then(|m| {
+            crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, &request.workspace_path)
+        });
 
         // Register a fresh cancellation flag for this turn, keyed by thread,
         // or refuse: a turn already runs there. The guard removes it from the
@@ -5467,17 +5507,6 @@ impl ChatEngine {
                 sandbox_roots.as_deref(),
             );
             let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());
-            // Entering Ask first or Plan only, from any mode, starts a fresh
-            // shell and cleans it (#1231): restart, don't clean what earlier
-            // commands left. So does a shell this process hasn't used yet (one
-            // reattached after a restart may have been in Edit freely).
-            let strict_mode = matches!(mode, crate::permissions::Mode::Ask | crate::permissions::Mode::Plan);
-            let entered = self.talk_shell.set_strict(&request.thread_id, strict_mode);
-            if strict_mode && self.talk_shell.available() && (entered || !self.talk_shell.has_session(&request.thread_id)) {
-                let (shell, tid, wp) = (Arc::clone(&self.talk_shell), request.thread_id.clone(), request.workspace_path.clone());
-                let label = mode.label();
-                let _ = tokio::task::spawn_blocking(move || shell.restart_strict(&tid, &wp, label)).await;
-            }
 
             let response = loop {
                 let llm_req = director_request(&request, &system_prompt, &messages, &tools);
@@ -5696,6 +5725,7 @@ impl ChatEngine {
                     mcp_read_only: &mcp_read_only,
                     delegate_writes: crate::chat_agents::delegate_writes(definition),
                     forced: crate::permissions::forced(sandbox_roots.as_deref()),
+                    ships_nothing,
                 };
                 let call = crate::permissions::ToolCall { name: &u.name, input: &u.input };
                 match crate::permissions::decide(mode, &call, &ctx) {
@@ -5910,38 +5940,11 @@ impl ChatEngine {
                 // (#1165; inside the workspace only, so it never tells whether a
                 // file exists outside), the mission sandbox's, an edit that
                 // doesn't apply (#1231).
-                // A reader runs in the shared shell without a card only in a
-                // shell started fresh, cleaned and proven so (#1231): an alias, a
-                // function or a trap could turn `ls` or `git` into a writer. One
-                // that ran anything else since starts fresh first; one that
-                // can't be proven clean asks, and its card says why.
-                let reader_shell = mode == crate::permissions::Mode::Ask
-                    && !mode_denied
-                    && u.name == "run_command"
-                    && !mode_asks.contains(&u.id)
-                    && self.talk_shell.available()
-                    && exec_roots.is_none();
-                let loose_shell: Option<String> = if reader_shell {
-                    let state = match self.talk_shell.strictness(&request.thread_id) {
-                        crate::talk_shell::Strictness::Unchecked => {
-                            let (shell, tid, wp) = (Arc::clone(&self.talk_shell), request.thread_id.clone(), request.workspace_path.clone());
-                            tokio::task::spawn_blocking(move || shell.restart_strict(&tid, &wp, "Ask first"))
-                                .await
-                                .unwrap_or_else(|e| crate::talk_shell::Strictness::Failed(e.to_string()))
-                        }
-                        state => state,
-                    };
-                    match state {
-                        crate::talk_shell::Strictness::Verified => None,
-                        crate::talk_shell::Strictness::Failed(why) => Some(why),
-                        crate::talk_shell::Strictness::Unchecked => Some("the shell isn't checked yet".to_string()),
-                    }
-                } else {
-                    None
-                };
-                let held = (mode_asks.contains(&u.id) || git_outside || loose_shell.is_some()) && skill_refusal.is_none();
-                // It runs on Ask first's read-only verdict: the shell stays proven.
-                let read_only_run = reader_shell && !held;
+                // A reader the check lets through runs in the shared shell only
+                // once it is strict and proven so (`prepare_shell`, #1231): an
+                // alias, a function or a trap could turn `ls` or `git` into a
+                // writer. A shell that can't be proven runs nothing.
+                let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();
                 let inside = || reach.outside_card(None, &u.name, &u.input, false, &[]).is_none();
                 let seen = self.thread_file_seen(&request.thread_id);
                 let refused = || {
@@ -5973,13 +5976,7 @@ impl ChatEngine {
                         reach.granted(&u.name, &u.input, ask_cwd.as_deref().map(Path::new), writes_confined, &grants)
                     };
                     if !reach.checked(&granted).await {
-                        let ask_place = || {
-                            let card = crate::permissions::ask_card(None, &u.name, &u.input, &reach);
-                            Some(match &loose_shell {
-                                Some(why) => ToolCard { reason: format!("{} Even a command that only reads asks here: {why}.", card.reason), ..card },
-                                None => card,
-                            })
-                        };
+                        let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));
                         let check = || reach.checked(&ask_place);
                         if let Some(card) = check().await {
                             let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
@@ -6185,7 +6182,7 @@ impl ChatEngine {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
-                    self.set_shell_ports(&request.workspace_id, &request.thread_id);
+                    self.prepare_shell(&request.workspace_id, &request.thread_id);
                     let shell = Arc::clone(&self.talk_shell);
                     let tid = request.thread_id.clone();
                     let wp = request.workspace_path.clone();
@@ -6194,9 +6191,8 @@ impl ChatEngine {
                     // a true hang is interrupted. Cancellable: if Stop is pressed
                     // while it blocks, interrupt the shell so the capture returns
                     // promptly instead of waiting out the full timeout.
-                    let jh = tokio::task::spawn_blocking(move || match read_only_run {
-                        true => shell.run_capture_read_only(&tid, &wp, &command, std::time::Duration::from_secs(600)),
-                        false => shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(600)),
+                    let jh = tokio::task::spawn_blocking(move || {
+                        shell.run_capture(&tid, &wp, &command, std::time::Duration::from_secs(600))
                     });
                     tokio::pin!(jh);
                     let join_result = loop {
@@ -6227,6 +6223,9 @@ impl ChatEngine {
                             }
                             (format_command_output(&r.output, r.exit_code), r.ok)
                         }
+                        // A strict shell that isn't proved clean runs nothing,
+                        // and no isolated shell runs it either (#1241, #1231).
+                        Ok(Err(AppError::Other(m))) if crate::talk_shell::strict_refusal(&m) => (m, false),
                         // Shared shell unavailable (a live `$` process holds it, or
                         // a transient error). Run THIS command in an isolated shell
                         // so the agent isn't blocked — but say so explicitly, since
@@ -8672,7 +8671,7 @@ mod tests {
         assert!(offered.grant.as_ref().is_some_and(|g| g.kind == GrantKind::Write), "{offered:?}");
         broker.settle_card("t-old", ApprovalDecision::Grant, &offered);
         let read_only = std::collections::HashSet::new();
-        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+        let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false, ships_nothing: false };
         let decision = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: "write_file", input: &input }, &ctx);
         let grants = broker.grants("t-old", mode);
         let ask_first = matches!(decision, crate::permissions::Decision::Ask { .. }) && !reach.granted("write_file", &input, None, false, &grants);
@@ -8726,7 +8725,7 @@ mod tests {
             ] {
                 let input = serde_json::json!({ "path": path, "content": content });
                 let read_only = std::collections::HashSet::new();
-                let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false };
+                let ctx = crate::permissions::PolicyCtx { exec_roots: None, mcp_read_only: &read_only, delegate_writes: false, forced: false, ships_nothing: false };
                 let decision = crate::permissions::decide(mode, &crate::permissions::ToolCall { name: "write_file", input: &input }, &ctx);
                 assert_eq!(matches!(decision, Decision::Ask { .. }), mode == Mode::Ask, "{mode:?}");
                 assert!(!w.reach.granted("write_file", &input, None, false, &w.grants), "{mode:?}: the grant isn't a yes for {path:?}");
