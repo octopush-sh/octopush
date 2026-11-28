@@ -31,6 +31,15 @@ describe("BacklogRowContextMenu", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("'Test this ticket' calls onTestTicket and onClose", () => {
+    const onTestTicket = vi.fn();
+    const onClose = vi.fn();
+    render(<BacklogRowContextMenu x={1} y={2} onCreateWorkspace={vi.fn()} onTestTicket={onTestTicket} onClose={onClose} />);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Test this ticket" }));
+    expect(onTestTicket).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it("pressing Escape calls onClose", () => {
     const onClose = vi.fn();
     render(

@@ -5717,6 +5717,58 @@ mod orchestrator_tests {
         assert!(stages[0].error.as_deref().unwrap().contains("stopped by the director"));
     }
 
+    /// A crew doesn't start in a workspace whose mission ships nothing
+    /// (#1239): its stages don't carry the posture yet. Refused before any
+    /// other gate, so nothing about the run changes.
+    #[tokio::test]
+    async fn launch_run_refuses_a_crew_in_a_mission_that_ships_nothing() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Crew", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        db.lock().insert_mission("m-test", Some(ws.as_str()), "p1", "test", "Test ENG-42", "active", Some("ENG-42"), "ephemeral", "none", "{}").unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Arc::new(Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner)));
+        let err = crate::orchestrator::launch::launch_run(&orch, &db, &run_id, Some(5.0)).await.unwrap_err();
+        assert!(err.to_string().contains(crate::orchestrator::launch::CREW_SHIPS_NOTHING), "{err}");
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert_eq!((run.status.as_str(), run.budget_usd), ("draft", None), "the run is untouched");
+    }
+
+    /// Every path that drives a crew refuses in a mission that ships
+    /// nothing: Begin and a Routine (`run_to_pause`), the detached and
+    /// unattended worker (`drive_segment`), a checkpoint decision
+    /// (`resolve_checkpoint`, as `dispatch_checkpoint` calls it) and a re-run
+    /// (`rerun_from_stage`). Nothing runs.
+    #[tokio::test]
+    async fn no_crew_drive_starts_in_a_mission_that_ships_nothing() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Crew", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let parked = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let done = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        orch.request_pause(&parked);
+        assert_eq!(orch.run_to_pause(&parked).await.unwrap(), RunStatus::Paused);
+        assert_eq!(orch.run_to_pause(&done).await.unwrap(), RunStatus::Completed);
+        db.lock().insert_mission("m-test", Some(ws.as_str()), "p1", "test", "Test ENG-42", "active", None, "ephemeral", "none", "{}").unwrap();
+        let stage = db.lock().list_run_stages(&done).unwrap()[0].id.clone();
+        let refused = [
+            orch.run_to_pause(&parked).await,
+            orch.drive_segment(&parked, false).await,
+            orch.resolve_checkpoint(&parked, CheckpointAction::Approve).await,
+            orch.rerun_from_stage(&done, &stage, None).await,
+        ];
+        for (i, r) in refused.into_iter().enumerate() {
+            let err = r.expect_err(&format!("path {i} drove")).to_string();
+            assert!(err.contains(crate::orchestrator::launch::CREW_SHIPS_NOTHING), "path {i}: {err}");
+        }
+        let stages = db.lock().list_run_stages(&parked).unwrap();
+        assert!(stages.iter().all(|s| s.started_at.is_none()), "no stage of the parked run ran");
+    }
+
     #[tokio::test]
     async fn stop_current_stage_without_inflight_stage_is_a_noop() {
         let (db, _ws) = db_with_workspace();
