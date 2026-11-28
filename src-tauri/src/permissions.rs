@@ -566,7 +566,9 @@ fn remote_walk(command: &str, ship_nothing: bool) -> Option<&'static str> {
     // Something anywhere in the command that can reroute a request (a proxy
     // variable for `bash -c '…'`, a function or alias named `curl`) means
     // no request is local.
-    let rerouted = matches!(crate::chat_engine::each_command(command, |l| reroutes(l).then_some(())), Ok(Some(())));
+    // Only a mission that ships nothing reads it: Plan only and the command
+    // check (`talk_guard`) call this on every command and needn't pay twice.
+    let rerouted = ship_nothing && matches!(crate::chat_engine::each_command(command, |l| reroutes(l).then_some(())), Ok(Some(())));
     walk(command, Scope { ship_nothing, loopback_ok: ship_nothing && !rerouted })
 }
 

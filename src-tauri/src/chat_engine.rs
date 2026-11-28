@@ -1091,6 +1091,10 @@ impl Lexer {
     /// (`inline`: a here-document or a here-string), its words already
     /// read included (`bash < script.sh`).
     fn feeds(&mut self, inline: bool) {
+        // Marked once per command: the words after it take the flag as they're read.
+        if (inline && self.inline) || (!inline && self.stdin) {
+            return;
+        }
         let segment = self.segment;
         let mark = |w: &mut CommandWord| if inline { w.inline = true } else { w.stdin = true };
         self.out.iter_mut().rev().take_while(|w| w.segment == segment).for_each(mark);
