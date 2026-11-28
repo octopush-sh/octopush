@@ -424,6 +424,31 @@ export interface McpServerStatus {
   reason: string | null;
 }
 
+/** A server a worktree's own `.claude/mcp.json` defines (#1245), as its
+ *  approval shows it: command, arguments and env names, never a value.
+ *  `waiting` was never approved in this project, `changed` was approved
+ *  with another entry, `clash` has a Settings server's name (that one runs). */
+export interface ProjectMcpServer {
+  name: string;
+  command: string;
+  args: string[];
+  envNames: string[];
+  /** What runs, as the approval card shows it: shell-quoted argv with every
+   *  control, invisible and bidi character written as its code point, then
+   *  `· env …` (values only for names that load code). */
+  display: string;
+  hash: string;
+  state: "approved" | "waiting" | "changed" | "clash";
+}
+
+/** One approved project server, as Settings › Integrations lists it. */
+export interface ProjectMcpApproval {
+  projectId: string;
+  projectName: string;
+  server: string;
+  approvedAt: string;
+}
+
 /** One instruction file Talk and its sub-agents follow
  *  (`list_project_instructions`): a file of the workspace's CLAUDE.md chain,
  *  or its AGENTS.md when it has no CLAUDE.md. `label` is the path as the user

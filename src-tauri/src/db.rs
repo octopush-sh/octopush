@@ -4217,6 +4217,18 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Every approval, for Settings: project id and name, server, when.
+    pub fn list_project_mcp_approvals(&self) -> AppResult<Vec<ProjectMcpApproval>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.project_id, p.name, a.server, a.approved_at FROM mcp_project_approvals a
+             JOIN projects p ON p.id = a.project_id ORDER BY p.name, a.server",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ProjectMcpApproval { project_id: r.get(0)?, project_name: r.get(1)?, server: r.get(2)?, approved_at: r.get(3)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// The MCP servers switched off in a conversation, sorted. Empty for a
     /// thread that never switched one off (NULL), an unreadable value, or a
     /// thread that no longer exists: the default is every server.
@@ -9671,6 +9683,16 @@ pub struct PipelineStageRow {
     pub escalate_effort: Option<crate::providers::Effort>,
     /// The MCP servers an API stage may use; empty ⇒ none (#1134).
     pub mcp_servers: Vec<String>,
+}
+
+/// One approved project MCP server (#1245), as Settings lists it.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMcpApproval {
+    pub project_id: String,
+    pub project_name: String,
+    pub server: String,
+    pub approved_at: String,
 }
 
 /// A row for the canonical `spend_events` ledger.

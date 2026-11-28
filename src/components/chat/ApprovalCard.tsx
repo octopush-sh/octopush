@@ -31,7 +31,7 @@ export const CODE_CARD_BODY = {
   config:
     "This file can make Octopush or Claude Code run commands, so a change to it always asks. Allowing lets this one call go ahead.",
   server:
-    "This project's .claude/mcp.json defines this server. Allowing starts it now and in later turns while its entry stays the same; any change asks again.",
+    "This project's .claude/mcp.json defines this server. Allowing starts it now and in later turns while its entry stays the same; any change asks again. Revoke it in Settings › Integrations or in the Companion.",
 } as const;
 
 /** The chord that focuses the oldest card waiting in the conversation on
