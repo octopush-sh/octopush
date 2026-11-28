@@ -411,6 +411,11 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None, None);
     }
     let path = field("path");
+    // A file in the workspace that runs commands (`talk_guard::RUNS_CODE`)
+    // keeps its preview, and says so: its own Config card asks after this
+    // one (#1245).
+    let runs_code = matches!(name, "write_file" | "edit_file")
+        && reach.outside_card(None, name, input, false, &[]).is_some_and(|c| c.kind == CardKind::Config);
     let (reason, diff, bound) = match name {
         "write_file" | "edit_file" if !previewed(reach, name, input, &path) => {
             ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None, None)
