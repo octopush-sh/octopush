@@ -97,7 +97,7 @@ jobs:
       - name: release helpers and the nightly beta routine
         run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs scripts/web-version.test.mjs scripts/rerun-starved.test.mjs scripts/homebrew-cask.test.mjs
       - name: routine scripts
-        run: node --test scripts/routines/routines.test.mjs scripts/routines/social.test.mjs
+        run: node --test scripts/routines/routines.test.mjs scripts/routines/social.test.mjs scripts/routines/frozen-node.test.mjs
       - name: visual audit logic
         # Pure parts only (merging, fingerprints, issue filing). The audit itself runs nightly (visual-audit.yml).
         run: node --test scripts/visual-audit/visual-audit.test.mjs
@@ -106,6 +106,51 @@ jobs:
         run: node --test scripts/web-audit/web-audit.test.mjs
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
+
+  sandbox-end:
+    # frozen-node.sh end on this runner image (docs/ROUTINES.md): the builders
+    # and promote's web-gate run code as octo-sandbox, inside one cgroup that
+    # `end` kills at once. A process that keeps forking, and one re-planting a
+    # checkout's .git, must not survive it. No token here.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Freeze Node and prepare the sandbox, as the builders do
+        run: |
+          set -euo pipefail
+          bash scripts/routines/frozen-node.sh freeze
+          mkdir "$GITHUB_WORKSPACE/sandbox-check"
+          OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/sandbox-check" bash scripts/routines/agent-sandbox-setup.sh
+      - name: In the sandbox, a process that keeps forking and one re-planting the checkout's .git
+        run: |
+          set -euo pipefail
+          c="$GITHUB_WORKSPACE/sandbox-check"
+          sudo -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/setsid /usr/bin/bash -c 'while :; do (sleep 0 &); done' >/dev/null 2>&1 &
+          sudo -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/setsid /usr/bin/bash -c \
+            'cd "$1"; while :; do mkdir -p .git 2>/dev/null; printf "[core]\n\tbare = false\n" > .git/config 2>/dev/null; (sleep 0 &); done' _ "$c" >/dev/null 2>&1 &
+          sleep 3
+          [ -d "$c/.git" ] || { echo "::error::the re-planter never ran"; exit 1; }
+          echo "$(grep -c . /sys/fs/cgroup/octo-sandbox/cgroup.procs) processes in the sandbox's cgroup"
+      - name: end leaves no process of the sandbox user, an empty cgroup and no .git
+        shell: /usr/bin/bash --noprofile --norc -e {0}
+        run: |
+          c="$GITHUB_WORKSPACE/sandbox-check"
+          # Its error here is the expected one: kept off the run's annotations.
+          rc=0; /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" end "$c" 2> "$RUNNER_TEMP/end.err" || rc=$?
+          [ "$rc" = 1 ] && grep -q "had a .git of the sandbox's: removed" "$RUNNER_TEMP/end.err" \
+            || { echo "::error::end should have failed on the planted .git (exit $rc)"; sed 's/^::/:/' "$RUNNER_TEMP/end.err"; exit 1; }
+          echo "end refused the planted .git, as expected"
+          sleep 2
+          if ps -u octo-sandbox -o stat= | grep -qv '^Z'; then echo "::error::a process of octo-sandbox survived end"; ps -u octo-sandbox -o pid=,stat=,args=; exit 1; fi
+          grep -qx 'populated 0' /sys/fs/cgroup/octo-sandbox/cgroup.events || { echo "::error::the sandbox's cgroup is not empty"; exit 1; }
+          [ ! -e "$c/.git" ] || { echo "::error::the checkout has a .git again"; exit 1; }
+          /usr/bin/bash "$RUNNER_TEMP/frozen-node.sh" guard
+          echo "end: the fork loop and the re-planter are gone, the cgroup is empty, the account is locked, the checkout has no .git"
 
   main-red:
     # main's CI failed: start the builder now instead of at its cron. Its job

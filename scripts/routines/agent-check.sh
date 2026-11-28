@@ -101,17 +101,19 @@ esac
 # the sandbox; reopen them for writing too, as setup did for the checkout.
 /bin/chmod -R o+rwX "$ROOT" 2>/dev/null || true
 
-# sudo -n: the workflow prepared the user and the permissions beforehand
-# (agent-sandbox-setup.sh); never prompt.
-# Not exec: after the checks, remove every symlink the sandbox created (one
-# into the runner's files would let the agent's file tools reach past cwd).
+# sudo -n: the workflow prepared the user, its cgroup and the permissions
+# beforehand (agent-sandbox-setup.sh); never prompt. octo-sandbox-exec runs the
+# checks as $SANDBOX_USER inside the sandbox's cgroup.
+# Not exec: after the checks, kill everything they left running (the whole
+# cgroup at once) and remove every symlink the sandbox created (one into the
+# runner's files would let the agent's file tools reach past cwd).
 set +e
-/usr/bin/sudo -n -u "$SANDBOX_USER" /usr/bin/env -i \
+/usr/bin/sudo -n /usr/local/sbin/octo-sandbox-exec /usr/bin/env -i \
   PATH="$NODE_DIR:/usr/local/bin:/usr/bin:/bin" \
   HOME="/tmp/$SANDBOX_USER-home" \
   CI=true LANG=C.UTF-8 ASTRO_TELEMETRY_DISABLED=1 "${extra_env[@]}" \
   bash -c 'cd "$1" && shift && exec "$@"' _ "$ROOT" "${cmd[@]}"
 rc=$?
-/usr/bin/sudo -n /usr/bin/pkill -KILL -u "$SANDBOX_USER" 2>/dev/null
+/usr/bin/sudo -n /usr/local/sbin/octo-sandbox-exec --kill 2>/dev/null
 /usr/bin/sudo -n /usr/bin/find "$ROOT" -type l -user "$SANDBOX_USER" -delete 2>/dev/null
 exit "$rc"
