@@ -2338,7 +2338,9 @@ mod tests {
         // More nested commands than the caps: read flat, so a path still counts.
         assert_eq!(run(&reach, &"echo $(date) ".repeat(65)), None);
         assert!(run(&reach, &"echo $(cat ~/.ssh/id_ed25519) ".repeat(65)).is_some_and(|c| c.sensitive));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // A blow-up past the caps takes minutes; a loaded CI runner takes a
+        // few seconds for all of it (5s failed there at 5.2s to 7.5s).
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     }
 
     /// A file tool's write outside offers its folder (#1229); once granted,
