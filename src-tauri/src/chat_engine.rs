@@ -4012,6 +4012,11 @@ pub struct ChatEngine {
 impl ChatEngine {
     pub fn new(db: Arc<Mutex<Db>>, daemon: Option<Arc<crate::pty_client::DaemonClient>>) -> Self {
         let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
+        // Beside the daemon's socket: where each shell last sat, for the
+        // shell that replaces it after a restart (#1231).
+        if daemon.is_some() {
+            talk_shell.set_cwd_store(crate::pty_daemon::socket_path().ok().and_then(|p| p.parent().map(|d| d.join("talk-cwd"))));
+        }
         talk_shell.set_client(daemon);
         // A project's own servers start once approved in its project (#1245).
         let project_approvals = Arc::new(crate::mcp::approval::DbApprovals(Arc::clone(&db)));

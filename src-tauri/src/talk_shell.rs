@@ -108,6 +108,8 @@ pub struct LiveRun {
     handle: Arc<Mutex<Session>>,
     client: Arc<DaemonClient>,
     thread_id: String,
+    /// Where the cwd its prompt reports is kept (#1231).
+    cwd_store: CwdStore,
 }
 
 /// Terminal state of a streamed live process.
@@ -141,6 +143,8 @@ pub struct TalkShell {
     /// The threads whose shell runs strict, and why
     /// ([`TalkShell::set_strict_for`]).
     strict: Mutex<HashMap<String, StrictFor>>,
+    /// Where each thread's shell last said it sits, kept on disk (#1231).
+    cwd_store: Mutex<CwdStore>,
 }
 
 impl TalkShell {
@@ -150,7 +154,15 @@ impl TalkShell {
             sessions: Mutex::new(HashMap::new()),
             spawn_env: Mutex::new(HashMap::new()),
             strict: Mutex::new(HashMap::new()),
+            cwd_store: Mutex::new(CwdStore::default()),
         }
+    }
+
+    /// Keep where each thread's shell last said it sits in `dir` (`None`:
+    /// nowhere), so a shell reattached after a restart can be replaced
+    /// there when the OS can't say ([`replacement_dir`], #1231).
+    pub fn set_cwd_store(&self, dir: Option<std::path::PathBuf>) {
+        *self.cwd_store.lock() = CwdStore(dir);
     }
 
     /// Run the thread's shell strict, or not, from its next command: in a
@@ -232,7 +244,8 @@ impl TalkShell {
         let handle = match existing {
             Some(h) => h,
             None => {
-                let session = Self::ensure_session(&client, thread_id, workspace_path, &extra, strict)?;
+                let recorded = self.cwd_store.lock().read(thread_id);
+                let session = Self::ensure_session(&client, thread_id, workspace_path, &extra, strict, recorded)?;
                 let h = Arc::new(Mutex::new(session));
                 let mut map = self.sessions.lock();
                 Arc::clone(map.entry(thread_id.to_string()).or_insert(h))
@@ -255,7 +268,7 @@ impl TalkShell {
             };
             let _ = client.remove(&id);
             let start = if std::path::Path::new(&cwd).is_dir() { cwd.as_str() } else { workspace_path };
-            match Self::ensure_session(&client, thread_id, start, &extra, Some(why)) {
+            match Self::ensure_session(&client, thread_id, start, &extra, Some(why), None) {
                 Ok(fresh) => {
                     if let Some(rx) = fresh.rx.as_ref() {
                         note_restart(&client, &fresh.id, rx, &fresh.nonce, why);
@@ -298,6 +311,7 @@ impl TalkShell {
         match probe(&rx, timeout, &nonce) {
             Probe::Done { output, exit_code, cwd: new_cwd } => {
                 let final_cwd = if new_cwd.is_empty() { cwd } else { new_cwd };
+                self.cwd_store.lock().record(thread_id, &final_cwd);
                 let mut session = handle.lock();
                 session.rx = Some(rx);
                 session.cwd = final_cwd.clone();
@@ -312,7 +326,7 @@ impl TalkShell {
             }
             Probe::Dead { output } => {
                 let _ = client.remove(&id);
-                match Self::ensure_session(&client, thread_id, &cwd, &extra, strict) {
+                match Self::ensure_session(&client, thread_id, &cwd, &extra, strict, None) {
                     Ok(fresh) => *handle.lock() = fresh,
                     Err(e) => {
                         self.sessions.lock().remove(thread_id);
@@ -336,6 +350,7 @@ impl TalkShell {
                 handle,
                 client,
                 thread_id: thread_id.to_string(),
+                cwd_store: self.cwd_store.lock().clone(),
             })),
             // Capture-only timeout: interrupt, then read the prompt marker bash
             // prints once the killed command returns control — keeping the shell
@@ -356,6 +371,7 @@ impl TalkShell {
                     // during the post-interrupt window (cleanup / SIGINT handler).
                     Probe::Done { output: tail, cwd: new_cwd, .. } => {
                         let final_cwd = if new_cwd.is_empty() { cwd } else { new_cwd };
+                        self.cwd_store.lock().record(thread_id, &final_cwd);
                         let body = join_nonempty(&[&partial, &tail, &note]);
                         let mut session = handle.lock();
                         session.rx = Some(rx);
@@ -374,7 +390,7 @@ impl TalkShell {
                     _ => {
                         let body = join_nonempty(&[&partial, &note]);
                         let _ = client.remove(&id);
-                        match Self::ensure_session(&client, thread_id, &cwd, &extra, strict) {
+                        match Self::ensure_session(&client, thread_id, &cwd, &extra, strict, None) {
                             Ok(fresh) => *handle.lock() = fresh,
                             Err(e) => {
                                 self.sessions.lock().remove(thread_id);
@@ -436,6 +452,7 @@ impl TalkShell {
         let handle = self.sessions.lock().remove(thread_id);
         self.spawn_env.lock().remove(thread_id);
         self.strict.lock().remove(thread_id);
+        self.cwd_store.lock().forget(thread_id);
         if let (Some(client), Some(handle)) = (client, handle) {
             let _ = client.remove(&handle.lock().id);
         }
@@ -447,35 +464,32 @@ impl TalkShell {
     /// A `strict` shell is never reattached: the surviving one may have run
     /// before its mission came to ship nothing, or in Edit freely (#1231),
     /// so it is replaced by a fresh `bash -l` where it was, and the terminal
-    /// says so. A strict shell runs [`apply_strict_shell`] before anything
-    /// else, and no command runs in it unless that proved it clean.
+    /// says so. Nothing is ever typed into it first: an init would run its
+    /// DEBUG trap, `PROMPT_COMMAND` and functions, with no card. Where it
+    /// sat comes from the OS ([`replacement_dir`]; `recorded`, the directory
+    /// its prompt last reported, when the OS can't say), and a job from
+    /// before the restart that holds its terminal keeps it alive. A strict
+    /// shell runs [`apply_strict_shell`] before anything else, and no
+    /// command runs in it unless that proved it clean.
     fn ensure_session(
         client: &Arc<DaemonClient>,
         thread_id: &str,
         cwd: &str,
         extra: &[(String, String)],
         strict: Option<StrictFor>,
+        recorded: Option<String>,
     ) -> AppResult<Session> {
         let id = format!("talk-{thread_id}");
-        let mut reattaching = client
-            .list_terminals()
-            .unwrap_or_default()
-            .iter()
-            .any(|t| t.id == id && t.running);
+        let live = client.list_terminals().unwrap_or_default().into_iter().find(|t| t.id == id && t.running);
+        let mut reattaching = live.is_some();
         let mut cwd = cwd.to_string();
         let replaced = reattaching && strict.is_some();
         if replaced {
-            // Where it was, read from its prompt, then gone.
-            let rx = client.attach(&id, 0)?;
-            match init_and_wait_ready(client, &id, &rx, &gen_nonce()) {
-                Ok(was) => {
-                    if let Some(was) = was.filter(|c| std::path::Path::new(c).is_dir()) {
-                        cwd = was;
-                    }
-                }
-                Err(_) => return Err(AppError::Other(SHELL_BUSY.into())),
+            let process = live.and_then(|t| t.pid).map(shell_process).unwrap_or_default();
+            if process.busy {
+                return Err(AppError::Other(SHELL_BUSY.into()));
             }
-            drop(rx);
+            cwd = replacement_dir(process.cwd, recorded, &cwd);
             client.remove(&id)?;
             reattaching = false;
         }
@@ -536,9 +550,135 @@ impl TalkShell {
     }
 }
 
-/// Why a reattached shell runs nothing: it never came back to its prompt.
+/// Why a reattached shell runs nothing: it never came back to its prompt,
+/// or a job from before the restart holds its terminal.
 const SHELL_BUSY: &str = "This conversation's shell is busy with a process still running from before \
     the restart. Wait for it to finish, or delete the conversation to stop it.";
+
+/// What the OS says about a reattached shell's process, read without typing
+/// anything into it (#1231).
+#[derive(Debug, Default, PartialEq)]
+struct ShellProcess {
+    /// Where it sits.
+    cwd: Option<String>,
+    /// A job holds its terminal: the terminal's foreground process group
+    /// isn't the shell's.
+    busy: bool,
+}
+
+/// [`ShellProcess`] for `pid`. Unknown parts stay empty: no directory, not
+/// busy.
+fn shell_process(pid: u32) -> ShellProcess {
+    ShellProcess { cwd: process_cwd(pid), busy: process_busy(pid) }
+}
+
+/// The working directory of `pid`, from the kernel (`proc_pidinfo` with
+/// `PROC_PIDVNODEPATHINFO`).
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: u32) -> Option<String> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: a plain C struct, valid zeroed; `proc_pidinfo` writes at most
+    // `size` bytes into it, which is its size, and fails on a bad pid.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
+    let wrote = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, (&mut info as *mut libc::proc_vnodepathinfo).cast(), size) };
+    if wrote != size {
+        return None;
+    }
+    let path: Vec<u8> = info.pvi_cdir.vip_path.iter().flatten().map(|&c| c as u8).take_while(|&b| b != 0).collect();
+    String::from_utf8(path).ok().filter(|p| p.starts_with('/'))
+}
+
+/// Whether a job holds the terminal of `pid` (`proc_pidinfo` with
+/// `PROC_PIDTBSDINFO`: the terminal's foreground group against the
+/// process's own).
+#[cfg(target_os = "macos")]
+fn process_busy(pid: u32) -> bool {
+    let Ok(pid) = libc::c_int::try_from(pid) else { return false };
+    // SAFETY: as in `process_cwd`.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let Ok(size) = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()) else { return false };
+    let wrote = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+    wrote == size && info.e_tpgid != 0 && info.e_tpgid != info.pbi_pgid
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?.to_str().map(str::to_string)
+}
+
+#[cfg(target_os = "linux")]
+fn process_busy(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|stat| stat_busy(&stat)).unwrap_or(false)
+}
+
+/// Whether a `/proc/<pid>/stat` line says a job holds the process's
+/// terminal: its `tpgid` set and not its `pgrp`. Pure.
+#[cfg(any(target_os = "linux", test))]
+fn stat_busy(stat: &str) -> Option<bool> {
+    // After the command name: state, ppid, pgrp, session, tty_nr, tpgid.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let pgrp: i64 = fields.get(2)?.parse().ok()?;
+    let tpgid: i64 = fields.get(5)?.parse().ok()?;
+    Some(tpgid > 0 && tpgid != pgrp)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_cwd(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_busy(_pid: u32) -> bool {
+    false
+}
+
+/// Where a replaced shell's fresh one starts (#1231): where the OS says the
+/// old one sat, else where its prompt last said (kept on disk), else
+/// `root`; each only while it is a directory. Never asks the old shell. A
+/// directory outside the workspace stays, as a `cd` there would.
+fn replacement_dir(os: Option<String>, recorded: Option<String>, root: &str) -> String {
+    [os, recorded].into_iter().flatten().find(|c| std::path::Path::new(c).is_dir()).unwrap_or_else(|| root.to_string())
+}
+
+/// Where each thread's shell last said it sits, one file per thread in a
+/// folder (`~/.octopush/talk-cwd/`), so a shell reattached after a restart
+/// is replaced where it was even when the OS can't say (#1231). Best
+/// effort: a write or read that fails keeps nothing.
+#[derive(Clone, Debug, Default)]
+struct CwdStore(Option<std::path::PathBuf>);
+
+impl CwdStore {
+    /// The thread's file: only for an id made of letters, digits, `-` and
+    /// `_`, so it never names another path.
+    fn file(&self, thread_id: &str) -> Option<std::path::PathBuf> {
+        let dir = self.0.as_ref()?;
+        let plain = !thread_id.is_empty() && thread_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        plain.then(|| dir.join(format!("{thread_id}.cwd")))
+    }
+
+    fn record(&self, thread_id: &str, cwd: &str) {
+        let Some(file) = self.file(thread_id) else { return };
+        if !cwd.starts_with('/') || std::fs::read_to_string(&file).is_ok_and(|was| was == cwd) {
+            return;
+        }
+        let part = file.with_extension("cwd.part");
+        let wrote = file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(&part, cwd).is_ok();
+        if !wrote || std::fs::rename(&part, &file).is_err() {
+            tracing::debug!(thread_id, "could not keep the talk shell's directory");
+        }
+    }
+
+    fn read(&self, thread_id: &str) -> Option<String> {
+        std::fs::read_to_string(self.file(thread_id)?).ok().filter(|c| c.starts_with('/'))
+    }
+
+    fn forget(&self, thread_id: &str) {
+        if let Some(file) = self.file(thread_id) {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
 
 /// A Talk shell's spawn env: `path` as PATH, plus the thread's `extra`
 /// variables (which never replace PATH).
@@ -853,6 +993,7 @@ impl LiveRun {
         session.rx = Some(self.rx);
         if !exit.cwd.is_empty() {
             session.cwd = exit.cwd.clone();
+            self.cwd_store.record(&self.thread_id, &exit.cwd);
         } else {
             exit.cwd = session.cwd.clone();
         }
@@ -1280,6 +1421,42 @@ mod tests {
         let tail = &capped[capped.find("omitted]").unwrap()..];
         assert!(tail.len() > MAX_OUTPUT_BYTES / 2, "a failure keeps more of the end");
         assert_eq!(cap_output(out.clone(), crate::chat_history::COMMAND_CAPTURE_BYTES, true), out, "the agent's capture keeps it whole");
+    }
+
+    /// A replaced shell's fresh one starts where the OS says the old one
+    /// sat, else where its prompt last said, else the workspace root, each
+    /// only while it is a directory; nothing asks the old shell (#1231).
+    #[test]
+    fn a_replaced_shell_starts_where_the_os_says_it_sat() {
+        let (os, kept) = (tempfile::TempDir::new().unwrap(), tempfile::TempDir::new().unwrap());
+        let (os, kept) = (os.path().to_str().unwrap().to_string(), kept.path().to_str().unwrap().to_string());
+        assert_eq!(replacement_dir(Some(os.clone()), Some(kept.clone()), "/ws"), os);
+        assert_eq!(replacement_dir(None, Some(kept.clone()), "/ws"), kept);
+        assert_eq!(replacement_dir(Some("/no/such/octo-dir".into()), Some(kept.clone()), "/ws"), kept);
+        assert_eq!(replacement_dir(Some("/no/such/octo-dir".into()), None, "/ws"), "/ws");
+        assert_eq!(replacement_dir(None, None, "/ws"), "/ws");
+        // A job holds the terminal when its group, not the shell's, is in front.
+        assert_eq!(stat_busy("123 (bash) S 1 123 123 34816 123 4194560 0"), Some(false));
+        assert_eq!(stat_busy("123 (ba sh)) S 1 123 123 34816 456 4194560 0"), Some(true));
+        assert_eq!(stat_busy("123 (bash) S 1 123 123 0 -1 4194560 0"), Some(false));
+        assert_eq!(stat_busy("garbage"), None);
+        // Where the shell last said it sits, kept per thread.
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = CwdStore(Some(dir.path().join("talk-cwd")));
+        assert_eq!(store.read("t-1"), None);
+        store.record("t-1", &os);
+        assert_eq!(store.read("t-1"), Some(os.clone()));
+        store.record("t-1", "relative/dir");
+        assert_eq!(store.read("t-1"), Some(os.clone()), "only an absolute directory");
+        store.record("t-1", &kept);
+        assert_eq!(store.read("t-1"), Some(kept.clone()));
+        for odd in ["", "../t", "a/b", "t 1"] {
+            assert_eq!(store.file(odd), None, "{odd:?}");
+        }
+        store.forget("t-1");
+        assert_eq!(store.read("t-1"), None);
+        CwdStore::default().record("t-1", &os);
+        assert_eq!(CwdStore::default().read("t-1"), None, "no folder, nothing kept");
     }
 
     /// Why a shell runs strict names its refusal and the terminal's line
@@ -1907,6 +2084,73 @@ mod e2e {
             assert!(!dir.path().join("ran").exists(), "the command ran");
             shell.close("askstuck");
         });
+    }
+
+    /// After a restart, the shell found running is replaced without a
+    /// keystroke (#1231): its DEBUG trap and `PROMPT_COMMAND` never run, in
+    /// a mission that ships nothing and in Ask first alike. The fresh shell
+    /// starts where the OS says the old one sat, which was also kept on
+    /// disk.
+    #[test]
+    #[serial]
+    fn a_reattached_shell_is_replaced_without_typing_into_it() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        let dir = TempDir::new().unwrap();
+        let at = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let store = TempDir::new().unwrap();
+        let quick = Duration::from_secs(20);
+        with_login_shell_env(&[], || {
+            for (thread, why) in [("noinit-sn", StrictFor::ShipsNothing), ("noinit-ask", StrictFor::Mode(crate::permissions::Mode::Ask))] {
+                let fired = dir.path().join(format!("{thread}-fired"));
+                let f = fired.to_string_lossy().into_owned();
+                {
+                    // Edit freely or a Build mission, then an Octopush restart.
+                    let shell = shell_on(&d.sock);
+                    shell.set_cwd_store(Some(store.path().to_path_buf()));
+                    done(shell.run(thread, "/tmp", &format!("cd '{at}'"), quick, true).unwrap());
+                    let plant = format!("trap \"touch '{f}'\" DEBUG; PROMPT_COMMAND=\"touch '{f}'; $PROMPT_COMMAND\"");
+                    done(shell.run(thread, "/tmp", &plant, quick, true).unwrap());
+                    assert!(fired.exists(), "the trap is armed");
+                    fs::remove_file(&fired).unwrap();
+                    assert_eq!(fs::read_to_string(store.path().join(format!("{thread}.cwd"))).unwrap(), at, "where it sits is kept");
+                }
+                let shell = shell_on(&d.sock);
+                shell.set_strict_for(thread, Some(why));
+                let r = done(shell.run(thread, "/tmp", "pwd", quick, true).unwrap());
+                assert_eq!(r.output, at, "{thread}");
+                assert!(!fired.exists(), "{thread}: something ran in the old shell");
+                shell.close(thread);
+            }
+        });
+    }
+
+    /// A reattached shell whose terminal a job from before the restart
+    /// holds isn't killed, and runs nothing (#1231): the OS says so, so
+    /// nothing is typed into the job either.
+    #[test]
+    #[serial]
+    fn a_reattached_shell_a_job_holds_is_left_alone() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        let old = DaemonClient::connect_to(d.sock.to_str().unwrap()).unwrap();
+        let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        old.spawn("talk-held", "/tmp", &env, Some("/bin/bash"), 40, 120).unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        old.write("talk-held", b"sleep 30\n").unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        with_login_shell_env(&[], || {
+            let shell = shell_on(&d.sock);
+            shell.set_strict("held", true);
+            let err = match shell.run("held", "/tmp", "true", Duration::from_secs(20), true) {
+                Err(AppError::Other(m)) => m,
+                Err(e) => panic!("{e}"),
+                Ok(_) => panic!("ran"),
+            };
+            assert_eq!(err, SHELL_BUSY);
+            assert!(old.list_terminals().unwrap().iter().any(|t| t.id == "talk-held" && t.running), "the job's shell was killed");
+        });
+        let _ = old.remove("talk-held");
     }
 
     /// A dir holding `octo-1087-tool`, an executable found only through it.
