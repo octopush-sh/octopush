@@ -88,6 +88,8 @@ import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
 import { focus as focusPane, useTerminalLayoutStore } from "./stores/terminalLayoutStore";
 import { useTerminalSlotsStore } from "./stores/terminalSlotsStore";
 import { useChatStore, workingTalkWorkspaces } from "./stores/chatStore";
+import { usePermissionModeStore } from "./stores/permissionModeStore";
+import type { PermissionMode } from "./lib/permissionModes";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
 import { useShallow } from "zustand/react/shallow";
@@ -1380,6 +1382,8 @@ function App() {
   // read separately below.
   const activeChatId = activeWorkspaceId;
   const activeThreadId = useChatStore((s) => s.getActiveThread(activeWorkspaceId ?? ""));
+  // The conversation's permission mode, as the Composer's control last read it (#1231).
+  const threadMode = usePermissionModeStore((s) => (activeThreadId ? s.byThread[activeThreadId] : undefined));
   const workspaceThreads = useChatStore((s) => s.getThreads(activeWorkspaceId ?? ""));
   // An approval card waits in the conversation Talk shows (as ChatCanvas
   // scopes them), for ⌘K's "Focus the waiting approval card".
@@ -3117,6 +3121,13 @@ function App() {
                       requestAnimationFrame(() => void focusOldestCard());
                     }
                   : undefined,
+                mode:
+                  activeThreadId && threadMode && !threadMode.forced
+                    ? {
+                        current: threadMode.effective,
+                        onSet: (m: PermissionMode) => void usePermissionModeStore.getState().set(activeThreadId, m),
+                      }
+                    : undefined,
               }
             : undefined
         }
@@ -3620,13 +3631,15 @@ function App() {
           y={backlogTicketMenu.y}
           onCreateWorkspace={() => void startCreateForTicket(backlogTicketMenu.issue)}
           // Testing works on its own `test/<KEY>` branch, so a workspace the
-          // ticket already has is no reason to stop. Jira tickets only for
-          // now: Epiku stories join Test a ticket after #1127.
-          onTestTicket={
-            epikuTicketTarget(backlogTicketMenu.issue, activeTracker, activeProject)
-              ? undefined
-              : () => void continueCreateForTicket(backlogTicketMenu.issue.key, backlogTicketMenu.issue.summary, "test")
-          }
+          // ticket already has is no reason to stop. An Epiku story opens on
+          // the active project, whose backlog listed it; a Jira ticket on the
+          // project its key's prefix names.
+          onTestTicket={() => {
+            const { issue } = backlogTicketMenu;
+            const epiku = epikuTicketTarget(issue, activeTracker, activeProject, "test");
+            if (epiku) setCreatorForTicket(epiku);
+            else void continueCreateForTicket(issue.key, issue.summary, "test");
+          }}
           onClose={() => setBacklogTicketMenu(null)}
         />
         </ErrorBoundary>

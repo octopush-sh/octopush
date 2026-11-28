@@ -66,6 +66,10 @@ pub struct ToolCard {
     /// diff the call makes, redacted and capped. Part of the card, so a file
     /// that changes while the card waits asks again (`guard_card`).
     pub diff: Option<String>,
+    /// What an Ask first approval binds to (#1231): a hash of the whole
+    /// file before and of the call (`permissions::change_bound`), so a change
+    /// anywhere, past the diff shown too, asks again. Never sent.
+    pub bound: Option<[u8; 32]>,
     /// What an MCP card offers to trust for good (#1243): only in Edit
     /// freely, never for a tool marked destructive, and only for a
     /// user-level server a project doesn't define (`TrustView::offer`).
@@ -200,6 +204,7 @@ pub fn server_card(server: &crate::mcp::approval::ProjectServer) -> ToolCard {
         grant: None,
         trust: None,
         diff: None,
+        bound: None,
     }
 }
 
@@ -208,7 +213,7 @@ pub fn server_card(server: &crate::mcp::approval::ProjectServer) -> ToolCard {
 pub fn mcp_card(label: Option<&str>, tool: &str, input: &Value, destructive: bool) -> ToolCard {
     let (reason, denial) = crate::chat_agents::mcp_gate_texts(label, tool, destructive);
     let shown = format!("{tool} {}", mcp_args_shown(input));
-    ToolCard { kind: CardKind::Mcp, shown, reason, denial, sensitive: false, grant: None, trust: None, diff: None }
+    ToolCard { kind: CardKind::Mcp, shown, reason, denial, sensitive: false, grant: None, trust: None, diff: None, bound: None }
 }
 
 /// What an MCP tool's server says about it, as a card reads it (#1243).
@@ -870,7 +875,7 @@ impl Reach {
                     r.shown
                 );
                 let reason = sub_agent(label, format!("changes {} \u{b7} it can make Octopush or Claude Code run commands", r.shown));
-                return Some(ToolCard { kind: CardKind::Config, shown: r.shown, reason, denial, sensitive: true, grant: None, trust: None, diff: None });
+                return Some(ToolCard { kind: CardKind::Config, shown: r.shown, reason, denial, sensitive: true, grant: None, trust: None, diff: None, bound: None });
             }
         }
         let writes = matches!(name, "write_file" | "edit_file");
@@ -894,7 +899,7 @@ impl Reach {
              Work inside the workspace, or ask the user for what you need; do not retry it.",
             r.shown, r.place
         );
-        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, grant, trust: None, diff: None })
+        Some(ToolCard { kind, shown: r.shown, reason, denial, sensitive: r.sensitive, grant, trust: None, diff: None, bound: None })
     }
 
     /// What a `write_file` or `edit_file` call the check just placed is
@@ -1061,6 +1066,15 @@ impl Reach {
     /// [`MAX_GLOB_NAMES`] names a glob reads, the command asks. A net, not a
     /// sandbox: a path built at run time isn't followed.
     pub fn command_card(&self, label: Option<&str>, command: &str, cwd: Option<&Path>, grants: &[Grant]) -> Option<ToolCard> {
+        // A line continued with `\` is read as the shell joins it too
+        // (#1231); the card still shows the command as written.
+        if let Some(joined) = command.contains("\\\n").then(|| crate::chat_engine::bash_joined(command)).flatten() {
+            if joined != command {
+                if let Some(card) = self.command_card(label, &joined, cwd, grants) {
+                    return Some(ToolCard { shown: command.to_string(), ..card });
+                }
+            }
+        }
         self.fresh();
         let start = cwd.unwrap_or(&self.workspace);
         let exact = self.exact(command, start);
@@ -1094,7 +1108,7 @@ impl Reach {
             ),
             (None, false, None) => return None,
         };
-        Some(ToolCard { kind, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None, diff: None })
+        Some(ToolCard { kind, shown: command.to_string(), reason: sub_agent(label, reason), denial, sensitive, grant, trust: None, diff: None, bound: None })
     }
 
     /// [`Reach::command_card`] for one line: the first credentials location

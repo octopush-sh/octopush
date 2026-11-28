@@ -6,6 +6,7 @@ import { ChatMarkdown, REMARK_PLUGINS } from "./chat/ChatMarkdown";
 import { splitBySkillTokens } from "../lib/skillMentions";
 import { formatUsd } from "../lib/cost";
 import { tourId } from "../lib/tour/ids";
+import { isModeNote } from "../lib/permissionModes";
 import { parseSentContext, typedText } from "../lib/sentContext";
 import { SentContext } from "./chat/SentContext";
 
@@ -122,13 +123,16 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
   if (!content || !content.trim()) return null;
 
   // A cancelled turn — a quiet, centered system note, never a model bubble.
+  // A mode change between rounds (#1231) is quiet too, with its own glyph.
   if (role === "stopped") {
+    const mode = isModeNote(content);
     return (
       <div
         data-role="stopped"
+        data-note={mode ? "mode" : undefined}
         className="flex items-center justify-center gap-2 py-1 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute"
       >
-        <span aria-hidden>◼</span>
+        <span aria-hidden>{mode ? "◐" : "◼"}</span>
         {content}
       </div>
     );

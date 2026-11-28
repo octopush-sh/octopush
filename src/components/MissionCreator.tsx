@@ -377,10 +377,11 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
         setCreating(false);
         return;
       }
-      // Testing a ticket opens on its brief, in the composer, unsent.
+      // Testing a ticket opens on its brief, in the composer, unsent. The
+      // ticket is read from this project's tracker (Jira or Epiku).
       if (intent === "test") {
         const brief = await ipc
-          .getIssue(linkIssueKeyOnCreate)
+          .getIssue(linkIssueKeyOnCreate, projectId)
           .then((issue) => testBrief(issue))
           .catch(() => testBrief({ key: linkIssueKeyOnCreate, summary: task.trim() }, true));
         useChatStore.getState().seedComposer(newWs.id, brief);

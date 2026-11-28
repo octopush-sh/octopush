@@ -187,15 +187,22 @@ export interface PendingApproval {
   rememberCommand?: boolean;
   /** Plan only withheld the conversation grant it would offer (#1229). */
   planOnly?: boolean;
+  /** An Ask first card's file change, as a unified diff (#1231). */
+  diff?: string;
+  /** The conversation is in Ask first: no "don't ask again" answers the
+   *  card, and it offers none (#1231). */
+  askFirst?: boolean;
   /** An MCP card in Edit freely (#1243): the server and tool its "Always
    *  allow this tool" and "Trust <server>" answers trust app-wide. */
   trustServer?: string;
   trustTool?: string;
 }
 
-/** `config`: a change to a workspace file that runs commands; `server`: a
+/** `edit` and `exec` are Ask first's cards (#1231): a file change (or
+ *  another tool that may write) and a command that doesn't only read.
+ *  `config`: a change to a workspace file that runs commands; `server`: a
  *  project's own MCP server waiting for approval (#1245). */
-export type ApprovalKind = "mcp" | "read" | "write" | "run" | "config" | "server";
+export type ApprovalKind = "mcp" | "read" | "write" | "run" | "edit" | "exec" | "config" | "server";
 
 /** The card fields a request carries beyond its command and reason. */
 function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command" | "reason">) {
@@ -207,6 +214,8 @@ function approvalMarks(c: Omit<PendingApproval, "callId" | "threadId" | "command
     ...(c.rememberDir ? { rememberDir: c.rememberDir } : {}),
     ...(c.rememberCommand ? { rememberCommand: true } : {}),
     ...(c.planOnly ? { planOnly: true } : {}),
+    ...(c.diff ? { diff: c.diff } : {}),
+    ...(c.askFirst ? { askFirst: true } : {}),
   };
 }
 
@@ -1222,6 +1231,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     rememberDir?: string;
     rememberCommand?: boolean;
     planOnly?: boolean;
+    diff?: string;
+    askFirst?: boolean;
     trustServer?: string;
     trustTool?: string;
   }>("chat://approval-request", (ev) => {

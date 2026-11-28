@@ -296,6 +296,7 @@ fn cmd_list_terminals(state: &SharedState) -> ResponsePayload {
             running: s.running,
             cwd: s.cwd.clone(),
             started_at: s.started_at,
+            pid: s.pid.filter(|p| *p > 0),
         })
         .collect();
     ResponsePayload::Terminals { terminals }

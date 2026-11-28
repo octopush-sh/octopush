@@ -257,6 +257,14 @@ pub const ASK_DECLINED_COMMAND: &str = "Not run: the user declined this command 
 pub fn decide(mode: Mode, call: &ToolCall, ctx: &PolicyCtx) -> Decision {
     let field = |key: &str| call.input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     let refuse = |r: Refused| Decision::Deny { message: plan_refusal(r, ctx.forced) };
+    // In every mode, before any other check: a control character the shared
+    // shell's line editor would act on (`\r` ends the line there) means
+    // what runs isn't what the checks read (#1231).
+    if matches!(classify(call.name), Class::Exec) {
+        if let Some(message) = crate::chat_engine::control_refusal(&field("command")) {
+            return Decision::Deny { message };
+        }
+    }
     if ctx.ships_nothing {
         match classify(call.name) {
             Class::Exec => {
@@ -305,16 +313,41 @@ const READERS: &[&str] = &["ls", "cat", "head", "tail", "wc", "grep", "diff", "p
 const GIT_READERS: &[&str] = &["status", "diff", "log", "show", "blame", "ls-files", "rev-parse"];
 
 /// Whether every command `command` runs only reads, so Ask first runs it
-/// without a card (#1231). Read the way the command check reads commands:
-/// every nested one ([`crate::chat_engine::each_command`]), each word as the
-/// shell splits it ([`crate::chat_engine::command_words`]). Each command must
-/// start with a program in [`READERS`] (or `git` with a subcommand in
-/// [`GIT_READERS`] right after it), named plainly, and nothing may redirect
-/// output except to `/dev/null`. Anything the check can't tell asks: a
-/// variable or a path as the program, an assignment before it, a wrapper or
-/// a shell keyword, a script, or nesting past the check's caps.
+/// without a card (#1231). Only a command of [`plain_shape`] qualifies.
+/// Then it is read the way the command check reads commands: every nested
+/// one ([`crate::chat_engine::each_command`]), each word as the shell splits
+/// it ([`crate::chat_engine::command_words`]). Each command must start with a
+/// program in [`READERS`] (or `git` with a subcommand in [`GIT_READERS`]
+/// right after it), named plainly, and nothing may redirect output except to
+/// `/dev/null`. Anything the check can't tell asks: a path as the program,
+/// an assignment before it, a wrapper or a shell keyword, a script.
 pub fn reads_only(command: &str) -> bool {
-    !command.trim().is_empty() && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+    !command.trim().is_empty()
+        && crate::chat_engine::control_refusal(command).is_none()
+        && plain_shape(command)
+        && matches!(crate::chat_engine::each_command(command, |line| (!line_reads_only(line)).then_some(())), Ok(None))
+}
+
+/// Whether `command` runs `git` from outside `workspace` (#1231): `cwd` is
+/// where it starts (the shared shell's directory, or the workspace root for
+/// a command run elsewhere), resolved on the disk, links followed. Ask
+/// first's git readers skip the card only inside the workspace: elsewhere a
+/// repository's own config (`core.fsmonitor`, a bare repository's) can run
+/// code. An unknown start (`None`: a reattached shell whose directory isn't
+/// read yet) and a directory that can't be resolved count as outside.
+pub fn git_outside(command: &str, cwd: Option<&Path>, workspace: &Path) -> bool {
+    use crate::chat_engine::WordRole;
+    let runs_git = crate::chat_engine::each_command(command, |line| {
+        crate::chat_engine::command_words(line).iter().any(|w| w.role == WordRole::Program && w.word == "git").then_some(())
+    });
+    if matches!(runs_git, Ok(None)) {
+        return false;
+    }
+    let Some(cwd) = cwd else { return true };
+    match (std::fs::canonicalize(cwd), std::fs::canonicalize(workspace)) {
+        (Ok(at), Ok(workspace)) => !at.starts_with(workspace),
+        _ => true,
+    }
 }
 
 fn line_reads_only(line: &str) -> bool {
@@ -369,7 +402,7 @@ const PREVIEW_MAX_BYTES: u64 = 2_000_000;
 /// again": Edit freely is the mode for that.
 pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -> ToolCard {
     let field = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-    let card = |kind, shown: String, reason: String, denial: &str, diff| ToolCard {
+    let card = |kind, shown: String, reason: String, denial: &str, diff, bound| ToolCard {
         kind,
         shown,
         reason: crate::talk_guard::sub_agent(label, reason),
@@ -378,34 +411,159 @@ pub fn ask_card(label: Option<&str>, name: &str, input: &Value, reach: &Reach) -
         grant: None,
         trust: None,
         diff,
+        bound,
     };
     if name == "run_command" {
-        return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None);
+        return card(CardKind::Exec, field("command"), "runs a command (Ask first)".into(), ASK_DECLINED_COMMAND, None, None);
     }
     let path = field("path");
-    let marked = crate::secret_scan::is_env_file(&path) || crate::secret_scan::is_sensitive_name(&path);
     // A file in the workspace that runs commands (`talk_guard::RUNS_CODE`)
-    // keeps its preview: its own Config card asks after this one (#1245).
-    let guard = matches!(name, "write_file" | "edit_file").then(|| reach.outside_card(None, name, input, false, &[])).flatten();
-    let runs_code = guard.as_ref().is_some_and(|c| c.kind == CardKind::Config);
-    let (reason, diff) = match name {
-        "write_file" | "edit_file" if marked || (guard.is_some() && !runs_code) => {
-            ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None)
+    // keeps its preview, and says so: its own Config card asks after this
+    // one (#1245).
+    let runs_code = matches!(name, "write_file" | "edit_file")
+        && reach.outside_card(None, name, input, false, &[]).is_some_and(|c| c.kind == CardKind::Config);
+    let (reason, diff, bound) = match name {
+        "write_file" | "edit_file" if !previewed(reach, name, input, &path) => {
+            ("changes a file outside the workspace or that may hold credentials, so the card doesn't preview it".to_string(), None, None)
         }
-        "write_file" | "edit_file" => change_preview(reach.workspace(), name, input, &path),
-        _ => (format!("calls {name}, which can change files"), None),
+        "write_file" | "edit_file" => {
+            // The user's own keys are redacted too, like any credential.
+            let known = crate::secret_scan::known_secrets_from(&crate::settings::load_settings().unwrap_or_default());
+            let (reason, diff) = change_preview(reach.workspace(), name, input, &path, &known);
+            (reason, diff, Some(change_bound(&reach.workspace().join(&path), input)))
+        }
+        _ => (format!("calls {name}, which can change files"), None, None),
     };
     let reason = match runs_code {
         true => format!("{reason} \u{b7} it can make Octopush or Claude Code run commands"),
         false => reason,
     };
     let shown = if path.is_empty() { name.to_string() } else { path };
-    card(CardKind::Edit, shown, format!("{reason} (Ask first)"), ASK_DECLINED_CHANGE, diff)
+    card(CardKind::Edit, shown, format!("{reason} (Ask first)"), ASK_DECLINED_CHANGE, diff, bound)
+}
+
+/// Whether Ask first's card reads the file `name` changes at `path` to show
+/// its diff: inside the workspace, and not named like an env file or a key.
+/// A workspace file that runs commands (`talk_guard::RUNS_CODE`) keeps its
+/// preview: its own Config card asks after this one (#1245).
+fn previewed(reach: &Reach, name: &str, input: &Value, path: &str) -> bool {
+    let marked = crate::secret_scan::is_env_file(path) || crate::secret_scan::is_sensitive_name(path);
+    !marked && reach.outside_card(None, name, input, false, &[]).is_none_or(|c| c.kind == CardKind::Config)
+}
+
+/// What an Ask first approval binds to (#1231): the SHA-256 of the file at
+/// `full` as it is now (every byte, or that it can't be read) and of the
+/// call's input, which with it fixes the whole file the call leaves. The
+/// diff shows a part at most; this is all of it.
+fn change_bound(full: &Path, input: &Value) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut hasher = Sha256::new();
+    match std::fs::File::open(full) {
+        Ok(mut file) => {
+            hasher.update(b"file\0");
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => hasher.update(&buf[..n]),
+                    Err(e) => {
+                        hasher.update(format!("\0unreadable {}", e.kind()).as_bytes());
+                        break;
+                    }
+                }
+            }
+        }
+        Err(e) => hasher.update(format!("none\0{}", e.kind()).as_bytes()),
+    }
+    hasher.update(b"\0input\0");
+    hasher.update(input.to_string().as_bytes());
+    hasher.finalize().into()
+}
+
+/// The refusal a file change gets from the tool whatever the user answers,
+/// so Ask first returns it instead of a card nobody could approve (#1231):
+/// a write outside the mission's sandbox (`roots`), and an `edit_file` that
+/// can't apply to the file as it is. Read like the tool reads them, with the
+/// tool's own words; a file the card wouldn't preview isn't read here.
+pub fn refused_before_card(reach: &Reach, name: &str, input: &Value, roots: Option<&[String]>) -> Option<String> {
+    let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+    sandbox_refusal(reach, name, input, roots).or_else(|| {
+        (name == "edit_file" && previewed(reach, name, input, path)).then(|| {
+            crate::chat_engine::edit_input_problem(input).or_else(|| match std::fs::read_to_string(reach.workspace().join(path)) {
+                Ok(content) => crate::chat_engine::apply_edit(&content, input, path).err(),
+                Err(e) => Some(format!("Error reading {path}: {e}")),
+            })
+        })?
+    })
+}
+
+/// A write or edit outside a sandboxed mission's roots, in the tool's own
+/// words, or `None`: refused in every mode before any card asks about it.
+/// Lexical, like the tool's own check; nothing is read.
+pub fn sandbox_refusal(reach: &Reach, name: &str, input: &Value, roots: Option<&[String]>) -> Option<String> {
+    let verb = match name {
+        "write_file" => "write",
+        "edit_file" => "edit",
+        _ => return None,
+    };
+    let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+    let outside = roots.is_some_and(|roots| !crate::orchestrator::sandbox::is_write_allowed(&reach.workspace().join(path), roots));
+    outside.then(|| format!("Sandboxed: refusing to {verb} outside the mission workspace ({path})"))
+}
+
+/// What an Ask first card adds when the change it stood for moved while it
+/// waited, so the user sees why it asks again.
+pub const CHANGED_WHILE_WAITING: &str =
+    "The file changed while the last card waited, so that approval no longer holds: this is the change as it is now.";
+
+/// How an Ask first card ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AskOutcome {
+    Approved,
+    /// The user declined: the card's fixed result.
+    Declined(String),
+    /// Once approved, the tool would refuse the call anyway: its refusal.
+    Refused(String),
+}
+
+/// Ask about Ask first's `card` and, once it is approved, read the call
+/// again (#1231). The approval holds only for exactly the change approved:
+/// the whole file before and after (`ToolCard::bound`), not only the diff
+/// shown. A change that moved meanwhile gets a new card that says so
+/// ([`CHANGED_WHILE_WAITING`]); one the tool would now refuse (`refused`)
+/// gets that refusal and no second card.
+pub async fn guard_ask_first<C, CFut, F, Fut>(
+    mut card: ToolCard,
+    recheck: C,
+    refused: impl Fn() -> Option<String>,
+    ask: F,
+) -> AskOutcome
+where
+    C: Fn() -> CFut,
+    CFut: std::future::Future<Output = Option<ToolCard>>,
+    F: Fn(ToolCard) -> Fut,
+    Fut: std::future::Future<Output = crate::chat_engine::ApprovalDecision>,
+{
+    loop {
+        if ask(card.clone()).await == crate::chat_engine::ApprovalDecision::Deny {
+            return AskOutcome::Declined(card.denial);
+        }
+        if let Some(why) = refused() {
+            return AskOutcome::Refused(why);
+        }
+        let Some(next) = recheck().await else { return AskOutcome::Approved };
+        let same = (next.kind, &next.shown, &next.diff, next.bound) == (card.kind, &card.shown, &card.diff, card.bound);
+        if same {
+            return AskOutcome::Approved;
+        }
+        card = ToolCard { reason: format!("{} {CHANGED_WHILE_WAITING}", next.reason), ..next };
+    }
 }
 
 /// Why a file change asks, and its diff: the file at `path` under
 /// `workspace` now against what `name` would leave there.
-fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str) -> (String, Option<String>) {
+fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str, known: &[crate::secret_scan::KnownSecret]) -> (String, Option<String>) {
     let full = workspace.join(path);
     let no_preview = |why: &str| (format!("changes a file {why}, so the card doesn't preview it"), None);
     let current = match std::fs::metadata(&full) {
@@ -433,7 +591,7 @@ fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str) -> (S
         ("edit_file", _) => "edits a file",
         _ => "writes a file",
     };
-    let diff = unified_diff(current.as_deref().unwrap_or(""), &after);
+    let diff = unified_diff_redacting(current.as_deref().unwrap_or(""), &after, known);
     if diff.is_empty() {
         return (format!("{verb} without changing a line"), Some(diff));
     }
@@ -446,13 +604,18 @@ fn change_preview(workspace: &Path, name: &str, input: &Value, path: &str) -> (S
 /// at most [`DIFF_MAX_LINES`] lines with the rest counted. Empty when no
 /// line changes. Pure.
 pub fn unified_diff(old: &str, new: &str) -> String {
+    unified_diff_redacting(old, new, &[])
+}
+
+/// [`unified_diff`], with `known` (the user's own keys) redacted as well.
+pub fn unified_diff_redacting(old: &str, new: &str, known: &[crate::secret_scan::KnownSecret]) -> String {
     let (a, b): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
     let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
     let mut ops: Vec<(char, &str)> = a[..pre].iter().map(|l| (' ', *l)).collect();
     ops.extend(align(&a[pre..a.len() - suf], &b[pre..b.len() - suf]));
     ops.extend(a[a.len() - suf..].iter().map(|l| (' ', *l)));
-    hunks(&ops)
+    hunks(&ops, known)
 }
 
 /// The lines of `a` and `b` as kept (` `), removed (`-`) and added (`+`),
@@ -489,7 +652,7 @@ fn align<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(char, &'a str)> {
     ops
 }
 
-fn hunks(ops: &[(char, &str)]) -> String {
+fn hunks(ops: &[(char, &str)], known: &[crate::secret_scan::KnownSecret]) -> String {
     // Where each op stands in the old and the new file, before it.
     let (mut old_at, mut new_at) = (Vec::with_capacity(ops.len() + 1), Vec::with_capacity(ops.len() + 1));
     let (mut o, mut n) = (0usize, 0usize);
@@ -525,7 +688,7 @@ fn hunks(ops: &[(char, &str)]) -> String {
                 break 'all;
             }
             // Redacted whole, then cut, so a cut never leaves part of a value.
-            let redacted = crate::secret_scan::redact_line(line, &[]);
+            let redacted = crate::secret_scan::redact_line(line, known);
             let cut = crate::chat_engine::truncate_char_safe(&redacted, DIFF_LINE_MAX);
             let more = if cut.len() < redacted.len() { "\u{2026}" } else { "" };
             out.push(format!("{kind}{cut}{more}"));
@@ -1991,6 +2154,21 @@ pub fn thread_mode(db: &Mutex<Db>, thread_id: &str) -> Mode {
 /// A thread's stored mode, and the mode its turns run in now: Plan only
 /// when its workspace's active mission is read-only.
 pub fn thread_modes(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode) {
+    let state = thread_mode_state(db, thread_id);
+    (state.stored, state.effective)
+}
+
+/// A thread's mode as the Composer shows it (#1231): stored, in force, and
+/// whether a read-only mission forces Plan only, by the rule its turns run
+/// under ([`forced`]), whatever is stored (Plan only included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadModeState {
+    pub stored: Mode,
+    pub effective: Mode,
+    pub forced: bool,
+}
+
+pub fn thread_mode_state(db: &Mutex<Db>, thread_id: &str) -> ThreadModeState {
     let stored = thread_mode(db, thread_id);
     let db = db.lock();
     let mission = db
@@ -2000,7 +2178,7 @@ pub fn thread_modes(db: &Mutex<Db>, thread_id: &str) -> (Mode, Mode) {
         .and_then(|w| db.active_mission_for_workspace(&w).ok().flatten());
     // Only whether the roots are empty matters here, not the workspace's path.
     let roots = mission.and_then(|m| crate::orchestrator::sandbox::sandbox_write_roots(&m.git_isolation, &m.exec_isolation, ""));
-    (stored, effective(stored, roots.as_deref()))
+    ThreadModeState { stored, effective: effective(stored, roots.as_deref()), forced: forced(roots.as_deref()) }
 }
 
 /// Whether a workspace's active mission, as read, ships nothing
@@ -2167,7 +2345,7 @@ mod tests {
             "git status", "git status --porcelain", "git diff HEAD~1", "git log --oneline -5", "git show HEAD:a.rs",
             "git blame a.rs", "git ls-files", "git rev-parse HEAD",
             "cat a.rs | grep fn | head -3", "ls && git status; pwd", "grep x a.rs 2>/dev/null", "ls >/dev/null 2>&1",
-            "cat < a.rs", "echo $(git rev-parse HEAD)", "cat \"$FILE\"", "grep -c fn a.rs || echo none",
+            "cat < a.rs", "grep -c fn a.rs || echo none", "grep -n 'foo*' a.rs",
         ];
         for command in runs {
             assert!(reads_only(command), "{command} should run without a card");
@@ -2180,6 +2358,8 @@ mod tests {
             "echo x > a.rs", "cat a >> b", "ls &> out.txt", "grep x a.rs 2> err.txt",
             // A reader beside a writer, or nested in one.
             "ls; rm a.rs", "cat a.rs | tee b.rs", "echo $(rm a.rs)", "ls `touch x`", "cat <(rm -rf x)",
+            // Outside the plain shape, a reader asks too (`plain_shape`).
+            "echo $(git rev-parse HEAD)", "cat \"$FILE\"",
             // git that writes, or git flags before the subcommand.
             "git commit -m x", "git push", "git checkout main", "git branch -D x", "git -c core.pager=x log",
             "git -C .. status", "git diff --output=patch.txt", "git log --output patch.txt", "git diff --ext-diff",
@@ -2192,6 +2372,135 @@ mod tests {
             assert!(!reads_only(command), "{command} should ask");
         }
         assert!(!reads_only(&format!("echo {}", "$(".repeat(6))), "past the nesting it reads, it asks");
+    }
+
+    /// The shared shell's line editor acts on control characters as keys
+    /// (`\r` ends the line, DEL erases), so a command holding one is
+    /// refused before any check, in every mode: `echo hi\rtouch x` would
+    /// run `touch` with no card.
+    #[test]
+    fn a_control_character_is_refused_in_every_mode_before_any_check() {
+        let ro = HashSet::new();
+        let refused = |mode: Mode, command: &str| {
+            let input = json!({ "command": command });
+            match decide(mode, &ToolCall { name: "run_command", input: &input }, &ctx(None, &ro, false)) {
+                Decision::Deny { message } => Some(message),
+                _ => None,
+            }
+        };
+        for mode in [Mode::Plan, Mode::Ask, Mode::Edit] {
+            let why = refused(mode, "echo hi\rtouch x").unwrap_or_else(|| panic!("{mode:?} let it through"));
+            assert!(why.starts_with("Not run: the command holds the control character U+000D (carriage return)"), "{why}");
+            let plain = refused(mode, "ls\t-la\nls");
+            assert!(plain.is_none_or(|m| !m.contains("control character")), "{mode:?}: a tab and a newline pass");
+        }
+        assert!(!reads_only("echo hi\rtouch x"), "the reader check reads `\\r` as a space; readline ends the line there");
+        // Edit freely's command check is fooled the same way: readline's
+        // DEL erases the `x`, so `rm -rf /` runs.
+        assert_eq!(crate::chat_engine::dangerous_command("rx\u{7f}m -rf /"), None);
+        assert!(refused(Mode::Edit, "rx\u{7f}m -rf /").is_some_and(|w| w.contains("U+007F (delete)")));
+        for (command, named) in [("ls\u{1b}[A", "U+001B (escape)"), ("ls\u{3}", "U+0003 (Ctrl-C)"), ("ls\u{4}", "U+0004 (Ctrl-D)"), ("ls\u{15}", "U+0015 (Ctrl-U)"), ("ls\u{0}", "U+0000"), ("ls\u{9b}", "U+009B")] {
+            assert!(refused(Mode::Edit, command).is_some_and(|w| w.contains(named)), "{command:?}");
+        }
+    }
+
+    /// A line continued with `\` can hide an expansion from the reader
+    /// check: bash joins `$\⏎{PWD:_}` into `${PWD:_}`, which runs `touch`.
+    #[test]
+    fn a_line_continuation_asks() {
+        for command in ["echo $'a[\\x24(touch x)]'; echo $\\\n{PWD:_}", "echo $'a[\\x24(touch x)]'; echo $\\\n[_]", "ls \\\n-la"] {
+            assert!(!reads_only(command), "{command:?} should ask");
+        }
+        // `$'\x24'` decodes to a plain `$`, which bash never expands again;
+        // it still asks, as anything with a `$` does (`plain_shape`).
+        assert!(!reads_only("echo $'\\x24'{PWD:_}"));
+        let dir = tempfile::tempdir().unwrap();
+        let run = |command: &str| std::process::Command::new("/bin/bash").arg("-c").arg(command).current_dir(dir.path()).output().unwrap();
+        run("echo 'a[$(touch x)]' >/dev/null; echo $'\\x24'{PWD:_} >/dev/null; echo $'\\x24(touch y)' >/dev/null");
+        assert!(!dir.path().join("x").exists() && !dir.path().join("y").exists(), "bash ran a decoded `$`");
+        run("echo $'a[\\x24(touch z)]' >/dev/null; echo $\\\n{PWD:_} >/dev/null");
+        assert!(dir.path().join("z").exists(), "the continuation does run it: the case the check asks for");
+    }
+
+    /// Only a command of the plain shape runs without Ask first's card: no
+    /// `$`, backtick, brace, backslash, `!` or `<<`. Brace expansion builds
+    /// `${PWD:_}` from `{$,}{PWD:_}`, whose arithmetic runs what `$_` holds.
+    #[test]
+    fn only_a_plain_shape_reads() {
+        for command in [
+            // Brace expansion builds `${PWD:_}`: bash ran `touch` from this one.
+            "echo $'a[\\x24(touch x)]'; echo {$,}{PWD:_}",
+            "echo {$,}{PWD:_}",
+            "echo 'a[$(touch x)]'; echo $_",
+            "echo ${x:-a.rs}",
+            "echo $((1+1))",
+            "echo 'a[$(touch x)]'; echo ${PWD:_}",
+            "echo ${a[_]}",
+            "echo $[_]",
+            "cat ${!_}",
+            "cat \"${FILE}\"",
+            "echo ${#PATH}",
+            "ls {a,b}.rs",
+            "grep x '${a[_]}'",
+            "echo hi!",
+            "grep 'a\\.b' a.rs",
+            "cat <<EOF",
+            // A glob or a tilde expands into words the check never read.
+            "git diff *",
+            "git lfs pu?h",
+            "grep -n foo src/*.rs",
+            "ls [ab].rs",
+            "cat ~/.bashrc",
+            "ls ~",
+            "echo 'open",
+            // An alias or a function changes what a later word runs.
+            "f() ( touch x ); f",
+            "alias ls=touch",
+            "unalias ls",
+            "function git",
+            "(ls)",
+        ] {
+            assert!(!plain_shape(command) && !reads_only(command), "{command} should ask");
+        }
+        for command in ["grep -n 'foo*' a.rs", "cat 'a*b' \"c?d\" '[x]' '~'", "git diff HEAD~1", "cat a.rs | head -3", "ls -la src > /dev/null 2>&1"] {
+            assert!(plain_shape(command) && reads_only(command), "{command} should run without a card");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ran = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg("echo $'a[\\x24(touch x)]' >/dev/null; echo {$,}{PWD:_} >/dev/null")
+            .current_dir(dir.path())
+            .status();
+        assert!(ran.is_ok_and(|s| s.success()) && dir.path().join("x").exists(), "bash runs it: the case the shape asks for");
+        // A glob expands into a flag: beside a file named `--output=x`, `git
+        // diff *` writes `x`.
+        let repo = tempfile::tempdir().unwrap();
+        let sh = |script: &str| std::process::Command::new("/bin/bash").arg("-c").arg(script).current_dir(repo.path()).output();
+        if sh("git init -q . && : > a && : > ./--output=x").is_ok_and(|o| o.status.success()) {
+            let _ = sh("git diff *");
+            assert!(repo.path().join("x").exists(), "git diff * wrote through a file named like a flag");
+        }
+    }
+
+    /// A git reader skips the card only where it starts inside the
+    /// workspace, resolved on the disk.
+    #[test]
+    fn a_git_reader_outside_the_workspace_asks() {
+        let (ws, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::create_dir(ws.path().join("sub")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(other.path(), ws.path().join("out")).unwrap();
+        let w = ws.path();
+        assert!(!git_outside("git status", Some(w), w), "at the workspace root");
+        assert!(git_outside("git status", None, w), "an unknown start (a reattached shell) asks");
+        assert!(!git_outside("cat a.rs", None, w), "only git is held");
+        assert!(!git_outside("git log -1", Some(&w.join("sub")), w));
+        assert!(git_outside("git status", Some(other.path()), w));
+        assert!(git_outside("ls && git diff", Some(other.path()), w), "any git in the command");
+        assert!(git_outside("git status", Some(&w.join("missing")), w), "unresolvable counts as outside");
+        #[cfg(unix)]
+        assert!(git_outside("git status", Some(&w.join("out")), w), "a link out of the workspace is outside");
+        assert!(!git_outside("cat a.rs", Some(other.path()), w), "only git is held");
     }
 
     fn workspace_reach(files: &[(&str, &str)]) -> (tempfile::TempDir, tempfile::TempDir, Reach) {
@@ -2326,6 +2635,93 @@ mod tests {
         assert_eq!(guard_card(check().unwrap(), || std::future::ready(check()), approve).await, None, "approved again, it runs");
         let shown = shown.into_inner();
         assert_eq!(shown, ["@@ -1,1 +1,1 @@\n-old\n+new", "@@ -1,1 +1,1 @@\n-changed meanwhile\n+new"]);
+    }
+
+    /// The approval binds to the whole change, not the diff shown: a line
+    /// far past the preview that changes while the card waits asks again,
+    /// and the new card says why. A cut diff says how many lines it hides.
+    #[tokio::test]
+    async fn an_approval_binds_to_the_whole_change_not_the_diff_shown() {
+        use crate::chat_engine::ApprovalDecision;
+        let long: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let (ws, _home, reach) = workspace_reach(&[("a.txt", &long)]);
+        let edit = json!({ "path": "a.txt", "old_string": "line 0\n", "new_string": "first\n" });
+        let check = || ask_card(None, "edit_file", &edit, &reach);
+        let first = check();
+        let asked = Mutex::new(Vec::<String>::new());
+        let approve = |c: ToolCard| {
+            asked.lock().push(c.reason.clone());
+            if asked.lock().len() == 1 {
+                std::fs::write(ws.path().join("a.txt"), long.replace("line 900\n", "line 900, edited\n")).unwrap();
+            }
+            std::future::ready(ApprovalDecision::Approve)
+        };
+        let recheck = || std::future::ready(Some(check()));
+        assert_eq!(guard_ask_first(first.clone(), recheck, || None, approve).await, AskOutcome::Approved);
+        let asked = asked.into_inner();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert_eq!(asked[1], format!("{} {CHANGED_WHILE_WAITING}", first.reason));
+        let now = ask_card(None, "edit_file", &edit, &reach);
+        assert_eq!(now.diff, first.diff, "the diff shown is the same");
+        assert_ne!(now.bound, first.bound, "the change isn't");
+        // A rewrite too long to show says how many lines it leaves out.
+        let all: String = (0..1000).map(|i| format!("new {i}\n")).collect();
+        let big = ask_card(None, "write_file", &json!({ "path": "a.txt", "content": all }), &reach);
+        assert!(big.diff.as_deref().is_some_and(|d| d.lines().last().is_some_and(|l| l.starts_with('\u{2026}') && l.ends_with(" more lines"))), "{:?}", big.diff);
+    }
+
+    /// A change the tool refuses whatever the user answers gets that
+    /// refusal, in the tool's words, and never a card; once approved, one the
+    /// tool would now refuse gets the refusal, not a second card.
+    #[tokio::test]
+    async fn a_change_the_tool_would_refuse_gets_no_card() {
+        use crate::chat_engine::ApprovalDecision;
+        let (ws, _home, reach) = workspace_reach(&[("a.rs", "one\n"), (".env", "A=1\n")]);
+        let refused = |name: &str, input: Value, roots: Option<&[String]>| refused_before_card(&reach, name, &input, roots);
+        let edit = |path: &str, old: &str| json!({ "path": path, "old_string": old, "new_string": "x" });
+        assert!(refused("edit_file", edit("a.rs", "two"), None).is_some_and(|r| r.starts_with("old_string not found in a.rs")));
+        assert!(refused("edit_file", edit("b.rs", "one"), None).is_some_and(|r| r.starts_with("Error reading b.rs:")));
+        assert_eq!(refused("edit_file", edit("a.rs", ""), None).as_deref(), Some("edit_file needs a non-empty `old_string`"));
+        let roots = [ws.path().to_string_lossy().into_owned()];
+        let outside = json!({ "path": "../elsewhere.txt", "content": "x" });
+        assert_eq!(
+            refused("write_file", outside.clone(), Some(&roots)).as_deref(),
+            Some("Sandboxed: refusing to write outside the mission workspace (../elsewhere.txt)")
+        );
+        assert_eq!(refused("write_file", outside, None), None, "unconfined, the outside card asks");
+        assert_eq!(
+            refused("edit_file", json!({ "path": "../elsewhere.txt", "old_string": "a", "new_string": "b" }), Some(&roots)).as_deref(),
+            Some("Sandboxed: refusing to edit outside the mission workspace (../elsewhere.txt)"),
+            "an edit outside the sandbox, which the card wouldn't preview, is refused too"
+        );
+        let outside_edit = json!({ "path": "../elsewhere.txt", "old_string": "a", "new_string": "b" });
+        assert!(sandbox_refusal(&reach, "edit_file", &outside_edit, Some(&roots)).is_some(), "in every mode");
+        assert_eq!(sandbox_refusal(&reach, "edit_file", &edit("a.rs", "two"), Some(&roots)), None, "only the sandbox's refusal");
+        assert_eq!(refused("edit_file", edit("a.rs", "one"), Some(&roots)), None, "an edit that applies");
+        assert_eq!(refused("edit_file", edit(".env", "B"), None), None, "a file the card won't read isn't read here");
+        // Approved, then the edit stopped applying: its refusal, asked once.
+        let input = edit("a.rs", "one");
+        let check = || ask_card(None, "edit_file", &input, &reach);
+        let asked = Mutex::new(0);
+        let approve = |_: ToolCard| {
+            *asked.lock() += 1;
+            std::fs::write(ws.path().join("a.rs"), "replaced\n").unwrap();
+            std::future::ready(ApprovalDecision::Approve)
+        };
+        let now = || refused_before_card(&reach, "edit_file", &input, None);
+        let outcome = guard_ask_first(check(), || std::future::ready(Some(check())), now, approve).await;
+        assert!(matches!(&outcome, AskOutcome::Refused(r) if r.starts_with("old_string not found")), "{outcome:?}");
+        assert_eq!(*asked.lock(), 1);
+    }
+
+    /// The user's own keys are redacted from a diff like any credential.
+    #[test]
+    fn a_diff_redacts_the_users_own_keys() {
+        let key = "sample-own-key-0123456789abcdef";
+        let known = [crate::secret_scan::KnownSecret::new("your sample API key", key)];
+        let diff = unified_diff_redacting("", &format!("note {key}\n"), &known);
+        assert!(diff.starts_with("@@ -0,0 +1,1 @@\n+note ") && !diff.contains(key), "{diff}");
+        assert!(unified_diff("", &format!("note {key}\n")).contains(key), "no pattern marks it: only the known key does");
     }
 
     /// A mode change during a turn applies at the next round, where the
@@ -3283,6 +3679,13 @@ mod tests {
         db.lock().insert_mission("m-ro", Some("w-eff"), "p-eff", "review", "Review it", "active", None, "readonly", "none", "{}").unwrap();
         assert_eq!(thread_modes(&db, &thread), (Mode::Edit, Mode::Plan), "the mission forces Plan only");
         assert_eq!(thread_modes(&db, "gone"), (Mode::Edit, Mode::Edit));
+        // The Composer reads `forced` from this rule, Plan only stored too
+        // (#1231): its control locks, and offers no mode the turns won't run.
+        let state = |db: &Mutex<Db>| thread_mode_state(db, &thread);
+        assert_eq!(state(&db), ThreadModeState { stored: Mode::Edit, effective: Mode::Plan, forced: true });
+        db.lock().set_thread_permission_mode(&thread, Mode::Plan).unwrap();
+        assert_eq!(state(&db), ThreadModeState { stored: Mode::Plan, effective: Mode::Plan, forced: true }, "stored=plan under a read-only mission");
+        assert!(!thread_mode_state(&db, "gone").forced);
     }
 
     /// A Plan only command runs off the turn's runtime thread and stops with
@@ -3320,9 +3723,14 @@ mod tests {
         for call in [
             "let exec_roots = crate::permissions::exec_roots(mode, sandbox_roots.as_deref());",
             "match crate::permissions::decide(mode, &call, &ctx) {",
-            "if mode_asks.contains(&u.id) && skill_refusal.is_none() {",
+            "let git_outside = mode == crate::permissions::Mode::Ask && !mode_denied && u.name == \"run_command\" && {",
+            "crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))",
+            "let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();",
+            "if held && pre_refused.is_none() {",
             "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
             "if !reach.checked(&granted).await {",
+            "match crate::permissions::guard_ask_first(card, &check, refused, ask).await {",
+            "None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,",
             "forced: crate::permissions::forced(sandbox_roots.as_deref()),",
             "let parsed = match mode_denials.get(&u.id) {",
             "let mut denied: Option<String> = mode_denials.get(&u.id).filter(|_| !is_agent).cloned();",
@@ -3356,13 +3764,28 @@ mod tests {
         let attempts: Vec<&str> = run.lines().filter(|l| l.contains("run_attempt(")).collect();
         assert_eq!(attempts.len(), 3, "{attempts:?}");
         assert!(attempts.iter().all(|l| l.contains("&sink, &tool_gate, external_ref")), "an attempt skips the mode gate: {attempts:?}");
+        // In Ask first no "don't ask again" answers a card (#1231): every
+        // card the director and a sub-agent gate raise carries the mode.
+        assert_eq!(body.matches("self.approvals.await_card(").count(), body.matches(", c, mode)").count(), "{body}");
+        assert!(body.contains("command, reason, grant, mode)"), "the destructive-command card");
+        let at = agents.find("impl ToolGate for SubagentGate").expect("the sub-agent gate");
+        let gate = &agents[at..at + agents[at..].find("\n}\n").unwrap()];
+        assert_eq!(gate.matches("self.broker.await_card(").count(), gate.matches(", c, mode)").count(), "{gate}");
+        assert!(gate.contains("&card_reason, grant, mode)"), "{gate}");
         // The thread's shell runs strict in a mission that ships nothing,
-        // for the agent's commands and the `$` ones alike.
+        // and in Ask first and Plan only (#1231), for the agent's commands
+        // and the `$` ones alike.
         let at = engine.find("fn prepare_shell(").expect("the shell's preparation");
         let prepare = &engine[at..at + engine[at..].find("\n    }\n").unwrap()];
-        assert!(prepare.contains("self.talk_shell.set_strict(thread_id, crate::permissions::mission_ships_nothing(&mission));"));
+        for line in [
+            "let (_, mode) = crate::permissions::thread_modes(&self.db, thread_id);",
+            "let why = crate::talk_shell::StrictFor::of(crate::permissions::mission_ships_nothing(&mission), mode);",
+            "self.talk_shell.set_strict_for(thread_id, why);",
+        ] {
+            assert!(prepare.contains(line), "{line}");
+        }
         assert!(body.contains("self.prepare_shell(&request.workspace_id, &request.thread_id);"), "the agent's commands");
-        assert!(body.contains("Ok(Err(AppError::Other(m))) if m.starts_with(crate::talk_shell::STRICT_SHELL_REFUSED) => (m, false),"), "no fallback runs it");
+        assert!(body.contains("Ok(Err(AppError::Other(m))) if crate::talk_shell::strict_refusal(&m) => (m, false),"), "no fallback runs it");
         assert_eq!(engine.matches("self.prepare_shell(&request.workspace_id, &request.thread_id);").count(), 2, "and `$` commands");
     }
 }
