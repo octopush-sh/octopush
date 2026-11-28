@@ -126,6 +126,8 @@ struct Session {
     cwd: String,
     /// Per-session random token mixed into the prompt marker.
     nonce: String,
+    /// [`apply_strict_shell`] ran in it: no alias or profile function left.
+    strict: bool,
 }
 
 pub struct TalkShell {
@@ -134,6 +136,9 @@ pub struct TalkShell {
     /// Per thread, the variables its shell is spawned with besides PATH (the
     /// workspace's ports, #1219). A shell already running keeps its env.
     spawn_env: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Threads in Ask first or Plan only (#1231): their shell is made strict
+    /// ([`apply_strict_shell`]) before it runs anything.
+    strict: Mutex<std::collections::HashSet<String>>,
 }
 
 impl TalkShell {
@@ -142,7 +147,33 @@ impl TalkShell {
             client: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             spawn_env: Mutex::new(HashMap::new()),
+            strict: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Whether the thread's shell must be strict (#1231): Ask first and Plan
+    /// only want it, read at each round. A shell made strict stays so until
+    /// it restarts, whatever the mode is set to after.
+    pub fn set_strict(&self, thread_id: &str, want: bool) {
+        let mut strict = self.strict.lock();
+        if want {
+            strict.insert(thread_id.to_string());
+        } else {
+            strict.remove(thread_id);
+        }
+    }
+
+    /// Whether the thread's next command is sure to run in a strict shell:
+    /// it is wanted, and [`Self::run`] makes the shell strict before it runs
+    /// anything or runs nothing. Until then no command reads as read-only.
+    pub fn strict_wanted(&self, thread_id: &str) -> bool {
+        self.strict.lock().contains(thread_id)
+    }
+
+    /// Whether the thread's shell has been made strict.
+    #[cfg(test)]
+    pub fn is_strict(&self, thread_id: &str) -> bool {
+        self.sessions.lock().get(thread_id).is_some_and(|h| h.lock().strict)
     }
 
     /// Set the variables the thread's shell starts with the next time it is
@@ -213,6 +244,20 @@ impl TalkShell {
             };
             (rx, session.nonce.clone(), session.id.clone(), session.cwd.clone())
         };
+
+        // Ask first and Plan only (#1231): the shell is made strict before it
+        // runs anything, on start, on reattach and after a switch into them;
+        // if it can't be, nothing runs.
+        if self.strict_wanted(thread_id) && !handle.lock().strict {
+            if !apply_strict_shell(&client, &id, &rx, &nonce) {
+                handle.lock().rx = Some(rx);
+                return Err(AppError::Other(
+                    "Talk couldn't clear this shell's aliases and functions for the conversation's mode, so nothing ran."
+                        .into(),
+                ));
+            }
+            handle.lock().strict = true;
+        }
 
         // Discard any stale bytes (the idle prompt left in the buffer) so the
         // next prompt marker we see is unambiguously THIS command's completion.
@@ -409,6 +454,7 @@ impl TalkShell {
                     rx: Some(rx),
                     cwd: ready_cwd.unwrap_or_else(|| cwd.to_string()),
                     nonce,
+                    strict: false,
                 })
             }
             // Reattached but never ready — the surviving shell is busy with a
@@ -491,6 +537,32 @@ fn apply_git_hardening(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermE
     if !matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. }) {
         tracing::warn!(id, "talk shell did not confirm git's hardening");
     }
+}
+
+/// The line that makes a Talk shell strict ([`apply_strict_shell`]): no
+/// alias, alias expansion off, and every function unset but Octopush's own
+/// prompt functions (`__octo_*`). Each builtin is named as `\builtin` so an
+/// alias of its name can't stand in.
+const STRICT_SHELL_LINE: &str = "__octo_strict() { \\builtin unalias -a; \\builtin shopt -u expand_aliases; \\builtin local f; \
+    while \\builtin read -r _ _ f; do case \"$f\" in __octo_*) ;; *) \\builtin unset -f \"$f\" ;; esac; done < <(\\builtin declare -F); }; \
+    __octo_strict; \\builtin unset -f __octo_strict\n";
+
+/// Make the shell strict for Ask first and Plan only (#1231), as git's
+/// hardening is given (see [`apply_git_hardening`]): `bash -l` loads the
+/// user's profile, whose aliases and functions can turn a word the reader
+/// check counts as read-only (`ls`, `git`) into a writer. Runs `unalias -a`,
+/// `shopt -u expand_aliases` and `unset -f` for each function `declare -F`
+/// lists. `true` once the shell confirms it.
+fn apply_strict_shell(client: &Arc<DaemonClient>, id: &str, rx: &Receiver<TermEvent>, nonce: &str) -> bool {
+    drain_pending(rx);
+    if client.write(id, STRICT_SHELL_LINE.as_bytes()).is_err() {
+        return false;
+    }
+    let done = matches!(probe(rx, Duration::from_secs(5), nonce), Probe::Done { .. });
+    if !done {
+        tracing::warn!(id, "talk shell did not confirm it was made strict");
+    }
+    done
 }
 
 impl LiveRun {
@@ -842,6 +914,20 @@ mod tests {
     const N: &str = "abc123";
 
     /// A `cd` goes where the path check reads it (#1229): no `CDPATH`.
+    #[test]
+    fn a_strict_shell_is_wanted_in_ask_first_and_plan_only_and_drops_aliases_and_functions() {
+        let shell = TalkShell::new();
+        assert!(!shell.strict_wanted("t"), "Edit freely: the profile stands");
+        shell.set_strict("t", true);
+        assert!(shell.strict_wanted("t") && !shell.strict_wanted("other"));
+        shell.set_strict("t", false);
+        assert!(!shell.strict_wanted("t"));
+        for part in ["\\builtin unalias -a", "\\builtin shopt -u expand_aliases", "\\builtin declare -F", "\\builtin unset -f \"$f\"", "__octo_*) ;;"] {
+            assert!(STRICT_SHELL_LINE.contains(part), "{part}");
+        }
+        assert!(STRICT_SHELL_LINE.ends_with("\\builtin unset -f __octo_strict\n"));
+    }
+
     #[test]
     fn the_shell_runs_without_cdpath() {
         assert!(SHELL_INPUT_AS_WRITTEN.starts_with("set +H; unset CDPATH;"), "{SHELL_INPUT_AS_WRITTEN}");
@@ -1358,6 +1444,38 @@ mod e2e {
             assert_eq!(crate::chat_engine::grants_where(true, shell.cwd("oldcwd").as_deref(), vec![grant.clone()]), vec![grant.clone()]);
             assert_eq!(crate::chat_engine::grants_where(false, None, vec![grant.clone()]).len(), 1, "off the shared shell, it starts at the root");
             shell.close("oldcwd");
+        });
+    }
+
+    /// In Ask first and Plan only the shell drops the profile's aliases and
+    /// functions before it runs anything (#1231), so an aliased `ls` or a
+    /// function named `git` can't write behind a read-only verdict. A switch
+    /// into those modes applies it at the next command.
+    #[test]
+    #[serial]
+    fn a_strict_shell_runs_the_real_ls_and_git() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let _d = boot();
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().to_string_lossy().into_owned();
+        let quick = Duration::from_secs(20);
+        with_login_shell_env(&[], || {
+            let shell = shell_on(&_d.sock);
+            // Edit freely: the profile's alias and function stand.
+            let plant = format!("cd '{at}' && alias ls='touch by-alias' && git() {{ touch by-function; }}");
+            done(shell.run("strict", &at, &plant, quick, false).unwrap());
+            assert!(!shell.is_strict("strict"));
+            // Switched into Ask first: made strict before the next command.
+            shell.set_strict("strict", true);
+            let r = cap(shell.run_capture("strict", &at, "ls >/dev/null; git status >/dev/null 2>&1; type -t ls git; true", quick).unwrap());
+            assert!(shell.is_strict("strict"));
+            assert!(!dir.path().join("by-alias").exists() && !dir.path().join("by-function").exists(), "{}", r.output);
+            assert_eq!(r.output.lines().collect::<Vec<_>>(), ["file", "file"], "the real programs");
+            // Back to Edit freely: the aliases stay gone until the shell restarts.
+            shell.set_strict("strict", false);
+            let r = cap(shell.run_capture("strict", &at, "type -t ls", quick).unwrap());
+            assert_eq!(r.output.trim(), "file");
+            shell.close("strict");
         });
     }
 

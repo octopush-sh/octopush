@@ -272,25 +272,36 @@ pub fn reads_only(command: &str) -> bool {
 /// The characters a command [`plain_shape`] never holds: every way into an
 /// expansion (`$`, a backtick, `{` and `}` of a brace expansion), quoting
 /// that changes what the next character means (`\`), history expansion
-/// (`!`), and a here-document (`<<`, checked as a pair).
-const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!'];
+/// (`!`), and the parentheses of a subshell or a function (`(`, `)`).
+const NOT_PLAIN: &[char] = &['$', '`', '{', '}', '\\', '!', '(', ')'];
+
+/// Words a command [`plain_shape`] never holds: they define or drop an alias
+/// or a function, which changes what a later word runs.
+const NOT_PLAIN_WORDS: &[&str] = &["alias", "function", "unalias"];
 
 /// Whether `command` has the plain shape Ask first lets run without a card:
-/// none of [`NOT_PLAIN`] anywhere in its raw text, quoted or not; no `<<`;
-/// outside quotes no `*`, `?` or `[`, and no word that starts with `~`; and
-/// every quote closed. A whitelist on purpose, not a list of tricks: bash
-/// builds code from many shapes a reader check doesn't model (`{$,}{PWD:_}`
-/// makes `${PWD:_}` by brace expansion, whose arithmetic runs the command
-/// `$_` holds after `echo $'a[\x24(touch x)]'`; `$\⏎{` joins a line;
-/// `$((…))`, `${x:-…}`), and each new one was a bypass. A glob or a tilde
-/// expands into words the check never read, flags included: `git diff *`
-/// beside a file named `--output=x` writes `x`, and `git lfs pu?h` can match
-/// `push`. Quoted, a glob is literal. Without these no expansion,
-/// substitution, globbing or line join can happen, so what the check reads
-/// is what runs. A command outside the shape only gets Ask first's card.
-/// Pure.
+/// none of [`NOT_PLAIN`] anywhere in its raw text, quoted or not; no `<<`
+/// (a here-document); none of [`NOT_PLAIN_WORDS`]; outside quotes no `*`,
+/// `?` or `[` and no word that starts with `~`; and every quote closed.
+///
+/// A whitelist on purpose, not a list of tricks: bash builds code from many
+/// shapes a reader check doesn't model, and each new one was a bypass.
+/// `{$,}{PWD:_}` makes `${PWD:_}` by brace expansion, whose arithmetic runs
+/// the command `$_` holds after `echo $'a[\x24(touch x)]'`; `$\⏎{` joins a
+/// line; `$((…))` and `${x:-…}` expand. A glob or a tilde expands into words
+/// the check never read, flags included: `git diff *` beside a file named
+/// `--output=x` writes `x`, and `git lfs pu?h` can match `push` (quoted, a
+/// glob is literal). A function or an alias gives a word a new meaning
+/// (`f() ( touch x ); f`). Without these no expansion, substitution,
+/// globbing, line join or new definition can happen, so what the check
+/// reads is what runs. A command outside the shape only gets Ask first's
+/// card. Pure.
 pub fn plain_shape(command: &str) -> bool {
     if command.contains(NOT_PLAIN) || command.contains("<<") {
+        return false;
+    }
+    let separator = |c: char| c.is_whitespace() || ";|&<>".contains(c);
+    if command.split(separator).any(|w| NOT_PLAIN_WORDS.contains(&w)) {
         return false;
     }
     let mut quote: Option<char> = None;
@@ -1258,6 +1269,12 @@ mod tests {
             "cat ~/.bashrc",
             "ls ~",
             "echo 'open",
+            // An alias or a function changes what a later word runs.
+            "f() ( touch x ); f",
+            "alias ls=touch",
+            "unalias ls",
+            "function git",
+            "(ls)",
         ] {
             assert!(!plain_shape(command) && !reads_only(command), "{command} should ask");
         }
@@ -1875,7 +1892,9 @@ mod tests {
             "match crate::permissions::decide(mode, &call, &ctx) {",
             "let git_outside = mode == crate::permissions::Mode::Ask && !mode_denied && u.name == \"run_command\" && {",
             "crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))",
-            "let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();",
+            "let held = (mode_asks.contains(&u.id) || git_outside || loose_shell) && skill_refusal.is_none();",
+            "&& !self.talk_shell.strict_wanted(&request.thread_id);",
+            "matches!(mode, crate::permissions::Mode::Ask | crate::permissions::Mode::Plan),",
             "if held && pre_refused.is_none() {",
             "let ask_place = || Some(crate::permissions::ask_card(None, &u.name, &u.input, &reach));",
             "if !reach.checked(&granted).await {",
