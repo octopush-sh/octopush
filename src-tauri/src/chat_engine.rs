@@ -597,7 +597,127 @@ fn not_found_note(output: &str) -> String {
 /// level. A command word is matched by its basename (`/bin/rm`), with quotes
 /// dropped.
 pub(crate) fn dangerous_command(command: &str) -> Option<&'static str> {
+    // A line continued with `\` reads as the shell joins it (#1231): `rm -r\⏎f`
+    // is `rm -rf`. Where the join can't be followed, it asks.
+    if command.contains("\\\n") {
+        match bash_joined(command) {
+            Some(joined) => {
+                if let Some(reason) = each_command(&joined, dangerous_line).unwrap_or(Some(TOO_NESTED)) {
+                    return Some(reason);
+                }
+            }
+            None => return Some(UNFOLLOWED_CONTINUATION),
+        }
+    }
     each_command(command, dangerous_line).unwrap_or(Some(TOO_NESTED))
+}
+
+/// The reason when a command continues a line with `\` where the check
+/// can't follow the join (a here-document, a nested command or backticks in
+/// it).
+const UNFOLLOWED_CONTINUATION: &str = "continues a line with a backslash where the check can't follow it";
+
+/// `command` as bash reads it once each line continuation (`\` then a
+/// newline) is removed, or `None` where this can't be sure: bash removes it
+/// unquoted and in double quotes, keeps it in single quotes, in `$'…'` and
+/// in a comment. A here-document, a `$(…)`, `${…}` or backtick inside double
+/// quotes, or backticks anywhere change how quotes nest, so they give
+/// `None`, as does a quote left open. Pure.
+pub(crate) fn bash_joined(command: &str) -> Option<String> {
+    #[derive(PartialEq)]
+    enum At {
+        Plain,
+        Single,
+        AnsiC,
+        Double,
+        Comment,
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut at = At::Plain;
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        let next = chars.get(i + 1).copied();
+        match at {
+            At::Plain => match c {
+                '\\' if next == Some('\n') => {
+                    i += 2;
+                    continue;
+                }
+                '\\' => {
+                    out.push(c);
+                    out.extend(next);
+                    i += 2;
+                    continue;
+                }
+                '\'' => at = At::Single,
+                '$' if next == Some('\'') => {
+                    out.push_str("$'");
+                    at = At::AnsiC;
+                    i += 2;
+                    continue;
+                }
+                '"' => at = At::Double,
+                '`' => return None,
+                '<' if next == Some('<') => return None,
+                '#' if out.chars().last().is_none_or(|p| p.is_whitespace() || ";|&()<>".contains(p)) => at = At::Comment,
+                _ => {}
+            },
+            At::Single if c == '\'' => at = At::Plain,
+            At::AnsiC if c == '\\' => {
+                out.push(c);
+                out.extend(next);
+                i += 2;
+                continue;
+            }
+            At::AnsiC if c == '\'' => at = At::Plain,
+            At::Double => match c {
+                '\\' if next == Some('\n') => {
+                    i += 2;
+                    continue;
+                }
+                '\\' => {
+                    out.push(c);
+                    out.extend(next);
+                    i += 2;
+                    continue;
+                }
+                '"' => at = At::Plain,
+                '`' => return None,
+                '$' if matches!(next, Some('(' | '{')) => return None,
+                _ => {}
+            },
+            At::Comment if c == '\n' => at = At::Plain,
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    matches!(at, At::Plain | At::Comment).then_some(out)
+}
+
+/// What an agent command gets when it holds a control character the shell
+/// would take as a keystroke (#1231), or `None`. The command is typed into
+/// the shared shell's line editor, where `\r` ends the line and `\x15`
+/// erases it, so what would run isn't what every check read. Only a tab
+/// and a newline pass, in every mode. Pure.
+pub(crate) fn control_refusal(command: &str) -> Option<String> {
+    let c = command.chars().find(|&c| c.is_control() && c != '\t' && c != '\n')?;
+    let named = match c {
+        '\r' => " (carriage return)",
+        '\x1b' => " (escape)",
+        '\x03' => " (Ctrl-C)",
+        '\x04' => " (Ctrl-D)",
+        '\x15' => " (Ctrl-U)",
+        '\x7f' => " (delete)",
+        _ => "",
+    };
+    Some(format!(
+        "Not run: the command holds the control character U+{:04X}{named}, which the shell would take as a keystroke, \
+         so what ran wouldn't be what was checked. Nothing ran. Write the command without control characters; \
+         to produce one, use an escape such as printf '\\r'.",
+        c as u32
+    ))
 }
 
 /// How deep [`each_command`] follows commands nested in commands.
@@ -1660,6 +1780,9 @@ struct Offer {
     trust: Option<crate::talk_guard::TrustOffer>,
     /// An Ask first card's diff (#1231).
     diff: Option<String>,
+    /// The conversation is in Ask first (#1231): the card offers no "don't
+    /// ask again" and no MCP trust.
+    ask_first: bool,
 }
 
 impl Offer {
@@ -1669,6 +1792,33 @@ impl Offer {
             Some(g) => Offer { dir: Some(g.shown.clone()), plan_only, ..Offer::default() },
             None => Offer { plan_only, ..Offer::default() },
         }
+    }
+}
+
+/// The grants a command may match where it starts (#1231): none in a shared
+/// shell (`shared`) whose directory isn't known yet (`cwd` `None`: a shell
+/// reattached after a restart, before it reports where it is), which may sit
+/// anywhere. A grant is bound to its folder; an unknown one never matches,
+/// and the card asks. Pure.
+pub(crate) fn grants_where(shared: bool, cwd: Option<&str>, grants: Vec<Grant>) -> Vec<Grant> {
+    if shared && cwd.is_none() {
+        Vec::new()
+    } else {
+        grants
+    }
+}
+
+/// What an answer counts as in `mode` (#1231): in Ask first a "don't ask
+/// again" or an MCP trust answer is one approval and keeps nothing. The
+/// conversation's narrow grants (#1229) stand. Pure.
+fn in_mode(decision: ApprovalDecision, mode: crate::permissions::Mode) -> ApprovalDecision {
+    match decision {
+        ApprovalDecision::ApproveAlways | ApprovalDecision::TrustTool | ApprovalDecision::TrustServer
+            if mode == crate::permissions::Mode::Ask =>
+        {
+            ApprovalDecision::Approve
+        }
+        d => d,
     }
 }
 
@@ -1719,6 +1869,10 @@ pub struct ApprovalRequestEvent {
     pub trust_server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_tool: Option<String>,
+    /// The conversation is in Ask first (#1231): no "don't ask again" or
+    /// trust answers this card, and the card offers none.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ask_first: bool,
 }
 
 /// A Talk approval card waiting on the user, as the Dock badge and the menu
@@ -1915,7 +2069,7 @@ impl ApprovalBroker {
         if answered {
             return ApprovalDecision::Approve;
         }
-        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, &offer).await;
+        let decision = in_mode(self.ask(app, workspace_id, thread_id, call_id, command, reason, None, None, &offer).await, mode);
         let settled = self.settle_command(thread_id, decision, grant.as_ref(), offer.command);
         if decision == ApprovalDecision::Grant {
             let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
@@ -1924,12 +2078,14 @@ impl ApprovalBroker {
     }
 
     /// Whether a flagged command is answered unseen, and what its card
-    /// offers otherwise (#1229). Pure but for the grants it reads.
+    /// offers otherwise (#1229). Pure but for the grants it reads. In Ask
+    /// first the thread's "don't ask again" never answers it (#1231).
     fn command_offer(&self, thread_id: &str, grant: Option<&Grant>, mode: crate::permissions::Mode) -> (bool, Offer) {
         let plan = mode == crate::permissions::Mode::Plan;
         let held = grant.is_some_and(|g| self.grants(thread_id, mode).iter().any(|h| h.same(g)));
-        let answered = held || self.auto_approve.lock().contains(thread_id);
-        (answered, Offer { command: grant.is_some() && !plan, plan_only: grant.is_some() && plan, ..Offer::default() })
+        let answered = held || self.silenced(thread_id, None, mode);
+        let ask_first = mode == crate::permissions::Mode::Ask;
+        (answered, Offer { command: grant.is_some() && !plan, plan_only: grant.is_some() && plan, ask_first, ..Offer::default() })
     }
 
     /// What an answer to a flagged command's card does: "grant" keeps this
@@ -1956,14 +2112,20 @@ impl ApprovalBroker {
         mut card: ToolCard,
         mode: crate::permissions::Mode,
     ) -> ApprovalDecision {
-        if self.grant_answers(thread_id, Some(card.kind)) {
+        if self.silenced(thread_id, Some(card.kind), mode) {
             return ApprovalDecision::Approve;
         }
         // A card that would offer a grant says why it doesn't.
         let withheld = mode == crate::permissions::Mode::Plan && card.grant.take().is_some();
+        // Ask first offers no lasting answer but the conversation's narrow
+        // grants (#1229): no "don't ask again" and no MCP trust (#1231).
+        let ask_first = mode == crate::permissions::Mode::Ask;
+        if ask_first {
+            card.trust = None;
+        }
         let marks = Some((card.kind, card.sensitive));
-        let offer = Offer { trust: card.trust.clone(), diff: card.diff.clone(), ..Offer::of(card.grant.as_ref(), withheld) };
-        let decision = self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, &offer).await;
+        let offer = Offer { trust: card.trust.clone(), diff: card.diff.clone(), ask_first, ..Offer::of(card.grant.as_ref(), withheld) };
+        let decision = in_mode(self.ask(app, workspace_id, thread_id, call_id, &card.shown, &card.reason, None, marks, &offer).await, mode);
         let settled = self.settle_card(thread_id, decision, &card);
         if decision == ApprovalDecision::Grant && card.grant.is_some() {
             let _ = app.emit(GRANTS_CHANGED_EVENT, serde_json::json!({ "threadId": thread_id }));
@@ -2004,6 +2166,12 @@ impl ApprovalBroker {
     /// a command's (`None`) or an MCP call's, never a file outside.
     pub(crate) fn grant_answers(&self, thread_id: &str, kind: Option<CardKind>) -> bool {
         kind.is_none_or(CardKind::grantable) && self.auto_approve.lock().contains(thread_id)
+    }
+
+    /// Whether the thread's "don't ask again" answers a card unseen in
+    /// `mode`: never in Ask first (#1231).
+    pub(crate) fn silenced(&self, thread_id: &str, kind: Option<CardKind>, mode: crate::permissions::Mode) -> bool {
+        mode != crate::permissions::Mode::Ask && self.grant_answers(thread_id, kind)
     }
 
     /// Ask about a command the secret guard stopped (#819). Unlike
@@ -2087,6 +2255,7 @@ impl ApprovalBroker {
             diff: offer.diff.clone(),
             trust_server: offer.trust.as_ref().map(|o| o.server.clone()),
             trust_tool: offer.trust.as_ref().map(|o| o.tool.clone()),
+            ask_first: offer.ask_first,
         };
         let rx = self.park(request.clone(), chrono::Utc::now().timestamp_millis());
         let _ = app.emit("chat://approval-request", &request);
@@ -3179,7 +3348,7 @@ fn edit_from_view(content: &str, old: &str, new: &str) -> Option<(String, String
 }
 
 /// Why an `edit_file` call can't apply whatever the file holds, or `None`.
-fn edit_input_problem(input: &serde_json::Value) -> Option<String> {
+pub(crate) fn edit_input_problem(input: &serde_json::Value) -> Option<String> {
     let old_string = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
     let new_string = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
     if old_string.is_empty() {
@@ -3281,6 +3450,8 @@ fn run_command_kept(
         c.arg("-c").arg(cmd).env("PATH", &path);
         c
     };
+    // Git uses a bare repository only when named (#1231).
+    command.envs(crate::talk_shell::git_hardening_env());
     command.current_dir(workspace_path);
     let (out, ok) = wait_command_bounded(command, timeout_secs, cancel);
     (with_read_only_note(out, ok, sandbox_roots), ok)
@@ -3852,6 +4023,11 @@ pub struct ChatEngine {
 impl ChatEngine {
     pub fn new(db: Arc<Mutex<Db>>, daemon: Option<Arc<crate::pty_client::DaemonClient>>) -> Self {
         let talk_shell = Arc::new(crate::talk_shell::TalkShell::new());
+        // Beside the daemon's socket: where each shell last sat, for the
+        // shell that replaces it after a restart (#1231).
+        if daemon.is_some() {
+            talk_shell.set_cwd_store(crate::pty_daemon::socket_path().ok().and_then(|p| p.parent().map(|d| d.join("talk-cwd"))));
+        }
         talk_shell.set_client(daemon);
         // A project's own servers start once approved in its project (#1245).
         let project_approvals = Arc::new(crate::mcp::approval::DbApprovals(Arc::clone(&db)));
@@ -4607,13 +4783,18 @@ impl ChatEngine {
     }
 
     /// Give the thread's Talk shell the workspace's port block (#1219), for
-    /// when it is next spawned, and, in a mission that ships nothing, the
-    /// strict shell (`TalkShell::set_strict`) before its next command.
+    /// when it is next spawned, and the strict shell (`TalkShell::set_strict_for`)
+    /// before its next command in a mission that ships nothing, and in Ask
+    /// first and Plan only (#1231), where a reader the command check lets
+    /// through must run the reader. A shell that ran a command while its
+    /// thread wasn't strict starts fresh then.
     fn prepare_shell(&self, workspace_id: &str, thread_id: &str) {
         let ports = crate::workspace_ports::ensure(&self.db.lock(), workspace_id);
         self.talk_shell.set_spawn_env(thread_id, ports.map(|b| b.env()).unwrap_or_default());
         let mission = self.db.lock().active_mission_for_workspace(workspace_id);
-        self.talk_shell.set_strict(thread_id, crate::permissions::mission_ships_nothing(&mission));
+        let (_, mode) = crate::permissions::thread_modes(&self.db, thread_id);
+        let why = crate::talk_shell::StrictFor::of(crate::permissions::mission_ships_nothing(&mission), mode);
+        self.talk_shell.set_strict_for(thread_id, why);
     }
 
     /// Run a `$`-direct command in the thread's TALK shell, bypassing the LLM.
@@ -5757,16 +5938,58 @@ impl ChatEngine {
                 // on its card (#1231), its diff checked again once approved: a
                 // file that changed meanwhile asks again. The guards' cards
                 // still ask after it.
-                if mode_asks.contains(&u.id) && skill_refusal.is_none() {
+                // A git reader skips Ask first's card only where it starts
+                // inside the workspace: the shared shell may sit elsewhere
+                // after an earlier `cd`, in a repository whose config runs code.
+                let git_outside = mode == crate::permissions::Mode::Ask && !mode_denied && u.name == "run_command" && {
+                    // In the shared shell, where it now is: unknown until a
+                    // reattached shell reports it, which asks. Elsewhere, the root.
+                    let shared = self.talk_shell.available() && exec_roots.is_none();
+                    let cwd = match shared {
+                        true => self.talk_shell.cwd(&request.thread_id),
+                        false => Some(request.workspace_path.clone()),
+                    };
+                    let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    crate::permissions::git_outside(command, cwd.as_deref().map(Path::new), Path::new(&request.workspace_path))
+                };
+                // A change the tool would refuse whatever the user answers gets
+                // that refusal, never an approvable card: the overwrite guard's
+                // (#1165; inside the workspace only, so it never tells whether a
+                // file exists outside), the mission sandbox's, an edit that
+                // doesn't apply (#1231).
+                // A reader the check lets through runs in the shared shell only
+                // once it is strict and proven so (`prepare_shell`, #1231): an
+                // alias, a function or a trap could turn `ls` or `git` into a
+                // writer. A shell that can't be proven runs nothing.
+                let held = (mode_asks.contains(&u.id) || git_outside) && skill_refusal.is_none();
+                let inside = || reach.outside_card(None, &u.name, &u.input, false, &[]).is_none();
+                let seen = self.thread_file_seen(&request.thread_id);
+                let refused = || {
+                    crate::permissions::refused_before_card(&reach, &u.name, &u.input, exec_roots.as_deref())
+                        .or_else(|| inside().then(|| crate::file_seen::refusal(&seen, &workspace_path, &u.name, &u.input)).flatten())
+                };
+                // A write outside a sandboxed mission is refused before any
+                // card in every mode.
+                let mut pre_refused = if held {
+                    match crate::permissions::refused_before_card(&reach, &u.name, &u.input, exec_roots.as_deref()) {
+                        None if inside() => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,
+                        other => other,
+                    }
+                } else if denied.is_none() && skill_refusal.is_none() {
+                    crate::permissions::sandbox_refusal(&reach, &u.name, &u.input, exec_roots.as_deref())
+                } else {
+                    None
+                };
+                if held && pre_refused.is_none() {
                     // A grant the conversation holds for this exact write
                     // folder, or this command from this folder, is the user's
-                    // yes (#1229): Ask first doesn't hold it. MCP trust never
-                    // is, and Plan only refused these calls above.
-                    let ask_cwd = (u.name == "run_command" && self.talk_shell.available() && exec_roots.is_none())
-                        .then(|| self.talk_shell.cwd(&request.thread_id))
-                        .flatten();
+                    // yes (#1229): Ask first doesn't hold it. MCP trust and the
+                    // thread's "don't ask again" never are, and Plan only
+                    // refused these calls above.
+                    let in_shell = u.name == "run_command" && self.talk_shell.available() && exec_roots.is_none();
+                    let ask_cwd = in_shell.then(|| self.talk_shell.cwd(&request.thread_id)).flatten();
                     let granted = || {
-                        let grants = self.approvals.grants(&request.thread_id, mode);
+                        let grants = grants_where(in_shell, ask_cwd.as_deref(), self.approvals.grants(&request.thread_id, mode));
                         reach.granted(&u.name, &u.input, ask_cwd.as_deref().map(Path::new), writes_confined, &grants)
                     };
                     if !reach.checked(&granted).await {
@@ -5776,7 +5999,11 @@ impl ChatEngine {
                             let ask = |c: ToolCard| {
                                 unless_stopped(Some(&*cancel), self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode))
                             };
-                            denied = guard_card(card, &check, ask).await;
+                            match crate::permissions::guard_ask_first(card, &check, refused, ask).await {
+                                crate::permissions::AskOutcome::Approved => {}
+                                crate::permissions::AskOutcome::Declined(denial) => denied = Some(denial),
+                                crate::permissions::AskOutcome::Refused(why) => pre_refused = Some(why),
+                            }
                         }
                     }
                 }
@@ -5799,7 +6026,11 @@ impl ChatEngine {
                 };
                 // Git is asked off the async worker, as each check starts.
                 let check = || reach.checked(&place);
-                let gated = denied.is_none() && skill_refusal.is_none() && bad_input.is_none() && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
+                let gated = denied.is_none()
+                    && pre_refused.is_none()
+                    && skill_refusal.is_none()
+                    && bad_input.is_none()
+                    && !(mcp_off || is_agent || is_skill || u.name == RECALL_TOOL_NAME);
                 let first = if gated { check().await } else { None };
                 if let Some(card) = first {
                     let ask = |c: ToolCard| self.approvals.await_card(&app, &request.workspace_id, &request.thread_id, &u.id, c, mode);
@@ -5831,7 +6062,7 @@ impl ChatEngine {
                     if denied.is_none() {
                         let place = || {
                             let cwd = shell_cwd();
-                            let grants = self.approvals.grants(&request.thread_id, mode);
+                            let grants = grants_where(shared, cwd.as_deref(), self.approvals.grants(&request.thread_id, mode));
                             reach.command_card(None, command, cwd.as_deref().map(Path::new), &grants)
                         };
                         let check = || reach.checked(&place);
@@ -5846,7 +6077,13 @@ impl ChatEngine {
                     }
                     if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         // Its grant is bound to where it runs, and checks where it reaches (#1229).
-                        let grant = reach.checked(|| reach.command_grant(command, shell_cwd().as_deref().map(Path::new))).await;
+                        // None from a shared shell whose directory isn't known.
+                        let cwd = shell_cwd();
+                        let known = !shared || cwd.is_some();
+                        let grant = match known {
+                            true => reach.checked(|| reach.command_grant(command, cwd.as_deref().map(Path::new))).await,
+                            false => None,
+                        };
                         let asked = self.approvals.await_command(&app, &request.workspace_id, &request.thread_id, &u.id, command, reason, grant, mode);
                         match unless_stopped(Some(&*cancel), asked).await {
                             ApprovalDecision::Deny => {
@@ -6007,8 +6244,8 @@ impl ChatEngine {
                             (format_command_output(&r.output, r.exit_code), r.ok)
                         }
                         // A strict shell that isn't proved clean runs nothing,
-                        // and no isolated shell runs it either (#1241).
-                        Ok(Err(AppError::Other(m))) if m.starts_with(crate::talk_shell::STRICT_SHELL_REFUSED) => (m, false),
+                        // and no isolated shell runs it either (#1241, #1231).
+                        Ok(Err(AppError::Other(m))) if crate::talk_shell::strict_refusal(&m) => (m, false),
                         // Shared shell unavailable (a live `$` process holds it, or
                         // a transient error). Run THIS command in an isolated shell
                         // so the agent isn't blocked — but say so explicitly, since
@@ -6033,7 +6270,11 @@ impl ChatEngine {
                     let (out, ok) = run_confined(&workspace_path, &u.input, exec_roots.clone(), &cancel).await;
                     interrupted = cancel.load(Ordering::Relaxed);
                     (name_forced_mission(out, crate::permissions::forced(sandbox_roots.as_deref())), ok)
-                } else if let Some(refusal) = self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await {
+                } else if let Some(refusal) = match pre_refused.take() {
+                    // Refused before Ask first's card could ask (#1231).
+                    Some(early) => Some(early),
+                    None => self.file_seen_refusal(&request.thread_id, &workspace_path, &u.name, &u.input).await,
+                } {
                     // A write over a file the agent hasn't read, or that
                     // changed since: refused, nothing written.
                     write_refused = true;
@@ -8050,7 +8291,7 @@ mod tests {
         let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
             workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
             command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted, kind: None, sensitive: false,
-            remember_dir: None, remember_command: false, plan_only: false, diff: None, trust_server: None, trust_tool: None,
+            remember_dir: None, remember_command: false, plan_only: false, diff: None, trust_server: None, trust_tool: None, ask_first: false,
         };
         let plain = serde_json::to_value(ev(false, false)).unwrap();
         assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
@@ -8071,6 +8312,32 @@ mod tests {
         let mcp = ApprovalRequestEvent { kind: Some(CardKind::Mcp), trust_server: Some("s".into()), trust_tool: Some("x".into()), ..ev(false, false) };
         let mcp = serde_json::to_value(mcp).unwrap();
         assert_eq!((mcp["trustServer"].as_str(), mcp["trustTool"].as_str()), (Some("s"), Some("x")));
+    }
+
+    /// In Ask first an earlier "don't ask again" never answers a card, and no
+    /// answer there keeps one or an MCP trust (#1231); the conversation's
+    /// narrow grants (#1229) stand, and the card says it's Ask first.
+    #[test]
+    fn no_dont_ask_again_or_trust_answers_a_card_in_ask_first() {
+        use crate::permissions::Mode::{Ask, Edit};
+        let (_tmp, db) = old_thread_db();
+        let broker = ApprovalBroker::with_db(Arc::clone(&db));
+        assert_eq!(broker.record("t-old", ApprovalDecision::ApproveAlways, false), ApprovalDecision::ApproveAlways);
+        for kind in [None, Some(CardKind::Mcp)] {
+            assert!(broker.silenced("t-old", kind, Edit), "{kind:?}: Edit freely keeps it");
+            assert!(!broker.silenced("t-old", kind, Ask), "{kind:?}: Ask first asks anyway");
+        }
+        let (answered, offer) = broker.command_offer("t-old", None, Ask);
+        assert!(!answered && offer.ask_first, "a flagged command asks, and its card says Ask first");
+        assert!(broker.command_offer("t-old", None, Edit).0);
+        for d in [ApprovalDecision::ApproveAlways, ApprovalDecision::TrustTool, ApprovalDecision::TrustServer] {
+            assert_eq!(in_mode(d, Ask), ApprovalDecision::Approve, "{d:?}");
+            assert_eq!(in_mode(d, Edit), d);
+        }
+        assert_eq!(in_mode(ApprovalDecision::Grant, Ask), ApprovalDecision::Grant, "a narrow grant stands");
+        let ev = approval_request("w", "t", "c", "git push --force");
+        assert!(serde_json::to_value(&ev).unwrap().get("askFirst").is_none());
+        assert_eq!(serde_json::to_value(ApprovalRequestEvent { ask_first: true, ..ev }).unwrap()["askFirst"], serde_json::json!(true));
     }
 
     /// A database from before `talk_grants` holding one conversation, `t-old`.
@@ -8096,7 +8363,7 @@ mod tests {
         assert!(db.lock().thread_grants("t-old").unwrap().is_empty(), "an old conversation holds none");
         let broker = ApprovalBroker::with_db(Arc::clone(&db));
         let dir = Grant { kind: GrantKind::Read, value: "/tmp/x".into(), shown: "/tmp/x".into() };
-        let card = ToolCard { kind: CardKind::Run, shown: "cat /tmp/x/a".into(), reason: "r".into(), denial: "d".into(), sensitive: false, grant: Some(dir.clone()), trust: None, diff: None };
+        let card = ToolCard { kind: CardKind::Run, shown: "cat /tmp/x/a".into(), reason: "r".into(), denial: "d".into(), sensitive: false, grant: Some(dir.clone()), trust: None, diff: None, bound: None };
         assert_eq!(broker.settle_card("t-old", ApprovalDecision::Grant, &card), ApprovalDecision::Approve);
         assert!(broker.grants("t-old", Mode::Plan).is_empty() && !broker.auto_approves("t-old"), "none in Plan only, no \"don't ask again\"");
         // Kept in the database: a restart keeps it, another conversation has none.
@@ -8351,6 +8618,7 @@ mod tests {
             grant: None,
             diff: None,
             trust: None,
+            bound: None,
         };
         // Approved, then a link moved: it asks about where it now leads.
         let asked = Mutex::new(Vec::<String>::new());
@@ -8528,6 +8796,7 @@ mod tests {
             grant,
             trust,
             diff: None,
+            bound: None,
         };
         let offer = crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: "c".into() };
         let write = Grant { kind: GrantKind::Write, value: "/tmp/octo-sample/out".into(), shown: "/tmp/octo-sample/out".into() };
@@ -8566,6 +8835,7 @@ mod tests {
             grant: None,
             trust,
             diff: None,
+            bound: None,
         };
         let offer = Some(crate::talk_guard::TrustOffer { server: "sample-server".into(), tool: "post_report".into(), config: config.clone() });
         assert_eq!(broker.settle_card("thread-a", ApprovalDecision::TrustTool, &card(offer.clone())), ApprovalDecision::Approve);
@@ -8609,6 +8879,29 @@ mod tests {
         let fresh = ApprovalBroker::default();
         assert_eq!(fresh.record("u", ApprovalDecision::ApproveAlways, !CardKind::Write.grantable()), ApprovalDecision::Approve);
         assert!(!fresh.auto_approves("u"));
+    }
+
+    /// The command check reads a line continued with `\` as bash joins it
+    /// (#1231): unquoted and in double quotes, not in single quotes, `$'…'`
+    /// or a comment. Where the join can't be followed, it asks.
+    #[test]
+    fn the_command_check_follows_a_line_continuation() {
+        assert_eq!(dangerous_command("rm -r\\\nf /"), Some("recursive force delete (rm)"));
+        assert_eq!(dangerous_command("# c \\\nr\\\nm -rf /"), Some("recursive force delete (rm)"), "a comment ends at its newline");
+        assert_eq!(bash_joined("a\\\nb \"c\\\nd\" 'e\\\nf' $'g\\\nh' # i \\\nj").as_deref(), Some("ab \"cd\" 'e\\\nf' $'g\\\nh' # i \\\nj"));
+        for unsure in ["cat <<EOF\\\nx\nEOF", "echo \"$(echo ')')\"\\\nx", "echo `a`\\\nb", "echo 'open\\\n"] {
+            assert_eq!(bash_joined(unsure), None, "{unsure:?}");
+            assert_eq!(dangerous_command(unsure), Some(UNFOLLOWED_CONTINUATION), "{unsure:?}");
+        }
+        assert_eq!(dangerous_command("cargo build \\\n  --release"), None, "a plain continuation still passes");
+    }
+
+    /// A control character other than a tab or a newline is refused, named.
+    #[test]
+    fn a_control_character_names_itself() {
+        let why = control_refusal("echo hi\rtouch x").unwrap();
+        assert!(why.starts_with("Not run: the command holds the control character U+000D (carriage return)") && why.contains("Nothing ran."), "{why}");
+        assert_eq!(control_refusal("cargo test\t--all\nls"), None);
     }
 
     #[test]
@@ -8843,6 +9136,7 @@ mod tests {
             diff: None,
             trust_server: None,
             trust_tool: None,
+            ask_first: false,
         }
     }
 
@@ -9126,6 +9420,32 @@ mod login_path_tests {
         assert_eq!(lines[2], "unset");
         assert!(lines[3].contains("build-cache") && lines[3].ends_with("/cargo"), "the sandbox's cache wins: {lines:?}");
         assert_eq!(lines[4], "/bin/bash", "the pinned bash, not the one first on the PATH");
+    }
+
+    /// A bare repository planted in a folder never brings its config into a
+    /// Talk command's git (#1231); one named with `--git-dir` still works.
+    #[test]
+    fn talk_commands_never_use_a_bare_repository_by_accident() {
+        assert_eq!(
+            crate::talk_shell::git_hardening_after(Some("2")),
+            [("GIT_CONFIG_COUNT", "3"), ("GIT_CONFIG_KEY_2", "safe.bareRepository"), ("GIT_CONFIG_VALUE_2", "explicit")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        assert_eq!(crate::talk_shell::git_hardening_after(None)[0], ("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let planted = dir.path().join("planted");
+        let made = std::process::Command::new("git").args(["init", "--bare", "-q"]).arg(&planted).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // No git here: nothing to run.
+        }
+        let run = |command: &str| {
+            let input = serde_json::json!({ "command": command });
+            with_login_shell_env(&[], || execute_tool(&planted, "run_command", &input, None))
+        };
+        let (out, ok) = run("git status");
+        assert!(!ok && out.contains("safe.bareRepository"), "{out}");
+        let (out, ok) = run("git --git-dir=. rev-parse --is-bare-repository");
+        assert!(ok && out.contains("true"), "{out}");
     }
 
     #[test]
