@@ -269,6 +269,21 @@ impl Barrier {
         }
     }
 
+    /// Put a Talk background command's spawn env (`talk_procs::launch_env`)
+    /// behind the barrier: PATH, as `env` holds it, with the shims first;
+    /// the askpass refuser; the push rewrite after the `GIT_CONFIG_*`
+    /// entries `env` holds; and each [`SCRUBBED`] token set empty, since the
+    /// PTY daemon can only set variables. Its command runs in a
+    /// non-interactive bash, which reads no startup file.
+    pub fn daemon_env(&self, env: &mut HashMap<String, String>) {
+        let path = env.get("PATH").cloned().unwrap_or_default();
+        let count = env.get("GIT_CONFIG_COUNT").cloned();
+        env.extend(self.env(&path, count.as_deref()));
+        for name in SCRUBBED {
+            env.insert(name.to_string(), String::new());
+        }
+    }
+
     /// What a terminal of the workspace (a Run terminal, the setup terminal)
     /// is spawned with. The PTY daemon can only set variables, so each
     /// [`SCRUBBED`] token is set empty. Its login shell reads its startup
